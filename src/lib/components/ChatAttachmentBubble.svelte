@@ -9,6 +9,7 @@
   } from '$lib/api/friends';
   import { formatBytes, formatDurationSecs, formatSpeed } from '$lib/utils';
   import { extensionFromPath, fileTypeKey } from '$lib/fileTypes';
+  import FileTypeIcon from '$lib/components/FileTypeIcon.svelte';
   import { noteXferBytes, xferRate, xferSecondsLeft, type RateSamples } from '$lib/xferRate';
   import { toastError } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
@@ -133,42 +134,8 @@
   aria-label={m.chat_attach_aria({ file: attachment.name, size: formatBytes(attachment.size) })}
 >
   <div class="attach-head">
-    <span
-      class="attach-icon"
-      class:k-audio={kind === 'Audio'}
-      class:k-video={kind === 'Video'}
-      class:k-image={kind === 'Image'}
-      class:k-archive={kind === 'Archive'}
-      class:k-disc={kind === 'CD/DVD'}
-      aria-hidden="true"
-    >
-      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-        {#if kind === 'Audio'}
-          <path d="M8 14.5V4.5l8-1.5v10"/>
-          <circle cx="6" cy="14.5" r="2"/>
-          <circle cx="14" cy="13" r="2"/>
-        {:else if kind === 'Video'}
-          <rect x="2.5" y="4.5" width="15" height="11" rx="2"/>
-          <path d="m8.5 7.8 4 2.2-4 2.2z"/>
-        {:else if kind === 'Image'}
-          <rect x="2.5" y="3.5" width="15" height="13" rx="2"/>
-          <circle cx="7" cy="8" r="1.5"/>
-          <path d="m17.5 13-4-4-8 7.5"/>
-        {:else if kind === 'Archive'}
-          <rect x="2.5" y="3.5" width="15" height="4" rx="1"/>
-          <path d="M4 7.5v8a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-8"/>
-          <path d="M8.5 11h3"/>
-        {:else if kind === 'CD/DVD'}
-          <circle cx="10" cy="10" r="7.5"/>
-          <circle cx="10" cy="10" r="2"/>
-        {:else}
-          <path d="M11.5 2.5H6a1.5 1.5 0 0 0-1.5 1.5v12A1.5 1.5 0 0 0 6 17.5h8a1.5 1.5 0 0 0 1.5-1.5V6.5z"/>
-          <path d="M11.5 2.5v4h4"/>
-          {#if kind === 'Document'}
-            <path d="M7.5 10.5h5M7.5 13.5h3.5"/>
-          {/if}
-        {/if}
-      </svg>
+    <span class="attach-icon" aria-hidden="true">
+      <FileTypeIcon {kind} size={38} />
       <!-- Which way it went, at a glance, on the corner of the tile. -->
       <span class="attach-dir">
         <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -308,28 +275,9 @@
   }
 
   .attach-icon {
-    --tile: var(--accent);
     position: relative;
     flex-shrink: 0;
-    width: 38px;
-    height: 38px;
-    border-radius: var(--radius-md);
     display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    background: color-mix(in srgb, var(--tile) 15%, transparent);
-    color: var(--tile);
-  }
-
-  .attach-icon.k-audio { --tile: #8b5cf6; }
-  .attach-icon.k-video { --tile: #e0567a; }
-  .attach-icon.k-image { --tile: #14a3a3; }
-  .attach-icon.k-archive { --tile: var(--warning); }
-  .attach-icon.k-disc { --tile: #6b7a90; }
-
-  .attach-icon > svg {
-    width: 20px;
-    height: 20px;
   }
 
   .attach-dir {

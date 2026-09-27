@@ -63,6 +63,13 @@
   --ed2k-color: #9b59b6;
   --ember-color: #c2185b;
   --aich-color: #27ae60;
+  /* File-type tiles (FileTypeIcon), one hue per Library type category. */
+  --type-audio: #7c4ddb;
+  --type-video: #d9486f;
+  --type-image: #129393;
+  --type-archive: var(--warning);
+  --type-document: var(--accent);
+  --type-disc: #5f6e84;
   --priority-verylow: #888888;
   --priority-low: #5599bb;
   --priority-auto: #7cb342;
@@ -198,6 +205,12 @@
   --ed2k-color: #c08cd9;
   --ember-color: #ea87ac;
   --aich-color: #5ecb87;
+  --type-audio: #a98bf0;
+  --type-video: #ef8aa6;
+  --type-image: #4cc4c4;
+  --type-archive: var(--warning);
+  --type-document: var(--accent);
+  --type-disc: #93a1b5;
   --priority-verylow: #9a9fa8;
   --priority-low: #7fb6d9;
   --priority-auto: #9ccc65;

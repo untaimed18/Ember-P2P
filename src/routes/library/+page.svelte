@@ -54,6 +54,8 @@
   import LibraryVirtualTable from '$lib/components/LibraryVirtualTable.svelte';
   import LibraryMediaPlayer from '$lib/components/LibraryMediaPlayer.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import FileTypeIcon from '$lib/components/FileTypeIcon.svelte';
+  import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import ShareFolderBrowser from '$lib/components/ShareFolderBrowser.svelte';
   import IconX from '$lib/components/IconX.svelte';
   import {
@@ -883,14 +885,6 @@
     } catch (e: unknown) {
       error = toErr(e);
       toastError(error);
-    }
-  }
-
-  async function copyToClipboard(text: string, label: string) {
-    if (await writeClipboard(text)) {
-      toastSuccess(label);
-    } else {
-      toastError(m.library_copy_failed());
     }
   }
 
@@ -2250,41 +2244,11 @@
           break;
         }
         case 'priority':
-          if (extra) {
-            await setFilePriority(f.path, extra as 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto');
-            await refresh();
-            toastSuccess(m.library_set_priority_one({ priority: priorityLabel(extra) }));
-          }
+          if (extra) await applyFilePriority(f, extra as FileInfo['priority']);
           break;
-        case 'copy_link': {
-          let link: string;
-          const emberHash = f.ember_file_hash || undefined;
-          if (extra === 'aich') {
-            link = await buildEd2kLink(f.name, f.size, f.hash, {
-              aichHash: f.aich_hash || undefined,
-              emberFileHash: emberHash,
-            });
-          } else if (extra === 'sources') {
-            link = await buildEd2kLink(f.name, f.size, f.hash, {
-              withSources: true,
-              emberFileHash: emberHash,
-            });
-          } else {
-            link = await formatEd2kLink(f.name, f.size, f.hash, emberHash);
-          }
-          if (!(await writeClipboard(link))) {
-            toastError(m.library_copy_failed());
-            break;
-          }
-          if (extra === 'aich') {
-            toastSuccess(m.library_copied_ed2k_link_aich());
-          } else if (extra === 'sources') {
-            toastSuccess(m.library_copied_ed2k_link_sources());
-          } else {
-            toastSuccess(m.library_copied_ed2k_link());
-          }
+        case 'copy_link':
+          await copyFileLink(f, extra === 'aich' || extra === 'sources' ? extra : undefined);
           break;
-        }
         case 'unshare': {
           const confirmed = await askConfirm(
             m.library_confirm_unshare_file({ name: f.name }),
@@ -2303,17 +2267,9 @@
           toastSuccess(m.library_sent_offer_named({ name: f.name }));
           break;
         }
-        case 'friends_only': {
-          const restrict = !f.friends_only;
-          await setFilesFriendsOnly([f.path], restrict);
-          await refresh();
-          toastSuccess(
-            restrict
-              ? m.library_friends_only_on_named({ name: f.name })
-              : m.library_friends_only_off_named({ name: f.name }),
-          );
+        case 'friends_only':
+          await applyFriendsOnly(f, !f.friends_only);
           break;
-        }
         case 'republish': {
           if (!f.hash || !f.shared) break;
           await republishFile(f.hash);
@@ -2327,6 +2283,115 @@
       }
     } catch (e: unknown) { error = toErr(e); }
   }
+
+  // One file's settings and links, for the context menu and the details
+  // drawer alike. They throw; each caller reports the error its own way.
+
+  async function applyFilePriority(f: FileInfo, priority: FileInfo['priority']) {
+    await setFilePriority(f.path, priority);
+    await refresh();
+    toastSuccess(m.library_set_priority_one({ priority: priorityLabel(priority) }));
+  }
+
+  async function applyFriendsOnly(f: FileInfo, restrict: boolean) {
+    await setFilesFriendsOnly([f.path], restrict);
+    await refresh();
+    toastSuccess(
+      restrict
+        ? m.library_friends_only_on_named({ name: f.name })
+        : m.library_friends_only_off_named({ name: f.name }),
+    );
+  }
+
+  /** Copy the file's eD2K link: plain, with its AICH root, or with sources. */
+  async function copyFileLink(f: FileInfo, variant?: 'aich' | 'sources'): Promise<boolean> {
+    const emberHash = f.ember_file_hash || undefined;
+    let link: string;
+    if (variant === 'aich') {
+      link = await buildEd2kLink(f.name, f.size, f.hash, {
+        aichHash: f.aich_hash || undefined,
+        emberFileHash: emberHash,
+      });
+    } else if (variant === 'sources') {
+      link = await buildEd2kLink(f.name, f.size, f.hash, {
+        withSources: true,
+        emberFileHash: emberHash,
+      });
+    } else {
+      link = await formatEd2kLink(f.name, f.size, f.hash, emberHash);
+    }
+    if (!(await writeClipboard(link))) {
+      toastError(m.library_copy_failed());
+      return false;
+    }
+    if (variant === 'aich') {
+      toastSuccess(m.library_copied_ed2k_link_aich());
+    } else if (variant === 'sources') {
+      toastSuccess(m.library_copied_ed2k_link_sources());
+    } else {
+      toastSuccess(m.library_copied_ed2k_link());
+    }
+    return true;
+  }
+
+  // ── Details drawer ──────────────────────────────────────────────────────
+  let selectedKind = $derived(
+    selectedFile ? fileTypeKey(selectedFile.extension || extensionFromPath(selectedFile.path)) : '',
+  );
+  /** Everything uploaded, as a multiple of the file: "shared out N times". */
+  let selectedUploadRatio = $derived(
+    selectedFile && selectedFile.size > 0 ? selectedFile.alltime_transferred / selectedFile.size : 0,
+  );
+  /** Two decimals under 10×, one above: "0.35×", "3.2×", "48.5×". */
+  function roundRatio(ratio: number): number {
+    const scale = ratio < 10 ? 100 : 10;
+    return Math.round(ratio * scale) / scale;
+  }
+  /** Which copy button just worked, for a moment's check mark. */
+  let drawerCopied = $state<string | null>(null);
+  let drawerCopiedTimer: ReturnType<typeof setTimeout> | null = null;
+  let drawerBusy = $state(false);
+  $effect(() => () => {
+    if (drawerCopiedTimer) clearTimeout(drawerCopiedTimer);
+  });
+
+  function flashCopied(key: string) {
+    drawerCopied = key;
+    if (drawerCopiedTimer) clearTimeout(drawerCopiedTimer);
+    drawerCopiedTimer = setTimeout(() => (drawerCopied = null), 1500);
+  }
+
+  async function drawerCopy(key: string, text: string, label: string) {
+    if (!(await writeClipboard(text))) {
+      toastError(m.library_copy_failed());
+      return;
+    }
+    toastSuccess(label);
+    flashCopied(key);
+  }
+
+  async function drawerCopyLink(f: FileInfo) {
+    try {
+      if (await copyFileLink(f)) flashCopied('link');
+    } catch (e: unknown) {
+      error = toErr(e);
+    }
+  }
+
+  /** A drawer control that changes the file; one at a time. */
+  async function drawerChange(action: () => Promise<void>) {
+    if (drawerBusy) return;
+    drawerBusy = true;
+    try {
+      await action();
+    } catch (e: unknown) {
+      error = toErr(e);
+    } finally {
+      drawerBusy = false;
+    }
+  }
+
+  const PRIORITY_CHOICES: FileInfo['priority'][] = ['verylow', 'low', 'normal', 'high', 'release', 'auto'];
 
   async function handleUnshareFolder(path: string) {
     try {
@@ -2771,6 +2836,28 @@
     };
   });
 </script>
+
+{#snippet copyButton(key: string, text: string, copiedLabel: string, label: string)}
+  <button
+    type="button"
+    class="copy-icon-btn"
+    class:copied={drawerCopied === key}
+    onclick={() => void drawerCopy(key, text, copiedLabel)}
+    title={label}
+    aria-label={label}
+  >
+    {#if drawerCopied === key}
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m3.5 8.5 3 3 6-7"/>
+      </svg>
+    {:else}
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/>
+        <path d="M10.5 5.5V4A1.5 1.5 0 0 0 9 2.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5"/>
+      </svg>
+    {/if}
+  </button>
+{/snippet}
 
 <svelte:document onclick={onDocClick} onkeydown={onPageKeyDown} />
 
@@ -3615,14 +3702,19 @@
   {#if selectedFile}
     <div class="detail-drawer" transition:fly={{ x: 24, duration: prefersReducedMotion.current ? 0 : 200 }}>
       <div class="drawer-header">
+        <FileTypeIcon kind={selectedKind} size={40} />
         <div class="drawer-header-text">
-          <span class="drawer-title" title={selectedFile.name}>{selectedFile.name}</span>
+          <span class="drawer-title" title={selectedFile.name}><bdi dir="auto">{selectedFile.name}</bdi></span>
           <span class="drawer-subtitle">
             <span>{fileType(selectedFile.extension) || (selectedFile.extension ? selectedFile.extension.toUpperCase() : '—')}</span>
             <span class="drawer-sub-sep" aria-hidden="true">·</span>
             <span>{formatSize(selectedFile.size)}</span>
-            <span class="drawer-sub-sep" aria-hidden="true">·</span>
-            <span class="drawer-sub-shared">{m.library_shared()}</span>
+            <!-- The Library lists what is offered, so this is who it is offered to. -->
+            {#if selectedFile.friends_only}
+              <span class="drawer-status drawer-status-friends" title={m.library_friends_only_badge_title()}>{m.library_friends_only_badge()}</span>
+            {:else}
+              <span class="drawer-status">{m.library_shared()}</span>
+            {/if}
           </span>
         </div>
         <button type="button" class="drawer-close" onclick={() => requestSelectPath(null)} title={m.library_close_details()} aria-label={m.library_close_details()}>
@@ -3656,6 +3748,21 @@
           </svg>
           {m.library_open_folder()}
         </button>
+        {#if selectedFile.hash}
+          <button class="drawer-action-btn" onclick={() => { const f = selectedFile; if (f) void drawerCopyLink(f); }}>
+            {#if drawerCopied === 'link'}
+              <svg class="copied-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="13" height="13" aria-hidden="true">
+                <path d="m3.5 8.5 3 3 6-7"/>
+              </svg>
+            {:else}
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13" aria-hidden="true">
+                <path d="M6.5 9.5a3 3 0 0 0 4.2 0l2-2a3 3 0 0 0-4.2-4.2l-.8.8"/>
+                <path d="M9.5 6.5a3 3 0 0 0-4.2 0l-2 2a3 3 0 0 0 4.2 4.2l.8-.8"/>
+              </svg>
+            {/if}
+            {m.servers_copy_ed2k_link()}
+          </button>
+        {/if}
       </div>
 
       <div class="drawer-body">
@@ -3674,30 +3781,33 @@
           <h3 class="drawer-block-title">{m.library_section_file()}</h3>
           <div class="details-meta-grid">
             <span class="meta-label">{m.library_meta_path()}</span>
-            <span class="meta-value meta-path" title={selectedFile.path}>{selectedFile.path}</span>
+            <span class="meta-value meta-copyable">
+              <span class="meta-path" title={selectedFile.path}><bdi dir="auto">{selectedFile.path}</bdi></span>
+              {@render copyButton('path', selectedFile.path, m.library_copied_path(), m.library_meta_copy_path())}
+            </span>
             {#if selectedFile.modified_at}
               <span class="meta-label">{m.library_col_modified()}</span>
               <span class="meta-value">{formatDateTime(selectedFile.modified_at)}</span>
             {/if}
             {#if selectedFile.hash}
               <span class="meta-label">{m.library_meta_hash()}</span>
-              <span class="meta-value meta-hash">
-                <code title={selectedFile.hash}>{selectedFile.hash}</code>
-                <button type="button" class="copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.hash, m.library_copied_hash()); }} title={m.library_meta_copy_hash()}>{m.common_copy()}</button>
+              <span class="meta-value meta-copyable">
+                <code class="meta-hash" title={selectedFile.hash}>{selectedFile.hash}</code>
+                {@render copyButton('hash', selectedFile.hash, m.library_copied_hash(), m.library_meta_copy_hash())}
               </span>
             {/if}
             {#if selectedFile.aich_hash}
               <span class="meta-label">{m.library_meta_aich()}</span>
-              <span class="meta-value meta-hash">
-                <code title={selectedFile.aich_hash}>{selectedFile.aich_hash}</code>
-                <button type="button" class="copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.aich_hash, m.library_copied_aich()); }} title={m.library_meta_copy_aich()}>{m.common_copy()}</button>
+              <span class="meta-value meta-copyable">
+                <code class="meta-hash" title={selectedFile.aich_hash}>{selectedFile.aich_hash}</code>
+                {@render copyButton('aich', selectedFile.aich_hash, m.library_copied_aich(), m.library_meta_copy_aich())}
               </span>
             {/if}
             {#if selectedFile.ember_file_hash}
               <span class="meta-label">{m.library_meta_ember()}</span>
-              <span class="meta-value meta-hash">
-                <code title={selectedFile.ember_file_hash}>{selectedFile.ember_file_hash}</code>
-                <button type="button" class="copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.ember_file_hash, m.library_copied_ember()); }} title={m.library_meta_copy_ember()}>{m.common_copy()}</button>
+              <span class="meta-value meta-copyable">
+                <code class="meta-hash" title={selectedFile.ember_file_hash}>{selectedFile.ember_file_hash}</code>
+                {@render copyButton('ember', selectedFile.ember_file_hash, m.library_copied_ember(), m.library_meta_copy_ember())}
               </span>
             {/if}
           </div>
@@ -3722,9 +3832,47 @@
                 <span class="shared-status">{m.common_pending()}</span>
               {/if}
             </span>
-            <span class="meta-label">{m.library_col_priority()}</span>
+            <!-- The same two settings the context menu changes, here where the
+                 file is being looked at. Both wait for the hash, as there. -->
+            <span class="meta-label" id="drawer-priority-label">{m.library_col_priority()}</span>
             <span class="meta-value">
-              <span class="prio-badge prio-{selectedFile.priority}">{priorityLabel(selectedFile.priority)}</span>
+              <!-- Remounted once a change settles, like the switch below, so a
+                   refused change does not stay selected. -->
+              {#key `${selectedFile.path}:${selectedFile.priority}:${drawerBusy}`}
+                <select
+                  class="drawer-select prio-{selectedFile.priority}"
+                  aria-labelledby="drawer-priority-label"
+                  value={selectedFile.priority}
+                  disabled={!selectedFile.hash || drawerBusy}
+                  onchange={(e) => {
+                    const f = selectedFile;
+                    const next = e.currentTarget.value as FileInfo['priority'];
+                    if (f && next !== f.priority) void drawerChange(() => applyFilePriority(f, next));
+                  }}
+                >
+                  {#each PRIORITY_CHOICES as prio (prio)}
+                    <option value={prio}>{priorityLabel(prio)}</option>
+                  {/each}
+                </select>
+              {/key}
+            </span>
+            <span class="meta-label">{m.library_friends_only_toggle()}</span>
+            <span class="meta-value meta-toggle">
+              <!-- Remounted from the file's state once a change settles: the
+                   switch flips itself on click, and a change that failed must
+                   not leave it showing what was only asked for. -->
+              {#key `${selectedFile.path}:${selectedFile.friends_only}:${drawerBusy}`}
+                <ToggleSwitch
+                  checked={selectedFile.friends_only}
+                  disabled={!selectedFile.hash || drawerBusy}
+                  ariaLabel={m.library_friends_only_toggle()}
+                  onchange={(restrict) => {
+                    const f = selectedFile;
+                    if (f && restrict !== f.friends_only) void drawerChange(() => applyFriendsOnly(f, restrict));
+                  }}
+                />
+              {/key}
+              <span class="meta-hint">{m.library_friends_only_hint()}</span>
             </span>
             {#if selectedFile.complete_sources > 0}
               <span class="meta-label">{m.library_col_peers()}</span>
@@ -3760,6 +3908,11 @@
               {/if}
             </div>
           </div>
+          {#if selectedUploadRatio >= 0.01}
+            <p class="activity-ratio">
+              {m.library_drawer_ratio({ ratio: formatNumber(roundRatio(selectedUploadRatio)) })}
+            </p>
+          {/if}
         </section>
 
         {#if selectedMedia}
@@ -4698,18 +4851,18 @@
   }
   .drawer-header {
     display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    padding: 12px 14px 10px;
+    align-items: center;
+    padding: 12px 12px 12px 14px;
     border-bottom: 1px solid var(--border);
     background: var(--bg-surface);
-    gap: 10px;
+    gap: 11px;
   }
   .drawer-header-text {
+    flex: 1;
     min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: 4px;
   }
   .drawer-title {
     font-weight: 700;
@@ -4735,9 +4888,21 @@
     line-height: 1.3;
   }
   .drawer-sub-sep { opacity: 0.55; }
-  .drawer-sub-shared {
+  .drawer-status {
+    margin-left: 2px;
+    padding: 0 7px;
+    border-radius: var(--radius-pill);
+    background: var(--accent-fill);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
     color: var(--accent);
+    font-size: 10.5px;
     font-weight: 600;
+    line-height: 16px;
+  }
+  .drawer-status.drawer-status-friends {
+    background: color-mix(in srgb, var(--success) 12%, transparent);
+    border-color: color-mix(in srgb, var(--success) 35%, transparent);
+    color: var(--success);
   }
   .drawer-close {
     width: 28px;
@@ -4767,24 +4932,30 @@
   .drawer-body {
     flex: 1;
     overflow-y: auto;
-    padding: 12px 14px 16px;
+    padding: 10px 12px 16px;
     font-size: 12px;
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: 10px;
   }
+  /* Each section a card, so File / Sharing / Activity read as groups rather
+     than one long list of labels. */
   .drawer-block {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 9px;
+    padding: 10px 12px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
   }
   .drawer-block-title {
     margin: 0;
     font-weight: 700;
-    font-size: 11px;
-    color: var(--text-secondary);
+    font-size: 10.5px;
+    color: var(--text-muted);
     text-transform: uppercase;
-    letter-spacing: 0.4px;
+    letter-spacing: 0.5px;
   }
   .drawer-block-comments .drawer-section-header {
     margin-bottom: 0;
@@ -5171,10 +5342,12 @@
   }
 
   /* --- Details meta grid --- */
+  /* The label column fits its longest label (up to a cap) rather than a fixed
+     72px, which a German "Veröffentlicht" overflowed into the values. */
   .details-meta-grid {
     display: grid;
-    grid-template-columns: 72px 1fr;
-    gap: 6px 10px;
+    grid-template-columns: minmax(64px, max-content) minmax(0, 1fr);
+    gap: 8px 12px;
     align-items: baseline;
   }
   .meta-label {
@@ -5182,6 +5355,9 @@
     font-size: 11px;
     text-align: left;
     white-space: nowrap;
+    max-width: 130px;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .meta-value {
     color: var(--text-primary);
@@ -5189,27 +5365,90 @@
     font-size: 12px;
     min-width: 0;
   }
+  .meta-copyable {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+  }
+  /* Two lines of path before it gives up, so the folder is readable and not
+     only its first few characters. */
   .meta-path {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 100%;
+    flex: 1;
+    min-width: 0;
     color: var(--text-secondary);
+    word-break: break-all;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    line-height: 1.4;
   }
   .meta-hash {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-family: var(--font-mono, monospace);
-    font-size: 11px;
+    flex: 1;
     min-width: 0;
-  }
-  .meta-hash code {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    min-width: 0;
+    font-family: var(--font-mono, monospace);
+    font-size: 11px;
+    line-height: 20px;
     color: var(--text-secondary);
+  }
+  .copy-icon-btn {
+    flex-shrink: 0;
+    width: 22px;
+    height: 20px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+  }
+  .copy-icon-btn svg { width: 13px; height: 13px; }
+  .copy-icon-btn:hover {
+    background: var(--bg-hover);
+    border-color: var(--border);
+    color: var(--accent);
+  }
+  .copy-icon-btn.copied,
+  .copy-icon-btn.copied:hover {
+    color: var(--success);
+  }
+  .copied-check { color: var(--success); }
+  .drawer-select {
+    max-width: 100%;
+    padding: 3px 8px;
+    font-size: 12px;
+    font-weight: 600;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+  .drawer-select:disabled { cursor: default; opacity: 0.6; }
+  .drawer-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .drawer-select.prio-verylow { color: var(--priority-verylow); }
+  .drawer-select.prio-low { color: var(--priority-low); }
+  .drawer-select.prio-high { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+  .drawer-select.prio-release { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+  .drawer-select.prio-auto { color: var(--priority-auto); }
+  .drawer-select option { color: var(--text-primary); }
+  .meta-toggle {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .meta-hint {
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--text-muted);
   }
   .meta-shared-row {
     display: flex;
@@ -5223,7 +5462,7 @@
     padding: 1px 7px;
     border-radius: var(--radius-pill);
     border: 1px solid var(--border);
-    background: var(--bg-surface);
+    background: var(--bg-secondary);
     color: var(--text-muted);
   }
   .shared-status.is-shared {
@@ -5243,8 +5482,14 @@
     padding: 8px 9px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    background: var(--bg-surface);
+    background: var(--bg-secondary);
     min-width: 0;
+  }
+  .activity-ratio {
+    margin: 0;
+    font-size: 11px;
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
   }
   .activity-stat-label {
     font-size: 10px;
@@ -5266,6 +5511,7 @@
   }
   .drawer-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 6px;
     padding: 8px 14px;
     border-bottom: 1px solid var(--border);
@@ -5294,18 +5540,6 @@
   .drawer-action-btn svg {
     flex-shrink: 0;
   }
-  .copy-btn {
-    font-size: 10px;
-    padding: 1px 5px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--bg-surface);
-    color: var(--text-secondary);
-    flex-shrink: 0;
-    cursor: pointer;
-    line-height: 1.3;
-  }
-  .copy-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--bg-surface); }
   .meta-badges { display: inline-flex; gap: 4px; }
   /* Tinted-chip recipe matching the same badges in the file table
      (LibraryVirtualTable's .shared-badge) so KAD/eD2K/AICH read as the
@@ -5345,23 +5579,6 @@
     margin: 10px 0;
   }
 
-  /* Priority pill in the properties drawer — mirrors the table cell colors. */
-  .prio-badge {
-    display: inline-block;
-    font-size: 11px;
-    font-weight: 600;
-    padding: 1px 7px;
-    border-radius: var(--radius-pill);
-    border: 1px solid var(--border);
-    background: var(--bg-surface);
-  }
-  .prio-badge.prio-verylow { color: var(--priority-verylow); }
-  .prio-badge.prio-low { color: var(--priority-low); }
-  .prio-badge.prio-normal { color: var(--text-primary); }
-  .prio-badge.prio-high { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
-  .prio-badge.prio-release { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
-  .prio-badge.prio-auto { color: var(--priority-auto); }
-
   /* --- Comment panel --- */
   .comment-last-saved {
     font-size: 11px;
@@ -5377,7 +5594,7 @@
     padding: 8px 10px;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    background: var(--bg-surface);
+    background: var(--bg-secondary);
   }
   .comment-rating-row {
     display: flex;
