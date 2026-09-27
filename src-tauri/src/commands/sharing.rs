@@ -9,13 +9,29 @@ use tauri_plugin_dialog::DialogExt;
 
 use tokio::sync::RwLock;
 
-/// How long a claim keeps other passes off a path. Comfortably longer than the
-/// 5-minute hash timeout, so a merely slow drain is never raced, but finite:
+/// How long a claim keeps other passes off a path. Comfortably longer than
+/// [`HASH_STALL_TIMEOUT`], so a merely slow drain is never raced, but finite:
 /// `spawn_blocking` cannot be aborted, and a read wedged in the kernel (offline
 /// cloud placeholder, dropped network share, antivirus hold) never returns, so
 /// a permanent claim would leave that file unindexed for the rest of the
-/// session with only a log line to say why.
+/// session with only a log line to say why. Counted from the last progress the
+/// consumer saw rather than from the claim, since a large file on a slow drive
+/// is read for far longer than this.
 const IN_FLIGHT_HASH_LEASE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// How long a hash may go without reading a byte before the pass gives up
+/// waiting for it and moves on.
+///
+/// Measured from the last progress rather than from the start. A ceiling on
+/// the whole read cannot tell a wedged read from a large file on a slow drive:
+/// a 20 GB archive on a USB disk at 40 MB/s takes over eight minutes, so it
+/// timed out on every launch, and the result it went on to compute was thrown
+/// away. The file never reached known.met and was read end to end again on the
+/// next launch, and the one after, for as long as it stayed shared.
+pub(crate) const HASH_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How often a waiting pass looks at a hash's progress counter.
+const HASH_PROGRESS_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Paces the `file-hash-progress` stream that drives the library scan's
 /// progress UI.
@@ -123,6 +139,63 @@ pub(crate) fn release_in_flight_hash(path: &str, claim: u64) {
         .unwrap_or_else(|e| e.into_inner());
     if claims.get(path).is_some_and(|(current, _)| *current == claim) {
         claims.remove(path);
+    }
+}
+
+/// Restart `claim`'s lease on `path`, if it is still the current one.
+fn renew_in_flight_hash(path: &str, claim: u64) {
+    let mut claims = hashing_in_flight()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some((current, claimed_at)) = claims.get_mut(path) {
+        if *current == claim {
+            *claimed_at = std::time::Instant::now();
+        }
+    }
+}
+
+/// A hash read made no progress for the whole stall window.
+#[derive(Debug)]
+pub(crate) struct HashStalled;
+
+/// Wait for a started hash for as long as it keeps reading.
+///
+/// Gives up only after [`HASH_STALL_TIMEOUT`] passes with `progress` standing
+/// still, and renews the claim on `path` each time it moves. The task keeps
+/// running either way; on `Err` the caller owns draining it.
+pub(crate) async fn await_hash(
+    task: &mut tokio::task::JoinHandle<HashPassResult>,
+    progress: &AtomicU64,
+    path: &str,
+    claim: u64,
+) -> Result<Result<HashPassResult, tokio::task::JoinError>, HashStalled> {
+    await_hash_within(task, progress, HASH_STALL_TIMEOUT, || {
+        renew_in_flight_hash(path, claim)
+    })
+    .await
+}
+
+async fn await_hash_within(
+    task: &mut tokio::task::JoinHandle<HashPassResult>,
+    progress: &AtomicU64,
+    stall: std::time::Duration,
+    mut on_progress: impl FnMut(),
+) -> Result<Result<HashPassResult, tokio::task::JoinError>, HashStalled> {
+    let mut seen = progress.load(Ordering::Relaxed);
+    let mut deadline = tokio::time::Instant::now() + stall;
+    loop {
+        let wake = (tokio::time::Instant::now() + HASH_PROGRESS_POLL).min(deadline);
+        if let Ok(result) = tokio::time::timeout_at(wake, &mut *task).await {
+            return Ok(result);
+        }
+        let now = progress.load(Ordering::Relaxed);
+        if now != seen {
+            seen = now;
+            deadline = tokio::time::Instant::now() + stall;
+            on_progress();
+        } else if tokio::time::Instant::now() >= deadline {
+            return Err(HashStalled);
+        }
     }
 }
 
@@ -344,6 +417,8 @@ pub(crate) struct StartedHash {
     /// Which device's budget this read is spending, so it can be given back.
     pub(crate) device: usize,
     pub(crate) claim: u64,
+    /// Bytes the read has consumed so far; see [`await_hash`].
+    pub(crate) progress: Arc<AtomicU64>,
     pub(crate) task: tokio::task::JoinHandle<HashPassResult>,
 }
 
@@ -588,19 +663,22 @@ impl<'a, T: HashCandidate> HashLookahead<'a, T> {
             let path = file.path().to_string();
             let cancel = self.cancel.clone();
             let top_up = file.top_up();
+            let progress = Arc::new(AtomicU64::new(0));
+            let read = progress.clone();
             let task = tokio::task::spawn_blocking(move || {
                 let path = std::path::Path::new(&path);
                 match top_up {
                     Some((ed2k, aich, ember, want)) => FileIndexer::hash_file_top_up_cancellable(
-                        path, ed2k, aich, ember, want, &cancel,
+                        path, ed2k, aich, ember, want, &cancel, &read,
                     ),
-                    None => FileIndexer::hash_file_cancellable(path, &cancel),
+                    None => FileIndexer::hash_file_cancellable(path, &cancel, &read),
                 }
             });
             self.inflight.push_back(StartedHash {
                 index,
                 device,
                 claim,
+                progress,
                 task,
             });
         }
@@ -2008,18 +2086,19 @@ async fn run_hash_top_up(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
             let began = std::time::Instant::now();
             let mut task = started.task;
             // An external drive that stops answering must not wedge the pass
-            // for the rest of the session. Same 300s ceiling the scan uses, and
+            // for the rest of the session. Same stall window the scan uses, and
             // the same handling: the claim stays held by a detached drain until
             // the read really does return, so nothing else tries the file in
             // the meantime.
             let Ok(outcome) =
-                tokio::time::timeout(std::time::Duration::from_secs(300), &mut task).await
+                await_hash(&mut task, &started.progress, &file.path, started.claim).await
             else {
-                warn!("Hash top-up timed out on {}", file.name);
+                warn!("Hash top-up stalled on {}", file.name);
                 pipeline.drain_started(StartedHash {
                     index: started.index,
                     device: started.device,
                     claim: started.claim,
+                    progress: started.progress,
                     task,
                 });
                 // Counted as dealt with. It is not retried this pass, and a
@@ -3455,7 +3534,7 @@ pub(crate) async fn add_shared_folder_approved(
             hash_progress.emit(&app, hashed_count + 1, total_to_hash, &file.name);
 
             let hash_result =
-                tokio::time::timeout(std::time::Duration::from_secs(300), &mut hash_task).await;
+                await_hash(&mut hash_task, &started.progress, &file.path, hash_claim).await;
 
             match hash_result {
                 Ok(Ok(Ok((
@@ -3552,16 +3631,17 @@ pub(crate) async fn add_shared_folder_approved(
                     index.abandon_hash_placeholder(&file_temp_id);
                     release_in_flight_hash(&file.path, hash_claim);
                 }
-                Err(_) => {
-                    // One slow file must not end the scan. Cancelling the whole
+                Err(HashStalled) => {
+                    // One stuck file must not end the scan. Cancelling the whole
                     // pass and dropping this folder's pending rows left every
                     // file after this one un-indexed, and it recurred on every
                     // retry because the queue is walked in a stable order.
                     // Leave the row pending, mark the page incomplete so nothing
                     // is reconciled away, and move on to the next file.
                     warn!(
-                        "Hash timed out after 5 min for {} (file may be on cloud storage or locked); leaving pending for retry",
-                        file.name
+                        "Hash of {} read nothing for {} min (file may be on cloud storage or locked); leaving pending for retry",
+                        file.name,
+                        HASH_STALL_TIMEOUT.as_secs() / 60
                     );
                     page_complete = false;
                     // Drain the abandoned blocking hash for its log line only,
@@ -4618,6 +4698,111 @@ fn hashes_in_library<'a>(
 pub async fn get_shared_folders(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     let config = state.config.read().await;
     Ok(config.settings.shared_folders.clone())
+}
+
+/// Shared folders that are there on disk but not approved, so nothing in them
+/// can be uploaded until the user re-approves them.
+///
+/// An offline folder is not one of them: it keeps whatever approval it had and
+/// comes back with its drive, and re-approving it could not capture anything.
+#[tauri::command]
+pub async fn get_unapproved_shared_folders(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let folders = state.config.read().await.settings.shared_folders.clone();
+    let Ok(registry) = crate::security::filesystem::approved_roots() else {
+        return Ok(Vec::new());
+    };
+    tokio::task::spawn_blocking(move || {
+        folders
+            .into_iter()
+            .filter(|folder| {
+                let path = std::path::Path::new(folder);
+                std::fs::symlink_metadata(path).is_ok() && registry.verify_root(path).is_err()
+            })
+            .collect()
+    })
+    .await
+    .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))
+}
+
+/// Re-approve a shared folder Ember stopped recognising, once the user has
+/// confirmed it in a native dialog. Returns whether the folder is approved
+/// afterwards.
+///
+/// Re-approval trusts whatever object now sits at the path, which is right
+/// after a drive was reconnected and exactly wrong after something else was
+/// put there, so the renderer may ask but only the user can answer: the dialog
+/// is drawn by the OS, where the webview cannot reach it.
+#[tauri::command]
+pub async fn reapprove_shared_folder(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<bool, String> {
+    let is_shared = |settings: &crate::types::AppSettings| settings.shared_folders.contains(&path);
+    if !is_shared(&state.config.read().await.settings) {
+        return Err(coded("sharing_folder_not_shared", "Folder is not a shared folder"));
+    }
+    let registry = crate::security::filesystem::approved_roots()
+        .map_err(|error| coded_ctx("sharing_reapprove_failed", "Could not re-approve the folder", error))?;
+
+    let prompt = format!(
+        "Ember no longer recognises the shared folder at:\n\n{}\n\nRe-approve it only if you reconnected its drive or moved the folder yourself. If something else was put at this path, re-approving shares whatever is there now.",
+        crate::commands::settings::elide_for_dialog(&path)
+    );
+    let dialog_app = app.clone();
+    let dialog_registry = registry.clone();
+    let folder = path.clone();
+    // `None`: nothing to authorize, because the folder is approved already.
+    let answer = tokio::task::spawn_blocking(move || {
+        let target = std::path::Path::new(&folder);
+        if std::fs::symlink_metadata(target).is_err() {
+            return Err(coded("sharing_folder_not_exist", "Folder does not exist"));
+        }
+        if dialog_registry.verify_root(target).is_ok() {
+            return Ok(None);
+        }
+        Ok(Some(
+            dialog_app
+                .dialog()
+                .message(prompt)
+                .title("Re-approve shared folder?")
+                .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+                .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                    "Re-approve".to_string(),
+                    "Keep blocked".to_string(),
+                ))
+                .blocking_show(),
+        ))
+    })
+    .await
+    .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))??;
+    match answer {
+        None => return Ok(true),
+        Some(false) => return Ok(false),
+        Some(true) => {}
+    }
+
+    // Held so the grant cannot interleave with a settings save's own root
+    // transaction, and re-read under it: the folder may have been removed
+    // while the dialog was open.
+    let _settings_save_guard = state.settings_save_lock.lock().await;
+    let settings = state.config.read().await.settings.clone();
+    if !is_shared(&settings) {
+        return Err(coded("sharing_folder_not_shared", "Folder is not a shared folder"));
+    }
+    let mut roots = settings.shared_folders.clone();
+    if !settings.download_folder.is_empty() {
+        roots.push(settings.download_folder.clone());
+    }
+    let folder = path.clone();
+    tokio::task::spawn_blocking(move || registry.reapprove_roots(&roots, std::slice::from_ref(&folder)))
+        .await
+        .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))?
+        .map_err(|error| coded_ctx("sharing_reapprove_failed", "Could not re-approve the folder", error))?;
+    info!("Re-approved shared folder {path} on the user's confirmation");
+    Ok(true)
 }
 
 /// Map a lofty `FileType` to a short eMule-style codec label.
@@ -5825,7 +6010,7 @@ async fn reload_shared_files_page(
             hash_progress.emit(&app, hashed_count + 1, total_to_hash, &file.name);
 
             let hash_result =
-                tokio::time::timeout(std::time::Duration::from_secs(300), &mut hash_task).await;
+                await_hash(&mut hash_task, &started.progress, &file.path, hash_claim).await;
 
             match hash_result {
                 Ok(Ok(Ok((
@@ -5920,16 +6105,17 @@ async fn reload_shared_files_page(
                     index.abandon_hash_placeholder(&file_temp_id);
                     release_in_flight_hash(&file.path, hash_claim);
                 }
-                Err(_) => {
-                    // One slow file must not end the reload. Cancelling the whole
+                Err(HashStalled) => {
+                    // One stuck file must not end the reload. Cancelling the whole
                     // pass and dropping the reloaded folders' pending rows left
                     // every file after this one un-indexed, and it recurred on
                     // every retry because the queue is walked in a stable order.
                     // Leave the row pending, mark the page incomplete so nothing
                     // is reconciled away, and move on to the next file.
                     warn!(
-                        "Hash timed out after 5 min for {} (file may be on cloud storage or locked); leaving pending for retry",
-                        file.name
+                        "Hash of {} read nothing for {} min (file may be on cloud storage or locked); leaving pending for retry",
+                        file.name,
+                        HASH_STALL_TIMEOUT.as_secs() / 60
                     );
                     page_complete = false;
                     // Drain the abandoned blocking hash for its log line only,
@@ -7887,6 +8073,51 @@ mod tests {
             );
             release_in_flight_hash(&files[started.index].path, started.claim);
         }
+    }
+
+    /// The reporter's library: archives large enough that a USB drive takes
+    /// longer than the stall window to read them. Timing those out threw the
+    /// finished hash away, so they were read again on every launch.
+    #[tokio::test]
+    async fn a_read_that_keeps_moving_is_waited_for_past_the_stall_window() {
+        let stall = std::time::Duration::from_millis(250);
+        let progress = Arc::new(AtomicU64::new(0));
+        let reader = progress.clone();
+        let mut task = tokio::spawn(async move {
+            for _ in 0..60 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                reader.fetch_add(1 << 20, Ordering::Relaxed);
+            }
+            Ok((String::new(), String::new(), Vec::new(), String::new(), 0, 0))
+        });
+        let began = tokio::time::Instant::now();
+        let mut renewed = 0usize;
+
+        let outcome = await_hash_within(&mut task, &progress, stall, || renewed += 1).await;
+
+        assert!(
+            matches!(outcome, Ok(Ok(Ok(_)))),
+            "a read still making progress must be allowed to finish"
+        );
+        assert!(began.elapsed() > stall, "the read outlasted the stall window");
+        assert!(renewed > 0, "progress has to keep the claim's lease alive");
+    }
+
+    #[tokio::test]
+    async fn a_read_that_stops_is_given_up_on() {
+        let progress = AtomicU64::new(0);
+        let mut task = tokio::spawn(std::future::pending::<HashPassResult>());
+
+        let outcome = await_hash_within(
+            &mut task,
+            &progress,
+            std::time::Duration::from_millis(50),
+            || panic!("nothing was read, so nothing may renew the claim"),
+        )
+        .await;
+
+        assert!(matches!(outcome, Err(HashStalled)));
+        task.abort();
     }
 
     /// A top-up may skip only what `known.met` really supplied, and must ask

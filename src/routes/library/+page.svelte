@@ -4,6 +4,8 @@
     removeSharedFolder,
     getSharedFilesIfChanged,
     getSharedFolders,
+    getUnapprovedSharedFolders,
+    reapproveSharedFolder,
     reloadSharedFiles,
     getScanStatus,
     getLibraryScanTruncated,
@@ -94,6 +96,8 @@
   // several fields per row on every pass. If you ever need an in-place edit,
   // switch back to `$state` rather than mutating these.
   let folders: string[] = $state.raw([]);
+  /** Shares present on disk that Ember will not upload from until re-approved. */
+  let unapprovedFolders: string[] = $state.raw([]);
   let folderPriorities: Record<string, string> = $state.raw({});
   /** A library row plus the three keys the filter chain would otherwise derive
    *  from it on every pass.
@@ -779,6 +783,7 @@
       getFolderPriorities(),
       getLibraryScanTruncated(),
       getStatistics().catch(() => null),
+      getUnapprovedSharedFolders().catch(() => [] as string[]),
     ]);
     // The watchdog must not discard the in-flight result. A large library can
     // take longer than 5s, and racing Promise.race used to drop that payload
@@ -794,9 +799,10 @@
       }
     }, 5000);
     try {
-      const [newFolders, snapshot, isScanning, newPriorities, newScanTruncated, newAggregateStats] = await work;
+      const [newFolders, snapshot, isScanning, newPriorities, newScanTruncated, newAggregateStats, newUnapproved] = await work;
       if (!mounted || gen !== loadGen) return;
       folders = newFolders;
+      unapprovedFolders = newUnapproved;
       if (!stoppedByUser) scanning = isScanning;
       // The library is the offer list. A file that is not offered stays on
       // disk and stays out of this view; sharing it again is the folder window.
@@ -2583,6 +2589,18 @@
     } catch (e: unknown) { error = toErr(e); }
   }
 
+  // The confirmation is a native dialog raised by the backend, not
+  // `askConfirm`: re-approving trusts whatever is at the path now, so the
+  // answer has to come from somewhere the page cannot answer for the user.
+  async function handleReapproveFolder(path: string) {
+    try {
+      if (!(await reapproveSharedFolder(path))) return;
+      const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
+      toastSuccess(m.library_folder_reapproved({ name: displayName }));
+      await refresh();
+    } catch (e: unknown) { error = toErr(e); }
+  }
+
   function formatSavedTime(ts: number | null): string {
     if (!ts) return '';
     return formatClockTime(ts / 1000, { hour: '2-digit', minute: '2-digit' });
@@ -3525,6 +3543,16 @@
           <div class="tree-meta">
             <span class="tree-count">{formatNumber(row.count)} &middot; {formatSize(row.size)}</span>
             {#if row.isShare}
+            {#if unapprovedFolders.some((f) => pathsEqualForFolder(f, folder))}
+              <button
+                type="button"
+                class="tree-unapproved"
+                onclick={(e) => { e.stopPropagation(); handleReapproveFolder(folder); }}
+                title={m.library_folder_unapproved_title()}
+              >
+                {m.library_folder_reapprove()}
+              </button>
+            {/if}
             <select
               class="tree-prio"
               class:tree-prio-set={!!folderPriorities[folder]}
@@ -4977,6 +5005,28 @@
     color: var(--on-warning);
     border-color: var(--warning);
     background: var(--warning);
+  }
+  button.tree-unapproved {
+    flex-shrink: 0;
+    height: 22px;
+    padding: 0 8px;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 20px;
+    white-space: nowrap;
+    border-radius: var(--radius-sm);
+    color: var(--warning);
+    border: 1px solid color-mix(in srgb, var(--warning) 55%, var(--border));
+    background: color-mix(in srgb, var(--warning) 18%, var(--bg-secondary));
+  }
+  button.tree-unapproved:hover,
+  button.tree-unapproved:focus-visible {
+    color: var(--on-warning);
+    border-color: var(--warning);
+    background: var(--warning);
+  }
+  button.tree-unapproved:active:not(:disabled) {
+    transform: none;
   }
   button.tree-btn.tree-remove,
   button.tree-btn.tree-remove:active:not(:disabled) {

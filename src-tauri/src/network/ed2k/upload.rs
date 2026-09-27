@@ -377,6 +377,41 @@ pub(crate) struct PeerFileAccess {
     pub secure_v2_authenticated: bool,
 }
 
+/// Log that a shared file could not be opened for upload: once per folder, the
+/// first time the approval check refuses it.
+///
+/// The peer is only ever told the file is not available, so an unapproved
+/// shared folder looked healthy — hashed, published and searchable — while
+/// every upload from it failed, and nothing said so anywhere. Once per folder
+/// per session, because a popular folder is asked for many times a minute.
+fn note_upload_refusal(path: &std::path::Path, allowed_roots: &[String], error: &std::io::Error) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let path_text = path.to_string_lossy();
+    if error.kind() != std::io::ErrorKind::PermissionDenied {
+        tracing::debug!("Could not open {path_text} for upload: {error}");
+        return;
+    }
+    let root = allowed_roots
+        .iter()
+        .find(|root| !root.is_empty() && crate::security::path_within_dir(&path_text, root))
+        .cloned()
+        .unwrap_or_else(|| path_text.to_string());
+    let first = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(root.clone());
+    if first {
+        tracing::warn!(
+            "Refusing uploads from {root}: {error}. Re-approve it in the Library if you \
+             reconnected its drive."
+        );
+    } else {
+        tracing::debug!("Refusing upload of {path_text}: {error}");
+    }
+}
+
 /// True when this peer may reach **private** content on this session: friends
 /// -only files and friend browse answers.
 ///
@@ -4926,7 +4961,7 @@ impl UploadHandler {
                 // join error.
                 let path_for_check = path.clone();
                 let allowed_for_open = allowed.clone();
-                let (verified_path, opened) = tokio::task::spawn_blocking(move || {
+                let opened = tokio::task::spawn_blocking(move || {
                     crate::security::filesystem::open_existing_approved(
                         &path_for_check,
                         &allowed_for_open,
@@ -4934,8 +4969,14 @@ impl UploadHandler {
                     )
                 })
                 .await
-                .ok()
-                .and_then(Result::ok)?;
+                .ok()?;
+                let (verified_path, opened) = match opened {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        note_upload_refusal(&path, &allowed, &error);
+                        return None;
+                    }
+                };
                 return Some(ResolvedUploadFile {
                     name: file.name,
                     path: verified_path,

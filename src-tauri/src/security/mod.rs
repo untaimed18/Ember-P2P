@@ -4,6 +4,7 @@ pub mod firewall;
 pub mod antileech;
 pub mod filesystem;
 pub mod policy;
+pub mod volume;
 
 pub mod logging {
     use std::io::{self, Write};

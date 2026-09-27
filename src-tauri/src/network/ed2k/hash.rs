@@ -6,7 +6,7 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use digest::Digest;
 use md4::Md4;
@@ -200,6 +200,19 @@ pub fn hash_open_file_digests_cancellable(
     want: WantedDigests,
     cancelled: &AtomicBool,
 ) -> anyhow::Result<FileDigests> {
+    hash_open_file_digests_tracked(file, want, cancelled, &AtomicU64::new(0))
+}
+
+/// [`hash_open_file_digests_cancellable`], adding every read's byte count to
+/// `progress` as it lands. A caller waiting on the pass from another thread
+/// reads it to tell a large file that is still being read from a read that has
+/// stopped returning.
+pub fn hash_open_file_digests_tracked(
+    file: &mut std::fs::File,
+    want: WantedDigests,
+    cancelled: &AtomicBool,
+    progress: &AtomicU64,
+) -> anyhow::Result<FileDigests> {
     use sha1::Sha1;
 
     file.seek(SeekFrom::Start(0))?;
@@ -258,6 +271,7 @@ pub fn hash_open_file_digests_cancellable(
         if n == 0 {
             anyhow::bail!("unexpected EOF: {} bytes remaining", file_remaining);
         }
+        progress.fetch_add(n as u64, Ordering::Relaxed);
 
         if want.ember {
             ember_hasher.update(&buf[..n]);
@@ -336,12 +350,17 @@ pub fn hash_open_file_digests_cancellable(
 ///
 /// `ember_blake3_hex` is the streaming BLAKE3 of the whole file (slice 18) —
 /// the Ember content integrity digest published alongside the eD2K MD4 id.
+///
+/// Bytes read are added to `progress` as they land; see
+/// [`hash_open_file_digests_tracked`].
 pub fn hash_file_combined_cancellable(
     path: &Path,
     cancelled: &AtomicBool,
+    progress: &AtomicU64,
 ) -> anyhow::Result<(String, String, Vec<[u8; 16]>, String)> {
     let mut file = std::fs::File::open(path)?;
-    let digests = hash_open_file_digests_cancellable(&mut file, WantedDigests::ALL, cancelled)?;
+    let digests =
+        hash_open_file_digests_tracked(&mut file, WantedDigests::ALL, cancelled, progress)?;
     Ok((
         digests.ed2k,
         hex::encode(digests.aich.unwrap_or_default()),
@@ -361,9 +380,14 @@ pub fn hash_file_combined_cancellable(
 /// than the drive, and a library big enough to take hours spends most of them
 /// recomputing two hashes it already has.
 ///
-/// Reads through the same `HASH_BUF_SIZE` buffer and honours the same
-/// cancellation flag, so it stops as promptly mid-file as the full pass does.
-pub fn blake3_file_cancellable(path: &Path, cancelled: &AtomicBool) -> anyhow::Result<String> {
+/// Reads through the same `HASH_BUF_SIZE` buffer, honours the same
+/// cancellation flag and reports the same `progress`, so it stops as promptly
+/// mid-file as the full pass does and looks no different to whoever is waiting.
+pub fn blake3_file_cancellable(
+    path: &Path,
+    cancelled: &AtomicBool,
+    progress: &AtomicU64,
+) -> anyhow::Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = crate::network::ember::crypto::Blake3FileHasher::new();
     let mut buf = vec![0u8; HASH_BUF_SIZE];
@@ -375,6 +399,7 @@ pub fn blake3_file_cancellable(path: &Path, cancelled: &AtomicBool) -> anyhow::R
         if n == 0 {
             break;
         }
+        progress.fetch_add(n as u64, Ordering::Relaxed);
         hasher.update(&buf[..n]);
     }
     Ok(hex::encode(hasher.finalize()))
@@ -1249,8 +1274,10 @@ mod combined_hash_tests {
         }
 
         static NEVER: AtomicBool = AtomicBool::new(false);
+        let read = AtomicU64::new(0);
         let (_, combined_aich_hex, combined_part_hashes, _) =
-            hash_file_combined_cancellable(&path, &NEVER).expect("combined hash");
+            hash_file_combined_cancellable(&path, &NEVER, &read).expect("combined hash");
+        assert_eq!(read.load(Ordering::Relaxed), file_size, "every byte read is reported");
         let hs = super::super::aich::AICHRecoveryHashSet::build_from_file(&path)
             .expect("build_from_file");
         let reread_part_hashes =

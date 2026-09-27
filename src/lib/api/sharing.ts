@@ -170,6 +170,18 @@ export async function getSharedFolders(): Promise<string[]> {
   return invoke('get_shared_folders');
 }
 
+/** Shared folders that are on disk but not approved, so none of their files
+ *  can be uploaded. Offline folders are not included. */
+export async function getUnapprovedSharedFolders(): Promise<string[]> {
+  return invoke('get_unapproved_shared_folders');
+}
+
+/** Ask the user, in a native dialog, to re-approve a shared folder Ember no
+ *  longer recognises. Resolves to whether it is approved afterwards. */
+export async function reapproveSharedFolder(path: string): Promise<boolean> {
+  return invoke('reapprove_shared_folder', { path });
+}
+
 export async function getFolderPriorities(): Promise<Record<string, string>> {
   return invoke('get_folder_priorities');
 }

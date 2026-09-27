@@ -1592,9 +1592,11 @@ pub fn run() {
                         "file_name": file.name,
                     }));
 
-                    let hash_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(300),
+                    let hash_result = commands::sharing::await_hash(
                         &mut hash_task,
+                        &started.progress,
+                        &file.path,
+                        hash_claim,
                     )
                     .await;
 
@@ -1727,8 +1729,8 @@ pub fn run() {
                             drop(idx);
                             commands::sharing::release_in_flight_hash(&file.path, hash_claim);
                         }
-                        Err(_) => {
-                            // One slow file must not end the scan. Cancelling the
+                        Err(commands::sharing::HashStalled) => {
+                            // One stuck file must not end the scan. Cancelling the
                             // whole pass here and dropping the pending rows made
                             // every file after this one silently un-indexed, and
                             // it recurred on every launch because the queue is
@@ -1737,8 +1739,9 @@ pub fn run() {
                             // prevent. Leave the row pending, mark the page
                             // incomplete so nothing is reconciled away, and move on.
                             tracing::warn!(
-                                "Startup hash timed out for {} (file may be on cloud storage or locked); leaving pending for retry",
-                                file.name
+                                "Startup hash of {} read nothing for {} min (file may be on cloud storage or locked); leaving pending for retry",
+                                file.name,
+                                commands::sharing::HASH_STALL_TIMEOUT.as_secs() / 60
                             );
                             page_complete = false;
                             // Drain the abandoned blocking hash and release its
@@ -2073,6 +2076,8 @@ pub fn run() {
             commands::sharing::get_shared_file_count,
             commands::sharing::library_has_hashes,
             commands::sharing::get_shared_folders,
+            commands::sharing::get_unapproved_shared_folders,
+            commands::sharing::reapprove_shared_folder,
             commands::sharing::get_file_media_metadata,
             commands::sharing::get_folder_priorities,
             commands::sharing::set_folder_priority,

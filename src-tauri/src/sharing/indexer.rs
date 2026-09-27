@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use tracing::{debug, info, warn};
 
@@ -725,16 +725,21 @@ impl FileIndexer {
 
     /// Computes ed2k, AICH, part hashes, and ember
     /// BLAKE3 (plus size/mtime) in a single pass for `known.met`.
+    ///
+    /// Bytes read are added to `progress` as they land, which is how the scan
+    /// tells a large file on a slow drive from a read that has stopped.
     pub fn hash_file_cancellable(
         path: &Path,
         cancelled: &AtomicBool,
+        progress: &AtomicU64,
     ) -> anyhow::Result<(String, String, Vec<[u8; 16]>, String, u64, i64)> {
         let before = std::fs::symlink_metadata(path)?;
         if before.is_symlink() {
             anyhow::bail!("refusing to hash symlink: {}", path.display());
         }
         let before_modified = before.modified().ok();
-        let (ed2k, aich, part_hashes, ember) = hash_file_combined_cancellable(path, cancelled)?;
+        let (ed2k, aich, part_hashes, ember) =
+            hash_file_combined_cancellable(path, cancelled, progress)?;
         let after = std::fs::symlink_metadata(path)?;
         let after_modified = after.modified().ok();
         if before.len() != after.len() || before_modified != after_modified {
@@ -808,6 +813,7 @@ impl FileIndexer {
         known_ember: String,
         want: crate::network::ed2k::hash::WantedDigests,
         cancelled: &AtomicBool,
+        progress: &AtomicU64,
     ) -> anyhow::Result<(String, String, Vec<[u8; 16]>, String, u64, i64)> {
         let before = std::fs::symlink_metadata(path)?;
         if before.is_symlink() {
@@ -817,8 +823,8 @@ impl FileIndexer {
 
         let (aich, ember, part_hashes) = if want.aich {
             let mut file = std::fs::File::open(path)?;
-            let digests = crate::network::ed2k::hash::hash_open_file_digests_cancellable(
-                &mut file, want, cancelled,
+            let digests = crate::network::ed2k::hash::hash_open_file_digests_tracked(
+                &mut file, want, cancelled, progress,
             )?;
             if digests.ed2k != known_ed2k {
                 anyhow::bail!(
@@ -836,7 +842,7 @@ impl FileIndexer {
         } else {
             (
                 known_aich,
-                crate::network::ed2k::hash::blake3_file_cancellable(path, cancelled)?,
+                crate::network::ed2k::hash::blake3_file_cancellable(path, cancelled, progress)?,
                 Vec::new(),
             )
         };
@@ -894,10 +900,12 @@ mod tests {
         std::fs::write(&path, &data).expect("write sample");
 
         let flag = AtomicBool::new(false);
+        let full_read = AtomicU64::new(0);
         let (ed2k, aich, parts, ember, full_size, full_mtime) =
-            FileIndexer::hash_file_cancellable(&path, &flag).expect("full pass");
+            FileIndexer::hash_file_cancellable(&path, &flag, &full_read).expect("full pass");
         assert!(!parts.is_empty(), "a multi-part file has part hashes");
 
+        let short_read = AtomicU64::new(0);
         let (short_ed2k, short_aich, short_parts, short_ember, short_size, short_mtime) =
             FileIndexer::hash_file_top_up_cancellable(
                 &path,
@@ -909,8 +917,14 @@ mod tests {
                     ember: true,
                 },
                 &flag,
+                &short_read,
             )
             .expect("digest-only pass");
+
+        // What the scan watches to tell a slow read from a stuck one, so both
+        // readers have to report the whole file.
+        assert_eq!(full_read.into_inner(), size as u64);
+        assert_eq!(short_read.into_inner(), size as u64);
 
         assert_eq!(short_ember, ember, "the digest must match the full pass");
         assert_eq!(short_ed2k, ed2k);
@@ -937,6 +951,7 @@ mod tests {
                     ember: true,
                 },
                 &flag,
+                &AtomicU64::new(0),
             )
             .expect("aich top-up pass");
         assert_eq!(
@@ -966,6 +981,7 @@ mod tests {
                 ember: false,
             },
             &flag,
+            &AtomicU64::new(0),
         );
         assert!(
             refused.is_err(),
@@ -985,6 +1001,7 @@ mod tests {
                 ember: false,
             },
             &flag,
+            &AtomicU64::new(0),
         )
         .expect("aich-only top-up");
         assert_eq!(
@@ -1027,6 +1044,7 @@ mod tests {
                 String::new(),
                 want,
                 &flag,
+                &AtomicU64::new(0),
             );
             assert!(
                 result.is_err(),

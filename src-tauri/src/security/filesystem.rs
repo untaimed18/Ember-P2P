@@ -84,6 +84,11 @@ struct ApprovedRoot {
     canonical: String,
     configured_identity: ObjectIdentity,
     target_identity: ObjectIdentity,
+    /// The filesystem the target is on, named by what is written on it. `None`
+    /// where that cannot be told, which leaves [`ApprovedRoot::verify`] exactly
+    /// as strict as the identities alone make it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    volume: Option<crate::security::volume::VolumeId>,
 }
 
 /// What to do when a recorded root no longer has the identity it was approved
@@ -199,27 +204,76 @@ impl ApprovedRoot {
             canonical: canonical.to_string_lossy().into_owned(),
             configured_identity,
             target_identity,
+            volume: crate::security::volume::volume_of(&canonical),
         })
     }
 
-    fn verify(&self) -> io::Result<PathBuf> {
+    /// The canonical root, and a replacement record when the root is the
+    /// approved folder under identities the kernel has since renumbered.
+    fn verify(&self) -> io::Result<(PathBuf, Option<ApprovedRoot>)> {
         let configured = PathBuf::from(&self.configured);
         let canonical = configured.canonicalize()?;
         let configured_identity = object_identity(&configured)?;
         let target_identity = object_identity(&canonical)?;
-        if !same_approved_object(&self.configured_identity, &configured_identity)
-            || !same_approved_object(&self.target_identity, &target_identity)
-            || path_key(&canonical) != path_key(Path::new(&self.canonical))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "approved root changed identity since it was authorized: {}",
-                    configured.display()
-                ),
-            ));
+        if path_key(&canonical) == path_key(Path::new(&self.canonical)) {
+            if same_approved_object(&self.configured_identity, &configured_identity)
+                && same_approved_object(&self.target_identity, &target_identity)
+            {
+                return Ok((canonical, None));
+            }
+            if let Some(remounted) = self.remounted(
+                crate::security::volume::volume_of(&canonical).as_ref(),
+                configured_identity,
+                target_identity,
+            ) {
+                return Ok((canonical, Some(remounted)));
+            }
         }
-        Ok(canonical)
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "approved root changed identity since it was authorized: {}",
+                configured.display()
+            ),
+        ))
+    }
+
+    /// This record, re-identified, when the live root is the approved folder
+    /// on the approved filesystem and only the kernel's numbering moved.
+    ///
+    /// A remount can renumber `st_dev` on Linux, and on filesystems whose
+    /// driver invents inode numbers, `st_ino` too. It cannot change the UUID on
+    /// the filesystem, the path, or a birth time, so those still have to match,
+    /// and so does the inode wherever it is stored on disk. A configured path
+    /// that is itself a symlink gets no such allowance: its identity is the
+    /// link's, on whatever filesystem holds the link.
+    fn remounted(
+        &self,
+        live_volume: Option<&crate::security::volume::VolumeId>,
+        configured_identity: ObjectIdentity,
+        target_identity: ObjectIdentity,
+    ) -> Option<ApprovedRoot> {
+        let volume = self.volume.as_ref()?;
+        if live_volume != Some(volume) {
+            return None;
+        }
+        if self.configured_identity.reparse_point || configured_identity.reparse_point {
+            return None;
+        }
+        let same_object = |stored: &ObjectIdentity, live: &ObjectIdentity| {
+            stored.reparse_point == live.reparse_point
+                && (!volume.persistent_inodes || stored.file_id == live.file_id)
+                && (stored.created_ns == 0
+                    || live.created_ns == 0
+                    || stored.created_ns == live.created_ns)
+        };
+        (same_object(&self.configured_identity, &configured_identity)
+            && same_object(&self.target_identity, &target_identity))
+        .then(|| ApprovedRoot {
+            configured_identity,
+            target_identity,
+            ..self.clone()
+        })
     }
 }
 
@@ -285,24 +339,39 @@ impl ApprovedRootRegistry {
             // verified against the object that replaced it and rejected again.
             let existing = current.get(&key).filter(|_| !reapprovals.contains(&key));
             if let Some(existing) = existing {
-                match existing.verify() {
-                    Ok(_) => {}
+                let record = match existing.verify() {
+                    Ok((canonical, remounted)) => {
+                        if remounted.is_some() {
+                            tracing::info!(
+                                "{} is on the same drive under a new device number; keeping its approval",
+                                configured_path.display()
+                            );
+                        }
+                        let mut record = remounted.unwrap_or_else(|| existing.clone());
+                        if record.volume.is_none() {
+                            // Approved before volumes were recorded. It has just
+                            // verified, so the volume it is on now is its own.
+                            record.volume = crate::security::volume::volume_of(&canonical);
+                        }
+                        record
+                    }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         // Offline removable/network roots retain their prior
                         // identity and simply fail every attempted operation
                         // until the same object returns.
+                        existing.clone()
                     }
                     Err(error) if on_mismatch == IdentityMismatch::Revoke => {
                         tracing::warn!(
                             "Revoking approval for {}: {error}. It stays unusable until \
-                             re-approved from Settings.",
+                             re-approved.",
                             configured_path.display()
                         );
                         continue;
                     }
                     Err(error) => return Err(error),
-                }
-                next.insert(key, existing.clone());
+                };
+                next.insert(key, record);
             } else if additions.contains(&key) {
                 match ApprovedRoot::capture(configured_path) {
                     Ok(captured) => {
@@ -445,7 +514,21 @@ impl ApprovedRootRegistry {
                 format!("path is not an approved root: {}", configured.display()),
             )
         })?;
-        record.verify()
+        let (canonical, remounted) = record.verify()?;
+        if let Some(remounted) = remounted {
+            // Held in memory so every later check takes the fast path; startup
+            // re-derives and persists it. Only over the record just verified,
+            // in case a settings change replaced it in between.
+            let mut roots = self.roots.write();
+            if roots.get(&key) == Some(&record) {
+                tracing::info!(
+                    "{} is on the same drive under a new device number; keeping its approval",
+                    configured.display()
+                );
+                roots.insert(key, remounted);
+            }
+        }
+        Ok(canonical)
     }
 
     pub fn verify_existing_path(
@@ -3356,6 +3439,102 @@ mod tests {
 
         *global_slot().write() = None;
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn identity(volume_serial: u64, file_id: u64, created_ns: u64) -> ObjectIdentity {
+        ObjectIdentity {
+            volume_serial,
+            file_id,
+            attributes: 0,
+            reparse_point: false,
+            created_ns,
+        }
+    }
+
+    fn approved_on(volume: &str, persistent_inodes: bool, id: ObjectIdentity) -> ApprovedRoot {
+        ApprovedRoot {
+            configured: "/media/u/VOLUME_8TB/CONDIVISI".to_string(),
+            canonical: "/media/u/VOLUME_8TB/CONDIVISI".to_string(),
+            configured_identity: id.clone(),
+            target_identity: id,
+            volume: Some(crate::security::volume::VolumeId {
+                id: volume.to_string(),
+                persistent_inodes,
+            }),
+        }
+    }
+
+    /// The tester's drives: plugged back in, the kernel numbered them
+    /// differently, and startup revoked every shared folder on them.
+    #[test]
+    fn a_remounted_drive_keeps_its_approval() {
+        let record = approved_on("A1B2:/", true, identity(0x0821, 5000, 77));
+        let volume = record.volume.clone();
+        let live = identity(0x0831, 5000, 77);
+        let refreshed = record
+            .remounted(volume.as_ref(), live.clone(), live.clone())
+            .expect("same filesystem, same inode, same birth time");
+        assert_eq!(refreshed.target_identity, live, "the record follows the new numbering");
+        assert_eq!(refreshed.volume, record.volume);
+
+        // exFAT and FUSE make inode numbers up at mount time, so there only
+        // the device number and the inode are allowed to move.
+        let fat = approved_on("ABCD-1234:/", false, identity(0x0831, 12, 0));
+        let fat_volume = fat.volume.clone();
+        let remounted = identity(0x0035, 98, 0);
+        assert!(fat
+            .remounted(fat_volume.as_ref(), remounted.clone(), remounted)
+            .is_some());
+    }
+
+    #[test]
+    fn a_remount_allowance_never_covers_a_different_folder() {
+        let record = approved_on("A1B2:/", true, identity(0x0821, 5000, 77));
+        let volume = record.volume.clone();
+
+        let other_inode = identity(0x0831, 6000, 77);
+        assert!(
+            record
+                .remounted(volume.as_ref(), other_inode.clone(), other_inode)
+                .is_none(),
+            "a stored inode is the folder's own; a different one is a different folder"
+        );
+
+        let reborn = identity(0x0831, 5000, 78);
+        assert!(
+            record.remounted(volume.as_ref(), reborn.clone(), reborn).is_none(),
+            "a different birth time is a recreated folder"
+        );
+
+        let other_drive = crate::security::volume::VolumeId {
+            id: "FFFF:/".to_string(),
+            persistent_inodes: true,
+        };
+        let live = identity(0x0831, 5000, 77);
+        assert!(
+            record
+                .remounted(Some(&other_drive), live.clone(), live.clone())
+                .is_none(),
+            "an empty mount point, or another drive, at the same path"
+        );
+        assert!(
+            record.remounted(None, live.clone(), live.clone()).is_none(),
+            "a volume that cannot be named now proves nothing"
+        );
+
+        let mut unnamed = record.clone();
+        unnamed.volume = None;
+        assert!(
+            unnamed.remounted(volume.as_ref(), live.clone(), live.clone()).is_none(),
+            "a record without a volume stays exactly as strict as before"
+        );
+
+        let mut link = live.clone();
+        link.reparse_point = true;
+        assert!(
+            record.remounted(volume.as_ref(), link, live).is_none(),
+            "a configured symlink's identity is the link's, not the drive's"
+        );
     }
 
     /// Re-approving a root that is merely offline must not destroy its record.
