@@ -44,7 +44,7 @@
   import { get } from 'svelte/store';
   import { listen } from '@tauri-apps/api/event';
   import type { SearchResult, SpamExplanation } from '$lib/types';
-  import { formatNumber, formatSize, formatSpeed, copyToClipboard } from '$lib/utils';
+  import { formatNumber, formatSize, formatSpeed, copyToClipboard, sizeUnitLabel } from '$lib/utils';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { addToast } from '$lib/stores/toast';
   import { inertBackground, trapTabKey } from '$lib/a11y';
@@ -64,6 +64,7 @@
     spamProfileText,
     transferFailureReasonText,
   } from '$lib/i18n';
+  import { plural } from '$lib/plural';
 
   const searchTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
   /** Request ids whose invoke has settled (success or error). Prevents a late
@@ -477,10 +478,10 @@
   ];
 
   const SIZE_UNITS = [
-    { value: 1, label: 'B' },
-    { value: 1024, label: 'KB' },
-    { value: 1024 * 1024, label: 'MB' },
-    { value: 1024 * 1024 * 1024, label: 'GB' },
+    { value: 1, label: sizeUnitLabel(0) },
+    { value: 1024, label: sizeUnitLabel(1) },
+    { value: 1024 * 1024, label: sizeUnitLabel(2) },
+    { value: 1024 * 1024 * 1024, label: sizeUnitLabel(3) },
   ];
 
   let filterType = $state('');
@@ -546,9 +547,11 @@
     const origin = r.result_origin || '';
     if (!origin.includes('Ember')) return undefined;
     if (origin !== 'Ember') return m.search_sources_ember_mixed_hint();
-    return r.availability === 1
-      ? m.search_sources_ember_hint_one()
-      : m.search_sources_ember_hint_other({ count: r.availability });
+    return plural(r.availability, {
+      one: m.search_sources_ember_hint_one,
+      few: () => m.search_sources_ember_hint_few({ count: r.availability }),
+      other: () => m.search_sources_ember_hint_other({ count: r.availability }),
+    });
   }
   let spamProfile = $derived(
     ($appSettings?.spam_filter_profile as 'relaxed' | 'balanced' | 'aggressive' | undefined)
@@ -2036,9 +2039,10 @@
     const preview = tab.query.length > 60 ? `${tab.query.slice(0, 59)}…` : tab.query;
     confirmMessage = tab.isSearching
       ? m.search_confirm_stop_message({ preview })
-      : (tab.results.length === 1
-          ? m.search_confirm_close_message_one({ preview })
-          : m.search_confirm_close_message_other({ preview, count: tab.results.length }));
+      : plural(tab.results.length, {
+          one: () => m.search_confirm_close_message_one({ preview }),
+          other: () => m.search_confirm_close_message_other({ preview, count: tab.results.length }),
+        });
     confirmOpen = true;
   }
 
@@ -2934,9 +2938,11 @@
     if (!tab || tab.results.length === 0) return;
     pendingConfirm = { kind: 'clear-results' };
     confirmTitle = m.search_confirm_clear_title();
-    confirmMessage = tab.results.length === 1
-      ? m.search_confirm_clear_message_one()
-      : m.search_confirm_clear_message_other({ count: tab.results.length });
+    confirmMessage = plural(tab.results.length, {
+      one: m.search_confirm_clear_message_one,
+      few: () => m.search_confirm_clear_message_few({ count: tab.results.length }),
+      other: () => m.search_confirm_clear_message_other({ count: tab.results.length }),
+    });
     confirmOpen = true;
   }
 
@@ -3139,9 +3145,10 @@
         addToast('error', m.search_copy_failed());
         return;
       }
-      addToast('success', targets.length === 1
-        ? m.search_copied_link_one()
-        : m.search_copied_links_other({ count: targets.length }));
+      addToast('success', plural(targets.length, {
+        one: m.search_copied_link_one,
+        other: () => m.search_copied_links_other({ count: targets.length }),
+      }));
     } catch (e: unknown) {
       addToast('error', translateError(e, m.search_copy_failed()));
     } finally {
@@ -3263,7 +3270,10 @@
     }, 3000);
 
     if (queued > 0 && failed === 0) {
-      const base = queued === 1 ? m.search_bulk_queued_one() : m.search_bulk_queued_other({ count: queued });
+      const base = plural(queued, {
+        one: m.search_bulk_queued_one,
+        other: () => m.search_bulk_queued_other({ count: queued }),
+      });
       addToast('success', skippedLocal > 0 ? m.search_bulk_queued_with_local({ base, local: skippedLocal }) : base);
     } else if (queued === 0 && alreadyQueued > 0 && failed === 0) {
       addToast('info', m.search_already_in_queue());
@@ -3300,6 +3310,12 @@
   // throttled count with an unthrottled one makes "showing X of Y" briefly
   // disagree with the rows actually on screen (and X - Y go negative).
   let resultsHidden = $derived(visibleResults.length - filteredResults.length);
+  let allHiddenSpamLabel = $derived(
+    plural(visibleResults.length, {
+      one: m.search_all_hidden_spam_one,
+      other: () => m.search_all_hidden_spam_other({ count: formatNumber(visibleResults.length) }),
+    }),
+  );
   // `.mp3` / `.mp4` on Ember or KAD walk a key publishers almost never
   // write (trailing three-letter extensions are stripped from the index).
   let extensionOnlyHintExt = $derived(
@@ -3458,7 +3474,7 @@
           tabindex={tab.id === $activeSearchTabId ? 0 : -1}
         >
           <span class="search-tab-label">{searchTabLabel(tab)}</span>
-          <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : (tab.results.length === 1 ? m.search_results_aria_one() : m.search_results_aria({ count: tab.results.length }))}>
+          <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : plural(tab.results.length, { one: m.search_results_aria_one, other: () => m.search_results_aria({ count: tab.results.length }) })}>
             {#if tab.isSearching}
               {m.search_searching_label()}
             {:else}
@@ -3574,7 +3590,10 @@
             {#if showSpamHelp}
               <div class="filter-help-popover" role="tooltip">
                 {#if hideSpam && spamHiddenCount > 0}
-                  {spamHiddenCount === 1 ? m.search_spam_hidden_count_one() : m.search_spam_hidden_count({ count: spamHiddenCount })}
+                  {plural(spamHiddenCount, {
+                    one: m.search_spam_hidden_count_one,
+                    other: () => m.search_spam_hidden_count({ count: spamHiddenCount }),
+                  })}
                 {:else}
                   {m.search_spam_hidden_none()}
                 {/if}
@@ -3737,10 +3756,18 @@
       <p class="empty-title">{m.search_searching_network()}</p>
       {#if activeTab.progress}
         {@const phase = searchPhaseLabel(activeTab.progress.phase)}
+        {@const nodes = activeTab.progress.nodes_contacted}
+        {@const found = activeTab.progress.results_so_far}
         <p class="search-detail">
-          {activeTab.progress.nodes_contacted === 1 ? m.search_contacted_nodes_one() : m.search_contacted_nodes({ count: activeTab.progress.nodes_contacted })}
-          {#if activeTab.progress.results_so_far > 0}
-            &middot; {activeTab.progress.results_so_far === 1 ? m.search_results_so_far_one() : m.search_results_so_far({ count: formatNumber(activeTab.progress.results_so_far) })}
+          {plural(nodes, {
+            one: m.search_contacted_nodes_one,
+            other: () => m.search_contacted_nodes({ count: nodes }),
+          })}
+          {#if found > 0}
+            &middot; {plural(found, {
+              one: m.search_results_so_far_one,
+              other: () => m.search_results_so_far({ count: formatNumber(found) }),
+            })}
           {/if}
           {#if phase}
             &middot; {phase}
@@ -3775,11 +3802,14 @@
             <span class="searching-indicator">{m.search_searching_indicator()}</span>
           {/if}
           {#if filteredResults.length > 0}
-            {filteredResults.length === 1 ? m.search_showing_one() : m.search_showing_other({ count: formatNumber(filteredResults.length) })}{#if resultsHidden > 0} {m.search_filtered_from({ total: formatNumber(visibleResults.length) })}{/if}
+            {plural(filteredResults.length, { one: m.search_showing_one, other: () => m.search_showing_other({ count: formatNumber(filteredResults.length) }) })}{#if resultsHidden > 0} {m.search_filtered_from({ total: formatNumber(visibleResults.length) })}{/if}
           {:else if visibleResults.length > 0 && !hasActiveFilters}
-            {visibleResults.length === 1 ? m.search_all_hidden_spam_one() : m.search_all_hidden_spam_other({ count: formatNumber(visibleResults.length) })}
+            {allHiddenSpamLabel}
           {:else if visibleResults.length > 0}
-            {visibleResults.length === 1 ? m.search_zero_of_one({ what: m.search_filters_word() }) : m.search_zero_of_other({ count: formatNumber(visibleResults.length), what: m.search_filters_word() })}
+            {plural(visibleResults.length, {
+              one: () => m.search_zero_of_one({ what: m.search_filters_word() }),
+              other: () => m.search_zero_of_other({ count: formatNumber(visibleResults.length), what: m.search_filters_word() }),
+            })}
           {:else}
             {m.search_zero_results()}
           {/if}
@@ -3820,10 +3850,10 @@
       <div class="bulk-actions" role="toolbar" aria-label={m.search_bulk_actions_aria()}>
         <span class="bulk-count">{m.search_bulk_selected({ count: checkedCount })}</span>
         <button class="bulk-download-btn" onclick={downloadChecked} disabled={bulkDownloadPending}>
-          {bulkDownloadPending ? m.search_downloading_ellipsis() : (checkedCount === 1 ? m.search_bulk_download_one() : m.search_bulk_download_other({ count: checkedCount }))}
+          {bulkDownloadPending ? m.search_downloading_ellipsis() : plural(checkedCount, { one: m.search_bulk_download_one, other: () => m.search_bulk_download_other({ count: checkedCount }) })}
         </button>
         <button class="ghost bulk-copy-btn" onclick={copyCheckedLinks} disabled={copyingLinks} title={m.search_bulk_copy_links_title()}>
-          {checkedCount === 1 ? m.search_bulk_copy_link_one() : m.search_bulk_copy_links_other({ count: checkedCount })}
+          {plural(checkedCount, { one: m.search_bulk_copy_link_one, other: () => m.search_bulk_copy_links_other({ count: checkedCount }) })}
         </button>
         <button class="ghost bulk-clear-btn" onclick={clearChecked} title={m.search_clear_selection_title()}>{m.search_clear_selection()}</button>
         {#if bulkDownloadMessage}
@@ -4138,7 +4168,7 @@
           <p class="empty-title">{m.search_no_results_filters()}</p>
           <button type="button" class="ghost empty-action" onclick={clearFilters}>{m.common_clear_filters()}</button>
         {:else}
-          <p class="empty-title">{visibleResults.length === 1 ? m.search_all_hidden_spam_one() : m.search_all_hidden_spam_other({ count: formatNumber(visibleResults.length) })}</p>
+          <p class="empty-title">{allHiddenSpamLabel}</p>
           <button type="button" class="ghost empty-action" onclick={() => (hideSpam = false)}>{m.search_show_spam()}</button>
         {/if}
       </div>

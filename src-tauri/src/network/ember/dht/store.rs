@@ -235,6 +235,22 @@ pub struct DhtStoreEntry {
     pub source_records: u32,
 }
 
+/// Whether a record from the same publisher for the same file, created at
+/// `created_at` and signed `signature`, may replace `resident`.
+///
+/// Older never replaces newer. Two different records stamped the same second
+/// settle on the larger signature, as members do (see
+/// `publish::moderation_supersedes`), so the copy a key serves does not depend
+/// on which one reached this node last. Re-storing the identical record still
+/// replaces it, which is how a republish refreshes it.
+fn resident_gives_way(resident: &DhtRecord, created_at: i64, signature: &[u8; 64]) -> bool {
+    match created_at.cmp(&resident.created_at) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => *signature >= resident.signature,
+    }
+}
+
 /// Cumulative store refusals, broken down by the cap or check that fired.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StoreRejectStats {
@@ -1029,7 +1045,7 @@ impl DhtStore {
             // FOUND_VALUE — so without this an attacker could keep re-storing
             // the oldest copy they had seen and pin a publisher's record to
             // that copy's (earlier) expiry, or roll back its metadata.
-            if records[pos].created_at > created_at {
+            if !resident_gives_way(&records[pos], created_at, &signature) {
                 debug!(
                     "Key {} already holds a newer record from this publisher, ignoring replay",
                     hex::encode(key)
@@ -2283,11 +2299,13 @@ mod tests {
         store.assert_publisher_index_consistent();
 
         // A republish replaces in place: the byte charge moves, the key count
-        // must not.
+        // must not. Dated a second on, as a republish is, so the newer copy
+        // takes the slot rather than whichever signature sorts higher.
         let sk = SigningKey::from_bytes(&[1u8; 32]);
         let again =
             SignedRecord::keyword("ubuntu", [0u8; 16], [0u8; 32], 100, "a-longer-name.iso", &sk);
-        assert!(store.store(again.keyword_hash, again.data.clone(), again.signature));
+        let (again_data, again_sig) = redated(&again, &sk, again.timestamp + 1);
+        assert!(store.store(again.keyword_hash, again_data, again_sig));
         assert_eq!(store.total_records(), 36, "a republish is not a new record");
         store.assert_publisher_index_consistent();
 
@@ -2466,7 +2484,9 @@ mod tests {
         let (sk_b, _) = keypair();
 
         let (d1, s1) = signed_body(key, &[1], &sk_a);
-        let (d2, s2) = signed_body(key, &[2], &sk_a);
+        // A second on, as a republish is; two records from one second are
+        // ordered by signature instead.
+        let (d2, s2) = signed_body_at(key, &[2], &sk_a, now_ts() + 1);
         let (d3, s3) = signed_body(key, &[3], &sk_b);
         store.store(key, d1.clone(), s1);
         store.store(key, d2.clone(), s2); // same publisher
@@ -3547,6 +3567,47 @@ mod tests {
         )
         .expect("the fixture fits one record");
         assert_eq!(record_ttl(&moderation.data), KEYWORD_RECORD_TTL);
+    }
+
+    /// Two snapshots an owner signed in the same second: every storer ends up
+    /// serving the same one, whichever order they arrived in, and a re-store of
+    /// the one it holds is still accepted as the republish it is.
+    #[test]
+    fn same_second_snapshots_settle_on_one_whatever_the_arrival_order() {
+        use super::super::publish::{ModerationTail, SignedRecord};
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let ident = ChannelIdentity::generate();
+        let at = now_ts() - 5;
+        let snapshot = |topic: &str| {
+            SignedRecord::channel_moderation_at(
+                topic,
+                "",
+                &[],
+                &[],
+                &ModerationTail::default(),
+                ident.channel_id,
+                ident.pubkey,
+                false,
+                &ident.signing_key,
+                at,
+            )
+            .expect("the fixture fits one record")
+        };
+        let (a, b) = (snapshot("before"), snapshot("after"));
+        assert_eq!(a.keyword_hash, b.keyword_hash);
+        let winner = if a.signature > b.signature { &a } else { &b };
+        for order in [[&a, &b], [&b, &a]] {
+            let mut store = DhtStore::new();
+            for record in order {
+                assert!(store.store(record.keyword_hash, record.data.clone(), record.signature));
+            }
+            let held = store.get_live(&a.keyword_hash);
+            assert_eq!(held.len(), 1);
+            assert_eq!(held[0].signature, winner.signature);
+            assert!(store.store(winner.keyword_hash, winner.data.clone(), winner.signature));
+            assert_eq!(store.get_live(&a.keyword_hash)[0].signature, winner.signature);
+        }
     }
 
     /// Only the room's owner can renew its listing — the record is signed by the

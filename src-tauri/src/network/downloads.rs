@@ -136,9 +136,15 @@ pub(super) async fn udp_reask_serveable_parts(state: &NetworkState, transfer_id:
     parts
 }
 
-/// How many queued OP_CALLBACKREQUESTs the event loop sends per turn, so a
-/// login or poll burst cannot monopolize it with a long run of TCP writes.
-pub(super) const MAX_LOWID_CALLBACKS_PER_TURN: usize = 32;
+/// How many queued OP_CALLBACKREQUESTs the event loop sends per
+/// [`LOWID_CALLBACK_INTERVAL`]: 20 per five seconds, eMule's default
+/// `MaxConPerFive`, the budget its callbacks are paced by
+/// (`TooManySockets`, DownloadClient.cpp:183-187). The loop turns many times a
+/// second, so a per-turn cap alone let a 255-source OP_FOUNDSOURCES or the
+/// post-login flush reach the server — and bring the connect-backs — within
+/// about a second.
+pub(super) const MAX_LOWID_CALLBACKS_PER_TURN: usize = 4;
+pub(super) const LOWID_CALLBACK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Ceiling on `pending_lowid_callback_queue`. Its drain only runs while we are
 /// logged in with a HighID, so a LowID (or disconnected) session drains nothing

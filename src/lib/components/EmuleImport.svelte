@@ -3,6 +3,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { plural } from '$lib/plural';
   import { formatDateTime, formatSize } from '$lib/utils';
   import ToggleSwitch from './ToggleSwitch.svelte';
   import {
@@ -478,9 +479,10 @@
                         <span class="item-meta warn">
                           {folder.subfolder_count_capped
                             ? m.emule_import_folder_subfolders_capped({ count: folder.newly_shared_subfolders })
-                            : folder.newly_shared_subfolders === 1
-                              ? m.emule_import_folder_subfolders_one()
-                              : m.emule_import_folder_subfolders_other({ count: folder.newly_shared_subfolders })}
+                            : plural(folder.newly_shared_subfolders, {
+                                one: m.emule_import_folder_subfolders_one,
+                                other: () => m.emule_import_folder_subfolders_other({ count: folder.newly_shared_subfolders }),
+                              })}
                         </span>
                       {/if}
                     </span>
@@ -510,9 +512,11 @@
           <div class="toggle-info">
             <span class="toggle-title">{m.emule_import_credits_title()}</span>
             <span class="hint">
-              {preview.credits === 1
-                ? m.emule_import_credits_desc_one()
-                : m.emule_import_credits_desc_other({ count: preview.credits })}
+              {plural(preview.credits, {
+                one: m.emule_import_credits_desc_one,
+                few: () => m.emule_import_credits_desc_few({ count: preview.credits }),
+                other: () => m.emule_import_credits_desc_other({ count: preview.credits }),
+              })}
               {#if preview.expired_credits > 0}
                 {m.emule_import_credits_expired({ count: preview.expired_credits })}
               {/if}
@@ -567,9 +571,10 @@
           <div class="toggle-row">
             <div class="toggle-info">
               <span class="toggle-title">
-                {preview.servers === 1
-                  ? m.emule_import_servers_one()
-                  : m.emule_import_servers_other({ count: preview.servers })}
+                {plural(preview.servers, {
+                  one: m.emule_import_servers_one,
+                  other: () => m.emule_import_servers_other({ count: preview.servers }),
+                })}
               </span>
             </div>
             <ToggleSwitch bind:checked={wantServers} ariaLabel={m.emule_import_report_servers()} />

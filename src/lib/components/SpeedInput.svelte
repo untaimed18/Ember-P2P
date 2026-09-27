@@ -1,6 +1,7 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import * as m from '$lib/paraglide/messages';
+  import { speedUnitLabel } from '$lib/utils';
 
   type Unit = 'B/s' | 'KB/s' | 'MB/s';
 
@@ -182,9 +183,9 @@
       aria-label={label || undefined}
     />
     <select value={unit} onchange={handleUnitChange} class="speed-unit" aria-label={m.speed_input_unit_label()}>
-      <option value="B/s">B/s</option>
-      <option value="KB/s">KB/s</option>
-      <option value="MB/s">MB/s</option>
+      <option value="B/s">{speedUnitLabel(0)}</option>
+      <option value="KB/s">{speedUnitLabel(1)}</option>
+      <option value="MB/s">{speedUnitLabel(2)}</option>
     </select>
     <button type="button" class="unlimited-btn" onclick={toggleUnlimited} title={m.speed_input_set_unlimited()} aria-label={m.speed_input_set_unlimited()}>
       &infin;

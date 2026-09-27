@@ -858,6 +858,9 @@ pub(super) async fn handle_inbound_channel_gossip(
             &sender,
             chrono::Utc::now().timestamp(),
         );
+        if answer_finished_xfer(socket, state, db, xfer_id, sender).await {
+            return;
+        }
         if let Some((_, _, _, offset, data)) = ember::channel::decode_xfer_block_data(&key, body) {
             apply_xfer_block_data(state, app_handle, xfer_id, sender, offset, &data);
         } else if let Some((_, _, _, offset, count)) =
@@ -933,10 +936,23 @@ pub(super) async fn handle_inbound_channel_gossip(
         );
         return;
     }
-    // Handoff frames are not gated on `opened`. Each carries its own authority —
-    // the room's signature on an offer, the pending nominee's on a ready — so
-    // the key that sealed it adds nothing, and a nominee who has not fetched
-    // the newest epoch yet must still be able to answer.
+    if let Some((sender_pk, tag)) = ember::channel::decode_room_friend_request(
+        &plain,
+        &gossip.channel_id,
+        &gossip.msg_id,
+        gossip.timestamp,
+    ) {
+        apply_room_friend_request(
+            socket, state, db, app_handle, &gossip, from_id, opened, sender_pk, tag,
+        )
+        .await;
+        return;
+    }
+    // Handoff frames are not gated on `opened`, for acting on or for relaying.
+    // Each carries its own authority — the room's signature on an offer, and on
+    // a ready the signature of the member that offer named — so the key that
+    // sealed it adds nothing, and a nominee who has not fetched the newest
+    // epoch yet must still be able to answer.
     let channel_pk = hex::decode(&ch.pubkey)
         .ok()
         .and_then(|b| <[u8; 32]>::try_from(b).ok());
@@ -1417,10 +1433,14 @@ pub(super) async fn apply_channel_handoff_offer(
     // A lapsed offer is a replay: the owner will not accept a ready for it, and
     // answering would only mint a seed over the one a live offer may need.
     // Nobody passes it on, either.
-    if !ember::channel::handoff_offer_live_at_target(version, chrono::Utc::now().timestamp()) {
+    let now = chrono::Utc::now().timestamp();
+    if !ember::channel::handoff_offer_live_at_target(version, now) {
         debug!("Ember channel handoff: ignored a lapsed offer for {}", ch.channel_id);
         return;
     }
+    handoff_offers_seen()
+        .lock()
+        .note(gossip.channel_id, target_pk, version, now);
     if target_pk == state.local_ed25519_pubkey {
         // Never answer with a successor key that is not on disk: the owner
         // publishes whatever pubkey the ready names, and a seed held only in
@@ -1488,6 +1508,99 @@ pub(super) async fn apply_channel_handoff_offer(
     }
 }
 
+/// A friend request that crossed a room: take it if it is ours, and pass it
+/// on either way.
+///
+/// Held to the sender's ban and chat rate first, since every member carries
+/// it. Taken only from a member the roster holds and has seen here — a public
+/// room carries anyone's key, and one that has never shown up in the room has
+/// no business asking its members anything. Passed on by the recipient too,
+/// under the current key like chat: a member that swallowed the requests
+/// addressed to it would be the one member that could be told apart.
+async fn apply_room_friend_request(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    gossip: &ember::channel::ChannelGossip,
+    from_id: ember::dht::EmberNodeId,
+    opened: ember::channel::OpenedUnder,
+    sender_pk: [u8; 32],
+    tag: [u8; 16],
+) {
+    let channel_id = gossip.channel_id;
+    let now = chrono::Utc::now().timestamp();
+    if sender_pk == state.local_ed25519_pubkey
+        || !ember::channel::room_friend_request_fresh(gossip.timestamp, now)
+        || channel_member_banned(state, db, channel_id, &sender_pk)
+    {
+        return;
+    }
+    if opened == ember::channel::OpenedUnder::Retired
+        && !channel_member_on_roster(state, db, channel_id, &sender_pk)
+    {
+        return;
+    }
+    if !channel_author_gossip_ok(state, channel_id, &sender_pk) {
+        forget_channel_gossip(state, &gossip.msg_id);
+        return;
+    }
+    let for_us = ember::channel::room_friend_request_is_for(
+        &state.local_ed25519_seed,
+        &sender_pk,
+        &channel_id,
+        &gossip.msg_id,
+        &tag,
+    );
+    // Forwarded before our own copy is looked at, so neither whether we pass
+    // it on nor how long we take to shows whether it was ours.
+    if opened == ember::channel::OpenedUnder::Current {
+        if let Some(next) = gossip.decremented_ttl() {
+            fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+        }
+    }
+    if for_us {
+        let sender_hex = hex::encode(sender_pk);
+        let seen_here = db
+            .list_channel_members(&hex::encode(channel_id))
+            .ok()
+            .and_then(|members| {
+                members
+                    .into_iter()
+                    .find(|m| m.member_pubkey.eq_ignore_ascii_case(&sender_hex))
+            })
+            .filter(|m| !m.banned && m.last_seen > 0);
+        match seen_here {
+            Some(member) => {
+                note_channel_member_alive(state, channel_id, &sender_pk, now);
+                process_room_friend_request(
+                    db,
+                    app_handle,
+                    sender_pk,
+                    &member.nickname,
+                    channel_id,
+                    gossip.timestamp,
+                )
+                .await;
+            }
+            None => debug!(
+                "Ember channel gossip: ignored a friend request in {} from a key this room's \
+                 roster has not seen",
+                hex::encode(channel_id)
+            ),
+        }
+    }
+}
+
+/// Live ownership offers seen flooding each room, for deciding which readies
+/// to relay. Held beside the event loop's state rather than in it because only
+/// the handoff handlers read it.
+fn handoff_offers_seen() -> &'static parking_lot::Mutex<ember::channel::HandoffOffersSeen> {
+    static SEEN: std::sync::OnceLock<parking_lot::Mutex<ember::channel::HandoffOffersSeen>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
 pub(super) async fn apply_channel_handoff_ready(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -1500,15 +1613,19 @@ pub(super) async fn apply_channel_handoff_ready(
     successor_pk: [u8; 32],
     version: u64,
 ) {
+    let mut offer_known = handoff_offers_seen()
+        .lock()
+        .names(&gossip.channel_id, &sender_pk, version);
     if ch.is_owner {
         if let Ok(Some((pending, pending_ver))) = db.channel_pending_handoff(&ch.channel_id) {
             let sender_hex = hex::encode(sender_pk);
+            let answers_ours = pending.eq_ignore_ascii_case(&sender_hex) && pending_ver == version;
+            offer_known |= answers_ours;
             // The pending mark only gates offering to somebody else, so it can
             // outlive both the offer's window and the target's standing in the
             // room. Completing on either would hand the room to someone the
             // owner no longer meant it for.
-            let acceptable = pending.eq_ignore_ascii_case(&sender_hex)
-                && pending_ver == version
+            let acceptable = answers_ours
                 && ember::channel::handoff_offer_live(version, chrono::Utc::now().timestamp())
                 && !db
                     .channel_member_is_banned(&ch.channel_id, &sender_hex)
@@ -1579,9 +1696,32 @@ pub(super) async fn apply_channel_handoff_ready(
             }
         }
     }
-    if let Some(next) = gossip.decremented_ttl() {
-        fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+    let Some(next) = gossip.decremented_ttl() else {
+        return;
+    };
+    let relay = ember::channel::handoff_ready_may_relay(
+        channel_member_banned(state, db, gossip.channel_id, &sender_pk),
+        offer_known,
+        version,
+        chrono::Utc::now().timestamp(),
+    );
+    // Rate last, so a ready that is not ours to carry spends nothing of the
+    // nominee's budget.
+    if !(relay && channel_author_gossip_ok(state, gossip.channel_id, &sender_pk)) {
+        // Released unless it is the ready itself that is refused: the offer it
+        // answers may be a flood behind it, or have crossed this node before a
+        // restart, and a copy arriving once we have seen it must still pass.
+        if !offer_known || relay {
+            forget_channel_gossip(state, &gossip.msg_id);
+        }
+        debug!(
+            "Ember channel handoff: not relaying a ready in {} (banned sender, unknown or \
+             lapsed offer, or over its rate)",
+            ch.channel_id
+        );
+        return;
     }
+    fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
 }
 
 /// Whether a publish of this room's handoff record is still out.

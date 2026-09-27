@@ -135,9 +135,78 @@ pub(super) fn count_accepted_bootstrap_contacts<T>(
         .sum()
 }
 
+/// Charge a plaintext KAD packet to the per-destination request budget (see
+/// `kad::outbound`). False when sending it now would put `addr` over eMule's
+/// request-flood limit for its opcode.
+pub(super) fn kad_request_allowed(state: &NetworkState, addr: SocketAddr, packet: &[u8]) -> bool {
+    kad_requests_allowed(state, addr, packet, 1)
+}
+
+/// [`kad_request_allowed`] for `count` packets of `packet`'s opcode at once:
+/// all are charged or none are. Pair with [`send_prepaid_kad_packet`].
+pub(super) fn kad_requests_allowed(
+    state: &NetworkState,
+    addr: SocketAddr,
+    packet: &[u8],
+    count: usize,
+) -> bool {
+    match kad::outbound::kad_packet_opcode(packet) {
+        Some(opcode) => state.kad_outbound.lock().allow_many(addr.ip(), opcode, count),
+        None => true,
+    }
+}
+
+/// Whether a request with `opcode` could go to `addr` now and none has gone
+/// there within `min_gap`. Charges nothing.
+pub(super) fn kad_request_ready(
+    state: &NetworkState,
+    addr: SocketAddr,
+    opcode: u8,
+    min_gap: std::time::Duration,
+) -> bool {
+    let governor = state.kad_outbound.lock();
+    governor.would_allow(addr.ip(), opcode)
+        && governor
+            .since_last(addr.ip(), opcode)
+            .is_none_or(|age| age >= min_gap)
+}
+
+/// The error [`send_kad_packet`] / [`send_kad_response`] return for a
+/// request the per-destination budget held back. Nothing was sent; unlike a
+/// socket error, retrying the same destination at once cannot succeed.
+pub(super) fn is_kad_request_paced(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+}
+
+fn kad_request_paced(addr: SocketAddr, packet: &[u8]) -> std::io::Error {
+    debug!(
+        "KAD request 0x{:02X} to {addr} deferred: per-destination budget spent",
+        packet.get(1).copied().unwrap_or(0)
+    );
+    std::io::Error::new(std::io::ErrorKind::WouldBlock, "KAD request pacing")
+}
+
 /// Send a KAD packet, optionally using obfuscation if the target supports it
 /// and the user has enabled protocol obfuscation in settings.
+///
+/// Requests over the destination's budget are not sent and return
+/// `ErrorKind::WouldBlock`.
 pub(super) async fn send_kad_packet(
+    socket: &UdpSocket,
+    packet: &[u8],
+    addr: SocketAddr,
+    state: &NetworkState,
+    target_id: &KadId,
+) -> std::io::Result<usize> {
+    if !kad_request_allowed(state, addr, packet) {
+        return Err(kad_request_paced(addr, packet));
+    }
+    send_prepaid_kad_packet(socket, packet, addr, state, target_id).await
+}
+
+/// [`send_kad_packet`] for a packet already charged with
+/// [`kad_requests_allowed`].
+pub(super) async fn send_prepaid_kad_packet(
     socket: &UdpSocket,
     packet: &[u8],
     addr: SocketAddr,
@@ -265,46 +334,41 @@ pub(super) async fn maybe_send_hello_challenge(
             receiver: contact_id,
         };
         if let Ok(packet) = messages::encode_packet(&req) {
-            state.legacy_challenges.add(
-                contact_id,
-                challenge,
-                ip,
-                LegacyChallengeTracker::OPCODE_REQ,
-            );
-            state
-                .flood_protection
-                .track_request(from, messages::KADEMLIA2_REQ);
-            let _ = send_kad_response(
-                socket,
-                &packet,
-                from,
-                state,
-                Some(&contact_id),
-                peer_udp_key,
-            )
-            .await;
-            debug!("Sent legacy KadReq challenge to {from} (version={version})");
+            // Registered only once the challenge is out: an active challenge
+            // suppresses the next one for its whole lifetime, so one the
+            // budget held back would leave the contact unverifiable until then.
+            if send_kad_response(socket, &packet, from, state, Some(&contact_id), peer_udp_key)
+                .await
+                .is_ok()
+            {
+                state.legacy_challenges.add(
+                    contact_id,
+                    challenge,
+                    ip,
+                    LegacyChallengeTracker::OPCODE_REQ,
+                );
+                state
+                    .flood_protection
+                    .track_request(from, messages::KADEMLIA2_REQ);
+                debug!("Sent legacy KadReq challenge to {from} (version={version})");
+            }
         }
     } else if version == KADEMLIA_VERSION7_49A {
         let ping = KadMessage::Ping;
         if let Ok(packet) = messages::encode_packet(&ping) {
-            state.legacy_challenges.add(
-                contact_id,
-                KadId::zero(),
-                ip,
-                LegacyChallengeTracker::OPCODE_PING,
-            );
-            state.flood_protection.track_request(from, 0x60);
-            let _ = send_kad_response(
-                socket,
-                &packet,
-                from,
-                state,
-                Some(&contact_id),
-                peer_udp_key,
-            )
-            .await;
-            debug!("Sent legacy Ping challenge to {from}");
+            if send_kad_response(socket, &packet, from, state, Some(&contact_id), peer_udp_key)
+                .await
+                .is_ok()
+            {
+                state.legacy_challenges.add(
+                    contact_id,
+                    KadId::zero(),
+                    ip,
+                    LegacyChallengeTracker::OPCODE_PING,
+                );
+                state.flood_protection.track_request(from, 0x60);
+                debug!("Sent legacy Ping challenge to {from}");
+            }
         }
     }
 }
@@ -317,6 +381,11 @@ pub(super) async fn send_kad_response(
     target_id: Option<&KadId>,
     peer_udp_key: Option<KadUDPKey>,
 ) -> std::io::Result<usize> {
+    // Responses pass untouched; the requests some callers send through here
+    // (Hello challenges, legacy pings) are paced like any other.
+    if !kad_request_allowed(state, addr, packet) {
+        return Err(kad_request_paced(addr, packet));
+    }
     let their_ip = match addr.ip() {
         std::net::IpAddr::V4(ip) => u32::from(ip),
         _ => 0,
@@ -646,6 +715,7 @@ pub(super) fn update_publish_manager_state(state: &mut NetworkState) {
         state.publish_manager.tcp_port,
         std::sync::atomic::Ordering::Relaxed,
     );
+    ed2k::peer_sessions::set_advertised_tcp_port(state.publish_manager.tcp_port);
     state.advertise_udp_port.store(
         state.publish_manager.udp_port,
         std::sync::atomic::Ordering::Relaxed,
@@ -879,13 +949,18 @@ pub(super) async fn send_udp_firewall_probe_request(
     let our_client_id = external_ip
         .map(|ip| u32::from_le_bytes(ip.octets()))
         .unwrap_or(0);
-    let hello = ed2k::messages::build_hello_with_buddy(
+    // Same crypt claims as every other Hello we send: the default options
+    // advertise obfuscation even for a user who turned it off.
+    let mut hello_options = ed2k::messages::HelloOptions::default_for_udp_port(udp_port);
+    hello_options.supports_crypt_layer = obfuscation_enabled;
+    hello_options.requests_crypt_layer = obfuscation_enabled;
+    let hello = ed2k::messages::build_hello_with_buddy_opts(
         &user_hash,
         our_client_id,
         tcp_port,
-        udp_port,
         &nickname,
         None,
+        &hello_options,
     );
     write_ed2k_packet_simple(
         &mut writer,
@@ -895,7 +970,7 @@ pub(super) async fn send_udp_firewall_probe_request(
     )
     .await?;
 
-    let (proto, opcode, _) = tokio::time::timeout(
+    let (proto, opcode, hello_answer) = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         read_ed2k_packet_simple(&mut reader),
     )
@@ -907,20 +982,25 @@ pub(super) async fn send_udp_firewall_probe_request(
         );
     }
 
-    let emule_info = ed2k::messages::build_emule_info(udp_port, obfuscation_enabled, None, None);
-    write_ed2k_packet_simple(
-        &mut writer,
-        OP_EMULEPROT,
-        ed2k::messages::OP_EMULEINFO,
-        &emule_info,
-    )
-    .await?;
+    let needs_mule_info = ed2k::messages::parse_hello_answer(&hello_answer)
+        .is_ok_and(|(hash, caps)| ed2k::messages::dialer_needs_mule_info(&hash, &caps));
+    if needs_mule_info {
+        let emule_info =
+            ed2k::messages::build_emule_info(udp_port, obfuscation_enabled, None, None);
+        write_ed2k_packet_simple(
+            &mut writer,
+            OP_EMULEPROT,
+            ed2k::messages::OP_EMULEINFO,
+            &emule_info,
+        )
+        .await?;
 
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        read_ed2k_packet_simple(&mut reader),
-    )
-    .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_ed2k_packet_simple(&mut reader),
+        )
+        .await;
+    }
 
     let mut payload = Vec::with_capacity(8);
     payload.extend_from_slice(&udp_port.to_le_bytes());

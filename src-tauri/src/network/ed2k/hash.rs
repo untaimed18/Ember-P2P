@@ -452,7 +452,7 @@ fn percent_encode_ed2k(name: &str) -> String {
 
 /// Format an ed2k link with optional AICH root hash, Ember BLAKE3 digest, and
 /// source endpoints, matching eMule's link variants plus an Ember extension:
-///   ed2k://|file|name|size|hash|h=<base32 AICH>|eh=<hex BLAKE3>|sources,ip:port,...|/
+///   ed2k://|file|name|size|hash|h=<base32 AICH>|eh=<hex BLAKE3>|/|sources,ip:port,...|/
 ///
 /// `aich_hex` is the 40-char hex AICH root (as stored on `FileInfo`); it is
 /// re-encoded to base32 for the `h=` segment the way eMule expects. `ember_hex`
@@ -487,17 +487,20 @@ pub fn format_ed2k_link_ext(
         link.push_str(&digest.to_lowercase());
         link.push('|');
     }
+    link.push('/');
+    // eMule writes sources as a segment after the link's closing `/`
+    // (`AbstractFile.cpp:434-438`) and reads them only from there
+    // (`ED2KLink.cpp`); before the `/` they are an unknown parameter it drops.
     if !sources.is_empty() {
-        link.push_str("sources");
+        link.push_str("|sources");
         for (ip, port) in sources {
             link.push(',');
             link.push_str(ip);
             link.push(':');
             link.push_str(&port.to_string());
         }
-        link.push('|');
+        link.push_str("|/");
     }
-    link.push('/');
     link
 }
 
@@ -864,11 +867,16 @@ mod link_tests {
         assert_eq!(parsed.as_deref(), Some(digest.as_str()));
     }
 
+    /// eMule's layout: the sources follow the link's closing `/`.
     #[test]
     fn link_with_sources_appends_endpoint() {
         let sources = vec![("203.0.113.5".to_string(), 4662u16)];
         let link = format_ed2k_link_ext("movie.avi", 1234, HASH, None, None, &sources);
-        assert!(link.contains("|sources,203.0.113.5:4662|"), "{link}");
+        assert_eq!(
+            link,
+            format!("ed2k://|file|movie.avi|1234|{}|/|sources,203.0.113.5:4662|/", HASH.to_uppercase())
+        );
+        assert_eq!(parse_ed2k_link(&link).expect("parse").2, HASH);
     }
 
     #[test]

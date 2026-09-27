@@ -1,18 +1,17 @@
 use std::io::{self, Cursor, Read};
 use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::messages::*;
 
-const SERVER_POLL_READABLE_TIMEOUT_MS: u64 = 5;
-/// Deadline for the first byte of a polled packet. Safe to abandon: nothing
-/// has been consumed, so the stream is still on a packet boundary.
-const SERVER_POLL_PACKET_TIMEOUT_SECS: u64 = 1;
-/// Longest silence tolerated at any single point inside a packet body.
+/// Longest silence tolerated at any single point inside a packet body, on a
+/// plain or an obfuscated connection.
 ///
 /// This, rather than the total below, is what detects a dead connection. A
 /// large `OP_SEARCHRESULT` or `OP_SERVERLIST` over a slow link keeps delivering
@@ -23,38 +22,38 @@ const SERVER_PACKET_IDLE_TIMEOUT_SECS: u64 = 10;
 
 /// Hard cap on one packet body once its first byte is consumed.
 ///
-/// There is no safe way to abandon this read — expiry is treated as a corrupt
-/// stream and drops the session — and it runs *inline* in the network task's
-/// `tokio::select!` loop, so whatever it is, it is also how long KAD, uploads,
-/// timers and UI events can stop. The idle deadline above covers honest
+/// There is no safe way to abandon this read, so expiry is treated as a
+/// corrupt stream and drops the session. The idle deadline above covers honest
 /// slowness; this only bounds a server that trickles just fast enough to keep
-/// resetting it. Matches the write side's `SERVER_WRITE_TIMEOUT_SECS` because
-/// it is the same tradeoff on the same thread.
-///
-/// The real fix is to stop awaiting socket I/O on the event loop at all —
-/// a reader task feeding `poll_messages` over a channel — at which point both
-/// budgets can be as generous as the protocol wants.
-const SERVER_PACKET_BODY_TIMEOUT_SECS: u64 = 30;
+/// resetting it. The read runs in the session's reader task, so waiting it out
+/// holds up that session and nothing else.
+const SERVER_PACKET_BODY_TIMEOUT_SECS: u64 = 120;
 
-/// Longest one `poll_messages` call spends draining before it returns what it
-/// has and lets the next tick continue.
-///
-/// The drain loop reads packets until the socket goes idle, so bounding a
-/// single packet bounds nothing on its own: a server that stalls just short of
-/// the per-packet deadline, completes, and repeats holds the event loop for as
-/// many packets as it cares to send. Checked between whole packets, where the
-/// stream is aligned and stopping is free — exactly the property the existing
-/// `Idle` return already depends on.
-const SERVER_POLL_DRAIN_BUDGET_SECS: u64 = 15;
-/// Bound on any single write to the server socket. Every write here runs
-/// inline in the network task's `tokio::select!` loop (not spawned), so an
-/// unbounded `write_all`/`flush` against a server that stops draining its
-/// receive buffer — congested, overloaded, or simply hostile — would
-/// otherwise stall all networking for as long as the OS TCP stack allows.
-/// 30s mirrors the read-side timeout already used for the login exchange
-/// (`Ed2kServerConnection::login`) — generous for a legitimate server on
-/// an ordinary connection, short enough to bound the worst case.
+/// Bound on any single write to the server socket, in the session's writer
+/// task. A server that stops draining its receive buffer — congested,
+/// overloaded, or simply hostile — fails the write here rather than after
+/// however long the OS TCP stack allows, and a failed write ends the session
+/// (see [`ServerLink`]). 30s mirrors the read-side timeout used for the login
+/// exchange (`Ed2kServerConnection::login`).
 const SERVER_WRITE_TIMEOUT_SECS: u64 = 30;
+
+/// Packets the network loop may queue ahead of the writer task.
+///
+/// Every producer is paced: `OP_GETSOURCES` leaves only in frames of at most
+/// 15 that every asking path shares (`SERVER_TCP_SRCREQ_MAX_PER_FRAME`), LowID
+/// callbacks at 4 a second, one `OP_OFFERFILES` chunk and one keep-alive a
+/// minute, and a search's follow-up requests seconds apart. Even a frame
+/// landing on top of a callback burst is a fraction of this, so a full queue
+/// means the writer is stuck behind a server that has stopped reading. Sends
+/// then fail at once instead of waiting, the caller keeps what it meant to
+/// send exactly as it does for a failed write, and the stuck write ends the
+/// session within `SERVER_WRITE_TIMEOUT_SECS`.
+const SERVER_WRITE_QUEUE: usize = 64;
+
+/// Decoded server events the reader task may hold for the network loop, which
+/// is also the most one server tick takes. While it is full the reader stops
+/// reading and TCP flow control pushes back on the server.
+pub const SERVER_EVENT_QUEUE: usize = 64;
 
 /// Overall deadline for one `Ed2kServerConnection::login` exchange.
 ///
@@ -191,52 +190,115 @@ enum ServerTransport {
     Encrypted(super::server_crypt::ObfuscatedServerStream),
 }
 
-pub struct Ed2kServerConnection {
-    transport: ServerTransport,
-    pub session: Option<ServerSession>,
-    /// Connected server's soft per-client file limit (`GetSoftFiles()` in
-    /// eMule). 0 = unknown. Used to cap `OP_OFFERFILES` like eMule does.
-    soft_files: u32,
-    /// Set by the first failed or timed-out write and never cleared. A write
-    /// abandoned part-way leaves a partial frame on the wire and, on an
-    /// obfuscated connection, an RC4 send keystream the server no longer
-    /// agrees with, so nothing written afterwards can be parsed. Every later
-    /// write fails immediately instead of paying `SERVER_WRITE_TIMEOUT_SECS`
-    /// again, and the server tick drops the session when it sees this.
-    write_failure: Option<String>,
-}
-
-#[derive(Debug)]
-enum PollReadPacketResult {
-    Packet((u8, Vec<u8>)),
-    Idle,
-    Disconnected(io::Error),
-}
-
-fn classify_packet_read_result(
-    result: io::Result<(u8, Vec<u8>)>,
-    encrypted: bool,
-) -> PollReadPacketResult {
-    match result {
-        Ok(pkt) => PollReadPacketResult::Packet(pkt),
-        Err(e) => {
-            if encrypted {
-                debug!("Server packet read error (encrypted): {e}");
-            } else {
-                debug!("Server packet read error: {e}");
+impl ServerTransport {
+    fn into_halves(self) -> (ServerReadHalf, ServerWriteHalf) {
+        match self {
+            ServerTransport::Plain { reader, writer } => {
+                (ServerReadHalf::Plain(reader), ServerWriteHalf::Plain(writer))
             }
-            PollReadPacketResult::Disconnected(e)
+            ServerTransport::Encrypted(stream) => {
+                let (reader, writer) = stream.into_split();
+                (
+                    ServerReadHalf::Encrypted(reader),
+                    ServerWriteHalf::Encrypted(writer),
+                )
+            }
         }
     }
 }
 
-fn packet_poll_timeout_result(encrypted: bool) -> PollReadPacketResult {
-    let mode = if encrypted { "encrypted" } else { "plain" };
-    warn!("Server poll read timed out mid-packet ({mode}), stream is corrupt — forcing disconnect");
-    PollReadPacketResult::Disconnected(io::Error::new(
-        io::ErrorKind::TimedOut,
-        format!("mid-packet read timeout ({mode}), BufReader state corrupted"),
-    ))
+// The encrypted arm carries its RC4 state inline. The half is built once per
+// server session and then read in place by its task, so the size difference
+// is a single move at login, while a box would add a pointer chase to every
+// read. Same trade as `StreamReader` in `upload.rs`.
+#[allow(clippy::large_enum_variant)]
+enum ServerReadHalf {
+    Plain(tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>),
+    Encrypted(super::server_crypt::ObfuscatedReadHalf),
+}
+
+impl ServerReadHalf {
+    /// The next whole packet.
+    ///
+    /// Waits as long as it takes for the first byte — an idle server is not a
+    /// dead one; the keep-alive and the network loop's watchdog decide that —
+    /// then gives the rest `SERVER_PACKET_BODY_TIMEOUT_SECS`.
+    async fn read_packet(&mut self) -> io::Result<(u8, Vec<u8>)> {
+        let body_budget = std::time::Duration::from_secs(SERVER_PACKET_BODY_TIMEOUT_SECS);
+        let body = match self {
+            ServerReadHalf::Plain(reader) => {
+                let protocol = reader.read_u8().await?;
+                tokio::time::timeout(
+                    body_budget,
+                    read_server_packet_after_protocol(reader, protocol),
+                )
+                .await
+            }
+            ServerReadHalf::Encrypted(stream) => {
+                let first = stream.read_packet_first_byte().await?;
+                tokio::time::timeout(body_budget, stream.read_packet_after_first_byte(first)).await
+            }
+        };
+        body.unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "server packet body did not arrive in time, stream is corrupt",
+            ))
+        })
+    }
+}
+
+#[allow(clippy::large_enum_variant)] // Same as `ServerReadHalf` above.
+enum ServerWriteHalf {
+    Plain(tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>),
+    Encrypted(super::server_crypt::ObfuscatedWriteHalf),
+}
+
+impl ServerWriteHalf {
+    /// Send one complete wire packet under `SERVER_WRITE_TIMEOUT_SECS`.
+    async fn write_packet(&mut self, wire: &[u8]) -> io::Result<()> {
+        let write = async {
+            match self {
+                ServerWriteHalf::Plain(writer) => {
+                    writer.write_all(wire).await?;
+                    writer.flush().await
+                }
+                ServerWriteHalf::Encrypted(stream) => stream.write_packet(wire).await,
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(SERVER_WRITE_TIMEOUT_SECS), write)
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "server write timed out",
+                ))
+            })
+    }
+}
+
+/// `[protocol][length u32 LE][opcode][payload]`, the framing of every server
+/// packet in both directions.
+fn server_wire_packet(protocol: u8, opcode: u8, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let wire_len = u32::try_from(1 + payload.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "packet payload too large for u32 length field",
+        )
+    })?;
+    let mut wire = Vec::with_capacity(6 + payload.len());
+    wire.push(protocol);
+    wire.extend_from_slice(&wire_len.to_le_bytes());
+    wire.push(opcode);
+    wire.extend_from_slice(payload);
+    Ok(wire)
+}
+
+/// A server connection from TCP connect through login. Once logged in it is
+/// handed to [`Ed2kServerConnection::into_link`], which gives the socket to
+/// the tasks that carry the session.
+pub struct Ed2kServerConnection {
+    transport: ServerTransport,
 }
 
 impl Ed2kServerConnection {
@@ -252,9 +314,6 @@ impl Ed2kServerConnection {
                 reader: tokio::io::BufReader::new(reader),
                 writer: tokio::io::BufWriter::new(writer),
             },
-            session: None,
-            soft_files: 0,
-            write_failure: None,
         })
     }
 
@@ -262,43 +321,12 @@ impl Ed2kServerConnection {
         let stream = super::server_crypt::connect_obfuscated(addr).await?;
         Ok(Self {
             transport: ServerTransport::Encrypted(stream),
-            session: None,
-            soft_files: 0,
-            write_failure: None,
         })
     }
 
-    /// Why this connection can no longer be written to, if a write has
-    /// failed or timed out. Once set the session is unusable and should be
-    /// dropped.
-    pub fn write_failure(&self) -> Option<&str> {
-        self.write_failure.as_deref()
-    }
-
-    fn ensure_writable(&self) -> io::Result<()> {
-        match &self.write_failure {
-            Some(reason) => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                format!("server connection unusable after earlier write failure: {reason}"),
-            )),
-            None => Ok(()),
-        }
-    }
-
-    fn record_write_result(&mut self, result: io::Result<()>) -> io::Result<()> {
-        if let Err(e) = &result {
-            if self.write_failure.is_none() {
-                warn!("Server write failed ({e}); connection marked unusable");
-                self.write_failure = Some(e.to_string());
-            }
-        }
-        result
-    }
-
-    /// Record the connected server's soft per-client file limit so
-    /// `offer_files` can cap each OP_OFFERFILES the way eMule does.
-    pub fn set_soft_files(&mut self, soft_files: u32) {
-        self.soft_files = soft_files;
+    /// Hand the logged-in socket to the session's reader and writer tasks.
+    pub fn into_link(self, session: ServerSession) -> ServerLink {
+        ServerLink::spawn(self.transport, session, SERVER_WRITE_QUEUE, SERVER_EVENT_QUEUE)
     }
 
     pub async fn login(
@@ -334,22 +362,14 @@ impl Ed2kServerConnection {
             flags
         );
 
-        // Build the full wire packet: [protocol(1)][length(4)][opcode(1)][payload]
-        let mut wire_packet = Vec::with_capacity(6 + payload.len());
-        wire_packet.push(OP_EDONKEYHEADER);
-        let wire_len = u32::try_from(1 + payload.len())
-            .map_err(|_| anyhow::anyhow!("login packet too large"))?;
-        wire_packet.extend_from_slice(&wire_len.to_le_bytes());
-        wire_packet.push(OP_LOGINREQUEST);
-        wire_packet.extend_from_slice(&payload);
+        let wire_packet = server_wire_packet(OP_EDONKEYHEADER, OP_LOGINREQUEST, &payload)?;
 
         // Absolute, so it covers the request write and every response read
         // together rather than resetting per packet.
         let login_deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(SERVER_LOGIN_TIMEOUT_SECS);
 
-        self.ensure_writable()?;
-        let login_write = tokio::time::timeout(
+        tokio::time::timeout(
             std::time::Duration::from_secs(SERVER_WRITE_TIMEOUT_SECS),
             async {
                 match &mut self.transport {
@@ -367,8 +387,7 @@ impl Ed2kServerConnection {
                 io::ErrorKind::TimedOut,
                 "server login write timed out",
             ))
-        });
-        self.record_write_result(login_write)?;
+        })?;
 
         let mut session = ServerSession {
             client_id: 0,
@@ -483,9 +502,7 @@ impl Ed2kServerConnection {
                         }
                         info!("Server assigned client ID: {}", session.client_id);
                     }
-                    let ret = session.clone();
-                    self.session = Some(session);
-                    return Ok(ret);
+                    return Ok(session);
                 }
                 OP_SERVERSTATUS => {
                     if payload.len() >= 8 {
@@ -541,245 +558,213 @@ impl Ed2kServerConnection {
         }
     }
 
-    /// Write a zlib-compressed packet (eMule header 0xD4 instead of 0xE3).
-    async fn write_packet_compressed(
-        &mut self,
-        opcode: u8,
-        compressed_payload: &[u8],
-    ) -> io::Result<()> {
-        self.ensure_writable()?;
-        let result = self
-            .write_packet_compressed_unguarded(opcode, compressed_payload)
-            .await;
-        self.record_write_result(result)
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self.transport, ServerTransport::Encrypted(_))
     }
+}
 
-    async fn write_packet_compressed_unguarded(
-        &mut self,
-        opcode: u8,
-        compressed_payload: &[u8],
-    ) -> io::Result<()> {
-        const OP_PACKEDPROT: u8 = 0xD4;
-        let wire_len = u32::try_from(1 + compressed_payload.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "compressed packet too large for u32 length field",
-            )
-        })?;
-        let timed = tokio::time::timeout(
-            std::time::Duration::from_secs(SERVER_WRITE_TIMEOUT_SECS),
-            async {
-                match &mut self.transport {
-                    ServerTransport::Plain { writer, .. } => {
-                        use tokio::io::AsyncWriteExt;
-                        writer.write_u8(OP_PACKEDPROT).await?;
-                        writer.write_all(&wire_len.to_le_bytes()).await?;
-                        writer.write_u8(opcode).await?;
-                        writer.write_all(compressed_payload).await?;
-                        writer.flush().await?;
-                        Ok(())
-                    }
-                    ServerTransport::Encrypted(stream) => {
-                        let mut wire = Vec::with_capacity(6 + compressed_payload.len());
-                        wire.push(OP_PACKEDPROT);
-                        wire.extend_from_slice(&wire_len.to_le_bytes());
-                        wire.push(opcode);
-                        wire.extend_from_slice(compressed_payload);
-                        let mut encrypted = vec![0u8; wire.len()];
-                        stream.send_key.process(&wire, &mut encrypted);
-                        stream.writer.write_all(&encrypted).await?;
-                        stream.writer.flush().await?;
-                        Ok(())
-                    }
-                }
-            },
-        )
-        .await;
-        timed.unwrap_or_else(|_| {
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "server write timed out",
-            ))
-        })
+/// What the reader task hands the network loop.
+enum ServerInbound {
+    Event(ServerEvent),
+    /// The reader has stopped, and why. Nothing follows it.
+    Closed(String),
+}
+
+/// The network loop's handle on a logged-in server session.
+///
+/// The socket belongs to two tasks: a reader that decodes packets into
+/// [`ServerEvent`]s, and a writer that sends queued packets one at a time,
+/// each under `SERVER_WRITE_TIMEOUT_SECS`. Both talk to the loop through
+/// bounded queues and nothing on this handle awaits, so a slow or hostile
+/// server can stall its own session but not UDP, KAD, the Ember DHT, timers
+/// or IPC. Dropping the handle stops both tasks and closes the socket.
+///
+/// A send returning `Ok` means the packet is queued, not that it reached the
+/// server; a write that later fails ends the session through
+/// [`ServerLink::write_failure`], which the server tick checks.
+pub struct ServerLink {
+    pub session: ServerSession,
+    /// Connected server's soft per-client file limit (`GetSoftFiles()` in
+    /// eMule). 0 = unknown. Used to cap `OP_OFFERFILES` like eMule does.
+    soft_files: u32,
+    encrypted: bool,
+    outbound: mpsc::Sender<Vec<u8>>,
+    inbound: mpsc::Receiver<ServerInbound>,
+    /// Set by the first failed or timed-out write and never cleared. A write
+    /// abandoned part-way leaves a partial frame on the wire and, on an
+    /// obfuscated connection, an RC4 send keystream the server no longer
+    /// agrees with, so nothing written afterwards can be parsed.
+    write_failure: Arc<OnceLock<String>>,
+    reader: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ServerLink {
+    fn drop(&mut self) {
+        self.reader.abort();
+        self.writer.abort();
     }
+}
 
-    /// Every post-login write funnels through here or
-    /// `write_packet_compressed`, which is what makes `write_failure` sticky.
-    async fn write_packet(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
-        self.ensure_writable()?;
-        let result = self.write_packet_unguarded(opcode, payload).await;
-        self.record_write_result(result)
-    }
-
-    async fn write_packet_unguarded(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
-        match &mut self.transport {
-            ServerTransport::Plain { writer, .. } => {
-                write_server_packet(writer, opcode, payload).await
+async fn run_server_reader(mut half: ServerReadHalf, inbound: mpsc::Sender<ServerInbound>) {
+    loop {
+        let (opcode, payload) = match half.read_packet().await {
+            Ok(packet) => packet,
+            Err(e) => {
+                debug!("Server packet read error: {e}");
+                let _ = inbound.send(ServerInbound::Closed(e.to_string())).await;
+                return;
             }
-            ServerTransport::Encrypted(stream) => {
-                let wire_len = u32::try_from(1 + payload.len()).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "packet payload too large for u32 length field",
-                    )
-                })?;
-                let mut wire = Vec::with_capacity(6 + payload.len());
-                wire.push(OP_EDONKEYHEADER);
-                wire.extend_from_slice(&wire_len.to_le_bytes());
-                wire.push(opcode);
-                wire.extend_from_slice(payload);
-                debug!(
-                    "Server write_packet: opcode=0x{opcode:02X}, wire={} bytes",
-                    wire.len(),
-                );
-                let mut encrypted = vec![0u8; wire.len()];
-                stream.send_key.process(&wire, &mut encrypted);
-                let write = async {
-                    stream.writer.write_all(&encrypted).await?;
-                    stream.writer.flush().await
-                };
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(SERVER_WRITE_TIMEOUT_SECS),
-                    write,
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "server write timed out",
-                    ))
-                })
+        };
+        info!(
+            "Server packet: opcode=0x{opcode:02X}, {} bytes",
+            payload.len()
+        );
+        // Caught so the session ends with the reason attached; an uncaught
+        // panic would only show up as the reader having gone away.
+        let events = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parse_server_event(opcode, &payload)
+        })) {
+            Ok(events) => events,
+            Err(panic) => {
+                let what = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic payload".to_string());
+                let _ = inbound
+                    .send(ServerInbound::Closed(format!(
+                        "server packet 0x{opcode:02X} parse panicked: {what}"
+                    )))
+                    .await;
+                return;
+            }
+        };
+        for event in events {
+            if inbound.send(ServerInbound::Event(event)).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+async fn run_server_writer(
+    mut half: ServerWriteHalf,
+    mut outbound: mpsc::Receiver<Vec<u8>>,
+    write_failure: Arc<OnceLock<String>>,
+) {
+    while let Some(wire) = outbound.recv().await {
+        if let Some(opcode) = wire.get(5) {
+            debug!("Server write: opcode=0x{opcode:02X}, wire={} bytes", wire.len());
+        }
+        if let Err(e) = half.write_packet(&wire).await {
+            warn!("Server write failed ({e}); connection marked unusable");
+            let _ = write_failure.set(e.to_string());
+            return;
+        }
+    }
+}
+
+impl ServerLink {
+    fn spawn(
+        transport: ServerTransport,
+        session: ServerSession,
+        write_queue: usize,
+        event_queue: usize,
+    ) -> Self {
+        let encrypted = matches!(transport, ServerTransport::Encrypted(_));
+        let (read_half, write_half) = transport.into_halves();
+        let (outbound, outbound_rx) = mpsc::channel(write_queue);
+        let (inbound_tx, inbound) = mpsc::channel(event_queue);
+        let write_failure = Arc::new(OnceLock::new());
+        let reader = tokio::spawn(run_server_reader(read_half, inbound_tx));
+        let writer = tokio::spawn(run_server_writer(
+            write_half,
+            outbound_rx,
+            write_failure.clone(),
+        ));
+        Self {
+            session,
+            soft_files: 0,
+            encrypted,
+            outbound,
+            inbound,
+            write_failure,
+            reader,
+            writer,
+        }
+    }
+
+    /// Why this session can no longer be written to, if a write has failed or
+    /// timed out. Once set the session is unusable and should be dropped.
+    pub fn write_failure(&self) -> Option<&str> {
+        self.write_failure.get().map(String::as_str)
+    }
+
+    /// Up to `max` events the reader has decoded since the last call, in
+    /// arrival order, and — if the reader has stopped — why. Never waits.
+    pub fn drain_events(&mut self, max: usize) -> (Vec<ServerEvent>, Option<String>) {
+        let mut events = Vec::new();
+        while events.len() < max {
+            match self.inbound.try_recv() {
+                Ok(ServerInbound::Event(event)) => events.push(event),
+                Ok(ServerInbound::Closed(reason)) => return (events, Some(reason)),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return (events, Some("server reader stopped".to_string()));
+                }
+            }
+        }
+        (events, None)
+    }
+
+    /// Queue one packet for the writer. Fails at once, without waiting, when
+    /// the session is already broken or the queue is full.
+    fn queue_packet(&mut self, protocol: u8, opcode: u8, payload: &[u8]) -> io::Result<()> {
+        if let Some(reason) = self.write_failure() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("server connection unusable after earlier write failure: {reason}"),
+            ));
+        }
+        let wire = server_wire_packet(protocol, opcode, payload)?;
+        match self.outbound.try_send(wire) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "server write queue full",
+            )),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                let _ = self.write_failure.set("server writer stopped".to_string());
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "server writer stopped",
+                ))
             }
         }
     }
 
-    /// Poll for a server packet without blocking. Cancel-safe: only starts
-    /// reading after confirming data is available, avoiding mid-read cancellation
-    /// that would corrupt the stream (read_exact is NOT cancel-safe).
-    async fn poll_read_packet(&mut self) -> PollReadPacketResult {
-        match &mut self.transport {
-            ServerTransport::Plain { reader, .. } => {
-                let has_buffered = !reader.buffer().is_empty();
-                if !has_buffered {
-                    let tcp = reader.get_ref();
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(SERVER_POLL_READABLE_TIMEOUT_MS),
-                        tcp.readable(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {}
-                        _ => return PollReadPacketResult::Idle,
-                    }
-                }
-                // Deadline the protocol byte on its own. `readable()` only
-                // promises the *first* byte, so entering the old single
-                // timeout around the whole packet could — and on a slow link
-                // receiving a large OP_SEARCHRESULT or OP_SERVERLIST routinely
-                // did — abandon a read that had already consumed part of the
-                // payload. With `has_buffered == false` that was then reported
-                // as `Idle`, and the next poll parsed payload bytes as a
-                // header. Expiry here provably consumed nothing.
-                let protocol = match tokio::time::timeout(
-                    std::time::Duration::from_secs(SERVER_POLL_PACKET_TIMEOUT_SECS),
-                    reader.read_u8(),
-                )
-                .await
-                {
-                    Ok(Ok(protocol)) => protocol,
-                    Ok(Err(e)) => {
-                        return classify_packet_read_result(Err(e), false);
-                    }
-                    Err(_) => return PollReadPacketResult::Idle,
-                };
-                // Past the first byte there is no safe way to walk away, so
-                // give the remainder a budget long enough that expiry means
-                // the connection is genuinely dead, and treat it as corrupt.
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(SERVER_PACKET_BODY_TIMEOUT_SECS),
-                    read_server_packet_after_protocol(reader, protocol),
-                )
-                .await
-                {
-                    Ok(result) => match classify_packet_read_result(result, false) {
-                        PollReadPacketResult::Packet(pkt) => {
-                            info!(
-                                "Server packet: opcode=0x{:02X}, {} bytes",
-                                pkt.0,
-                                pkt.1.len()
-                            );
-                            PollReadPacketResult::Packet(pkt)
-                        }
-                        other => other,
-                    },
-                    Err(_) => packet_poll_timeout_result(false),
-                }
-            }
-            ServerTransport::Encrypted(stream) => {
-                let has_buffered = !stream.reader.buffer().is_empty();
-                if !has_buffered {
-                    let tcp = stream.reader.get_ref();
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(SERVER_POLL_READABLE_TIMEOUT_MS),
-                        tcp.readable(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {}
-                        _ => return PollReadPacketResult::Idle,
-                    }
-                }
-                // Same split as the plain path above: only the first byte is
-                // safely abandonable, and on this transport an abandoned read
-                // desynchronizes the RC4 keystream as well as the framing.
-                let first = match tokio::time::timeout(
-                    std::time::Duration::from_secs(SERVER_POLL_PACKET_TIMEOUT_SECS),
-                    stream.read_packet_first_byte(),
-                )
-                .await
-                {
-                    Ok(Ok(first)) => first,
-                    Ok(Err(e)) => {
-                        return classify_packet_read_result(Err(e), true);
-                    }
-                    Err(_) => return PollReadPacketResult::Idle,
-                };
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(SERVER_PACKET_BODY_TIMEOUT_SECS),
-                    stream.read_packet_after_first_byte(first),
-                )
-                .await
-                {
-                    Ok(result) => match classify_packet_read_result(result, true) {
-                        PollReadPacketResult::Packet(pkt) => {
-                            info!(
-                                "Server packet (encrypted): opcode=0x{:02X}, {} bytes",
-                                pkt.0,
-                                pkt.1.len()
-                            );
-                            PollReadPacketResult::Packet(pkt)
-                        }
-                        other => other,
-                    },
-                    Err(_) => packet_poll_timeout_result(true),
-                }
-            }
-        }
+    fn queue(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
+        self.queue_packet(OP_EDONKEYHEADER, opcode, payload)
+    }
+
+    /// Record the connected server's soft per-client file limit so
+    /// `offer_files_chunk_limit` can cap each OP_OFFERFILES the way eMule does.
+    pub fn set_soft_files(&mut self, soft_files: u32) {
+        self.soft_files = soft_files;
     }
 
     /// Send a pre-built search expression (AND tree or single keyword) as
     /// `OP_SEARCHREQUEST`. Multi-word queries MUST use the AND-tree wire
     /// format for reliable results across all eD2K servers.
     ///
-    /// The result arrives asynchronously via `poll_messages()` as
-    /// `ServerEvent::SearchResult`; this does not block waiting for it, so
-    /// other server events continue flowing.
-    pub async fn send_search_expr_bytes(&mut self, expr: &[u8]) -> anyhow::Result<()> {
+    /// The result arrives later as `ServerEvent::SearchResult`.
+    pub fn send_search_expr_bytes(&mut self, expr: &[u8]) -> anyhow::Result<()> {
         info!(
-            "Sending OP_SEARCHREQUEST expression ({} bytes payload)",
+            "Queuing OP_SEARCHREQUEST expression ({} bytes payload)",
             expr.len(),
         );
-        self.write_packet(OP_SEARCHREQUEST, expr).await?;
+        self.queue(OP_SEARCHREQUEST, expr)?;
         Ok(())
     }
 
@@ -791,14 +776,10 @@ impl Ed2kServerConnection {
     /// payload) so callers can attribute the cost to source-exchange
     /// overhead in the Statistics panel. Returns 0 when the request was
     /// silently skipped (e.g. the server lacks LARGEFILES support).
-    pub async fn send_get_sources(
-        &mut self,
-        file_hash: &[u8; 16],
-        file_size: u64,
-    ) -> anyhow::Result<u64> {
+    pub fn send_get_sources(&mut self, file_hash: &[u8; 16], file_size: u64) -> anyhow::Result<u64> {
         let mut payload = Vec::with_capacity(28);
         payload.extend_from_slice(file_hash);
-        let srv_flags = self.session.as_ref().map(|s| s.server_flags).unwrap_or(0);
+        let srv_flags = self.session.server_flags;
         let supports_large = (srv_flags & SRV_TCPFLG_LARGEFILES) != 0;
         // Match eMule's `CPartFile::IsLargeFile()` boundary (OLD_MAX_EMULE_FILE_SIZE),
         // NOT u32::MAX. Files in the (OLD_MAX_EMULE_FILE_SIZE, u32::MAX] window are
@@ -827,7 +808,7 @@ impl Ed2kServerConnection {
         // which is also when its login advertises crypt). Mirror that: use the
         // OBFU opcode only when this connection is encrypted AND the server
         // supports it; otherwise send the plain OP_GETSOURCES.
-        let is_encrypted = matches!(self.transport, ServerTransport::Encrypted(_));
+        let is_encrypted = self.encrypted;
         let opcode = if is_encrypted && (srv_flags & SRV_TCPFLG_TCPOBFUSCATION) != 0 {
             OP_GETSOURCES_OBFU
         } else {
@@ -845,15 +826,15 @@ impl Ed2kServerConnection {
             is_encrypted,
             (srv_flags & SRV_TCPFLG_TCPOBFUSCATION) != 0,
         );
-        self.write_packet(opcode, &payload).await?;
+        self.queue(opcode, &payload)?;
         // Wire framing: 1 protocol + 4 length + 1 opcode + payload.
         Ok(6 + payload.len() as u64)
     }
 
-    /// eMule keep-alive: send empty OP_OFFERFILES (file count = 0).
-    pub async fn keep_alive(&mut self) -> anyhow::Result<()> {
-        self.write_packet(OP_OFFERFILES, &0u32.to_le_bytes())
-            .await?;
+    /// eMule keep-alive: send empty OP_OFFERFILES (file count = 0). The only
+    /// empty offer that is ever sent; servers read it as nothing else.
+    pub fn keep_alive(&mut self) -> anyhow::Result<()> {
+        self.queue(OP_OFFERFILES, &0u32.to_le_bytes())?;
         Ok(())
     }
 
@@ -861,28 +842,26 @@ impl Ed2kServerConnection {
     /// peer servers. The response arrives later as `OP_SERVERLIST` and
     /// is parsed by `ServerList::add_from_server_list_packet`. Called
     /// after login when `add_servers_from_server` is enabled.
-    pub async fn request_server_list(&mut self) -> anyhow::Result<()> {
-        self.write_packet(OP_GETSERVERLIST, &[]).await?;
-        debug!("Sent OP_GETSERVERLIST request to server");
+    pub fn request_server_list(&mut self) -> anyhow::Result<()> {
+        self.queue(OP_GETSERVERLIST, &[])?;
+        debug!("Queued OP_GETSERVERLIST request to server");
         Ok(())
     }
 
-    /// Request additional search results from the server (up to 5 batches).
-    pub async fn request_more_results(&mut self) -> anyhow::Result<()> {
-        self.write_packet(OP_QUERY_MORE_RESULT, &[]).await?;
-        debug!("Sent OP_QUERY_MORE_RESULT to server");
+    /// Ask for the next page of the current search (eMule `SearchMore`).
+    pub fn request_more_results(&mut self) -> anyhow::Result<()> {
+        self.queue(OP_QUERY_MORE_RESULT, &[])?;
+        debug!("Queued OP_QUERY_MORE_RESULT to server");
         Ok(())
     }
 
-    pub async fn request_callback(&mut self, client_id: u32) -> anyhow::Result<()> {
-        let payload = client_id.to_le_bytes().to_vec();
-        self.write_packet(OP_CALLBACKREQUEST, &payload).await?;
-        info!("Sent callback request for LowID client {client_id}");
+    pub fn request_callback(&mut self, client_id: u32) -> anyhow::Result<()> {
+        self.queue(OP_CALLBACKREQUEST, &client_id.to_le_bytes())?;
+        info!("Queued callback request for LowID client {client_id}");
         Ok(())
     }
 
-    /// Send OP_OFFERFILES to the server, capping the list at the server's
-    /// soft per-client file limit exactly like eMule's
+    /// Soft per-packet file cap, exactly like eMule's
     /// `CSharedFileList::SendListToServer`:
     ///
     /// ```text
@@ -890,26 +869,9 @@ impl Ed2kServerConnection {
     /// ```
     ///
     /// eMule truncates to that many files in a single packet. Sending the
-    /// rest as extra `OP_OFFERFILES` packets looks like republishing to
-    /// Lugdunum, which answers "Too many files republished by your client
+    /// rest as extra `OP_OFFERFILES` packets at once looks like republishing
+    /// to Lugdunum, which answers "Too many files republished by your client
     /// software. Please upgrade it." and can blacklist the client.
-    pub async fn offer_files(&mut self, files: &[OfferFile], tcp_port: u16) -> anyhow::Result<()> {
-        let limit = self.offer_files_chunk_limit();
-        if files.is_empty() {
-            // Preserve the empty (count=0) offer some callers may rely on.
-            return self.offer_files_chunk(files, tcp_port).await;
-        }
-        let offered = files.len().min(limit);
-        if files.len() > limit {
-            info!(
-                "OP_OFFERFILES: offering {offered} of {} files (eMule SendListToServer cap {limit})",
-                files.len()
-            );
-        }
-        self.offer_files_chunk(&files[..offered], tcp_port).await
-    }
-
-    /// Soft per-packet file cap used by `offer_files` / deferred chunk sends.
     pub fn offer_files_chunk_limit(&self) -> usize {
         if self.soft_files == 0 || self.soft_files > 200 {
             200
@@ -918,74 +880,20 @@ impl Ed2kServerConnection {
         }
     }
 
-    /// Send a single OP_OFFERFILES packet (one chunk). Matches eMule
-    /// SharedFileList.cpp's per-file encoding; uses magic client ID/port
-    /// values when the server supports SRV_TCPFLG_COMPRESSION.
-    pub async fn offer_files_chunk(
-        &mut self,
-        files: &[OfferFile],
-        tcp_port: u16,
-    ) -> anyhow::Result<()> {
-        let real_client_id = self.our_client_id().unwrap_or(0);
-        let srv_flags = self.session.as_ref().map(|s| s.server_flags).unwrap_or(0);
-        let use_magic_ids = (srv_flags & SRV_TCPFLG_COMPRESSION) != 0;
-
-        let filtered_files: Vec<&OfferFile> = files
+    /// Send a single OP_OFFERFILES packet (one chunk), compressed when the
+    /// server supports SRV_TCPFLG_COMPRESSION and that makes it smaller.
+    ///
+    /// Refuses a chunk with nothing this server can index rather than send it
+    /// empty: a zero-file OP_OFFERFILES is the keep-alive, not an offer.
+    pub fn offer_files_chunk(&mut self, files: &[OfferFile], tcp_port: u16) -> anyhow::Result<()> {
+        let srv_flags = self.session.server_flags;
+        if !files
             .iter()
-            .filter(|file| {
-                file.size <= OLD_MAX_EMULE_FILE_SIZE || (srv_flags & SRV_TCPFLG_LARGEFILES) != 0
-            })
-            .collect();
-        if filtered_files.len() != files.len() {
-            debug!(
-                "OP_OFFERFILES: omitted {} large file(s) because server lacks LARGEFILES",
-                files.len() - filtered_files.len()
-            );
+            .any(|file| server_indexes_file_size(file.size, srv_flags))
+        {
+            anyhow::bail!("OP_OFFERFILES chunk has no file this server can index");
         }
-
-        let mut payload = Vec::with_capacity(4 + filtered_files.len() * 64);
-        payload.extend_from_slice(&(filtered_files.len() as u32).to_le_bytes());
-        for file in filtered_files {
-            payload.extend_from_slice(&file.hash);
-
-            if use_magic_ids {
-                if file.is_complete {
-                    payload.extend_from_slice(&0xFBFBFBFBu32.to_le_bytes());
-                    payload.extend_from_slice(&0xFBFBu16.to_le_bytes());
-                } else {
-                    payload.extend_from_slice(&0xFCFCFCFCu32.to_le_bytes());
-                    payload.extend_from_slice(&0xFCFCu16.to_le_bytes());
-                }
-            } else {
-                payload.extend_from_slice(&real_client_id.to_le_bytes());
-                payload.extend_from_slice(&tcp_port.to_le_bytes());
-            }
-
-            let mut tag_count: u32 = 0;
-            let mut tags = Vec::new();
-            write_string_tag(&mut tags, 0x01, &file.name); // FT_FILENAME
-            tag_count += 1;
-            // eMule offers files above OLD_MAX_EMULE_FILE_SIZE (not u32::MAX) as
-            // large: FT_FILESIZE (low 32) + FT_FILESIZE_HI (high 32, may be 0).
-            // Using the same boundary keeps the server's large-file index aligned
-            // with our later OP_GETSOURCES so source lookups for ~4 GiB files match.
-            if file.size > OLD_MAX_EMULE_FILE_SIZE {
-                write_uint32_tag(&mut tags, 0x02, file.size as u32);
-                tag_count += 1;
-                write_uint32_tag(&mut tags, 0x3A, (file.size >> 32) as u32);
-                tag_count += 1;
-            } else {
-                write_uint32_tag(&mut tags, 0x02, file.size as u32);
-                tag_count += 1;
-            }
-            // FT_FILETYPE (0x03) -- file type string
-            if !file.file_type.is_empty() {
-                write_string_tag(&mut tags, 0x03, &file.file_type);
-                tag_count += 1;
-            }
-            payload.extend_from_slice(&tag_count.to_le_bytes());
-            payload.extend_from_slice(&tags);
-        }
+        let payload = build_offer_files_payload(files, srv_flags, self.session.client_id, tcp_port);
         // Compress payload if server supports compression (eMule SharedFileList.cpp)
         if (srv_flags & SRV_TCPFLG_COMPRESSION) != 0 && payload.len() > 100 {
             use flate2::write::ZlibEncoder;
@@ -999,10 +907,9 @@ impl Ed2kServerConnection {
                         payload.len(),
                         compressed.len()
                     );
-                    self.write_packet_compressed(OP_OFFERFILES, &compressed)
-                        .await?;
+                    self.queue_packet(OP_PACKEDPROT, OP_OFFERFILES, &compressed)?;
                     info!(
-                        "Sent compressed OP_OFFERFILES with {} shared files to server",
+                        "Queued compressed OP_OFFERFILES with {} shared files to server",
                         files.len()
                     );
                     return Ok(());
@@ -1011,77 +918,142 @@ impl Ed2kServerConnection {
                 Err(e) => debug!("OP_OFFERFILES compression failed: {e}, sending uncompressed"),
             }
         }
-        self.write_packet(OP_OFFERFILES, &payload).await?;
+        self.queue(OP_OFFERFILES, &payload)?;
         info!(
-            "Sent OP_OFFERFILES with {} shared files to server",
+            "Queued OP_OFFERFILES with {} shared files to server",
             files.len()
         );
         Ok(())
     }
 
-    pub async fn poll_messages(&mut self) -> io::Result<Vec<ServerEvent>> {
-        let mut events = Vec::new();
-        let started = std::time::Instant::now();
-        loop {
-            match self.poll_read_packet().await {
-                PollReadPacketResult::Packet((opcode, payload)) => {
-                    info!(
-                        "Server poll received opcode=0x{opcode:02X}, {} bytes",
-                        payload.len()
-                    );
-                    events.extend(parse_server_event(opcode, &payload));
-                    // Between packets the stream is on a boundary, so handing
-                    // the event loop back costs nothing but a tick of latency.
-                    // Draining unconditionally let one busy (or deliberately
-                    // chatty) server hold the loop for as long as it kept
-                    // sending.
-                    if started.elapsed()
-                        >= std::time::Duration::from_secs(SERVER_POLL_DRAIN_BUDGET_SECS)
-                    {
-                        debug!(
-                            "Server poll yielding after {} event(s); more may be waiting",
-                            events.len()
-                        );
-                        break;
-                    }
-                }
-                PollReadPacketResult::Idle => break,
-                PollReadPacketResult::Disconnected(err) => return Err(err),
-            }
-        }
-        Ok(events)
-    }
-
     pub fn is_low_id(&self) -> bool {
-        self.session
-            .as_ref()
-            .map(|s| s.client_id > 0 && s.client_id < LOWID_THRESHOLD)
-            .unwrap_or(false)
+        self.session.client_id > 0 && self.session.client_id < LOWID_THRESHOLD
     }
 
-    pub fn our_client_id(&self) -> Option<u32> {
-        self.session.as_ref().map(|s| s.client_id)
+    pub fn our_client_id(&self) -> u32 {
+        self.session.client_id
+    }
+}
+
+/// eMule's `EED2KFileType` protocol value (`OtherFunctions.h`, "eserver
+/// 17.6+") for an offer's file-type string, when it has one. Archives and CD
+/// images are already folded into "Pro" by [`offer_file_type`], matching
+/// `GetED2KFileTypeSearchID`; "EmuleCollection" has no integer form.
+fn ed2k_file_type_id(file_type: &str) -> Option<u32> {
+    match file_type {
+        "Audio" => Some(1),
+        "Video" => Some(2),
+        "Image" => Some(3),
+        "Pro" => Some(4),
+        "Doc" => Some(5),
+        _ => None,
+    }
+}
+
+/// The `FT_FILETYPE` string eMule publishes for `file_name`:
+/// `GetED2KFileTypeSearchTerm(GetED2KFileTypeID(name))`, which files archives
+/// and CD images under "Pro" (`OtherFunctions.cpp:1528-1533`). Empty when the
+/// extension maps to no type, in which case no tag is sent.
+pub fn offer_file_type(file_name: &str) -> String {
+    let extension = file_name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext)
+        .unwrap_or_default();
+    match crate::search::index::infer_file_type(extension).as_str() {
+        "Arc" | "Iso" => "Pro".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether a server with `server_flags` can index a file of `file_size`:
+/// past eMule's old 4 GiB limit only with SRV_TCPFLG_LARGEFILES.
+pub fn server_indexes_file_size(file_size: u64, server_flags: u32) -> bool {
+    file_size <= OLD_MAX_EMULE_FILE_SIZE || server_flags & SRV_TCPFLG_LARGEFILES != 0
+}
+
+/// The OP_OFFERFILES body for `files`, using eMule SharedFileList.cpp's
+/// per-file encoding; magic client ID/port values stand in for our address
+/// when the server supports SRV_TCPFLG_COMPRESSION.
+fn build_offer_files_payload(
+    files: &[OfferFile],
+    srv_flags: u32,
+    client_id: u32,
+    tcp_port: u16,
+) -> Vec<u8> {
+    let use_magic_ids = (srv_flags & SRV_TCPFLG_COMPRESSION) != 0;
+    // Our address only means something to a peer when we hold a HighID;
+    // otherwise eMule offers 0/0 (`SharedFileList.cpp:907-913`).
+    let (offered_id, offered_port) = if client_id >= LOWID_THRESHOLD {
+        (client_id, tcp_port)
+    } else {
+        (0, 0)
+    };
+
+    let filtered_files: Vec<&OfferFile> = files
+        .iter()
+        .filter(|file| server_indexes_file_size(file.size, srv_flags))
+        .collect();
+    if filtered_files.len() != files.len() {
+        debug!(
+            "OP_OFFERFILES: omitted {} large file(s) because server lacks LARGEFILES",
+            files.len() - filtered_files.len()
+        );
     }
 
-    pub fn is_encrypted(&self) -> bool {
-        matches!(self.transport, ServerTransport::Encrypted(_))
-    }
+    let mut payload = Vec::with_capacity(4 + filtered_files.len() * 64);
+    payload.extend_from_slice(&(filtered_files.len() as u32).to_le_bytes());
+    for file in filtered_files {
+        payload.extend_from_slice(&file.hash);
 
-    pub async fn disconnect(self) {
-        match self.transport {
-            ServerTransport::Plain { mut writer, .. } => {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), writer.shutdown())
-                    .await;
+        if use_magic_ids {
+            if file.is_complete {
+                payload.extend_from_slice(&0xFBFBFBFBu32.to_le_bytes());
+                payload.extend_from_slice(&0xFBFBu16.to_le_bytes());
+            } else {
+                payload.extend_from_slice(&0xFCFCFCFCu32.to_le_bytes());
+                payload.extend_from_slice(&0xFCFCu16.to_le_bytes());
             }
-            ServerTransport::Encrypted(mut stream) => {
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    stream.writer.shutdown(),
-                )
-                .await;
-            }
+        } else {
+            payload.extend_from_slice(&offered_id.to_le_bytes());
+            payload.extend_from_slice(&offered_port.to_le_bytes());
         }
+
+        let mut tag_count: u32 = 0;
+        let mut tags = Vec::new();
+        write_string_tag(&mut tags, 0x01, &file.name); // FT_FILENAME
+        tag_count += 1;
+        // eMule offers files above OLD_MAX_EMULE_FILE_SIZE (not u32::MAX) as
+        // large: FT_FILESIZE (low 32) + FT_FILESIZE_HI (high 32, may be 0).
+        // Using the same boundary keeps the server's large-file index aligned
+        // with our later OP_GETSOURCES so source lookups for ~4 GiB files match.
+        if file.size > OLD_MAX_EMULE_FILE_SIZE {
+            write_uint32_tag(&mut tags, 0x02, file.size as u32);
+            tag_count += 1;
+            write_uint32_tag(&mut tags, 0x3A, (file.size >> 32) as u32);
+            tag_count += 1;
+        } else {
+            write_uint32_tag(&mut tags, 0x02, file.size as u32);
+            tag_count += 1;
+        }
+        // FT_FILETYPE (0x03): the integer form for servers that take it and
+        // a type that has one, the string otherwise (SharedFileList.cpp:965-983).
+        match ed2k_file_type_id(&file.file_type)
+            .filter(|_| srv_flags & SRV_TCPFLG_TYPETAGINTEGER != 0)
+        {
+            Some(type_id) => {
+                write_uint32_tag(&mut tags, 0x03, type_id);
+                tag_count += 1;
+            }
+            None if !file.file_type.is_empty() => {
+                write_string_tag(&mut tags, 0x03, &file.file_type);
+                tag_count += 1;
+            }
+            None => {}
+        }
+        payload.extend_from_slice(&tag_count.to_le_bytes());
+        payload.extend_from_slice(&tags);
     }
+    payload
 }
 
 #[derive(Debug, Clone)]
@@ -1106,6 +1078,8 @@ pub enum ServerEvent {
     },
     SearchResult {
         results: Vec<ServerSearchResult>,
+        /// The server's trailing "more results available" byte.
+        more: bool,
     },
     FoundSources {
         file_hash: [u8; 16],
@@ -1179,9 +1153,9 @@ fn parse_server_event(opcode: u8, payload: &[u8]) -> Vec<ServerEvent> {
             });
         }
         OP_SEARCHRESULT => match parse_search_result(payload) {
-            Ok(results) => {
-                debug!("Server search result: {} files", results.len());
-                events.push(ServerEvent::SearchResult { results });
+            Ok((results, more)) => {
+                debug!("Server search result: {} files (more={more})", results.len());
+                events.push(ServerEvent::SearchResult { results, more });
             }
             Err(e) => {
                 debug!("Failed to parse search result: {e}");
@@ -1427,40 +1401,6 @@ mod tests {
         assert_eq!(parse_server_ident_name(&payload).as_deref(), Some("Second"));
     }
 
-    #[test]
-    fn classify_packet_read_timeout_as_disconnect() {
-        let timeout = io::Error::new(io::ErrorKind::TimedOut, "server read timed out");
-        match classify_packet_read_result(Err(timeout), false) {
-            PollReadPacketResult::Disconnected(err) => {
-                assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-            }
-            other => panic!("expected disconnect, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn poll_timeout_is_treated_as_disconnect() {
-        match packet_poll_timeout_result(false) {
-            PollReadPacketResult::Disconnected(e) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
-            other => panic!("expected Disconnected, got {other:?}"),
-        }
-        match packet_poll_timeout_result(true) {
-            PollReadPacketResult::Disconnected(e) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
-            other => panic!("expected Disconnected, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_packet_read_eof_as_disconnect() {
-        let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "closed");
-        match classify_packet_read_result(Err(eof), true) {
-            PollReadPacketResult::Disconnected(err) => {
-                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
-            }
-            other => panic!("expected disconnect, got {other:?}"),
-        }
-    }
-
     #[tokio::test]
     async fn read_packet_reads_loopback_server_message() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1504,30 +1444,145 @@ mod tests {
         (conn, accept.await.unwrap())
     }
 
+    fn test_session(server_flags: u32) -> ServerSession {
+        ServerSession {
+            client_id: 0x0102_0304,
+            server_flags,
+            server_name: String::new(),
+            user_count: 0,
+            file_count: 0,
+            server_list_data: None,
+            motd_messages: Vec::new(),
+            server_reported_ip: 0,
+        }
+    }
+
+    async fn loopback_link(write_queue: usize) -> (ServerLink, TcpStream) {
+        let (conn, peer) = loopback_connection().await;
+        let link = ServerLink::spawn(conn.transport, test_session(0), write_queue, SERVER_EVENT_QUEUE);
+        (link, peer)
+    }
+
+    fn server_message(text: &str) -> Vec<u8> {
+        let mut payload = (text.len() as u16).to_le_bytes().to_vec();
+        payload.extend_from_slice(text.as_bytes());
+        server_wire_packet(OP_EDONKEYHEADER, OP_SERVERMESSAGE, &payload).unwrap()
+    }
+
+    /// Drain the link until `done` holds for everything collected so far, or
+    /// five seconds pass.
+    async fn drain_until(
+        link: &mut ServerLink,
+        done: impl Fn(&[ServerEvent], &Option<String>) -> bool,
+    ) -> (Vec<ServerEvent>, Option<String>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut events = Vec::new();
+        let mut closed = None;
+        while !done(&events, &closed) && std::time::Instant::now() < deadline {
+            let (more, reason) = link.drain_events(SERVER_EVENT_QUEUE);
+            events.extend(more);
+            closed = closed.or(reason);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        (events, closed)
+    }
+
+    #[tokio::test]
+    async fn the_link_frames_queued_writes_and_delivers_decoded_events() {
+        let (mut link, mut peer) = loopback_link(SERVER_WRITE_QUEUE).await;
+
+        link.keep_alive().unwrap();
+        let mut wire = [0u8; 10];
+        tokio::time::timeout(std::time::Duration::from_secs(5), peer.read_exact(&mut wire))
+            .await
+            .expect("keep-alive never reached the server")
+            .unwrap();
+        assert_eq!(
+            wire.to_vec(),
+            server_wire_packet(OP_EDONKEYHEADER, OP_OFFERFILES, &0u32.to_le_bytes()).unwrap()
+        );
+
+        peer.write_all(&server_message("hi")).await.unwrap();
+        let (events, closed) = drain_until(&mut link, |events, _| !events.is_empty()).await;
+        assert!(matches!(events.as_slice(), [ServerEvent::Message(msg)] if msg == "hi"));
+        assert!(closed.is_none());
+    }
+
+    /// The whole point of the link: a server that stops reading may stall its
+    /// own writer, but every send on the network loop returns at once, and a
+    /// full queue is reported as back-pressure rather than a broken session.
+    #[tokio::test]
+    async fn a_server_that_stops_reading_never_blocks_a_send() {
+        let (mut link, _peer) = loopback_link(2).await;
+        let payload = vec![0x5Au8; 256 * 1024];
+
+        let mut spent = std::time::Duration::ZERO;
+        let mut refused = None;
+        for _ in 0..4096 {
+            let started = std::time::Instant::now();
+            let result = link.send_search_expr_bytes(&payload);
+            spent += started.elapsed();
+            if let Err(e) = result {
+                refused = Some(e);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let err = refused.expect("the queue never filled against a server that does not read");
+        assert_eq!(
+            err.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::WouldBlock)
+        );
+        assert!(link.write_failure().is_none());
+        assert!(spent < std::time::Duration::from_secs(1), "sends took {spent:?}");
+    }
+
+    #[tokio::test]
+    async fn a_closed_server_is_reported_after_what_it_sent_first() {
+        let (mut link, mut peer) = loopback_link(SERVER_WRITE_QUEUE).await;
+        peer.write_all(&server_message("bye")).await.unwrap();
+        drop(peer);
+
+        let (events, closed) = drain_until(&mut link, |_, closed| closed.is_some()).await;
+        assert!(matches!(events.as_slice(), [ServerEvent::Message(msg)] if msg == "bye"));
+        assert!(closed.is_some(), "the reader must report the close");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_link_closes_the_socket() {
+        let (link, mut peer) = loopback_link(SERVER_WRITE_QUEUE).await;
+        drop(link);
+
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), peer.read(&mut buf))
+            .await
+            .expect("the socket stayed open after the link was dropped")
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
     #[tokio::test]
     async fn failed_write_makes_every_later_write_fail_fast_without_touching_the_wire() {
-        let (mut conn, mut peer) = loopback_connection().await;
-        assert!(conn.write_failure().is_none());
+        let (mut link, mut peer) = loopback_link(SERVER_WRITE_QUEUE).await;
+        assert!(link.write_failure().is_none());
 
-        let timed_out = io::Error::new(io::ErrorKind::TimedOut, "server write timed out");
-        assert!(conn.record_write_result(Err(timed_out)).is_err());
-        assert_eq!(conn.write_failure(), Some("server write timed out"));
+        link.write_failure.set("server write timed out".to_string()).unwrap();
 
-        let started = std::time::Instant::now();
-        let err = conn.keep_alive().await.unwrap_err();
+        let err = link.keep_alive().unwrap_err();
         assert_eq!(
             err.downcast_ref::<io::Error>().map(io::Error::kind),
             Some(io::ErrorKind::BrokenPipe)
         );
-        assert!(conn.request_callback(0x00AB_CDEF).await.is_err());
-        assert!(conn.request_more_results().await.is_err());
-        assert!(conn.send_get_sources(&[7u8; 16], 1024).await.is_err());
-        assert!(conn.offer_files(&[], 4662).await.is_err());
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(link.request_callback(0x00AB_CDEF).is_err());
+        assert!(link.request_more_results().is_err());
+        assert!(link.send_get_sources(&[7u8; 16], 1024).is_err());
+        assert!(link.offer_files_chunk(&[offer("movie.avi")], 4662).is_err());
+        assert!(link.send_search_expr_bytes(b"x").is_err());
         // A later failure does not overwrite the first, root-cause reason.
-        assert_eq!(conn.write_failure(), Some("server write timed out"));
+        assert_eq!(link.write_failure(), Some("server write timed out"));
 
-        drop(conn);
+        drop(link);
         let mut buf = [0u8; 16];
         let n = tokio::time::timeout(std::time::Duration::from_secs(5), peer.read(&mut buf))
             .await
@@ -1538,23 +1593,187 @@ mod tests {
 
     #[tokio::test]
     async fn socket_write_error_marks_connection_unusable() {
-        let (mut conn, peer) = loopback_connection().await;
+        let (mut link, peer) = loopback_link(SERVER_WRITE_QUEUE).await;
         drop(peer);
 
-        let mut first_err = None;
-        for _ in 0..100 {
-            if let Err(e) = conn.keep_alive().await {
-                first_err = Some(e);
+        for _ in 0..200 {
+            if link.write_failure().is_some() {
                 break;
             }
+            let _ = link.keep_alive();
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let first_err = first_err.expect("writes to a closed peer never failed");
-        assert!(!first_err.to_string().contains("earlier write failure"));
-        assert!(conn.write_failure().is_some());
+        let reason = link
+            .write_failure()
+            .expect("writes to a closed peer never failed")
+            .to_string();
+        assert!(!reason.contains("earlier write failure"));
 
-        let err = conn.keep_alive().await.unwrap_err();
+        let err = link.keep_alive().unwrap_err();
         assert!(err.to_string().contains("earlier write failure"));
+    }
+
+    fn offer(name: &str) -> OfferFile {
+        OfferFile {
+            hash: [1u8; 16],
+            name: name.to_string(),
+            size: 1000,
+            is_complete: true,
+            file_type: offer_file_type(name),
+        }
+    }
+
+    /// FT_FILETYPE of the one file in an OP_OFFERFILES body, as
+    /// `(tag type, value bytes)`. Every tag the builder writes uses the old
+    /// one-byte-name form.
+    fn offered_file_type(payload: &[u8]) -> Option<(u8, Vec<u8>)> {
+        let mut pos = 4 + 16 + 4 + 2;
+        let tag_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        for _ in 0..tag_count {
+            let tag_type = payload[pos];
+            assert_eq!(u16::from_le_bytes([payload[pos + 1], payload[pos + 2]]), 1);
+            let name_id = payload[pos + 3];
+            pos += 4;
+            let len = match tag_type {
+                0x02 => {
+                    let len = u16::from_le_bytes([payload[pos], payload[pos + 1]]) as usize;
+                    pos += 2;
+                    len
+                }
+                0x03 => 4,
+                other => panic!("unexpected tag type 0x{other:02X}"),
+            };
+            let value = payload[pos..pos + len].to_vec();
+            pos += len;
+            if name_id == 0x03 {
+                return Some((tag_type, value));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn offer_file_type_follows_emules_search_terms() {
+        assert_eq!(offer_file_type("movie.AVI"), "Video");
+        assert_eq!(offer_file_type("song.mp3"), "Audio");
+        assert_eq!(offer_file_type("photo.jpg"), "Image");
+        assert_eq!(offer_file_type("setup.exe"), "Pro");
+        assert_eq!(offer_file_type("book.pdf"), "Doc");
+        assert_eq!(offer_file_type("backup.tar.gz"), "Pro", "archives publish as Pro");
+        assert_eq!(offer_file_type("disc.iso"), "Pro", "CD images publish as Pro");
+        assert_eq!(offer_file_type("set.emulecollection"), "EmuleCollection");
+        assert_eq!(offer_file_type("README"), "");
+        assert_eq!(offer_file_type("odd.unknownext"), "");
+    }
+
+    #[test]
+    fn offers_carry_the_integer_file_type_to_servers_that_take_it() {
+        let flags = SRV_TCPFLG_TYPETAGINTEGER;
+        for (name, id) in [("movie.avi", 2u32), ("song.mp3", 1), ("pack.zip", 4), ("book.pdf", 5)] {
+            let payload = build_offer_files_payload(&[offer(name)], flags, 0, 4662);
+            assert_eq!(
+                offered_file_type(&payload),
+                Some((0x03, id.to_le_bytes().to_vec())),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn offers_fall_back_to_the_file_type_string() {
+        let payload = build_offer_files_payload(&[offer("movie.avi")], 0, 0, 4662);
+        assert_eq!(offered_file_type(&payload), Some((0x02, b"Video".to_vec())));
+
+        // No integer form exists for a collection, even on a server that
+        // takes integers (`SharedFileList.cpp:975-982`).
+        let payload = build_offer_files_payload(
+            &[offer("set.emulecollection")],
+            SRV_TCPFLG_TYPETAGINTEGER,
+            0,
+            4662,
+        );
+        assert_eq!(
+            offered_file_type(&payload),
+            Some((0x02, b"EmuleCollection".to_vec()))
+        );
+
+        let payload = build_offer_files_payload(&[offer("README")], SRV_TCPFLG_TYPETAGINTEGER, 0, 4662);
+        assert_eq!(offered_file_type(&payload), None);
+    }
+
+    /// `(client id, port)` the first file in an OP_OFFERFILES body is offered
+    /// under.
+    fn offered_address(payload: &[u8]) -> (u32, u16) {
+        let at = 4 + 16;
+        (
+            u32::from_le_bytes(payload[at..at + 4].try_into().unwrap()),
+            u16::from_le_bytes([payload[at + 4], payload[at + 5]]),
+        )
+    }
+
+    #[test]
+    fn only_a_highid_offers_its_address() {
+        let highid = 0x0102_0304;
+        let lowid = 0x00AB_CDEF;
+        let files = [offer("movie.avi")];
+        assert_eq!(
+            offered_address(&build_offer_files_payload(&files, 0, highid, 4662)),
+            (highid, 4662)
+        );
+        assert_eq!(
+            offered_address(&build_offer_files_payload(&files, 0, lowid, 4662)),
+            (0, 0)
+        );
+        assert_eq!(
+            offered_address(&build_offer_files_payload(&files, SRV_TCPFLG_COMPRESSION, lowid, 4662)),
+            (0xFBFB_FBFB, 0xFBFB),
+            "the status markers do not depend on our ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chunk_the_server_cannot_index_is_refused_rather_than_sent_empty() {
+        let (mut link, _peer) = loopback_link(SERVER_WRITE_QUEUE).await;
+        assert_eq!(link.session.server_flags & SRV_TCPFLG_LARGEFILES, 0);
+
+        assert!(link.offer_files_chunk(&[], 4662).is_err());
+        let mut huge = offer("disc.iso");
+        huge.size = OLD_MAX_EMULE_FILE_SIZE + 1;
+        assert!(link.offer_files_chunk(&[huge], 4662).is_err());
+        assert!(link.offer_files_chunk(&[offer("disc.iso")], 4662).is_ok());
+        assert!(!server_indexes_file_size(OLD_MAX_EMULE_FILE_SIZE + 1, 0));
+        assert!(server_indexes_file_size(OLD_MAX_EMULE_FILE_SIZE + 1, SRV_TCPFLG_LARGEFILES));
+    }
+
+    fn search_result_payload(declared: u32, records: u32, trailing: &[u8]) -> Vec<u8> {
+        let mut payload = declared.to_le_bytes().to_vec();
+        for n in 0..records {
+            payload.extend_from_slice(&[n as u8; 16]);
+            payload.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+            payload.extend_from_slice(&4662u16.to_le_bytes());
+            payload.extend_from_slice(&0u32.to_le_bytes());
+        }
+        payload.extend_from_slice(trailing);
+        payload
+    }
+
+    #[test]
+    fn search_result_reads_the_more_results_byte() {
+        let more = |payload: Vec<u8>| parse_search_result(&payload).unwrap().1;
+        assert!(more(search_result_payload(2, 2, &[0x01])));
+        assert!(more(search_result_payload(0, 0, &[0x01])));
+        assert!(!more(search_result_payload(2, 2, &[0x00])));
+        assert!(!more(search_result_payload(2, 2, &[])));
+        assert!(!more(search_result_payload(2, 2, &[0x02])), "only 0x01 means more");
+        assert!(!more(search_result_payload(2, 2, &[0x01, 0x01])), "extra data is not a flag");
+    }
+
+    #[test]
+    fn a_truncated_search_result_never_asks_for_more() {
+        let (results, more) = parse_search_result(&search_result_payload(3, 2, &[0x01])).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(!more);
     }
 
     // ---- Boolean search tree tests (L12) ----
@@ -1738,7 +1957,8 @@ mod tests {
         payload.push(0xF6);
         put_str(&mut payload, "great rip");
 
-        let results = parse_search_result(&payload).expect("parse");
+        let (results, more) = parse_search_result(&payload).expect("parse");
+        assert!(!more);
         assert_eq!(results.len(), 1);
         let r = &results[0];
         assert_eq!(r.file_name, "song.mp3");
@@ -1793,8 +2013,9 @@ fn build_login_request(user_hash: &[u8; 16], tcp_port: u16, nickname: &str, flag
 
     // Tag 4: CT_EMULE_VERSION (0xFB) - (compat << 24) | (major << 17) | (minor << 10) | (update << 7)
     // Claim 0.50a (last official eMule release) — must match build_hello_inner.
-    // update=1 encodes the 'a' suffix.
-    let emule_version: u32 = (50u32 << 10) | (1u32 << 7);
+    // The update field is the letter's offset from 'a' (`Emule.cpp:316`), so
+    // 'a' is 0.
+    let emule_version: u32 = 50u32 << 10;
     write_uint32_tag(&mut buf, CT_EMULE_VERSION, emule_version);
 
     buf
@@ -1899,7 +2120,7 @@ const FT_SOURCES_TAG: u8 = 0x15;
 /// Nothing in a release build constructs one: live searches serialize through
 /// [`crate::network::kad::messages::build_search_expression_with_node`], which
 /// also covers Kad and 64-bit size leaves, and go out via
-/// [`Ed2kServerConnection::send_search_expr_bytes`]. This tree and its helpers
+/// [`ServerLink::send_search_expr_bytes`]. This tree and its helpers
 /// are kept because the `search_tree_*` tests pin the eD2K search wire format
 /// byte for byte, independently of that shared builder — which is what would
 /// catch the shared builder drifting away from what eD2K servers accept.
@@ -2314,10 +2535,18 @@ fn read_tag_value(
     }
 }
 
-fn parse_search_result(payload: &[u8]) -> anyhow::Result<Vec<ServerSearchResult>> {
+/// The results in one `OP_SEARCHRESULT`, and whether the server says it has
+/// more to give.
+///
+/// The flag is the single byte eMule reads after the last record
+/// (`SearchList.cpp:264-281`): 0x01 means more, 0x00 or anything else does
+/// not. It is only meaningful if every declared record was read in step, so a
+/// truncated or desynchronised answer never asks for another page.
+fn parse_search_result(payload: &[u8]) -> anyhow::Result<(Vec<ServerSearchResult>, bool)> {
     let mut cursor = Cursor::new(payload);
     let count = ReadBytesExt::read_u32::<LittleEndian>(&mut cursor)? as usize;
     let mut results = Vec::with_capacity(count.min(1000));
+    let mut last_in_sync = true;
 
     for _ in 0..count.min(1000) {
         let mut file_hash = [0u8; 16];
@@ -2407,12 +2636,16 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<Vec<ServerSearchResult>
         // a mid-tag offset (which would emit garbage rows). The surplus-tag
         // path above keeps us aligned on success, so only a desync forces the
         // break. Mirrors the UDP sibling in `server_udp.rs`.
+        last_in_sync = in_sync;
         if !in_sync {
             break;
         }
     }
 
-    Ok(results)
+    let aligned = results.len() == count && last_in_sync;
+    let trailing = payload.len().saturating_sub(cursor.position() as usize);
+    let more = aligned && trailing == 1 && payload.last() == Some(&0x01);
+    Ok((results, more))
 }
 
 fn parse_found_sources(
@@ -2485,37 +2718,6 @@ fn parse_found_sources(
     Ok((file_hash, sources))
 }
 
-async fn write_server_packet<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    opcode: u8,
-    payload: &[u8],
-) -> io::Result<()> {
-    let wire_len = u32::try_from(1 + payload.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "packet payload too large for u32 length field",
-        )
-    })?;
-    let write = async {
-        writer.write_u8(OP_EDONKEYHEADER).await?;
-        writer.write_u32_le(wire_len).await?;
-        writer.write_u8(opcode).await?;
-        writer.write_all(payload).await?;
-        writer.flush().await
-    };
-    tokio::time::timeout(
-        std::time::Duration::from_secs(SERVER_WRITE_TIMEOUT_SECS),
-        write,
-    )
-    .await
-    .unwrap_or_else(|_| {
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "server write timed out",
-        ))
-    })
-}
-
 async fn read_server_packet_timeout<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> io::Result<(u8, Vec<u8>)> {
@@ -2535,20 +2737,15 @@ async fn read_server_packet<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Resu
     read_server_packet_after_protocol(reader, protocol).await
 }
 
-/// The rest of a server packet, once its protocol byte has been consumed.
-///
-/// Split out so the poll loop can put a short deadline on the *first* byte
-/// only — where expiry provably consumed nothing — and read the remainder
-/// under a long, fatal budget. `read_exact` is not cancel-safe, so a deadline
-/// that fires anywhere after the first byte leaves the reader parked
-/// mid-payload with no way to resynchronize.
 /// Await `read`, failing with `TimedOut` if it delivers nothing for
 /// [`SERVER_PACKET_IDLE_TIMEOUT_SECS`].
 ///
 /// Applied per step rather than once around the whole body so that progress
 /// resets the clock: a slow but live transfer is never cut off, while a server
 /// that goes quiet mid-packet is detected without waiting out the total budget.
-async fn read_step<T>(read: impl std::future::Future<Output = io::Result<T>>) -> io::Result<T> {
+pub(super) async fn read_step<T>(
+    read: impl std::future::Future<Output = io::Result<T>>,
+) -> io::Result<T> {
     match tokio::time::timeout(
         std::time::Duration::from_secs(SERVER_PACKET_IDLE_TIMEOUT_SECS),
         read,
@@ -2563,6 +2760,13 @@ async fn read_step<T>(read: impl std::future::Future<Output = io::Result<T>>) ->
     }
 }
 
+/// The rest of a server packet, once its protocol byte has been consumed.
+///
+/// Split out so the reader can wait indefinitely for the *first* byte — where
+/// giving up provably consumed nothing — and read the remainder under a long,
+/// fatal budget. `read_exact` is not cancel-safe, so a deadline that fires
+/// anywhere after the first byte leaves the reader parked mid-payload with no
+/// way to resynchronize.
 async fn read_server_packet_after_protocol<R: AsyncReadExt + Unpin>(
     reader: &mut R,
     protocol: u8,

@@ -2013,7 +2013,13 @@ impl CreditManager {
                 downloaded,
                 last_seen,
                 public_key,
-                ident_state,
+                // Identification is per session, like the database load in
+                // `network::mod`; the stored state still seeds the anchor
+                // below.
+                ident_state: match ident_state {
+                    IdentState::Verified | IdentState::Failed => IdentState::Needed,
+                    other => other,
+                },
                 ident_ip,
                 ember_hash,
                 // Fallback for files written before v3, which the anchor
@@ -3678,11 +3684,14 @@ mod tests {
         assert_eq!(n, 1);
         let rec = loaded.get_record(&hash).expect("record must load");
         assert_eq!(rec.ident_ip, 0x0102_0304, "ident_ip must survive restart");
+        // Identification is per session, as in eMule: the peer proves its key
+        // again, and the anchor keeps its totals through that.
         assert_eq!(
             rec.ident_state,
-            IdentState::Verified,
-            "ident_state must survive restart"
+            IdentState::Needed,
+            "a verified peer must identify again after a restart"
         );
+        assert!(rec.crypto_verified_once, "the anchor must survive restart");
         assert_eq!(rec.uploaded, 4096);
         assert_eq!(rec.downloaded, 8192);
         assert_eq!(rec.last_seen, 1_700_000_123);

@@ -163,20 +163,26 @@ pub(super) struct NetworkState {
     pub(super) stats: NetworkStats,
     pub(super) pending_keyword_searches: HashMap<SearchId, PendingKeywordSearch>,
     /// Pending server TCP search: when we send OP_SEARCHREQUEST, store the results here
-    /// until poll_messages() delivers OP_SEARCHRESULT.
+    /// until the server tick receives OP_SEARCHRESULT.
     pub(super) pending_server_search: Option<PendingServerSearch>,
     pub(super) active_search_request: Option<ActiveSearchRequest>,
-    /// eMule OP_QUERY_MORE_RESULT: capped follow-up requests for more server results.
-    pub(super) server_search_more_needed: bool,
+    /// eMule OP_QUERY_MORE_RESULT: when the next page of the current server
+    /// search may be asked for. Set only when the server flagged more results;
+    /// `None` means no page is owed.
+    pub(super) server_search_more_due_at: Option<std::time::Instant>,
     pub(super) server_search_more_requests: u8,
     /// A second TCP search to send this server once the current one finishes,
     /// as `(request_id, wire expression)`. A related search has two different
     /// questions for the one connected server — the keyword query the user can
     /// see, and eMule's co-share request for the seed hashes — and a
     /// connection carries one search at a time. Lives here beside
-    /// `server_search_more_needed` because it is sent from the same place, by
-    /// the same rule: queue it in the poll loop, send it on the next pass.
+    /// `server_search_more_due_at` because it is sent from the same place, by
+    /// the same rule: never in the tick that delivered the first search's last
+    /// page, but `SERVER_MORE_RESULTS_DELAY` after it (`server_followup_due_at`).
     pub(super) server_followup_search: Option<(u64, Vec<u8>)>,
+    /// When the queued follow-up search may go out; set as the first search's
+    /// last page is handled.
+    pub(super) server_followup_due_at: Option<std::time::Instant>,
     /// Counter for throttling server keep-alive (sent every N poll ticks)
     pub(super) server_poll_count: u32,
     /// Counter for pending server search timeout (in poll ticks)
@@ -347,6 +353,10 @@ pub(super) struct NetworkState {
     /// Nodes that reported load=100 -- avoid publishing to them for a while
     pub(super) overloaded_nodes: HashMap<Ipv4Addr, i64>,
     pub(super) flood_protection: FloodProtection,
+    /// Per-destination pacing of our own KAD requests, so no eMule/aMule
+    /// node ever sees us over its request-flood budget. A mutex because the
+    /// send helpers only hold `&NetworkState`.
+    pub(super) kad_outbound: parking_lot::Mutex<kad::outbound::KadOutboundGovernor>,
     /// Pending Kad <7 (and crypt-off) Hello verification challenges.
     pub(super) legacy_challenges: LegacyChallengeTracker,
     pub(super) buddy_manager: BuddyManager,
@@ -422,8 +432,9 @@ pub(super) struct NetworkState {
     pub(super) server_list: ServerList,
     /// Whether we're connected to an ed2k server
     pub(super) server_connected: bool,
-    /// Active ed2k server connection (kept for keep-alive and source requests)
-    pub(super) server_connection: Option<Ed2kServerConnection>,
+    /// Active ed2k server session. The socket itself lives in the link's
+    /// reader and writer tasks; see [`ServerLink`].
+    pub(super) server_connection: Option<ServerLink>,
     /// Address of the currently connected server
     pub(super) server_addr: Option<SocketAddr>,
     /// Throttled UDP source-request queue: packets paced at ~1 per second
@@ -462,6 +473,18 @@ pub(super) struct NetworkState {
     /// see `SERVER_TCP_SRCREQ_INTERVAL_SECS` for the server-credit accounting
     /// this protects. 0 means "may send now".
     pub(super) server_tcp_srcreq_next_at: i64,
+    /// Unix second each file last went out in a TCP `OP_GETSOURCES`, whatever
+    /// the path — eMule's per-file `m_LastSearchTime`. Deliberately kept
+    /// across server sessions, as eMule's is, so a reconnect does not re-ask
+    /// the new server for everything at once. See
+    /// `SERVER_TCP_SRCREQ_FILE_REASK_SECS`.
+    pub(super) server_tcp_srcreq_file_at: HashMap<[u8; 16], i64>,
+    /// Downloads that asked for the connected server's sources outside the
+    /// periodic sweep — a new download, Find Sources — as `(transfer_id,
+    /// file_hash, file_size)`, served first by the next frame. eMule's
+    /// `m_localServerReqQueue`: nothing sends `OP_GETSOURCES` on its own, so
+    /// these share the frame budget like every other request.
+    pub(super) server_tcp_srcreq_asks: VecDeque<(String, [u8; 16], u64)>,
     /// Unix-seconds timestamp of the most recent successful server login.
     /// Server source requests (OP_GETSOURCES) are held off until the
     /// connection has settled for `SERVER_SOURCE_SETTLE_SECS` so we don't
@@ -1275,6 +1298,12 @@ pub(super) struct NetworkState {
     /// connect-and-serve the searcher. Drained on the search timer, which
     /// has `connect_serve_tx`.
     pub(super) ember_pending_callback_connects: Vec<ember::dht::engine::CallbackConnect>,
+    /// eD2K `OP_DIRECTCALLBACKREQ`s waiting to be dialed back, drained with
+    /// `ember_pending_callback_connects` on the search timer.
+    pub(super) pending_direct_callbacks: Vec<ember::dht::engine::CallbackConnect>,
+    /// When each requester IP last had a direct callback accepted; eMule
+    /// allows one per 180 s (`CClientList::AllowCalbackRequest`).
+    pub(super) direct_callback_requests: HashMap<Ipv4Addr, std::time::Instant>,
     /// Firewalled source records waiting for `PROXY_STORE_ACK` before overlay
     /// `STORE_BATCH`. Keyed by `(buddy, request_id)`.
     pub(super) ember_pending_proxy_overlay: HashMap<(ember::dht::EmberNodeId, u32), EmberPendingProxyOverlay>,

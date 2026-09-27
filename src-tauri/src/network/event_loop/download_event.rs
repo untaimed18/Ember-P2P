@@ -138,7 +138,7 @@ pub(in crate::network) async fn on_download_event(
     upload_queue_handle: &ed2k::upload::UploadQueueRef,
 ) {
     if let DownloadEvent::PartFileReady { ref transfer_id, ref file_hash, file_size, ref file_name } = event {
-        info!("Part file ready for {} ({}) — offering to server and publishing to KAD",
+        info!("Part file ready for {} ({}) — queuing server offer and publishing to KAD",
             transfer_id, hex::encode(file_hash));
         let from_restricting_friend = {
             let mgr = transfer_manager.read().await;
@@ -150,33 +150,13 @@ pub(in crate::network) async fn on_download_event(
                 || hash16_is_friends_only(file_hash, &index, known_files)
         };
         if !restricted {
-        // Skip if this hash already went out in the login dump or
-        // an earlier incremental offer. Re-sending it is a
-        // one-file republish; Lugdunum's penalty is for republish,
-        // not for a later new file (eMule SendFileToServer).
+        // Flag the shared list dirty rather than offering at once: eMule
+        // batches new files into the next `SendListToServer`, at most one per
+        // ED2KREPUBLISHTIME (`SharedFileList.cpp:653-663`, `:1226-1233`).
+        // The drain skips hashes this session has already offered, since
+        // re-sending one is the republish Lugdunum penalises.
         if state.server_connected && !state.offered_ed2k_hashes.contains(file_hash) {
-            let offer = vec![ed2k::server::OfferFile {
-                hash: *file_hash,
-                name: file_name.clone(),
-                size: file_size,
-                is_complete: false,
-                file_type: String::new(),
-            }];
-            let offer_tcp_port = advertised_tcp_port(state);
-            let offered_ok = if let Some(conn) = state.server_connection.as_mut() {
-                match conn.offer_files(&offer, offer_tcp_port).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        debug!("Failed to offer new partial to server: {e}");
-                        false
-                    }
-                }
-            } else {
-                false
-            };
-            if offered_ok {
-                record_offered_ed2k_hashes(state, &offer);
-            }
+            state.request_offer_files = true;
         }
         let kad_hash = md4_bytes_to_kad_id(file_hash);
         let ext = std::path::Path::new(file_name.as_str())
@@ -250,8 +230,7 @@ pub(in crate::network) async fn on_download_event(
         // Snapshot only the fields we need, then release the
         // `transfer_manager` read lock immediately. The rest of
         // this handler runs several `.await`s (source_manager
-        // read, local_index write/read, shared_files write, and a
-        // server `offer_files` network round-trip). Holding the
+        // read, local_index write/read, shared_files write). Holding the
         // read lock across them previously stalled the whole
         // network `select!` loop and blocked download workers that
         // need `transfer_manager.write()`.
@@ -641,32 +620,22 @@ pub(in crate::network) async fn on_download_event(
                             },
                         });
 
-                        // Offer to eD2K server
+                        // Offer to eD2K server through the batched drain, like
+                        // any other new shared file. A hash already offered as
+                        // a partial is republished only to a server with
+                        // SRV_TCPFLG_COMPRESSION, whose index records complete
+                        // vs. partial (eMule `RepublishFile`,
+                        // `SharedFileList.cpp:667-674`, called from
+                        // `PartFile.cpp:3015-3016`); to any other server the
+                        // earlier offer already says everything it can hold.
                         if state.server_connected {
-                            let offer = vec![ed2k::server::OfferFile {
-                                hash: fh,
-                                name: shared_file.name.clone(),
-                                size: shared_file.size,
-                                is_complete: true,
-                                file_type: String::new(),
-                            }];
-                            let offer_tcp_port = advertised_tcp_port(state);
-                            let offered_ok =
-                                if let Some(conn) = state.server_connection.as_mut() {
-                                    match conn.offer_files(&offer, offer_tcp_port).await
-                                    {
-                                        Ok(()) => true,
-                                        Err(e) => {
-                                            debug!("Failed to offer completed download to server: {e}");
-                                            false
-                                        }
-                                    }
-                                } else {
-                                    false
-                                };
-                            if offered_ok {
-                                record_offered_ed2k_hashes(state, &offer);
+                            let server_compresses = state.server_connection.as_ref().is_some_and(|c| {
+                                c.session.server_flags & ed2k::server::SRV_TCPFLG_COMPRESSION != 0
+                            });
+                            if server_compresses {
+                                state.offered_ed2k_hashes.remove(&fh);
                             }
+                            state.request_offer_files = true;
                         }
                     }
 
@@ -1349,7 +1318,7 @@ pub(in crate::network) async fn on_download_event(
                     // Slot granted, waiting on the first block —
                     // eMule is already DS_DOWNLOADING here.
                     "stalled" | "transferring" => pfs.set_downloading(v4, port, None),
-                    "completed" => {}
+                    "completed" => pfs.set_transfer_ended(v4, port, None),
                     "failed" => {
                         if state.banned_ips.contains(&v4) {
                             pfs.set_banned(v4, port, None);
@@ -1536,6 +1505,9 @@ pub(in crate::network) async fn on_download_event(
         let contributors = state
             .corruption_blackbox
             .corrupted_part_contributors(file_hash, part_start, part_end);
+        let fully_attributed = state
+            .corruption_blackbox
+            .part_fully_attributed(file_hash, part_start, part_end);
         let ban_list = state.corruption_blackbox.corrupted_part(file_hash, part_start, part_end);
         for ip in ban_list {
             // Sustained corruption is a deterministic, serious
@@ -1560,8 +1532,11 @@ pub(in crate::network) async fn on_download_event(
         // contributor of unverified data in this part; the
         // byte-ratio ban above (which is genuinely per-IP
         // attributed) already covers the ambiguous multi-source
-        // case without punishing an innocent connection.
-        if contributors.len() <= 1 {
+        // case without punishing an innocent connection. With no
+        // contributor on record, or bytes in the part nobody here is
+        // on record for (a resumed `.part`), the finisher is no more
+        // likely to be at fault than anyone else.
+        if contributors.len() == 1 && fully_attributed {
             if let Some(ref uh) = sender_user_hash {
                 let contributor_ip = contributors.iter().next().copied();
                 let (node_banned, ip_banned) = if let Some(ip) = contributor_ip {
@@ -1580,20 +1555,11 @@ pub(in crate::network) async fn on_download_event(
                     )
                 };
                 if node_banned || ip_banned {
-                    let sm = source_manager.read().await;
-                    let mut ips = sm.find_ips_by_user_hash(uh);
-                    drop(sm);
-                    if let Some(ip) = contributor_ip {
-                        if !ips.contains(&ip) {
-                            ips.push(ip);
-                        }
-                    }
-                    apply_reputation_ban_ips(
-                        state,
-                        shared_banned_ips,
-                        ips,
-                        uh,
-                    );
+                    // Only the address that sent the bytes. Other addresses
+                    // filed under this user hash came from source records and
+                    // exchanges that anyone can forge; the identity itself is
+                    // refused by hash from now on.
+                    apply_reputation_ban_ips(state, shared_banned_ips, contributor_ip, uh);
                 }
             }
         }
@@ -1613,18 +1579,8 @@ pub(in crate::network) async fn on_download_event(
                     ember::reputation::ReputationEvent::ProtocolViolation,
                 );
             if node_banned || ip_banned {
-                let sm = source_manager.read().await;
-                let mut ips = sm.find_ips_by_user_hash(uh);
-                drop(sm);
-                if !ips.contains(&sender_ip) {
-                    ips.push(sender_ip);
-                }
-                apply_reputation_ban_ips(
-                    state,
-                    shared_banned_ips,
-                    ips,
-                    uh,
-                );
+                // The offending address only; see the CorruptData arm.
+                apply_reputation_ban_ips(state, shared_banned_ips, [sender_ip], uh);
             }
         } else {
             // No user hash to score against — fall back to a

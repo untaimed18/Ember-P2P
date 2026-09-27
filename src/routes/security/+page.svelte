@@ -19,6 +19,7 @@
   import { onMount, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { plural } from '$lib/plural';
   import { getSettings } from '$lib/api/settings';
   import { setAppSettings } from '$lib/stores/settings';
   import { networkStats } from '$lib/stores/network';
@@ -260,6 +261,22 @@
 
   function toErrorMsg(e: unknown): string {
     return translateError(e, m.error_operation_failed());
+  }
+
+  function rangeCountText(count: number): string {
+    return plural(count, {
+      one: m.security_range_count_one,
+      few: () => m.security_range_count_few({ count: formatNumber(count) }),
+      other: () => m.security_ranges_count({ count: formatNumber(count) }),
+    });
+  }
+
+  function hitsCountText(count: number): string {
+    return plural(count, {
+      one: m.security_hits_count_one,
+      few: () => m.security_hits_count_few({ count: formatNumber(count) }),
+      other: () => m.security_hits_count({ count: formatNumber(count) }),
+    });
   }
 
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
@@ -580,18 +597,14 @@
       </div>
       <div class="controls-right">
         <span class="inline-stat">
-          {stats.range_count === 1
-            ? m.security_range_count_one()
-            : m.security_ranges_count({ count: formatNumber(stats.range_count) })}
+          {rangeCountText(stats.range_count)}
         </span>
         <span class="inline-sep">&middot;</span>
         <!-- Red only when there is something to be red about. A permanent
              danger-coloured "0 hits" trains the eye to ignore the one place
              on the page that reports blocks actually happening. -->
         <span class="inline-stat" class:hits-stat={stats.total_hits > 0}>
-          {stats.total_hits === 1
-            ? m.security_hits_count_one()
-            : m.security_hits_count({ count: formatNumber(stats.total_hits) })}
+          {hitsCountText(stats.total_hits)}
         </span>
       </div>
     </div>
@@ -649,9 +662,11 @@
         {/if}
       </div>
       <span class="result-count">
-        {matchedCount === 1
-          ? m.security_range_count_one()
-          : m.security_range_count_other({ count: formatNumber(matchedCount) })}
+        {plural(matchedCount, {
+          one: m.security_range_count_one,
+          few: () => m.security_range_count_few({ count: formatNumber(matchedCount) }),
+          other: () => m.security_range_count_other({ count: formatNumber(matchedCount) }),
+        })}
       </span>
     </div>
 

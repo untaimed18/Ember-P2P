@@ -19,7 +19,15 @@
   import { flip } from 'svelte/animate';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
-  import { copyToClipboard, formatClockTime, formatCompactCount, formatNumber } from '$lib/utils';
+  import { serverMetDownloadedText } from '$lib/commandReplies';
+  import { plural } from '$lib/plural';
+  import {
+    copyToClipboard,
+    formatClockTime,
+    formatCompactCount,
+    formatNumber,
+    withTimeout,
+  } from '$lib/utils';
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
   import { menuKeydown } from '$lib/a11y';
   import { toastError } from '$lib/stores/toast';
@@ -201,18 +209,6 @@
     };
   });
 
-  function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<T>((_, reject) => {
-      timer = setTimeout(() => reject(new Error('timeout')), ms);
-    });
-    // Clear the watchdog once either side settles so the loser timer doesn't
-    // linger (and can't reject after the real promise already resolved).
-    return Promise.race([promise, timeout]).finally(() => {
-      if (timer) clearTimeout(timer);
-    });
-  }
-
   async function refresh() {
     if (!mounted) return;
     if (refreshInProgress) {
@@ -223,8 +219,8 @@
     pendingRefresh = false;
     try {
       const [list, connected] = await Promise.allSettled([
-        withTimeout(getServerList(), 4000),
-        withTimeout(getConnectedServer(), 4000),
+        withTimeout(getServerList(), 'get_server_list', 4000),
+        withTimeout(getConnectedServer(), 'get_connected_server', 4000),
       ]);
       if (!mounted) return;
       let hadFailure = false;
@@ -522,7 +518,10 @@
     selectedServer = null;
     selectedServers = new Set();
     lastClickedKey = null;
-    const msg = removed === 1 ? m.servers_removed_one() : m.servers_removed_other({ count: removed });
+    const msg = plural(removed, {
+      one: m.servers_removed_one,
+      other: () => m.servers_removed_other({ count: removed }),
+    });
     log(msg);
     if (failedCount > 0) {
       error = m.servers_removed_with_failures({ message: msg, failed: failedCount });
@@ -543,9 +542,9 @@
     updatingMet = true;
     log(m.servers_log_downloading_met({ url }));
     try {
-      const result = await downloadServerMet(url);
-      flash(result);
-      log(result);
+      const msg = serverMetDownloadedText(await downloadServerMet(url));
+      flash(msg);
+      log(msg);
       await refresh();
     } catch (e: unknown) {
       const msg = toErrorMsg(e);
@@ -712,7 +711,10 @@
     selectedServers = new Set();
     selectedServer = null;
     lastClickedKey = null;
-    const removedMsg = count === 1 ? m.servers_removed_one() : m.servers_removed_other({ count });
+    const removedMsg = plural(count, {
+      one: m.servers_removed_one,
+      other: () => m.servers_removed_other({ count }),
+    });
     log(removedMsg);
     // Mirror doRemoveAll: surface failures instead of flashing a success
     // toast when some (or all) removals were rejected.
@@ -1323,9 +1325,10 @@
 <ConfirmDialog
   bind:open={confirmRemoveOpen}
   title={m.servers_confirm_remove_title()}
-  message={pendingRemoveServers.length === 1
-    ? m.servers_confirm_remove_message_one()
-    : m.servers_confirm_remove_message_other({ count: pendingRemoveServers.length })}
+  message={plural(pendingRemoveServers.length, {
+    one: m.servers_confirm_remove_message_one,
+    other: () => m.servers_confirm_remove_message_other({ count: pendingRemoveServers.length }),
+  })}
   confirmLabel={m.common_remove()}
   danger={true}
   onconfirm={confirmPendingRemoval}

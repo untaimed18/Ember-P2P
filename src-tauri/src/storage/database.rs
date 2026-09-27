@@ -27,7 +27,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 59;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 62;
 
 /// Longest room name kept from a moderation snapshot. Keep in step with
 /// `MAX_CHANNEL_NAME_CHARS` in `commands/channels.rs`, the cap an owner names
@@ -354,6 +354,49 @@ impl StoredChannel {
     }
 }
 
+/// The contents of one owner moderation snapshot, as
+/// [`Database::apply_channel_moderation`] stores them. The trailing facts are
+/// `None` when the record does not carry them.
+#[derive(Debug, Clone, Copy)]
+pub struct ModerationSnapshot<'a> {
+    pub topic: &'a str,
+    pub welcome: &'a str,
+    pub banned_pubkeys: &'a [[u8; 32]],
+    pub moderator_pubkeys: &'a [[u8; 32]],
+    pub owner_pubkey: Option<&'a [u8; 32]>,
+    pub successor_nominee: Option<&'a [u8; 32]>,
+    pub claim_after_days: Option<u16>,
+    pub key_epoch: Option<u64>,
+    pub invites_owner_only: Option<bool>,
+    pub slow_mode_secs: Option<u16>,
+}
+
+/// The room policy an owner snapshot carries beside the moderation fields.
+/// See [`Database::apply_owner_room_policy`].
+#[derive(Debug, Clone, Copy)]
+pub struct OwnerRoomPolicy<'a> {
+    pub announce_only: bool,
+    pub pinned_msg_ids: &'a [[u8; 16]],
+    pub language: Option<&'a str>,
+}
+
+/// How a moderation snapshot is weighed against the one this device holds.
+#[derive(Debug, Clone, Copy)]
+enum ModerationOrder<'a> {
+    /// Applied by this device itself: by stamp alone, the way every snapshot
+    /// was ordered before signatures were kept.
+    Local,
+    /// Fetched from the network: by stamp, then by this signature, and on a
+    /// room this device owns only when stamped after all it has signed.
+    Fetched(&'a [u8; 64]),
+    /// The owner making an edit, which always applies.
+    OwnerEdit,
+}
+
+/// Furthest ahead of now a stored owner stamp is still counted on from. See
+/// [`Database::stamp_owner_snapshot`].
+const OWNER_STAMP_MAX_LEAD_SECS: i64 = 10 * 60;
+
 /// One member of a joined channel. `member_pubkey` is 64-char hex.
 #[derive(Debug, Clone)]
 pub struct StoredChannelMember {
@@ -507,11 +550,26 @@ const CHAT_ATTACHMENT_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 /// someone the user has removed, so it must not be kept indefinitely on the
 /// chance that they eventually reappear.
 const RETRACTION_QUEUE_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
+/// New friend requests one room may bring in an hour. A room carries a request
+/// from any key it will carry at all, which in a public room is anyone's.
+pub const ROOM_FRIEND_REQUESTS_PER_ROOM_HOUR: i64 = 5;
+/// How long a refusal is remembered against a room request: past the oldest
+/// envelope a room request is still acted on in, plus the clock skew allowed.
+const FRIEND_REQUEST_REFUSAL_MEMORY_SECS: i64 =
+    crate::network::ember::channel::ROOM_FRIEND_REQUEST_MAX_AGE_SECS
+        + crate::network::ember::channel::CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS;
 const CHAT_NONCE_LEN: usize = 24;
 const CHAT_AAD_DOMAIN: &[u8] = b"ember-chat-db-row-v1\0";
 const CHANNEL_MSG_AAD_DOMAIN: &[u8] = b"ember-channel-db-row-v1\0";
 const CHANNEL_SECRET_AAD_DOMAIN: &[u8] = b"ember-channel-secret-v1\0";
 const CHANNEL_SECRET_PREFIX: &str = "EMBRCSEC1:";
+const CHAT_ATTACH_AAD_DOMAIN: &[u8] = b"ember-chat-attachment-db-v1\0";
+/// Marks a sealed `chat_attachments` name or path. A value without it is one
+/// written before v60 that has not been sealed yet, and is read as it stands.
+const CHAT_ATTACH_PREFIX: &str = "EMBRCATT1:";
+/// Shown for an attachment whose name is sealed under a key this device no
+/// longer holds.
+const CHAT_ATTACH_UNAVAILABLE_NAME: &str = "[File name unavailable]";
 
 pub struct Database {
     conn: Mutex<Connection>,
@@ -825,7 +883,7 @@ impl Database {
     /// `starts_with` elsewhere: under LIKE a plaintext body beginning
     /// `embrchat1:` would count as ciphertext and seal chat permanently instead
     /// of minting a fresh key.
-    const CHAT_KEYED_COLUMNS: [(&'static str, &'static str); 5] = [
+    const CHAT_KEYED_COLUMNS: [(&'static str, &'static str); 6] = [
         ("chat_messages", "message GLOB 'EMBRCHAT1:*'"),
         ("channel_messages", "message GLOB 'EMBRCHAT1:*'"),
         (
@@ -834,6 +892,11 @@ impl Database {
         ),
         ("channel_key_epochs", "secret_enc GLOB 'EMBRCSEC1:*'"),
         ("channel_handoff_pending", "owner_seed GLOB 'EMBRCSEC1:*'"),
+        (
+            "chat_attachments",
+            "file_name GLOB 'EMBRCATT1:*' OR source_path GLOB 'EMBRCATT1:*' \
+             OR dest_path GLOB 'EMBRCATT1:*'",
+        ),
     ];
 
     /// Whether anything in the database is still sealed under the chat key.
@@ -1152,6 +1215,84 @@ impl Database {
             .map_err(|_| anyhow::anyhow!("Channel message {id} failed authentication"))?;
         String::from_utf8(plaintext)
             .map_err(|_| anyhow::anyhow!("Channel message {id} decrypted to invalid UTF-8"))
+    }
+
+    /// Binds a sealed attachment field to its row and column, so one cannot be
+    /// moved onto another attachment or read back as a different field.
+    fn chat_attach_aad(xfer_id: &str, column: &str) -> Vec<u8> {
+        let mut aad =
+            Vec::with_capacity(CHAT_ATTACH_AAD_DOMAIN.len() + 4 + xfer_id.len() + 4 + column.len());
+        aad.extend_from_slice(CHAT_ATTACH_AAD_DOMAIN);
+        aad.extend_from_slice(&(xfer_id.len() as u32).to_le_bytes());
+        aad.extend_from_slice(xfer_id.as_bytes());
+        aad.extend_from_slice(&(column.len() as u32).to_le_bytes());
+        aad.extend_from_slice(column.as_bytes());
+        aad
+    }
+
+    fn seal_attachment_field(
+        key: &[u8; 32],
+        xfer_id: &str,
+        column: &str,
+        plaintext: &str,
+    ) -> anyhow::Result<String> {
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+        let mut nonce = [0u8; CHAT_NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let aad = Self::chat_attach_aad(xfer_id, column);
+        let encrypted = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext.as_bytes(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("Failed to seal a chat attachment field"))?;
+        let mut envelope = Vec::with_capacity(CHAT_NONCE_LEN + encrypted.len());
+        envelope.extend_from_slice(&nonce);
+        envelope.extend_from_slice(&encrypted);
+        Ok(format!("{CHAT_ATTACH_PREFIX}{}", STANDARD_NO_PAD.encode(envelope)))
+    }
+
+    /// Read a stored attachment field. `None` when it is sealed and cannot be
+    /// opened here — the chat key is unavailable, or the value is damaged.
+    fn open_attachment_field(
+        key: Option<&[u8; 32]>,
+        xfer_id: &str,
+        column: &str,
+        stored: &str,
+    ) -> Option<String> {
+        let Some(encoded) = stored.strip_prefix(CHAT_ATTACH_PREFIX) else {
+            return Some(stored.to_string());
+        };
+        let envelope = STANDARD_NO_PAD.decode(encoded).ok()?;
+        if envelope.len() < CHAT_NONCE_LEN + 16 {
+            return None;
+        }
+        let aad = Self::chat_attach_aad(xfer_id, column);
+        let plaintext = XChaCha20Poly1305::new(ChaChaKey::from_slice(key?))
+            .decrypt(
+                XNonce::from_slice(&envelope[..CHAT_NONCE_LEN]),
+                Payload {
+                    msg: &envelope[CHAT_NONCE_LEN..],
+                    aad: &aad,
+                },
+            )
+            .ok()?;
+        String::from_utf8(plaintext).ok()
+    }
+
+    /// [`Self::seal_attachment_field`] under this database's chat key. Refused
+    /// while chat is locked, which stores nothing new rather than storing it
+    /// readable.
+    fn seal_attachment_value(
+        &self,
+        xfer_id: &str,
+        column: &str,
+        plaintext: &str,
+    ) -> anyhow::Result<String> {
+        Self::seal_attachment_field(self.require_chat_key()?, xfer_id, column, plaintext)
     }
 
     fn is_corruption_error(error: &anyhow::Error) -> bool {
@@ -2804,6 +2945,73 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 60 {
+            // Attachment names and paths were the one part of a conversation
+            // left readable on disk: which files a friend sent, and where on
+            // this machine they and ours live. Sealed under the chat key like
+            // the bodies beside them. With the key unavailable the rows are
+            // left as they are and sealed on the first open that has it, the
+            // same deferral v23 makes.
+            let tx = conn.unchecked_transaction()?;
+            let sealed = match self.chat_key.as_deref() {
+                Some(key) => Self::seal_chat_attachment_rows(&tx, key)?,
+                None => 0,
+            };
+            set_version(&tx, 60)?;
+            tx.commit()?;
+            if sealed > 0 {
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+                info!("Sealed {sealed} chat attachment row(s) (database v60)");
+            }
+        }
+
+        if version < 61 {
+            // What orders two owner snapshots stamped in the same second, and
+            // the newest stamp this device has signed for a room it owns. See
+            // `apply_channel_moderation_locked` and `stamp_owner_snapshot`.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(&tx, "channels", "moderation_sig", "BLOB")?;
+            Self::add_column_if_missing(
+                &tx,
+                "channels",
+                "owner_snapshot_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 61)?;
+            tx.commit()?;
+        }
+
+        if version < 62 {
+            // Friend requests that came through a room. `via_room` names the
+            // room one arrived through, empty for one from a session, so room
+            // requests can be capped per room and never push a session's out;
+            // refusals are remembered past the window a room request is
+            // accepted in, so a replay cannot put one back; and a friend asked
+            // through rooms is asked less and less often, then not at all.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "friend_requests",
+                "via_room",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS friend_request_refusals (
+                    user_hash TEXT PRIMARY KEY,
+                    refused_at INTEGER NOT NULL DEFAULT 0
+                );",
+            )?;
+            Self::add_column_if_missing(&tx, "friends", "room_asks", "INTEGER NOT NULL DEFAULT 0")?;
+            Self::add_column_if_missing(
+                &tx,
+                "friends",
+                "room_asked_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            set_version(&tx, 62)?;
+            tx.commit()?;
+        }
+
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -2838,9 +3046,71 @@ impl Database {
                     }
                 }
             }
+            // The v60 pass, when it was deferred. Finds nothing once done.
+            if let Some(key) = self.chat_key.as_deref() {
+                let tx = conn.unchecked_transaction()?;
+                let sealed = Self::seal_chat_attachment_rows(&tx, key)?;
+                if sealed > 0 {
+                    tx.commit()?;
+                    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+                    info!(
+                        "Sealed {sealed} chat attachment row(s) left readable by a migration \
+                         that ran while the chat key was unavailable"
+                    );
+                }
+            }
         }
 
         Ok(())
+    }
+
+    /// Seal every attachment name and path still stored readable. Returns how
+    /// many rows it rewrote.
+    fn seal_chat_attachment_rows(tx: &Connection, key: &[u8; 32]) -> anyhow::Result<usize> {
+        let has_table: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+             WHERE type='table' AND name='chat_attachments')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_table {
+            return Ok(0);
+        }
+        let rows: Vec<(String, String, Option<String>, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT xfer_id, file_name, source_path, dest_path FROM chat_attachments
+                 WHERE file_name NOT GLOB 'EMBRCATT1:*'
+                    OR (source_path IS NOT NULL AND source_path NOT GLOB 'EMBRCATT1:*')
+                    OR (dest_path IS NOT NULL AND dest_path NOT GLOB 'EMBRCATT1:*')",
+            )?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        let reseal = |xfer_id: &str, column: &str, stored: &str| -> anyhow::Result<String> {
+            if stored.starts_with(CHAT_ATTACH_PREFIX) {
+                return Ok(stored.to_string());
+            }
+            Self::seal_attachment_field(key, xfer_id, column, stored)
+        };
+        for (xfer_id, file_name, source_path, dest_path) in &rows {
+            let file_name = reseal(xfer_id, "file_name", file_name)?;
+            let source_path = source_path
+                .as_deref()
+                .map(|path| reseal(xfer_id, "source_path", path))
+                .transpose()?;
+            let dest_path = dest_path
+                .as_deref()
+                .map(|path| reseal(xfer_id, "dest_path", path))
+                .transpose()?;
+            tx.execute(
+                "UPDATE chat_attachments SET file_name = ?2, source_path = ?3, dest_path = ?4
+                 WHERE xfer_id = ?1",
+                params![xfer_id, file_name, source_path, dest_path],
+            )?;
+        }
+        Ok(rows.len())
     }
 
     /// `schema_version` recorded in the open database.
@@ -2874,6 +3144,10 @@ impl Database {
         created_at: i64,
         expires_at: i64,
     ) -> anyhow::Result<()> {
+        let file_name = self.seal_attachment_value(xfer_id, "file_name", file_name)?;
+        let source_path = source_path
+            .map(|path| self.seal_attachment_value(xfer_id, "source_path", path))
+            .transpose()?;
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO chat_attachments (
@@ -2921,24 +3195,29 @@ impl Database {
         now: i64,
     ) -> Option<(String, u64, String)> {
         let conn = self.conn.lock();
-        conn.query_row(
-            // An allow-list, not a deny-list: a status added later is not a
-            // grant until someone decides it should be. `offered` has to be on
-            // it because the recipient dials straight after sending its accept,
-            // and the accept can still be in flight when the stream arrives.
-            "SELECT source_path, file_size, root_hash FROM chat_attachments
-             WHERE xfer_id = ?1 AND friend_hash = ?2 AND direction = 'sent'
-               AND source_path IS NOT NULL AND expires_at > ?3
-               AND status IN ('offered', 'accepted', 'active', 'complete')",
-            rusqlite::params![xfer_id, friend_hash, now],
-            |row| {
-                let path: String = row.get(0)?;
-                let size: i64 = row.get(1)?;
-                let root: String = row.get(2)?;
-                Ok((path, size.max(0) as u64, root))
-            },
-        )
-        .ok()
+        let (stored, size, root) = conn
+            .query_row(
+                // An allow-list, not a deny-list: a status added later is not a
+                // grant until someone decides it should be. `offered` has to be on
+                // it because the recipient dials straight after sending its accept,
+                // and the accept can still be in flight when the stream arrives.
+                "SELECT source_path, file_size, root_hash FROM chat_attachments
+                 WHERE xfer_id = ?1 AND friend_hash = ?2 AND direction = 'sent'
+                   AND source_path IS NOT NULL AND expires_at > ?3
+                   AND status IN ('offered', 'accepted', 'active', 'complete')",
+                rusqlite::params![xfer_id, friend_hash, now],
+                |row| {
+                    let path: String = row.get(0)?;
+                    let size: i64 = row.get(1)?;
+                    let root: String = row.get(2)?;
+                    Ok((path, size.max(0) as u64, root))
+                },
+            )
+            .ok()?;
+        drop(conn);
+        let path =
+            Self::open_attachment_field(self.chat_key.as_deref(), xfer_id, "source_path", &stored)?;
+        Some((path, size, root))
     }
 
     /// Move an attachment to a new status, optionally recording progress and
@@ -2950,6 +3229,9 @@ impl Database {
         transferred: Option<u64>,
         dest_path: Option<&str>,
     ) -> anyhow::Result<()> {
+        let dest_path = dest_path
+            .map(|path| self.seal_attachment_value(xfer_id, "dest_path", path))
+            .transpose()?;
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE chat_attachments SET
@@ -2975,6 +3257,9 @@ impl Database {
         transferred: Option<u64>,
         dest_path: Option<&str>,
     ) -> anyhow::Result<bool> {
+        let dest_path = dest_path
+            .map(|path| self.seal_attachment_value(xfer_id, "dest_path", path))
+            .transpose()?;
         let conn = self.conn.lock();
         let moved = conn.execute(
             "UPDATE chat_attachments SET
@@ -3059,12 +3344,15 @@ impl Database {
                 Self::chat_attachment_from_row,
             )?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        drop(stmt);
+        drop(conn);
+        Ok(rows.into_iter().map(|row| self.open_chat_attachment_row(row)).collect())
     }
 
     /// Column order shared by every attachment read: xfer_id, friend_hash,
     /// direction, file_name, file_size, dest_path, status, transferred,
-    /// created_at.
+    /// created_at. Name and path come back as stored; see
+    /// [`Self::open_chat_attachment_row`].
     fn chat_attachment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatAttachmentRow> {
         Ok(ChatAttachmentRow {
             xfer_id: row.get(0)?,
@@ -3079,17 +3367,34 @@ impl Database {
         })
     }
 
+    /// Open the sealed name and path of a row read by
+    /// [`Self::chat_attachment_from_row`]. One that cannot be opened reads as
+    /// unavailable rather than as its ciphertext.
+    fn open_chat_attachment_row(&self, mut row: ChatAttachmentRow) -> ChatAttachmentRow {
+        let key = self.chat_key.as_deref();
+        row.file_name = Self::open_attachment_field(key, &row.xfer_id, "file_name", &row.file_name)
+            .unwrap_or_else(|| CHAT_ATTACH_UNAVAILABLE_NAME.to_string());
+        row.dest_path = row
+            .dest_path
+            .as_deref()
+            .and_then(|path| Self::open_attachment_field(key, &row.xfer_id, "dest_path", path));
+        row
+    }
+
     /// One attachment by id, whichever side of it this node is on.
     pub fn chat_attachment(&self, xfer_id: &str) -> Option<ChatAttachmentRow> {
         let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT xfer_id, friend_hash, direction, file_name, file_size,
-                    dest_path, status, transferred, created_at
-             FROM chat_attachments WHERE xfer_id = ?1",
-            rusqlite::params![xfer_id],
-            Self::chat_attachment_from_row,
-        )
-        .ok()
+        let row = conn
+            .query_row(
+                "SELECT xfer_id, friend_hash, direction, file_name, file_size,
+                        dest_path, status, transferred, created_at
+                 FROM chat_attachments WHERE xfer_id = ?1",
+                rusqlite::params![xfer_id],
+                Self::chat_attachment_from_row,
+            )
+            .ok()?;
+        drop(conn);
+        Some(self.open_chat_attachment_row(row))
     }
 
     /// Retire attachments nobody answered, and stop their grants being readable.
@@ -5248,19 +5553,21 @@ impl Database {
     /// for somebody who is not a friend, so the address has to be copied out
     /// at the moment of removal or the courier has nowhere to dial.
     ///
-    /// `Ok(false)` when there was no request to refuse.
+    /// `Ok(false)` when there was no request to refuse, or nowhere to send the
+    /// refusal.
     pub fn reject_and_queue_friend_decline(&self, user_hash: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
-        let pending: Option<(String, i64)> = tx
+        let pending: Option<(String, i64, bool)> = tx
             .query_row(
-                "SELECT COALESCE(sender_ip, ''), COALESCE(sender_port, 0) FROM friend_requests \
-                 WHERE sender_hash = ?1",
+                "SELECT COALESCE(sender_ip, ''), COALESCE(sender_port, 0),
+                        sender_pubkey IS NOT NULL AND COALESCE(verified, 0) != 0
+                 FROM friend_requests WHERE sender_hash = ?1",
                 params![user_hash],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((last_ip, last_port)) = pending else {
+        let Some((last_ip, last_port, keyed)) = pending else {
             tx.commit()?;
             return Ok(false);
         };
@@ -5268,10 +5575,27 @@ impl Database {
             "DELETE FROM friend_requests WHERE sender_hash = ?1",
             params![user_hash],
         )?;
-        // Only worth a courier if we know where to send it. A request that
-        // arrived without a usable address is still rejected locally — the
-        // queue is about delivery, not about the decision.
-        if !last_ip.is_empty() && last_port > 0 {
+        // Remembered past the decline's delivery, which clears its queue row:
+        // a member replaying the room envelope the request came in, before it
+        // ages out, must not put the question back.
+        let now = chrono::Utc::now().timestamp();
+        tx.execute(
+            "DELETE FROM friend_request_refusals WHERE refused_at < ?1",
+            params![now.saturating_sub(FRIEND_REQUEST_REFUSAL_MEMORY_SECS)],
+        )?;
+        tx.execute(
+            "INSERT INTO friend_request_refusals (user_hash, refused_at) VALUES (?1, ?2)
+             ON CONFLICT(user_hash) DO UPDATE SET refused_at = excluded.refused_at",
+            params![user_hash, now],
+        )?;
+        // Only worth a courier if it can reach them: at the address the request
+        // came from, or through the rendezvous, which finds a sender that
+        // proved its key because a sender who has our key publishes pairwise
+        // presence for us. A request that came through a room has only the
+        // second. Anything else is still rejected locally — the queue is about
+        // delivery, not about the decision.
+        let addressed = !last_ip.is_empty() && last_port > 0;
+        if addressed || keyed {
             tx.execute(
                 "INSERT INTO friend_request_declines (user_hash, last_ip, last_port, queued_at) \
                  VALUES (?1, ?2, ?3, ?4) \
@@ -5286,7 +5610,7 @@ impl Database {
             )?;
         }
         tx.commit()?;
-        Ok(!last_ip.is_empty() && last_port > 0)
+        Ok(addressed || keyed)
     }
 
     /// Refusals not yet delivered, as `(user_hash, last_ip, last_port)`.
@@ -5482,6 +5806,33 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// How often a friend has been asked through rooms, and when last, as
+    /// `(asks, asked_at)`. `None` when they are not on the list.
+    pub fn room_friend_request_asks(&self, user_hash: &str) -> anyhow::Result<Option<(i64, i64)>> {
+        let conn = self.conn.lock();
+        Ok(conn
+            .query_row(
+                "SELECT room_asks, room_asked_at FROM friends WHERE user_hash = ?1",
+                params![user_hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn set_room_friend_request_asks(
+        &self,
+        user_hash: &str,
+        asks: i64,
+        asked_at: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE friends SET room_asks = ?2, room_asked_at = ?3 WHERE user_hash = ?1",
+            params![user_hash, asks, asked_at],
+        )?;
+        Ok(())
+    }
+
     /// `(user_hash, nickname, blocked_at)`, most recently blocked first.
     pub fn get_blocked_friends(&self) -> anyhow::Result<Vec<(String, String, i64)>> {
         let conn = self.conn.lock();
@@ -5606,17 +5957,115 @@ impl Database {
         verified: bool,
     ) -> anyhow::Result<bool> {
         let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let queued = Self::add_friend_request_in(
+            &tx,
+            sender_hash,
+            sender_pubkey,
+            nickname,
+            sender_ip,
+            sender_port,
+            verified,
+            "",
+            chrono::Utc::now().timestamp(),
+        )?;
+        if queued {
+            tx.commit()?;
+        }
+        Ok(queued)
+    }
+
+    /// Queue a friend request that reached us through room `channel_id`, in an
+    /// envelope dated `sent_at`. `Ok(false)` when it is not queued.
+    ///
+    /// Held to more than a request from a session, because any key a room will
+    /// carry can send one and nobody but the recipient sees it: it must not
+    /// come from someone already on our list or asked to go away, the room may
+    /// only bring [`ROOM_FRIEND_REQUESTS_PER_ROOM_HOUR`] new ones an hour, and
+    /// a full table makes room for it only at the expense of other room or
+    /// unverified requests, never one a session proved.
+    pub fn add_room_friend_request(
+        &self,
+        sender_hash: &str,
+        sender_pubkey: &[u8; 32],
+        nickname: &str,
+        channel_id: &str,
+        sent_at: i64,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let listed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM friends WHERE user_hash = ?1)
+                 OR EXISTS(SELECT 1 FROM friend_request_declines WHERE user_hash = ?1)
+                 OR EXISTS(SELECT 1 FROM friend_request_refusals
+                           WHERE user_hash = ?1 AND refused_at + ?3 >= ?2)",
+            params![
+                sender_hash,
+                sent_at,
+                crate::network::ember::channel::CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS
+            ],
+            |row| row.get(0),
+        )?;
+        if listed {
+            return Ok(false);
+        }
+        let present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM friend_requests WHERE sender_hash = ?1)",
+            params![sender_hash],
+            |row| row.get(0),
+        )?;
+        if !present {
+            let recent: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM friend_requests WHERE via_room = ?1 AND received_at > ?2",
+                params![channel_id, now.saturating_sub(3600)],
+                |row| row.get(0),
+            )?;
+            if recent >= ROOM_FRIEND_REQUESTS_PER_ROOM_HOUR {
+                return Ok(false);
+            }
+        }
+        let queued = Self::add_friend_request_in(
+            &tx,
+            sender_hash,
+            Some(sender_pubkey),
+            nickname,
+            "",
+            0,
+            true,
+            channel_id,
+            now,
+        )?;
+        if queued {
+            tx.commit()?;
+        }
+        Ok(queued)
+    }
+
+    /// Everything [`Self::add_friend_request`] writes, inside the caller's
+    /// transaction. `via_room` is the room a request came through, empty for
+    /// one from a session.
+    #[allow(clippy::too_many_arguments)]
+    fn add_friend_request_in(
+        tx: &Connection,
+        sender_hash: &str,
+        sender_pubkey: Option<&[u8; 32]>,
+        nickname: &str,
+        sender_ip: &str,
+        sender_port: u16,
+        verified: bool,
+        via_room: &str,
+        now: i64,
+    ) -> anyhow::Result<bool> {
         // The network ingress normalizes this already, but keep the storage
         // boundary bounded for future callers and migrations that bypass the
         // live event path.
         let nickname = crate::security::sanitize_inbound_friend_nickname(nickname);
-        let now = chrono::Utc::now().timestamp();
-        let tx = conn.transaction()?;
 
         // Authoritative block test. Callers check first to avoid the work of
         // queueing and notifying, but this is the one that decides, because
         // it cannot be raced by a block committing mid-flight.
-        if Self::blocked_in(&tx, sender_hash)? {
+        if Self::blocked_in(tx, sender_hash)? {
             return Ok(false);
         }
 
@@ -5628,12 +6077,14 @@ impl Database {
         // sea of spoofed ones in the UI list. We pick 100 unique
         // pending requests as a generous practical ceiling. When
         // overflowing, evict the oldest **unverified** rows first,
-        // then the oldest verified row only if every row is
-        // verified (which keeps a real request from being
-        // displaced by a flood of unverified noise). A repeat
-        // request from a sender already present is exempt from
-        // the cap — it just refreshes the existing row via the
-        // UPSERT.
+        // then the oldest that came through a room, and only then
+        // — and only for a request from a session — the oldest
+        // verified one. A request through a room is proven by a key
+        // anyone can mint, so it may displace noise and its own kind
+        // but never a request a session proved; with nothing it may
+        // displace, it is refused. A repeat request from a sender
+        // already present is exempt from the cap — it just refreshes
+        // the existing row via the UPSERT.
         const MAX_FRIEND_REQUESTS: i64 = 100;
         let already_present: i64 = tx
             .query_row(
@@ -5647,26 +6098,33 @@ impl Database {
                 .query_row("SELECT COUNT(*) FROM friend_requests", [], |row| row.get(0))
                 .unwrap_or(0);
             if total >= MAX_FRIEND_REQUESTS {
-                let to_evict = (total - MAX_FRIEND_REQUESTS + 1).max(1);
-                let evicted_unverified = tx.execute(
-                    "DELETE FROM friend_requests WHERE sender_hash IN (
-                        SELECT sender_hash FROM friend_requests
-                        WHERE COALESCE(verified, 0) = 0
-                        ORDER BY received_at ASC
-                        LIMIT ?1
-                    )",
-                    params![to_evict],
-                )? as i64;
-                let remaining = to_evict - evicted_unverified;
-                if remaining > 0 {
-                    tx.execute(
-                        "DELETE FROM friend_requests WHERE sender_hash IN (
-                            SELECT sender_hash FROM friend_requests
-                            ORDER BY received_at ASC
-                            LIMIT ?1
-                        )",
+                let mut remaining = (total - MAX_FRIEND_REQUESTS + 1).max(1);
+                let mut tiers = vec![
+                    "COALESCE(verified, 0) = 0",
+                    "COALESCE(verified, 0) != 0 AND via_room != ''",
+                ];
+                if via_room.is_empty() {
+                    tiers.push("1");
+                }
+                for tier in tiers {
+                    if remaining <= 0 {
+                        break;
+                    }
+                    // `tier` is one of the literals above, never input.
+                    remaining -= tx.execute(
+                        &format!(
+                            "DELETE FROM friend_requests WHERE sender_hash IN (
+                                SELECT sender_hash FROM friend_requests
+                                WHERE {tier}
+                                ORDER BY received_at ASC
+                                LIMIT ?1
+                            )"
+                        ),
                         params![remaining],
-                    )?;
+                    )? as i64;
+                }
+                if remaining > 0 {
+                    return Ok(false);
                 }
             }
         }
@@ -5685,20 +6143,42 @@ impl Database {
         // The same goes for the fields an accept acts on: an unverified
         // request must not repoint a verified one's nickname or address,
         // since accepting it would dial whatever the spoofer supplied.
+        //
+        // A request that carries no address — one through a room — leaves a
+        // verified address where it is, and does not rename a verified request
+        // a session made: the nickname a session carried is the one they
+        // chose, the room's is only what that room calls them. Which kind a row
+        // counts as follows whatever verified it, so the eviction order above
+        // cannot be climbed by pairing a room request with an unproven one.
         tx.execute(
-            "INSERT INTO friend_requests (sender_hash, sender_nickname, received_at, sender_ip, sender_port, verified, sender_pubkey)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO friend_requests (sender_hash, sender_nickname, received_at, sender_ip, sender_port, verified, sender_pubkey, via_room)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(sender_hash) DO UPDATE SET
-             sender_nickname = CASE WHEN excluded.verified = 0 AND COALESCE(friend_requests.verified, 0) != 0
-                THEN friend_requests.sender_nickname ELSE excluded.sender_nickname END,
-             sender_ip = CASE WHEN excluded.verified = 0 AND COALESCE(friend_requests.verified, 0) != 0
-                THEN friend_requests.sender_ip ELSE excluded.sender_ip END,
-             sender_port = CASE WHEN excluded.verified = 0 AND COALESCE(friend_requests.verified, 0) != 0
-                THEN friend_requests.sender_port ELSE excluded.sender_port END,
+             sender_nickname = CASE
+                WHEN COALESCE(friend_requests.verified, 0) != 0
+                     AND (excluded.verified = 0
+                          OR (excluded.via_room != '' AND friend_requests.via_room = ''))
+                    THEN friend_requests.sender_nickname
+                ELSE excluded.sender_nickname END,
+             sender_ip = CASE
+                WHEN COALESCE(friend_requests.verified, 0) != 0
+                     AND (excluded.verified = 0 OR COALESCE(excluded.sender_ip, '') = '')
+                    THEN friend_requests.sender_ip
+                ELSE excluded.sender_ip END,
+             sender_port = CASE
+                WHEN COALESCE(friend_requests.verified, 0) != 0
+                     AND (excluded.verified = 0 OR COALESCE(excluded.sender_ip, '') = '')
+                    THEN friend_requests.sender_port
+                ELSE excluded.sender_port END,
              verified = MAX(COALESCE(friend_requests.verified, 0), excluded.verified),
              sender_pubkey = CASE WHEN excluded.verified != 0
                 THEN COALESCE(excluded.sender_pubkey, friend_requests.sender_pubkey)
-                ELSE friend_requests.sender_pubkey END",
+                ELSE friend_requests.sender_pubkey END,
+             via_room = CASE
+                WHEN excluded.verified != 0 AND excluded.via_room = '' THEN ''
+                WHEN excluded.verified != 0 AND COALESCE(friend_requests.verified, 0) = 0
+                    THEN excluded.via_room
+                ELSE friend_requests.via_room END",
             params![
                 sender_hash,
                 nickname,
@@ -5706,10 +6186,10 @@ impl Database {
                 sender_ip,
                 sender_port as i64,
                 verified as i64,
-                sender_pubkey.map(|key| key.as_slice())
+                sender_pubkey.map(|key| key.as_slice()),
+                via_room
             ],
         )?;
-        tx.commit()?;
         Ok(true)
     }
 
@@ -7983,6 +8463,32 @@ impl Database {
         Ok(rows)
     }
 
+    /// Rooms this device is in with `member_pubkey`, where neither of us is
+    /// banned and they have been seen, most recently seen there first.
+    pub fn rooms_shared_with(
+        &self,
+        member_pubkey: &str,
+        our_pubkey: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT c.channel_id FROM channel_members m
+             JOIN channels c ON c.channel_id = m.channel_id
+             WHERE lower(m.member_pubkey) = lower(?1) AND m.banned = 0 AND m.last_seen > 0
+               AND c.in_room = 1 AND c.deleted = 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM channel_members us
+                   WHERE us.channel_id = c.channel_id
+                     AND lower(us.member_pubkey) = lower(?2) AND us.banned = 1)
+             ORDER BY m.last_seen DESC LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![member_pubkey, our_pubkey, limit as i64], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn channel_member_is_banned(
         &self,
         channel_id: &str,
@@ -8229,25 +8735,193 @@ impl Database {
         invites_owner_only: Option<bool>,
         slow_mode_secs: Option<u16>,
     ) -> anyhow::Result<bool> {
+        let snapshot = ModerationSnapshot {
+            topic,
+            welcome,
+            banned_pubkeys,
+            moderator_pubkeys,
+            owner_pubkey,
+            successor_nominee,
+            claim_after_days,
+            key_epoch,
+            invites_owner_only,
+            slow_mode_secs,
+        };
         let conn = self.conn.lock();
-        let current: i64 = conn
+        let tx = conn.unchecked_transaction()?;
+        let applied = Self::apply_channel_moderation_locked(
+            &tx,
+            channel_id,
+            &snapshot,
+            timestamp,
+            ModerationOrder::Local,
+        )?;
+        if applied {
+            tx.commit()?;
+            bump_channel_roster_generation(channel_id);
+        }
+        Ok(applied)
+    }
+
+    /// [`Self::apply_channel_moderation`] for a snapshot fetched from the
+    /// network, which is ordered by its signature as well as its stamp.
+    ///
+    /// On a room this device owns, only a snapshot stamped after everything it
+    /// has signed or applied itself is taken. Anything else is its own earlier
+    /// work coming back, and applying it would roll back whatever the owner
+    /// changed since.
+    pub fn ingest_channel_moderation(
+        &self,
+        channel_id: &str,
+        snapshot: &ModerationSnapshot<'_>,
+        timestamp: i64,
+        signature: &[u8; 64],
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let applied = Self::apply_channel_moderation_locked(
+            &tx,
+            channel_id,
+            snapshot,
+            timestamp,
+            ModerationOrder::Fetched(signature),
+        )?;
+        if applied {
+            tx.commit()?;
+            bump_channel_roster_generation(channel_id);
+        }
+        Ok(applied)
+    }
+
+    /// Stamp and apply an owner's edit to a room it owns in one step, with the
+    /// room policy that rides the same record, and return the stamp its record
+    /// must be signed with. `None` when the room is not on this device.
+    ///
+    /// One step so the owner's republish, which stamps and then reads, either
+    /// reads this edit or is stamped before it: a republish of the state before
+    /// the edit can never carry the later stamp and undo it for the room.
+    ///
+    /// Applied whatever this device already holds. The owner is the authority,
+    /// and after a stamp from a clock that ran fast (see
+    /// [`Self::stamp_owner_snapshot`]) its own last snapshot can be dated after
+    /// the edit it is making now.
+    pub fn commit_owner_channel_moderation(
+        &self,
+        channel_id: &str,
+        snapshot: &ModerationSnapshot<'_>,
+        policy: &OwnerRoomPolicy<'_>,
+        now: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let Some(stamp) = Self::stamp_owner_snapshot_locked(&tx, channel_id, now)? else {
+            return Ok(None);
+        };
+        if !Self::apply_channel_moderation_locked(
+            &tx,
+            channel_id,
+            snapshot,
+            stamp,
+            ModerationOrder::OwnerEdit,
+        )? {
+            return Ok(None);
+        }
+        Self::apply_owner_room_policy_locked(&tx, channel_id, policy)?;
+        tx.commit()?;
+        bump_channel_roster_generation(channel_id);
+        Ok(Some(stamp))
+    }
+
+    /// The stamp for the next moderation snapshot this device signs for a room
+    /// it owns: `now`, or one past the newest it has signed or applied when that
+    /// is not already behind. Stored, so neither a restart nor a republish in
+    /// the same second as an edit can repeat one. `None` when the room is not on
+    /// this device.
+    ///
+    /// A stored stamp more than [`OWNER_STAMP_MAX_LEAD_SECS`] ahead of now was
+    /// taken while this clock ran fast. Counting on from it would date every
+    /// later snapshot that far ahead, which storers refuse past an hour, so the
+    /// room's bans and topic would stop reaching anyone until real time caught
+    /// up. Such a stamp is dropped and counting restarts from now.
+    pub fn stamp_owner_snapshot(&self, channel_id: &str, now: i64) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock();
+        Self::stamp_owner_snapshot_locked(&conn, channel_id, now)
+    }
+
+    fn stamp_owner_snapshot_locked(
+        conn: &Connection,
+        channel_id: &str,
+        now: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        Ok(conn
             .query_row(
-                "SELECT moderation_updated_at FROM channels WHERE channel_id = ?1",
-                params![channel_id],
+                "UPDATE channels SET owner_snapshot_at = MAX(?2, 1 + MAX(
+                    CASE WHEN owner_snapshot_at <= ?2 + ?3 THEN owner_snapshot_at ELSE 0 END,
+                    CASE WHEN moderation_updated_at <= ?2 + ?3 THEN moderation_updated_at ELSE 0 END))
+                 WHERE channel_id = ?1
+                 RETURNING owner_snapshot_at",
+                params![channel_id, now, OWNER_STAMP_MAX_LEAD_SECS],
                 |row| row.get(0),
             )
-            .optional()?
-            .unwrap_or(0);
-        if timestamp < current {
+            .optional()?)
+    }
+
+    /// Everything [`Self::apply_channel_moderation`] writes, inside the
+    /// caller's transaction. The caller commits and bumps the roster.
+    fn apply_channel_moderation_locked(
+        tx: &Connection,
+        channel_id: &str,
+        snapshot: &ModerationSnapshot<'_>,
+        timestamp: i64,
+        order: ModerationOrder<'_>,
+    ) -> anyhow::Result<bool> {
+        let ModerationSnapshot {
+            topic,
+            welcome,
+            banned_pubkeys,
+            moderator_pubkeys,
+            owner_pubkey,
+            successor_nominee,
+            claim_after_days,
+            key_epoch,
+            invites_owner_only,
+            slow_mode_secs,
+        } = *snapshot;
+        let held: Option<(i64, Option<Vec<u8>>, i64, bool)> = tx
+            .query_row(
+                "SELECT moderation_updated_at, moderation_sig, owner_snapshot_at, is_owner
+                 FROM channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)? != 0)),
+            )
+            .optional()?;
+        let Some((current, held_sig, owner_signed_at, is_owner)) = held else {
+            return Ok(false);
+        };
+        let held_sig = held_sig.and_then(|sig| <[u8; 64]>::try_from(sig).ok());
+        let (takes, signature) = match order {
+            ModerationOrder::Local => (timestamp >= current, None),
+            ModerationOrder::Fetched(sig) => (
+                crate::network::ember::dht::publish::moderation_supersedes(
+                    timestamp,
+                    sig,
+                    current,
+                    held_sig.as_ref(),
+                ) && !(is_owner && timestamp <= current.max(owner_signed_at)),
+                Some(sig),
+            ),
+            ModerationOrder::OwnerEdit => (true, None),
+        };
+        if !takes {
             return Ok(false);
         }
         let topic = crate::security::sanitize_remote_text(topic, 64);
         let welcome = crate::security::sanitize_remote_text(welcome, 512);
-        let tx = conn.unchecked_transaction()?;
         let n = tx.execute(
-            "UPDATE channels SET topic = ?2, welcome = ?3, moderation_updated_at = ?4
+            "UPDATE channels SET topic = ?2, welcome = ?3, moderation_updated_at = ?4,
+                moderation_sig = ?5
              WHERE channel_id = ?1",
-            params![channel_id, topic, welcome, timestamp],
+            params![channel_id, topic, welcome, timestamp, signature.map(|s| s.as_slice())],
         )?;
         if n == 0 {
             return Ok(false);
@@ -8351,8 +9025,6 @@ impl Database {
             "UPDATE channels SET slow_mode_secs = ?2 WHERE channel_id = ?1",
             params![channel_id, i64::from(slow_mode_secs.unwrap_or(0))],
         )?;
-        tx.commit()?;
-        bump_channel_roster_generation(channel_id);
         Ok(true)
     }
 
@@ -8393,23 +9065,41 @@ impl Database {
         pinned_msg_ids: &[[u8; 16]],
         language: Option<&str>,
     ) -> anyhow::Result<bool> {
-        let pins = pinned_msg_ids
+        let conn = self.conn.lock();
+        let changed = Self::apply_owner_room_policy_locked(
+            &conn,
+            channel_id,
+            &OwnerRoomPolicy {
+                announce_only,
+                pinned_msg_ids,
+                language,
+            },
+        )?;
+        drop(conn);
+        if changed {
+            bump_channel_roster_generation(channel_id);
+        }
+        Ok(changed)
+    }
+
+    fn apply_owner_room_policy_locked(
+        conn: &Connection,
+        channel_id: &str,
+        policy: &OwnerRoomPolicy<'_>,
+    ) -> anyhow::Result<bool> {
+        let pins = policy
+            .pinned_msg_ids
             .iter()
             .map(hex::encode)
             .collect::<Vec<_>>()
             .join(",");
-        let language = language.unwrap_or("");
-        let conn = self.conn.lock();
+        let language = policy.language.unwrap_or("");
         let changed = conn.execute(
             "UPDATE channels SET announce_only = ?2, pinned_msg_ids = ?3, language = ?4
              WHERE channel_id = ?1
                AND (announce_only <> ?2 OR pinned_msg_ids <> ?3 OR language <> ?4)",
-            params![channel_id, i64::from(announce_only), pins, language],
+            params![channel_id, i64::from(policy.announce_only), pins, language],
         )?;
-        drop(conn);
-        if changed > 0 {
-            bump_channel_roster_generation(channel_id);
-        }
         Ok(changed > 0)
     }
 
@@ -10144,7 +10834,9 @@ mod tests {
                 last_port INTEGER DEFAULT 0,
                 last_seen INTEGER DEFAULT 0,
                 mutual INTEGER NOT NULL DEFAULT 0,
-                ed25519_pubkey BLOB
+                ed25519_pubkey BLOB,
+                room_asks INTEGER NOT NULL DEFAULT 0,
+                room_asked_at INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE friend_requests (
                 sender_hash TEXT PRIMARY KEY,
@@ -10153,7 +10845,12 @@ mod tests {
                 sender_ip TEXT DEFAULT '',
                 sender_port INTEGER DEFAULT 0,
                 verified INTEGER NOT NULL DEFAULT 0,
-                sender_pubkey BLOB
+                sender_pubkey BLOB,
+                via_room TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE friend_request_refusals (
+                user_hash TEXT PRIMARY KEY,
+                refused_at INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE chat_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -10883,6 +11580,146 @@ mod tests {
         assert!(db.pending_friend_request_declines().expect("list").is_empty());
         // And a request that was never there is not an error either.
         assert!(!db.reject_and_queue_friend_decline("66").expect("reject none"));
+    }
+
+    /// A request that came through a room has no address but a proven key, and
+    /// the rendezvous finds a sender like that, so its refusal is still owed.
+    #[test]
+    fn rejecting_a_keyed_request_without_an_address_still_owes_a_decline() {
+        let db = friends_only_db();
+        db.add_friend_request("99", Some(&[7u8; 32]), "Roomie", "", 0, true)
+            .expect("seed request");
+        assert!(db.reject_and_queue_friend_decline("99").expect("reject"));
+        let queued = db.pending_friend_request_declines().expect("list");
+        assert_eq!(queued.len(), 1);
+        assert_eq!((queued[0].0.as_str(), queued[0].1.as_str(), queued[0].2), ("99", "", 0));
+
+        // Unproven, the key is only a claim, and nothing is owed.
+        db.add_friend_request("98", Some(&[8u8; 32]), "Claim", "", 0, false)
+            .expect("seed unverified request");
+        assert!(!db.reject_and_queue_friend_decline("98").expect("reject"));
+        assert_eq!(db.pending_friend_request_declines().expect("list").len(), 1);
+    }
+
+    fn room_request(db: &Database, hash: &str, room: &str, now: i64) -> bool {
+        db.add_room_friend_request(hash, &[3u8; 32], "Roomie", room, now, now)
+            .expect("room request")
+    }
+
+    fn via_room_of(db: &Database, hash: &str) -> String {
+        db.conn
+            .lock()
+            .query_row(
+                "SELECT via_room FROM friend_requests WHERE sender_hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .expect("row")
+    }
+
+    /// Room requests can be minted by any key, so a full table takes one only
+    /// at the expense of other room or unproven requests, never a session's
+    /// verified one; a session's request makes room the other way.
+    #[test]
+    fn room_requests_never_displace_a_sessions_verified_one() {
+        let db = friends_only_db();
+        let now = 1_700_000_000;
+        for i in 0..100 {
+            db.add_friend_request(&format!("s{i:02}"), None, "Real", "1.2.3.4", 4662, true)
+                .expect("session request");
+        }
+        let held = |hash: &str| {
+            row_count(
+                &db,
+                &format!("SELECT COUNT(*) FROM friend_requests WHERE sender_hash = '{hash}'"),
+            )
+        };
+        assert!(!room_request(&db, "r0", "room-a", now), "nothing it may displace");
+        assert_eq!(row_count(&db, "SELECT COUNT(*) FROM friend_requests"), 100);
+        assert_eq!(held("r0"), 0);
+
+        db.conn
+            .lock()
+            .execute("DELETE FROM friend_requests WHERE sender_hash = 's00'", [])
+            .unwrap();
+        assert!(room_request(&db, "r1", "room-a", now));
+        assert!(room_request(&db, "r2", "room-b", now), "another room request may go");
+        assert_eq!(held("r1"), 0);
+        assert!(db
+            .add_friend_request("s00", None, "Real", "1.2.3.4", 4662, true)
+            .expect("session request"));
+        assert_eq!(
+            row_count(&db, "SELECT COUNT(*) FROM friend_requests WHERE via_room != ''"),
+            0,
+            "a session's request makes room by displacing a room one"
+        );
+    }
+
+    #[test]
+    fn a_room_brings_only_its_hourly_share_of_new_requests() {
+        let db = friends_only_db();
+        let now = 1_700_000_000;
+        for i in 0..ROOM_FRIEND_REQUESTS_PER_ROOM_HOUR {
+            assert!(room_request(&db, &format!("a{i}"), "room-a", now));
+        }
+        assert!(!room_request(&db, "late", "room-a", now));
+        assert!(room_request(&db, "a0", "room-a", now + 10), "a repeat only refreshes");
+        assert!(room_request(&db, "b0", "room-b", now), "another room has its own share");
+        assert!(room_request(&db, "late", "room-a", now + 3601), "and it comes back each hour");
+    }
+
+    /// A room request carries no address and only the room's name for them, so
+    /// it leaves what a session's verified request recorded — and on top of an
+    /// unproven one, it is what proved the row, so the row counts as a room's.
+    #[test]
+    fn a_room_request_keeps_what_a_session_proved() {
+        let db = friends_only_db();
+        let now = 1_700_000_000;
+        db.add_friend_request("cc", Some(&[3u8; 32]), "Carol", "1.2.3.4", 4662, true)
+            .expect("session request");
+        assert!(room_request(&db, "cc", "room-a", now));
+        let rows = db.get_friend_requests().expect("list");
+        let (_, nick, _, ip, port, verified) = rows.iter().find(|r| r.0 == "cc").unwrap();
+        assert_eq!(
+            (nick.as_str(), ip.as_str(), *port, *verified),
+            ("Carol", "1.2.3.4", 4662, true)
+        );
+        assert_eq!(via_room_of(&db, "cc"), "");
+
+        db.add_friend_request("dd", None, "Dave?", "6.6.6.6", 6666, false)
+            .expect("unproven request");
+        assert!(room_request(&db, "dd", "room-a", now));
+        let rows = db.get_friend_requests().expect("list");
+        let (_, nick, _, ip, _, verified) = rows.iter().find(|r| r.0 == "dd").unwrap();
+        assert_eq!((nick.as_str(), ip.as_str(), *verified), ("Roomie", "", true));
+        assert_eq!(via_room_of(&db, "dd"), "room-a");
+        db.add_friend_request("dd", None, "Dave?", "6.6.6.6", 6666, false)
+            .expect("unproven again");
+        assert_eq!(via_room_of(&db, "dd"), "room-a", "an unproven request cannot promote it");
+        db.add_friend_request("dd", Some(&[3u8; 32]), "Dave", "5.6.7.8", 4662, true)
+            .expect("verified session");
+        assert_eq!(via_room_of(&db, "dd"), "", "a verified session does");
+    }
+
+    /// A refused sender's envelopes from before the refusal stay refused after
+    /// the decline is delivered, for as long as a room would still accept
+    /// them; one sent afterwards is a new question.
+    #[test]
+    fn a_refused_room_request_cannot_be_replayed_back() {
+        let db = friends_only_db();
+        let sent = chrono::Utc::now().timestamp();
+        assert!(room_request(&db, "ee", "room-a", sent));
+        assert!(db.reject_and_queue_friend_decline("ee").expect("reject"));
+        assert!(!room_request(&db, "ee", "room-a", sent), "while the decline is owed");
+        db.clear_friend_request_decline("ee").expect("delivered");
+        assert!(!room_request(&db, "ee", "room-a", sent), "a replay after delivery");
+        let later = sent + crate::network::ember::channel::CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS + 10;
+        assert!(db
+            .add_room_friend_request("ee", &[3u8; 32], "Roomie", "room-a", later, later)
+            .expect("new request"));
+
+        db.add_friend("ff", "Listed", None).expect("add");
+        assert!(!room_request(&db, "ff", "room-a", sent), "someone already on the list");
     }
 
     /// A second refusal is a new delivery with its own lifetime, not the tail
@@ -12211,6 +13048,299 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
+    fn raw_attachment_fields(
+        db: &Database,
+        xfer: &str,
+    ) -> (String, Option<String>, Option<String>) {
+        db.conn
+            .lock()
+            .query_row(
+                "SELECT file_name, source_path, dest_path FROM chat_attachments WHERE xfer_id = ?1",
+                params![xfer],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("raw row")
+    }
+
+    /// Names and paths are sealed on disk like message bodies, and read back as
+    /// written. Under a key that cannot open them they read as unavailable,
+    /// never as their ciphertext and never as a grant.
+    #[test]
+    fn attachment_names_and_paths_are_sealed_at_rest() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-attach-sealed-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let (sent, received) = ("a1".repeat(16), "b2".repeat(16));
+        let friend = "cd".repeat(8);
+        let now = 1_500_000i64;
+        db.upsert_chat_attachment(
+            &sent, &friend, "sent", "tax-return.pdf", 10, &"11".repeat(32),
+            Some("C:\\Users\\me\\Private\\tax-return.pdf"), "offered", now, now + 600,
+        )
+        .expect("insert sent");
+        db.upsert_chat_attachment(
+            &received, &friend, "received", "photo.jpg", 10, &"22".repeat(32), None, "awaiting",
+            now, now + 600,
+        )
+        .expect("insert received");
+        let landed = Some("D:\\Chat Files\\photo.jpg");
+        assert!(db
+            .advance_chat_attachment(&received, "complete", Some(10), landed)
+            .expect("complete"));
+
+        for xfer in [&sent, &received] {
+            let (name, source, dest) = raw_attachment_fields(&db, xfer);
+            for stored in std::iter::once(name).chain(source).chain(dest) {
+                assert!(stored.starts_with(CHAT_ATTACH_PREFIX), "stored readable: {stored}");
+                for plain in ["tax-return", "Private", "photo", "Chat Files"] {
+                    assert!(!stored.contains(plain));
+                }
+            }
+        }
+        assert_eq!(db.chat_attachment(&sent).unwrap().file_name, "tax-return.pdf");
+        assert_eq!(
+            db.chat_attachment_grant(&sent, &friend, now).unwrap().0,
+            "C:\\Users\\me\\Private\\tax-return.pdf"
+        );
+        let row = db.chat_attachment(&received).unwrap();
+        assert_eq!(row.file_name, "photo.jpg");
+        assert_eq!(row.dest_path.as_deref(), Some("D:\\Chat Files\\photo.jpg"));
+        assert_eq!(db.chat_attachments_for_friend(&friend, 10).unwrap().len(), 2);
+
+        let wrong_key = Database {
+            conn: Mutex::new(Connection::open(&path).expect("second connection")),
+            path: path.clone(),
+            chat_key: Some(Zeroizing::new([0x5A; 32])),
+            corrupt_backup: None,
+        };
+        let row = wrong_key.chat_attachment(&received).unwrap();
+        assert_eq!(row.file_name, CHAT_ATTACH_UNAVAILABLE_NAME);
+        assert_eq!(row.dest_path, None);
+        assert!(wrong_key.chat_attachment_grant(&sent, &friend, now).is_none());
+
+        drop(wrong_key);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// v60 seals the rows an older build left readable, and until it has run a
+    /// readable row still reads.
+    #[test]
+    fn v60_seals_attachment_rows_written_before_it() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-attach-v60-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let xfer = "c3".repeat(16);
+        let friend = "de".repeat(8);
+        db.conn
+            .lock()
+            .execute_batch(&format!(
+                "INSERT INTO chat_attachments (
+                    xfer_id, friend_hash, direction, file_name, file_size, root_hash,
+                    source_path, dest_path, status, transferred, created_at, expires_at
+                 ) VALUES ('{xfer}', '{friend}', 'sent', 'old.txt', 3, '{root}',
+                    'C:\\old\\old.txt', 'C:\\dl\\old.txt', 'offered', 0, 10, 99999999999);
+                 DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES (59);",
+                root = "33".repeat(32),
+            ))
+            .expect("plant a v59 row");
+        let row = db.chat_attachment(&xfer).expect("a readable row still reads");
+        assert_eq!(row.file_name, "old.txt");
+        assert_eq!(row.dest_path.as_deref(), Some("C:\\dl\\old.txt"));
+        drop(db);
+
+        let db = Database::open_at(&path).expect("reopen and migrate");
+        assert_eq!(db.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
+        let (name, source, dest) = raw_attachment_fields(&db, &xfer);
+        assert!(name.starts_with(CHAT_ATTACH_PREFIX));
+        assert!(source.unwrap().starts_with(CHAT_ATTACH_PREFIX));
+        assert!(dest.unwrap().starts_with(CHAT_ATTACH_PREFIX));
+        let row = db.chat_attachment(&xfer).unwrap();
+        assert_eq!(row.file_name, "old.txt");
+        assert_eq!(row.dest_path.as_deref(), Some("C:\\dl\\old.txt"));
+        assert_eq!(db.chat_attachment_grant(&xfer, &friend, 20).unwrap().0, "C:\\old\\old.txt");
+        {
+            let conn = db.conn.lock();
+            assert!(Database::database_holds_chat_ciphertext(&conn).unwrap());
+        }
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn owned_room_db(tag: &str, is_owner: bool) -> (Database, std::path::PathBuf, String) {
+        let path = std::env::temp_dir().join(format!(
+            "ember-moderation-{tag}-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "ab".repeat(16);
+        db.insert_channel(&channel_id, &"cd".repeat(32), "Lobby", "public", is_owner, None, None)
+            .expect("insert channel");
+        (db, path, channel_id)
+    }
+
+    fn drop_db(db: Database, path: &std::path::Path) {
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn topic_only(topic: &str) -> ModerationSnapshot<'_> {
+        ModerationSnapshot {
+            topic,
+            welcome: "",
+            banned_pubkeys: &[],
+            moderator_pubkeys: &[],
+            owner_pubkey: None,
+            successor_nominee: None,
+            claim_after_days: None,
+            key_epoch: None,
+            invites_owner_only: None,
+            slow_mode_secs: None,
+        }
+    }
+
+    const NO_POLICY: OwnerRoomPolicy<'static> = OwnerRoomPolicy {
+        announce_only: false,
+        pinned_msg_ids: &[],
+        language: None,
+    };
+
+    /// Every snapshot an owner signs gets a stamp of its own, however many land
+    /// in one second, and never one at or behind what it already holds.
+    #[test]
+    fn owner_snapshot_stamps_never_repeat() {
+        let (db, path, id) = owned_room_db("stamps", true);
+        let now = 1_700_000_000i64;
+        let first = db.stamp_owner_snapshot(&id, now).unwrap().unwrap();
+        assert_eq!(first, now);
+        let edit = db
+            .commit_owner_channel_moderation(&id, &topic_only("edit"), &NO_POLICY, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(edit, now + 1);
+        let republish = db.stamp_owner_snapshot(&id, now).unwrap().unwrap();
+        assert_eq!(republish, now + 2);
+        assert_eq!(db.stamp_owner_snapshot(&id, now + 60).unwrap(), Some(now + 60));
+        assert_eq!(db.stamp_owner_snapshot(&"ee".repeat(16), now).unwrap(), None);
+        assert_eq!(db.get_channel(&id).unwrap().unwrap().topic, "edit");
+        drop_db(db, &path);
+    }
+
+    /// A stamp taken while the clock ran hours fast is not counted on from once
+    /// it is corrected — storers would refuse everything after it — and the
+    /// owner can still edit, although its last snapshot is dated after now.
+    #[test]
+    fn a_stamp_from_a_fast_clock_is_not_counted_on_from() {
+        let (db, path, id) = owned_room_db("fast-clock", true);
+        let now = 1_700_000_000i64;
+        let fast = now + 5 * 3600;
+        let ahead = db
+            .commit_owner_channel_moderation(&id, &topic_only("while fast"), &NO_POLICY, fast)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ahead, fast);
+        assert_eq!(db.stamp_owner_snapshot(&id, now).unwrap(), Some(now));
+        assert_eq!(db.stamp_owner_snapshot(&id, now).unwrap(), Some(now + 1), "and counts on");
+        let edit = db
+            .commit_owner_channel_moderation(&id, &topic_only("corrected"), &NO_POLICY, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(edit, now + 2);
+        assert_eq!(db.get_channel(&id).unwrap().unwrap().topic, "corrected");
+        // A stamp only a little ahead is still counted on from.
+        assert_eq!(db.stamp_owner_snapshot(&id, now - 60).unwrap(), Some(now + 3));
+        drop_db(db, &path);
+    }
+
+    /// The pins, posting rule and language an edit carries are stored with it,
+    /// so a republish can never read the moderation fields without them.
+    #[test]
+    fn an_owner_edit_stores_its_room_policy_in_the_same_write() {
+        let (db, path, id) = owned_room_db("policy", true);
+        let pins = [[0xA1u8; 16]];
+        let policy = OwnerRoomPolicy {
+            announce_only: true,
+            pinned_msg_ids: &pins,
+            language: Some("fr"),
+        };
+        db.commit_owner_channel_moderation(&id, &topic_only("rules"), &policy, 1_700_000_000)
+            .unwrap()
+            .unwrap();
+        let row = db.get_channel(&id).unwrap().unwrap();
+        assert!(row.announce_only);
+        assert_eq!(row.pinned_msg_ids, vec!["a1".repeat(16)]);
+        assert_eq!(row.language, "fr");
+        assert!(db
+            .commit_owner_channel_moderation(&"ee".repeat(16), &topic_only("x"), &policy, 1)
+            .unwrap()
+            .is_none());
+        drop_db(db, &path);
+    }
+
+    /// Two snapshots from one second leave every member holding the same one,
+    /// whichever arrived first.
+    #[test]
+    fn same_second_snapshots_settle_on_the_larger_signature() {
+        let (low, high) = ([0x10u8; 64], [0x20u8; 64]);
+        let at = 1_700_000_000i64;
+        let orders = [(("low", &low), ("high", &high)), (("high", &high), ("low", &low))];
+        for (first, second) in orders {
+            let (db, path, id) = owned_room_db("tie", false);
+            assert!(db.ingest_channel_moderation(&id, &topic_only(first.0), at, first.1).unwrap());
+            let replaced = db
+                .ingest_channel_moderation(&id, &topic_only(second.0), at, second.1)
+                .unwrap();
+            assert_eq!(replaced, second.0 == "high");
+            assert_eq!(db.get_channel(&id).unwrap().unwrap().topic, "high");
+            assert!(
+                !db.ingest_channel_moderation(&id, &topic_only("older"), at - 1, &[0xFF; 64])
+                    .unwrap(),
+                "an older stamp never wins on signature"
+            );
+            drop_db(db, &path);
+        }
+    }
+
+    /// The owner's device never lets one of its own snapshots coming back from
+    /// the network roll back what it has changed since.
+    #[test]
+    fn an_owner_does_not_reapply_its_own_snapshot() {
+        let (db, path, id) = owned_room_db("owner", true);
+        let now = 1_700_000_000i64;
+        let stamp = db
+            .commit_owner_channel_moderation(&id, &topic_only("current"), &NO_POLICY, now)
+            .unwrap()
+            .unwrap();
+        for (at, sig) in [(stamp, [0xFFu8; 64]), (stamp - 1, [0xFF; 64])] {
+            assert!(!db.ingest_channel_moderation(&id, &topic_only("stale"), at, &sig).unwrap());
+        }
+        let republished = db.stamp_owner_snapshot(&id, now).unwrap().unwrap();
+        assert!(
+            !db.ingest_channel_moderation(&id, &topic_only("stale"), republished, &[0xFF; 64])
+                .unwrap(),
+            "a republish it signed is its own work too"
+        );
+        assert_eq!(db.get_channel(&id).unwrap().unwrap().topic, "current");
+        drop_db(db, &path);
+    }
+
     /// The receiving side has no source path, so it must never look like a
     /// grant — otherwise receiving a file would authorize serving one.
     #[test]
@@ -13080,8 +14210,7 @@ mod tests {
         drop(db);
 
         let db = Database::open_at(&path).expect("reopen and migrate");
-        assert_eq!(db.schema_version(), 59);
-        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 59);
+        assert_eq!(db.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
         let row = db.get_channel(&channel_id).unwrap().unwrap();
         assert_eq!(row.language, "", "an upgraded room has no default language");
 

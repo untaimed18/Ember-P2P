@@ -37,6 +37,8 @@
   import { cancelIncomingCollection, presentIncomingCollection } from '$lib/stores/collection';
   import { toastSuccess, toastError } from '$lib/stores/toast';
   import { codedErrorOf, translateError } from '$lib/i18n';
+  import { serverMetDownloadedText } from '$lib/commandReplies';
+  import { plural } from '$lib/plural';
   import { formatBytes, formatNumber } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
 
@@ -190,21 +192,16 @@
           );
           return 'fail';
         }
-        // A link to a server that is already listed should still connect, so
-        // only the duplicate outcome falls through. That one arrives as the
-        // network task's plain sentence ("Server …:… is already in the list"),
-        // not a coded envelope. Any other failure leaves the server unlisted,
-        // and `connect_to_server` would then refuse with a misleading "add it
-        // first".
+        // A link to a server that is already listed should still connect.
         try {
           await addServer(ip, port, '');
         } catch (e: unknown) {
-          if (codedErrorOf(e)?.code === 'server_add_declined') return 'done';
-          const raw = e instanceof Error ? e.message : typeof e === 'string' ? e : '';
-          if (!/ is already in the list$/.test(raw)) throw e;
+          const code = codedErrorOf(e)?.code;
+          if (code === 'server_add_declined') return 'done';
+          if (code !== 'server_already_listed') throw e;
         }
-        const msg = await connectToServer(ip, port);
-        if (!destroyed) toastSuccess(msg);
+        await connectToServer(ip, port);
+        if (!destroyed) toastSuccess(m.servers_connecting_to({ address: `${ip}:${port}` }));
       } else if (preview.kind === 'serverList') {
         const segs = ed2kSegments(payload); // ['serverlist', url]
         const url = preview.endpoint || segs[1] || '';
@@ -214,8 +211,16 @@
           toastError(m.security_url_must_be_https());
           return 'fail';
         }
-        const msg = await downloadServerMet(url);
-        if (!destroyed) toastSuccess(msg);
+        let reply: string;
+        try {
+          reply = await downloadServerMet(url);
+        } catch (e: unknown) {
+          // Declining the native prompt is the user's answer, like
+          // `server_add_declined` above, not a failure to park for Review.
+          if (codedErrorOf(e)?.code === 'server_met_declined') return 'done';
+          throw e;
+        }
+        if (!destroyed) toastSuccess(serverMetDownloadedText(reply));
       } else if (preview.kind === 'collection') {
         // The native side resolves this durable queue id to the OS-delivered
         // path. Never return the raw path to an unrestricted path-taking IPC
@@ -235,9 +240,12 @@
         }
         await presented;
         if (!destroyed) {
-          toastSuccess(coll.files.length === 1
-            ? m.library_collection_loaded_one({ name: coll.name })
-            : m.library_collection_loaded({ name: coll.name, count: formatNumber(coll.files.length) }));
+          const count = formatNumber(coll.files.length);
+          toastSuccess(plural(coll.files.length, {
+            one: () => m.library_collection_loaded_one({ name: coll.name }),
+            few: () => m.library_collection_loaded_few({ name: coll.name, count }),
+            other: () => m.library_collection_loaded({ name: coll.name, count }),
+          }));
         }
       } else if (preview.kind === 'channel') {
         await goto(`/channels?join=${encodeURIComponent(payload)}`);
@@ -421,9 +429,11 @@
 {#if deferredCount > 0}
   <div class="deferred-link-notice" role="status" aria-live="polite">
     <span>
-      {deferredCount === 1
-        ? m.deeplink_pending_one()
-        : m.deeplink_pending_other({ count: deferredCount })}
+      {plural(deferredCount, {
+        one: m.deeplink_pending_one,
+        few: () => m.deeplink_pending_few({ count: deferredCount }),
+        other: () => m.deeplink_pending_other({ count: deferredCount }),
+      })}
     </span>
     <button
       type="button"

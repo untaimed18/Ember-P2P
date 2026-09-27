@@ -85,8 +85,14 @@ pub(in crate::network) async fn on_a4af_tick(
     }
 
     // Feed NNP sources from persistent per-file lists into A4AF.
-    // A source with NNP on file X should be offered to all OTHER
-    // active downloads, not back to file X itself.
+    // A source with NNP on file X is offered only to the OTHER
+    // downloads it is already a known source for, as eMule's A4AF
+    // lists hold only clients independently found for that file
+    // (`AddRequestForAnotherFile`, DownloadQueue.cpp:497, :584).
+    // Offering it to every download made us ask peers for files they
+    // never had: each such request is a `CheckFailedFileIdReqs` strike
+    // toward eMule's "FileReq flood" ban, and the peer was dropped from
+    // the file it really serves.
     //
     // Both sides are collected before the lock is taken, and the
     // dry list is de-duplicated by address. A peer that has run
@@ -94,27 +100,38 @@ pub(in crate::network) async fn on_a4af_tick(
     // feeding the raw per-file lists in walked every target once
     // per file the peer appeared on, for no added coverage.
     {
-        let all_file_hashes: Vec<[u8; 16]> = state.per_file_sources
-            .values()
-            .map(|pfs| pfs.file_hash)
-            .collect();
+        let mut known_for: HashMap<SocketAddr, Vec<[u8; 16]>> = HashMap::new();
         let mut seen_dry: HashSet<SocketAddr> = HashSet::new();
         let mut dry_sources: Vec<(SocketAddr, [u8; 16])> = Vec::new();
         for pfs in state.per_file_sources.values() {
             for src in &pfs.sources {
+                let addr = SocketAddr::new(src.ip.into(), src.tcp_port);
                 if matches!(src.state, ed2k::sources::DownloadSourceState::NoneNeededParts) {
-                    let addr = SocketAddr::new(src.ip.into(), src.tcp_port);
                     if seen_dry.insert(addr) {
                         dry_sources.push((addr, pfs.file_hash));
                     }
+                } else {
+                    known_for.entry(addr).or_default().push(pfs.file_hash);
                 }
             }
         }
-        if !dry_sources.is_empty() {
-            a4af_shared
-                .write()
-                .await
-                .offer_dry_sources(&all_file_hashes, &dry_sources);
+        let offers: Vec<(Vec<[u8; 16]>, (SocketAddr, [u8; 16]))> = dry_sources
+            .into_iter()
+            .filter_map(|(addr, assigned)| {
+                let targets: Vec<[u8; 16]> = known_for
+                    .get(&addr)?
+                    .iter()
+                    .copied()
+                    .filter(|hash| *hash != assigned)
+                    .collect();
+                (!targets.is_empty()).then_some((targets, (addr, assigned)))
+            })
+            .collect();
+        if !offers.is_empty() {
+            let mut a4af = a4af_shared.write().await;
+            for (targets, dry) in &offers {
+                a4af.offer_dry_sources(targets, std::slice::from_ref(dry));
+            }
         }
     }
 

@@ -629,6 +629,12 @@ pub struct PeerCapabilities {
     pub version_major: u8,
     pub emule_version_min: u8,
     pub version_update: u8,
+    /// eMule's `m_byEmuleVersion`: `0x99` once a Hello carries
+    /// `CT_EMULE_VERSION` (`BaseClient.cpp:539`), otherwise the version byte
+    /// of the peer's EmuleInfo (`:743`), 0 when neither arrived. Only this
+    /// byte, never the Hello's minor version, decides eMule's old-client
+    /// score halving (`UploadClient.cpp:228`).
+    pub emule_version_byte: u8,
     pub mod_version: String,
     pub peer_name: String,
     /// eMule's `m_bEmuleProtocol` / `ExtProtocolAvailable()`
@@ -651,26 +657,6 @@ pub struct PeerCapabilities {
     /// Ed25519 public key for Ember auth, from the same private handshake as
     /// `ember_hash`. The `ET_EMBER_PUBKEY` EmuleInfo harvest was removed too.
     pub ember_pubkey: Option<[u8; 32]>,
-}
-
-/// Build Hello with buddy info tags.
-pub fn build_hello_with_buddy(
-    user_hash: &[u8; 16],
-    client_id: u32,
-    tcp_port: u16,
-    udp_port: u16,
-    nickname: &str,
-    buddy: Option<BuddyInfo>,
-) -> Vec<u8> {
-    build_hello_inner(
-        user_hash,
-        client_id,
-        tcp_port,
-        nickname,
-        true,
-        buddy,
-        &HelloOptions::default_for_udp_port(udp_port),
-    )
 }
 
 pub fn build_hello_with_buddy_opts(
@@ -754,17 +740,11 @@ const MO2_SUPPORT_LARGE_FILES: u32 = 4;
 /// `ET_FEATURES` (0x27) layout. eMule defines exactly two fields
 /// (`BaseClient.cpp:847-853`, whose own comment is the authority here):
 /// bits 0-1 are the SecureIdent level — a value, not a flag, hence no shift —
-/// and **bit 7** is preview. Everything between is "0 - reserved".
-///
-/// Bits 3-5 are Ember's, not eMule's. eMule touches `ET_FEATURES` in exactly
-/// two places — the write at `:723-725` and the read above — and neither knows
-/// about a crypt layer here; it carries those in `CT_EMULE_MISCOPTIONS2`
-/// instead. eMule masks the bits it wants and ignores the rest, so occupying
-/// reserved space costs nothing today, but it is an extension sitting inside a
-/// standard tag rather than a namespaced one, and it is recorded as such.
+/// and **bit 7** is preview. Everything between is "0 - reserved", and we
+/// leave it so: the crypt layer is advertised in `CT_EMULE_MISCOPTIONS2`, as
+/// eMule does, not in this tag.
 const ET_FEATURES_SEC_IDENT_LEVEL: u8 = 3;
 const ET_FEATURES_PREVIEW: u32 = 7;
-const ET_FEATURES_SUPPORTS_CRYPT_LAYER: u32 = 3;
 
 /// Whether a SecureIdent keypair is actually usable this session.
 ///
@@ -801,7 +781,6 @@ fn secident_level() -> u8 {
         0
     }
 }
-const ET_FEATURES_REQUESTS_CRYPT_LAYER: u32 = 4;
 
 /// Compute CT_EMULE_MISCOPTIONS1 matching eMule BaseClient.cpp SendHelloTypePacket.
 ///
@@ -912,11 +891,13 @@ fn build_hello_inner(
     // byte: any non-zero value is treated as a third-party / spoofing
     // client and triggers a silent queue-ban (the peer accepts the
     // connection, answers OP_REQFILENAMEANSWER, then closes the socket
-    // before sending OP_FILESTATUS). We claim eMule 0.50.1 (the last
-    // known-good vanilla build) so anti-leecher version-range heuristics
-    // accept us. Ember-specific identity is exchanged later via
-    // `OP_EMBER_HELLO`, which vanilla peers ignore.
-    let emule_version: u32 = (50u32 << 10) | (1u32 << 7);
+    // before sending OP_FILESTATUS). We claim eMule 0.50a, the last official
+    // build and the one whose Kad v9 and capability set this Hello matches,
+    // so anti-leecher version-range heuristics accept us. The update field is
+    // the letter's offset from 'a' (`Emule.cpp:316`), so it is 0; 1 read as a
+    // "0.50b" that never shipped. Ember-specific identity is exchanged later
+    // via `OP_EMBER_HELLO`, which vanilla peers ignore.
+    let emule_version: u32 = 50u32 << 10;
     write_ed2k_tag(&mut buf, 0xFB, &Ed2kTagValue::Uint32(emule_version));
 
     buf.write_u32::<LittleEndian>(options.server_ip).unwrap();
@@ -985,6 +966,29 @@ pub(super) fn write_ed2k_tag(buf: &mut Vec<u8>, name_id: u8, value: &Ed2kTagValu
     }
 }
 
+/// Whether we, having dialed, should send `OP_EMULEINFO` after reading the
+/// peer's HelloAnswer.
+///
+/// eMule never does as the dialer. Only its listener sends MuleInfo, and only
+/// to an eMule-hash peer whose Hello lacked `CT_EMULE_VERSION`
+/// (`ListenSocket.cpp:272-273`); a Hello with that tag already carries every
+/// capability. We ask that same legacy kind of peer, and Ember 1.6.x: its
+/// listener waits for our MuleInfo on an obfuscated connection and discards
+/// every packet it reads before one arrives, file request included.
+pub fn dialer_needs_mule_info(peer_user_hash: &[u8; 16], hello_caps: &PeerCapabilities) -> bool {
+    let emule_hash = peer_user_hash[5] == 14 && peer_user_hash[14] == 111;
+    emule_hash && (hello_caps.emule_version_byte != 0x99 || is_ember_1_6_hello(hello_caps))
+}
+
+/// Ember before 1.7 claimed eMule "0.50b" in `CT_EMULE_VERSION` (update 1),
+/// a build eMule never shipped; 1.7 claims 0.50a like the real client.
+fn is_ember_1_6_hello(caps: &PeerCapabilities) -> bool {
+    caps.compatible_client == 0
+        && caps.version_major == 0
+        && caps.emule_version_min == 50
+        && caps.version_update == 1
+}
+
 /// Build an EmuleInfo packet payload matching eMule `BaseClient.cpp`
 /// `SendMuleInfoPacket` byte-for-byte: version(1) + EMULE_PROTOCOL(1) +
 /// tag_count(4) + 7 ET_ tags. **No** `ET_COMPATIBLECLIENT`, **no**
@@ -996,10 +1000,12 @@ pub(super) fn write_ed2k_tag(buf: &mut Vec<u8>, name_id: u8, value: &Ed2kTagValu
 /// API stability but are intentionally ignored here — Ember identity is
 /// exchanged in a separate `OP_EMBER_HELLO` opcode that vanilla peers
 /// silently ignore. Callers that need Ember peer identification should
-/// also send `build_ember_hello(...)` after their EmuleInfoAnswer.
+/// also send `build_ember_hello(...)` after their EmuleInfoAnswer. The
+/// obfuscation flag is ignored for the same byte-for-byte reason: the Hello's
+/// `CT_EMULE_MISCOPTIONS2` already states it.
 pub fn build_emule_info(
     udp_port: u16,
-    obfuscation_enabled: bool,
+    _obfuscation_enabled: bool,
     _ember_hash: Option<&[u8; 16]>,
     _ed25519_pubkey: Option<&[u8; 32]>,
 ) -> Vec<u8> {
@@ -1050,16 +1056,15 @@ pub fn build_emule_info(
     write_ed2k_tag(&mut buf, 0x22, &Ed2kTagValue::Uint32(4));
     // ET_UDPPORT (0x21) = udp_port
     write_ed2k_tag(&mut buf, 0x21, &Ed2kTagValue::Uint32(udp_port as u32));
-    // ET_SOURCEEXCHANGE (0x23) = 4 — must match MISCOPTIONS1 SX version
-    write_ed2k_tag(&mut buf, 0x23, &Ed2kTagValue::Uint32(4));
+    // ET_SOURCEEXCHANGE (0x23) = 3, eMule's literal (`BaseClient.cpp:715`)
+    // even though its MISCOPTIONS1 says 4. Source exchange runs on the
+    // MISCOPTIONS2 SX2 bit, so the value only has to match what eMule sends.
+    write_ed2k_tag(&mut buf, 0x23, &Ed2kTagValue::Uint32(3));
     // ET_COMMENTS (0x24) = 1
     write_ed2k_tag(&mut buf, 0x24, &Ed2kTagValue::Uint32(1));
     // ET_EXTENDEDREQUEST (0x25) = 2
     write_ed2k_tag(&mut buf, 0x25, &Ed2kTagValue::Uint32(2));
-    // ET_FEATURES (0x27). Named like the MISCOPTIONS shifts above and for the
-    // same reason: bit 7 (preview) and bit 5 (RequiresCryptLayer) are left
-    // clear, and the labels for those two once slid onto the neighbouring
-    // fields when the zero terms were removed.
+    // ET_FEATURES (0x27): the SecureIdent level, as eMule writes it (`:722`).
     //
     // Preview stays clear deliberately rather than by omission, but not for the
     // reason this comment used to give. It said Ember's browse responder was
@@ -1073,9 +1078,7 @@ pub fn build_emule_info(
     // the bit and asked would get silence. Claiming a capability and then not
     // answering it is worse than not claiming it, which is the whole argument
     // behind the SecIdent level above. Set this only alongside a responder.
-    let features: u32 = secident_level() as u32
-        | ((obfuscation_enabled as u32) << ET_FEATURES_SUPPORTS_CRYPT_LAYER)
-        | ((obfuscation_enabled as u32) << ET_FEATURES_REQUESTS_CRYPT_LAYER);
+    let features: u32 = secident_level() as u32;
     write_ed2k_tag(&mut buf, 0x27, &Ed2kTagValue::Uint32(features));
 
     buf
@@ -1478,7 +1481,7 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
     // extended protocol whatever its tags turn out to say.
     caps.ext_protocol = true;
     let mut cursor = Cursor::new(payload);
-    let _version = cursor.read_u8().unwrap_or(0);
+    caps.emule_version_byte = cursor.read_u8().unwrap_or(0);
     let protocol_or_tag_count_byte = cursor.read_u8().unwrap_or(0);
 
     let tag_count = if protocol_or_tag_count_byte == 0x01 {
@@ -1865,6 +1868,7 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
                 caps.version_major = ((int_val >> 17) & 0x7F) as u8;
                 caps.emule_version_min = ((int_val >> 10) & 0x7F) as u8;
                 caps.version_update = ((int_val >> 7) & 0x07) as u8;
+                caps.emule_version_byte = 0x99;
             }
             _ => {}
         }
@@ -2385,6 +2389,11 @@ pub fn merge_caps(base: &mut PeerCapabilities, update: PeerCapabilities) {
     }
     if update.version_update != 0 {
         base.version_update = update.version_update;
+    }
+    // Last writer wins, as in eMule: an EmuleInfo after the Hello
+    // overwrites the Hello's 0x99.
+    if update.emule_version_byte != 0 {
+        base.emule_version_byte = update.emule_version_byte;
     }
     if !update.mod_version.is_empty() {
         base.mod_version = update.mod_version;
@@ -3822,6 +3831,29 @@ mod tests {
             assert!(!taken.contains(&op), "op 0x{op:02X} collides");
         }
         assert_ne!(OP_EMBER_XFER_REQ, OP_EMBER_XFER_ACK);
+    }
+
+    #[test]
+    fn a_dialer_sends_mule_info_only_to_legacy_peers_and_ember_1_6() {
+        let mut emule_hash = [0u8; 16];
+        emule_hash[5] = 14;
+        emule_hash[14] = 111;
+        let hello = |update: u8| PeerCapabilities {
+            emule_version_byte: 0x99,
+            emule_version_min: 50,
+            version_update: update,
+            ..Default::default()
+        };
+        assert!(!dialer_needs_mule_info(&emule_hash, &hello(0)), "eMule 0.50a, Ember 1.7");
+        assert!(dialer_needs_mule_info(&emule_hash, &hello(1)), "Ember 1.6.x");
+        assert!(
+            dialer_needs_mule_info(&emule_hash, &PeerCapabilities::default()),
+            "a Hello without CT_EMULE_VERSION"
+        );
+        assert!(
+            !dialer_needs_mule_info(&[0u8; 16], &PeerCapabilities::default()),
+            "not an eMule user hash"
+        );
     }
 
     /// Anti-leecher contract: the public Hello our `build_hello_with_buddy_opts`

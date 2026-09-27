@@ -136,6 +136,9 @@ pub(in crate::network) async fn on_bootstrap_tick(
                     let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                     let msg = KadMessage::BootstrapReq;
                     if let Ok(packet) = messages::encode_packet(&msg) {
+                        if !kad_request_allowed(state, addr, &packet) {
+                            continue;
+                        }
                         // Track the outgoing request (opcode 0x01) so the
                         // matching `BootstrapRes` (0x09) passes
                         // `validate_response`. The sampled-contact path
@@ -170,15 +173,12 @@ pub(in crate::network) async fn on_bootstrap_tick(
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                 let msg = KadMessage::BootstrapReq;
                 if let Ok(packet) = messages::encode_packet(&msg) {
-                    state.flood_protection.track_request(addr, 0x01);
-                    let _ = send_kad_packet(
-                        udp_socket,
-                        &packet,
-                        addr,
-                        state,
-                        &contact.id,
-                    )
-                    .await;
+                    if send_kad_packet(udp_socket, &packet, addr, state, &contact.id)
+                        .await
+                        .is_ok()
+                    {
+                        state.flood_protection.track_request(addr, 0x01);
+                    }
                 }
             }
         }
@@ -215,12 +215,23 @@ pub(in crate::network) async fn on_bootstrap_tick(
                 (KadMessage::FirewalledReq { tcp_port: fw_tcp_port }, 0x50u8)
             };
             if let Ok(packet) = messages::encode_packet(&msg) {
-                state.flood_protection.track_request(addr, track_opcode);
-                if let Ok(mut probes) = firewall_probe_ips.lock() { probes.insert(contact.ip); }
-                let _ = send_kad_packet(
-                    udp_socket, &packet, addr, state, &contact.id,
-                ).await;
-                state.firewall_checker.record_tcp_request_sent(contact.ip);
+                // In the probe set before the request leaves, since the peer's
+                // connect-back races our return from the send; out again if it
+                // never left, so the checker waits only on requests it made.
+                let newly_probed = firewall_probe_ips
+                    .lock()
+                    .is_ok_and(|mut probes| probes.insert(contact.ip));
+                if send_kad_packet(udp_socket, &packet, addr, state, &contact.id)
+                    .await
+                    .is_ok()
+                {
+                    state.flood_protection.track_request(addr, track_opcode);
+                    state.firewall_checker.record_tcp_request_sent(contact.ip);
+                } else if newly_probed {
+                    if let Ok(mut probes) = firewall_probe_ips.lock() {
+                        probes.remove(&contact.ip);
+                    }
+                }
             }
         }
         let udp_contacts: Vec<KadContact> = state
@@ -235,11 +246,13 @@ pub(in crate::network) async fn on_bootstrap_tick(
             let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
             let msg = KadMessage::Ping;
             if let Ok(packet) = messages::encode_packet(&msg) {
-                state.flood_protection.track_request(addr, 0x60);
-                let _ = send_kad_packet(
-                    udp_socket, &packet, addr, state, &contact.id,
-                ).await;
-                state.firewall_checker.record_udp_port_probe_sent();
+                if send_kad_packet(udp_socket, &packet, addr, state, &contact.id)
+                    .await
+                    .is_ok()
+                {
+                    state.flood_protection.track_request(addr, 0x60);
+                    state.firewall_checker.record_udp_port_probe_sent();
+                }
             }
         }
         // Eagerly dispatch UDP firewall probes now. If a previous

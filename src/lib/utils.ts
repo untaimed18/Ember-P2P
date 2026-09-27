@@ -1,12 +1,12 @@
 import { getLocale } from '$lib/i18n';
 
 /**
- * Format a byte count as a human-readable string (e.g. "1.5 MB").
+ * Format a byte count as a human-readable string (e.g. "1.5 MB", "1,5 Mo").
  * Uses iterative division to avoid floating-point edge cases.
  */
 export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const units = SIZE_UNITS.units;
+  if (!Number.isFinite(bytes) || bytes <= 0) return `${SIZE_FORMATTER.format(0)} ${units[0]}`;
   let i = 0;
   let val = bytes;
   while (val >= 1024 && i < units.length - 1) {
@@ -19,8 +19,7 @@ export function formatBytes(bytes: number): string {
     val /= 1024;
     i++;
   }
-  const formatted = val.toFixed(1);
-  return `${formatted.endsWith('.0') ? formatted.slice(0, -2) : formatted} ${units[i]}`;
+  return `${SIZE_FORMATTER.format(Number(val.toFixed(1)))} ${units[i]}`;
 }
 
 /**
@@ -35,9 +34,19 @@ export function isAppVisible(): boolean {
 /** Alias for formatBytes -- used in file-size contexts. */
 export const formatSize = formatBytes;
 
-/** Format bytes/sec as a speed string (e.g. "1.5 MB/s"). */
+/** Format bytes/sec as a speed string (e.g. "1.5 MB/s", "1,5 МБ/с"). */
 export function formatSpeed(bytesPerSec: number): string {
-  return `${formatBytes(bytesPerSec)}/s`;
+  return `${formatBytes(bytesPerSec)}${SIZE_UNITS.perSecond}`;
+}
+
+/** The app language's label for 1024^`power` bytes: "KB", "Ko", "КБ". */
+export function sizeUnitLabel(power: number): string {
+  return SIZE_UNITS.units[power] ?? '';
+}
+
+/** The app language's label for 1024^`power` bytes per second: "KB/s", "КБ/с". */
+export function speedUnitLabel(power: number): string {
+  return `${sizeUnitLabel(power)}${SIZE_UNITS.perSecond}`;
 }
 
 /*
@@ -70,6 +79,20 @@ const COMPACT_COUNT_FORMATTER = new Intl.NumberFormat(APP_LOCALE, {
 });
 const NUMBER_FORMATTER = new Intl.NumberFormat(APP_LOCALE);
 const DATE_FORMATTERS = new Map<string, Intl.DateTimeFormat>();
+// Sizes stay binary (1 KB = 1024 B), so these are hand-written rather than
+// Intl's `kilobyte` units, which are decimal and would print "kB" everywhere.
+// The per-second suffix follows the units' script: "Mo/s", but "МБ/с".
+const SIZE_UNITS: { units: readonly string[]; perSecond: string } = ({
+  fr: { units: ['o', 'Ko', 'Mo', 'Go', 'To'], perSecond: '/s' },
+  ru: { units: ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'], perSecond: '/с' },
+} as Record<string, { units: readonly string[]; perSecond: string }>)[APP_LOCALE]
+  ?? { units: ['B', 'KB', 'MB', 'GB', 'TB'], perSecond: '/s' };
+const SIZE_FORMATTER = new Intl.NumberFormat(APP_LOCALE, {
+  maximumFractionDigits: 1,
+  useGrouping: false,
+});
+const DURATION_UNIT_FORMATTERS = new Map<string, Intl.NumberFormat>();
+let durationJoiner: string | undefined;
 
 function dateFormatter(options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
   const key = JSON.stringify(options);
@@ -197,17 +220,76 @@ export function formatRelativeTime(ts: number, nowSecs: number = Math.floor(Date
   return RELATIVE_TIME_FORMATTER.format(-y, 'year');
 }
 
-/** Format seconds as a human-readable duration (e.g. "2h 15m"). */
-export function formatDurationSecs(secs: number): string {
-  if (!Number.isFinite(secs) || secs < 0) return '\u2014';
-  if (secs === 0) return '0s';
+type DurationUnit = 'day' | 'hour' | 'minute' | 'second';
+
+function formatDurationUnit(value: number, unit: DurationUnit, digits: number): string {
+  const key = `${unit}:${digits}`;
+  let formatter = DURATION_UNIT_FORMATTERS.get(key);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat(APP_LOCALE, {
+      style: 'unit',
+      unit,
+      unitDisplay: 'narrow',
+      minimumIntegerDigits: digits,
+    });
+    DURATION_UNIT_FORMATTERS.set(key, formatter);
+  }
+  return formatter.format(value);
+}
+
+/**
+ * Join duration parts compactly in the app language's narrow units: "2h 15m",
+ * "2h 15 Min.", "2 ч 15 мин", "2小时15分钟".
+ *
+ * Deliberately not `Intl.ListFormat` / `Intl.DurationFormat`: their narrow
+ * style joins as a list ("2h, 15 Min.", "1h, 05 Min. und 09 Sek."), which reads
+ * as prose in a table column. Parts are spaced, except where the units are
+ * Chinese or Japanese set solid; zh-TW's narrow units carry their own space
+ * ("2 小時"), so that locale is spaced like the rest.
+ * `pad` zero-pads every part after the first, for counters that tick in place.
+ */
+function formatDurationParts(parts: [number, DurationUnit][], pad = false): string {
+  if (durationJoiner === undefined) {
+    const sample = formatDurationUnit(1, 'hour', 1);
+    durationJoiner =
+      /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(sample) && !/\s/u.test(sample)
+        ? ''
+        : ' ';
+  }
+  return parts
+    .map(([value, unit], i) => formatDurationUnit(value, unit, pad && i > 0 ? 2 : 1))
+    .join(durationJoiner);
+}
+
+/** The two most significant units of a non-negative duration, for table columns. */
+function compactDuration(secs: number): string {
   const days = Math.floor(secs / 86400);
   const hrs = Math.floor((secs % 86400) / 3600);
   const mins = Math.floor((secs % 3600) / 60);
-  if (days > 0) return `${days}d ${hrs}h`;
-  if (hrs > 0) return `${hrs}h ${mins}m`;
-  if (mins > 0) return `${mins}m`;
-  return `${Math.floor(secs)}s`;
+  if (days > 0) return formatDurationParts([[days, 'day'], [hrs, 'hour']]);
+  if (hrs > 0) return formatDurationParts([[hrs, 'hour'], [mins, 'minute']]);
+  if (mins > 0) return formatDurationParts([[mins, 'minute']]);
+  return formatDurationParts([[Math.floor(secs), 'second']]);
+}
+
+/** Format seconds as a human-readable duration (e.g. "2h 15m"). */
+export function formatDurationSecs(secs: number): string {
+  if (!Number.isFinite(secs) || secs < 0) return '\u2014';
+  return compactDuration(secs);
+}
+
+/**
+ * Format elapsed seconds down to the second, zero-padding minutes and seconds
+ * so a live counter keeps its width (e.g. "1h 05m 09s").
+ */
+export function formatElapsed(secs: number): string {
+  const total = Number.isFinite(secs) && secs > 0 ? Math.floor(secs) : 0;
+  const h = Math.floor(total / 3600);
+  const min = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return formatDurationParts([[h, 'hour'], [min, 'minute'], [s, 'second']], true);
+  if (min > 0) return formatDurationParts([[min, 'minute'], [s, 'second']], true);
+  return formatDurationParts([[s, 'second']]);
 }
 
 /** Format remaining size + ETA combined (eMule Remaining column style). */
@@ -218,16 +300,7 @@ export function formatRemaining(totalSize: number, transferred: number, speed: n
   // Guard against a non-finite speed (NaN/Infinity) — `NaN <= 0` is false, so
   // without `Number.isFinite` the ETA math below would render "NaNd NaNh".
   if (!Number.isFinite(speed) || speed <= 0) return remainStr;
-  const secs = Math.round(remaining / speed);
-  const days = Math.floor(secs / 86400);
-  const hrs = Math.floor((secs % 86400) / 3600);
-  const mins = Math.floor((secs % 3600) / 60);
-  let timeStr: string;
-  if (days > 0) timeStr = `${days}d ${hrs}h`;
-  else if (hrs > 0) timeStr = `${hrs}h ${mins}m`;
-  else if (mins > 0) timeStr = `${mins}m`;
-  else timeStr = `${secs}s`;
-  return `${timeStr} (${remainStr})`;
+  return `${compactDuration(Math.round(remaining / speed))} (${remainStr})`;
 }
 
 /** Truncate a hex hash with ellipsis. */
@@ -236,32 +309,9 @@ export function truncateHash(hash: string, len = 16): string {
   return `${hash.slice(0, len)}\u2026`;
 }
 
-/**
- * Race a promise (in practice a Tauri `invoke()`) against a deadline.
- *
- * K24: without this the UI hangs indefinitely when the backend is wedged —
- * blocked on a slow DNS resolution, a stuck oneshot receiver — and a poll's
- * in-flight guard stays latched for the rest of the session. Rejects with a
- * normal `Error` carrying a recognisable message so callers can show a
- * "timed out, please try again" toast instead of a spinner that never
- * resolves.
- *
- * Only for calls whose expected duration is short and bounded. Anything
- * legitimately long-running — library scans, file hashing, native file
- * dialogs waiting on the user — must not be wrapped: a deadline there
- * reports failure for an operation that is still succeeding.
- */
-export function withTimeout<T>(promise: Promise<T>, label: string, ms = 20_000): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`));
-    }, ms);
-    promise.then(
-      (v) => { clearTimeout(timer); resolve(v); },
-      (e) => { clearTimeout(timer); reject(e); },
-    );
-  });
-}
+// Lives in its own module so `$lib/i18n` can recognise `TimeoutError` without
+// importing this file, which imports `$lib/i18n` itself.
+export { TimeoutError, withTimeout } from './timeout';
 
 /**
  * Copy text to the clipboard.

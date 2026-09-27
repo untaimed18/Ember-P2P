@@ -588,6 +588,9 @@ pub struct SourceAskOutcome {
     pub ember: bool,
     /// The connected eD2K server, asked over TCP.
     pub server: bool,
+    /// `server` is false because that server was asked for this file within
+    /// the last 15 minutes (eMule's `SERVERREASKTIME`), not for want of one.
+    pub server_recent: bool,
     /// The other eligible servers, asked over UDP.
     pub server_udp: bool,
 }

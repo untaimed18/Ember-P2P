@@ -10,6 +10,7 @@
   import { addToast } from '$lib/stores/toast';
   import { emberJoinTimedOut } from '$lib/stores/emberJoin';
   import { isUploadCounterPhase } from '$lib/sharedFileStats';
+  import { plural } from '$lib/plural';
   import * as m from '$lib/paraglide/messages';
 
   // Count / total size of files the user is actively sharing (the `shared`
@@ -27,9 +28,12 @@
 
   function sharedTitle(count: number, bytes: number): string {
     const size = formatBytes(bytes);
-    return count === 1
-      ? m.statusbar_shared_title_one({ size })
-      : m.statusbar_shared_title_other({ count: formatNumber(count), size });
+    const n = formatNumber(count);
+    return plural(count, {
+      one: () => m.statusbar_shared_title_one({ size }),
+      few: () => m.statusbar_shared_title_few({ count: n, size }),
+      other: () => m.statusbar_shared_title_other({ count: n, size }),
+    });
   }
 
   onMount(() => {
@@ -124,9 +128,12 @@
     let base: string;
     if (status === 'connected') {
       const peers = stats.ember_dht_verified_contacts ?? 0;
-      base = peers === 1
-        ? m.statusbar_ember_dht_title_peers_one({ status: statusLabel(status) })
-        : m.statusbar_ember_dht_title_peers_other({ status: statusLabel(status), count: peers });
+      const label = statusLabel(status);
+      base = plural(peers, {
+        one: () => m.statusbar_ember_dht_title_peers_one({ status: label }),
+        few: () => m.statusbar_ember_dht_title_peers_few({ status: label, count: peers }),
+        other: () => m.statusbar_ember_dht_title_peers_other({ status: label, count: peers }),
+      });
     } else if (status === 'no_peers') {
       base = m.statusbar_ember_dht_title_no_peers();
     } else {
@@ -162,10 +169,16 @@
     if (status === 'idle') return m.statusbar_epx_title_idle();
     const p = stats.ember_peers;
     const s = stats.epx_sources_received;
-    if (p === 1 && s === 1) return m.statusbar_epx_title_active_one_one();
-    if (p === 1) return m.statusbar_epx_title_active_one_other({ sources: s });
-    if (s === 1) return m.statusbar_epx_title_active_other_one({ peers: p });
-    return m.statusbar_epx_title_active_other_other({ peers: p, sources: s });
+    return plural(p, {
+      one: () => plural(s, {
+        one: m.statusbar_epx_title_active_one_one,
+        other: () => m.statusbar_epx_title_active_one_other({ sources: s }),
+      }),
+      other: () => plural(s, {
+        one: () => m.statusbar_epx_title_active_other_one({ peers: p }),
+        other: () => m.statusbar_epx_title_active_other_other({ peers: p, sources: s }),
+      }),
+    });
   }
 </script>
 

@@ -43,14 +43,20 @@ fn parse_xfer_id(hex_str: &str) -> Result<[u8; 16], String> {
 /// reveal" check both read, so a long name loses characters from the stem, and
 /// always on a character boundary so the peer never receives half of one.
 fn clamp_attachment_name(name: &str) -> String {
-    if name.len() <= ATTACH_NAME_MAX {
+    clamp_file_name_keep_extension(name, ATTACH_NAME_MAX)
+}
+
+/// [`clamp_attachment_name`] for any wire limit, such as a room transfer's
+/// `XFER_NAME_MAX`.
+pub(crate) fn clamp_file_name_keep_extension(name: &str, max: usize) -> String {
+    if name.len() <= max {
         return name.to_string();
     }
     let (stem, ext) = match name.rfind('.') {
         Some(dot) if dot > 0 && name.len() - dot <= 16 => (&name[..dot], &name[dot..]),
         _ => (name, ""),
     };
-    let mut end = ATTACH_NAME_MAX.saturating_sub(ext.len());
+    let mut end = max.saturating_sub(ext.len());
     while end > 0 && !stem.is_char_boundary(end) {
         end -= 1;
     }

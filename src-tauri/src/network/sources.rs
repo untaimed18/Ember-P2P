@@ -469,10 +469,11 @@ pub(super) const KAD_CALLBACK_PLACEHOLDER_TIMEOUT_SECS: i64 =
 /// Per-file interval for re-asking the connected eD2K server for sources when a
 /// download is *starved* (no source currently transferring).
 ///
-/// This is a *priority ordering* within [`SERVER_TCP_SRCREQ_INTERVAL_SECS`], not
-/// a licence to send: a file becomes eligible after 45 s, but nothing leaves
-/// until the shared frame budget below opens. It used to be the only gate, which
-/// put the real rate an order of magnitude above what eMule permits itself.
+/// This is a *priority ordering*, not a licence to send: nothing leaves until
+/// the shared frame budget below opens, and no file is asked again inside
+/// [`SERVER_TCP_SRCREQ_FILE_REASK_SECS`], which is far longer than this. It
+/// used to be the only gate, which put the real rate an order of magnitude
+/// above what eMule permits itself.
 pub(super) const STARVED_SERVER_REASK_SECS: i64 = 45;
 
 /// Hashes one TCP `OP_GETSOURCES` frame may carry, and how long the connection
@@ -485,11 +486,14 @@ pub(super) const STARVED_SERVER_REASK_SECS: i64 = 45;
 /// credit, which takes the *whole* server half of source discovery down for the
 /// session — so exceeding this is self-defeating rather than merely impolite.
 ///
-/// Every path that can send `OP_GETSOURCES` over the server connection shares
-/// this one budget (starved re-ask, periodic sweep, warm-start), because the
-/// server's accounting is per connection and does not care which of our code
-/// paths a request came from. Between them they previously reached roughly 40 a
-/// minute against eMule's ceiling of 3.
+/// Every request shares this one budget, because the server's accounting is per
+/// connection and does not care which of our code paths a request came from.
+/// The periodic sweep, the starved re-ask and warm-start each spend a frame;
+/// a new download or Find Sources queues its file for the next one
+/// ([`queue_server_source_ask`]) rather than sending, as eMule's
+/// `SendLocalSrcRequest` does. Between them these paths once reached roughly 40
+/// a minute against eMule's ceiling of 3, and a large collection could send
+/// one per file at once.
 pub(super) const SERVER_TCP_SRCREQ_MAX_PER_FRAME: usize = 15;
 pub(super) const SERVER_TCP_SRCREQ_INTERVAL_SECS: i64 =
     (SERVER_TCP_SRCREQ_MAX_PER_FRAME as i64) * (16 + 4);
@@ -546,6 +550,144 @@ pub(super) fn server_tcp_srcreq_frame_open(state: &NetworkState, now: i64) -> bo
 /// eMule does — the credit is spent on the frame, not the hash.
 pub(super) fn close_server_tcp_srcreq_frame(state: &mut NetworkState, now: i64) {
     state.server_tcp_srcreq_next_at = now + SERVER_TCP_SRCREQ_INTERVAL_SECS;
+}
+
+/// eMule's `SERVERREASKTIME` (`Opcodes.h:65`): the least time between two TCP
+/// `OP_GETSOURCES` for the same file, counted from its last request on any
+/// path (`PartFile.cpp:2382`, stamped at `DownloadQueue.cpp:1337`).
+///
+/// The frame budget above limits how often a frame goes out, not what is in
+/// it. With 15 or fewer downloads every file rode every frame, and the
+/// post-login, warm-start and starved paths each asked again on top.
+pub(super) const SERVER_TCP_SRCREQ_FILE_REASK_SECS: i64 = 15 * 60;
+
+/// Whether `file_hash` may go out in another TCP `OP_GETSOURCES` at `now`.
+pub(super) fn server_tcp_srcreq_file_due(
+    asked_at: &HashMap<[u8; 16], i64>,
+    file_hash: &[u8; 16],
+    now: i64,
+) -> bool {
+    asked_at
+        .get(file_hash)
+        .is_none_or(|at| now.saturating_sub(*at) >= SERVER_TCP_SRCREQ_FILE_REASK_SECS)
+}
+
+/// Stamp `file_hash` as asked at `now`. Entries past the re-ask floor decide
+/// nothing, so they are dropped whenever the map grows.
+pub(super) fn note_server_tcp_srcreq_file(
+    asked_at: &mut HashMap<[u8; 16], i64>,
+    file_hash: [u8; 16],
+    now: i64,
+) {
+    const PRUNE_ABOVE: usize = 1024;
+    if asked_at.len() >= PRUNE_ABOVE {
+        asked_at.retain(|_, at| now.saturating_sub(*at) < SERVER_TCP_SRCREQ_FILE_REASK_SECS);
+    }
+    asked_at.insert(file_hash, now);
+}
+
+/// Explicit asks held for the coming frames. Past this the periodic sweep still
+/// reaches every download, just not ahead of the others.
+pub(super) const MAX_QUEUED_SERVER_SOURCE_ASKS: usize = 1024;
+
+/// Put one download's file in line for the next TCP `OP_GETSOURCES` frame,
+/// ahead of the periodic sweep's own picks — eMule's `SendLocalSrcRequest`.
+/// When a frame is open the loop runs it at once (see the source timer in
+/// `start_network`), so an ask is not left waiting on the sweep's 4-minute tick.
+///
+/// Returns whether the file is in line: false with no server session, when it
+/// was asked within `SERVER_TCP_SRCREQ_FILE_REASK_SECS`, when this server
+/// cannot index a file that large, or when the line is full.
+pub(super) fn queue_server_source_ask(
+    state: &mut NetworkState,
+    transfer_id: &str,
+    file_hash: [u8; 16],
+    file_size: u64,
+    now: i64,
+) -> bool {
+    let Some(conn) = state.server_connection.as_ref().filter(|_| state.server_connected) else {
+        return false;
+    };
+    if !ed2k::server::server_indexes_file_size(file_size, conn.session.server_flags) {
+        return false;
+    }
+    push_server_source_ask(
+        &mut state.server_tcp_srcreq_asks,
+        &state.server_tcp_srcreq_file_at,
+        transfer_id,
+        file_hash,
+        file_size,
+        now,
+    )
+}
+
+/// [`queue_server_source_ask`] past its session checks: one place in line
+/// per file, none for a file inside its re-ask floor, and a bounded line.
+pub(super) fn push_server_source_ask(
+    asks: &mut VecDeque<(String, [u8; 16], u64)>,
+    asked_at: &HashMap<[u8; 16], i64>,
+    transfer_id: &str,
+    file_hash: [u8; 16],
+    file_size: u64,
+    now: i64,
+) -> bool {
+    if !server_tcp_srcreq_file_due(asked_at, &file_hash, now) {
+        return false;
+    }
+    if asks.iter().any(|(_, hash, _)| *hash == file_hash) {
+        return true;
+    }
+    if asks.len() >= MAX_QUEUED_SERVER_SOURCE_ASKS {
+        return false;
+    }
+    asks.push_back((transfer_id.to_string(), file_hash, file_size));
+    true
+}
+
+/// Take the explicit asks that lead one frame off the head of the line,
+/// oldest first and at most `max`. An ask `keep` refuses — its download has
+/// gone, or its file was asked since it was queued — is dropped rather than
+/// carried to the next frame.
+pub(super) fn take_frame_source_asks(
+    asks: &mut VecDeque<(String, [u8; 16], u64)>,
+    max: usize,
+    mut keep: impl FnMut(&str, &[u8; 16]) -> bool,
+) -> Vec<(String, [u8; 16], u64)> {
+    let mut frame: Vec<(String, [u8; 16], u64)> = Vec::new();
+    while frame.len() < max {
+        let Some((tid, fh, file_size)) = asks.pop_front() else {
+            break;
+        };
+        if keep(&tid, &fh) && !frame.iter().any(|(_, queued, _)| *queued == fh) {
+            frame.push((tid, fh, file_size));
+        }
+    }
+    frame
+}
+
+/// Queue a TCP `OP_GETSOURCES` for one file, if there is a session and the
+/// file's re-ask floor allows it. Every frame sends through here, so the floor
+/// holds whichever path filled it.
+///
+/// Returns the wire bytes queued, 0 when nothing was sent — no session, asked
+/// too recently, or a large file the server cannot index.
+pub(super) fn send_server_get_sources(
+    state: &mut NetworkState,
+    file_hash: &[u8; 16],
+    file_size: u64,
+    now: i64,
+) -> anyhow::Result<u64> {
+    if !server_tcp_srcreq_file_due(&state.server_tcp_srcreq_file_at, file_hash, now) {
+        return Ok(0);
+    }
+    let Some(conn) = state.server_connection.as_mut() else {
+        return Ok(0);
+    };
+    let bytes = conn.send_get_sources(file_hash, file_size)?;
+    if bytes > 0 {
+        note_server_tcp_srcreq_file(&mut state.server_tcp_srcreq_file_at, *file_hash, now);
+    }
+    Ok(bytes)
 }
 
 /// Grace period after a successful server login before we send the connection
@@ -697,7 +839,13 @@ pub(super) async fn send_kad_callback_req(
     // delivery to buddies that expect a plain KADEMLIA_CALLBACK_REQ.
     //
     // One packet per attempt, matching `BaseClient.cpp:1451` — see
-    // `kad_callback_buddy_port` for what a second one costs.
+    // `kad_callback_buddy_port` for what a second one costs. Several of our
+    // downloads can name the same firewalled source, and so the same buddy;
+    // the shared per-destination budget holds all of them to one a minute.
+    if !super::kad_io::kad_request_allowed(state, buddy_addr, &packet) {
+        debug!("KAD CallbackReq to {buddy_addr} deferred: buddy's per-minute budget spent");
+        return false;
+    }
     match udp_socket.send_to(&packet, buddy_addr).await {
         Ok(_) => true,
         Err(e) => {
@@ -753,16 +901,6 @@ pub(super) fn is_eligible_udp_server(
         }
     }
     true
-}
-
-/// True once the connected eD2k server has been up long enough that
-/// `OP_GETSOURCES` is unlikely to be dropped by Lugdunum flood protection.
-pub(super) fn server_source_settle_elapsed(state: &NetworkState) -> bool {
-    state.server_connected
-        && chrono::Utc::now()
-            .timestamp()
-            .saturating_sub(state.server_connected_at)
-            >= SERVER_SOURCE_SETTLE_SECS
 }
 
 /// KAD is actually usable for FindSource (not merely `Connecting` while
@@ -1044,10 +1182,15 @@ pub(super) fn inject_source_into_active_transfers(
 ///
 /// The four legs are independent, and a leg with no route is skipped rather
 /// than allowed to hold up the others: KAD with no contacts or no session,
-/// Ember disabled or with no overlay peers, no eD2K server session (or one too
-/// fresh to ask — Lugdunum drops a `GETSOURCES` sent before login settles), no
+/// Ember disabled or with no overlay peers, no eD2K server session, no
 /// eligible servers for the UDP fan-out. What comes back arrives on each
 /// network's own schedule, through the same paths the periodic sweeps use.
+///
+/// The connected server is not asked here but put in line for its next source
+/// frame, which also waits out the post-login settle. Its leg also reports
+/// `server: false` for a file that server was asked about within
+/// `SERVER_TCP_SRCREQ_FILE_REASK_SECS` (eMule's `SERVERREASKTIME`): asking
+/// again that soon only spends the connection's request credit.
 ///
 /// This is what a download's opening fan-out does and what the Transfers
 /// "find sources" button does, which is the reason it is one function: three
@@ -1059,7 +1202,6 @@ pub(super) async fn ask_networks_for_sources(
     socket: &UdpSocket,
     state: &mut NetworkState,
     app_handle: &tauri::AppHandle,
-    stats_manager: &mut StatsManager,
     settings: &AppSettings,
     transfer_id: &str,
     file_hash: [u8; 16],
@@ -1119,28 +1261,15 @@ pub(super) async fn ask_networks_for_sources(
         outcome.ember = start_ember_source_search(socket, state, transfer_id, file_hash).await;
     }
 
-    // The connected eD2K server, over TCP.
-    if server_source_settle_elapsed(state) {
-        if let Some(conn) = state.server_connection.as_mut() {
-            if let Ok(bytes) = conn.send_get_sources(&file_hash, file_size).await {
-                if bytes > 0 {
-                    stats_manager.add_overhead(
-                        crate::storage::statistics::OverheadCategory::SourceExchange,
-                        crate::storage::statistics::OverheadDirection::Upload,
-                        bytes,
-                    );
-                    let _ = app_handle.emit(
-                        "transfer:source-search",
-                        serde_json::json!({
-                            "transfer_id": transfer_id,
-                            "kind": "server_query",
-                        }),
-                    );
-                    outcome.server = true;
-                }
-            }
-        }
-    }
+    // The connected eD2K server, over TCP: in line for its next source frame,
+    // which reports `server_query` for this transfer when it goes out.
+    // `server` stays false when the file was asked within the last
+    // `SERVER_TCP_SRCREQ_FILE_REASK_SECS`, the same as with no session.
+    let now = chrono::Utc::now().timestamp();
+    outcome.server = queue_server_source_ask(state, transfer_id, file_hash, file_size, now);
+    outcome.server_recent = !outcome.server
+        && state.server_connected
+        && !server_tcp_srcreq_file_due(&state.server_tcp_srcreq_file_at, &file_hash, now);
 
     // Every other eligible server, over UDP, paced through the queue so this
     // never becomes a burst of datagrams.
@@ -1163,6 +1292,104 @@ pub(super) async fn ask_networks_for_sources(
     }
 
     outcome
+}
+
+#[cfg(test)]
+mod server_tcp_srcreq_file_floor_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_is_not_asked_again_inside_serverreasktime() {
+        let mut asked = HashMap::new();
+        let file = [0x11; 16];
+        assert!(server_tcp_srcreq_file_due(&asked, &file, 1_000), "never asked");
+
+        note_server_tcp_srcreq_file(&mut asked, file, 1_000);
+        assert!(!server_tcp_srcreq_file_due(&asked, &file, 1_001));
+        assert!(!server_tcp_srcreq_file_due(
+            &asked,
+            &file,
+            1_000 + SERVER_TCP_SRCREQ_FILE_REASK_SECS - 1
+        ));
+        assert!(server_tcp_srcreq_file_due(
+            &asked,
+            &file,
+            1_000 + SERVER_TCP_SRCREQ_FILE_REASK_SECS
+        ));
+        assert!(
+            server_tcp_srcreq_file_due(&asked, &[0x22; 16], 1_001),
+            "the floor is per file"
+        );
+    }
+
+    /// A 200-file collection used to send 200 `OP_GETSOURCES` at once. Queued,
+    /// it goes out one frame at a time, oldest first.
+    #[test]
+    fn a_large_collection_waits_its_turn_in_frames() {
+        let mut asks = VecDeque::new();
+        let asked = HashMap::new();
+        let file = |n: u32| {
+            let mut hash = [0u8; 16];
+            hash[..4].copy_from_slice(&n.to_le_bytes());
+            hash
+        };
+        for n in 0..200 {
+            assert!(push_server_source_ask(&mut asks, &asked, &format!("t{n}"), file(n), 1_000, 0));
+        }
+
+        let first = take_frame_source_asks(&mut asks, SERVER_TCP_SRCREQ_MAX_PER_FRAME, |_, _| true);
+        assert_eq!(first.len(), SERVER_TCP_SRCREQ_MAX_PER_FRAME);
+        assert_eq!(first[0].1, file(0));
+        assert_eq!(asks.len(), 200 - SERVER_TCP_SRCREQ_MAX_PER_FRAME);
+        assert_eq!(asks[0].1, file(SERVER_TCP_SRCREQ_MAX_PER_FRAME as u32));
+    }
+
+    #[test]
+    fn an_ask_is_refused_inside_the_floor_and_queued_once() {
+        let mut asks = VecDeque::new();
+        let mut asked = HashMap::new();
+        note_server_tcp_srcreq_file(&mut asked, [1; 16], 1_000);
+
+        assert!(!push_server_source_ask(&mut asks, &asked, "recent", [1; 16], 10, 1_060));
+        assert!(push_server_source_ask(&mut asks, &asked, "a", [2; 16], 10, 1_060));
+        assert!(push_server_source_ask(&mut asks, &asked, "b", [2; 16], 10, 1_061));
+        assert_eq!(asks.len(), 1, "one place in line per file");
+    }
+
+    #[test]
+    fn a_frame_drops_asks_it_cannot_use_instead_of_carrying_them() {
+        let mut asks: VecDeque<_> = [("gone", [1u8; 16]), ("live", [2u8; 16]), ("live2", [3u8; 16])]
+            .into_iter()
+            .map(|(tid, hash)| (tid.to_string(), hash, 10u64))
+            .collect();
+
+        let frame = take_frame_source_asks(&mut asks, SERVER_TCP_SRCREQ_MAX_PER_FRAME, |tid, _| {
+            tid != "gone"
+        });
+        assert_eq!(
+            frame.iter().map(|(tid, _, _)| tid.as_str()).collect::<Vec<_>>(),
+            ["live", "live2"]
+        );
+        assert!(asks.is_empty(), "nothing is left to pull the next frame forward");
+    }
+
+    #[test]
+    fn stale_stamps_are_pruned_and_live_ones_kept() {
+        let mut asked = HashMap::new();
+        for n in 0..1024u32 {
+            let mut file = [0u8; 16];
+            file[..4].copy_from_slice(&n.to_le_bytes());
+            // Half stale, half still inside the floor at t = 10_000.
+            let at = if n % 2 == 0 { 0 } else { 10_000 - 60 };
+            asked.insert(file, at);
+        }
+        note_server_tcp_srcreq_file(&mut asked, [0xFF; 16], 10_000);
+
+        assert_eq!(asked.len(), 513);
+        assert!(asked
+            .values()
+            .all(|at| 10_000 - at < SERVER_TCP_SRCREQ_FILE_REASK_SECS));
+    }
 }
 
 #[cfg(test)]

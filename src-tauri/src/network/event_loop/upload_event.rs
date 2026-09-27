@@ -1660,24 +1660,11 @@ pub(in crate::network) async fn on_upload_event(
                     )
                 };
                 if node_banned || ip_banned {
-                    // Ban every known IP for this user hash (not just
-                    // the one address on the transfer row) so a
-                    // multi-homed peer can't keep going from another
-                    // address — matching the PartCorrupted path.
-                    let sm = source_manager.read().await;
-                    let mut ips = sm.find_ips_by_user_hash(&uh);
-                    drop(sm);
-                    if let Some(ip) = peer_ip {
-                        if !ips.contains(&ip) {
-                            ips.push(ip);
-                        }
-                    }
-                    apply_reputation_ban_ips(
-                        state,
-                        shared_banned_ips,
-                        ips,
-                        &uh,
-                    );
+                    // The address on the transfer only. Other addresses filed
+                    // under this user hash came from source records and
+                    // exchanges anyone can forge; the identity itself is
+                    // refused by hash from now on, whatever address it uses.
+                    apply_reputation_ban_ips(state, shared_banned_ips, peer_ip, &uh);
                 }
             }
             }

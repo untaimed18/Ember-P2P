@@ -110,6 +110,13 @@ impl NodeIdentity {
         if user_hash[0] == 14 {
             user_hash[0] = 15;
         }
+        // eMule's client marker (`CPreferences::CreateUserHash`): its
+        // `GetHashType` reads a hash without it as not-eMule, which contradicts
+        // the eMule Hello we send. Only new identities get it — changing an
+        // existing hash is a userhash change to every peer that remembers us,
+        // and eMule bans those for two hours.
+        user_hash[5] = 14;
+        user_hash[14] = 111;
         let udp_key_seed: u32 = rng.next_u32();
 
         let signing_key = SigningKey::generate(&mut OsRng);

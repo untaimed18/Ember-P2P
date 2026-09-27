@@ -432,16 +432,6 @@ impl ReputationManager {
         self.touch();
     }
 
-    /// Node identities whose reputation ban has not yet expired.
-    pub fn currently_banned_node_ids(&self) -> Vec<[u8; 16]> {
-        let now = now_secs();
-        self.peers
-            .iter()
-            .filter(|(_, p)| p.is_banned(now))
-            .map(|(id, _)| *id)
-            .collect()
-    }
-
     /// IPv4 addresses whose IP-reputation ban has not yet expired.
     pub fn currently_banned_ips(&self) -> Vec<std::net::Ipv4Addr> {
         let now = now_secs();

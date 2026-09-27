@@ -10,6 +10,7 @@
  */
 import * as m from '$lib/paraglide/messages';
 import { getLocale } from '$lib/i18n';
+import { plural } from '$lib/plural';
 import {
   REACTION_DOWN,
   REACTION_HEART,
@@ -92,9 +93,10 @@ export function formatReactors(
   const others =
     options.others ??
     ((count: number) =>
-      count === 1
-        ? m.channels_reactors_others_one()
-        : m.channels_reactors_others_other({ count }));
+      plural(count, {
+        one: m.channels_reactors_others_one,
+        other: () => m.channels_reactors_others_other({ count }),
+      }));
   const count = Math.max(total, names.length);
   const limit = count <= max + 1 ? max + 1 : max;
   const named = names.slice(0, limit);

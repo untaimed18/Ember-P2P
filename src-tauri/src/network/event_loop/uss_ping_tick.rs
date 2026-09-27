@@ -18,6 +18,8 @@ pub(in crate::network) async fn on_uss_ping_tick(
     }
     let now_ts = chrono::Utc::now().timestamp();
     const USS_PING_TIMEOUT_SECS: u64 = 3;
+    // Half the outbound governor's window: two pings per window, evenly spaced.
+    const USS_PING_MIN_GAP: std::time::Duration = std::time::Duration::from_millis(31_500);
 
     // Count timed-out in-flight pings as misses, then drop them.
     // Do NOT increment on send — that falsely rotates hosts when
@@ -91,8 +93,16 @@ pub(in crate::network) async fn on_uss_ping_tick(
 
     // Send at most one in-flight Ping per host so a late pong cannot
     // measure against a newer overwrite of the send timestamp.
+    //
+    // eMule takes two KADEMLIA2_PING a minute from one IP (see
+    // `kad::outbound`), and a different host would give USS a different RTT
+    // baseline, so one host is pinged no faster than that allows. Checked
+    // here rather than left to the send's refusal, which this 2 s timer would
+    // otherwise hit on almost every tick.
     if let Some((addr, ref contact_id)) = state.uss_host {
-        if !state.pending_uss_pings.contains_key(&addr) {
+        if !state.pending_uss_pings.contains_key(&addr)
+            && kad_request_ready(state, addr, messages::KADEMLIA2_PING, USS_PING_MIN_GAP)
+        {
             let msg = KadMessage::Ping;
             if let Ok(packet) = messages::encode_packet(&msg) {
                 match send_kad_packet(udp_socket, &packet, addr, state, contact_id).await {

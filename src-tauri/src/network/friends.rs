@@ -729,6 +729,67 @@ pub(super) async fn process_inbound_friend_request(
     }
 }
 
+/// A friend request that reached us through room `channel_id` in an envelope
+/// dated `sent_at`, from a member that room's roster holds.
+///
+/// Queued for the user like one from a session, and marked verified: the
+/// sender's signature over this envelope is proof of the key. Held to the
+/// stricter rules [`Database::add_room_friend_request`] applies, since any key
+/// a room carries can send one. Nothing more than queueing: someone already on
+/// our list registers presence for them, so our own lookup or theirs will open
+/// the session that settles it, and promoting here would call a friend online
+/// who has no session with us. `nickname` is what the room calls them, since
+/// the request carries none.
+pub(super) async fn process_room_friend_request(
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    sender_pubkey: [u8; 32],
+    nickname: &str,
+    channel_id: [u8; 16],
+    sent_at: i64,
+) {
+    let Some(hash) = crate::network::ember::crypto::node_id_from_ed25519_bytes(&sender_pubkey)
+    else {
+        return;
+    };
+    let hash_hex = hex::encode(hash);
+    let nickname = crate::security::sanitize_inbound_friend_nickname(nickname);
+    let db_q = db.clone();
+    let h_q = hash_hex.clone();
+    let n_q = nickname.clone();
+    let queued = tokio::task::spawn_blocking(move || {
+        db_q.add_room_friend_request(
+            &h_q,
+            &sender_pubkey,
+            &n_q,
+            &hex::encode(channel_id),
+            sent_at,
+            chrono::Utc::now().timestamp(),
+        )
+        .unwrap_or_else(|e| {
+            warn!("Failed to persist a friend request from a room: {e}");
+            false
+        })
+    })
+    .await
+    .unwrap_or(false);
+    if !queued {
+        debug!(
+            "Room friend request from {hash_hex} not queued (blocked, listed, refused, over the \
+             room's share, or failed)"
+        );
+        return;
+    }
+    let _ = app_handle.emit(
+        "ember:friend-request",
+        serde_json::json!({
+            "sender_hash": hash_hex,
+            "nickname": nickname,
+            "verified": true,
+        }),
+    );
+}
+
 /// Which verdict on a friend request a queued courier dial is carrying.
 ///
 /// The two queues are separate tables and opposite directions of the same
@@ -886,6 +947,40 @@ pub(crate) async fn deliver_friend_request_verdict(
                 debug!("The {noun} to {hash_hex} at {addr} did not land: {e}");
             }
         }
+    }
+}
+
+/// Ask a friend the rendezvous could not find, and who has not added us back,
+/// again through a room we share with them. Paced by
+/// `commands::channels::send_room_friend_request`, since the retry sweep
+/// that lands here runs every few minutes.
+async fn ask_unmatched_friend_through_rooms(app_handle: &tauri::AppHandle, target_hash: [u8; 16]) {
+    let Some(app_state) = app_handle.try_state::<crate::app_state::AppState>() else {
+        return;
+    };
+    let db = app_state.db.clone();
+    let hash_hex = hex::encode(target_hash);
+    let pubkey = tokio::task::spawn_blocking(move || {
+        let mutual = db
+            .get_friends_full()
+            .ok()?
+            .into_iter()
+            .find(|(hash, ..)| *hash == hash_hex)
+            .map(|(.., mutual)| mutual)?;
+        if mutual {
+            return None;
+        }
+        db.get_friend_public_keys()
+            .ok()?
+            .into_iter()
+            .find(|(hash, _)| *hash == target_hash)
+            .map(|(_, key)| key)
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(pubkey) = pubkey {
+        crate::commands::channels::send_room_friend_request(&app_state, pubkey, false).await;
     }
 }
 
@@ -1107,6 +1202,9 @@ pub(super) fn spawn_rendezvous_friend_lookup(
                 // the fix is their new friend code rather than waiting.
                 let legacy_code =
                     crate::network::friend_intro::friend_intro_secret(&target_hash).is_none();
+                if legacy_code {
+                    ask_unmatched_friend_through_rooms(&app_fc, target_hash).await;
+                }
                 let _ = app_fc.emit(
                     "ember:friend-search-failed",
                     serde_json::json!({
@@ -1121,6 +1219,9 @@ pub(super) fn spawn_rendezvous_friend_lookup(
                     "Rendezvous lookup failed for {}: {e}",
                     hex::encode(target_hash)
                 );
+                if crate::network::friend_intro::friend_intro_secret(&target_hash).is_none() {
+                    ask_unmatched_friend_through_rooms(&app_fc, target_hash).await;
+                }
                 let _ = app_fc.emit(
                     "ember:friend-search-failed",
                     serde_json::json!({

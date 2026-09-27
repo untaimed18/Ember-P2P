@@ -393,6 +393,38 @@ impl CorruptionBlackBox {
         ips
     }
 
+    /// Whether recorded, still-unverified ranges account for every byte of
+    /// `[start, end)`.
+    ///
+    /// Records only cover what this session received. A `.part` file resumed
+    /// after a restart or a requeue (both of which drop the file's records)
+    /// already holds bytes nobody here is on record for, so a part that fails
+    /// with one *recorded* contributor may still have been spoiled by an
+    /// unrecorded one. Only full coverage makes the recorded contributors the
+    /// complete list.
+    pub fn part_fully_attributed(&self, file_hash: &[u8; 16], start: u64, end: u64) -> bool {
+        if start >= end {
+            return false;
+        }
+        let Some(blocks) = self.records.get(file_hash) else {
+            return false;
+        };
+        let mut ranges: Vec<(u64, u64)> = blocks
+            .iter()
+            .filter(|b| b.is_live_range() && b.start < end && b.end > start)
+            .map(|b| (b.start.max(start), b.end.min(end)))
+            .collect();
+        ranges.sort_unstable();
+        let mut covered_to = start;
+        for (s, e) in ranges {
+            if s > covered_to {
+                return false;
+            }
+            covered_to = covered_to.max(e);
+        }
+        covered_to >= end
+    }
+
     /// Evaluates corruption within [part_start, part_end). Returns a list of IPs
     /// that should be banned based on their corruption ratio across the entire file.
     ///
@@ -401,7 +433,9 @@ impl CorruptionBlackBox {
     /// from part-level MD4 alone, so marking every overlapping block corrupt
     /// would poison honest multi-source peers toward a false ban. AICH
     /// narrowing (or a later single-contributor failure) is required before
-    /// corrupt bytes count toward the ban ratio.
+    /// corrupt bytes count toward the ban ratio. It is equally a no-op when
+    /// part of the range has no recorded sender (see
+    /// [`Self::part_fully_attributed`]).
     pub fn corrupted_part(
         &mut self,
         file_hash: &[u8; 16],
@@ -409,7 +443,9 @@ impl CorruptionBlackBox {
         part_end: u64,
     ) -> Vec<Ipv4Addr> {
         let contributors = self.corrupted_part_contributors(file_hash, part_start, part_end);
-        if contributors.len() != 1 {
+        if contributors.len() != 1
+            || !self.part_fully_attributed(file_hash, part_start, part_end)
+        {
             return Vec::new();
         }
 
@@ -793,5 +829,28 @@ mod tests {
 
         let banned = bb.corrupted_part(&h, 0, EMBLOCKSIZE);
         assert!(banned.is_empty());
+    }
+
+    /// A resumed part holds bytes from before the records were dropped. The
+    /// one peer on record filled only the tail, so it cannot be blamed for
+    /// the part failing, however much it sent.
+    #[test]
+    fn part_with_unrecorded_bytes_blames_nobody() {
+        let mut bb = CorruptionBlackBox::new();
+        let h = hash(9);
+        let finisher = ip(10, 0, 0, 5);
+        let part_end = MIN_BYTES_FOR_BAN_DECISION * 3;
+        bb.record_data(h, MIN_BYTES_FOR_BAN_DECISION, part_end, finisher);
+
+        assert!(!bb.part_fully_attributed(&h, 0, part_end));
+        assert!(bb.corrupted_part(&h, 0, part_end).is_empty());
+        assert!(
+            bb.records[&h].iter().all(|b| !b.corrupt),
+            "nothing is marked corrupt without full attribution"
+        );
+
+        bb.record_data(h, 0, MIN_BYTES_FOR_BAN_DECISION, finisher);
+        assert!(bb.part_fully_attributed(&h, 0, part_end));
+        assert_eq!(bb.corrupted_part(&h, 0, part_end), vec![finisher]);
     }
 }

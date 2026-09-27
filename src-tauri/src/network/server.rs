@@ -171,11 +171,12 @@ pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &t
     // longer be sent.
     ed2k::server::set_server_flags_mirror(0);
     state.server_poll_count = 0;
-    state.server_search_more_needed = false;
+    state.server_search_more_due_at = None;
     state.server_search_more_requests = 0;
     // No session, no way to send it — and the flags mirror cleared above means
     // the next plan will not count on a co-share request either.
     state.server_followup_search = None;
+    state.server_followup_due_at = None;
     state.low_id = false;
     state.server_client_id = 0;
     // A new connection (even to the same server) is a fresh session that
@@ -185,6 +186,9 @@ pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &t
     // "unchanged" when the new server session has never seen it.
     state.last_offer_files_signature = None;
     state.offered_ed2k_hashes.clear();
+    // Asks for this server's sources; the next server's first sweep covers
+    // every download anyway.
+    state.server_tcp_srcreq_asks.clear();
     if let Some(mut pending) = state.pending_server_search.take() {
         let request_id = pending.request_id;
         if let Some(tx) = pending.tx.take() {
@@ -223,6 +227,16 @@ pub(super) async fn handle_server_disconnect(
 ) {
     debug!("Server connection lost: {reason}");
     emit_server_log(app_handle, &format!("Server disconnected: {reason}"));
+    if state.server_connected {
+        let session_secs = chrono::Utc::now()
+            .timestamp()
+            .saturating_sub(state.server_connected_at);
+        state.server_reconnect_failures =
+            reconnect_failures_after_session(state.server_reconnect_failures, session_secs);
+        if session_secs < SHORT_SERVER_SESSION_SECS {
+            state.server_last_connect_attempt = Some(std::time::Instant::now());
+        }
+    }
     if let Some(handle) = state.pending_server_connect.take() {
         handle.abort();
     }
@@ -299,9 +313,6 @@ pub(super) async fn disconnect_connected_server_if_ip_filtered(
         app_handle,
         &format!("Server {ip}:{port} blocked by IP filter"),
     );
-    if let Some(conn) = state.server_connection.take() {
-        conn.disconnect().await;
-    }
     handle_server_disconnect(
         state,
         shared_server_addr,
@@ -353,6 +364,39 @@ pub(super) async fn apply_server_ip_filter(
 /// UI is told to connect manually. Covers boot auto-connect and mid-session
 /// drop recovery for the same host only.
 pub(super) const AUTO_CONNECT_MAX_FAILURES: u32 = 3;
+
+/// A server session that ends sooner than this after login counts toward
+/// `AUTO_CONNECT_MAX_FAILURES` (see `handle_server_disconnect`).
+const SHORT_SERVER_SESSION_SECS: i64 = 120;
+
+/// The reconnect failure count once a session of `session_secs` has ended.
+///
+/// A login that is dropped soon after it succeeds is another failed attempt,
+/// and only a session that outlasts `SHORT_SERVER_SESSION_SECS` clears the
+/// count. Login itself must not: a server that accepts us and then kicks us
+/// (flood protection, a ban notice) would otherwise take the count 0→1→0
+/// forever, be redialed every few seconds, and see the whole post-login burst
+/// each time — the pattern servers blacklist.
+fn reconnect_failures_after_session(failures: u32, session_secs: i64) -> u32 {
+    if session_secs < SHORT_SERVER_SESSION_SECS {
+        failures.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+/// Wait before auto-reconnecting to the preferred server after `failures`
+/// consecutive failed attempts.
+pub(super) fn server_reconnect_backoff_secs(failures: u32) -> u64 {
+    match failures {
+        0 => 0,
+        1 => 3,
+        2 => 5,
+        3 => 10,
+        4 => 20,
+        _ => 30,
+    }
+}
 
 pub(super) fn emit_server_auto_connect_failed(app_handle: &tauri::AppHandle, detail: &str) {
     warn!("eD2K auto-connect abandoned: {detail}");
@@ -427,7 +471,7 @@ pub(super) async fn initiate_server_connect(
     }
     let tcp_port = if let Some(conn) = state.server_connection.take() {
         emit_server_log(app_handle, "Disconnecting from current server...");
-        conn.disconnect().await;
+        drop(conn);
         state.server_connected = false;
         state.server_addr = None;
         *shared_server_addr.write().await = None;
@@ -550,8 +594,7 @@ pub(super) fn server_entry_to_info(server: &ServerEntry) -> ServerInfo {
 }
 
 pub(super) fn connected_server_info(state: &NetworkState) -> Option<ServerInfo> {
-    let conn = state.server_connection.as_ref()?;
-    let session = conn.session.as_ref()?;
+    let session = &state.server_connection.as_ref()?.session;
     let addr = state.server_addr?;
     // The live session carries the user/file counts but not the capacity
     // limits — those come from `server.met` (ST_MAXUSERS / ST_SOFTFILES /
@@ -580,4 +623,35 @@ pub(super) fn connected_server_info(state: &NetworkState) -> Option<ServerInfo> 
         client_id: state.server_client_id,
         is_low_id: state.low_id,
     })
+}
+
+#[cfg(test)]
+mod reconnect_backoff_tests {
+    use super::*;
+
+    /// A server that accepts the login and kicks us 20 s later: each redial
+    /// has to wait longer than the last, and auto-reconnect gives up after
+    /// `AUTO_CONNECT_MAX_FAILURES` of them instead of redialing forever.
+    #[test]
+    fn repeated_short_sessions_back_off_and_then_stop() {
+        let mut failures = 0;
+        let mut last_backoff = server_reconnect_backoff_secs(failures);
+        for expected in 1..=AUTO_CONNECT_MAX_FAILURES {
+            failures = reconnect_failures_after_session(failures, 20);
+            assert_eq!(failures, expected);
+            let backoff = server_reconnect_backoff_secs(failures);
+            assert!(backoff > last_backoff, "backoff must grow: {backoff} after {last_backoff}");
+            last_backoff = backoff;
+        }
+        assert!(failures >= AUTO_CONNECT_MAX_FAILURES);
+    }
+
+    #[test]
+    fn only_a_session_that_lasts_clears_the_count() {
+        assert_eq!(
+            reconnect_failures_after_session(2, SHORT_SERVER_SESSION_SECS - 1),
+            3
+        );
+        assert_eq!(reconnect_failures_after_session(2, SHORT_SERVER_SESSION_SECS), 0);
+    }
 }

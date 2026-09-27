@@ -1176,14 +1176,16 @@ fn a_tcp_batch_cannot_spend_the_udp_sweeps_budget() {
     );
 }
 
-/// The backstop has to sit above the point where a server signals it has
-/// more to give, or the "More results" gate — which requires a full 200-row
-/// batch *and* room under the budget — can never open. Those were the two
-/// halves of one `if`, and `note_ed2k_search_results` charges the batch
-/// before the gate reads the counter, so page two was never asked for.
+/// A page that flags more results must still earn the next one once it has
+/// been charged to the search's counters. The "More results" gate once also
+/// read a source counter that `note_ed2k_search_results` had already charged
+/// for the very batch being judged, so page two was never asked for. It now
+/// reads only the server's "more" byte, the pages already asked for and the
+/// result cap (`server_should_ask_for_more`); a large, well-sourced page must
+/// leave it open and the UDP sweep's backstop untouched.
 #[test]
 fn the_more_results_gate_is_reachable() {
-    // The batch size that makes a server worth asking again.
+    // A full page from a typical eD2K server.
     const FULL_BATCH: u32 = 200;
     const {
         assert!(
@@ -1199,9 +1201,8 @@ fn the_more_results_gate_is_reachable() {
         )
     };
 
-    // The gate no longer consults a source budget at all, so its two halves
-    // can no longer contradict each other: a batch large enough to ask about
-    // leaves the sweep's counter untouched.
+    // Charging the batch leaves the sweep's counter untouched, and the gate
+    // consults no source counter at all.
     let mut active = sample_active_search_request(1);
     let none = HashSet::new();
     let batch: Vec<SearchResult> = (0..FULL_BATCH)
@@ -1219,6 +1220,10 @@ fn the_more_results_gate_is_reachable() {
     assert_eq!(
         active.udp_found_sources, 0,
         "the server's own pages must not spend the sweep's budget"
+    );
+    assert!(
+        server_should_ask_for_more(true, 0, true),
+        "a charged page that flags more must still open the gate"
     );
 }
 

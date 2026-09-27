@@ -15,7 +15,6 @@ pub(in crate::network) async fn on_stats_tick(
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
-    source_manager: &Arc<RwLock<SourceManager>>,
     stats_manager: &mut StatsManager,
     known_files: &mut KnownFileList,
     shared_banned_ips: &upload_server::SharedBannedIps,
@@ -70,16 +69,7 @@ pub(in crate::network) async fn on_stats_tick(
         *banned_ips_sync_in_flight = false;
         if let Some((peers, auto_bans)) = inputs {
             let before = state.banned_ips.len();
-            {
-                let sm = source_manager.read().await;
-                apply_enforced_banned_ips(
-                    state,
-                    shared_banned_ips,
-                    peers,
-                    auto_bans,
-                    &sm,
-                );
-            }
+            apply_enforced_banned_ips(state, shared_banned_ips, peers, auto_bans);
             if state.banned_ips.len() > MAX_BANNED_IPS {
                 warn!(
                     "banned_ips still over cap after sync ({} → {}); durable sources exceed MAX_BANNED_IPS",

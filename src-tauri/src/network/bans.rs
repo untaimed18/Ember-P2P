@@ -136,7 +136,6 @@ pub(super) fn apply_enforced_banned_ips(
     shared_banned_ips: &ed2k::upload::SharedBannedIps,
     peers: Vec<crate::types::PeerInfo>,
     auto_bans: Vec<Ipv4Addr>,
-    source_manager: &SourceManager,
 ) {
     let mut rebuilt: HashSet<Ipv4Addr> = peers
         .iter()
@@ -146,16 +145,15 @@ pub(super) fn apply_enforced_banned_ips(
         .collect();
     rebuilt.extend(auto_bans);
 
+    // The addresses a node ban was observed on are mirrored into IP reputation
+    // when the ban is applied (`apply_reputation_ban_ips`), and the banned
+    // identity itself is refused by user hash wherever sources are picked.
+    // Nothing here re-derives addresses from the identity: the user hash on a
+    // KAD source record and the ID of a routing-table contact are both
+    // whatever the sender claimed, so a banned peer could otherwise point its
+    // own ban at any address it liked.
     for ip in state.reputation.currently_banned_ips() {
         rebuilt.insert(ip);
-    }
-    for uh in state.reputation.currently_banned_node_ids() {
-        for ip in source_manager.find_ips_by_user_hash(&uh) {
-            rebuilt.insert(ip);
-        }
-        if let Some(contact) = state.routing_table.get_contact(&KadId(uh)) {
-            rebuilt.insert(contact.ip);
-        }
     }
 
     state.banned_ips = rebuilt;

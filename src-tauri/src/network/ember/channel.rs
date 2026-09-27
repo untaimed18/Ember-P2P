@@ -437,6 +437,73 @@ pub fn handoff_offer_live_at_target(version: u64, now: i64) -> bool {
     handoff_offer_live(version, now.saturating_add(CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS))
 }
 
+/// Most rooms whose live ownership offer a node keeps in mind at once. Only an
+/// owner can sign an offer, so an honest room has one at a time and this is
+/// far above what a device's joined rooms will ever need.
+pub const HANDOFF_OFFERS_SEEN_CAP: usize = 64;
+
+/// The live ownership offer this node last saw in each room: whom it names,
+/// and at which version.
+///
+/// What a member relaying a ready checks it against. A ready is signed by the
+/// member it names, not by the room, so anyone holding the content key can mint
+/// one naming themselves; only one from the member the owner's signed offer
+/// named, for that offer, is worth carrying across the room.
+#[derive(Debug, Default)]
+pub struct HandoffOffersSeen {
+    offers: HashMap<[u8; 16], ([u8; 32], u64)>,
+}
+
+impl HandoffOffersSeen {
+    /// Remember a verified, live offer. A later version replaces an earlier
+    /// one; lapsed offers are dropped first, and at the cap the oldest goes.
+    pub fn note(&mut self, channel_id: [u8; 16], target: [u8; 32], version: u64, now: i64) {
+        self.offers
+            .retain(|_, (_, held)| handoff_offer_live_at_target(*held, now));
+        if let Some((_, held)) = self.offers.get(&channel_id) {
+            if *held > version {
+                return;
+            }
+        } else if self.offers.len() >= HANDOFF_OFFERS_SEEN_CAP {
+            if let Some(oldest) = self
+                .offers
+                .iter()
+                .min_by_key(|(_, (_, held))| *held)
+                .map(|(id, _)| *id)
+            {
+                self.offers.remove(&oldest);
+            }
+        }
+        self.offers.insert(channel_id, (target, version));
+    }
+
+    /// Whether the offer seen in `channel_id` named `member` at `version`.
+    pub fn names(&self, channel_id: &[u8; 16], member: &[u8; 32], version: u64) -> bool {
+        self.offers
+            .get(channel_id)
+            .is_some_and(|(target, held)| target == member && *held == version)
+    }
+}
+
+/// Whether a verified ready may be passed on to the rest of the room, before
+/// the sender's rate budget is spent on it.
+///
+/// From a member who is not banned, for an offer still live and known to this
+/// node as naming that member. Anything else is at best useless to the room
+/// and at worst a flood: the owner acts only on its own pending offer, so no
+/// other ready can move the room, and every copy relayed costs each member a
+/// signature check. The key that sealed it is not asked about: the owner's
+/// signed offer already names the sender, and a nominee still on the epoch
+/// before a ban's rotation is exactly who has to be able to answer.
+pub fn handoff_ready_may_relay(
+    sender_banned: bool,
+    offer_known: bool,
+    version: u64,
+    now: i64,
+) -> bool {
+    !sender_banned && offer_known && handoff_offer_live_at_target(version, now)
+}
+
 /// Least gap between two publishes of a committed handoff record.
 pub const HANDOFF_REPUBLISH_SECS: i64 = 60;
 /// How long after a handoff is committed (or re-driven) its record keeps
@@ -1393,6 +1460,15 @@ const XFER_STREAM_SEALED_VERSION: u8 = 25;
 /// for why 1.7.0 reads it and does not yet send it. v1.6.x drops the number
 /// like the two above, which is why senders keep the plain offer for now.
 const XFER_OFFER_SEALED_VERSION: u8 = 26;
+/// A friend request from one member to another, for a recipient the friend
+/// rendezvous cannot find: a current build publishes presence only to its
+/// friends and to holders of its v3 friend code, and a room shows members
+/// neither. Flooded, because the sender cannot tell which members reach the
+/// recipient, and addressed by a tag only the two of them can compute, so the
+/// members carrying it learn who is asking but not whom. A new number for the
+/// reason typing has one: v1.6.x drops it without scoring the hop, and never
+/// relays it.
+const ROOM_FRIEND_REQUEST_PLAIN_VERSION: u8 = 27;
 const TYPING_SIG_DOMAIN: &[u8] = b"ember-channel-typing-author-v1\0";
 const PRESENCE_BEACON_SIG_DOMAIN: &[u8] = b"ember-channel-presence-beacon-v1\0";
 const MOD_ACTION_BAN: u8 = 1;
@@ -2555,6 +2631,125 @@ pub fn decode_channel_typing(
         return None;
     }
     Some((member, typing))
+}
+
+const ROOM_FRIEND_REQUEST_DOMAIN: &[u8] = b"ember-channel-friend-request-v1\0";
+/// `version || sender(32) || recipient tag(16) || sig(64)`.
+const ROOM_FRIEND_REQUEST_LEN: usize = 1 + 32 + 16 + 64;
+/// Oldest room friend request acted on or passed on. Past the sender's own
+/// ten-minute origin retry, and short enough that a member replaying one it
+/// carried has only this window to do it in — inside which the recipient
+/// remembers a refusal (`Database::add_room_friend_request`), so a declined
+/// request cannot be put back in front of them.
+pub const ROOM_FRIEND_REQUEST_MAX_AGE_SECS: i64 = 15 * 60;
+
+/// The tag that tells `recipient` a room friend request is theirs.
+///
+/// Pairwise, so the sender and the recipient derive the same value and nobody
+/// else can, and bound to the envelope's id so no two requests carry the same
+/// tag: the members relaying them cannot tell whether two are to one person.
+pub fn room_friend_request_tag(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+) -> Option<[u8; 16]> {
+    let mut purpose = Vec::with_capacity(12 + 16 + 16);
+    purpose.extend_from_slice(b"ch-friend-v1");
+    purpose.extend_from_slice(channel_id);
+    purpose.extend_from_slice(msg_id);
+    let key =
+        crypto::derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, 0)?;
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&key[..16]);
+    Some(tag)
+}
+
+/// Whether a room friend request from `sender` carrying `tag` is addressed to
+/// the holder of `our_ed25519_seed`.
+pub fn room_friend_request_is_for(
+    our_ed25519_seed: &[u8; 32],
+    sender: &[u8; 32],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    tag: &[u8; 16],
+) -> bool {
+    let Some(expected) = room_friend_request_tag(our_ed25519_seed, sender, channel_id, msg_id)
+    else {
+        return false;
+    };
+    expected.iter().zip(tag.iter()).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
+}
+
+fn room_friend_request_preimage(
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+    sender: &[u8; 32],
+    tag: &[u8; 16],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ROOM_FRIEND_REQUEST_DOMAIN.len() + 16 + 16 + 8 + 32 + 16);
+    out.extend_from_slice(ROOM_FRIEND_REQUEST_DOMAIN);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(msg_id);
+    out.extend_from_slice(&timestamp.to_le_bytes());
+    out.extend_from_slice(sender);
+    out.extend_from_slice(tag);
+    out
+}
+
+/// Signed by the sender's user key, so every member it passes through can
+/// hold it to the sender's ban and rate like chat, and cannot pin it on
+/// anyone else.
+pub fn encode_room_friend_request(
+    signing_key: &SigningKey,
+    sender: &[u8; 32],
+    tag: &[u8; 16],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+) -> Vec<u8> {
+    let sig = crypto::sign(
+        signing_key,
+        &room_friend_request_preimage(channel_id, msg_id, timestamp, sender, tag),
+    );
+    let mut out = Vec::with_capacity(ROOM_FRIEND_REQUEST_LEN);
+    out.push(ROOM_FRIEND_REQUEST_PLAIN_VERSION);
+    out.extend_from_slice(sender);
+    out.extend_from_slice(tag);
+    out.extend_from_slice(&sig);
+    out
+}
+
+/// The sender and recipient tag of a room friend request, or nothing if it is
+/// malformed or not signed by the member it names for this envelope.
+pub fn decode_room_friend_request(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+) -> Option<([u8; 32], [u8; 16])> {
+    if bytes.len() != ROOM_FRIEND_REQUEST_LEN || bytes[0] != ROOM_FRIEND_REQUEST_PLAIN_VERSION {
+        return None;
+    }
+    let sender: [u8; 32] = bytes[1..33].try_into().ok()?;
+    let tag: [u8; 16] = bytes[33..49].try_into().ok()?;
+    let sig: [u8; 64] = bytes[49..].try_into().ok()?;
+    let author = crypto::verifying_key_from_bytes(&sender)?;
+    if !crypto::verify(
+        &author,
+        &room_friend_request_preimage(channel_id, msg_id, timestamp, &sender, &tag),
+        &sig,
+    ) {
+        return None;
+    }
+    Some((sender, tag))
+}
+
+/// Whether a room friend request's envelope time is recent enough to act on.
+pub fn room_friend_request_fresh(timestamp: i64, now: i64) -> bool {
+    timestamp >= now.saturating_sub(ROOM_FRIEND_REQUEST_MAX_AGE_SECS)
+        && timestamp <= now.saturating_add(CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS)
 }
 
 /// Whether a typing envelope's time is close enough to now to mean anything.
@@ -6016,6 +6211,113 @@ mod tests {
         assert!(!handoff_offer_live(u64::MAX, at));
     }
 
+    /// A ready is carried across the room only for the offer the owner signed,
+    /// from the member it named, while it lives — under whichever key.
+    #[test]
+    fn only_a_ready_answering_a_known_live_offer_is_relayed() {
+        let room = [0x31u8; 16];
+        let (nominee, other) = ([0xA1u8; 32], [0xB2u8; 32]);
+        let offered = 1_700_000_000u64;
+        let now = offered as i64 + 10;
+        let mut seen = HandoffOffersSeen::default();
+        assert!(!seen.names(&room, &nominee, offered), "nothing seen yet");
+        seen.note(room, nominee, offered, now);
+        assert!(seen.names(&room, &nominee, offered));
+        assert!(!seen.names(&room, &other, offered), "a ready naming itself");
+        assert!(!seen.names(&room, &nominee, offered + 1), "for an offer never made");
+        assert!(!seen.names(&[0x32; 16], &nominee, offered), "in another room");
+
+        // A later offer replaces it; an older one arriving late does not.
+        seen.note(room, other, offered + 5, now);
+        seen.note(room, nominee, offered, now);
+        assert!(seen.names(&room, &other, offered + 5));
+        assert!(!seen.names(&room, &nominee, offered));
+
+        assert!(handoff_ready_may_relay(false, true, offered, now));
+        assert!(!handoff_ready_may_relay(true, true, offered, now), "banned sender");
+        assert!(!handoff_ready_may_relay(false, false, offered, now), "unknown offer");
+        assert!(
+            !handoff_ready_may_relay(false, true, offered, now + HANDOFF_PENDING_TTL_SECS),
+            "lapsed offer"
+        );
+    }
+
+    #[test]
+    fn remembered_handoff_offers_are_bounded_and_forget_lapsed_ones() {
+        let offered = 1_700_000_000u64;
+        let now = offered as i64;
+        let mut seen = HandoffOffersSeen::default();
+        for i in 0..HANDOFF_OFFERS_SEEN_CAP + 8 {
+            let mut room = [0u8; 16];
+            room[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            seen.note(room, [1; 32], offered + i as u64, now);
+        }
+        assert_eq!(seen.offers.len(), HANDOFF_OFFERS_SEEN_CAP);
+        assert!(!seen.names(&[0u8; 16], &[1; 32], offered), "the oldest made way");
+        seen.note([0xEE; 16], [2; 32], offered, now + HANDOFF_PENDING_TTL_SECS * 2);
+        assert_eq!(seen.offers.len(), 1, "lapsed offers are dropped");
+    }
+
+    /// Only the member a room friend request was made out to recognises it,
+    /// and no two requests carry a tag the relaying members could match up.
+    #[test]
+    fn a_room_friend_request_is_recognised_only_by_its_recipient() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let bob = SigningKey::generate(&mut OsRng);
+        let carol = SigningKey::generate(&mut OsRng);
+        let alice_pk = alice.verifying_key().to_bytes();
+        let bob_pk = bob.verifying_key().to_bytes();
+        let room = [0x44u8; 16];
+        let (msg, other_msg) = ([1u8; 16], [2u8; 16]);
+        let tag = room_friend_request_tag(&alice.to_bytes(), &bob_pk, &room, &msg).unwrap();
+
+        assert!(room_friend_request_is_for(&bob.to_bytes(), &alice_pk, &room, &msg, &tag));
+        assert!(!room_friend_request_is_for(&carol.to_bytes(), &alice_pk, &room, &msg, &tag));
+        assert!(!room_friend_request_is_for(&alice.to_bytes(), &alice_pk, &room, &msg, &tag));
+        assert!(!room_friend_request_is_for(&bob.to_bytes(), &alice_pk, &[0x45; 16], &msg, &tag));
+        assert_ne!(
+            room_friend_request_tag(&alice.to_bytes(), &bob_pk, &room, &other_msg).unwrap(),
+            tag,
+            "a second request to the same member carries a different tag"
+        );
+    }
+
+    #[test]
+    fn a_room_friend_request_is_signed_by_its_sender_for_its_envelope() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let alice_pk = alice.verifying_key().to_bytes();
+        let tag = [9u8; 16];
+        let (room, msg) = (CHAT_CHANNEL, CHAT_MSG_ID);
+        let frame = encode_room_friend_request(&alice, &alice_pk, &tag, &room, &msg, CHAT_TS);
+        let decode = |bytes: &[u8], channel: &[u8; 16], msg: &[u8; 16], ts: i64| {
+            decode_room_friend_request(bytes, channel, msg, ts)
+        };
+        assert_eq!(decode(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS), Some((alice_pk, tag)));
+        assert!(decode(&frame, &[0u8; 16], &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode(&frame, &CHAT_CHANNEL, &[0u8; 16], CHAT_TS).is_none());
+        assert!(decode(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS + 1).is_none());
+
+        let mut impostor = frame.clone();
+        let stranger = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        impostor[1..33].copy_from_slice(&stranger);
+        assert!(decode(&impostor, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        let mut retargeted = frame.clone();
+        retargeted[33] ^= 1;
+        assert!(decode(&retargeted, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+
+        // No other decoder in the dispatch reads it as its own.
+        assert!(xfer_frame_peek(&frame).is_none());
+        assert!(decode_channel_typing(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_channel_chat_plain(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_channel_handoff_ready(&frame, &CHAT_CHANNEL).is_none());
+
+        let now = CHAT_TS;
+        assert!(room_friend_request_fresh(now, now));
+        assert!(room_friend_request_fresh(now - ROOM_FRIEND_REQUEST_MAX_AGE_SECS, now));
+        assert!(!room_friend_request_fresh(now - ROOM_FRIEND_REQUEST_MAX_AGE_SECS - 1, now));
+        assert!(!room_friend_request_fresh(now + CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS + 1, now));
+    }
+
     #[test]
     fn only_catch_up_shaped_lines_put_a_room_on_the_walk_interval() {
         assert!(gossip_is_catch_up_shaped(1));
@@ -7349,6 +7651,19 @@ mod tests {
         // protocol.
         assert!(!V167_ASSIGNED_OR_RETIRED.contains(&XFER_STREAM_SEALED_VERSION));
         assert!(!V167_ASSIGNED_OR_RETIRED.contains(&XFER_OFFER_SEALED_VERSION));
+        // A room friend request too: v1.6.7 neither reads nor relays it.
+        assert!(!V167_ASSIGNED_OR_RETIRED.contains(&ROOM_FRIEND_REQUEST_PLAIN_VERSION));
+        assert_eq!(
+            v1_6_7_branch(&encode_room_friend_request(
+                &alice,
+                &alice.verifying_key().to_bytes(),
+                &[4u8; 16],
+                &CHAT_CHANNEL,
+                &CHAT_MSG_ID,
+                CHAT_TS,
+            )),
+            V167Branch::DroppedWithDebugLog
+        );
         assert_eq!(
             v1_6_7_branch(&encode_xfer_offer_sealed(&[0x5Au8; 32], &sample_offer())),
             V167Branch::DroppedWithDebugLog

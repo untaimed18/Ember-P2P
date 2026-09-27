@@ -98,6 +98,7 @@
     type Locale,
   } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
+  import { plural } from '$lib/plural';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import SpeedInput from '$lib/components/SpeedInput.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
@@ -1820,7 +1821,10 @@
       } else {
         webServiceMessage = {
           kind: 'ok',
-          text: added === 1 ? m.webservices_imported_one() : m.webservices_imported_other({ count: added }),
+          text: plural(added, {
+            one: m.webservices_imported_one,
+            other: () => m.webservices_imported_other({ count: added }),
+          }),
         };
       }
     } catch (e: unknown) {
@@ -1926,17 +1930,19 @@
         const rejected = String(result.compile_errors.length);
         antileechMessage = {
           kind: 'warn',
-          text: savedCount === 1
-            ? m.settings_antileech_saved_rejected_one({ rejected })
-            : m.settings_antileech_saved_rejected_other({ count: savedCount, rejected }),
+          text: plural(savedCount, {
+            one: () => m.settings_antileech_saved_rejected_one({ rejected }),
+            other: () => m.settings_antileech_saved_rejected_other({ count: savedCount, rejected }),
+          }),
         };
       } else {
         const savedCount = result.snapshot.pattern_count;
         antileechMessage = {
           kind: 'ok',
-          text: savedCount === 1
-            ? m.settings_antileech_saved_one()
-            : m.settings_antileech_saved_other({ count: savedCount }),
+          text: plural(savedCount, {
+            one: m.settings_antileech_saved_one,
+            other: () => m.settings_antileech_saved_other({ count: savedCount }),
+          }),
         };
         trackedTimeout(() => (antileechMessage = null), 4000);
       }
@@ -2013,9 +2019,10 @@
       antileechDraft = snap.patterns.join('\n');
       antileechMessage = {
         kind: 'ok',
-        text: snap.pattern_count === 1
-          ? m.settings_antileech_restored_one()
-          : m.settings_antileech_restored_other({ count: snap.pattern_count }),
+        text: plural(snap.pattern_count, {
+          one: m.settings_antileech_restored_one,
+          other: () => m.settings_antileech_restored_other({ count: snap.pattern_count }),
+        }),
       };
       trackedTimeout(() => (antileechMessage = null), 4000);
     } catch (e: unknown) {
@@ -2342,9 +2349,10 @@
         </div>
         {:else}
           <p class="settings-filter-status" role="status">
-            {filterMatchCount === 1
-              ? m.settings_filter_one_result()
-              : m.settings_filter_results({ count: filterMatchCount })}
+            {plural(filterMatchCount, {
+              one: m.settings_filter_one_result,
+              other: () => m.settings_filter_results({ count: filterMatchCount }),
+            })}
           </p>
           <button type="button" class="ghost settings-filter-clear" onclick={() => (settingsFilter = '')}>
             {m.common_clear_filters()}

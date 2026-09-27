@@ -31,8 +31,8 @@ export async function kadDisconnect(): Promise<void> {
   return withTimeout(invoke('kad_disconnect'), 'KAD disconnect');
 }
 
-/** Returns a human-readable success message when the bootstrap packet
- *  actually went out, or throws with a concrete failure reason. */
+/** Resolves once the bootstrap packet actually went out, or throws with a
+ *  concrete failure reason. The resolved string is backend English. */
 export async function kadBootstrapIp(ip: string, port: number): Promise<string> {
   return withTimeout(
     invoke<string>('kad_bootstrap_ip', { ip, port }),
@@ -40,19 +40,20 @@ export async function kadBootstrapIp(ip: string, port: number): Promise<string> 
   );
 }
 
-/** Returns a human-readable success message (e.g. "Loaded 123 contacts
- *  from nodes.dat") when the download + parse + insert all succeeded, or
- *  throws with a concrete failure reason. */
+/** Resolves with backend English ("Loaded 123 contacts from nodes.dat") when
+ *  the download + parse + insert all succeeded, or throws with a concrete
+ *  failure reason. Render it through `kadNodesLoadedText`. */
 export async function kadBootstrapUrl(url: string): Promise<string> {
-  // URL bootstrap includes an HTTP download; give it a longer ceiling.
-  // Must be >= the backend's own 90s deadline (`kad_bootstrap_url` in
-  // peers.rs awaits the worker with a 90s timeout); a shorter client
-  // ceiling would surface a false "timed out" toast while the backend is
-  // still legitimately downloading and may yet succeed.
+  // Must cover the backend's worst case, or a slow host gets a false "timed
+  // out" toast while the command is still running and may yet succeed.
+  // `kad_bootstrap_url` (peers.rs) runs, in sequence: an up-front DNS check
+  // (5 s), `fetch_pinned_get` following up to 5 redirects — six hops of a 5 s
+  // DNS check plus a 60 s request each (`build_pinned_client`) — and then a
+  // 90 s wait for the network task. That is 485 s; the rest is margin.
   return withTimeout(
     invoke<string>('kad_bootstrap_url', { url }),
     'KAD URL bootstrap',
-    90_000,
+    (5 + 6 * (5 + 60) + 90 + 25) * 1000,
   );
 }
 

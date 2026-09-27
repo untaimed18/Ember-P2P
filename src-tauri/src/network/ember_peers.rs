@@ -24,6 +24,13 @@ pub(super) const MAX_KNOWN_EMBER_PEERS: usize = 500;
 /// harness scale to a few hundred peers without churn.
 pub(super) const MAX_KNOWN_EMBER_NOISE_KEYS: usize = 500;
 
+/// Most distinct ports one host may hold in the noise-key cache before we
+/// have reached it. The cache feeds bridge dials, and unreached entries come
+/// from unauthenticated KAD source records, so without a cap one lookup reply
+/// could fill it with a single third party's address on hundreds of ports and
+/// have a cold node send it a handshake on each.
+const MAX_EMBER_NOISE_KEYS_PER_IP: usize = 3;
+
 /// Insert or refresh an Ember peer in `known_ember_peers`. Returns true
 /// when this is the first time we've seen the address (caller uses that
 /// signal to mark `ember_payload_dirty`). When the map is at capacity
@@ -143,6 +150,12 @@ pub(super) fn cache_bound_ember_noise_key(
         return None;
     }
     if !established {
+        if !map.contains_key(&(ip, udp_port))
+            && map.keys().filter(|(known_ip, _)| *known_ip == ip).count()
+                >= MAX_EMBER_NOISE_KEYS_PER_IP
+        {
+            return None;
+        }
         // Nothing to protect yet. The pin exists to stop an unauthenticated
         // KAD tag redirecting dials to a peer we already talk to; holding a
         // first sighting we have never reached does the opposite, because a

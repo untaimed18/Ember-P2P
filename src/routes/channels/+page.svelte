@@ -38,6 +38,7 @@
   } from '$lib/xferRate';
   import { toast, toastError, toastSuccess } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
+  import { plural } from '$lib/plural';
   import * as m from '$lib/paraglide/messages';
   import {
     addChannelModerator,
@@ -417,9 +418,10 @@
     const left = Math.ceil(selected.claim_after_days - elapsedDays);
     // Only worth mentioning once the owner has actually started to go quiet.
     if (left <= 0 || elapsedDays < selected.claim_after_days / 2) return '';
-    return left === 1
-      ? m.channels_owner_inactive_one({ name: who })
-      : m.channels_owner_inactive({ name: who, days: left });
+    return plural(left, {
+      one: () => m.channels_owner_inactive_one({ name: who }),
+      other: () => m.channels_owner_inactive({ name: who, days: left }),
+    });
   });
   let selectedNotifyLevel = $derived<ChannelNotifyLevel>(
     selected ? notifyLevelOf($channelNotifyLevels, selected.channel_id) : 'all',
@@ -2248,9 +2250,10 @@
   let membersToggleLabel = $derived.by(() => {
     if (membersOpen) return m.channels_hide_members();
     if (roomOffersWaiting === 0) return m.channels_show_members();
-    return roomOffersWaiting === 1
-      ? m.channels_show_members_offers_one()
-      : m.channels_show_members_offers_other({ count: roomOffersWaiting });
+    return plural(roomOffersWaiting, {
+      one: m.channels_show_members_offers_one,
+      other: () => m.channels_show_members_offers_other({ count: roomOffersWaiting }),
+    });
   });
   let roomXferRate = $derived(
     roomTransfers.reduce(
@@ -2291,9 +2294,10 @@
          someone who had joined two. -->
     {#if joinedCount > 0}
       <span class="header-count">
-        {joinedCount === 1
-          ? m.channels_count_one()
-          : m.channels_count_other({ count: joinedCount })}
+        {plural(joinedCount, {
+          one: m.channels_count_one,
+          other: () => m.channels_count_other({ count: joinedCount }),
+        })}
       </span>
     {/if}
   </div>
@@ -2644,9 +2648,11 @@
                            3 sitting above a 5 reads as a broken sort. -->
                       {@const countLabel = ch.in_room
                         ? m.channels_members_here_of_total({ present: count, total: Math.max(ch.roster_count, count) })
-                        : count === 1
-                          ? m.channels_members_one()
-                          : m.channels_members_n({ count })}
+                        : plural(count, {
+                            one: m.channels_members_one,
+                            few: () => m.channels_members_few({ count }),
+                            other: () => m.channels_members_n({ count }),
+                          })}
                       <span class="chan-members" title={countLabel} aria-label={countLabel}>
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                           <circle cx="6" cy="6" r="2.2"/>
@@ -2668,9 +2674,11 @@
                         class:silenced={unreadBadgeTone(notifyLevelOf($channelNotifyLevels, ch.channel_id), mentioned) === 'quiet'}
                         aria-label={mentioned
                           ? m.channels_unread_mention_aria({ count: ch.unread })
-                          : ch.unread === 1
-                            ? m.channels_unread_title_one()
-                            : m.channels_unread_title_other({ count: ch.unread })}
+                          : plural(ch.unread, {
+                              one: m.channels_unread_title_one,
+                              few: () => m.channels_unread_title_few({ count: ch.unread }),
+                              other: () => m.channels_unread_title_other({ count: ch.unread }),
+                            })}
                       >{#if mentioned}<span class="unread-at" aria-hidden="true">@</span>{/if}{ch.unread}</span>
                     {/if}
                   </button>

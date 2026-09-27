@@ -1155,6 +1155,7 @@ async fn fetch_to_chat_files(ctx: &FetchCtx) -> Result<bool, ReceiveFailure> {
             let _ = std::fs::remove_file(&part_path);
             e.to_string()
         })?;
+        super::ember::xfer::mark_received_from_internet(&dest);
         let dest_str = dest.to_string_lossy().into_owned();
         match db.advance_chat_attachment(&xfer_hex, "complete", Some(size), Some(&dest_str)) {
             Ok(true) => Ok(true),

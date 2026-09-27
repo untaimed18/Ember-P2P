@@ -752,6 +752,20 @@ impl PerFileSourceList {
         }
     }
 
+    /// A session that moved data has ended. The uploader has put us back in
+    /// its queue (`OP_OUTOFPARTREQS`) or we ended it, so the source waits out
+    /// a normal reask from now. Left `Downloading`, the stuck-task watchdog
+    /// read it as due the moment the session closed and it was redialed.
+    pub fn set_transfer_ended(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
+        if let Some(s) = self.find_mut(ip, port, user_hash) {
+            let now = Instant::now();
+            s.state = DownloadSourceState::OnQueue { rank: None };
+            s.state_changed = now;
+            s.last_asked = now;
+            s.fail_count = 0;
+        }
+    }
+
     /// Mark a source as actively transferring.
     pub fn set_downloading(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
         if let Some(s) = self.find_mut(ip, port, user_hash) {
@@ -1282,7 +1296,12 @@ impl PerFileSourceList {
                     rank: rank.map(u32::from),
                 };
             }
-            s.state_changed = std::time::Instant::now();
+            let now = std::time::Instant::now();
+            s.state_changed = now;
+            // eMule's `UDPReaskACK` (`DownloadClient.cpp:1302-1307`) restarts
+            // the reask clock, so a TCP reask only follows a UDP one that went
+            // unanswered. Without this we redialed every FILEREASKTIME anyway.
+            s.last_asked = now;
             s.fail_count = s.fail_count.saturating_sub(1);
         }
     }
@@ -3991,6 +4010,22 @@ mod tests {
             DownloadSourceState::Downloading
         ));
         assert!(pfs.friend_connect_sources(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn a_finished_transfer_waits_a_full_reask_instead_of_tripping_the_watchdog() {
+        let ip = Ipv4Addr::new(7, 7, 7, 8);
+        let mut pfs = PerFileSourceList::new([0x57; 16]);
+        assert!(pfs.add_source_full(ip, 4662, 0));
+        pfs.set_downloading(ip, 4662, None);
+        let long_session = Instant::now() + Duration::from_secs(3600);
+        assert_eq!(pfs.sources[0].time_until_reask_at(long_session), 0);
+
+        pfs.set_transfer_ended(ip, 4662, None);
+        let s = &pfs.sources[0];
+        assert!(matches!(s.state, DownloadSourceState::OnQueue { rank: None }));
+        let soon = Instant::now() + Duration::from_secs(300);
+        assert!(s.time_until_reask_at(soon) > (FILEREASKTIME_SECS as u64) - 400);
     }
 
     #[test]

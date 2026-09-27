@@ -31,6 +31,7 @@ mod network;
 mod power;
 mod search;
 pub mod security;
+mod session_end;
 mod sharing;
 mod storage;
 mod types;
@@ -280,6 +281,8 @@ pub(crate) async fn run_graceful_shutdown(
         );
     }
 
+    network::ed2k::peer_sessions::save_upload_requests(&storage::paths::resolve_data_dir());
+
     // Flush any learned spam signals not yet persisted by the periodic flush
     // (e.g. an auto-not-spam that landed since the last tick). Wait briefly for
     // the lock rather than the old non-blocking `try_write`, which silently
@@ -424,6 +427,10 @@ pub fn run() {
 
     // Keep the guard alive for the entire app lifetime
     let _log_guard = log_guard;
+
+    // Before any download can dial: an uploader we asked just before the
+    // last exit still counts that ask against the next one.
+    network::ed2k::peer_sessions::load_upload_requests(&data_dir);
 
     // Route panics into the log file. Release builds are linked with
     // `windows_subsystem = "windows"` (no console), so the default hook's
@@ -580,6 +587,7 @@ pub fn run() {
             // are latched for a blocking UI notice — logging alone left users
             // running on mixed or pre-restore files with no explanation.
             let mut restore_failed_notice = false;
+            let mut restore_applied = false;
             match storage::paths::ensure_data_dir_with_app(&app_handle) {
                 Ok(dir) => {
                     match commands::backup::apply_pending_restore(&dir) {
@@ -597,7 +605,7 @@ pub fn run() {
                                 restore_failed_notice = true;
                             }
                         }
-                        Ok(Some(_)) => {}
+                        Ok(Some(_)) => restore_applied = true,
                     }
                 }
                 Err(e) => tracing::error!("Failed to prepare the data dir: {e}"),
@@ -647,8 +655,21 @@ pub fn run() {
             if !settings.download_folder.is_empty() {
                 configured_roots.push(settings.download_folder.clone());
             }
-            let import_roots =
+            let mut import_roots =
                 emule_import::apply::pending_root_additions(&data_dir, emule_import.as_ref());
+            // The backup deliberately leaves out `approved_roots.json`, whose
+            // records bind folders to one machine's file identities, so the
+            // folders a restore just brought back are approved here, as the
+            // ones an eMule import names are. Left out, a restore onto a new
+            // install kept them configured but unapproved: every download
+            // refused its target and every upload its file.
+            if restore_applied {
+                for root in &configured_roots {
+                    if !import_roots.contains(root) {
+                        import_roots.push(root.clone());
+                    }
+                }
+            }
             let approved_roots = security::filesystem::initialize_approved_roots_with_additions(
                 &data_dir,
                 &configured_roots,
@@ -988,6 +1009,8 @@ pub fn run() {
                     commands::deeplink::dispatch_deep_links(&app_handle, payloads);
                 }
             }
+
+            session_end::watch(app.handle());
 
             // System tray icon. Rendered unconditionally so users who pick
             // "Minimize to Tray" (or the saved `tray` behavior) always have

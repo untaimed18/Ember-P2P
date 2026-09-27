@@ -752,7 +752,14 @@ impl RoutingZone {
         }
     }
 
-    /// Remove stale/expired contacts from all bins. Returns IPs removed.
+    /// Remove dead contacts that are also stale or expired from all bins.
+    /// Returns IPs removed.
+    ///
+    /// Staleness alone is not enough, as in eMule, which only drops a contact
+    /// the small timer's probes have aged to dead: every contact goes stale
+    /// across a sleep of an hour or two (both clocks here are wall time), and
+    /// removing them all on the first tick after resume emptied the table
+    /// before a single probe could run.
     fn remove_stale(
         &mut self,
         now: i64,
@@ -762,7 +769,9 @@ impl RoutingZone {
         if let Some(bin) = &mut self.bin {
             let before = bin.len();
             bin.contacts.retain(|c| {
-                if dht_common::is_stale(now, c.last_seen, max_age_secs) || c.is_expired() {
+                if c.is_dead()
+                    && (dht_common::is_stale(now, c.last_seen, max_age_secs) || c.is_expired())
+                {
                     ips_removed.push(c.ip);
                     false
                 } else {

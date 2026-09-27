@@ -2289,6 +2289,15 @@ impl Ed2kDownload {
         self.emit_source_detail(&event_tx, "connected (callback)", None, 0, 0, "", "")
             .await;
 
+        let _peer_session = match self.source_addr.ip() {
+            std::net::IpAddr::V4(v4) => Some(super::peer_sessions::register(
+                Some(peer_user_hash),
+                v4,
+                peer_caps.tcp_port,
+            )),
+            std::net::IpAddr::V6(_) => None,
+        };
+
         if let Some(sm) = &self.source_manager {
             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                 let mut sm = sm.write().await;
@@ -2738,15 +2747,13 @@ impl Ed2kDownload {
                 (OP_EMULEPROT, OP_SECIDENTSTATE) if pl.len() >= 5 => {
                     let state = pl[0];
                     let challenge = u32::from_le_bytes([pl[1], pl[2], pl[3], pl[4]]);
-                    let missing_peer_key = if state >= 2 {
-                        if let Some(cm) = &self.credit_manager {
-                            let cm = cm.read().await;
-                            !cm.has_public_key(&peer_user_hash)
-                        } else {
-                            true
-                        }
+                    // Any state needs the peer's key to sign against
+                    // (BaseClient.cpp:1851-1852).
+                    let missing_peer_key = if let Some(cm) = &self.credit_manager {
+                        let cm = cm.read().await;
+                        !cm.has_public_key(&peer_user_hash)
                     } else {
-                        false
+                        true
                     };
                     if missing_peer_key {
                         pending_peer_challenge = Some((challenge, state));
@@ -4104,9 +4111,11 @@ impl Ed2kDownload {
             }
         }
 
-        // Request source exchange only when not already sent in multipacket, and throttled
+        // Request source exchange only when not already sent in multipacket, and throttled.
+        // eMule asks only a peer with SX2 or an SX1 version above 1.
         if !(peer_supports_file_ident || peer_supports_ext_multipacket || peer_supports_multipacket)
             && sx_allowed
+            && (peer_supports_source_ex2 || peer_source_exchange_ver > 1)
         {
             if peer_supports_source_ex2 {
                 let mut sx2_req = Vec::with_capacity(19);
@@ -4151,17 +4160,47 @@ impl Ed2kDownload {
                 })
                 .await;
         } else {
-            // Request upload slot
-            let upload_req = build_file_request(&self.file_hash);
-            write_packet_async(
-                &mut writer,
-                OP_EDONKEYHEADER,
-                OP_STARTUPLOADREQ,
-                &upload_req,
-            )
-            .await?;
-            self.file_req_overhead
-                .record_upload((6 + upload_req.len()) as u64);
+            // Inside eMule's MIN_REQUESTTIME of our last ask we are still on
+            // its queue, and asking again only counts toward `BADCLIENTBAN`.
+            let ask_ports = [self.source_addr.port(), initial_caps.tcp_port];
+            let source_v4 = match self.source_addr.ip() {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                _ => None,
+            };
+            let ask_wait = source_v4.and_then(|v4| {
+                super::peer_sessions::upload_request_wait(
+                    Some(peer_user_hash),
+                    v4,
+                    &ask_ports,
+                    &self.file_hash,
+                )
+            });
+            if let Some(wait) = ask_wait {
+                debug!(
+                    "Not re-sending StartUploadReq to {} ({}s left of MIN_REQUESTTIME)",
+                    self.source_addr,
+                    wait.as_secs()
+                );
+            } else {
+                let upload_req = build_file_request(&self.file_hash);
+                write_packet_async(
+                    &mut writer,
+                    OP_EDONKEYHEADER,
+                    OP_STARTUPLOADREQ,
+                    &upload_req,
+                )
+                .await?;
+                self.file_req_overhead
+                    .record_upload((6 + upload_req.len()) as u64);
+                if let Some(v4) = source_v4 {
+                    super::peer_sessions::note_upload_request(
+                        Some(peer_user_hash),
+                        v4,
+                        &ask_ports,
+                        self.file_hash,
+                    );
+                }
+            }
 
             let _ = event_tx
                 .send(DownloadEvent::SourcesUpdate {
@@ -6142,8 +6181,10 @@ impl Ed2kDownload {
             peer_out_of_parts = false;
         }
 
-        // Signal the uploader that we're done downloading from them
-        write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_END_OF_DOWNLOAD, &[])
+        // Signal the uploader that we're done downloading from them. eMule
+        // counts a payload without the file hash as a failed file request
+        // (ListenSocket.cpp OP_END_OF_DOWNLOAD -> CheckFailedFileIdReqs).
+        write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_END_OF_DOWNLOAD, &self.file_hash)
             .await
             .ok();
 
@@ -7036,6 +7077,20 @@ pub(crate) async fn maybe_send_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     Ok(Some(challenge))
 }
 
+/// A peer's IPv4 as SecIdent v2 signs it: eMule's in-memory network-order
+/// `dwIP`, which `PokeUInt32` writes back out as the octets in order
+/// (`ClientCredits.cpp:440, :481-495`) — the same form as a HighID client ID,
+/// not the big-endian value credit bookkeeping keys on.
+fn secident_wire_ip(peer_addr: SocketAddr) -> u32 {
+    match peer_addr.ip() {
+        std::net::IpAddr::V4(v4) => u32::from_le_bytes(v4.octets()),
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(|v4| u32::from_le_bytes(v4.octets()))
+            .unwrap_or(0),
+    }
+}
+
 pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Sized>(
     writer: &mut W,
     credit_manager: Option<&Arc<tokio::sync::RwLock<CreditManager>>>,
@@ -7049,13 +7104,6 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     let Some(cm) = credit_manager else {
         return Ok(());
     };
-    let peer_ip_u32 = match peer_addr.ip() {
-        std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(|v4| u32::from_be_bytes(v4.octets()))
-            .unwrap_or(0),
-    };
     let (challenge_ip_kind, challenge_ip, add_trailer) = if (peer_secident_level & 1) != 0 {
         (None, 0u32, false)
     } else {
@@ -7063,7 +7111,7 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
         if our_client_id == 0 || our_client_id < 0x0100_0000 {
             (
                 Some(super::credits::CRYPT_CIP_REMOTECLIENT),
-                peer_ip_u32,
+                secident_wire_ip(peer_addr),
                 true,
             )
         } else {
@@ -7157,7 +7205,7 @@ pub(crate) async fn handle_secident_signature(
             &peer_user_hash,
             challenge,
             challenge_kind,
-            peer_ip_u32,
+            secident_wire_ip(peer_addr),
             local_ip,
             sig_bytes,
         )

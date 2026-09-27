@@ -110,6 +110,193 @@ fn spawn_reask_parts_refresh(transfer_id: String, total_size: u64, part_path: Pa
     });
 }
 
+/// eMule accepts one `OP_DIRECTCALLBACKREQ` per requester IP per 180 s
+/// (`CClientList::AllowCalbackRequest`, ClientList.cpp:923-932).
+const DIRECT_CALLBACK_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(180);
+const MAX_DIRECT_CALLBACK_REQUESTERS: usize = 4096;
+/// Callbacks we dial per second, from anyone. The source address is all that
+/// identifies a requester and it is trivially spoofed, so without a global
+/// ceiling each spoofed address bought one outbound connection. Also keeps
+/// the per-IP table short of `MAX_DIRECT_CALLBACK_REQUESTERS`, where it would
+/// refuse everyone until entries lapsed.
+const MAX_DIRECT_CALLBACKS_PER_SEC: u32 = 10;
+
+/// Arrival order of `NetworkState::direct_callback_requests`, so entries
+/// lapse from the front instead of by a scan of the whole map per packet,
+/// and the count against [`MAX_DIRECT_CALLBACKS_PER_SEC`].
+#[derive(Default)]
+struct DirectCallbackGate {
+    order: VecDeque<(Ipv4Addr, std::time::Instant)>,
+    second: Option<(std::time::Instant, u32)>,
+}
+
+impl DirectCallbackGate {
+    /// Whether a request from `from` is accepted now; records it in `accepted`
+    /// when it is.
+    fn admit(
+        &mut self,
+        accepted: &mut HashMap<Ipv4Addr, std::time::Instant>,
+        from: Ipv4Addr,
+        now: std::time::Instant,
+    ) -> bool {
+        while let Some(&(ip, at)) = self.order.front() {
+            if now.saturating_duration_since(at) < DIRECT_CALLBACK_MIN_INTERVAL {
+                break;
+            }
+            self.order.pop_front();
+            if accepted.get(&ip) == Some(&at) {
+                accepted.remove(&ip);
+            }
+        }
+        if accepted.contains_key(&from) || accepted.len() >= MAX_DIRECT_CALLBACK_REQUESTERS {
+            return false;
+        }
+        let (started, count) = self.second.get_or_insert((now, 0));
+        if now.saturating_duration_since(*started) >= std::time::Duration::from_secs(1) {
+            *started = now;
+            *count = 0;
+        }
+        if *count >= MAX_DIRECT_CALLBACKS_PER_SEC {
+            return false;
+        }
+        *count += 1;
+        accepted.insert(from, now);
+        self.order.push_back((from, now));
+        true
+    }
+}
+
+fn direct_callback_gate() -> &'static parking_lot::Mutex<DirectCallbackGate> {
+    static GATE: std::sync::OnceLock<parking_lot::Mutex<DirectCallbackGate>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(Default::default)
+}
+
+/// eMule `OP_DIRECTCALLBACKREQ` (ClientUDPSocket.cpp:363-394): a downloader
+/// that found us as a TCP-firewalled, UDP-reachable source — which our Hello
+/// and KAD source type 6 advertise — asks us to dial it and be served.
+/// Payload: its TCP port (u16), its user hash (16), its connect options (u8).
+///
+/// Left unanswered, the requester's connect attempt times out in
+/// `CCS_DIRECTCALLBACK` and eMule dead-sources us for that file
+/// (BaseClient.cpp:1188-1194).
+fn accept_direct_callback_request(state: &mut NetworkState, from: Ipv4Addr, payload: &[u8]) {
+    // eMule's own gate is "KAD running and firewalled": a reachable node has
+    // no reason to be asked, and dialing out for strangers is not free.
+    if !state.firewalled || payload.len() < 19 {
+        return;
+    }
+    let now = std::time::Instant::now();
+    if !direct_callback_gate()
+        .lock()
+        .admit(&mut state.direct_callback_requests, from, now)
+    {
+        debug!(
+            "Ignoring direct callback request from {from}: one per {DIRECT_CALLBACK_MIN_INTERVAL:?} \
+             per IP, {MAX_DIRECT_CALLBACKS_PER_SEC} a second overall"
+        );
+        return;
+    }
+    let mut user_hash = [0u8; 16];
+    user_hash.copy_from_slice(&payload[2..18]);
+    state
+        .pending_direct_callbacks
+        .push(ember::dht::engine::CallbackConnect {
+            dest_ip: from,
+            dest_port: u16::from_le_bytes([payload[0], payload[1]]),
+            file_hash: [0u8; 16],
+            crypt_options: payload[18],
+            user_hash: Some(user_hash),
+        });
+}
+
+/// The Hello we open a KAD TCP firewall connect-back with: the same identity
+/// and capabilities as every other Hello we send.
+fn fw_check_hello(state: &NetworkState, nickname: &str) -> Vec<u8> {
+    let mut options = ed2k::messages::HelloOptions::default_for_udp_port(state.udp_port);
+    options.supports_crypt_layer = state.obfuscation_enabled;
+    options.requests_crypt_layer = state.obfuscation_enabled;
+    options.supports_direct_udp_callback = can_advertise_direct_udp_callback(state);
+    let client_id = state
+        .external_ip
+        .map(|ip| u32::from_le_bytes(ip.octets()))
+        .unwrap_or(0);
+    ed2k::messages::build_hello_with_buddy_opts(
+        &state.user_hash,
+        client_id,
+        advertised_tcp_port(state),
+        nickname,
+        None,
+        &options,
+    )
+}
+
+/// Our half of a KAD TCP firewall check, as eMule does it once the
+/// connection is up (`CClientList::Process`, `KS_CONNECTED_FWCHECK`,
+/// ClientList.cpp:511-521): finish the Hello exchange, then send
+/// `OP_KAD_FWTCPCHECK_ACK`. eMule throws on an extended packet from a socket
+/// that never sent `OP_HELLO` (ListenSocket.cpp:1752-1757), so an ACK sent
+/// straight after connecting never counted toward the peer's check.
+///
+/// Ends by half-closing and draining for a moment: the peer follows its
+/// HelloAnswer with SecIdent packets, and dropping a socket with unread data
+/// resets it, which can discard the ACK before the peer reads it.
+async fn send_fw_tcp_check_ack<R, W>(reader: &mut R, writer: &mut W, hello: &[u8]) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut frame = Vec::with_capacity(6 + hello.len());
+    frame.push(OP_EDONKEYHEADER);
+    frame.extend_from_slice(&((1 + hello.len()) as u32).to_le_bytes());
+    frame.push(ed2k::messages::OP_HELLO);
+    frame.extend_from_slice(hello);
+    writer.write_all(&frame).await?;
+    writer.flush().await?;
+
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut header = [0u8; 6];
+        reader.read_exact(&mut header).await?;
+        let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        if header[0] != OP_EDONKEYHEADER
+            || header[5] != ed2k::messages::OP_HELLOANSWER
+            || !(1..=64 * 1024).contains(&len)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "expected OP_HELLOANSWER",
+            ));
+        }
+        let mut body = vec![0u8; len - 1];
+        reader.read_exact(&mut body).await
+    })
+    .await;
+    match answer {
+        Ok(result) => {
+            result?;
+        }
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "no OP_HELLOANSWER",
+            ))
+        }
+    }
+
+    writer
+        .write_all(&[OP_EMULEPROT, 1, 0, 0, 0, ed2k::messages::OP_KAD_FWTCPCHECK_ACK])
+        .await?;
+    writer.flush().await?;
+    let _ = writer.shutdown().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut sink = [0u8; 1024];
+        while matches!(reader.read(&mut sink).await, Ok(n) if n > 0) {}
+    })
+    .await;
+    Ok(())
+}
+
 /// Panic-isolating wrapper around [`handle_udp_packet_inner`]. Untrusted
 /// network packets are the prime adversarial surface, so a panic here must be
 /// contained rather than allowed to kill the network event loop.
@@ -255,6 +442,19 @@ pub(super) async fn handle_udp_packet_inner(
         return;
     }
 
+    // Obfuscated eD2K client UDP: stock eMule encrypts its reasks to us, and
+    // its answers to ours, whenever both sides support the crypt layer
+    // (`ShouldReceiveCryptUDPPackets`, BaseClient.cpp:2588-2591), which is
+    // the default. Decrypted, it is handled exactly like the plain form.
+    let decrypted_client_packet =
+        kad::obfuscation::try_decrypt_client_ed2k_packet(data, &state.user_hash, from_ipv4.octets())
+            .filter(|plain| plain[0] == OP_EDONKEYHEADER || plain[0] == OP_EMULEPROT);
+    let data: &[u8] = decrypted_client_packet.as_deref().unwrap_or(data);
+    if decrypted_client_packet.is_some() && state.ip_filter.is_blocked_readonly(from_ipv4) {
+        debug!("Dropping obfuscated eD2K UDP packet from blocked IP {from}");
+        return;
+    }
+
     // Handle eMule peer-to-peer and server UDP packets
     let header = data.first().copied().unwrap_or(0);
     if header == OP_EDONKEYHEADER || header == OP_EMULEPROT {
@@ -285,6 +485,11 @@ pub(super) async fn handle_udp_packet_inner(
                 return;
             }
 
+            if header == OP_EMULEPROT && opcode == ed2k::messages::OP_DIRECTCALLBACKREQ {
+                accept_direct_callback_request(state, from_ipv4, payload);
+                return;
+            }
+
             // eMule UDP reask: peer asks if we still have a file and what their queue rank is
             if header == OP_EMULEPROT
                 && opcode == ed2k::messages::OP_REASKFILEPING
@@ -308,8 +513,16 @@ pub(super) async fn handle_udp_packet_inner(
                 // parts bitmap — confirming we hold a friends-only file. Fail
                 // closed until the catalog is authoritative, matching the
                 // partial branch below and the TCP serve path's
-                // `!snapshot_ready` rule.
-                let restricted = !known_files.is_authoritative() || {
+                // `!snapshot_ready` rule — closed means silent, not
+                // `OP_FILENOTFOUND`: eMule answers that with `AddDeadSource` +
+                // `RemoveSource` (DownloadClient.cpp:1309-1327), so every peer
+                // queued on us would drop us while the catalog loads, while an
+                // unanswered reask is simply retried.
+                if !known_files.is_authoritative() {
+                    debug!("UDP reask from {from} for {hash_hex}: file catalog not loaded; not answering");
+                    return;
+                }
+                let restricted = {
                     let idx = local_index.read().await;
                     idx.get_by_hash(&hash_hex).is_some_and(|f| f.friends_only)
                         || known_files
@@ -542,6 +755,9 @@ pub(super) async fn handle_udp_packet_inner(
                         return;
                     };
                     let is_banned = state.banned_ips.contains(&v4);
+                    // Dead-source entries and the registry are keyed on the
+                    // source's TCP port, not the UDP port this came from.
+                    let mut tcp_ports: Vec<u16> = Vec::new();
                     if let Some(pfs) = state
                         .per_file_sources
                         .values_mut()
@@ -549,6 +765,9 @@ pub(super) async fn handle_udp_packet_inner(
                     {
                         for src in &mut pfs.sources {
                             if src.ip == v4 && src.udp_port == from.port() {
+                                if !tcp_ports.contains(&src.tcp_port) {
+                                    tcp_ports.push(src.tcp_port);
+                                }
                                 if is_banned {
                                     src.state = ed2k::sources::DownloadSourceState::Banned;
                                     src.state_changed = std::time::Instant::now();
@@ -574,16 +793,18 @@ pub(super) async fn handle_udp_packet_inner(
                     // 29 minutes, for as long as the download ran. `QUEUEFULL` is
                     // deliberately excluded: that peer *has* the file.
                     if !is_banned && opcode != ed2k::messages::OP_QUEUEFULL_UDP {
-                        state
-                            .dead_sources
-                            .add_dead_source_for_file(file_hash, u32::from(v4), from.port());
-                        retire_dead_source_from_registry(
-                            source_manager,
-                            &file_hash,
-                            v4,
-                            from.port(),
-                        )
-                        .await;
+                        for tcp_port in tcp_ports {
+                            state
+                                .dead_sources
+                                .add_dead_source_for_file(file_hash, u32::from(v4), tcp_port);
+                            retire_dead_source_from_registry(
+                                source_manager,
+                                &file_hash,
+                                v4,
+                                tcp_port,
+                            )
+                            .await;
+                        }
                         debug!(
                             "UDP reask: {v4} reports it does not have {} — written off for this file",
                             hex::encode(file_hash)
@@ -783,7 +1004,7 @@ pub(super) async fn handle_udp_packet_inner(
     if data.first() == Some(&kad::messages::OP_KADEMLIAPACKEDPROT)
         && state
             .flood_protection
-            .over_compressed_budget(from.ip(), data.len())
+            .over_compressed_budget(from.ip(), opcode_hint, data.len())
     {
         debug!("Dropping compressed KAD packet from {from}: per-IP decompression budget exhausted");
         return;
@@ -826,7 +1047,11 @@ pub(super) async fn handle_udp_packet_inner(
                 if decrypted.payload.first() == Some(&kad::messages::OP_KADEMLIAPACKEDPROT)
                     && state
                         .flood_protection
-                        .over_compressed_budget(from.ip(), decrypted.payload.len())
+                        .over_compressed_budget(
+                            from.ip(),
+                            decrypted.payload.get(1).copied().unwrap_or(0),
+                            decrypted.payload.len(),
+                        )
                 {
                     debug!(
                         "Dropping obfuscated compressed KAD packet from {from}: decompression budget exhausted"
@@ -1810,16 +2035,22 @@ pub(super) async fn handle_udp_packet_inner(
                     }
                     if let Ok(packet) = messages::encode_packet(&msg) {
                         let opcode = packet.get(1).copied().unwrap_or(0);
-                        if send_kad_packet(socket, &packet, addr, state, &contact.id)
-                            .await
-                            .is_ok()
-                        {
-                            if let Some(search) = state.search_manager.get_mut(&sid) {
-                                search.commit_query_sent(contact.id, addr);
+                        match send_kad_packet(socket, &packet, addr, state, &contact.id).await {
+                            Ok(_) => {
+                                if let Some(search) = state.search_manager.get_mut(&sid) {
+                                    search.commit_query_sent(contact.id, addr);
+                                }
+                                state.flood_protection.track_request(addr, opcode);
                             }
-                            state.flood_protection.track_request(addr, opcode);
-                        } else if let Some(search) = state.search_manager.get_mut(&sid) {
-                            search.rollback_unsent_query(contact.id, &msg);
+                            Err(e) => {
+                                if let Some(search) = state.search_manager.get_mut(&sid) {
+                                    if is_kad_request_paced(&e) {
+                                        search.skip_paced_query(contact.id, &msg);
+                                    } else {
+                                        search.rollback_unsent_query(contact.id, &msg);
+                                    }
+                                }
+                            }
                         }
                     } else if let Some(search) = state.search_manager.get_mut(&sid) {
                         search.rollback_unsent_query(contact.id, &msg);
@@ -2688,6 +2919,7 @@ pub(super) async fn handle_udp_packet_inner(
 
             if let Ok(permit) = state.firewall_connect_semaphore.clone().try_acquire_owned() {
                 let tcp_addr = SocketAddr::new(peer_ip.into(), peer_tcp_port);
+                let hello = fw_check_hello(state, &settings.nickname);
                 tokio::spawn(async move {
                     let _permit = permit;
                     let result = tokio::time::timeout(
@@ -2698,18 +2930,14 @@ pub(super) async fn handle_udp_packet_inner(
                     match result {
                         Ok(Ok(stream)) => {
                             debug!("Peer {tcp_addr} is reachable on TCP");
-                            let (_r, w) = stream.into_split();
+                            let (r, w) = stream.into_split();
+                            let mut reader = tokio::io::BufReader::new(r);
                             let mut writer = tokio::io::BufWriter::new(w);
-                            let ack_packet = {
-                                let mut pkt = Vec::with_capacity(6);
-                                pkt.push(OP_EMULEPROT);
-                                pkt.extend_from_slice(&1u32.to_le_bytes());
-                                pkt.push(ed2k::messages::OP_KAD_FWTCPCHECK_ACK);
-                                pkt
-                            };
-                            let _ =
-                                tokio::io::AsyncWriteExt::write_all(&mut writer, &ack_packet).await;
-                            let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
+                            if let Err(e) =
+                                send_fw_tcp_check_ack(&mut reader, &mut writer, &hello).await
+                            {
+                                debug!("Failed sending OP_KAD_FWTCPCHECK_ACK to {tcp_addr}: {e}");
+                            }
                         }
                         _ => debug!("Peer {tcp_addr} is NOT reachable on TCP"),
                     }
@@ -2858,6 +3086,7 @@ pub(super) async fn handle_udp_packet_inner(
             if let Ok(permit) = state.firewall_connect_semaphore.clone().try_acquire_owned() {
                 let tcp_addr = SocketAddr::new(requester_ip.into(), peer_tcp_port);
                 let allow_obf = state.obfuscation_enabled && (connect_options & 0x01) != 0;
+                let hello = fw_check_hello(state, &settings.nickname);
                 tokio::spawn(async move {
                     let _permit = permit;
                     let connect_result = tokio::time::timeout(
@@ -2871,13 +3100,6 @@ pub(super) async fn handle_udp_packet_inner(
                             let (r, w) = stream.into_split();
                             let mut reader = tokio::io::BufReader::new(r);
                             let mut writer = tokio::io::BufWriter::new(w);
-                            let ack_packet = {
-                                let mut pkt = Vec::with_capacity(6);
-                                pkt.push(OP_EMULEPROT);
-                                pkt.extend_from_slice(&1u32.to_le_bytes());
-                                pkt.push(ed2k::messages::OP_KAD_FWTCPCHECK_ACK);
-                                pkt
-                            };
                             let write_res = if allow_obf && user_hash != [0u8; 16] {
                                 match ed2k::tcp_obfuscation::negotiate_outgoing(
                                     &mut reader,
@@ -2887,16 +3109,14 @@ pub(super) async fn handle_udp_packet_inner(
                                 .await
                                 {
                                     Ok((recv_key, send_key)) => {
-                                        let _obf_reader = tokio::io::BufReader::new(
+                                        let mut obf_reader = tokio::io::BufReader::new(
                                             ed2k::tcp_obfuscation::Rc4Reader::new(reader, recv_key),
                                         );
                                         let mut obf_writer = tokio::io::BufWriter::new(
                                             ed2k::tcp_obfuscation::Rc4Writer::new(writer, send_key),
                                         );
-                                        match obf_writer.write_all(&ack_packet).await {
-                                            Ok(()) => obf_writer.flush().await,
-                                            Err(e) => Err(e),
-                                        }
+                                        send_fw_tcp_check_ack(&mut obf_reader, &mut obf_writer, &hello)
+                                            .await
                                     }
                                     Err(e) if (connect_options & 0x04) != 0 => Err(e),
                                     Err(_) => {
@@ -2909,12 +3129,10 @@ pub(super) async fn handle_udp_packet_inner(
                                         .await
                                         {
                                             Ok(Ok(plain_stream)) => {
-                                                let mut pw =
-                                                    tokio::io::BufWriter::new(plain_stream);
-                                                match pw.write_all(&ack_packet).await {
-                                                    Ok(()) => pw.flush().await,
-                                                    Err(e) => Err(e),
-                                                }
+                                                let (pr, pw) = plain_stream.into_split();
+                                                let mut pr = tokio::io::BufReader::new(pr);
+                                                let mut pw = tokio::io::BufWriter::new(pw);
+                                                send_fw_tcp_check_ack(&mut pr, &mut pw, &hello).await
                                             }
                                             Ok(Err(e)) => Err(e),
                                             Err(_) => Err(std::io::Error::new(
@@ -2925,10 +3143,7 @@ pub(super) async fn handle_udp_packet_inner(
                                     }
                                 }
                             } else {
-                                match writer.write_all(&ack_packet).await {
-                                    Ok(()) => writer.flush().await,
-                                    Err(e) => Err(e),
-                                }
+                                send_fw_tcp_check_ack(&mut reader, &mut writer, &hello).await
                             };
                             if let Err(e) = write_res {
                                 debug!("Failed sending OP_KAD_FWTCPCHECK_ACK to {tcp_addr}: {e}");
@@ -3239,5 +3454,45 @@ mod udp_reask_cache_tests {
             assert!(std::time::Instant::now() < deadline, "in-flight marker never cleared");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod direct_callback_gate_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn requester(n: u32) -> Ipv4Addr {
+        Ipv4Addr::from(0x0A00_0000 | n)
+    }
+
+    #[test]
+    fn one_callback_per_requester_per_interval() {
+        let mut gate = DirectCallbackGate::default();
+        let mut accepted = HashMap::new();
+        let t0 = Instant::now();
+        assert!(gate.admit(&mut accepted, requester(1), t0));
+        assert!(!gate.admit(&mut accepted, requester(1), t0 + Duration::from_secs(179)));
+        assert!(gate.admit(&mut accepted, requester(1), t0 + DIRECT_CALLBACK_MIN_INTERVAL));
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(gate.order.len(), 1, "the lapsed entry left from the front");
+    }
+
+    /// Spoofed sources each look new, so only the global ceiling holds them.
+    #[test]
+    fn spoofed_requesters_are_held_to_the_global_rate() {
+        let mut gate = DirectCallbackGate::default();
+        let mut accepted = HashMap::new();
+        let t0 = Instant::now();
+        let admitted = (0..100)
+            .filter(|n| gate.admit(&mut accepted, requester(*n), t0))
+            .count();
+        assert_eq!(admitted, MAX_DIRECT_CALLBACKS_PER_SEC as usize);
+        assert!(gate.admit(&mut accepted, requester(500), t0 + Duration::from_secs(1)));
+        let most_live = u64::from(MAX_DIRECT_CALLBACKS_PER_SEC) * DIRECT_CALLBACK_MIN_INTERVAL.as_secs();
+        assert!(
+            most_live < MAX_DIRECT_CALLBACK_REQUESTERS as u64,
+            "the rate alone must keep the per-IP table from filling"
+        );
     }
 }

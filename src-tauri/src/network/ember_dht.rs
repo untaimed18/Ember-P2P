@@ -716,6 +716,11 @@ pub(super) const EMBER_FRIEND_CONTACT_ASKS_PER_TICK: usize = 4;
 /// enforce and we never ask them to hold it longer than a normal source.
 pub(super) const EMBER_RENDEZVOUS_REPUBLISH_SECS: i64 = 5 * 3600;
 
+/// How long an advert no peer acknowledged waits before the next attempt.
+/// Retrying at once restarted the store lookup every 15-25 s against the same
+/// handful of nodes nearest the fixed key.
+pub(super) const EMBER_RENDEZVOUS_UNACKED_RETRY_SECS: i64 = 10 * 60;
+
 /// Minimum spacing between rendezvous *lookups*. The lookup only runs while
 /// the Ember routing table is below `EMBER_KAD_BRIDGE_UNTIL_CONTACTS`, but a
 /// node that genuinely cannot reach anyone would otherwise re-run a 45-second
@@ -2041,7 +2046,16 @@ pub(super) async fn handle_ember_dht_message(
     // routing table: leaving it in front of the gate meant a peer already over
     // its frame rate still bought a table scan per datagram, which is the
     // opposite of what a gate that exists to make junk cheap to reject is for.
-    if !state.ember_dht_protection.allow_frame(from.ip()) {
+    // Channel frames carry room transfers and have a budget of their own.
+    let admitted = if matches!(
+        msg_type,
+        ember::dht::messages::MSG_CHANNEL_MSG | ember::dht::messages::MSG_CHANNEL_RELAY
+    ) {
+        state.ember_dht_protection.allow_channel_frame(from.ip())
+    } else {
+        state.ember_dht_protection.allow_frame(from.ip())
+    };
+    if !admitted {
         return;
     }
 

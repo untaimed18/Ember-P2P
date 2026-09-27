@@ -259,7 +259,7 @@ async fn send_friend_request_verdict(
     let hello_payload = build_hello_with_buddy_opts(
         &our_user_hash,
         our_client_id,
-        tcp_port,
+        super::peer_sessions::advertised_tcp_port_or(tcp_port),
         &our_nickname,
         None,
         &hello_options,
@@ -401,7 +401,7 @@ pub async fn run_friend_session_over_transport(
     let hello_payload = build_hello_with_buddy_opts(
         &our_user_hash,
         our_client_id,
-        tcp_port,
+        super::peer_sessions::advertised_tcp_port_or(tcp_port),
         &our_nickname,
         None,
         &hello_options,

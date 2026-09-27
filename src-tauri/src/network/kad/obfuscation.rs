@@ -25,6 +25,12 @@ const VALID_INNER_HEADERS: [u8; 7] = [
     0xD4, // OP_PACKEDPROT
 ];
 
+/// First bytes eMule passes through as plaintext without trying to decrypt
+/// (`EncryptedDatagramSocket.cpp:164-171`), the same set its senders keep
+/// their marker off (`:338-346`). Unlike [`VALID_INNER_HEADERS`] it leaves out
+/// `OP_EDONKEYHEADER`.
+const EMULE_PLAINTEXT_UDP_HEADERS: [u8; 6] = [0xC5, 0xE5, 0xE4, 0xA3, 0xB2, 0xD4];
+
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Rc4State {
     s: [u8; 256],
@@ -325,6 +331,59 @@ pub fn encrypt_client_ed2k_packet(
     out
 }
 
+/// Decrypt an obfuscated ED2K **client-to-client** UDP packet addressed to
+/// us: the receive half of [`encrypt_client_ed2k_packet`] and of eMule's
+/// `DecryptReceivedClient` ed2k branch (`EncryptedDatagramSocket.cpp`).
+///
+/// Key = `MD5(our_user_hash[16] + sender_ip[4] + 91 + random_key_part[2])`,
+/// the sender having keyed on our hash and its own public address. Unlike
+/// KAD there are no verify keys after the padding.
+///
+/// Returns the plain packet (starting with its protocol byte) or `None` when
+/// the datagram is not one of these. eMule always sets marker bit 0 on this
+/// kind and clears it on KAD, so only such datagrams are tried.
+///
+/// A marker of `OP_EDONKEYHEADER` (0xE3) is tried too: eMule does not keep its
+/// senders off that value, so about one obfuscated datagram in 125 starts with
+/// it. The magic check below is what tells it from a plaintext 0xE3 packet.
+pub fn try_decrypt_client_ed2k_packet(
+    data: &[u8],
+    our_user_hash: &[u8; 16],
+    sender_ip: [u8; 4],
+) -> Option<Vec<u8>> {
+    // marker(1) + random key part(2) + magic(4) + padding length(1) + at
+    // least a protocol byte and an opcode.
+    if data.len() < 10
+        || data[0] & 0x01 == 0
+        || EMULE_PLAINTEXT_UDP_HEADERS.contains(&data[0])
+    {
+        return None;
+    }
+    let mut key_data = [0u8; 23];
+    key_data[..16].copy_from_slice(our_user_hash);
+    key_data[16..20].copy_from_slice(&sender_ip);
+    key_data[20] = MAGICVALUE_UDP;
+    key_data[21..23].copy_from_slice(&data[1..3]);
+    let mut rc4 = Rc4State::new(&md5::Md5::digest(key_data));
+
+    let mut magic = [0u8; 4];
+    rc4.process(&data[3..7], &mut magic);
+    if u32::from_le_bytes(magic) != MAGICVALUE_UDP_SYNC_CLIENT {
+        return None;
+    }
+    let mut pad = [0u8; 1];
+    rc4.process(&data[7..8], &mut pad);
+    let pad_len = usize::from(pad[0] & 0x0F);
+    let body_start = 8 + pad_len;
+    if body_start + 2 > data.len() {
+        return None;
+    }
+    rc4.skip(pad_len);
+    let mut plain = vec![0u8; data.len() - body_start];
+    rc4.process(&data[body_start..], &mut plain);
+    VALID_INNER_HEADERS.contains(&plain[0]).then_some(plain)
+}
+
 fn try_decrypt_with_key(
     data: &[u8],
     rc4_key: &[u8],
@@ -415,5 +474,68 @@ mod tests {
             decode_packet(&decrypted.payload).unwrap(),
             KadMessage::BootstrapReq
         ));
+    }
+
+    #[test]
+    fn client_ed2k_packet_round_trips_and_needs_the_right_key() {
+        let our_hash = [0x5A; 16];
+        let sender_ip = [198, 51, 100, 9];
+        let plain = [0xC5, 0x90, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let wire = encrypt_client_ed2k_packet(&plain, &our_hash, sender_ip);
+        assert_eq!(wire[0] & 0x01, 1, "ed2k marker bit");
+        assert_eq!(
+            try_decrypt_client_ed2k_packet(&wire, &our_hash, sender_ip).as_deref(),
+            Some(&plain[..])
+        );
+        assert!(try_decrypt_client_ed2k_packet(&wire, &[0x5B; 16], sender_ip).is_none());
+        assert!(try_decrypt_client_ed2k_packet(&wire, &our_hash, [198, 51, 100, 10]).is_none());
+    }
+
+    /// eMule pads with up to 15 random bytes before the packet; the receiver
+    /// skips that much keystream.
+    #[test]
+    fn client_ed2k_packet_with_padding_decrypts() {
+        let our_hash = [0x11; 16];
+        let sender_ip = [203, 0, 113, 4];
+        let plain = [0xC5u8, 0x91, 0xAA, 0xBB];
+        let pad = [0x77u8; 5];
+        let random_key_part = [0x34u8, 0x12];
+        let mut key_data = [0u8; 23];
+        key_data[..16].copy_from_slice(&our_hash);
+        key_data[16..20].copy_from_slice(&sender_ip);
+        key_data[20] = MAGICVALUE_UDP;
+        key_data[21..23].copy_from_slice(&random_key_part);
+        let mut rc4 = Rc4State::new(&md5::Md5::digest(key_data));
+        let mut inner = MAGICVALUE_UDP_SYNC_CLIENT.to_le_bytes().to_vec();
+        inner.push(pad.len() as u8);
+        inner.extend_from_slice(&pad);
+        inner.extend_from_slice(&plain);
+        let mut enc = vec![0u8; inner.len()];
+        rc4.process(&inner, &mut enc);
+        let mut wire = vec![0x4D];
+        wire.extend_from_slice(&random_key_part);
+        wire.extend_from_slice(&enc);
+        assert_eq!(
+            try_decrypt_client_ed2k_packet(&wire, &our_hash, sender_ip).as_deref(),
+            Some(&plain[..])
+        );
+
+        // eMule may pick `OP_EDONKEYHEADER` as the marker; the key does not
+        // cover the marker, so the same body decrypts under it.
+        wire[0] = 0xE3;
+        assert_eq!(
+            try_decrypt_client_ed2k_packet(&wire, &our_hash, sender_ip).as_deref(),
+            Some(&plain[..])
+        );
+        // eMule's plaintext set is still never tried.
+        wire[0] = 0xC5;
+        assert!(try_decrypt_client_ed2k_packet(&wire, &our_hash, sender_ip).is_none());
+    }
+
+    /// A plaintext 0xE3 datagram is tried now, and has to fail the magic check.
+    #[test]
+    fn plaintext_edonkey_udp_is_not_mistaken_for_obfuscated() {
+        let plain = [0xE3u8, 0x96, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        assert!(try_decrypt_client_ed2k_packet(&plain, &[0x22; 16], [192, 0, 2, 1]).is_none());
     }
 }

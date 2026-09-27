@@ -286,8 +286,7 @@ async fn handle_command_inner(
             let server_flags = state
                 .server_connection
                 .as_ref()
-                .and_then(|c| c.session.as_ref())
-                .map(|s| s.server_flags);
+                .map(|c| c.session.server_flags);
             let co_share_term =
                 if related_hashes.is_empty() || !server_supports_related_search(state) {
                     None
@@ -403,7 +402,7 @@ async fn handle_command_inner(
 
             // --- TCP server search ---
             if legs.server && state.server_connected {
-                if let Some(mut conn) = state.server_connection.take() {
+                if let Some(conn) = state.server_connection.as_mut() {
                     // The co-share term must be wrapped as a `QueryExpr::Term`
                     // by hand rather than parsed: `:` is an eD2k keyword
                     // separator, so parsing `related::<hash>` would send the
@@ -422,10 +421,10 @@ async fn handle_command_inner(
                     // goes out from the poll loop once the first has delivered.
                     let (first_expr, followup_expr) =
                         server_search_phases(&search_expr, co_share_expr, has_keyword_query);
-                    match conn.send_search_expr_bytes(&first_expr).await {
+                    match conn.send_search_expr_bytes(&first_expr) {
                         Ok(()) => {
                             active_request.server_pending = true;
-                            state.server_search_more_needed = false;
+                            state.server_search_more_due_at = None;
                             state.server_search_more_requests = 0;
                             state.pending_server_search = Some(PendingServerSearch {
                                 tx: None,
@@ -461,7 +460,6 @@ async fn handle_command_inner(
                             debug!("TCP server search failed to send: {e}");
                         }
                     }
-                    state.server_connection = Some(conn);
                 }
             }
 
@@ -1348,26 +1346,7 @@ async fn handle_command_inner(
                             priority: pending_priority,
                         },
                     );
-                    if server_source_settle_elapsed(state) {
-                        if let Some(conn) = state.server_connection.as_mut() {
-                            if let Ok(bytes) = conn.send_get_sources(&hash_bytes, file_size).await {
-                                if bytes > 0 {
-                                    stats_manager.add_overhead(
-                                        crate::storage::statistics::OverheadCategory::SourceExchange,
-                                        crate::storage::statistics::OverheadDirection::Upload,
-                                        bytes,
-                                    );
-                                    let _ = app_handle.emit(
-                                        "transfer:source-search",
-                                        serde_json::json!({
-                                            "transfer_id": &transfer_id,
-                                            "kind": "server_query",
-                                        }),
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    queue_server_source_ask(state, &transfer_id, hash_bytes, file_size, now);
                     if network_ready_for_sources(state) {
                         let packets = build_all_getsources_packets(state, &hash_bytes, file_size);
                         if !packets.is_empty() {
@@ -1703,7 +1682,6 @@ async fn handle_command_inner(
                     socket,
                     state,
                     app_handle,
-                    stats_manager,
                     settings,
                     &transfer_id,
                     hash_bytes,
@@ -1833,7 +1811,6 @@ async fn handle_command_inner(
                     socket,
                     state,
                     app_handle,
-                    stats_manager,
                     settings,
                     &transfer_id,
                     file_hash_arr,
@@ -3873,7 +3850,6 @@ async fn handle_command_inner(
                 socket,
                 state,
                 app_handle,
-                stats_manager,
                 settings,
                 &transfer_id,
                 file_hash,
@@ -3940,6 +3916,9 @@ async fn handle_command_inner(
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                 let msg = KadMessage::BootstrapReq;
                 if let Ok(packet) = messages::encode_packet(&msg) {
+                    if !kad_request_allowed(state, addr, &packet) {
+                        continue;
+                    }
                     state.flood_protection.track_request(addr, 0x01);
                     let _ = socket.send_to(&packet, addr).await;
                 }
@@ -4333,6 +4312,9 @@ async fn handle_command_inner(
                     let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                     let msg = KadMessage::BootstrapReq;
                     if let Ok(packet) = messages::encode_packet(&msg) {
+                        if !kad_request_allowed(state, addr, &packet) {
+                            continue;
+                        }
                         state.flood_protection.track_request(addr, 0x01);
                         let _ = socket.send_to(&packet, addr).await;
                     }
@@ -4346,6 +4328,9 @@ async fn handle_command_inner(
                     let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                     let msg = KadMessage::BootstrapReq;
                     if let Ok(packet) = messages::encode_packet(&msg) {
+                        if !kad_request_allowed(state, addr, &packet) {
+                            continue;
+                        }
                         state.flood_protection.track_request(addr, 0x01);
                         let _ = socket.send_to(&packet, addr).await;
                     }
@@ -4851,6 +4836,9 @@ async fn handle_command_inner(
                 let addr = SocketAddr::new(addr_ip.into(), port);
                 let msg = KadMessage::BootstrapReq;
                 match messages::encode_packet(&msg) {
+                    Ok(packet) if !kad_request_allowed(state, addr, &packet) => Err(format!(
+                        "Bootstrap request to {addr} not sent: it was already asked twice in the last minute"
+                    )),
                     Ok(packet) => {
                         state.flood_protection.track_request(addr, 0x01);
                         match socket.send_to(&packet, addr).await {
@@ -4899,6 +4887,9 @@ async fn handle_command_inner(
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                 let msg = KadMessage::BootstrapReq;
                 if let Ok(packet) = messages::encode_packet(&msg) {
+                    if !kad_request_allowed(state, addr, &packet) {
+                        continue;
+                    }
                     // K17: track outgoing bootstrap requests so the periodic
                     // sweeps do not double-send to the same contact.
                     state.flood_protection.track_request(addr, 0x01);
@@ -4930,9 +4921,12 @@ async fn handle_command_inner(
                 // rebootstrap could send duplicate BootstrapReqs to the
                 // same contact within the flood window — we'd then reject
                 // our own replies. Track every send here too.
-                state.flood_protection.track_request(addr, 0x01);
                 let msg = KadMessage::BootstrapReq;
                 if let Ok(packet) = messages::encode_packet(&msg) {
+                    if !kad_request_allowed(state, addr, &packet) {
+                        continue;
+                    }
+                    state.flood_protection.track_request(addr, 0x01);
                     if socket.send_to(&packet, addr).await.is_ok() {
                         actually_sent += 1;
                     }
@@ -5055,9 +5049,6 @@ async fn handle_command_inner(
             if let Some(handle) = state.pending_server_connect.take() {
                 handle.abort();
             }
-            if let Some(conn) = state.server_connection.take() {
-                conn.disconnect().await;
-            }
             handle_server_disconnect(state, shared_server_addr, app_handle, "User disconnected")
                 .await;
         }
@@ -5088,14 +5079,20 @@ async fn handle_command_inner(
                             );
                             Ok(format!("Added server {ip}:{port}"))
                         }
-                        AddServerOutcome::Duplicate => {
-                            Err(format!("Server {ip}:{port} is already in the list"))
-                        }
-                        AddServerOutcome::Filtered => {
-                            Err(format!("Server {ip}:{port} is blocked by the IP filter"))
-                        }
-                        AddServerOutcome::AtCapacity => Err(format!(
-                            "Server list is full; remove an entry before adding {ip}:{port}"
+                        AddServerOutcome::Duplicate => Err(crate::commands::errors::coded_ctx(
+                            "server_already_listed",
+                            "That server is already in your server list",
+                            format!("{ip}:{port}"),
+                        )),
+                        AddServerOutcome::Filtered => Err(crate::commands::errors::coded_ctx(
+                            "server_blocked_by_ip_filter",
+                            "That server is blocked by your IP filter",
+                            format!("{ip}:{port}"),
+                        )),
+                        AddServerOutcome::AtCapacity => Err(crate::commands::errors::coded_ctx(
+                            "server_list_full",
+                            "Your server list is full; remove a server first",
+                            format!("{ip}:{port}"),
                         )),
                     }
                 }
@@ -5821,8 +5818,7 @@ async fn handle_command_inner(
             or_index_friends_only_from_known(local_index, known_files).await;
             // Until known.met is absorbed, kad_may_advertise_* is false for
             // every hash. Reconciling anyway would retain([]) — wiping a
-            // first-publish that landed in the same session — and queue an
-            // empty OP_OFFERFILES that tells the server we share nothing.
+            // first-publish that landed in the same session.
             if !known_files.is_authoritative() {
                 info!("Skipping KAD/eD2K advertise reconcile until known.met is absorbed");
             } else {
@@ -5863,7 +5859,7 @@ async fn handle_command_inner(
                                 name: f.name.clone(),
                                 size: f.size,
                                 is_complete: true,
-                                file_type: String::new(),
+                                file_type: ed2k::server::offer_file_type(&f.name),
                             });
                         }
                     }
@@ -5941,7 +5937,7 @@ async fn handle_command_inner(
                                     name: transfer.file_name.clone(),
                                     size: transfer.total_size,
                                     is_complete: false,
-                                    file_type: String::new(),
+                                    file_type: ed2k::server::offer_file_type(&transfer.file_name),
                                 },
                             ));
                         }

@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::info;
 
+use super::server::read_step;
 use crate::network::kad::obfuscation::Rc4State;
 
 const MAGICVALUE_REQUESTER: u8 = 0x22;
@@ -52,11 +53,25 @@ fn biguint_to_be_padded(val: &BigUint, size: usize) -> Vec<u8> {
 }
 
 /// Result of the server DH handshake.
+///
+/// The two directions share nothing but the socket, so the stream splits into
+/// halves that can be driven by separate tasks once login is done.
 pub struct ObfuscatedServerStream {
-    pub(crate) reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
-    pub(crate) writer: tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>,
-    pub(crate) recv_key: Rc4State,
-    pub(crate) send_key: Rc4State,
+    read: ObfuscatedReadHalf,
+    write: ObfuscatedWriteHalf,
+}
+
+/// Receiving side: the socket's read half and the server-to-client keystream.
+pub struct ObfuscatedReadHalf {
+    reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    recv_key: Rc4State,
+}
+
+/// Sending side: the socket's write half, the client-to-server keystream, and
+/// the handshake response (Message 3) still owed to the server.
+pub struct ObfuscatedWriteHalf {
+    writer: tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>,
+    send_key: Rc4State,
     pending_handshake: Vec<u8>,
 }
 
@@ -65,26 +80,42 @@ impl ObfuscatedServerStream {
     /// This matches eMule's delayed-sending behavior: the handshake response and the
     /// first payload go out as a single TCP frame.
     pub async fn write_login(&mut self, login_payload: &[u8]) -> io::Result<()> {
-        let mut encrypted_payload = vec![0u8; login_payload.len()];
-        self.send_key.process(login_payload, &mut encrypted_payload);
-
-        let mut combined =
-            Vec::with_capacity(self.pending_handshake.len() + encrypted_payload.len());
-        combined.extend_from_slice(&self.pending_handshake);
-        combined.extend_from_slice(&encrypted_payload);
-        self.pending_handshake.clear();
-
-        self.writer.write_all(&combined).await?;
-        self.writer.flush().await?;
-        Ok(())
+        self.write.write_packet(login_payload).await
     }
 
-    /// Read and decrypt a server packet. Returns (opcode, payload).
+    pub async fn read_packet(&mut self) -> io::Result<(u8, Vec<u8>)> {
+        self.read.read_packet().await
+    }
+
+    pub fn into_split(self) -> (ObfuscatedReadHalf, ObfuscatedWriteHalf) {
+        (self.read, self.write)
+    }
+}
+
+impl ObfuscatedWriteHalf {
+    /// Encrypt and send one complete wire packet (header included). Whatever
+    /// handshake bytes are still pending go out in front of it, in the same
+    /// TCP write.
+    ///
+    /// The keystream advances before the write is attempted, so a failed or
+    /// abandoned write leaves this half unusable: the server can no longer
+    /// decrypt anything sent after it.
+    pub async fn write_packet(&mut self, wire: &[u8]) -> io::Result<()> {
+        let mut combined = std::mem::take(&mut self.pending_handshake);
+        let start = combined.len();
+        combined.resize(start + wire.len(), 0);
+        self.send_key.process(wire, &mut combined[start..]);
+        self.writer.write_all(&combined).await?;
+        self.writer.flush().await
+    }
+}
+
+impl ObfuscatedReadHalf {
     /// Consume just the first ciphertext byte of a packet header.
     ///
-    /// The poll loop deadlines this alone so an expiry provably leaves the
-    /// stream on a packet boundary; everything after it is read under a long
-    /// fatal budget, because RC4 is a stream cipher and an abandoned read
+    /// Waiting here is safe to abandon: nothing has been consumed, so the
+    /// stream is still on a packet boundary. Everything after it must run to
+    /// completion, because RC4 is a stream cipher and an abandoned read
     /// desynchronizes the keystream as well as the framing.
     pub async fn read_packet_first_byte(&mut self) -> io::Result<u8> {
         let mut first = [0u8; 1];
@@ -101,11 +132,12 @@ impl ObfuscatedServerStream {
     ///
     /// The byte is re-joined with the remaining five before decryption, so the
     /// RC4 keystream advances over exactly the same six bytes as a single
-    /// read would have.
+    /// read would have. Each read is held to the same mid-packet idle deadline
+    /// as a plain connection's (`server::read_step`).
     pub async fn read_packet_after_first_byte(&mut self, first: u8) -> io::Result<(u8, Vec<u8>)> {
         let mut enc_header = [0u8; 6];
         enc_header[0] = first;
-        self.reader.read_exact(&mut enc_header[1..]).await?;
+        read_step(self.reader.read_exact(&mut enc_header[1..])).await?;
         let mut dec_header = [0u8; 6];
         self.recv_key.process(&enc_header, &mut dec_header);
 
@@ -143,7 +175,7 @@ impl ObfuscatedServerStream {
             let mut enc_chunk = vec![0u8; payload_len.min(32 * 1024)];
             while remaining > 0 {
                 let want = remaining.min(enc_chunk.len());
-                self.reader.read_exact(&mut enc_chunk[..want]).await?;
+                read_step(self.reader.read_exact(&mut enc_chunk[..want])).await?;
                 let start = payload.len();
                 payload.resize(start + want, 0);
                 self.recv_key
@@ -347,11 +379,12 @@ pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServer
     info!("Server DH: handshake complete, encrypted stream ready");
 
     Ok(ObfuscatedServerStream {
-        reader,
-        writer,
-        recv_key,
-        send_key,
-        pending_handshake: resp_encrypted,
+        read: ObfuscatedReadHalf { reader, recv_key },
+        write: ObfuscatedWriteHalf {
+            writer,
+            send_key,
+            pending_handshake: resp_encrypted,
+        },
     })
 }
 

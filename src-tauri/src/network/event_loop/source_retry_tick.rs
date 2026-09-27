@@ -1180,52 +1180,48 @@ pub(in crate::network) async fn on_source_retry_tick(
             // the periodic source timer (fast-forwarded on connect)
             // sends the initial batch; this on-demand kick would just
             // add to a premature, flood-prone burst.
+            let tcp_targets: Vec<&(String, [u8; 16], u64)> = targets
+                .iter()
+                .filter(|(_, fh, _)| {
+                    server_tcp_srcreq_file_due(&state.server_tcp_srcreq_file_at, fh, now)
+                })
+                .take(SERVER_TCP_SRCREQ_MAX_PER_FRAME)
+                .collect();
             if !state.low_id
                 && state.server_connection.is_some()
+                && !tcp_targets.is_empty()
                 && server_tcp_srcreq_frame_open(state, now)
             {
-                // Bounded, and it stops at the first write failure.
-                // Each `send_get_sources` is a TCP write on the
-                // network task with a 30 s timeout
-                // (`SERVER_WRITE_TIMEOUT_SECS`), and resuming a
-                // session can warm-start thousands of rows
-                // (`MAX_PENDING_DOWNLOADS` is 10,000). Walking that
-                // list one blocking write at a time against a server
-                // that has stopped reading parked all networking for
-                // hours. The periodic sweep below carries whatever
-                // this tick does not reach, which is why dropping
-                // the tail costs nothing but a few seconds of
+                // Bounded to one frame, and it stops at the first
+                // refusal: resuming a session can warm-start
+                // thousands of rows (`MAX_PENDING_DOWNLOADS` is
+                // 10,000), and once the writer queue is full or the
+                // session broken the rest would be refused too. The
+                // periodic sweep carries whatever this tick does not
+                // reach, which costs nothing but a few seconds of
                 // discovery latency.
                 close_server_tcp_srcreq_frame(state, now);
-                if let Some(conn) = state.server_connection.as_mut() {
-                    for (tid, fh, file_size) in
-                        targets.iter().take(SERVER_TCP_SRCREQ_MAX_PER_FRAME)
-                    {
-                        match conn.send_get_sources(fh, *file_size).await {
-                            Ok(bytes) => {
-                                if bytes > 0 {
-                                    stats_manager.add_overhead(
-                                        crate::storage::statistics::OverheadCategory::SourceExchange,
-                                        crate::storage::statistics::OverheadDirection::Upload,
-                                        bytes,
-                                    );
-                                    info!(
-                                        "Warm-start: sent OP_GETSOURCES to server for resumed download {} ({})",
-                                        tid,
-                                        hex::encode(fh),
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                // One timed-out write means the
-                                // server is not draining; the rest
-                                // of the batch would each cost
-                                // another full timeout.
-                                warn!(
-                                    "Warm-start OP_GETSOURCES for {tid} failed: {e} — abandoning the rest of this batch"
+                for (tid, fh, file_size) in tcp_targets {
+                    match send_server_get_sources(state, fh, *file_size, now) {
+                        Ok(bytes) => {
+                            if bytes > 0 {
+                                stats_manager.add_overhead(
+                                    crate::storage::statistics::OverheadCategory::SourceExchange,
+                                    crate::storage::statistics::OverheadDirection::Upload,
+                                    bytes,
                                 );
-                                break;
+                                info!(
+                                    "Warm-start: sent OP_GETSOURCES to server for resumed download {} ({})",
+                                    tid,
+                                    hex::encode(fh),
+                                );
                             }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Warm-start OP_GETSOURCES for {tid} not queued: {e} — abandoning the rest of this batch"
+                            );
+                            break;
                         }
                     }
                 }
@@ -1786,17 +1782,17 @@ pub(in crate::network) async fn on_source_retry_tick(
         }
     }
 
-    // Starved-download fast server re-ask. eMule keeps pulling the
-    // connected server's (growing) source list for a file that has
-    // no working sources; our 4-minute TCP batch is far too slow to
-    // recover when the initial source set is dead (e.g. all HighID
-    // sources reset, all KAD callbacks unanswered). For ACTIVE
-    // downloads with zero throughput we re-ask the connected server
-    // for that file's sources on a flood-safe per-file cadence
-    // (STARVED_SERVER_REASK_SECS). This is the path that surfaces
-    // the LowID server sources eMule reaches via OP_CALLBACKREQUEST.
-    // Gated on the shared frame budget, so the 45 s per-file clock
-    // only decides *which* starved files ride the next frame.
+    // Starved-download server re-ask. For ACTIVE downloads with zero
+    // throughput — the initial source set is dead (all HighID sources
+    // reset, all KAD callbacks unanswered) — the connected server is
+    // re-asked for that file's sources as soon as the rules allow,
+    // instead of waiting for its turn in the 4-minute sweep. This is
+    // the path that surfaces the LowID server sources eMule reaches via
+    // OP_CALLBACKREQUEST. It spends a frame of the shared budget, and
+    // each file is still held to eMule's 15-minute SERVERREASKTIME
+    // floor (`SERVER_TCP_SRCREQ_FILE_REASK_SECS`); the
+    // STARVED_SERVER_REASK_SECS clock only orders which starved files
+    // ride a frame, since the floor is the longer of the two.
     if state.server_connection.is_some() && server_tcp_srcreq_frame_open(state, now) {
         let starved: Vec<(String, [u8; 16], u64)> = {
             let mgr = transfer_manager.read().await;
@@ -1814,6 +1810,9 @@ pub(in crate::network) async fn on_source_retry_tick(
                         if raw.len() == 16 {
                             let mut fh = [0u8; 16];
                             fh.copy_from_slice(&raw[..16]);
+                            if !server_tcp_srcreq_file_due(&state.server_tcp_srcreq_file_at, &fh, now) {
+                                continue;
+                            }
                             out.push((tid.clone(), fh, transfer.total_size));
                         }
                     }
@@ -1824,35 +1823,29 @@ pub(in crate::network) async fn on_source_retry_tick(
         };
         if !starved.is_empty() {
             close_server_tcp_srcreq_frame(state, now);
-            if let Some(conn) = state.server_connection.as_mut() {
-                for (tid, fh, file_size) in &starved {
-                    // Stop at the first failed write: these are
-                    // sequential 30 s-timeout TCP writes on the
-                    // network task, so a server that has stopped
-                    // reading turns a capped batch into
-                    // `SERVER_TCP_SRCREQ_MAX_PER_FRAME` back-to-back
-                    // stalls of everything else.
-                    match conn.send_get_sources(fh, *file_size).await {
-                        Ok(bytes) => {
-                            if bytes > 0 {
-                                stats_manager.add_overhead(
-                                    crate::storage::statistics::OverheadCategory::SourceExchange,
-                                    crate::storage::statistics::OverheadDirection::Upload,
-                                    bytes,
-                                );
-                                info!(
-                                    "Starved re-ask: sent OP_GETSOURCES to server for active download {} ({})",
-                                    tid,
-                                    hex::encode(fh),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Starved re-ask OP_GETSOURCES for {tid} failed: {e} — abandoning the rest of this batch"
+            for (tid, fh, file_size) in &starved {
+                // Stop at the first refusal: the writer queue is full or
+                // the session is broken, and the rest would fare the same.
+                match send_server_get_sources(state, fh, *file_size, now) {
+                    Ok(bytes) => {
+                        if bytes > 0 {
+                            stats_manager.add_overhead(
+                                crate::storage::statistics::OverheadCategory::SourceExchange,
+                                crate::storage::statistics::OverheadDirection::Upload,
+                                bytes,
                             );
-                            break;
+                            info!(
+                                "Starved re-ask: sent OP_GETSOURCES to server for active download {} ({})",
+                                tid,
+                                hex::encode(fh),
+                            );
                         }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Starved re-ask OP_GETSOURCES for {tid} not queued: {e} — abandoning the rest of this batch"
+                        );
+                        break;
                     }
                 }
             }

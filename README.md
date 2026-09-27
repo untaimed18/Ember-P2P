@@ -74,7 +74,7 @@ Shared files are published as keyword records (findable by name) and source reco
 
 ### Current limits
 
-- **Library content still moves over eD2K.** Ember discovers the source; the bytes travel the eMule wire. The one exception is **Ember Transfer** ([`ember/xfer.rs`](src-tauri/src/network/ember/xfer.rs)), which hands a file from one channel member to another over the room's own session — accept-first, receiver-driven, up to 100 MB. It borrows the BLAKE3 hash tree from [`ember/transfer.rs`](src-tauri/src/network/ember/transfer.rs) to identify a file; that module's QUIC chunk-stream framing is still unused. Putting ordinary downloads on the same footing is the largest remaining piece toward a network that does not need the eMule wire at all.
+- **Library content still moves over eD2K.** Ember discovers the source; the bytes travel the eMule wire. The one exception is **Ember Transfer** ([`ember/xfer.rs`](src-tauri/src/network/ember/xfer.rs)), which hands a file from one channel member to another over the room's own session — accept-first, receiver-driven, up to 2 GB. It borrows the BLAKE3 hash tree from [`ember/transfer.rs`](src-tauri/src/network/ember/transfer.rs) to identify a file; that module's QUIC chunk-stream framing is still unused. Putting ordinary downloads on the same footing is the largest remaining piece toward a network that does not need the eMule wire at all.
 - **Bootstrap depends on eMule** — as described above; seed lists are deliberately not planned.
 - **Version mismatches are silent** — incompatible peers refuse each other cleanly, but neither side is told why and there is no upgrade prompt. They simply never fold each other into a routing table.
 - **Multi-keyword search is approximate** — sparse DHT intersection (missing secondary keys are skipped) plus a filename match at emit time, not a strict worldwide AND of every keyword.
@@ -225,7 +225,7 @@ Channels are in beta and the app marks them so. The format is still settling; re
 
 You need a **Channel username** first: two to twelve letters or numbers, claimed across Ember so two people in a room are never the same name. It is separate from your friend nickname, and Create and Join stay disabled until you have one.
 
-From there, create a room (names are up to 20 characters, claimed once, first come first served), paste an `ember-channel:` invite, or browse **Discover** for public rooms other people have published.
+From there, create a room (names are up to 32 characters, claimed once, first come first served), paste an `ember-channel:` invite, or browse **Discover** for public rooms other people have published.
 
 ### Public and private
 
@@ -255,7 +255,7 @@ Every member can **mute** a room and **ignore** a member. Both are local to the 
 
 ### Sending files
 
-A member can send one other member a file, up to **100 MB**, and only after they accept the offer. Unanswered offers lapse after five minutes and up to 4 transfers run at once. Files go directly between the two members, not to the room. Two firewalled members need a relay and may not connect at all.
+A member can send one other member a file, up to **2 GB**, and only after they accept the offer. Unanswered offers lapse after five minutes and up to 4 transfers run at once. Files go directly between the two members, not to the room. Two firewalled members need a relay and may not connect at all.
 
 ### What to expect
 
@@ -310,7 +310,7 @@ Ember's own additions — the [Ember Network](#ember-network) overlay and the [E
 
 ### Social
 
-- **Friends** — Ember-exclusive friend system with v2 Friend Codes, Noise-secured sessions, end-to-end encrypted chat, remote browsing, friends-only shares, file offers, priority uploads, a block list, and transfers that can work without HighID (see [above](#friends--ember-exclusive-social-features)).
+- **Friends** — Ember-exclusive friend system with v3 Friend Codes, Noise-secured sessions, end-to-end encrypted chat, remote browsing, friends-only shares, file offers, priority uploads, a block list, and transfers that can work without HighID (see [above](#friends--ember-exclusive-social-features)).
 - **Channels (beta)** — Group rooms carried over the Ember Network itself: public rooms anyone can find, private rooms that need an invite, moderation with bans, moderators, owner-only invites and slow mode, and member-to-member file sending. Nobody publishes their IP address to the room (see [above](#channels--group-rooms-beta)).
 - **Credits & SecIdent** — RSA-based Secure Identification prevents credit theft; upload priority follows the standard credit ratio formula.
 

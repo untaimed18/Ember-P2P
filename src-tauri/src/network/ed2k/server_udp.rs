@@ -588,6 +588,82 @@ pub struct ServerSearchResult {
     pub media: crate::types::MediaMetadata,
 }
 
+type FoundSourcesBlock = ([u8; 16], Vec<(Ipv4Addr, u16, u32)>);
+
+/// One `<hash><count><sources>` block starting at `pos`, and where it ends.
+fn read_found_sources_block(buf: &[u8], pos: usize) -> Option<(FoundSourcesBlock, usize)> {
+    let hash: [u8; 16] = buf.get(pos..pos + 16)?.try_into().ok()?;
+    let count = usize::from(*buf.get(pos + 16)?);
+    let end = pos + 17 + count * 6;
+    let sources = buf
+        .get(pos + 17..end)?
+        .chunks_exact(6)
+        .map(|s| {
+            let id = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+            let port = u16::from_le_bytes([s[4], s[5]]);
+            if id < super::server::LOWID_THRESHOLD {
+                (Ipv4Addr::UNSPECIFIED, port, id)
+            } else {
+                (Ipv4Addr::from(id.to_le_bytes()), port, 0)
+            }
+        })
+        .collect();
+    Some(((hash, sources), end))
+}
+
+/// Where the block starting at `pos` ends, without decoding it. `Some` exactly
+/// when [`read_found_sources_block`] would succeed.
+fn found_sources_block_end(buf: &[u8], pos: usize) -> Option<usize> {
+    let count = usize::from(*buf.get(pos.checked_add(16)?)?);
+    let end = pos + 17 + count * 6;
+    (end <= buf.len()).then_some(end)
+}
+
+/// Every source block in an `OP_GLOBFOUNDSOURCES` payload.
+///
+/// Where `E3 9B` follows a block it is either eMule's inter-block header or
+/// the start of a contiguous block whose hash begins with those bytes. The
+/// reading that consumes the datagram exactly wins, the header if both do.
+/// Whether the blocks from an offset can finish the datagram is worked out
+/// once per offset, back to front, so a reply crafted with the pair at every
+/// boundary costs linear work and no recursion. A datagram neither reading
+/// consumes (truncated) is read greedily, taking the header where it appears,
+/// and keeps the blocks read before the damage.
+fn parse_found_sources_blocks(buf: &[u8]) -> Vec<FoundSourcesBlock> {
+    const HEADER: [u8; 2] = [OP_EDONKEYPROT, OP_GLOBFOUNDSOURCES];
+    // A block always ends past where it starts, so every offset this reads
+    // from has already been filled in.
+    let len = buf.len();
+    let mut finishes = vec![false; len + 1];
+    for pos in (0..len).rev() {
+        finishes[pos] = match found_sources_block_end(buf, pos) {
+            None => false,
+            Some(end) if end == len => true,
+            Some(end) => {
+                (buf.get(end..end + 2) == Some(&HEADER[..]) && finishes[end + 2]) || finishes[end]
+            }
+        };
+    }
+
+    let exact = finishes[0];
+    let mut blocks = Vec::new();
+    let mut pos = 0;
+    while let Some((block, end)) = read_found_sources_block(buf, pos) {
+        blocks.push(block);
+        let has_header = buf.get(end..end + 2) == Some(&HEADER[..]);
+        pos = if !exact {
+            if has_header { end + 2 } else { end }
+        } else if end == buf.len() {
+            break;
+        } else if has_header && finishes[end + 2] {
+            end + 2
+        } else {
+            end
+        };
+    }
+    blocks
+}
+
 fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpResponse> {
     if data.is_empty() {
         return None;
@@ -671,78 +747,21 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
             })
         }
         OP_GLOBFOUNDSOURCES => {
-            // eMule/Lugdunum UDP servers PACK MULTIPLE file responses into a
-            // single OP_GLOBFOUNDSOURCES datagram, laid out CONTIGUOUSLY with
-            // NO per-block separator: <hash><count><sources> repeats back to
-            // back until the datagram ends. (eMule's own client parser proves
-            // this — for files it doesn't recognise it manually skips
-            // `count * 6` bytes to reach the next block, which is only
-            // necessary because there is no header to scan for.)
-            //
-            // A previous version required a re-emitted
-            // `<OP_EDONKEYPROT><OP_GLOBFOUNDSOURCES>` header between blocks and
-            // stopped at the first block not preceded by one — i.e. every
-            // block after the first in a packed reply. That silently dropped
-            // the sources for all-but-one file whenever more than one download
-            // was active (we batch hashes into OP_GLOBGETSOURCES2), which
-            // surfaced as "UDP returned no sources". We now read every
-            // contiguous block until the datagram is exhausted, and we do NOT
-            // probe for an inter-block header: a file hash legitimately
-            // starting with the two header bytes would otherwise misalign the
-            // whole rest of the packet.
+            // A server answering an OP_GLOBGETSOURCES2 for several files packs
+            // one `<hash><count><sources>` block per file into the datagram.
+            // eMule's reader requires a re-emitted
+            // `<OP_EDONKEYPROT><OP_GLOBFOUNDSOURCES>` header before each block
+            // after the first and stops at the first block without one
+            // (`UDPSocket.cpp:286-305`), so that is the layout servers send.
+            // Blocks packed back to back without it are read too, since
+            // requiring the header once cost every block after the first.
+            // See `parse_found_sources_blocks`.
             //
             // Per-entry layout: <file_hash[16]><source_count u8><sources(6 each)>.
             // Per-source layout: <id u32 LE><port u16 LE>. id < LOWID_THRESHOLD
             // means this entry is a LowID peer — store with the client_id slot
             // populated, IP unspecified (same convention as before).
-            if payload.len() < 17 {
-                return None;
-            }
-            let mut all_files: Vec<([u8; 16], Vec<(Ipv4Addr, u16, u32)>)> = Vec::new();
-            let mut cursor = Cursor::new(payload);
-            loop {
-                let mut file_hash = [0u8; 16];
-                if std::io::Read::read_exact(&mut cursor, &mut file_hash).is_err() {
-                    break;
-                }
-                let source_count = match cursor.read_u8() {
-                    Ok(c) => c as usize,
-                    Err(_) => break,
-                };
-                let mut sources = Vec::with_capacity(source_count);
-                let mut entry_ok = true;
-                for _ in 0..source_count {
-                    let id = match cursor.read_u32::<LittleEndian>() {
-                        Ok(v) => v,
-                        Err(_) => {
-                            entry_ok = false;
-                            break;
-                        }
-                    };
-                    let port = match cursor.read_u16::<LittleEndian>() {
-                        Ok(v) => v,
-                        Err(_) => {
-                            entry_ok = false;
-                            break;
-                        }
-                    };
-                    if id < super::server::LOWID_THRESHOLD {
-                        sources.push((Ipv4Addr::UNSPECIFIED, port, id));
-                    } else {
-                        let ip = Ipv4Addr::from(id.to_le_bytes());
-                        sources.push((ip, port, 0));
-                    }
-                }
-                if !entry_ok {
-                    // Truncated source list — drop this entry but keep what
-                    // we successfully parsed so far. Matches eMule's
-                    // "swallow leftover bytes silently" tolerance.
-                    break;
-                }
-                all_files.push((file_hash, sources));
-                // Next iteration reads the following contiguous block (if any);
-                // `read_exact` of the file hash fails cleanly at end-of-datagram.
-            }
+            let all_files = parse_found_sources_blocks(payload);
             if all_files.is_empty() {
                 return None;
             }
@@ -1277,14 +1296,33 @@ mod tests {
         }
     }
 
-    /// eMule/Lugdunum UDP servers pack multiple OP_GLOBFOUNDSOURCES file
-    /// responses CONTIGUOUSLY in a single datagram, with NO separator between
-    /// blocks. Verify the parser walks every contiguous entry.
-    ///
-    /// Regression: a previous parser required a re-emitted
-    /// `<OP_EDONKEYPROT><OP_GLOBFOUNDSOURCES>` header between blocks and
-    /// dropped every file after the first in a packed reply — surfacing as
-    /// "UDP returned no sources" whenever more than one download was active.
+    /// eMule's reader (`UDPSocket.cpp:286-305`) expects a re-emitted
+    /// `<OP_EDONKEYPROT><OP_GLOBFOUNDSOURCES>` header before every block after
+    /// the first; each block must be read.
+    #[test]
+    fn parse_globfoundsources_reads_blocks_behind_emule_headers() {
+        let addr: SocketAddr = "10.0.0.3:4665".parse().unwrap();
+        let mut packet = vec![OP_GLOBFOUNDSOURCES];
+        for (n, last) in [(0x11u8, 4662u16), (0x22, 4663), (0x33, 4664)] {
+            if n != 0x11 {
+                packet.extend_from_slice(&[OP_EDONKEYPROT, OP_GLOBFOUNDSOURCES]);
+            }
+            packet.extend_from_slice(&[n; 16]);
+            packet.push(1);
+            packet.extend_from_slice(&[n, 2, 3, 4]);
+            packet.extend_from_slice(&last.to_le_bytes());
+        }
+        match parse_server_udp_response(&packet, addr).unwrap() {
+            ServerUdpResponse::FoundSources { files, .. } => {
+                assert_eq!(files.len(), 3);
+                assert_eq!(files[1].0, [0x22; 16]);
+                assert_eq!(files[2].1[0], (Ipv4Addr::new(0x33, 2, 3, 4), 4664, 0));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// Blocks packed back to back without eMule's header are read too.
     #[test]
     fn parse_multi_file_globfoundsources_packet_drains_all_entries() {
         let addr: SocketAddr = "10.0.0.1:4665".parse().unwrap();
@@ -1363,6 +1401,32 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    /// The largest datagram, packed with empty blocks each followed by what
+    /// could be a header, used to cost one stack frame per block. It must read
+    /// every block, on a thread with a deliberately small stack.
+    #[test]
+    fn a_datagram_of_empty_blocks_parses_without_deep_recursion() {
+        let mut buf = Vec::new();
+        let mut blocks = 0usize;
+        while buf.len() + 19 <= 65_000 {
+            let mut hash = [0x33u8; 16];
+            hash[..2].copy_from_slice(&[OP_EDONKEYPROT, OP_GLOBFOUNDSOURCES]);
+            buf.extend_from_slice(&hash);
+            buf.push(0);
+            buf.extend_from_slice(&[OP_EDONKEYPROT, OP_GLOBFOUNDSOURCES]);
+            blocks += 1;
+        }
+        buf.truncate(buf.len() - 2);
+
+        let parsed = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || parse_found_sources_blocks(&buf).len())
+            .unwrap()
+            .join()
+            .expect("parser overflowed a 64 KiB stack");
+        assert_eq!(parsed, blocks);
     }
 
     /// A search result declaring more tags than `MAX_APPLIED_TAGS` (256) must

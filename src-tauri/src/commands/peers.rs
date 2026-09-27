@@ -504,6 +504,12 @@ pub async fn add_friend(
             "Friend added to DB, but auto-connect search was not enqueued (channel full): {e}"
         );
     }
+    // A code without their intro secret cannot find a current build on the
+    // rendezvous until they add us back, which is the case for every member
+    // added from a room. Ask them through a room we share instead.
+    if let (Some(pubkey), None, false) = (friend_pubkey, intro_secret, became_mutual) {
+        crate::commands::channels::send_room_friend_request(&state, pubkey, true).await;
+    }
 
     Ok(())
 }

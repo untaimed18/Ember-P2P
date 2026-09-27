@@ -30,6 +30,7 @@ import {
   type Locale,
 } from '$lib/paraglide/runtime';
 import * as m from '$lib/paraglide/messages';
+import { TimeoutError } from '$lib/timeout';
 import type { SpamReason } from '$lib/types';
 
 export { baseLocale, locales, getLocale, setLocale };
@@ -585,6 +586,7 @@ export function firewallStatusText(status: string | undefined): string {
  * still decoded while the bespoke fallback is preserved.
  */
 export function translateError(input: unknown, fallback?: string): string {
+  if (input instanceof TimeoutError) return m.error_timed_out();
   const raw = input instanceof Error
     ? input.message
     : typeof input === 'string'

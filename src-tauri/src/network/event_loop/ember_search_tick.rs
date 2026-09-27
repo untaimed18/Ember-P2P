@@ -93,6 +93,7 @@ pub(in crate::network) async fn on_ember_search_tick(
         && state.ember_dht_maint_pings.is_empty()
         && state.ember_pending_source_injections.is_empty()
         && state.ember_pending_callback_connects.is_empty()
+        && state.pending_direct_callbacks.is_empty()
         && state.ember_pending_proxy_overlay.is_empty()
         && state.ember_pending_keyword_results.is_empty()
         && state.ember_pending_channel_presence.is_empty()

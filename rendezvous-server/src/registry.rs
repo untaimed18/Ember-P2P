@@ -141,11 +141,13 @@ pub struct ChannelNameRecord {
     /// was never renamed. Enforces [`RENAME_INTERVAL_SECS`].
     #[serde(default)]
     pub renamed_at: i64,
-    /// User key of whoever took the room over in the handover that bound this
-    /// name to its current channel, or empty when unknown (a transfer to
-    /// someone the owner never nominated, or a record older than this field).
-    /// Only this key's handover retries count as the successor being alive;
-    /// see [`ChannelRegistry::handover_channel_name`].
+    /// User key of the nominee whose takeover bound this name to its current
+    /// channel, or empty (an explicit transfer, whose new owner's user key the
+    /// registry never learns, or a record older than this field). A handover
+    /// retry signed by this key counts as the successor being alive, as does
+    /// one signed by the successor room's own key; see
+    /// [`ChannelRegistry::handover_channel_name`]. Records written while the
+    /// first retry after an explicit transfer named it keep whom it named.
     #[serde(default)]
     pub inheritor: String,
 }
@@ -717,10 +719,24 @@ impl ChannelRegistry {
         // otherwise rename the room with nobody having asked. Renaming is
         // [`Self::rename_channel_name_at`], and so is going back to a name this
         // room retired: the exact-key block below refuses that here too.
-        if self
+        //
+        // The claim is still signed by the room's own key, though, so it says
+        // the room is alive, and its name is kept from ageing out. That is all
+        // that keeps a successor on a build without the handover retry's room
+        // key signature — one whose device holds a name other than this — from
+        // losing the name it inherited while still in use.
+        if let Some(existing) = self
             .live_name_of_channel(&id)
-            .is_some_and(|existing| existing != normalized)
+            .filter(|existing| *existing != normalized)
         {
+            if let Some(rec) = self
+                .names
+                .get_mut(&existing)
+                .filter(|rec| rec.pubkey.eq_ignore_ascii_case(&pk))
+            {
+                rec.refreshed_at = now;
+                self.touch();
+            }
             return Err(RegistryError::Taken);
         }
         // Reject a name that merely *looks* like one already on record. Scoped
@@ -1060,18 +1076,17 @@ impl ChannelRegistry {
             // leaves Discover after a week and loses its name after a year
             // while still in use.
             //
-            // Nothing above checked the signer's authority, though, so only
-            // the key that took the room over counts; anyone else's request
-            // would keep a dead room's name held. When that key is not on
-            // record — a transfer to someone never nominated, or a handover
-            // older than the field — the first retry names it. That is the
-            // successor's own client, the only one with a reason to send it,
-            // and the outgoing owner's key is kept out since its retries say
-            // nothing about the successor.
-            if rec.inheritor.is_empty() && channel_id_of_key(&signer).as_deref() != Some(old_id.as_str()) {
-                rec.inheritor = signer.clone();
-            }
-            if rec.inheritor == signer {
+            // Nothing above checked the signer's authority, though, so only a
+            // key that speaks for the room now counts; anyone else's request
+            // would keep a dead room's name held. That is the successor room's
+            // own key, which hashes to the id the name is bound to, or the
+            // nominee whose takeover moved it here. Nobody is named from the
+            // retries themselves: after an explicit transfer the first key to
+            // ask would otherwise become the one whose requests hold the name,
+            // and that can be anyone's.
+            let successor_signed = channel_id_of_key(&signer).as_deref() == Some(new_id.as_str());
+            let inheritor_signed = !rec.inheritor.is_empty() && rec.inheritor == signer;
+            if successor_signed || inheritor_signed {
                 rec.refreshed_at = now;
                 self.touch();
             }
@@ -1093,7 +1108,8 @@ impl ChannelRegistry {
         }
         let previous_id = rec.channel_id.to_ascii_lowercase();
         // An explicit transfer may go to anyone, not only the nominee, so the
-        // registry does not know the new owner's key; see the retry above.
+        // registry does not know the new owner's user key; its retries are
+        // signed with the successor room's key instead. See the retry above.
         rec.inheritor = if by_nominee { signer.clone() } else { String::new() };
         rec.channel_id = new_id.clone();
         rec.pubkey = new_pk;
@@ -3031,25 +3047,72 @@ mod tests {
     }
 
     /// After an explicit transfer the registry does not know the new owner's
-    /// key, so the first retry names it.
+    /// user key, so only the successor room's own key keeps the name alive —
+    /// the first stranger to retry does not get to become the one who does.
     #[test]
-    fn an_explicit_transfers_first_retry_names_the_successor() {
+    fn after_an_explicit_transfer_only_the_successor_room_key_refreshes() {
         let mut reg = ChannelRegistry::in_memory();
         let t0 = 1_700_000_000;
         let owner = user_key(0);
         let old_id = channel_id_of_key(&owner).unwrap();
-        let (new_id, new_pk) = (room_id(1), user_key(1));
-        let heir = user_key(3);
+        let new_pk = user_key(1);
+        let new_id = channel_id_of_key(&new_pk).unwrap();
+        let stranger = user_key(3);
         assert!(reg.claim_channel_name_at(&old_id, &owner, "Lobby", false, t0).is_ok());
         assert!(reg.handover_channel_name(&old_id, &new_id, &new_pk, &owner, t0).is_ok());
-        assert!(reg.handover_channel_name(&old_id, &new_id, &new_pk, &heir, t0 + 10).is_ok());
-        assert_eq!(reg.names.get("lobby").unwrap().refreshed_at, t0 + 10);
-        assert!(reg
-            .handover_channel_name(&old_id, &new_id, &new_pk, &user_key(9), t0 + 20)
-            .is_ok());
-        assert_eq!(reg.names.get("lobby").unwrap().refreshed_at, t0 + 10);
-        assert!(reg.handover_channel_name(&old_id, &new_id, &new_pk, &heir, t0 + 30).is_ok());
+        assert!(reg.names.get("lobby").unwrap().inheritor.is_empty());
+
+        assert!(reg.handover_channel_name(&old_id, &new_id, &new_pk, &stranger, t0 + 10).is_ok());
+        assert_eq!(
+            reg.names.get("lobby").unwrap().refreshed_at,
+            t0,
+            "a stranger's retry keeps nothing alive"
+        );
+        assert!(reg.names.get("lobby").unwrap().inheritor.is_empty(), "nor names anyone");
+        assert!(reg.handover_channel_name(&old_id, &new_id, &new_pk, &owner, t0 + 20).is_ok());
+        assert_eq!(
+            reg.names.get("lobby").unwrap().refreshed_at,
+            t0,
+            "the outgoing owner's retries say nothing about the successor"
+        );
+
+        assert!(reg.handover_channel_name(&old_id, &new_id, &new_pk, &new_pk, t0 + 30).is_ok());
         assert_eq!(reg.names.get("lobby").unwrap().refreshed_at, t0 + 30);
+        assert!(reg.handover_channel_name(&old_id, &new_id, &new_pk, &stranger, t0 + 40).is_ok());
+        assert_eq!(reg.names.get("lobby").unwrap().refreshed_at, t0 + 30);
+    }
+
+    /// A successor on a build whose handover retries carry only its user key
+    /// still re-claims with its room key; refused for holding another name,
+    /// that claim still keeps the name it inherited alive — and nobody else's
+    /// claim does.
+    #[test]
+    fn a_room_keys_claim_for_another_name_keeps_its_own_name_alive() {
+        let mut reg = ChannelRegistry::in_memory();
+        let t0 = 1_700_000_000;
+        let owner = user_key(0);
+        let old_id = channel_id_of_key(&owner).unwrap();
+        let new_pk = user_key(1);
+        let new_id = channel_id_of_key(&new_pk).unwrap();
+        assert!(reg.claim_channel_name_at(&old_id, &owner, "Lobby", false, t0).is_ok());
+        assert!(reg.handover_channel_name(&old_id, &new_id, &new_pk, &owner, t0).is_ok());
+
+        assert_eq!(
+            reg.claim_channel_name_at(&new_id, &new_pk, "Attic", false, t0 + 50),
+            Err(RegistryError::Taken),
+            "still one name per room"
+        );
+        assert_eq!(reg.names.get("lobby").unwrap().refreshed_at, t0 + 50);
+        assert!(!reg.names.contains_key("attic"));
+
+        let other_pk = user_key(2);
+        let other_id = channel_id_of_key(&other_pk).unwrap();
+        assert!(reg.claim_channel_name_at(&other_id, &other_pk, "Den", false, t0 + 60).is_ok());
+        assert_eq!(
+            reg.claim_channel_name_at(&other_id, &other_pk, "Lobby", false, t0 + 70),
+            Err(RegistryError::Taken)
+        );
+        assert_eq!(reg.names.get("lobby").unwrap().refreshed_at, t0 + 50);
     }
 
     /// A retried handover (its first answer lost, or answered 503 while the

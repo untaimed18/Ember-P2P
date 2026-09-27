@@ -883,15 +883,27 @@ pub async fn create_channel(
             "room created but its presence record did not publish"
         );
     }
-    let moderation = SignedRecord::channel_moderation(
+    // From the same stamp sequence as every later snapshot, so an edit made in
+    // the room's first second still outranks this one.
+    let now = chrono::Utc::now().timestamp();
+    let opening_at = {
+        let db = state.db.clone();
+        let id = channel_id_hex.clone();
+        tokio::task::spawn_blocking(move || db.stamp_owner_snapshot(&id, now))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .unwrap_or(now)
+    };
+    let moderation = SignedRecord::channel_moderation_at(
         "",
         "",
         &[],
         &[],
         // Names us as owner from the very first record, so a member who joins
         // before any moderation edit already knows who cannot be banned. The
-        // language too, or this device would fetch its own opening record back
-        // and read it as "no language".
+        // language too, or a member would read the room as having none.
         &ModerationTail {
             owner_pubkey: Some(state.identity.ed25519_public_key),
             key_epoch: Some(0),
@@ -902,6 +914,7 @@ pub async fn create_channel(
         ident.pubkey,
         private,
         &ident.signing_key,
+        opening_at,
     );
     // An empty topic, welcome and lists cannot overrun the record budget, so
     // this only fires if those limits are ever changed out from under it.
@@ -926,7 +939,7 @@ pub async fn create_channel(
             &id_owner,
             "",
             "",
-            // Older than any real DHT record so the first fetch still applies.
+            // Older than any snapshot this device signs, so it never outranks one.
             1,
             &[],
             &[],
@@ -2748,14 +2761,13 @@ async fn commit_channel_moderation_with(
              message, or remove some bans or moderators.",
         ));
     }
-    let Some(record) = record else {
+    if record.is_none() {
         return Err(coded(
             "channels_moderation_too_large",
             "This change does not fit in one published record. Shorten the welcome \
              message, or remove some bans or moderators.",
         ));
-    };
-    let ts = record.timestamp;
+    }
     let tail_nominee = tail.successor_nominee;
     let tail_days = tail.claim_after_days;
     let tail_epoch = tail.key_epoch;
@@ -2770,38 +2782,55 @@ async fn commit_channel_moderation_with(
     let welcome_s = welcome.to_string();
     let bans_v = bans.to_vec();
     let mods_v = mods.to_vec();
-    let applied = tokio::task::spawn_blocking(move || {
-        let applied = db.apply_channel_moderation(
+    let stamped = tokio::task::spawn_blocking(move || {
+        db.commit_owner_channel_moderation(
             &id,
-            &topic_s,
-            &welcome_s,
-            ts,
-            &bans_v,
-            &mods_v,
-            Some(&our_pk),
-            tail_nominee.as_ref(),
-            tail_days,
-            tail_epoch,
-            tail_owner_only,
-            tail_slow_mode,
-        )?;
-        // Before the record is queued, like the rest of the snapshot, so a
-        // failed write is an edit that did not happen rather than one that
-        // reaches the room while this device forgets it.
-        if applied {
-            db.apply_owner_room_policy(&id, tail_announce, &tail_pins, tail_language)?;
-        }
-        Ok::<_, anyhow::Error>(applied)
+            &crate::storage::database::ModerationSnapshot {
+                topic: &topic_s,
+                welcome: &welcome_s,
+                banned_pubkeys: &bans_v,
+                moderator_pubkeys: &mods_v,
+                owner_pubkey: Some(&our_pk),
+                successor_nominee: tail_nominee.as_ref(),
+                claim_after_days: tail_days,
+                key_epoch: tail_epoch,
+                invites_owner_only: tail_owner_only,
+                slow_mode_secs: tail_slow_mode,
+            },
+            // In the same write, and before the record is queued, like the
+            // rest of the snapshot: a failed write is an edit that did not
+            // happen rather than one that reaches the room while this device
+            // forgets it.
+            &crate::storage::database::OwnerRoomPolicy {
+                announce_only: tail_announce,
+                pinned_msg_ids: &tail_pins,
+                language: tail_language,
+            },
+            chrono::Utc::now().timestamp(),
+        )
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to save room info", e))?;
-    if !applied {
-        return Err(coded(
-            "channels_moderation_failed",
-            "A newer moderation record is already stored",
-        ));
-    }
+    let Some(stamp) = stamped else {
+        return Err(coded("channels_not_found", "Channel not found"));
+    };
+    // Signed again at the stamp the edit was stored under. Nothing about the
+    // size depends on it, so this fits exactly as the check above found.
+    let Some(record) = SignedRecord::channel_moderation_at(
+        topic,
+        welcome,
+        bans,
+        mods,
+        &tail,
+        owned.channel_id,
+        owned.ident.pubkey,
+        private,
+        &owned.ident.signing_key,
+        stamp,
+    ) else {
+        return Ok(());
+    };
     // Queued, not awaited. The rows above are already committed and the owner's
     // periodic republish (`maybe_republish_channel_moderation`) rebuilds this
     // record from them, so the STORE result was never acted on — only logged.
@@ -5489,6 +5518,166 @@ pub async fn channel_member_friend_code(
     Ok(format!("ember2:{}:{}", hex::encode(hash), hex::encode(pk)))
 }
 
+/// Rooms one friend request is sent across when it goes through rooms.
+const ROOM_FRIEND_REQUEST_ROOMS: usize = 2;
+
+/// How long after the first ask through rooms the second waits. Each later one
+/// waits twice as long as the one before: the friend retry sweep that repeats
+/// them runs every few minutes, and each ask floods every room it goes through.
+const ROOM_FRIEND_REQUEST_FIRST_GAP_SECS: i64 = 30 * 60;
+
+/// Asks through rooms before that route is given up, some two and a half days
+/// of them. A member who has not answered by then is not going to — and one
+/// added from an older code may run a build that never reads the frame.
+const ROOM_FRIEND_REQUEST_ATTEMPTS: i64 = 8;
+
+/// Whether a friend asked through rooms `asks` times, the last at `asked_at`,
+/// is due another ask at `now`.
+fn room_friend_request_due(asks: i64, asked_at: i64, now: i64) -> bool {
+    if asks <= 0 {
+        return true;
+    }
+    if asks >= ROOM_FRIEND_REQUEST_ATTEMPTS {
+        return false;
+    }
+    let gap = ROOM_FRIEND_REQUEST_FIRST_GAP_SECS.saturating_mul(1i64 << (asks - 1).min(30));
+    now.saturating_sub(asked_at) >= gap
+}
+
+/// Ask `member` to be friends through the rooms we share with them. Returns
+/// how many rooms the request went out through.
+///
+/// The friend rendezvous cannot find a member added from a room: a current
+/// build publishes its presence only to its friends and to holders of its v3
+/// code, and what a room shows is neither. The request travels as a room
+/// frame instead (see `channel::encode_room_friend_request`), addressed so
+/// that only the member can tell it is theirs and older builds ignore it. Once
+/// they accept, both sides are keyed friends and pairwise presence connects
+/// them as usual.
+///
+/// `asked_now` is the user adding them just now, which is never held back by
+/// earlier attempts and starts their count again. Otherwise asks back off as
+/// [`room_friend_request_due`] says, counted on the friend's row so a restart
+/// does not start them over.
+pub(crate) async fn send_room_friend_request(
+    state: &AppState,
+    member: [u8; 32],
+    asked_now: bool,
+) -> usize {
+    let Some(hash) = crypto::node_id_from_ed25519_bytes(&member) else {
+        return 0;
+    };
+    if member == state.identity.ed25519_public_key
+        || state.db.chat_locked()
+        || require_ember(state).await.is_err()
+    {
+        return 0;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let hash_hex = hex::encode(hash);
+    let db = state.db.clone();
+    let lookup_hash = hash_hex.clone();
+    let member_hex = hex::encode(member);
+    let our_hex = hex::encode(state.identity.ed25519_public_key);
+    let due = tokio::task::spawn_blocking(move || {
+        let asks = if asked_now {
+            0
+        } else {
+            match db.room_friend_request_asks(&lookup_hash) {
+                Ok(Some((asks, asked_at))) if room_friend_request_due(asks, asked_at, now) => asks,
+                _ => return None,
+            }
+        };
+        let rooms = db
+            .rooms_shared_with(&member_hex, &our_hex, ROOM_FRIEND_REQUEST_ROOMS)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|id| db.get_channel_lite(&id).ok().flatten())
+            .collect::<Vec<_>>();
+        Some((asks, rooms))
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some((asks, rooms)) = due else {
+        return 0;
+    };
+    let seed = state.identity.ed25519_secret_key;
+    let our_pk = state.identity.ed25519_public_key;
+    let signing = crypto::signing_key_from_bytes(&seed);
+    let mut sent = 0;
+    for row in rooms {
+        let Ok(channel_id) = channel_id_bytes(&row.channel_id) else {
+            continue;
+        };
+        let Some(join_secret) = join_secret_for_channel(state, &row).await else {
+            continue;
+        };
+        let mut msg_id = [0u8; 16];
+        OsRng.fill_bytes(&mut msg_id);
+        let Some(tag) = channel::room_friend_request_tag(&seed, &member, &channel_id, &msg_id)
+        else {
+            continue;
+        };
+        let ts = chrono::Utc::now().timestamp();
+        let plain =
+            channel::encode_room_friend_request(&signing, &our_pk, &tag, &channel_id, &msg_id, ts);
+        let gossip = channel::ChannelGossip::sealed(
+            channel_id,
+            msg_id,
+            &channel::content_key(&join_secret),
+            ts.max(0) as u64,
+            &plain,
+            channel::CHANNEL_MSG_TTL_DEFAULT,
+            ts,
+        );
+        if state
+            .network_tx
+            .try_send(NetworkCommand::FanoutChannelGossip {
+                body: gossip.encode(),
+            })
+            .is_ok()
+        {
+            sent += 1;
+        }
+    }
+    // Only an ask that went somewhere counts, so a friend we share no room with
+    // yet is asked as soon as we do.
+    if sent > 0 {
+        let db = state.db.clone();
+        let recorded = tokio::task::spawn_blocking(move || {
+            db.set_room_friend_request_asks(&hash_hex, asks + 1, now)
+        })
+        .await;
+        if let Ok(Err(e)) = recorded {
+            tracing::debug!("Could not record a friend request sent through rooms: {e}");
+        }
+    }
+    sent
+}
+
+#[cfg(test)]
+mod room_friend_request_backoff_tests {
+    use super::{
+        room_friend_request_due, ROOM_FRIEND_REQUEST_ATTEMPTS, ROOM_FRIEND_REQUEST_FIRST_GAP_SECS,
+    };
+
+    /// Each ask through rooms waits twice as long as the last, and after the
+    /// last attempt none follows.
+    #[test]
+    fn asks_through_rooms_back_off_and_then_stop() {
+        let at = 1_700_000_000;
+        let gap = ROOM_FRIEND_REQUEST_FIRST_GAP_SECS;
+        assert!(room_friend_request_due(0, 0, at));
+        assert!(!room_friend_request_due(1, at, at + gap - 1));
+        assert!(room_friend_request_due(1, at, at + gap));
+        assert!(!room_friend_request_due(2, at, at + gap));
+        assert!(room_friend_request_due(2, at, at + 2 * gap));
+        assert!(room_friend_request_due(3, at, at + 4 * gap));
+        assert!(!room_friend_request_due(ROOM_FRIEND_REQUEST_ATTEMPTS, at, i64::MAX));
+    }
+}
+
 // --- Ember Transfer -------------------------------------------------------
 
 /// Offer a file to one member of a room.
@@ -5589,11 +5778,17 @@ pub async fn pick_and_offer_channel_transfer(
                 channel::XFER_MAX_BYTES,
             ));
         }
-        let name = crate::security::sanitize_filename(
-            canonical
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file"),
+        // Clamped here, keeping the extension, rather than cut from the end by
+        // the wire encoder, so the recipient saves the same name the sender's
+        // UI shows.
+        let name = super::chat_attachments::clamp_file_name_keep_extension(
+            &crate::security::sanitize_filename(
+                canonical
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file"),
+            ),
+            channel::XFER_NAME_MAX,
         );
         if name.is_empty() {
             return Err(coded(

@@ -15,6 +15,7 @@
   import { copyToClipboard, formatBytes, formatCalendarDate } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { plural } from '$lib/plural';
   import {
     onlineFriends as onlineFriendsStore,
     unreadCounts as unreadCountsStore,
@@ -1239,9 +1240,11 @@
         </div>
       {/if}
       <span class="inline-stat">
-        {friends.length === 1
-          ? m.friends_online_count_one({ online: onlineFriendCount })
-          : m.friends_online_count_other({ online: onlineFriendCount, total: friends.length })}
+        {plural(friends.length, {
+          one: () => m.friends_online_count_one({ online: onlineFriendCount }),
+          few: () => m.friends_online_count_few({ online: onlineFriendCount, total: friends.length }),
+          other: () => m.friends_online_count_other({ online: onlineFriendCount, total: friends.length }),
+        })}
       </span>
     </div>
   </div>
@@ -1282,9 +1285,11 @@
   {#if searchQuery.trim() && friends.length > 0}
     <div class="result-count-row">
       <span class="result-count">
-        {filtered.length === 1
-          ? m.friends_match_count_one()
-          : m.friends_match_count_other({ count: filtered.length })}
+        {plural(filtered.length, {
+          one: m.friends_match_count_one,
+          few: () => m.friends_match_count_few({ count: filtered.length }),
+          other: () => m.friends_match_count_other({ count: filtered.length }),
+        })}
       </span>
     </div>
   {/if}
@@ -1404,7 +1409,11 @@
               <span class="status-pending">{m.friends_status_waiting_accept()}</span>
             {:else if unread > 0}
               <span class="status-unread">
-                {unread === 1 ? m.friends_unread_one() : m.friends_unread_other({ count: unread })}
+                {plural(unread, {
+                  one: m.friends_unread_one,
+                  few: () => m.friends_unread_few({ count: unread }),
+                  other: () => m.friends_unread_other({ count: unread }),
+                })}
               </span>
             {:else if presence === 'online'}
               <span class="status-online">{m.friends_status_online()}</span>

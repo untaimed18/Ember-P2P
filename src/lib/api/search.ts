@@ -169,6 +169,8 @@ export type SourceAskOutcome = {
   ember: boolean;
   /** The connected eD2k server, asked over TCP. */
   server: boolean;
+  /** `server` is false only because that server was asked for this file in the last 15 minutes. */
+  server_recent: boolean;
   /** The other eligible servers, asked over UDP. */
   server_udp: boolean;
 };

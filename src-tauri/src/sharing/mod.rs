@@ -55,6 +55,42 @@ pub fn is_sensitive_dir_name(name: &str) -> bool {
     SENSITIVE_DIR_NAMES.contains(&lower.as_str())
 }
 
+/// More per-user credential stores, skipped when indexing walks a shared tree
+/// but, unlike [`SENSITIVE_DIR_NAMES`], not refused as parts of a configured
+/// path: settings validation resets the whole config over such a path, and
+/// Ember's own Linux data directory is under `~/.local/share`. What lives
+/// under `.local` and `.var` — GNOME keyrings, KDE wallets, fish history,
+/// Flatpak browser profiles — is excluded by file name and extension in
+/// `sharing::indexer` instead.
+const CREDENTIAL_DIR_NAMES: &[&str] = &[
+    ".azure",
+    ".cargo",
+    ".gradle",
+    ".m2",
+    ".terraform.d",
+    ".purple",
+    ".pki",
+];
+
+/// True when indexing should not descend into a directory named `name`.
+pub fn is_index_skip_dir_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    SENSITIVE_DIR_NAMES.contains(&lower.as_str()) || CREDENTIAL_DIR_NAMES.contains(&lower.as_str())
+}
+
+/// The folders Ember files privately received chat attachments and room
+/// transfers into. They sit inside the download folder, so a walk of a shared
+/// download folder must not publish them. Checked only while walking: sharing
+/// one of these folders, or a file in it, on purpose still works.
+pub fn is_private_receive_dir_name(name: &str) -> bool {
+    [
+        crate::network::chat_attach::CHAT_FILES_DIR,
+        crate::network::ember::xfer::CHANNEL_FILES_DIR,
+    ]
+    .iter()
+    .any(|dir| dir.eq_ignore_ascii_case(name))
+}
+
 /// What sharing `path` would mean if it is a whole volume (`T:\`, `\\nas\share\`, `/`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriveRootShare {

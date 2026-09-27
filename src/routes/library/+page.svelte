@@ -72,6 +72,7 @@
   } from '$lib/libraryFolderTree';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { plural } from '$lib/plural';
   import { openChatFilesFolder } from '$lib/api/friends';
   import { openChannelFilesFolder } from '$lib/api/channels';
   import { inertBackground, trapTabKey } from '$lib/a11y';
@@ -213,9 +214,12 @@
       collectionsOpen = true;
       loadedCollection = collection;
       const count = loadedCollection.files.length;
-      toastSuccess(count === 1
-        ? m.library_collection_loaded_one({ name: loadedCollection.name })
-        : m.library_collection_loaded({ name: loadedCollection.name, count: formatNumber(count) }));
+      const name = loadedCollection.name;
+      toastSuccess(plural(count, {
+        one: () => m.library_collection_loaded_one({ name }),
+        few: () => m.library_collection_loaded_few({ name, count: formatNumber(count) }),
+        other: () => m.library_collection_loaded({ name, count: formatNumber(count) }),
+      }));
     } catch (e: unknown) {
       toastError(toErr(e));
     } finally {
@@ -254,20 +258,23 @@
         }
       }
       if (queued > 0) {
-        toastSuccess(queued === 1
-          ? m.library_queued_files_download_one()
-          : m.library_queued_files_download({ count: formatNumber(queued) }));
+        toastSuccess(plural(queued, {
+          one: m.library_queued_files_download_one,
+          other: () => m.library_queued_files_download({ count: formatNumber(queued) }),
+        }));
       }
       if (skipped > 0 || oversize > 0) {
         const totalSkipped = skipped + oversize;
-        toastWarning(totalSkipped === 1
-          ? m.library_collection_entries_skipped_one()
-          : m.library_collection_entries_skipped({ count: formatNumber(totalSkipped) }));
+        toastWarning(plural(totalSkipped, {
+          one: m.library_collection_entries_skipped_one,
+          other: () => m.library_collection_entries_skipped({ count: formatNumber(totalSkipped) }),
+        }));
       }
       if (failed > 0) {
-        toastWarning(failed === 1
-          ? m.library_collection_start_failed_one()
-          : m.library_collection_start_failed({ count: formatNumber(failed) }));
+        toastWarning(plural(failed, {
+          one: m.library_collection_start_failed_one,
+          other: () => m.library_collection_start_failed({ count: formatNumber(failed) }),
+        }));
       }
       if (firstError) throw firstError;
     } catch (e: unknown) {
@@ -299,7 +306,7 @@
         toastError(m.library_copy_failed());
         return;
       }
-      toastSuccess(files.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: files.length }));
+      toastSuccess(copiedLinksText(files.length));
     } catch (e: unknown) {
       toastError(toErr(e));
     } finally {
@@ -410,9 +417,12 @@
       );
       if (!msg) return;
       const name = newCollName.trim();
-      toastSuccess(collFiles.length === 1
-        ? m.library_collection_created_one({ name })
-        : m.library_collection_created({ name, count: formatNumber(collFiles.length) }));
+      const count = formatNumber(collFiles.length);
+      toastSuccess(plural(collFiles.length, {
+        one: () => m.library_collection_created_one({ name }),
+        few: () => m.library_collection_created_few({ name, count }),
+        other: () => m.library_collection_created({ name, count }),
+      }));
       closeCreateDialog();
     } catch (e: unknown) {
       toastError(toErr(e));
@@ -522,7 +532,11 @@
       // authorizes the loop below to remove every missing index row.
       const count = Math.max(missingTotalCount, missingPathSet.size);
       const confirmed = await askConfirm(
-        count === 1 ? m.library_confirm_remove_missing_one() : m.library_confirm_remove_missing_other({ count }),
+        plural(count, {
+          one: m.library_confirm_remove_missing_one,
+          few: () => m.library_confirm_remove_missing_few({ count }),
+          other: () => m.library_confirm_remove_missing_other({ count }),
+        }),
         m.library_remove_missing_title(),
       );
       if (!confirmed) return;
@@ -536,9 +550,7 @@
         await refreshMissingSet(true);
         if (removedThisBatch === 0) break;
       }
-      if (removed > 0) {
-        toastSuccess(removed === 1 ? m.library_removed_missing_one() : m.library_removed_missing_other({ count: removed }));
-      }
+      if (removed > 0) toastSuccess(removedMissingText(removed));
       if (missingPathSet.size === 0) showMissingOnly = false;
       await refresh();
     } catch (e: unknown) {
@@ -556,7 +568,7 @@
       );
       if (!confirmed) return;
       const removed = await removeMissingFiles([f.path]);
-      toastSuccess(removed === 1 ? m.library_removed_missing_one() : m.library_removed_missing_other({ count: removed }));
+      toastSuccess(removedMissingText(removed));
       const next = new Set(missingPathSet);
       next.delete(f.path);
       missingPathSet = next;
@@ -857,6 +869,45 @@
     return translateError(e, m.error_operation_failed());
   }
 
+  function copiedLinksText(count: number): string {
+    return plural(count, {
+      one: m.library_copied_link_one,
+      other: () => m.library_copied_links_other({ count }),
+    });
+  }
+
+  function removedMissingText(count: number): string {
+    return plural(count, {
+      one: m.library_removed_missing_one,
+      other: () => m.library_removed_missing_other({ count }),
+    });
+  }
+
+  function unsharedText(count: number): string {
+    return plural(count, {
+      one: m.library_unshared_one,
+      other: () => m.library_unshared_other({ count }),
+    });
+  }
+
+  function starsText(count: number): string {
+    return plural(count, {
+      one: m.library_star_one,
+      few: () => m.library_star_few({ count }),
+      other: () => m.library_star_other({ count }),
+    });
+  }
+
+  function collectionMetaText(collection: Collection): string {
+    const author = collection.author || m.common_unknown();
+    const count = formatNumber(collection.files.length);
+    return plural(collection.files.length, {
+      one: () => m.library_collection_meta_one({ author }),
+      few: () => m.library_collection_meta_few({ author, count }),
+      other: () => m.library_collection_meta_other({ author, count }),
+    });
+  }
+
   async function openSharedFile(path: string) {
     // No in-app player on Linux, so there is nothing to open "into": media and
     // everything else alike go to the user's default application.
@@ -965,11 +1016,7 @@
         toastError(m.library_copy_failed());
         return;
       }
-      toastSuccess(
-        targets.length === 1
-          ? m.library_copied_link_one()
-          : m.library_copied_links_other({ count: targets.length })
-      );
+      toastSuccess(copiedLinksText(targets.length));
     } catch (e: unknown) {
       toastError(toErr(e));
     } finally {
@@ -1002,13 +1049,15 @@
         const folderNames = new Set(sharedFiles.map(parentFolderName));
         if (folderNames.size === 1) {
           const name = [...folderNames][0];
-          toastSuccess(sharedFiles.length === 1
-            ? m.library_shared_from_one({ name })
-            : m.library_shared_from_other({ count: formatNumber(sharedFiles.length), name }));
-        } else if (sharedFiles.length === 1) {
-          toastSuccess(m.library_shared_one());
+          toastSuccess(plural(sharedFiles.length, {
+            one: () => m.library_shared_from_one({ name }),
+            other: () => m.library_shared_from_other({ count: formatNumber(sharedFiles.length), name }),
+          }));
         } else {
-          toastSuccess(m.library_shared_other({ count: formatNumber(sharedFiles.length) }));
+          toastSuccess(plural(sharedFiles.length, {
+            one: m.library_shared_one,
+            other: () => m.library_shared_other({ count: formatNumber(sharedFiles.length) }),
+          }));
         }
       }
       if (selected.added.length === 0) {
@@ -1039,9 +1088,10 @@
       if (!mounted) return;
       if (priority) {
         folderPriorities = { ...folderPriorities, [path]: priority };
-        toastSuccess(count === 1
-          ? m.library_folder_priority_set_one()
-          : m.library_folder_priority_set({ count: formatNumber(count) }));
+        toastSuccess(plural(count, {
+          one: m.library_folder_priority_set_one,
+          other: () => m.library_folder_priority_set({ count: formatNumber(count) }),
+        }));
       } else {
         const next = { ...folderPriorities };
         delete next[path];
@@ -1066,9 +1116,10 @@
     try {
       const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
       const body = stats > 0
-        ? (stats === 1
-            ? m.library_confirm_remove_folder_one({ name: displayName })
-            : m.library_confirm_remove_folder_other({ name: displayName, count: formatNumber(stats) }))
+        ? plural(stats, {
+            one: () => m.library_confirm_remove_folder_one({ name: displayName }),
+            other: () => m.library_confirm_remove_folder_other({ name: displayName, count: formatNumber(stats) }),
+          })
         : m.library_confirm_remove_folder_empty({ name: displayName });
       const confirmed = await askConfirm(body, m.library_remove_folder_title());
       if (!confirmed || !mounted) return;
@@ -1417,9 +1468,10 @@
         targets,
         (paths) => batchSetPriority(paths, priority),
       );
-      toastSuccess(count === 1
-        ? m.library_set_priority_one({ priority: priorityLabel(priority) })
-        : m.library_set_priority_other({ priority: priorityLabel(priority), count }));
+      toastSuccess(plural(count, {
+        one: () => m.library_set_priority_one({ priority: priorityLabel(priority) }),
+        other: () => m.library_set_priority_other({ priority: priorityLabel(priority), count }),
+      }));
     } catch (e: unknown) { error = toErr(e); }
     finally {
       // Earlier batches may have committed before a later IPC batch failed.
@@ -1442,7 +1494,7 @@
     bulkBusy = true;
     try {
       const count = await runBulkBatches(targets, batchUnshare);
-      toastSuccess(count === 1 ? m.library_unshared_one() : m.library_unshared_other({ count }));
+      toastSuccess(unsharedText(count));
     } catch (e: unknown) { error = toErr(e); }
     finally {
       await refresh();
@@ -1470,8 +1522,14 @@
       const count = await runBulkBatches(targets, paths => setFilesFriendsOnly(paths, friendsOnly));
       toastSuccess(
         friendsOnly
-          ? count === 1 ? m.library_friends_only_on_count_one() : m.library_friends_only_on_count({ count: formatNumber(count) })
-          : count === 1 ? m.library_friends_only_off_count_one() : m.library_friends_only_off_count({ count: formatNumber(count) }),
+          ? plural(count, {
+              one: m.library_friends_only_on_count_one,
+              other: () => m.library_friends_only_on_count({ count: formatNumber(count) }),
+            })
+          : plural(count, {
+              one: m.library_friends_only_off_count_one,
+              other: () => m.library_friends_only_off_count({ count: formatNumber(count) }),
+            }),
       );
     } catch (e: unknown) { error = toErr(e); }
     finally {
@@ -1488,9 +1546,11 @@
     bulkBusy = true;
     try {
       const confirmed = await askConfirm(
-        targets.length === 1
-          ? m.library_confirm_delete_one({ size: formatSize(totalBytes) })
-          : m.library_confirm_delete_other({ count: formatNumber(targets.length), size: formatSize(totalBytes) }),
+        plural(targets.length, {
+          one: () => m.library_confirm_delete_one({ size: formatSize(totalBytes) }),
+          few: () => m.library_confirm_delete_few({ count: formatNumber(targets.length), size: formatSize(totalBytes) }),
+          other: () => m.library_confirm_delete_other({ count: formatNumber(targets.length), size: formatSize(totalBytes) }),
+        }),
         m.library_delete_files_title(),
       );
       if (!confirmed) return;
@@ -1515,7 +1575,10 @@
       clearChecked();
       await refresh();
       if (deleted > 0) {
-        const base = deleted === 1 ? m.library_deleted_one() : m.library_deleted_other({ count: deleted });
+        const base = plural(deleted, {
+          one: m.library_deleted_one,
+          other: () => m.library_deleted_other({ count: deleted }),
+        });
         toastSuccess(failures.length ? m.library_deleted_with_failures({ base, failed: failures.length }) : base);
       }
       if (failures.length > 0) {
@@ -1548,7 +1611,7 @@
         toastError(m.library_copy_failed());
         return;
       }
-      toastSuccess(files.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: files.length }));
+      toastSuccess(copiedLinksText(files.length));
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -2079,7 +2142,7 @@
           toastError(m.library_copy_failed());
           return;
         }
-        toastSuccess(files.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: files.length }));
+        toastSuccess(copiedLinksText(files.length));
       } catch (e: unknown) { error = toErr(e); }
       return;
     }
@@ -2123,6 +2186,10 @@
       }
       return;
     }
+    // A dialog owned elsewhere (the shortcut sheet, Share Folders) or the chat
+    // dock has the keyboard; it handles its own Escape.
+    if (document.querySelector('[aria-modal="true"]')) return;
+    if (e.target instanceof Element && e.target.closest('.chat-dock')) return;
 
     const typing = isTypingTarget(e.target);
 
@@ -2503,15 +2570,16 @@
         return;
       }
       const confirmed = await askConfirm(
-        sharedCount === 1
-          ? m.library_confirm_unshare_folder_one({ name: displayName })
-          : m.library_confirm_unshare_folder_other({ count: formatNumber(sharedCount), name: displayName }),
+        plural(sharedCount, {
+          one: () => m.library_confirm_unshare_folder_one({ name: displayName }),
+          other: () => m.library_confirm_unshare_folder_other({ count: formatNumber(sharedCount), name: displayName }),
+        }),
         m.library_unshare_folder_title(),
       );
       if (!confirmed) return;
       await unshareFolder(path);
       await refresh();
-      toastSuccess(sharedCount === 1 ? m.library_unshared_one() : m.library_unshared_other({ count: sharedCount }));
+      toastSuccess(unsharedText(sharedCount));
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -3058,9 +3126,10 @@
       onclick={() => (showDuplicatesOnly = !showDuplicatesOnly)}
       title={duplicateHashes.size === 0
         ? m.library_no_duplicates()
-        : duplicateHashes.size === 1
-          ? m.library_duplicates_tooltip_one({ files: formatNumber(duplicateFileCount) })
-          : m.library_duplicates_tooltip({ files: formatNumber(duplicateFileCount), hashes: formatNumber(duplicateHashes.size) })}
+        : plural(duplicateHashes.size, {
+            one: () => m.library_duplicates_tooltip_one({ files: formatNumber(duplicateFileCount) }),
+            other: () => m.library_duplicates_tooltip({ files: formatNumber(duplicateFileCount), hashes: formatNumber(duplicateHashes.size) }),
+          })}
     >
       {m.library_duplicates()}{duplicateHashes.size > 0 ? ` (${formatNumber(duplicateFileCount)})` : ''}
     </button>
@@ -3108,9 +3177,11 @@
         filteredHashedFiles.length === 0
           ? m.library_copy_all_none()
           : hasActiveLibraryFilters
-            ? filteredHashedFiles.length === 1
-              ? m.library_copy_all_filtered_title_one()
-              : m.library_copy_all_filtered_title({ count: formatNumber(filteredHashedFiles.length) })
+            ? plural(filteredHashedFiles.length, {
+                one: m.library_copy_all_filtered_title_one,
+                few: () => m.library_copy_all_filtered_title_few({ count: formatNumber(filteredHashedFiles.length) }),
+                other: () => m.library_copy_all_filtered_title({ count: formatNumber(filteredHashedFiles.length) }),
+              })
             : m.library_copy_all_links_title()
       }
     >
@@ -3133,11 +3204,22 @@
       {m.library_columns_button()}
     </button>
     <span class="inline-stats">
-      <span class="inline-stat">{files.length === 1 ? m.library_stat_files_one() : m.library_stat_files({ count: formatNumber(files.length) })}</span>
+      <span class="inline-stat">{plural(files.length, {
+        one: m.library_stat_files_one,
+        few: () => m.library_stat_files_few({ count: formatNumber(files.length) }),
+        other: () => m.library_stat_files({ count: formatNumber(files.length) }),
+      })}</span>
       <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{libraryHashedCount === 1 ? m.library_stat_hashed_one() : m.library_stat_hashed({ count: formatNumber(libraryHashedCount) })}</span>
+      <span class="inline-stat">{plural(libraryHashedCount, {
+        one: m.library_stat_hashed_one,
+        other: () => m.library_stat_hashed({ count: formatNumber(libraryHashedCount) }),
+      })}</span>
       <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{folders.length === 1 ? m.library_stat_folders_one() : m.library_stat_folders({ count: formatNumber(folders.length) })}</span>
+      <span class="inline-stat">{plural(folders.length, {
+        one: m.library_stat_folders_one,
+        few: () => m.library_stat_folders_few({ count: formatNumber(folders.length) }),
+        other: () => m.library_stat_folders({ count: formatNumber(folders.length) }),
+      })}</span>
       <span class="inline-sep">&middot;</span>
       <span class="inline-stat">{m.library_stat_total_uploaded({ size: formatSize(aggregateUploaded) })}</span>
     </span>
@@ -3153,9 +3235,7 @@
           {m.library_collection_label({ name: loadedCollection?.name ?? m.library_loading_ellipsis() })}
           {#if loadedCollection}
             <span class="collection-meta">
-              {loadedCollection.files.length === 1
-                ? m.library_collection_meta_one({ author: loadedCollection.author || m.common_unknown() })
-                : m.library_collection_meta_other({ author: loadedCollection.author || m.common_unknown(), count: formatNumber(loadedCollection.files.length) })}
+              {collectionMetaText(loadedCollection)}
             </span>
           {/if}
         </span>
@@ -3588,7 +3668,11 @@
                   <span class="top-value">
                     {topPanelMetric === 'bytes'
                       ? formatSize(val)
-                      : (val === 1 ? m.library_uploads_one() : m.library_uploads_other({ count: formatNumber(val) }))}
+                      : plural(val, {
+                          one: m.library_uploads_one,
+                          few: () => m.library_uploads_few({ count: formatNumber(val) }),
+                          other: () => m.library_uploads_other({ count: formatNumber(val) }),
+                        })}
                   </span>
                 </span>
               </button>
@@ -3749,7 +3833,7 @@
 
     {#if checkedCount > 0}
       <div class="bulk-action-bar">
-        <span class="bulk-count">{checkedCount === 1 ? m.library_bulk_count_one() : m.library_bulk_count_other({ count: checkedCount })}</span>
+        <span class="bulk-count">{plural(checkedCount, { one: m.library_bulk_count_one, other: () => m.library_bulk_count_other({ count: checkedCount }) })}</span>
         {#if checkedHiddenCount > 0}
           <button
             type="button"
@@ -3759,7 +3843,7 @@
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
               <path d="M2 3h12l-4.5 5.5V13l-3 1.5V8.5z"/>
             </svg>
-            {checkedHiddenCount === 1 ? m.library_bulk_hidden_one() : m.library_bulk_hidden_other({ count: formatNumber(checkedHiddenCount) })}
+            {plural(checkedHiddenCount, { one: m.library_bulk_hidden_one, other: () => m.library_bulk_hidden_other({ count: formatNumber(checkedHiddenCount) }) })}
           </button>
         {/if}
         <div class="bulk-prio-group">
@@ -4094,9 +4178,9 @@
                       type="button"
                       class="star-btn"
                       onclick={() => ourRating = star}
-                      aria-label={star === 1 ? m.library_star_one() : m.library_star_other({ count: star })}
+                      aria-label={starsText(star)}
                       aria-pressed={star <= ourRating}
-                      title={star === 1 ? m.library_star_one() : m.library_star_other({ count: star })}
+                      title={starsText(star)}
                     >
                       <span aria-hidden="true">{star <= ourRating ? '\u2605' : '\u2606'}</span>
                     </button>
@@ -4149,7 +4233,7 @@
                       <span
                         class="comment-peer-stars"
                         role="img"
-                        aria-label={pc.rating === 1 ? m.library_star_one() : m.library_star_other({ count: pc.rating })}
+                        aria-label={starsText(pc.rating)}
                       >
                         {#each [1,2,3,4,5] as s}
                           <span class="star-display" aria-hidden="true">{s <= pc.rating ? '\u2605' : '\u2606'}</span>

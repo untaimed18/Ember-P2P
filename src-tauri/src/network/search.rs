@@ -52,9 +52,46 @@ pub(super) const MAX_UDP_SEARCH_SOURCES: u32 = 1_000;
 pub(super) const ED2K_SEARCH_SOURCE_CAP: u32 = 5;
 
 /// `OP_QUERY_MORE_RESULT` pages we will ask the connected server for, on top of
-/// the first batch. Paired with the 1000-result ceiling in the same gate: a
-/// server answering 200 at a time is exhausted in five pages either way.
+/// the first batch: eMule's `MAX_MORE_SEARCH_REQ` (`Opcodes.h:61`).
 pub(super) const MAX_SERVER_MORE_REQUESTS: u8 = 5;
+
+/// How long after a page that flagged more results the next one is asked for.
+///
+/// eMule asks only when the user presses "More" (`SearchResultsWnd.cpp:1266`),
+/// so a server never sees a page requested in the same instant the last one
+/// arrived. Asking automatically is ours; doing it at that pace is not.
+pub(super) const SERVER_MORE_RESULTS_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// Whether a server page earns a request for the next one: the server set
+/// its "more results" byte (`SearchList.cpp:264-281`), fewer than
+/// `MAX_SERVER_MORE_REQUESTS` pages have been asked for
+/// (`SearchResultsWnd.cpp:463`), and the search is still under its result cap.
+pub(super) fn server_should_ask_for_more(
+    server_has_more: bool,
+    more_requests_sent: u8,
+    under_result_cap: bool,
+) -> bool {
+    server_has_more && under_result_cap && more_requests_sent < MAX_SERVER_MORE_REQUESTS
+}
+
+#[cfg(test)]
+mod server_more_results_tests {
+    use super::{server_should_ask_for_more, MAX_SERVER_MORE_REQUESTS};
+
+    #[test]
+    fn only_a_page_the_server_flagged_earns_another() {
+        assert!(server_should_ask_for_more(true, 0, true));
+        assert!(!server_should_ask_for_more(false, 0, true), "a full page alone is not a flag");
+    }
+
+    #[test]
+    fn the_follow_ups_stop_at_emules_cap_and_the_result_ceiling() {
+        assert!(server_should_ask_for_more(true, MAX_SERVER_MORE_REQUESTS - 1, true));
+        assert!(!server_should_ask_for_more(true, MAX_SERVER_MORE_REQUESTS, true));
+        assert!(!server_should_ask_for_more(true, 0, false));
+    }
+}
 
 /// Whether the UDP global-search leg should be force-completed this tick.
 /// True once the post-drain quiet-period grace expires (`server_udp_search_age`
@@ -980,8 +1017,7 @@ pub(super) fn server_supports_related_search(state: &NetworkState) -> bool {
         && state
             .server_connection
             .as_ref()
-            .and_then(|c| c.session.as_ref())
-            .is_some_and(|s| related_search_flag_set(s.server_flags))
+            .is_some_and(|c| related_search_flag_set(c.session.server_flags))
 }
 
 /// `SRV_TCPFLG_RELATEDSEARCH` in the TCP capability flags a server sends with
@@ -1260,14 +1296,17 @@ pub(super) fn drop_queued_server_followup(state: &mut NetworkState, request_id: 
 }
 
 /// End the TCP server leg for `request_id` now that its results are in — or
-/// keep it pending when a second request is queued for it, so the poll loop
-/// sends that before anything reports the search complete.
+/// keep it pending when a second request is queued for it, so the server tick
+/// sends that, `SERVER_MORE_RESULTS_DELAY` from now, before anything reports
+/// the search complete.
 pub(super) fn end_or_continue_server_search_leg(
     state: &mut NetworkState,
     request_id: u64,
     finished_search_requests: &mut Vec<u64>,
 ) {
     if has_queued_server_followup(state, request_id) {
+        state.server_followup_due_at =
+            Some(std::time::Instant::now() + SERVER_MORE_RESULTS_DELAY);
         return;
     }
     if let Some(active) = state.active_search_request.as_mut() {

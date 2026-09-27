@@ -4,6 +4,11 @@
 
 use super::*;
 
+/// How long a chunk the server link refused (writer queue full, or the session
+/// breaking) waits before the next try, rather than being retried on every
+/// turn of the loop.
+const OFFER_RETRY_AFTER_REFUSAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn drain_offer_files(
     state: &mut NetworkState,
@@ -18,7 +23,16 @@ pub(in crate::network) async fn drain_offer_files(
     // Drain at most one OP_OFFERFILES chunk per `ED2K_OFFER_PACKET_INTERVAL`,
     // as eMule's `CSharedFileList::Process` does; the first packet after
     // login goes out at once.
-    if state.request_offer_files && pending_offer_files.is_none() {
+    let offer_packet_due =
+        next_offer_packet_at.is_none_or(|at| tokio::time::Instant::now() >= at);
+    // A request to re-read the shared list is eMule's dirty flag: it is
+    // folded in when the list is idle, or just before the next due packet so
+    // files that turned up since the last one ride in it. Nothing is
+    // advertisable until known.met is absorbed, so the list is not read before.
+    if state.request_offer_files
+        && (pending_offer_files.is_none() || offer_packet_due)
+        && known_files.is_authoritative()
+    {
         state.request_offer_files = false;
         if state.server_connected {
             let mut seen_offer_hashes = std::collections::HashSet::new();
@@ -44,7 +58,7 @@ pub(in crate::network) async fn drain_offer_files(
                             name: f.name.clone(),
                             size: f.size,
                             is_complete: true,
-                            file_type: String::new(),
+                            file_type: ed2k::server::offer_file_type(&f.name),
                         })
                     })
                     .collect();
@@ -86,101 +100,136 @@ pub(in crate::network) async fn drain_offer_files(
                         name: transfer.file_name.clone(),
                         size: transfer.total_size,
                         is_complete: false,
-                        file_type: String::new(),
+                        file_type: ed2k::server::offer_file_type(&transfer.file_name),
                     });
                 }
             }
             let signature = offer_files_signature(&offer_files);
-            if offer_files.is_empty() {
-                *pending_offer_signature = Some(signature);
-                if state.offered_ed2k_hashes.is_empty() {
-                    state.last_offer_files_signature = Some(signature);
-                    *pending_offer_files = None;
-                } else {
-                    // Tell the server we no longer share anything. Do not
-                    // republish the old list on the way out.
-                    *pending_offer_files = Some(Vec::new());
-                }
+            // Files that left the list are not unpublished, because eD2K has
+            // no message for it: an empty OP_OFFERFILES is eMule's keep-alive
+            // (`ServerConnect.cpp:561-579`) and a server treats it as one. As
+            // in eMule, an unshared or friends-only file stays listed on this
+            // server until the next session. It also stays in
+            // `offered_ed2k_hashes`, so sharing it again is not a republish.
+            let incremental = incremental_ed2k_offers(offer_files, &state.offered_ed2k_hashes);
+            *pending_offer_signature = Some(signature);
+            if incremental.is_empty() {
+                state.last_offer_files_signature = Some(signature);
+                *pending_offer_files = None;
             } else {
-                let incremental =
-                    incremental_ed2k_offers(offer_files, &state.offered_ed2k_hashes);
-                *pending_offer_signature = Some(signature);
-                if incremental.is_empty() {
-                    state.last_offer_files_signature = Some(signature);
-                    *pending_offer_files = None;
-                } else {
-                    *pending_offer_files = Some(incremental);
-                }
+                *pending_offer_files = Some(incremental);
             }
         }
     }
-    let offer_packet_due =
-        next_offer_packet_at.is_none_or(|at| tokio::time::Instant::now() >= at);
     if let Some(files) = pending_offer_files.as_mut().filter(|_| offer_packet_due) {
-        if state.server_connection.is_some() {
-            let limit = state
-                .server_connection
-                .as_ref()
-                .map(|c| c.offer_files_chunk_limit())
-                .unwrap_or(200);
-            let end = limit.min(files.len());
-            let chunk: Vec<_> = files.drain(..end).collect();
-            let offer_tcp_port = advertised_tcp_port(state);
-            if let Some(conn) = state.server_connection.as_mut() {
-                if !chunk.is_empty() {
-                    match conn.offer_files_chunk(&chunk, offer_tcp_port).await {
-                        Ok(()) => {
-                            *next_offer_packet_at =
-                                Some(tokio::time::Instant::now() + ED2K_OFFER_PACKET_INTERVAL);
-                            record_offered_ed2k_hashes(state, &chunk);
-                            if files.is_empty() {
-                                *pending_offer_files = None;
-                                if let Some(sig) = pending_offer_signature.take() {
-                                    state.last_offer_files_signature = Some(sig);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            debug!("Failed to send OP_OFFERFILES chunk: {e}");
-                            // Put the failed chunk back at the front so it is
-                            // retried on a later turn instead of being dropped.
-                            let mut rest = std::mem::take(files);
-                            let mut retry = chunk;
-                            retry.append(&mut rest);
-                            *files = retry;
-                        }
-                    }
-                } else if files.is_empty() {
-                    // An empty offer is a real message — it tells the
-                    // server we no longer share anything, and
-                    // `offer_files_chunk` deliberately supports the
-                    // count=0 form. Dropping it here meant a user who
-                    // unshared their library (or removed their last
-                    // shared folder, or marked everything friends-only)
-                    // stayed listed as a source for all of it until they
-                    // disconnected, with peers still being handed their
-                    // address. It also left `last_offer_files_signature`
-                    // stale, so every later reconcile re-armed this same
-                    // no-op.
-                    match conn.offer_files_chunk(&chunk, offer_tcp_port).await {
-                        Ok(()) => {
-                            *next_offer_packet_at =
-                                Some(tokio::time::Instant::now() + ED2K_OFFER_PACKET_INTERVAL);
-                            *pending_offer_files = None;
-                            state.offered_ed2k_hashes.clear();
-                            if let Some(sig) = pending_offer_signature.take() {
-                                state.last_offer_files_signature = Some(sig);
-                            }
-                        }
-                        Err(e) => {
-                            debug!("Failed to send the clearing OP_OFFERFILES: {e}");
-                        }
-                    }
-                }
-            }
-        } else {
+        let Some((limit, server_flags)) = state
+            .server_connection
+            .as_ref()
+            .map(|c| (c.offer_files_chunk_limit(), c.session.server_flags))
+        else {
             *pending_offer_files = None;
             *pending_offer_signature = None;
+            return;
+        };
+        let end = limit.min(files.len());
+        // A server without large-file support cannot index a file past the
+        // old 4 GiB limit, and eMule leaves such files out of the list
+        // (`SharedFileList.cpp:812`): neither sent nor recorded as offered.
+        let drained: Vec<_> = files
+            .drain(..end)
+            .filter(|f| ed2k::server::server_indexes_file_size(f.size, server_flags))
+            .collect();
+        let chunk = still_offerable(
+            state,
+            local_index,
+            transfer_manager,
+            known_files,
+            drained,
+        )
+        .await;
+        if chunk.is_empty() {
+            // Everything in this slice went friends-only, unshared, is too
+            // large for this server, or was already offered since it was
+            // queued. Nothing to send: an empty OP_OFFERFILES is only a
+            // keep-alive.
+            if files.is_empty() {
+                *pending_offer_files = None;
+                if let Some(sig) = pending_offer_signature.take() {
+                    state.last_offer_files_signature = Some(sig);
+                }
+            }
+            return;
+        }
+        let offer_tcp_port = advertised_tcp_port(state);
+        if let Some(conn) = state.server_connection.as_mut() {
+            match conn.offer_files_chunk(&chunk, offer_tcp_port) {
+                Ok(()) => {
+                    *next_offer_packet_at =
+                        Some(tokio::time::Instant::now() + ED2K_OFFER_PACKET_INTERVAL);
+                    record_offered_ed2k_hashes(state, &chunk);
+                    if files.is_empty() {
+                        *pending_offer_files = None;
+                        if let Some(sig) = pending_offer_signature.take() {
+                            state.last_offer_files_signature = Some(sig);
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("Failed to send OP_OFFERFILES chunk: {e}");
+                    // Put the failed chunk back at the front so it is
+                    // retried on a later turn instead of being dropped.
+                    let mut rest = std::mem::take(files);
+                    let mut retry = chunk;
+                    retry.append(&mut rest);
+                    *files = retry;
+                    *next_offer_packet_at =
+                        Some(tokio::time::Instant::now() + OFFER_RETRY_AFTER_REFUSAL);
+                }
+            }
         }
     }
+}
+
+/// The part of a queued OP_OFFERFILES slice that may still go out.
+///
+/// The backlog is built from the shared list and drained a slice a minute, so a
+/// large library takes many minutes to offer. A file the user marks
+/// friends-only or unshares in that window, or one that already went out in an
+/// earlier slice, must not be offered from the stale list: the first leaks a
+/// restricted file to the public server, the second re-offers a hash the
+/// server already has.
+async fn still_offerable(
+    state: &NetworkState,
+    local_index: &Arc<RwLock<LocalIndex>>,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    known_files: &KnownFileList,
+    files: Vec<ed2k::server::OfferFile>,
+) -> Vec<ed2k::server::OfferFile> {
+    if files.is_empty() {
+        return files;
+    }
+    let index = local_index.read().await;
+    let restricted = collect_friends_only_hashes(&index, known_files);
+    let mgr = transfer_manager.read().await;
+    files
+        .into_iter()
+        .filter(|f| {
+            if state.offered_ed2k_hashes.contains(&f.hash) {
+                return false;
+            }
+            let hex = hex::encode(f.hash);
+            if f.is_complete {
+                index
+                    .get_by_hash(&hex)
+                    .is_some_and(|file| kad_may_advertise_complete(file, known_files, &restricted))
+            } else {
+                mgr.active.values().chain(mgr.queue.iter()).any(|t| {
+                    t.direction == TransferDirection::Download
+                        && t.file_hash.eq_ignore_ascii_case(&hex)
+                        && !matches!(t.status, TransferStatus::Completed | TransferStatus::Failed)
+                        && transfer_may_advertise_partial(known_files, &restricted, t)
+                })
+            }
+        })
+        .collect()
 }

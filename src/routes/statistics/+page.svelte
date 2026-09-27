@@ -8,6 +8,8 @@
     formatNumber,
     formatSpeed as formatRate,
     formatDurationSecs as formatDuration,
+    formatElapsed,
+    withTimeout,
   } from '$lib/utils';
   import { onMount } from 'svelte';
   import * as m from '$lib/paraglide/messages';
@@ -51,8 +53,6 @@
     if (busySeq !== 0 && !opts.force) return;
     const seq = ++requestSeq;
     busySeq = seq;
-    let statsTimer: ReturnType<typeof setTimeout> | undefined;
-    let repTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       // Fire both fetches concurrently — they hit different backend
       // paths (stats reads a cached snapshot; reputation reads the
@@ -62,12 +62,7 @@
       // allSettled so a stats timeout can't discard an already-resolved
       // reputation result (and vice versa) — they're independent fetches.
       const [statsResult, repResult] = await Promise.allSettled([
-        Promise.race([
-          getStatistics(),
-          new Promise<TransferStats>((_, reject) => {
-            statsTimer = setTimeout(() => reject(new Error('timeout')), 4000);
-          }),
-        ]),
+        withTimeout(getStatistics(), 'get_statistics', 4000),
         // Reputation rides the same watchdog as stats. Unlike
         // getStatistics() (a direct cached-snapshot read), this round-trips
         // through the network task's command channel, whose reply timeout
@@ -75,12 +70,7 @@
         // briefly-busy network loop would otherwise stall the entire
         // dashboard refresh for up to 10s even though the transfer stats
         // themselves resolved instantly. Bound it independently.
-        Promise.race([
-          getReputationStats(),
-          new Promise<ReputationStatsInfo>((_, reject) => {
-            repTimer = setTimeout(() => reject(new Error('timeout')), 4000);
-          }),
-        ]),
+        withTimeout(getReputationStats(), 'get_reputation_stats', 4000),
       ]);
       if (unmounted || seq < appliedSeq) return;
       appliedSeq = seq;
@@ -108,10 +98,6 @@
       if (unmounted || seq < appliedSeq) return;
       if (!stats) error = translateError(e, m.error_operation_failed());
     } finally {
-      // Clear the race watchdogs so the loser timers don't linger until they
-      // fire (otherwise each poll leaves an orphan timeout pending).
-      if (statsTimer) clearTimeout(statsTimer);
-      if (repTimer) clearTimeout(repTimer);
       if (!unmounted) loading = false;
       if (busySeq === seq) busySeq = 0;
     }
@@ -223,15 +209,6 @@
     });
   }
 
-  function formatSessionTime(secs: number): string {
-    if (secs <= 0) return '0s';
-    const h = Math.floor(secs / 3600);
-    const min = Math.floor((secs % 3600) / 60);
-    const s = secs % 60;
-    if (h > 0) return `${h}h ${String(min).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
-    if (min > 0) return `${min}m ${String(s).padStart(2, '0')}s`;
-    return `${s}s`;
-  }
 </script>
 
 <div class="page-header">
@@ -293,7 +270,7 @@
           </svg>
         </div>
         <div class="hero-body">
-          <span class="hero-value">{formatSessionTime(sessionTime)}</span>
+          <span class="hero-value">{formatElapsed(sessionTime)}</span>
           <span class="hero-label">{m.stats_session_time()}</span>
         </div>
       </div>

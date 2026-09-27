@@ -1475,6 +1475,7 @@ pub(super) fn finish_xfer_recv(state: &mut NetworkState, xfer_id: [u8; 16]) {
                 &recv.part_identity,
             )
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+            ember::xfer::mark_received_from_internet(&landed);
             final_path = Some(landed);
             Ok(true)
         })();
@@ -1585,6 +1586,13 @@ pub(super) async fn apply_xfer_finish(
         )
     };
     send_xfer_frame(socket, state, db, result.channel_id, result.peer, &plain).await;
+    finished_xfers().lock().record(
+        result.xfer_id,
+        result.channel_id,
+        result.peer,
+        plain,
+        std::time::Instant::now(),
+    );
     let done = if complete { result.size } else { 0 };
     emit_xfer_update(
         app_handle,
@@ -1597,6 +1605,38 @@ pub(super) async fn apply_xfer_finish(
         done,
         result.status,
     );
+}
+
+/// Receives that have ended here, with the verdict their sender was sent.
+/// Beside the event loop's state rather than in it because only the transfer
+/// handlers read it.
+fn finished_xfers() -> &'static parking_lot::Mutex<ember::xfer::FinishedXfers> {
+    static FINISHED: std::sync::OnceLock<parking_lot::Mutex<ember::xfer::FinishedXfers>> =
+        std::sync::OnceLock::new();
+    FINISHED.get_or_init(Default::default)
+}
+
+/// Answer a verified frame about a receive that has already ended by sending
+/// its verdict again. True when `xfer_id` is one of those, in which case the
+/// frame has nothing else to act on.
+///
+/// The frame that matters is the stall cancel: a sender whose "done" was lost
+/// sends one and then waits a little for exactly this answer.
+pub(super) async fn answer_finished_xfer(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    xfer_id: [u8; 16],
+    sender: [u8; 32],
+) -> bool {
+    let answer = finished_xfers()
+        .lock()
+        .answer(&xfer_id, &sender, std::time::Instant::now());
+    let Some((channel_id, verdict)) = answer else {
+        return false;
+    };
+    send_xfer_frame(socket, state, db, channel_id, sender, &verdict).await;
+    true
 }
 
 /// The recipient has the whole file and it matched. Retire the send side.
@@ -1699,8 +1739,13 @@ pub(super) async fn drive_channel_transfers(
     bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     // Ahead of the early return: a fetch can end, and a grant can need
-    // retiring, after the last transfer has gone.
+    // retiring, after the last transfer has gone — and a verdict is repeated
+    // after its receive has.
     sync_xfer_streams(socket, state, db, app_handle).await;
+    let repeats = finished_xfers().lock().due(std::time::Instant::now());
+    for (channel_id, peer, verdict) in repeats {
+        send_xfer_frame(socket, state, db, channel_id, peer, &verdict).await;
+    }
     if state.xfer_send.is_empty() && state.xfer_recv.is_empty() && state.xfer_pending.is_empty() {
         return;
     }
@@ -1863,6 +1908,25 @@ pub(super) async fn drive_channel_transfers(
         .map(|(id, _)| *id)
         .collect();
     for xfer_id in stalled_send {
+        let Some(send) = state.xfer_send.get_mut(&xfer_id) else {
+            continue;
+        };
+        match send.stall_verdict(now) {
+            ember::xfer::SendStall::AskFirst => {
+                let (channel_id, peer) = (send.channel_id, send.peer);
+                let plain = ember::channel::encode_xfer_cancel(
+                    &send.key,
+                    &me,
+                    &peer,
+                    &xfer_id,
+                    ember::channel::XferCancel::Stalled,
+                );
+                send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+                continue;
+            }
+            ember::xfer::SendStall::Waiting => continue,
+            ember::xfer::SendStall::GiveUp => {}
+        }
         if let Some(send) = state.xfer_send.remove(&xfer_id) {
             let plain = ember::channel::encode_xfer_cancel(
                 &send.key,

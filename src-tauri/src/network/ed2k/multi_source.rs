@@ -21,6 +21,7 @@ use crate::types::Ed2kDownloadLimits;
 use super::chunk_selection::ChunkSelector;
 use super::comments::CommentManager;
 use super::credits::CreditManager;
+use super::peer_sessions;
 use super::part_tracker::PartTracker;
 use super::sources::SourceManager;
 use super::tcp_obfuscation::{self, Rc4Reader, Rc4Writer};
@@ -1121,6 +1122,68 @@ impl Drop for LivePeerGuard {
     }
 }
 
+/// A source connection past its handshake. Owns both halves so that, however
+/// the download session ends, a peer still waiting on requests it sent us
+/// over this socket gets the connection passed to the upload server instead
+/// of closed (see [`peer_sessions::HeldRequests`]).
+struct PeerConnection {
+    reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    held: Arc<peer_sessions::HeldRequests>,
+    peer_addr: SocketAddr,
+    peer_user_hash: [u8; 16],
+    hello_caps: super::messages::PeerCapabilities,
+    session: Option<peer_sessions::PeerSession>,
+}
+
+impl PeerConnection {
+    fn new(
+        reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        peer_addr: SocketAddr,
+        peer_user_hash: [u8; 16],
+        hello_caps: super::messages::PeerCapabilities,
+        session: Option<peer_sessions::PeerSession>,
+    ) -> Self {
+        let held = Arc::new(peer_sessions::HeldRequests::default());
+        Self {
+            reader: Box::new(peer_sessions::HoldingReader::new(reader, held.clone())),
+            writer: Box::new(peer_sessions::FrameTrackingWriter::new(
+                writer,
+                held.clone(),
+            )),
+            held,
+            peer_addr,
+            peer_user_hash,
+            hello_caps,
+            session,
+        }
+    }
+}
+
+impl Drop for PeerConnection {
+    fn drop(&mut self) {
+        if !self.held.ready_for_handover() {
+            return;
+        }
+        self.held.release();
+        let handover = peer_sessions::DownloadHandover {
+            peer_addr: self.peer_addr,
+            reader: std::mem::replace(&mut self.reader, Box::new(tokio::io::empty())),
+            writer: std::mem::replace(&mut self.writer, Box::new(tokio::io::sink())),
+            peer_user_hash: self.peer_user_hash,
+            hello_caps: std::mem::take(&mut self.hello_caps),
+            session: self.session.take(),
+        };
+        if peer_sessions::hand_over(handover) {
+            debug!(
+                "Passing connection to {} to the upload server: the peer asked us for files on it",
+                self.peer_addr
+            );
+        }
+    }
+}
+
 /// Max *silence* tolerated on a single handshake-phase packet read
 /// (hello / emule-info / file-status / hashset). The timer resets whenever a
 /// packet arrives, so a responsive peer is never cut off. Kept far below the
@@ -1920,44 +1983,34 @@ enum InSessionRequeueResult {
     Disconnected(String),
 }
 
-/// Try to re-acquire an upload slot from the peer on the SAME TCP
-/// connection that just signalled `OP_OUTOFPARTREQS`. Sends a fresh
-/// `OP_STARTUPLOADREQ` (the eMule "I want this file" packet) and waits
-/// up to `timeout_secs` for the peer to either:
+/// Wait on the SAME TCP connection that just signalled `OP_OUTOFPARTREQS`
+/// for the peer to hand us the next slot. Waits up to `timeout_secs` for
+/// the peer to either:
 ///   * promote us with `OP_ACCEPTUPLOADREQ` → `Promoted`
 ///   * reject us with `OP_QUEUEFULL` → `Timeout`
 ///   * stay silent past the deadline → `Timeout`
 ///   * close the TCP socket → `Disconnected`
 ///
-/// Saves a Hello/SecIdent/obfuscation reconnect (1–3 s) on every
-/// peer-rotation cycle. eMule's per-session upload cap (SESSIONMAXTRANS,
-/// ~9.30 MiB) means well-behaved peers fire `OP_OUTOFPARTREQS` after
-/// every ~1 part of upload to us — without re-queue we'd pay the full
-/// reconnect tax for each subsequent part from the same peer.
+/// Nothing is sent. The uploader re-queues us itself when it rotates us
+/// out (`SendOutOfPartReqsAndAddToWaitingQueue`, UploadClient.cpp:487-500,
+/// and our own uploader after `OP_OUTOFPARTREQS`), and eMule's downloader
+/// only moves to `DS_ONQUEUE` (ListenSocket.cpp:583-589). A fresh
+/// `OP_STARTUPLOADREQ` here reaches `AddRequestCount` (UploadQueue.cpp:528)
+/// and, inside `MIN_REQUESTTIME` of our previous ask, is a strike toward
+/// eMule's `BADCLIENTBAN` "Aggressive behaviour" ban.
 ///
-/// Wire-protocol-compatible: `OP_STARTUPLOADREQ` mid-session is the
-/// same packet the initial handshake uses, and our own upload code
-/// (`upload.rs:2613`) already handles duplicate `OP_STARTUPLOADREQ`
-/// from a peer whose previous session was just rotated out.
-async fn try_in_session_requeue<R, W>(
-    writer: &mut W,
+/// An idle eMule socket times out after `CONNECTION_TIMEOUT` (40 s), so a
+/// disconnect here is the normal outcome and we stay on its queue; the
+/// uploader dials us (or we reask) when our turn comes.
+async fn try_in_session_requeue<R>(
     reader: &mut R,
-    file_hash: &[u8; 16],
     timeout_secs: u64,
     control: &TransferControl,
 ) -> InSessionRequeueResult
 where
     R: AsyncReadExt + Unpin + ?Sized,
-    W: AsyncWriteExt + Unpin + ?Sized,
 {
     use super::messages::*;
-
-    let upload_req = build_file_request(file_hash);
-    if let Err(e) =
-        write_packet_async_ms(writer, OP_EDONKEYHEADER, OP_STARTUPLOADREQ, &upload_req).await
-    {
-        return InSessionRequeueResult::Disconnected(format!("send OP_STARTUPLOADREQ: {e:#}"));
-    }
 
     let queue_start = std::time::Instant::now();
     loop {
@@ -4159,14 +4212,34 @@ impl MultiSourceDownload {
             // 29 min cooldown and a peer that simply refused a TCP
             // connection gets the hello-fail cooldown (`MIN_REQUESTTIME`).
             let now = std::time::Instant::now();
+            // Our last `OP_STARTUPLOADREQ` may predate this download's own
+            // history (a pause, a restart, another transfer path), so the
+            // process-wide record gates dials alongside `source_dial_history`.
+            let file_hash = self.file_hash;
+            let reask_wait = |s: &DownloadSource| -> std::time::Duration {
+                s.peer_ip
+                    .parse::<Ipv4Addr>()
+                    .ok()
+                    .and_then(|ip| {
+                        peer_sessions::upload_request_wait(
+                            s.peer_user_hash,
+                            ip,
+                            &[s.peer_port],
+                            &file_hash,
+                        )
+                    })
+                    .unwrap_or_default()
+            };
             let eligible: Vec<bool> = all_sources
                 .iter()
-                .map(
-                    |s| match source_dial_history.get(&(s.peer_ip.clone(), s.peer_port)) {
+                .map(|s| {
+                    let cooled = match source_dial_history.get(&(s.peer_ip.clone(), s.peer_port))
+                    {
                         Some((t, kind)) => now.duration_since(*t) >= cooldown_for(*kind),
                         None => true,
-                    },
-                )
+                    };
+                    cooled && reask_wait(s).is_zero()
+                })
                 .collect();
 
             let mut retry_assignments: Vec<Vec<usize>> = vec![Vec::new(); all_sources.len()];
@@ -4270,7 +4343,8 @@ impl MultiSourceDownload {
                             .checked_sub(now.duration_since(*t))
                             .unwrap_or_default(),
                         None => std::time::Duration::ZERO,
-                    };
+                    }
+                    .max(reask_wait(source));
                     next_eligible = Some(match next_eligible {
                         Some(cur) => cur.min(remaining),
                         None => remaining,
@@ -5325,9 +5399,17 @@ async fn download_parts_from_source(
     // a Path B detach) to release the machine-wide connection slot. Stays
     // `None` for adopted inbound streams, which open no outbound connection.
     let mut _global_conn_permit: Option<GlobalConnPermit> = None;
+    let mut peer_session: Option<peer_sessions::PeerSession> = None;
 
     if let Some(es) = pre_established {
         emit_source!("connecting", None, 0u64);
+        if let std::net::IpAddr::V4(v4) = addr.ip() {
+            peer_session = Some(peer_sessions::register(
+                Some(es.peer_user_hash),
+                v4,
+                es.peer_caps.tcp_port,
+            ));
+        }
         // Pre-established (KAD/server callback) path: the upload-side
         // listener already did TCP + (maybe obfuscation) + Hello +
         // (maybe EmuleInfo) for this peer, so we adopt the supplied
@@ -5440,6 +5522,37 @@ async fn download_parts_from_source(
             debug!("Source {} ({}) skip dial: port 0", _src_idx, addr,);
             return Ok(());
         }
+        let std::net::IpAddr::V4(dial_v4) = addr.ip() else {
+            return Ok(());
+        };
+        // Every dial ends in `OP_STARTUPLOADREQ`, and one inside eMule's
+        // `MIN_REQUESTTIME` of the last is a strike toward a ban however we
+        // got here: a restarted or resumed download, another retry path, or a
+        // re-found source. The peer keeps our queue slot meanwhile.
+        if let Some(wait) = peer_sessions::upload_request_wait(
+            source.peer_user_hash,
+            dial_v4,
+            &[addr.port()],
+            file_hash,
+        ) {
+            debug!(
+                "Source {} ({}) skip dial: asked for this file too recently ({}s to go)",
+                _src_idx,
+                addr,
+                wait.as_secs(),
+            );
+            return Ok(());
+        }
+        // eMule gives each peer one socket. Dialing while another session
+        // with it is open, from another download or its own connection to our
+        // upload side, makes it close that one.
+        if peer_sessions::is_busy(source.peer_user_hash, dial_v4, addr.port()) {
+            debug!(
+                "Source {} ({}) skip dial: a connection with this peer is already open",
+                _src_idx, addr,
+            );
+            return Ok(());
+        }
         emit_source!("connecting", None, 0u64);
         // Global connection cap + dial pacing apply to outbound dials only:
         // a machine-wide slot (eMule's `maxconnections`) once the "New
@@ -5448,6 +5561,18 @@ async fn download_parts_from_source(
         _global_conn_permit = acquire_dial_slot(&control).await;
         check_control(&control).await?;
         space_outbound_dial().await;
+        // Reserved only now: holding it through the slot wait would turn away
+        // our own upload side's push-grant to this peer meanwhile.
+        let Some(session) = peer_sessions::try_reserve(source.peer_user_hash, dial_v4, addr.port())
+        else {
+            debug!(
+                "Source {} ({}) skip dial: the peer connected to us while we waited to dial",
+                _src_idx, addr,
+            );
+            emit_source!("duplicate", None, 0u64);
+            return Ok(());
+        };
+        peer_session = Some(session);
 
         // Build the Hello payload once; it's identical across attempts.
         // (Include buddy tags if we have a buddy.)
@@ -5478,7 +5603,7 @@ async fn download_parts_from_source(
         let hello_payload = build_hello_with_buddy_opts(
             user_hash,
             our_client_id,
-            tcp_port,
+            peer_sessions::advertised_tcp_port_or(tcp_port),
             nickname,
             buddy,
             &hello_options,
@@ -5740,19 +5865,25 @@ async fn download_parts_from_source(
         peer_supports_aich = hello_caps.supports_aich;
         peer_ember_hash = hello_caps.ember_hash;
 
-        let emule_payload =
-            build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
-        write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
-
-        match read_packet_timeout_ms(&mut *reader)
-            .await
-            .context("stage:emule_info_wait")
-        {
-            Ok((proto, opcode, payload)) => {
+        let mule_info_reply = if dialer_needs_mule_info(&peer_user_hash, &hello_caps) {
+            let emule_payload =
+                build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
+            write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload)
+                .await?;
+            Some(
+                read_packet_timeout_ms(&mut *reader)
+                    .await
+                    .context("stage:emule_info_wait"),
+            )
+        } else {
+            None
+        };
+        match mule_info_reply {
+            None => {}
+            Some(Ok((proto, opcode, payload))) => {
                 if proto == OP_EMULEPROT && (opcode == OP_EMULEINFOANSWER || opcode == OP_EMULEINFO)
                 {
                     merge_caps(&mut hello_caps, parse_emule_info(&payload));
-                    let peer_udp = hello_caps.udp_port;
                     peer_supports_multipacket = hello_caps.supports_multi_packet;
                     peer_supports_ext_multipacket = hello_caps.ext_multi_packet;
                     peer_supports_file_ident = hello_caps.supports_file_ident;
@@ -5766,30 +5897,6 @@ async fn download_parts_from_source(
                     src_client_software = client_software_from_caps(&hello_caps);
                     if !hello_caps.peer_name.is_empty() {
                         src_peer_name = hello_caps.peer_name.clone();
-                    }
-                    // Always remember the peer's user hash once we've learned
-                    // it from the handshake — eMule keeps client identity in its
-                    // `clientlist` so it can obfuscate future connections to the
-                    // same peer (and reuse the hash cross-file via
-                    // `get_user_hash_by_addr`). Previously this was gated on the
-                    // peer advertising a UDP port, which silently dropped hashes
-                    // for peers that didn't, leaving us unable to obfuscate them
-                    // later.
-                    if peer_user_hash != [0u8; 16] {
-                        if let Some(sm) = &source_mgr {
-                            let mut sm = sm.write().await;
-                            if let std::net::IpAddr::V4(v4) = addr.ip() {
-                                sm.register_observed_peer_ports(
-                                    *file_hash,
-                                    v4,
-                                    addr.port(),
-                                    hello_caps.tcp_port,
-                                    peer_udp,
-                                    peer_user_hash,
-                                    hello_caps.is_high_id(),
-                                );
-                            }
-                        }
                     }
                     if opcode == OP_EMULEINFO {
                         let emule_answer = build_emule_info(
@@ -5824,12 +5931,46 @@ async fn download_parts_from_source(
                     deferred_packet = Some((proto, opcode, payload));
                 }
             }
-            Err(e) if is_packet_stream_desynced(&e) => return Err(e),
-            Err(e) => {
+            Some(Err(e)) if is_packet_stream_desynced(&e) => return Err(e),
+            Some(Err(e)) => {
                 debug!("EmuleInfo exchange failed for source {}: {e}", _src_idx);
             }
         }
+        // Remember the peer's user hash and ports once the handshake has
+        // told us them. eMule keeps client identity in its `clientlist` so it
+        // can obfuscate later connections to the same peer, and we reuse the
+        // hash across files via `get_user_hash_by_addr`.
+        if peer_user_hash != [0u8; 16] {
+            if let (Some(sm), std::net::IpAddr::V4(v4)) = (&source_mgr, addr.ip()) {
+                sm.write().await.register_observed_peer_ports(
+                    *file_hash,
+                    v4,
+                    addr.port(),
+                    hello_caps.tcp_port,
+                    hello_caps.udp_port,
+                    peer_user_hash,
+                    hello_caps.is_high_id(),
+                );
+            }
+        }
     }
+
+    if let Some(session) = &peer_session {
+        session.identify(peer_user_hash);
+        if hello_caps.is_ember {
+            session.mark_ember();
+        }
+    }
+    let mut peer_conn = PeerConnection::new(
+        reader,
+        writer,
+        addr,
+        peer_user_hash,
+        hello_caps.clone(),
+        peer_session,
+    );
+    let reader = &mut peer_conn.reader;
+    let writer = &mut peer_conn.writer;
 
     // Now that the handshake has converged (dialed or adopted) we know the
     // peer's authoritative user hash. Claim it as the live identity for this
@@ -5996,16 +6137,13 @@ async fn download_parts_from_source(
                 // this, `respond_to_secident_challenge` silently drops the
                 // OP_SIGNATURE (sig len = 0) when `record.public_key` is
                 // empty, the peer never gets our signature, and the
-                // handshake never completes.
-                let missing_peer_key = if state >= 2 {
-                    if let Some(cm) = &credit_mgr {
-                        let cm = cm.read().await;
-                        !cm.has_public_key(&peer_user_hash)
-                    } else {
-                        true
-                    }
+                // handshake never completes. A state-1 challenge needs their
+                // key just the same (BaseClient.cpp:1851-1852).
+                let missing_peer_key = if let Some(cm) = &credit_mgr {
+                    let cm = cm.read().await;
+                    !cm.has_public_key(&peer_user_hash)
                 } else {
-                    false
+                    true
                 };
                 if missing_peer_key {
                     pending_peer_challenge = Some((challenge, state));
@@ -6237,6 +6375,9 @@ async fn download_parts_from_source(
             (OP_EMULEPROT, OP_EMBER_HELLO) | (OP_EMULEPROT, OP_EMBER_HELLOANSWER) => {
                 if let Some(ident) = parse_ember_hello(&payload) {
                     hello_caps.is_ember = true;
+                    if let Some(session) = &peer_conn.session {
+                        session.mark_ember();
+                    }
                     // Identity lock: refuse to swap pubkey/hash after
                     // PoP verification (see upload.rs/transfer.rs for
                     // the same fix; the risk is credit accounting on
@@ -6615,7 +6756,9 @@ async fn download_parts_from_source(
         if !single_part {
             mp.push(OP_SETREQFILEID);
         }
-        if sx_allowed {
+        // eMule asks only peers that support SX2 or SX1 v2+
+        // (DownloadClient.cpp:228-229).
+        if sx_allowed && (peer_supports_source_ex2 || peer_source_exchange_ver > 1) {
             if peer_supports_source_ex2 {
                 mp.push(OP_REQUESTSOURCES2);
                 mp.push(SOURCEEXCHANGE2_VERSION);
@@ -6669,7 +6812,9 @@ async fn download_parts_from_source(
     // file-status-wait loop below. Sending after FileStatus leaves the answer
     // to land in the bounded hashset-wait loop, which has no arm for it — the
     // peer is then never identified as Ember (no EPX, no friend detection).
-    if !sent_ember_hello {
+    // Only to peers that speak the eMule extended protocol: anything else has
+    // no handler for an `OP_EMULEPROT` packet, and every Ember peer does.
+    if !sent_ember_hello && hello_caps.ext_protocol {
         let payload = build_ember_hello(&ember_hash, &our_nickname, Some(&ed25519_public_key));
         if write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload)
             .await
@@ -6823,15 +6968,11 @@ async fn download_parts_from_source(
             let state = _payload[0];
             let challenge =
                 u32::from_le_bytes([_payload[1], _payload[2], _payload[3], _payload[4]]);
-            let missing_peer_key = if state >= 2 {
-                if let Some(cm) = &credit_mgr {
-                    let cm = cm.read().await;
-                    !cm.has_public_key(&peer_user_hash)
-                } else {
-                    true
-                }
+            let missing_peer_key = if let Some(cm) = &credit_mgr {
+                let cm = cm.read().await;
+                !cm.has_public_key(&peer_user_hash)
             } else {
-                false
+                true
             };
             if missing_peer_key {
                 pending_peer_challenge = Some((challenge, state));
@@ -6970,6 +7111,9 @@ async fn download_parts_from_source(
         if proto == OP_EMULEPROT && (opcode == OP_EMBER_HELLO || opcode == OP_EMBER_HELLOANSWER) {
             if let Some(ident) = parse_ember_hello(&_payload) {
                 hello_caps.is_ember = true;
+                if let Some(session) = &peer_conn.session {
+                    session.mark_ember();
+                }
                 let identity_changed = ember_auth_verified
                     && ((ident.ed25519_pubkey.is_some()
                         && hello_caps.ember_pubkey.is_some()
@@ -7758,7 +7902,9 @@ async fn download_parts_from_source(
     } else {
         true
     };
-    if sx_allowed {
+    // eMule asks only peers that support SX2 or SX1 v2+
+    // (DownloadClient.cpp:228-229).
+    if sx_allowed && (peer_supports_source_ex2 || peer_source_exchange_ver > 1) {
         let sx_write_ok = if peer_supports_source_ex2 {
             let mut sx2_req = Vec::with_capacity(19);
             sx2_req.push(SOURCEEXCHANGE2_VERSION);
@@ -7824,19 +7970,50 @@ async fn download_parts_from_source(
         // `got_any_data` gate in the receive loop).
         emit_source!("stalled", None, 0u64);
     } else {
-        // Request upload slot
-        let upload_req = build_file_request(file_hash);
-        write_packet_async_ms(
-            &mut *writer,
-            OP_EDONKEYHEADER,
-            OP_STARTUPLOADREQ,
-            &upload_req,
-        )
-        .await?;
-        file_req_overhead.record_upload((6 + upload_req.len()) as u64);
+        // Every port the peer is known by, so the record matches however we
+        // reach it next time: dialed, its Hello, or its source row.
+        let ask_ports = [addr.port(), source.peer_port, hello_caps.tcp_port];
+        let ask_wait = match addr.ip() {
+            std::net::IpAddr::V4(v4) => peer_sessions::upload_request_wait(
+                Some(peer_user_hash),
+                v4,
+                &ask_ports,
+                file_hash,
+            ),
+            _ => None,
+        };
+        if let Some(wait) = ask_wait {
+            // We are already on its queue from that ask; another would only
+            // count toward eMule's `BADCLIENTBAN`. Wait for the grant instead.
+            debug!(
+                "Source {} ({}) not re-sending StartUploadReq ({}s left of MIN_REQUESTTIME)",
+                _src_idx,
+                addr,
+                wait.as_secs(),
+            );
+        } else {
+            let upload_req = build_file_request(file_hash);
+            write_packet_async_ms(
+                &mut *writer,
+                OP_EDONKEYHEADER,
+                OP_STARTUPLOADREQ,
+                &upload_req,
+            )
+            .await?;
+            file_req_overhead.record_upload((6 + upload_req.len()) as u64);
+            if let std::net::IpAddr::V4(v4) = addr.ip() {
+                peer_sessions::note_upload_request(
+                    Some(peer_user_hash),
+                    v4,
+                    &ask_ports,
+                    *file_hash,
+                );
+            }
+        }
 
         queued_count.fetch_add(1, Ordering::Relaxed);
         queued_guard.armed = true;
+        peer_conn.held.set_awaiting_grant(true);
 
         // Wait for the uploader to grant a slot. Don't re-request; eMule
         // uploaders push OP_ACCEPTUPLOADREQ when a slot opens.
@@ -7922,6 +8099,7 @@ async fn download_parts_from_source(
                 queued_count.fetch_sub(1, Ordering::Relaxed);
                 active_count.fetch_add(1, Ordering::Relaxed);
                 _active_guard.armed = true;
+                peer_conn.held.set_awaiting_grant(false);
                 info!(
                     "Source {} ({}) accepted upload request — entering transfer (obfuscated={})",
                     _src_idx, addr, connection_is_obfuscated
@@ -7936,6 +8114,8 @@ async fn download_parts_from_source(
             if proto == OP_EMULEPROT && opcode == OP_QUEUEFULL && payload.is_empty() {
                 file_req_overhead.record_download(6u64);
                 emit_source!("queue_full", None, 0u64);
+                // Not queued after all, so no grant will come on this socket.
+                peer_conn.held.set_awaiting_grant(false);
                 anyhow::bail!("peer queue is full");
             }
             if proto == OP_EDONKEYHEADER && opcode == OP_OUTOFPARTREQS {
@@ -10896,18 +11076,14 @@ async fn download_parts_from_source(
         // last measured rate here put a live-looking speed on a row the lines
         // above went out of their way to stop presenting as active.
         emit_source!("queued", None, 0u64);
+        peer_conn.held.set_awaiting_grant(true);
 
-        let requeue_outcome = try_in_session_requeue(
-            &mut *writer,
-            &mut *reader,
-            file_hash,
-            requeue_timeout_secs,
-            &control,
-        )
-        .await;
+        let requeue_outcome =
+            try_in_session_requeue(&mut *reader, requeue_timeout_secs, &control).await;
 
         match requeue_outcome {
             InSessionRequeueResult::Promoted => {
+                peer_conn.held.set_awaiting_grant(false);
                 // Peer gave us a fresh slot on the same TCP connection.
                 // Reset per-session state and re-enter the per-part
                 // loop.  pipelined_next / per_part_credit stay because
@@ -11008,15 +11184,20 @@ async fn download_parts_from_source(
                     queued_guard.armed = false;
                     queued_count.fetch_sub(1, Ordering::Relaxed);
                 }
-                // Bail with an error so the spawn handler logs and emits
-                // a SourceDetail "failed" event.
-                anyhow::bail!("in-session re-queue lost connection: {reason}");
+                // The uploader still holds us on its queue (it re-queued us
+                // when it sent OP_OUTOFPARTREQS), so this is a queue state,
+                // not a source failure.
+                anyhow::bail!(
+                    "stage:queue_detached connection lost while queued after OutOfPartReqs: {reason}"
+                );
             }
         }
     } // end 'session_loop
 
-    // Signal the uploader that we're done
-    write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_END_OF_DOWNLOAD, &[])
+    // Signal the uploader that we're done. eMule counts a payload without the
+    // file hash as a failed file request (ListenSocket.cpp OP_END_OF_DOWNLOAD
+    // -> CheckFailedFileIdReqs).
+    write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_END_OF_DOWNLOAD, file_hash)
         .await
         .ok();
 
@@ -11812,7 +11993,7 @@ pub async fn perform_outbound_hello(
     let hello_payload = build_hello_with_buddy_opts(
         user_hash,
         our_client_id,
-        tcp_port,
+        peer_sessions::advertised_tcp_port_or(tcp_port),
         nickname,
         None,
         &hello_options,

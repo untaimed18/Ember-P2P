@@ -8,17 +8,19 @@
   import CloseAppDialog from '$lib/components/CloseAppDialog.svelte';
   import DeepLinkHandler from '$lib/components/DeepLinkHandler.svelte';
   import ChatDock from '$lib/components/ChatDock.svelte';
+  import ErrorBoundary from '$lib/components/ErrorBoundary.svelte';
   import UpdateNotice from '$lib/components/UpdateNotice.svelte';
 
   import { initNetworkStore, cleanupNetworkStore, startStatsPoll } from '$lib/stores/network';
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
-  import { retainChatTabs } from '$lib/stores/chatTabs';
+  import { chatDockOpen, closeDock, retainChatTabs } from '$lib/stores/chatTabs';
   import { initChannelsStore, cleanupChannelsStore } from '$lib/stores/channels';
   import { loadAppSettings, clearAppSettings, setAppSettings } from '$lib/stores/settings';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { applyDocumentLang, translateError } from '$lib/i18n';
+  import { plural } from '$lib/plural';
   import * as m from '$lib/paraglide/messages';
   import {
     getSettings,
@@ -95,13 +97,16 @@
       return m.library_drop_many_confirm({ count: folders.length, summary });
     }
     if (dropPrompt.reason === 'broad') {
-      return folders.length === 1
-        ? m.library_drop_broad_confirm_one({ folder: folders[0] })
-        : m.library_drop_broad_confirm_other({ count: folders.length, summary });
+      return plural(folders.length, {
+        one: () => m.library_drop_broad_confirm_one({ folder: folders[0] }),
+        other: () => m.library_drop_broad_confirm_other({ count: folders.length, summary }),
+      });
     }
-    return folders.length === 1
-      ? m.library_drop_parent_confirm_one({ folder: folders[0] })
-      : m.library_drop_parent_confirm_other({ count: folders.length, summary });
+    return plural(folders.length, {
+      one: () => m.library_drop_parent_confirm_one({ folder: folders[0] }),
+      few: () => m.library_drop_parent_confirm_few({ count: folders.length, summary }),
+      other: () => m.library_drop_parent_confirm_other({ count: folders.length, summary }),
+    });
   });
   let policyResetReason = $state<string | null>(null);
   let policyResetPending = $state(false);
@@ -401,7 +406,10 @@
       const count = event.payload?.count ?? 0;
       if (count <= 0) return;
       toastSuccess(
-        count === 1 ? m.library_folders_shared_one() : m.library_folders_shared_other({ count }),
+        plural(count, {
+          one: m.library_folders_shared_one,
+          other: () => m.library_folders_shared_other({ count }),
+        }),
       );
     })
       .then((fn) => { if (mounted) unlistenFoldersAdded = fn; else fn(); })
@@ -414,9 +422,10 @@
       const count = event.payload?.count ?? 0;
       if (count <= 0) return;
       toastWarning(
-        count === 1
-          ? m.library_folders_share_failed_one()
-          : m.library_folders_share_failed_other({ count }),
+        plural(count, {
+          one: m.library_folders_share_failed_one,
+          other: () => m.library_folders_share_failed_other({ count }),
+        }),
       );
     })
       .then((fn) => { if (mounted) unlistenFoldersFailed = fn; else fn(); })
@@ -503,9 +512,11 @@
               const migrated = await takePendingDownloadOverflowNotice();
               if (migrated > 0) {
                 toastWarning(
-                  migrated === 1
-                    ? m.layout_download_overflow_notice_one()
-                    : m.layout_download_overflow_notice_other({ count: migrated }),
+                  plural(migrated, {
+                    one: m.layout_download_overflow_notice_one,
+                    few: () => m.layout_download_overflow_notice_few({ count: migrated }),
+                    other: () => m.layout_download_overflow_notice_other({ count: migrated }),
+                  }),
                 );
               }
             }
@@ -657,7 +668,9 @@
 </script>
 
 {#if chatWindow}
-<ChatWindowShell />
+<ErrorBoundary variant="window" title={m.chat_dock_render_error()}>
+  <ChatWindowShell />
+</ErrorBoundary>
 {:else}
 <a href="#main-content" class="skip-to-content">{m.layout_skip_to_content()}</a>
 {#if splashVisible}
@@ -703,7 +716,9 @@
         -->
         {#key $page.url.pathname}
           <div class="route-view" in:fly={{ y: 8, duration: 160 }}>
-            {@render children()}
+            <ErrorBoundary title={m.layout_render_error_title()} body={m.layout_render_error_body()}>
+              {@render children()}
+            </ErrorBoundary>
           </div>
         {/key}
       {/if}
@@ -724,7 +739,14 @@
     keyed off the `chatTabs` store, so opening a chat from any page
     just calls `chatTabs.openChat(hash, name)`.
   -->
-  <ChatDock />
+  <ErrorBoundary
+    variant="panel"
+    title={m.chat_dock_render_error()}
+    onclose={closeDock}
+    active={$chatDockOpen}
+  >
+    <ChatDock />
+  </ErrorBoundary>
 </div>
 
 <!-- Outside `.app-shell` so `CloseAppDialog`'s inert walk, which inerts the
@@ -753,9 +775,10 @@
       ? m.library_drop_share_anyway()
       : m.library_drop_share_folders_confirm()}
   altLabel={dropPrompt.reason === 'files'
-    ? dropPrompt.folders.length === 1
-      ? m.library_drop_share_folder()
-      : m.library_drop_share_folders()
+    ? plural(dropPrompt.folders.length, {
+        one: m.library_drop_share_folder,
+        other: m.library_drop_share_folders,
+      })
     : undefined}
   danger={dropPrompt.reason === 'broad'}
   isolateMessage

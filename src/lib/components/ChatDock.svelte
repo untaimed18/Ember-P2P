@@ -31,6 +31,7 @@
   import { formatBytes } from '$lib/utils';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
+  import { plural } from '$lib/plural';
   import IconX from '$lib/components/IconX.svelte';
   import { shortcutModAria } from '$lib/platform';
   import {
@@ -276,6 +277,13 @@
    */
   let unreadElsewhere = $derived(
     openRows.reduce((sum, r) => (r.hash === $activeChatTab ? sum : sum + r.unread), 0),
+  );
+  let unreadElsewhereLabel = $derived(
+    plural(unreadElsewhere, {
+      one: m.chat_dock_unread_elsewhere_one,
+      few: () => m.chat_dock_unread_elsewhere_few({ count: unreadElsewhere }),
+      other: () => m.chat_dock_unread_elsewhere_other({ count: unreadElsewhere }),
+    }),
   );
 
   function openSwitcher() {
@@ -660,12 +668,8 @@
         <button
           type="button"
           class="dock-elsewhere"
-          title={unreadElsewhere === 1
-            ? m.chat_dock_unread_elsewhere_one()
-            : m.chat_dock_unread_elsewhere_other({ count: unreadElsewhere })}
-          aria-label={unreadElsewhere === 1
-            ? m.chat_dock_unread_elsewhere_one()
-            : m.chat_dock_unread_elsewhere_other({ count: unreadElsewhere })}
+          title={unreadElsewhereLabel}
+          aria-label={unreadElsewhereLabel}
           onclick={goToUnread}
         >
           {unreadElsewhere > 99 ? '99+' : unreadElsewhere}
@@ -785,9 +789,11 @@
                 {#if row.unread > 0}
                   <span
                     class="dock-row-unread"
-                    aria-label={row.unread === 1
-                      ? m.chat_dock_unread_aria_one()
-                      : m.chat_dock_unread_aria_other({ count: row.unread })}
+                    aria-label={plural(row.unread, {
+                      one: m.chat_dock_unread_aria_one,
+                      few: () => m.chat_dock_unread_aria_few({ count: row.unread }),
+                      other: () => m.chat_dock_unread_aria_other({ count: row.unread }),
+                    })}
                   >{row.unread > 99 ? '99+' : row.unread}</span>
                 {/if}
                 <!--

@@ -170,7 +170,11 @@ mod owner_room_policy_ingest_tests {
     use crate::storage::database::Database;
 
     fn blob(ident: &ChannelIdentity, tail: &ModerationTail) -> Vec<u8> {
-        let record = SignedRecord::channel_moderation(
+        blob_at(ident, tail, chrono::Utc::now().timestamp())
+    }
+
+    fn blob_at(ident: &ChannelIdentity, tail: &ModerationTail, timestamp: i64) -> Vec<u8> {
+        let record = SignedRecord::channel_moderation_at(
             "Topic",
             "Welcome",
             &[],
@@ -180,6 +184,7 @@ mod owner_room_policy_ingest_tests {
             ident.pubkey,
             false,
             &ident.signing_key,
+            timestamp,
         )
         .expect("fits");
         let mut blob = record.data.clone();
@@ -255,26 +260,30 @@ mod owner_room_policy_ingest_tests {
         assert_eq!(row.language, "fr", "or clear its language");
 
         // In a second room, the newest snapshot saying nothing is "off".
+        // Stamped a second apart: within one second the signature, not
+        // arrival order, decides which snapshot is newest.
         let other = ChannelIdentity::generate();
         let other_hex = hex::encode(other.channel_id);
         db.insert_channel(&other_hex, &hex::encode(other.pubkey), "Den", "public", false, None, None)
             .expect("insert channel");
+        let stamped = chrono::Utc::now().timestamp();
         assert!(ingest_channel_moderation_records(
             &db,
             other.channel_id,
-            &[blob(
+            &[blob_at(
                 &other,
                 &ModerationTail {
                     language: Some("de"),
                     ..policy_tail(true, pins)
-                }
+                },
+                stamped,
             )],
         ));
         assert_eq!(db.get_channel(&other_hex).unwrap().unwrap().language, "de");
         assert!(ingest_channel_moderation_records(
             &db,
             other.channel_id,
-            &[blob(&other, &policy_tail(false, Vec::new()))],
+            &[blob_at(&other, &policy_tail(false, Vec::new()), stamped + 1)],
         ));
         let row = db.get_channel(&other_hex).unwrap().unwrap();
         assert!(!row.announce_only);
@@ -2147,10 +2156,14 @@ pub(super) fn ingest_channel_moderation_records(
         if stored_pk.as_slice() != parsed.publisher_key.as_slice() {
             continue;
         }
-        if best
-            .as_ref()
-            .is_none_or(|cur| parsed.timestamp > cur.timestamp)
-        {
+        if best.as_ref().is_none_or(|cur| {
+            ember::dht::publish::moderation_supersedes(
+                parsed.timestamp,
+                &parsed.signature,
+                cur.timestamp,
+                Some(&cur.signature),
+            )
+        }) {
             best = Some(parsed);
         }
     }
@@ -2158,27 +2171,29 @@ pub(super) fn ingest_channel_moderation_records(
         return false;
     };
     let applied = db
-        .apply_channel_moderation(
+        .ingest_channel_moderation(
             &channel_id_hex,
-            &moderation.topic,
-            &moderation.welcome,
+            &crate::storage::database::ModerationSnapshot {
+                topic: &moderation.topic,
+                welcome: &moderation.welcome,
+                banned_pubkeys: &moderation.banned_pubkeys,
+                moderator_pubkeys: &moderation.moderator_pubkeys,
+                owner_pubkey: moderation.tail.owner_pubkey.as_ref(),
+                successor_nominee: moderation.tail.successor_nominee.as_ref(),
+                claim_after_days: moderation.tail.claim_after_days,
+                key_epoch: moderation.tail.key_epoch,
+                invites_owner_only: moderation.tail.invites_owner_only,
+                slow_mode_secs: moderation.tail.slow_mode_secs,
+            },
             moderation.timestamp,
-            &moderation.banned_pubkeys,
-            &moderation.moderator_pubkeys,
-            moderation.tail.owner_pubkey.as_ref(),
-            moderation.tail.successor_nominee.as_ref(),
-            moderation.tail.claim_after_days,
-            moderation.tail.key_epoch,
-            moderation.tail.invites_owner_only,
-            moderation.tail.slow_mode_secs,
+            &moderation.signature,
         )
         .unwrap_or(false);
     // Only from a snapshot just accepted as the owner's newest, so an older
     // record replayed from a slow storer cannot rename the room back. Never on
     // the owner's own device: its name is the one it renamed the room to, and
-    // a snapshot of its own from before the rename — which one stamped in the
-    // same second still counts as newest — would quietly undo it here while
-    // the registry and every member moved on.
+    // a snapshot of its own signed before the rename would quietly undo it here
+    // while the registry and every member moved on.
     if applied {
         if let Some(name) = moderation.tail.room_name.as_deref().filter(|_| !ch.is_owner) {
             if let Err(e) = db.apply_owner_room_name(&channel_id_hex, name) {
@@ -2281,6 +2296,17 @@ pub(super) async fn maybe_publish_owned_channel_records(
         } else {
             None
         };
+        // Stamped before the state is read, and read from the table rather
+        // than the cached roster: an owner edit committed after this stamp
+        // carries a later one, and one committed before it is what gets read,
+        // so this republish can never undo an edit for the room.
+        let Ok(Some(stamp)) = db.stamp_owner_snapshot(&ch.channel_id, now) else {
+            undo_owned_rotation(db, &ch.channel_id, rotated);
+            continue;
+        };
+        if let Ok(Some(fresh)) = db.get_channel_lite(&ch.channel_id) {
+            ch = std::borrow::Cow::Owned(fresh);
+        }
         let mut bans = db
             .list_banned_channel_pubkeys(&ch.channel_id)
             .unwrap_or_default();
@@ -2292,7 +2318,7 @@ pub(super) async fn maybe_publish_owned_channel_records(
         let mods = db
             .list_moderator_channel_pubkeys(&ch.channel_id)
             .unwrap_or_default();
-        let record = ember::dht::publish::SignedRecord::channel_moderation(
+        let record = ember::dht::publish::SignedRecord::channel_moderation_at(
             &ch.topic,
             &ch.welcome,
             &bans,
@@ -2349,6 +2375,7 @@ pub(super) async fn maybe_publish_owned_channel_records(
             ident.pubkey,
             private,
             &ident.signing_key,
+            stamp,
         );
         // A snapshot too large for one record cannot be republished at all, and
         // the copy the network holds expires within the day. Say so once per
@@ -2447,12 +2474,25 @@ pub(super) async fn maybe_publish_owned_channel_records(
                     let Some(old_id) = predecessor.filter(|_| taken) else {
                         return;
                     };
-                    if let Err(error) = crate::network::rendezvous::handover_channel_name(
+                    // Twice. Once the name is bound here, this room's own key is
+                    // what the registry counts as the room being alive, however
+                    // it changed hands. The user key is what moves the name on a
+                    // nominee's takeover, and what a registry from before that
+                    // rule still counts.
+                    let as_room = crate::network::rendezvous::handover_channel_name(
+                        &url, &old_id, &cid, &cpk, &cpk, &seed,
+                    )
+                    .await;
+                    let as_user = crate::network::rendezvous::handover_channel_name(
                         &url, &old_id, &cid, &cpk, &our_pk, &our_sk,
                     )
-                    .await
-                    {
-                        tracing::debug!(?error, "could not move the inherited channel name");
+                    .await;
+                    if let (Err(room), Err(user)) = (as_room, as_user) {
+                        tracing::debug!(
+                            ?room,
+                            ?user,
+                            "could not move the inherited channel name"
+                        );
                     }
                 });
             }

@@ -4,6 +4,7 @@
   import { untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { plural } from '$lib/plural';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
   import { formatBytes, formatNumber } from '$lib/utils';
@@ -307,9 +308,10 @@
   let shareLabel = $derived.by(() => {
     if (sharing) return m.library_explorer_sharing();
     if (ownFilesOnly) {
-      return currentOwnFiles.length === 1
-        ? m.library_explorer_share_file_one()
-        : m.library_explorer_share_file_other({ count: currentOwnFiles.length });
+      return plural(currentOwnFiles.length, {
+        one: m.library_explorer_share_file_one,
+        other: () => m.library_explorer_share_file_other({ count: currentOwnFiles.length }),
+      });
     }
     if (selectedCount === 0) {
       if (currentPartial) return m.library_explorer_share_rest();
@@ -317,9 +319,10 @@
       return m.library_explorer_share();
     }
     if (selectedFileCount > 0 && selectedFolderCount === 0) {
-      return selectedFileCount === 1
-        ? m.library_explorer_share_file_one()
-        : m.library_explorer_share_file_other({ count: selectedFileCount });
+      return plural(selectedFileCount, {
+        one: m.library_explorer_share_file_one,
+        other: () => m.library_explorer_share_file_other({ count: selectedFileCount }),
+      });
     }
     if (selectedFileCount === 0 && selectedFolderCount === 1 && selectedEntries[0]?.share_status === 'partial') {
       return m.library_explorer_share_rest();
@@ -462,9 +465,10 @@
     if (shareSummary?.state === 'lower_bound') {
       return m.library_explorer_summary_files_at_least({ count: formatNumber(count) });
     }
-    return count === 1
-      ? m.library_explorer_summary_files_one()
-      : m.library_explorer_summary_files_other({ count: formatNumber(count) });
+    return plural(count, {
+      one: m.library_explorer_summary_files_one,
+      other: () => m.library_explorer_summary_files_other({ count: formatNumber(count) }),
+    });
   });
   let summarySize = $derived(
     shareSummary
@@ -475,13 +479,15 @@
     if (!shareSummary) return '';
     const { folders: count, subfolders } = shareSummary;
     if (subfolders) {
-      return count === 1
-        ? m.library_explorer_summary_subfolders_one()
-        : m.library_explorer_summary_subfolders_other({ count: formatNumber(count) });
+      return plural(count, {
+        one: m.library_explorer_summary_subfolders_one,
+        other: () => m.library_explorer_summary_subfolders_other({ count: formatNumber(count) }),
+      });
     }
-    return count === 1
-      ? m.library_explorer_summary_folders_one()
-      : m.library_explorer_summary_folders_other({ count: formatNumber(count) });
+    return plural(count, {
+      one: m.library_explorer_summary_folders_one,
+      other: () => m.library_explorer_summary_folders_other({ count: formatNumber(count) }),
+    });
   });
   let summaryHint = $derived.by(() => {
     switch (shareSummary?.state) {
@@ -586,8 +592,10 @@
       case 'partial': {
         const count = entry.shared_count ?? 0;
         if (count === 0) return m.library_explorer_partial_none();
-        if (count === 1) return m.library_explorer_partial_one();
-        return m.library_explorer_partial_other({ count });
+        return plural(count, {
+          one: m.library_explorer_partial_one,
+          other: () => m.library_explorer_partial_other({ count }),
+        });
       }
       case 'inherited': return m.library_explorer_inherited();
       case 'overlap': return m.library_explorer_overlap();

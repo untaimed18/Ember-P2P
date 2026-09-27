@@ -41,6 +41,31 @@ use super::channel::{
 /// publish to the network.
 pub const CHANNEL_FILES_DIR: &str = "Channel Files";
 
+/// What Windows records on a file that came from the Internet zone.
+#[cfg(windows)]
+const ZONE_IDENTIFIER_INTERNET: &[u8] = b"[ZoneTransfer]\r\nZoneId=3\r\n";
+
+/// Mark a file another person sent us as downloaded from the Internet, the way
+/// a browser does, so Windows warns before running it and Office opens it in
+/// Protected View. Best-effort: a volume without alternate data streams (FAT,
+/// some network shares) simply does not get the mark, and the file is kept.
+pub fn mark_received_from_internet(path: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        // Opening the stream of a file that is not there creates the file.
+        if !path.is_file() {
+            return;
+        }
+        let mut stream = path.as_os_str().to_os_string();
+        stream.push(":Zone.Identifier");
+        if let Err(e) = std::fs::write(&stream, ZONE_IDENTIFIER_INTERNET) {
+            tracing::debug!("Could not mark a received file as from the Internet: {e}");
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+}
+
 /// Progress is reported to the UI in steps this many percent apart.
 ///
 /// A 2 GiB file is two million blocks; emitting an IPC message per
@@ -186,6 +211,26 @@ pub struct SendState {
     /// Bytes served over a QUIC stream, when the transfer went that way.
     streamed: u64,
     reporter: ProgressReporter,
+    /// When the stall timer fired on a transfer that had sent everything, and
+    /// the recipient was asked how it ended. See [`SendState::stall_verdict`].
+    asked_at: Option<Instant>,
+}
+
+/// How long a sender that has sent everything waits, once its stall timer
+/// fires, for the recipient to repeat a verdict it may have missed.
+pub const XFER_VERDICT_WAIT_SECS: u64 = 30;
+
+/// What the stall sweep should do with a send that has gone quiet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendStall {
+    /// Every byte went out, so the recipient's "done" may simply have been
+    /// lost. Ask it once — the stall cancel it would get anyway, which a
+    /// current recipient that finished answers with its verdict — and wait.
+    AskFirst,
+    /// Asked, and still inside [`XFER_VERDICT_WAIT_SECS`].
+    Waiting,
+    /// Report it stalled.
+    GiveUp,
 }
 
 impl SendState {
@@ -213,6 +258,25 @@ impl SendState {
             read_pos: None,
             streamed: 0,
             reporter: ProgressReporter::default(),
+            asked_at: None,
+        }
+    }
+
+    /// What to do now that [`Self::is_stalled`] holds.
+    pub fn stall_verdict(&mut self, now: Instant) -> SendStall {
+        match self.asked_at {
+            Some(at)
+                if now.saturating_duration_since(at)
+                    <= Duration::from_secs(XFER_VERDICT_WAIT_SECS) =>
+            {
+                SendStall::Waiting
+            }
+            Some(_) => SendStall::GiveUp,
+            None if self.accepted && self.bytes_sent() >= self.size => {
+                self.asked_at = Some(now);
+                SendStall::AskFirst
+            }
+            None => SendStall::GiveUp,
         }
     }
 
@@ -295,6 +359,7 @@ impl SendState {
             self.queued.insert(block);
         }
         self.updated_at = Instant::now();
+        self.asked_at = None;
     }
 
     pub fn next_block(&mut self) -> Option<u64> {
@@ -662,6 +727,121 @@ pub struct PendingOffer {
     pub received_at: Instant,
 }
 
+/// How long a recipient remembers how a transfer ended, to tell a sender that
+/// missed it. Past the sender's stall timer and its wait for a verdict, after
+/// which nothing is left on that side to tell.
+pub const XFER_FINISHED_REMEMBER: Duration =
+    Duration::from_secs(XFER_STALL_SECS + XFER_VERDICT_WAIT_SECS + 60);
+/// Transfers remembered at once. Far above what `XFER_MAX_ACTIVE` lets finish
+/// inside [`XFER_FINISHED_REMEMBER`].
+pub const XFER_FINISHED_CAP: usize = 64;
+/// When the verdict is sent again unasked, after the first send. Two more
+/// datagrams, spaced so one loss burst does not take all three.
+const XFER_VERDICT_REPEATS: [Duration; 2] = [Duration::from_secs(3), Duration::from_secs(15)];
+/// Least gap between two answers to later frames about one transfer, so a
+/// sender's retransmits cannot make us send one reply each.
+const XFER_VERDICT_ANSWER_GAP: Duration = Duration::from_secs(2);
+
+struct FinishedXfer {
+    channel_id: [u8; 16],
+    peer: [u8; 32],
+    /// The frame that told the sender how it ended, ready to send again.
+    verdict: Vec<u8>,
+    finished_at: Instant,
+    repeats_sent: usize,
+    last_sent: Instant,
+}
+
+/// Transfers this node received that have ended, with the frame that told the
+/// sender so.
+///
+/// That frame is a single datagram. When it is lost the sender has nothing
+/// else to go on: it answers requests and then hears nothing, and its stall
+/// timer reports a finished transfer as stalled. So the verdict is sent twice
+/// more unasked, and again whenever the sender says anything more about the
+/// transfer.
+#[derive(Default)]
+pub struct FinishedXfers {
+    entries: HashMap<[u8; 16], FinishedXfer>,
+}
+
+impl FinishedXfers {
+    /// Remember that `verdict` has just been sent to `peer` for `xfer_id`.
+    pub fn record(
+        &mut self,
+        xfer_id: [u8; 16],
+        channel_id: [u8; 16],
+        peer: [u8; 32],
+        verdict: Vec<u8>,
+        now: Instant,
+    ) {
+        self.prune(now);
+        if self.entries.len() >= XFER_FINISHED_CAP && !self.entries.contains_key(&xfer_id) {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.finished_at)
+                .map(|(id, _)| *id)
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            xfer_id,
+            FinishedXfer {
+                channel_id,
+                peer,
+                verdict,
+                finished_at: now,
+                repeats_sent: 0,
+                last_sent: now,
+            },
+        );
+    }
+
+    /// The verdict to send back to `peer`, who has just sent another frame
+    /// about `xfer_id`, as `(channel_id, frame)`. `None` for a transfer not
+    /// remembered here, a frame from anyone else, or one inside the answer gap.
+    pub fn answer(
+        &mut self,
+        xfer_id: &[u8; 16],
+        peer: &[u8; 32],
+        now: Instant,
+    ) -> Option<([u8; 16], Vec<u8>)> {
+        let entry = self.entries.get_mut(xfer_id).filter(|entry| entry.peer == *peer)?;
+        if now.saturating_duration_since(entry.finished_at) > XFER_FINISHED_REMEMBER
+            || now.saturating_duration_since(entry.last_sent) < XFER_VERDICT_ANSWER_GAP
+        {
+            return None;
+        }
+        entry.last_sent = now;
+        Some((entry.channel_id, entry.verdict.clone()))
+    }
+
+    /// Verdicts due to be sent again unasked, as `(channel_id, peer, frame)`.
+    pub fn due(&mut self, now: Instant) -> Vec<([u8; 16], [u8; 32], Vec<u8>)> {
+        self.prune(now);
+        let mut due = Vec::new();
+        for entry in self.entries.values_mut() {
+            let Some(after) = XFER_VERDICT_REPEATS.get(entry.repeats_sent) else {
+                continue;
+            };
+            if now.saturating_duration_since(entry.finished_at) >= *after {
+                entry.repeats_sent += 1;
+                entry.last_sent = now;
+                due.push((entry.channel_id, entry.peer, entry.verdict.clone()));
+            }
+        }
+        due
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.entries.retain(|_, entry| {
+            now.saturating_duration_since(entry.finished_at) <= XFER_FINISHED_REMEMBER
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,6 +887,96 @@ mod tests {
             file,
         );
         (state, TempDir(dir))
+    }
+
+    /// A lost "done" is repeated twice unasked, and again when the sender
+    /// speaks up about the transfer — to that sender only, never faster than
+    /// the answer gap, and not once the transfer is long past.
+    #[test]
+    fn a_finished_receive_repeats_its_verdict_to_the_sender() {
+        let (xfer, room, sender, stranger) = ([7u8; 16], [8u8; 16], [9u8; 32], [10u8; 32]);
+        let t0 = Instant::now();
+        let mut finished = FinishedXfers::default();
+        finished.record(xfer, room, sender, b"done".to_vec(), t0);
+
+        assert!(finished.due(t0 + Duration::from_secs(1)).is_empty());
+        let first = finished.due(t0 + Duration::from_secs(3));
+        assert_eq!(first, vec![(room, sender, b"done".to_vec())]);
+        assert!(finished.due(t0 + Duration::from_secs(4)).is_empty(), "each repeat once");
+        assert_eq!(finished.due(t0 + Duration::from_secs(15)).len(), 1);
+        assert!(finished.due(t0 + Duration::from_secs(60)).is_empty(), "then no more unasked");
+
+        let later = t0 + Duration::from_secs(95);
+        assert!(
+            finished.answer(&xfer, &stranger, later).is_none(),
+            "only its sender is answered"
+        );
+        assert_eq!(finished.answer(&xfer, &sender, later), Some((room, b"done".to_vec())));
+        assert!(finished.answer(&xfer, &sender, later + Duration::from_secs(1)).is_none());
+        assert!(finished.answer(&xfer, &sender, later + Duration::from_secs(3)).is_some());
+        assert!(finished.answer(&[0u8; 16], &sender, later).is_none());
+        assert!(finished
+            .answer(&xfer, &sender, t0 + XFER_FINISHED_REMEMBER + Duration::from_secs(1))
+            .is_none());
+    }
+
+    #[test]
+    fn remembered_verdicts_are_bounded() {
+        let t0 = Instant::now();
+        let mut finished = FinishedXfers::default();
+        for i in 0..XFER_FINISHED_CAP + 5 {
+            let mut xfer = [0u8; 16];
+            xfer[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let at = t0 + Duration::from_millis(i as u64);
+            finished.record(xfer, [0; 16], [1; 32], Vec::new(), at);
+        }
+        assert_eq!(finished.entries.len(), XFER_FINISHED_CAP);
+        assert!(!finished.entries.contains_key(&[0u8; 16]), "the oldest made way");
+    }
+
+    /// A send whose every byte went out asks once before it is called stalled;
+    /// one that never got that far, or was already asked, is given up on.
+    #[test]
+    fn a_fully_sent_transfer_asks_before_it_reports_a_stall() {
+        let size = XFER_BLOCK_SIZE as u64 * 2;
+        let mut send =
+            SendState::new([1; 16], [2; 32], [3; 32], "a.bin".into(), size, PathBuf::new());
+        let now = Instant::now();
+        send.accepted = true;
+        assert_eq!(send.stall_verdict(now), SendStall::GiveUp, "bytes still owed");
+
+        send.note_streamed(size);
+        assert_eq!(send.stall_verdict(now), SendStall::AskFirst);
+        assert_eq!(send.stall_verdict(now + Duration::from_secs(5)), SendStall::Waiting);
+        let lapsed = now + Duration::from_secs(XFER_VERDICT_WAIT_SECS + 1);
+        assert_eq!(send.stall_verdict(lapsed), SendStall::GiveUp);
+
+        // The recipient asking again means it was alive, so the next stall
+        // gets its own question.
+        send.enqueue(0, 1);
+        assert_eq!(send.stall_verdict(lapsed), SendStall::AskFirst);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_received_file_is_marked_as_from_the_internet() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-motw-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = TempDir(dir.clone());
+        let file = dir.join("report.pdf");
+        std::fs::write(&file, b"%PDF").unwrap();
+        mark_received_from_internet(&file);
+        let mut stream = file.as_os_str().to_os_string();
+        stream.push(":Zone.Identifier");
+        assert_eq!(std::fs::read(&stream).unwrap(), ZONE_IDENTIFIER_INTERNET);
+        assert_eq!(std::fs::read(&file).unwrap(), b"%PDF", "the file itself is untouched");
+        let missing = dir.join("missing.bin");
+        mark_received_from_internet(&missing);
+        assert!(!missing.exists(), "marking a file that is gone must not create it");
     }
 
     /// While a stream writes the part file, nothing is asked for and a late

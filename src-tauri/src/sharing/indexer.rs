@@ -77,6 +77,30 @@ const SENSITIVE_SHARE_FILE_NAMES: &[&str] = &[
     ".pypirc",
     ".pgpass",
     ".dockercfg",
+    // Plaintext tokens and shell histories (which routinely hold pasted
+    // secrets) that live directly in a home folder.
+    ".git-credentials",
+    "credentials.toml",
+    ".my.cnf",
+    ".vault-token",
+    ".s3cfg",
+    ".bash_history",
+    ".zsh_history",
+    // fish keeps its under `~/.local/share/fish`.
+    "fish_history",
+    ".python_history",
+    ".psql_history",
+    ".mysql_history",
+    ".node_repl_history",
+    // Browser credential and cookie stores, wherever the profile sits
+    // (including Flatpak's `~/.var/app/*`).
+    "logins.json",
+    "key3.db",
+    "key4.db",
+    "cookies.sqlite",
+    "login data",
+    "web data",
+    "cookies",
     // Ember profile material. `is_excluded_share_location` only matches the
     // live data directory; a copy elsewhere would be hashed and announced.
     "identity.json",
@@ -92,8 +116,9 @@ const EMBER_DB_BASENAME: &str = "ember.db";
 
 /// Extensions that only ever carry private keys or key stores. Unlike the
 /// basenames above these are unambiguous, so any file with one is excluded.
+/// `keyring` is a GNOME keyring and `kwl` a KDE wallet.
 const SENSITIVE_SHARE_FILE_EXTENSIONS: &[&str] =
-    &["pem", "ppk", "pfx", "p12", "kdbx", "keystore", "jks"];
+    &["pem", "ppk", "pfx", "p12", "kdbx", "keystore", "jks", "keyring", "kwl"];
 
 /// Names discovery refuses to share: partial downloads, their sidecars, our own
 /// temp/backup files, and credential material. Shared with the `known.met`
@@ -183,7 +208,7 @@ fn canonical_data_dir() -> &'static Path {
 pub fn is_excluded_share_location(path: &Path) -> bool {
     for component in path.components() {
         if let std::path::Component::Normal(name) = component {
-            if crate::sharing::is_sensitive_dir_name(&name.to_string_lossy()) {
+            if crate::sharing::is_index_skip_dir_name(&name.to_string_lossy()) {
                 return true;
             }
         }
@@ -433,7 +458,10 @@ impl FileIndexer {
                     }
                 }
                 if file_type.is_dir() {
-                    if crate::sharing::is_sensitive_dir_name(&entry.file_name().to_string_lossy()) {
+                    let dir_name = entry.file_name().to_string_lossy().into_owned();
+                    if crate::sharing::is_index_skip_dir_name(&dir_name)
+                        || crate::sharing::is_private_receive_dir_name(&dir_name)
+                    {
                         continue;
                     }
                     if let Ok(canonical) = entry_path.canonicalize() {
@@ -609,7 +637,10 @@ impl FileIndexer {
                 }
                 let entry_path = entry.path();
                 if file_type.is_dir() {
-                    if crate::sharing::is_sensitive_dir_name(&entry.file_name().to_string_lossy()) {
+                    let dir_name = entry.file_name().to_string_lossy().into_owned();
+                    if crate::sharing::is_index_skip_dir_name(&dir_name)
+                        || crate::sharing::is_private_receive_dir_name(&dir_name)
+                    {
                         continue;
                     }
                     if let Ok(canonical) = entry_path.canonicalize() {
@@ -1142,6 +1173,13 @@ mod tests {
             "identity.json.ember-replace-bak",
             "cryptkey.dat.20260819120000.corrupt",
             "chat-history.key.ember-replace-bak",
+            "kdewallet.kwl",
+            "login.keyring",
+            "fish_history",
+            ".vault-token",
+            ".s3cfg",
+            "Web Data",
+            "cookies.sqlite",
         ] {
             assert!(
                 is_excluded_share_file_name(&Path::new(r"C:\Users\me\Documents").join(name)),

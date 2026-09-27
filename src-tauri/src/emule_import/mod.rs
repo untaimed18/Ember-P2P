@@ -505,7 +505,7 @@ pub fn scan(source_id: u32, ctx: &ScanContext) -> anyhow::Result<EmulePreview> {
     let ipfilter = existing(config_dir.join("ipfilter.dat"))
         .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 0));
 
-    let token = rand::random::<u64>();
+    let token = crate::commands::js_safe_token();
     let preview = EmulePreview {
         token,
         source: install,

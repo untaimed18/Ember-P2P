@@ -73,7 +73,7 @@ use self::ed2k::credits::CreditManager;
 use self::ed2k::dead_sources::DeadSourceList;
 use self::ed2k::messages::{OP_EDONKEYHEADER, OP_EMULEPROT, OP_PORTTEST};
 use self::ed2k::multi_source::{DownloadSource, MultiSourceDownload, SharedTrackerRegistry};
-use self::ed2k::server::Ed2kServerConnection;
+use self::ed2k::server::{Ed2kServerConnection, ServerLink};
 use self::ed2k::server_list::{ServerEntry, ServerList};
 use self::ed2k::server_udp::{ServerUdpResponse, ServerUdpSocket};
 use self::ed2k::sources::SourceManager;
@@ -722,9 +722,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         pending_keyword_searches: HashMap::new(),
         pending_server_search: None,
         active_search_request: None,
-        server_search_more_needed: false,
+        server_search_more_due_at: None,
         server_search_more_requests: 0,
         server_followup_search: None,
+        server_followup_due_at: None,
         server_poll_count: 0,
         server_search_age: 0,
         server_udp_search_age: 0,
@@ -777,6 +778,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         notes_publish_cursor: None,
         overloaded_nodes: HashMap::new(),
         flood_protection: FloodProtection::new(),
+        kad_outbound: parking_lot::Mutex::new(kad::outbound::KadOutboundGovernor::new()),
         legacy_challenges: LegacyChallengeTracker::new(),
         buddy_manager,
         udp_key_seed,
@@ -812,6 +814,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         offered_ed2k_hashes: HashSet::new(),
         server_tcp_getsources_cursor: 0,
         server_tcp_srcreq_next_at: 0,
+        server_tcp_srcreq_file_at: HashMap::new(),
+        server_tcp_srcreq_asks: VecDeque::new(),
         server_connected_at: 0,
         starved_server_reask_at: std::collections::HashMap::new(),
         kad_source_search_cursor: 0,
@@ -1022,6 +1026,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_source_search_state: HashMap::new(),
         ember_pending_source_injections: Vec::new(),
         ember_pending_callback_connects: Vec::new(),
+        pending_direct_callbacks: Vec::new(),
+        direct_callback_requests: HashMap::new(),
         ember_pending_proxy_overlay: HashMap::new(),
         ember_proxy_buddies: EmberProxyBuddyPacer::default(),
         channel_gossip_seen: HashMap::new(),
@@ -1395,12 +1401,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             }
             Err(_) => {}
         }
-        // Map still-banned reputation identities onto cached source IPs so
-        // enforcement matches a live session after restart.
-        for uh in state.reputation.currently_banned_node_ids() {
-            for ip in sm.find_ips_by_user_hash(&uh) {
-                state.banned_ips.insert(ip);
-            }
+        // Still-banned identities are refused by user hash, and the addresses
+        // they were caught on are in IP reputation (see
+        // `apply_enforced_banned_ips` for why cached source rows are not).
+        for ip in state.reputation.currently_banned_ips() {
+            state.banned_ips.insert(ip);
         }
         if let Ok(mut shared) = shared_banned_ips.write() {
             *shared = state.banned_ips.clone();
@@ -1448,7 +1453,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // ident_ip) across restarts instead of blanking until the peer
                 // reconnects.
                 record.ident_ip = ident_ip;
-                record.ident_state = ed2k::credits::IdentState::from_u8(ident_state);
+                // Identification is per session, as in eMule, which loads a
+                // keyed record as IS_IDNEEDED (`ClientCredits.cpp:293-302`).
+                // Restoring `Verified` with its old IP made a peer that later
+                // regenerated its key and moved address a permanent BadGuy
+                // (queue score 0): its new signatures never verify, so the
+                // stale pin was never replaced.
+                record.ident_state = match ed2k::credits::IdentState::from_u8(ident_state) {
+                    ed2k::credits::IdentState::Verified | ed2k::credits::IdentState::Failed => {
+                        ed2k::credits::IdentState::Needed
+                    }
+                    other => other,
+                };
                 record.ember_hash = ember_hash;
                 // Assigning `ident_state` directly bypasses `set_ident_state`,
                 // which is what makes the anchor sticky in memory — so it has
@@ -2237,6 +2253,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // Rate-limited LowID callback flush after login (avoid monopolizing the loop).
     let mut pending_lowid_callback_queue: std::collections::VecDeque<([u8; 16], u32)> =
         std::collections::VecDeque::new();
+    let mut next_lowid_callback_at = tokio::time::Instant::now();
     // Chunked OP_OFFERFILES across loop turns (post-login + shared-files changes).
     let mut pending_offer_files: Option<Vec<ed2k::server::OfferFile>> = None;
     let mut pending_offer_signature: Option<(usize, u64)> = None;
@@ -2455,7 +2472,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         if !pending_lowid_callback_queue.is_empty()
             && state.server_connected
             && !state.low_id
+            && tokio::time::Instant::now() >= next_lowid_callback_at
         {
+            next_lowid_callback_at = tokio::time::Instant::now() + LOWID_CALLBACK_INTERVAL;
             if let Some(conn) = state.server_connection.as_mut() {
                 let mut succeeded = Vec::new();
                 for _ in 0..MAX_LOWID_CALLBACKS_PER_TURN {
@@ -2463,11 +2482,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     else {
                         break;
                     };
-                    if conn.request_callback(client_id).await.is_ok() {
+                    if conn.request_callback(client_id).is_ok() {
                         succeeded.push((file_hash, client_id));
                     } else {
-                        // Keep the entry and stop this turn — further attempts
-                        // against a failing TCP session would just burn the quota.
+                        // Keep the entry and stop this turn: the writer queue
+                        // is full or the session is broken, and either way
+                        // the rest would be refused too.
                         pending_lowid_callback_queue.push_front((file_hash, client_id));
                         break;
                     }
@@ -2484,6 +2504,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     );
                 }
             }
+        }
+
+        // A new download or Find Sources waits for the next source frame,
+        // not the sweep's next 4-minute tick: when the frame budget is open,
+        // run it now. The tick either spends the frame or drops every ask it
+        // could not use, so this cannot fire twice for the same line.
+        if !state.server_tcp_srcreq_asks.is_empty()
+            && server_tcp_srcreq_frame_open(&state, chrono::Utc::now().timestamp())
+        {
+            server_tcp_source_timer.reset_immediately();
         }
 
 
@@ -4053,7 +4083,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &db,
                     &app_handle,
                     &transfer_manager,
-                    &source_manager,
                     &mut stats_manager,
                     &mut known_files,
                     &shared_banned_ips,
@@ -4472,6 +4501,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &transfer_manager,
                     &source_manager,
                     &mut stats_manager,
+                    &app_handle,
                 ))
                 .catch_unwind()
                 .await;

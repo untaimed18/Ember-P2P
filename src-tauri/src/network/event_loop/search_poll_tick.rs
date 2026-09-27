@@ -116,11 +116,15 @@ pub(in crate::network) async fn on_search_poll_tick(
         }
         if let Ok(packet) = messages::encode_packet(&msg) {
             let opcode = packet.get(1).copied().unwrap_or(0);
-            if send_kad_packet(
+            if let Err(e) = send_kad_packet(
                 udp_socket, &packet, addr, state, &contact_id,
-            ).await.is_err() {
+            ).await {
                 if let Some(search) = state.search_manager.get_mut(&sid) {
-                    search.rollback_unsent_query(contact_id, &msg);
+                    if is_kad_request_paced(&e) {
+                        search.skip_paced_query(contact_id, &msg);
+                    } else {
+                        search.rollback_unsent_query(contact_id, &msg);
+                    }
                 }
                 continue;
             }
@@ -188,16 +192,20 @@ pub(in crate::network) async fn on_search_poll_tick(
                                 continue;
                             }
                             if let Ok(packet) = messages::encode_packet(msg) {
-                                if send_kad_packet(
+                                let sent = send_kad_packet(
                                     udp_socket,
                                     &packet,
                                     addr,
                                     state,
                                     &contact.id,
                                 )
-                                .await
-                                .is_ok()
-                                {
+                                .await;
+                                if sent.as_ref().is_err_and(is_kad_request_paced) {
+                                    if let Some(search) = state.search_manager.get_mut(&sid) {
+                                        search.defer_publish(contact);
+                                    }
+                                }
+                                if sent.is_ok() {
                                     state.flood_protection.track_request(addr, opcode);
                                     if let Some(sent_search) =
                                         state.search_manager.get_mut(&sid)
@@ -230,7 +238,7 @@ pub(in crate::network) async fn on_search_poll_tick(
     // the DHT walk finding in-tolerance nodes rather than only at
     // search completion (now held open for close to the full
     // eMule lifetime — see `check_phase_transition`). A keyword
-    // batch can carry multiple 50-entry packets, so every
+    // batch can carry up to three 50-entry packets, so every
     // eagerly-found contact gets all of them.
     {
         let store_sids: Vec<SearchId> = state.store_keyword_searches.keys().copied().collect();
@@ -239,48 +247,31 @@ pub(in crate::network) async fn on_search_poll_tick(
                 let candidates = search.next_publish_candidates();
                 if !candidates.is_empty() {
                     if let Some(batch) = state.store_keyword_searches.get(&sid).cloned() {
+                        let Some(packets) = encode_keyword_batch(&batch) else {
+                            continue;
+                        };
                         for contact in &candidates {
                             let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                             if state.flood_protection.check_outgoing_rate(addr.ip()) {
                                 debug!("Throttling eager keyword publish to {addr}");
                                 continue;
                             }
-                            let mut successful_packets = 0usize;
-                            for msg in &batch.messages {
-                                if let Ok(packet) = messages::encode_packet(msg) {
-                                    if send_kad_packet(
-                                        udp_socket,
-                                        &packet,
-                                        addr,
-                                        state,
-                                        &contact.id,
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        continue;
-                                    }
-                                    let opcode = kad_request_opcode(msg).unwrap_or(0);
-                                    state.flood_protection.track_request(addr, opcode);
-                                    successful_packets += 1;
-                                    let now_ts = chrono::Utc::now().timestamp();
-                                    let pending = state
-                                        .publish_pending
-                                        .entry((batch.keyword_hash, addr))
-                                        .or_insert((batch.keyword_hash, now_ts, false, 0));
-                                    pending.0 = batch.keyword_hash;
-                                    pending.1 = now_ts;
-                                    pending.2 = false;
-                                    pending.3 = pending.3.saturating_add(1);
+                            // The whole batch is charged at once, so a node
+                            // either gets every packet or is left for later.
+                            if !kad_requests_allowed(state, addr, &packets[0], packets.len()) {
+                                if let Some(search) = state.search_manager.get_mut(&sid) {
+                                    search.defer_publish(contact);
                                 }
+                                continue;
                             }
+                            let sent =
+                                send_keyword_batch(udp_socket, state, &batch, &packets, addr, contact)
+                                    .await;
                             // A keyword peer is complete only after
                             // every split packet reached the socket.
                             // Partial success remains retryable on
                             // the next StorePacket tick.
-                            if successful_packets == batch.messages.len()
-                                && successful_packets > 0
-                            {
+                            if sent == packets.len() {
                                 if let Some(sent_search) =
                                     state.search_manager.get_mut(&sid)
                                 {
@@ -323,7 +314,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                 let Ok(packet) = messages::encode_packet(&note.message) else {
                     continue;
                 };
-                if send_kad_packet(
+                if let Err(e) = send_kad_packet(
                     udp_socket,
                     &packet,
                     addr,
@@ -331,8 +322,12 @@ pub(in crate::network) async fn on_search_poll_tick(
                     &contact.id,
                 )
                 .await
-                .is_err()
                 {
+                    if is_kad_request_paced(&e) {
+                        if let Some(search) = state.search_manager.get_mut(&sid) {
+                            search.defer_publish(contact);
+                        }
+                    }
                     continue;
                 }
                 state.flood_protection.track_request(addr, opcode);
@@ -2120,7 +2115,6 @@ pub(in crate::network) async fn on_search_poll_tick(
             // that reference the keyword (up to 150, split into
             // 50-entry packets), not one DHT walk per file token.
             if let Some(search) = state.search_manager.get(&sid) {
-                let now = chrono::Utc::now().timestamp();
                 // Publish only to nodes that actually answered during
                 // the lookup AND fall within the eMule search tolerance
                 // of the keyword target (mirrors the StoreSource path).
@@ -2130,64 +2124,40 @@ pub(in crate::network) async fn on_search_poll_tick(
                 // (`next_publish_candidates`) already reached while
                 // the search was walking — this is the completion
                 // mop-up, not a resend of it.
-                let already_published = &search.store_sent;
-                let remaining = STORE_PUBLISH_TARGET_TOTAL.saturating_sub(already_published.len());
-                let candidates: Vec<&kad::types::KadContact> = search.closest.iter()
+                let already_published = search.store_sent.len();
+                let remaining = STORE_PUBLISH_TARGET_TOTAL.saturating_sub(already_published);
+                let candidates: Vec<kad::types::KadContact> = search.closest.iter()
                     .filter(|c| {
-                        !already_published.contains(&c.id)
+                        !search.store_sent.contains(&c.id)
                             && !state.overloaded_nodes.contains_key(&c.ip)
                             && search.responded_during_lookup.contains(&c.id)
                             && kad::search::within_search_tolerance_pub(&search.target, &c.id)
                     })
                     .take(remaining)
+                    .cloned()
                     .collect();
                 let mut successful_packets = 0usize;
                 let mut successful_peers = 0usize;
-                for contact in &candidates {
+                let packets = encode_keyword_batch(&batch).unwrap_or_default();
+                for contact in candidates.iter().filter(|_| !packets.is_empty()) {
                     let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                     if state.flood_protection.check_outgoing_rate(addr.ip()) {
                         debug!("Throttling completion keyword publish to {addr}");
                         continue;
                     }
-                    let mut peer_packets = 0usize;
-                    for msg in &batch.messages {
-                        if let Ok(packet) = messages::encode_packet(msg) {
-                            if send_kad_packet(
-                                udp_socket,
-                                &packet,
-                                addr,
-                                state,
-                                &contact.id,
-                            )
-                            .await
-                            .is_err()
-                            {
-                                continue;
-                            }
-                            state.flood_protection.track_request(
-                                addr,
-                                kad_request_opcode(msg).unwrap_or(0),
-                            );
-                            // Per-peer pending entry so every ack counts.
-                            let pending = state
-                                .publish_pending
-                                .entry((batch.keyword_hash, addr))
-                                .or_insert((batch.keyword_hash, now, false, 0));
-                            pending.0 = batch.keyword_hash;
-                            pending.1 = now;
-                            pending.2 = false;
-                            pending.3 = pending.3.saturating_add(1);
-                            peer_packets += 1;
-                            successful_packets += 1;
-                        }
+                    if !kad_requests_allowed(state, addr, &packets[0], packets.len()) {
+                        continue;
                     }
-                    if peer_packets == batch.messages.len() && peer_packets > 0 {
+                    let peer_packets =
+                        send_keyword_batch(udp_socket, state, &batch, &packets, addr, contact).await;
+                    successful_packets += peer_packets;
+                    if peer_packets == packets.len() {
                         successful_peers += 1;
                     }
                 }
-                let total_published = already_published.len() + successful_peers;
+                let total_published = already_published + successful_peers;
                 if total_published > 0 {
-                    state.publish_manager.mark_keyword_published(&batch.keyword_hash);
+                    state.publish_manager.mark_keyword_batch_published(&batch);
                     info!(
                         "StoreKeyword search {} completed: published keyword '{}' ({} file entries, {} packet send(s)) to {} fully-reached nodes ({} during lookup, {} at completion)",
                         sid.0,
@@ -2195,7 +2165,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                         batch.file_hashes.len(),
                         successful_packets,
                         total_published,
-                        already_published.len(),
+                        already_published,
                         successful_peers,
                     );
                 }
@@ -2286,8 +2256,10 @@ pub(in crate::network) async fn on_search_poll_tick(
                         .copied()
                         .unwrap_or(0);
                     if acked == 0 {
-                        state.ember_rendezvous_published_at = 0;
-                        info!("Ember rendezvous: advert unacknowledged, will retry");
+                        state.ember_rendezvous_published_at = chrono::Utc::now().timestamp()
+                            - EMBER_RENDEZVOUS_REPUBLISH_SECS
+                            + EMBER_RENDEZVOUS_UNACKED_RETRY_SECS;
+                        info!("Ember rendezvous: advert unacknowledged, will retry in 10 minutes");
                     } else {
                         info!("Ember rendezvous: advert stored by {acked} peer(s)");
                     }
@@ -2553,4 +2525,53 @@ pub(in crate::network) async fn on_search_poll_tick(
             rendezvous_target,
         );
     }
+}
+
+/// Every packet of a keyword batch, or `None` when one cannot be encoded: a
+/// node only counts as reached with the whole batch, so none is sent.
+fn encode_keyword_batch(batch: &kad::publish::KeywordPublishBatch) -> Option<Vec<Vec<u8>>> {
+    let packets = batch
+        .messages
+        .iter()
+        .map(messages::encode_packet)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    (!packets.is_empty()).then_some(packets)
+}
+
+/// Send a keyword batch already charged with `kad_requests_allowed` to
+/// `addr`, tracking each packet that left for ack matching. Returns how many
+/// did.
+async fn send_keyword_batch(
+    udp_socket: &UdpSocket,
+    state: &mut NetworkState,
+    batch: &kad::publish::KeywordPublishBatch,
+    packets: &[Vec<u8>],
+    addr: SocketAddr,
+    contact: &KadContact,
+) -> usize {
+    let mut sent = 0usize;
+    for packet in packets {
+        if send_prepaid_kad_packet(udp_socket, packet, addr, state, &contact.id)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        state
+            .flood_protection
+            .track_request(addr, kad::messages::KADEMLIA2_PUBLISH_KEY_REQ);
+        sent += 1;
+        // Per-peer pending entry so every ack counts.
+        let now_ts = chrono::Utc::now().timestamp();
+        let pending = state
+            .publish_pending
+            .entry((batch.keyword_hash, addr))
+            .or_insert((batch.keyword_hash, now_ts, false, 0));
+        pending.0 = batch.keyword_hash;
+        pending.1 = now_ts;
+        pending.2 = false;
+        pending.3 = pending.3.saturating_add(1);
+    }
+    sent
 }

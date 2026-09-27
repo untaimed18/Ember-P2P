@@ -29,7 +29,7 @@ pub(in crate::network) async fn on_server_connect_result(
 ) {
     state.pending_server_connect = None;
     match result {
-        Ok(ServerConnectResult { addr, ip, port, login_tcp_port, result: Ok((mut conn, session)) }) => {
+        Ok(ServerConnectResult { addr, ip, port, login_tcp_port, result: Ok((conn, session)) }) => {
             // Check server IP against IP filter (eMule: FilterServerByIP)
             if settings.filter_servers_by_ip {
                 let server_ipv4 = match addr.ip() {
@@ -42,7 +42,7 @@ pub(in crate::network) async fn on_server_connect_result(
                     if !skip_fail_closed && state.ip_filter.is_blocked(ipv4) {
                         warn!("Server {ip}:{port} blocked by IP filter, disconnecting");
                         emit_server_log(app_handle, &format!("Server {ip}:{port} blocked by IP filter"));
-                        conn.disconnect().await;
+                        drop(conn);
                         state.server_list.record_failure(&ip, port);
                         let met_path = state.data_dir.join("server.met");
                         spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
@@ -69,8 +69,9 @@ pub(in crate::network) async fn on_server_connect_result(
                 emit_server_log(app_handle, &format!("Server: {motd}"));
             }
 
+            let mut conn = conn.into_link(session.clone());
             let is_low = conn.is_low_id();
-            let our_id = conn.our_client_id().unwrap_or(0);
+            let our_id = conn.our_client_id();
             let id_type = if is_low { "LowID" } else { "HighID" };
             info!("Connected to ed2k server: {} ({} users, {} files, {} id={})",
                 session.server_name, session.user_count, session.file_count,
@@ -86,7 +87,8 @@ pub(in crate::network) async fn on_server_connect_result(
             state.server_list.record_success(&ip, port);
             state.server_connected = true;
             ed2k::server::set_server_flags_mirror(session.server_flags);
-            state.server_reconnect_failures = 0;
+            // `server_reconnect_failures` is deliberately left alone: only a
+            // session that lasts clears it (`handle_server_disconnect`).
             state.preferred_ed2k_server = Some((ip.clone(), port));
             {
                 let last = ed2k::server_list::LastEd2kServer {
@@ -259,7 +261,7 @@ pub(in crate::network) async fn on_server_connect_result(
                 // don't push the list unsolicited — they wait for the
                 // client to ask. Without this our `add_servers_from_server`
                 // setting was effectively dead for the common case.
-                if let Err(e) = conn.request_server_list().await {
+                if let Err(e) = conn.request_server_list() {
                     debug!("Failed to send OP_GETSERVERLIST: {e}");
                 }
             }
@@ -293,7 +295,7 @@ pub(in crate::network) async fn on_server_connect_result(
                                 name: f.name.clone(),
                                 size: f.size,
                                 is_complete: true,
-                                file_type: String::new(),
+                                file_type: ed2k::server::offer_file_type(&f.name),
                             })
                         })
                         .collect();
@@ -335,7 +337,7 @@ pub(in crate::network) async fn on_server_connect_result(
                             name: transfer.file_name.clone(),
                             size: transfer.total_size,
                             is_complete: false,
-                            file_type: String::new(),
+                            file_type: ed2k::server::offer_file_type(&transfer.file_name),
                         });
                     }
                 }

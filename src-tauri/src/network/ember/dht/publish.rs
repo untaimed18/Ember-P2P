@@ -811,6 +811,31 @@ pub struct ChannelModeration {
     pub tail: ModerationTail,
     pub timestamp: i64,
     pub publisher_key: [u8; 32],
+    /// Breaks ties between two snapshots stamped the same second. See
+    /// [`moderation_supersedes`].
+    pub signature: [u8; 64],
+}
+
+/// Whether a snapshot stamped `(timestamp, signature)` replaces the one held
+/// at `(held_timestamp, held_signature)`.
+///
+/// Newer wins. Two different snapshots in one second — which an owner on a
+/// build before stamps were made strictly increasing can still produce — are
+/// ordered by signature, so every member and storer settles on the same one
+/// rather than on whichever reached it last. The same snapshot again is not a
+/// replacement but is harmless to apply, and a held one whose signature was
+/// never recorded is treated as the old rule treated every tie.
+pub fn moderation_supersedes(
+    timestamp: i64,
+    signature: &[u8; 64],
+    held_timestamp: i64,
+    held_signature: Option<&[u8; 64]>,
+) -> bool {
+    match timestamp.cmp(&held_timestamp) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => held_signature.is_none_or(|held| signature >= held),
+    }
 }
 
 /// Owner-signed successor mapping. `file_hash` is the **old** channel_id.
@@ -971,6 +996,7 @@ impl SignedRecord {
             None,
             media,
             signing_key,
+            chrono::Utc::now().timestamp(),
         )
     }
 
@@ -1109,6 +1135,39 @@ impl SignedRecord {
         private: bool,
         signing_key: &SigningKey,
     ) -> Option<Self> {
+        Self::channel_moderation_at(
+            topic,
+            welcome,
+            banned_pubkeys,
+            moderator_pubkeys,
+            tail,
+            channel_id,
+            channel_pubkey,
+            private,
+            signing_key,
+            chrono::Utc::now().timestamp(),
+        )
+    }
+
+    /// [`Self::channel_moderation`] stamped `timestamp` rather than now.
+    ///
+    /// Snapshots are whole replacements ordered by this stamp alone, and it is
+    /// whole seconds, so an owner signing two in one second — an edit racing the
+    /// republish — would publish two different snapshots every storer and
+    /// member ranks as equal. Owners stamp from
+    /// `Database::stamp_owner_snapshot`, which never repeats.
+    pub fn channel_moderation_at(
+        topic: &str,
+        welcome: &str,
+        banned_pubkeys: &[[u8; 32]],
+        moderator_pubkeys: &[[u8; 32]],
+        tail: &ModerationTail,
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        private: bool,
+        signing_key: &SigningKey,
+        timestamp: i64,
+    ) -> Option<Self> {
         let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
         let tail = fit_moderation_pins(topic, welcome, banned_pubkeys, moderator_pubkeys, tail);
         let topic = truncate_utf8(topic, CHANNEL_NAME_MAX);
@@ -1124,7 +1183,7 @@ impl SignedRecord {
         {
             return None;
         }
-        Some(Self::build(
+        Some(Self::build_with_media(
             RECORD_TYPE_CHANNEL,
             channel::moderation_key(&channel_id),
             channel_id,
@@ -1133,7 +1192,9 @@ impl SignedRecord {
             topic,
             None,
             Some(extra),
+            None,
             signing_key,
+            timestamp,
         ))
     }
 
@@ -1366,6 +1427,7 @@ impl SignedRecord {
             channel_extra,
             None,
             signing_key,
+            chrono::Utc::now().timestamp(),
         )
     }
 
@@ -1381,9 +1443,9 @@ impl SignedRecord {
         channel_extra: Option<Vec<u8>>,
         media: Option<&crate::types::MediaMetadata>,
         signing_key: &SigningKey,
+        timestamp: i64,
     ) -> Self {
         let publisher_key = signing_key.verifying_key().to_bytes();
-        let timestamp = chrono::Utc::now().timestamp();
         let contact_bytes = source_contact_encoded_len(source_contact.as_ref());
         // Encoded before the name is clamped, because its length is part of what
         // the name has to fit around.
@@ -1576,6 +1638,7 @@ impl SignedRecord {
             tail,
             timestamp: rec.timestamp,
             publisher_key: rec.publisher_key,
+            signature: rec.signature,
         })
     }
 
@@ -3451,6 +3514,50 @@ mod tests {
                 .unwrap();
         assert_eq!(member_info.nickname, "Ada");
         assert_eq!(member_info.noise_pub, noise_pub);
+    }
+
+    /// A snapshot carries the stamp it was built at and the signature that
+    /// orders it against another from the same second.
+    #[test]
+    fn a_stamped_moderation_snapshot_parses_back_with_its_stamp_and_signature() {
+        let ident = channel::ChannelIdentity::generate();
+        let at = chrono::Utc::now().timestamp() + 3;
+        let record = SignedRecord::channel_moderation_at(
+            "rules",
+            "",
+            &[],
+            &[],
+            &ModerationTail::default(),
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+            at,
+        )
+        .expect("the fixture fits one record");
+        assert_eq!(record.timestamp, at);
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        let parsed = SignedRecord::parse_channel_moderation(&blob, &ident.channel_id).unwrap();
+        assert_eq!(parsed.timestamp, at);
+        assert_eq!(parsed.signature, record.signature);
+    }
+
+    #[test]
+    fn moderation_snapshots_order_by_stamp_then_signature() {
+        let (low, high) = ([0x10u8; 64], [0x20u8; 64]);
+        assert!(moderation_supersedes(11, &low, 10, Some(&high)), "newer wins");
+        assert!(!moderation_supersedes(9, &high, 10, Some(&low)), "older never does");
+        assert!(moderation_supersedes(10, &high, 10, Some(&low)));
+        assert!(!moderation_supersedes(10, &low, 10, Some(&high)));
+        assert!(
+            moderation_supersedes(10, &low, 10, Some(&low)),
+            "the same snapshot again is harmless to apply"
+        );
+        assert!(
+            moderation_supersedes(10, &low, 10, None),
+            "a held snapshot with no recorded signature ties the old way"
+        );
     }
 
     #[test]

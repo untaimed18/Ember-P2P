@@ -19,6 +19,7 @@
   import { onMount, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
   import { translateError, degradedReasonText } from '$lib/i18n';
+  import { kadNodesLoadedText } from '$lib/commandReplies';
   import { inertBackground } from '$lib/a11y';
   import { copyToClipboard, formatDateTime, formatNumber } from '$lib/utils';
   import IconX from '$lib/components/IconX.svelte';
@@ -273,8 +274,8 @@
           toastError(m.kad_bootstrap_port_range());
           return;
         }
-        const result = await kadBootstrapIp(host, portNum);
-        toastSuccess(result || m.kad_bootstrap_from_host({ host, port: portNum }));
+        await kadBootstrapIp(host, portNum);
+        toastSuccess(m.kad_bootstrap_from_host({ host, port: portNum }));
       } else if (bootstrapMode === 'url') {
         const url = bootstrapUrl.trim();
         if (!url) { toastError(m.kad_bootstrap_url_required()); return; }
@@ -282,8 +283,7 @@
           toastError(m.kad_bootstrap_url_must_be_https());
           return;
         }
-        const result = await kadBootstrapUrl(url);
-        toastSuccess(result || m.kad_bootstrap_loaded_url());
+        toastSuccess(kadNodesLoadedText(await kadBootstrapUrl(url)));
       } else {
         if (contacts.length === 0) return;
         await kadBootstrapClients();

@@ -26,6 +26,8 @@ pub(super) enum ChannelRelayEvent {
     Frame {
         peer_pubkey: [u8; 32],
         body: Vec<u8>,
+        /// Counts this frame against its session until the event is dropped.
+        _queued: QueuedRelayFrame,
     },
     Closed {
         peer_pubkey: [u8; 32],
@@ -66,6 +68,54 @@ impl Drop for ChannelRelaySessionGuard {
             session_id: self.session_id,
         });
     }
+}
+
+/// Frames one relay session may pass to the event loop per second: the most
+/// the loop's own per-hop admission could take from that peer, transfer
+/// allowance included. The loop still applies the exact check; this one runs
+/// before anything is queued, so a peer sending faster costs a dropped buffer
+/// rather than a growing queue.
+pub(super) const CHANNEL_RELAY_FRAMES_PER_SEC: usize =
+    ember::channel::CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC
+        + ember::channel::CHANNEL_XFER_IN_PER_PEER_PER_SEC;
+
+/// Frames one session may have queued for the event loop and not yet had
+/// applied. The loop drains relay events once a tick, so a second's worth is
+/// what an honest peer can have waiting; past it, a loop that has fallen
+/// behind sheds new frames instead of holding them.
+pub(super) const CHANNEL_RELAY_FRAMES_QUEUED_MAX: usize = CHANNEL_RELAY_FRAMES_PER_SEC;
+
+/// One frame a relay session has queued for the event loop. Dropping it,
+/// which happens once the loop has applied the event, releases its place.
+pub(super) struct QueuedRelayFrame(Arc<std::sync::atomic::AtomicUsize>);
+
+impl QueuedRelayFrame {
+    fn new(queued: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        queued.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(queued.clone())
+    }
+}
+
+impl Drop for QueuedRelayFrame {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Whether a relay session may queue one more inbound frame now, given the
+/// frames it has admitted this second and how many still wait on the loop.
+pub(super) fn relay_frame_admissible(
+    admitted: &mut VecDeque<std::time::Instant>,
+    queued: usize,
+    now: std::time::Instant,
+) -> bool {
+    queued < CHANNEL_RELAY_FRAMES_QUEUED_MAX
+        && ember::channel::rate_window_allow(
+            admitted,
+            now,
+            CHANNEL_GOSSIP_RATE_WINDOW,
+            CHANNEL_RELAY_FRAMES_PER_SEC,
+        )
 }
 
 /// Process-wide source of relay session ids. Monotonic, so a stale close can
@@ -595,6 +645,9 @@ pub(super) async fn run_channel_relay_session(
         }
     });
 
+    let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut admitted: VecDeque<std::time::Instant> = VecDeque::new();
+    let mut shed = 0u64;
     loop {
         tokio::select! {
             body = outbound_rx.recv() => {
@@ -612,10 +665,16 @@ pub(super) async fn run_channel_relay_session(
             // happens here.
             frame = frame_rx.recv() => {
                 let Some(body) = frame else { break; };
+                let waiting = queued.load(std::sync::atomic::Ordering::Acquire);
+                if !relay_frame_admissible(&mut admitted, waiting, std::time::Instant::now()) {
+                    shed += 1;
+                    continue;
+                }
                 if event_tx
                     .send(ChannelRelayEvent::Frame {
                         peer_pubkey,
                         body,
+                        _queued: QueuedRelayFrame::new(&queued),
                     })
                     .is_err()
                 {
@@ -625,6 +684,9 @@ pub(super) async fn run_channel_relay_session(
         }
     }
     reader_task.abort();
+    if shed > 0 {
+        debug!("Ember channel relay: shed {shed} inbound frame(s) over the session budget");
+    }
     // `Closed` is sent by `ChannelRelaySessionGuard` as this task unwinds, so
     // that every exit path reports — not only this one.
 }
@@ -663,7 +725,7 @@ pub(super) async fn apply_channel_relay_event(
                 state.channel_relay_outboxes.remove(&peer_pubkey);
             }
         }
-        ChannelRelayEvent::Frame { peer_pubkey, body } => {
+        ChannelRelayEvent::Frame { peer_pubkey, body, .. } => {
             let from_id =
                 ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(&peer_pubkey));
             handle_inbound_channel_gossip(
@@ -687,4 +749,48 @@ pub(super) fn ember_has_live_session(
     state
         .ember_transport
         .has_live_session(&contact.addr, &contact.noise_pub)
+}
+
+#[cfg(test)]
+mod relay_frame_budget_tests {
+    use super::{
+        relay_frame_admissible, QueuedRelayFrame, CHANNEL_RELAY_FRAMES_PER_SEC,
+        CHANNEL_RELAY_FRAMES_QUEUED_MAX,
+    };
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// A neighbour sending faster than the loop could ever admit from it is
+    /// shed at the session, and the budget comes back as the window rolls.
+    #[test]
+    fn a_session_admits_at_most_its_rate_per_second() {
+        let mut admitted = VecDeque::new();
+        let now = Instant::now();
+        let taken = (0..CHANNEL_RELAY_FRAMES_PER_SEC * 3)
+            .filter(|_| relay_frame_admissible(&mut admitted, 0, now))
+            .count();
+        assert_eq!(taken, CHANNEL_RELAY_FRAMES_PER_SEC);
+        assert!(relay_frame_admissible(&mut admitted, 0, now + Duration::from_millis(1_100)));
+    }
+
+    /// Frames still waiting on a loop that has fallen behind stop the session
+    /// queuing more, whatever the rate allows, until they are applied.
+    #[test]
+    fn a_session_stops_queuing_while_the_loop_holds_a_backlog() {
+        let queued = Arc::new(AtomicUsize::new(0));
+        let backlog: Vec<QueuedRelayFrame> = (0..CHANNEL_RELAY_FRAMES_QUEUED_MAX)
+            .map(|_| QueuedRelayFrame::new(&queued))
+            .collect();
+        let mut admitted = VecDeque::new();
+        assert!(!relay_frame_admissible(
+            &mut admitted,
+            queued.load(Ordering::Acquire),
+            Instant::now()
+        ));
+        drop(backlog);
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+        assert!(relay_frame_admissible(&mut admitted, 0, Instant::now()));
+    }
 }

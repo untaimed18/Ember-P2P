@@ -27,6 +27,15 @@ pub(in crate::network) async fn on_mapping_keepalive_tick(
             + ember::mapping_keepalive::MAPPING_KEEPALIVE_INTERVAL;
         return;
     }
+    // Every cycle contacts third-party STUN servers, which is pointless while
+    // the router forwards all our ports from the address peers see. Behind
+    // carrier NAT the router's own WAN address differs, and keep-alives stay.
+    if upnp::forwarded_external_ip().is_some_and(|ip| state.external_ip == Some(ip)) {
+        state.stats.stun_keepalive_active = false;
+        *next_mapping_ka_at = now
+            + ember::mapping_keepalive::MAPPING_KEEPALIVE_INTERVAL;
+        return;
+    }
     if state.stun_ka_auto_suspended {
         state.stats.stun_keepalive_active = false;
         // Retry every ~5 minutes in case the path became full-cone/CGNAT.

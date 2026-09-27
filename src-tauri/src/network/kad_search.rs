@@ -671,17 +671,47 @@ pub(super) fn connect_serve_target_ok(
     true
 }
 
-/// Drain buddy-relayed Ember `CALLBACK`s: connect-and-serve the searcher
-/// (same upload-listener path as KAD `OP_CALLBACK`).
+/// Drain buddy-relayed Ember `CALLBACK`s and eD2K `OP_DIRECTCALLBACKREQ`s:
+/// connect-and-serve the requester (same upload-listener path as KAD
+/// `OP_CALLBACK`).
 pub(super) async fn drain_ember_callback_connects(
     state: &mut NetworkState,
     connect_serve_tx: &tokio::sync::mpsc::Sender<upload_server::ConnectServeRequest>,
 ) {
+    let direct = std::mem::take(&mut state.pending_direct_callbacks);
     let pending = std::mem::take(&mut state.ember_pending_callback_connects);
-    if pending.is_empty() {
+    if pending.is_empty() && direct.is_empty() {
         return;
     }
     let self_tcp = advertised_tcp_port(state);
+    for cb in direct {
+        let safe = !state.ip_filter.is_blocked(cb.dest_ip)
+            && !state.banned_ips.contains(&cb.dest_ip)
+            && connect_serve_target_ok(
+                cb.dest_ip,
+                cb.dest_port,
+                state.external_ip,
+                state.tcp_port,
+                self_tcp,
+                cb.user_hash,
+                &state.user_hash,
+            );
+        if !safe {
+            continue;
+        }
+        let peer_addr = SocketAddr::new(cb.dest_ip.into(), cb.dest_port);
+        debug!("Direct UDP callback: connecting to {peer_addr}");
+        if let Err(e) = connect_serve_tx.try_send(upload_server::ConnectServeRequest {
+            peer_addr,
+            crypt_options: cb.crypt_options,
+            user_hash: cb.user_hash,
+            push_grant_file_hash: None,
+            push_grant_accepted: None,
+            secure_friend_ember_hash: None,
+        }) {
+            debug!("Could not enqueue direct callback-serve for {peer_addr}: {e}");
+        }
+    }
     for cb in pending {
         // Same as KAD `OP_CALLBACK`: connect-and-serve, do not treat this as
         // an AddUpNextClient push-grant (`push_grant_file_hash` would send

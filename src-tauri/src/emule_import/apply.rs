@@ -268,7 +268,10 @@ fn apply_credits(pending: &Path, db: &Database) -> anyhow::Result<u64> {
     let mut rows = db.load_credits()?;
     let mut by_hash: std::collections::HashMap<[u8; 16], usize> =
         rows.iter().enumerate().map(|(i, row)| (row.0, i)).collect();
-    let verified = IdentState::Verified.to_u8();
+    // A key eMule stored is one the peer must still prove it holds here, as
+    // eMule itself loads such a record (IS_IDNEEDED, `ClientCredits.cpp:293-302`);
+    // the anchor flag keeps the imported totals through that first check.
+    let needed = IdentState::Needed.to_u8();
     for credit in &imported {
         let has_key = !credit.public_key.is_empty();
         match by_hash.get(&credit.user_hash) {
@@ -279,7 +282,7 @@ fn apply_credits(pending: &Path, db: &Database) -> anyhow::Result<u64> {
                 row.3 = row.3.max(credit.last_seen);
                 if row.4.is_empty() && has_key {
                     row.4 = credit.public_key.clone();
-                    row.6 = verified;
+                    row.6 = needed;
                     row.8 = true;
                 }
             }
@@ -292,7 +295,7 @@ fn apply_credits(pending: &Path, db: &Database) -> anyhow::Result<u64> {
                     credit.last_seen,
                     credit.public_key.clone(),
                     0,
-                    if has_key { verified } else { IdentState::Unknown.to_u8() },
+                    if has_key { needed } else { IdentState::Unknown.to_u8() },
                     None,
                     has_key,
                     String::new(),

@@ -19,13 +19,30 @@ const FT_FILESIZE: u8 = 0x02;
 /// builds and some mods write large files this way instead of as one u64.
 const FT_FILESIZE_HI: u8 = 0x3A;
 const FT_AICH_HASH: u8 = 0x27;
+// eMule's ids (`Opcodes.h:363, :381, :388-392`).
 const FT_ATTRANSFERRED: u8 = 0x50;
-const FT_ATTRANSFERREDHI: u8 = 0x51;
-const FT_ATREQUESTED: u8 = 0x52;
-const FT_ATACCEPTED: u8 = 0x53;
-const FT_ULPRIORITY: u8 = 0x18;
+const FT_ATREQUESTED: u8 = 0x51;
+const FT_ATACCEPTED: u8 = 0x52;
+const FT_ATTRANSFERREDHI: u8 = 0x54;
+/// Holds an eMule `PR_*` value, not Ember's byte: see [`priority_to_emule`].
+const FT_ULPRIORITY: u8 = 0x19;
 const FT_KADLASTPUBLISHSRC: u8 = 0x21;
-const FT_LASTSHARED: u8 = 0x24;
+const FT_LASTSHARED: u8 = 0x34;
+// Ids Ember wrote before it matched eMule. It also put transferred-hi,
+// requested and accepted at 0x51-0x53, which are eMule's requested, accepted
+// and category, so those are read the old way only from Ember's own records
+// that carry neither [`FT_EMBER_TAGSET`] nor an id only eMule's layout uses
+// (see `read_record`). The two below collide with nothing eMule writes to
+// known.met and are always accepted.
+/// Held Ember's own priority byte, not a `PR_*` value. Still written beside
+/// `FT_ULPRIORITY` so a build from before 1.7 keeps the priority; eMule's
+/// `CKnownFile` does not read 0x18 (`FT_DLPRIORITY` is a `.part.met` tag) and
+/// carries it through as an unknown tag.
+const LEGACY_EMBER_FT_ULPRIORITY: u8 = 0x18;
+const LEGACY_EMBER_FT_LASTSHARED: u8 = 0x24;
+/// Ember-only tag on every record written with eMule's ids above.
+const FT_EMBER_TAGSET: u8 = 0xED;
+const EMBER_TAGSET_EMULE_IDS: u32 = 1;
 // Older Ember builds accidentally wrote the source-publish timestamp with
 // eMule's `FT_DL_ACTIVE_TIME` id. Read it for migration, but write the real
 // eMule tag above.
@@ -535,7 +552,7 @@ impl KnownFileList {
     /// otherwise write into that client's folder.
     pub fn from_bytes(data: &[u8]) -> anyhow::Result<Self> {
         let mut list = Self::new();
-        list.parse_known_met(data)?;
+        list.parse_known_met(data, false)?;
         list.authoritative = true;
         Ok(list)
     }
@@ -595,7 +612,7 @@ impl KnownFileList {
         // Set before parsing, not after: a partial parse clears it, and that
         // verdict has to survive rather than being overwritten here.
         list.authoritative = true;
-        list.parse_known_met(&data)?;
+        list.parse_known_met(&data, true)?;
         list.load_path_index(&path.with_file_name("known_paths.dat"));
         Ok(list)
     }
@@ -682,7 +699,9 @@ impl KnownFileList {
         }
     }
 
-    fn parse_known_met(&mut self, data: &[u8]) -> anyhow::Result<()> {
+    /// `own_catalog` is true for Ember's own known.met, whose older records
+    /// carry Ember's pre-1.7 tag ids (see [`FT_EMBER_TAGSET`]).
+    fn parse_known_met(&mut self, data: &[u8], own_catalog: bool) -> anyhow::Result<()> {
         if data.len() < 5 {
             anyhow::bail!("known.met is truncated");
         }
@@ -720,7 +739,7 @@ impl KnownFileList {
         // strictly better: the app runs with what could be read, and the file
         // on disk is untouched until the user repairs it.
         for record_index in 0..count {
-            let record = match Self::read_record(&mut cursor, version) {
+            let record = match Self::read_record(&mut cursor, version, own_catalog) {
                 Ok(record) => record,
                 Err(e) => {
                     warn!(
@@ -782,7 +801,11 @@ impl KnownFileList {
         Ok(())
     }
 
-    fn read_record(cursor: &mut Cursor<&[u8]>, _version: u8) -> anyhow::Result<KnownFileRecord> {
+    fn read_record(
+        cursor: &mut Cursor<&[u8]>,
+        _version: u8,
+        own_catalog: bool,
+    ) -> anyhow::Result<KnownFileRecord> {
         let modified_at = cursor.read_u32::<LittleEndian>()? as i64;
 
         let mut file_hash = [0u8; 16];
@@ -837,6 +860,17 @@ impl KnownFileList {
             media: None,
             media_scanned: false,
         };
+        // 0x51-0x53 mean different things in eMule's records and in Ember's
+        // pre-1.7 ones, so they are resolved once the whole record (and
+        // whether it carries `FT_EMBER_TAGSET`) has been read.
+        let mut tag_51 = None;
+        let mut tag_52 = None;
+        let mut tag_53 = None;
+        let mut transferred_hi = None;
+        let mut emule_priority = None;
+        let mut legacy_priority = None;
+        let mut emule_last_shared = false;
+        let mut emule_ids = !own_catalog;
 
         for _ in 0..tag_count {
             let tag_type = cursor.read_u8()?;
@@ -907,18 +941,21 @@ impl KnownFileList {
                             record.all_time_transferred =
                                 (record.all_time_transferred & 0xFFFF_FFFF_0000_0000) | v as u64;
                         }
-                        FT_ATTRANSFERREDHI => {
-                            record.all_time_transferred = (record.all_time_transferred
-                                & 0x0000_0000_FFFF_FFFF)
-                                | ((v as u64) << 32);
-                        }
-                        FT_ATREQUESTED => record.all_time_requested = v,
-                        FT_ATACCEPTED => record.all_time_accepted = v,
-                        FT_ULPRIORITY => record.upload_priority = v as u8,
+                        FT_ATTRANSFERREDHI => transferred_hi = Some(v),
+                        0x51 => tag_51 = Some(v),
+                        0x52 => tag_52 = Some(v),
+                        0x53 => tag_53 = Some(v),
+                        FT_ULPRIORITY => emule_priority = Some(v),
+                        LEGACY_EMBER_FT_ULPRIORITY => legacy_priority = Some(v),
+                        FT_EMBER_TAGSET => emule_ids |= v >= EMBER_TAGSET_EMULE_IDS,
                         FT_KADLASTPUBLISHSRC | FT_KADLASTPUBLISHSRC_LEGACY_EMBER => {
                             record.last_publish_src = v;
                         }
-                        FT_LASTSHARED => record.last_shared = v,
+                        FT_LASTSHARED => {
+                            record.last_shared = v;
+                            emule_last_shared = true;
+                        }
+                        LEGACY_EMBER_FT_LASTSHARED => record.last_shared = v,
                         FT_EMBER_UNSHARED => record.is_shared = v == 0,
                         FT_EMBER_FRIENDS_ONLY => record.friends_only = v != 0,
                         FT_EMBER_SOURCES => record.complete_sources = v,
@@ -1015,6 +1052,29 @@ impl KnownFileList {
                     );
                 }
             }
+        }
+
+        // Ember before 1.7 never wrote these ids, and eMule always writes
+        // `FT_LASTSHARED`, so a catalog copied over from eMule by hand reads
+        // as eMule's even without our marker.
+        emule_ids |= emule_priority.is_some() || transferred_hi.is_some() || emule_last_shared;
+        let (requested, accepted, hi) = if emule_ids {
+            (tag_51, tag_52, transferred_hi)
+        } else {
+            // Ember's pre-1.7 layout: 0x51 transferred-hi, 0x52 requested,
+            // 0x53 accepted.
+            (tag_52, tag_53, tag_51.or(transferred_hi))
+        };
+        record.all_time_requested = requested.unwrap_or(0);
+        record.all_time_accepted = accepted.unwrap_or(0);
+        if let Some(hi) = hi {
+            record.all_time_transferred =
+                (record.all_time_transferred & 0x0000_0000_FFFF_FFFF) | (u64::from(hi) << 32);
+        }
+        if let Some(pr) = emule_priority {
+            record.upload_priority = priority_from_emule(pr);
+        } else if let Some(p) = legacy_priority {
+            record.upload_priority = p as u8;
         }
 
         Ok(record)
@@ -1610,6 +1670,8 @@ impl KnownFileList {
                 write_string_tag(&mut tags, FT_FILENAME, &record.file_name)?;
                 tag_count += 1;
             }
+            write_u32_tag(&mut tags, FT_EMBER_TAGSET, EMBER_TAGSET_EMULE_IDS)?;
+            tag_count += 1;
             if record.file_size > u32::MAX as u64 {
                 write_u64_tag(&mut tags, FT_FILESIZE, record.file_size)?;
             } else {
@@ -1648,10 +1710,12 @@ impl KnownFileList {
                 write_u32_tag(&mut tags, FT_ATACCEPTED, record.all_time_accepted)?;
                 tag_count += 1;
             }
-            if record.upload_priority > 0 {
-                write_u32_tag(&mut tags, FT_ULPRIORITY, record.upload_priority as u32)?;
-                tag_count += 1;
-            }
+            // Always written, as eMule does, so a record without it can only
+            // be an older one.
+            write_u32_tag(&mut tags, FT_ULPRIORITY, priority_to_emule(record.upload_priority))?;
+            tag_count += 1;
+            write_u32_tag(&mut tags, LEGACY_EMBER_FT_ULPRIORITY, u32::from(record.upload_priority))?;
+            tag_count += 1;
             if record.last_publish_src > 0 {
                 write_u32_tag(&mut tags, FT_KADLASTPUBLISHSRC, record.last_publish_src)?;
                 tag_count += 1;
@@ -2208,11 +2272,39 @@ fn aich_base32_to_hex(value: &str) -> Option<String> {
     }
 }
 
+/// Ember's stored priority byte to eMule's `PR_*` value for `FT_ULPRIORITY`
+/// (`PartFile.h:36-41`: low 0, normal 1, high 2, very high 3, very low 4,
+/// auto 5). "release" is eMule's very high.
+fn priority_to_emule(priority: u8) -> u32 {
+    match priority {
+        0 => 4,
+        1 => 0,
+        3 => 2,
+        4 => 3,
+        5 => 5,
+        _ => 1,
+    }
+}
+
+/// Inverse of [`priority_to_emule`]; anything eMule would itself coerce to
+/// normal reads as normal.
+fn priority_from_emule(pr: u32) -> u8 {
+    match pr {
+        4 => 0,
+        0 => 1,
+        2 => 3,
+        3 => 4,
+        5 => 5,
+        _ => 2,
+    }
+}
+
 /// Encode a UI priority label into the byte stored as
-/// `KnownFileRecord::upload_priority` (and shipped as the `FT_ULPRIORITY`
-/// known-file tag). Order matches eMule's priority enum: 0=verylow, 1=low,
-/// 2=normal, 3=high, 4=release, 5=auto. Unknown labels fall back to `normal`
-/// so a malformed UI value never silently promotes a file to the highest tier.
+/// `KnownFileRecord::upload_priority`: 0=verylow, 1=low, 2=normal, 3=high,
+/// 4=release, 5=auto. This is Ember's own order, not eMule's; the known.met
+/// tag carries the eMule value (see [`priority_to_emule`]). Unknown labels
+/// fall back to `normal` so a malformed UI value never silently promotes a
+/// file to the highest tier.
 pub fn priority_str_to_u8(priority: &str) -> u8 {
     match priority {
         "verylow" => 0,
@@ -2371,9 +2463,159 @@ mod tests {
             }
         }
         let mut kf = KnownFileList::new();
-        kf.parse_known_met(&buf).unwrap();
+        kf.parse_known_met(&buf, false).unwrap();
         for hash in [[0x31; 16], [0x32; 16]] {
             assert_eq!(kf.files.get(&hash).unwrap().file_size, (3u64 << 32) | 0x1000);
+        }
+    }
+
+    /// One record with the given `(id, value)` uint32 tags.
+    fn met_with_u32_tags(tags: &[(u8, u32)]) -> Vec<u8> {
+        let mut buf = vec![MET_HEADER];
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&1_700_000_000u32.to_le_bytes());
+        buf.extend_from_slice(&[0x44; 16]);
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&(tags.len() as u32 + 1).to_le_bytes());
+        buf.extend_from_slice(&[TAG_UINT32 | 0x80, FT_FILESIZE]);
+        buf.extend_from_slice(&1000u32.to_le_bytes());
+        for (id, value) in tags {
+            buf.extend_from_slice(&[TAG_UINT32 | 0x80, *id]);
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        buf
+    }
+
+    /// eMule's statistics and upload priority, as its `WriteToFile` lays
+    /// them out (`Opcodes.h:363, :381, :388-392`; `PR_HIGH` = 2).
+    #[test]
+    fn an_emule_catalog_reads_with_emule_tag_ids() {
+        let buf = met_with_u32_tags(&[
+            (0x50, 7),
+            (0x51, 57),
+            (0x52, 12),
+            (0x53, 3),
+            (0x54, 2),
+            (0x19, 2),
+            (0x34, 1_690_000_000),
+        ]);
+        let kf = KnownFileList::from_bytes(&buf).unwrap();
+        let r = kf.files.get(&[0x44; 16]).unwrap();
+        assert_eq!(r.all_time_requested, 57);
+        assert_eq!(r.all_time_accepted, 12, "0x53 is eMule's category, not accepted");
+        assert_eq!(r.all_time_transferred, (2u64 << 32) | 7);
+        assert_eq!(priority_u8_to_str(r.upload_priority), "high");
+        assert_eq!(r.last_shared, 1_690_000_000);
+    }
+
+    /// Ember's own records from before the ids were corrected keep their
+    /// meaning, and are rewritten in eMule's layout.
+    #[test]
+    fn an_older_ember_record_keeps_its_statistics_and_is_rewritten_as_emule() {
+        let buf = met_with_u32_tags(&[
+            (0x50, 7),
+            (0x51, 2),
+            (0x52, 57),
+            (0x53, 12),
+            (0x18, 3),
+            (0x24, 1_690_000_000),
+        ]);
+        let mut own = KnownFileList::new();
+        own.parse_known_met(&buf, true).unwrap();
+        let r = own.files.get(&[0x44; 16]).unwrap().clone();
+        assert_eq!(r.all_time_transferred, (2u64 << 32) | 7);
+        assert_eq!(r.all_time_requested, 57);
+        assert_eq!(r.all_time_accepted, 12);
+        assert_eq!(priority_u8_to_str(r.upload_priority), "high");
+        assert_eq!(r.last_shared, 1_690_000_000);
+
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-tagset-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        own.save(&path).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        for list in [
+            KnownFileList::from_bytes(&written).unwrap(),
+            {
+                let mut again = KnownFileList::new();
+                again.parse_known_met(&written, true).unwrap();
+                again
+            },
+        ] {
+            let back = list.files.get(&[0x44; 16]).unwrap();
+            assert_eq!(back.all_time_transferred, r.all_time_transferred);
+            assert_eq!(back.all_time_requested, 57);
+            assert_eq!(back.all_time_accepted, 12);
+            assert_eq!(back.upload_priority, r.upload_priority);
+            assert_eq!(back.last_shared, r.last_shared);
+        }
+    }
+
+    /// eMule's own known.met copied into Ember's data folder has no
+    /// `FT_EMBER_TAGSET`, but its eMule-only ids give its layout away.
+    #[test]
+    fn a_hand_copied_emule_catalog_reads_with_emule_tag_ids() {
+        let buf = met_with_u32_tags(&[
+            (0x50, 7),
+            (0x51, 57),
+            (0x52, 12),
+            (0x19, 2),
+            (0x34, 1_690_000_000),
+        ]);
+        let mut own = KnownFileList::new();
+        own.parse_known_met(&buf, true).unwrap();
+        let r = own.files.get(&[0x44; 16]).unwrap();
+        assert_eq!(r.all_time_transferred, 7, "0x51 is not transferred-hi here");
+        assert_eq!(r.all_time_requested, 57);
+        assert_eq!(r.all_time_accepted, 12);
+        assert_eq!(priority_u8_to_str(r.upload_priority), "high");
+    }
+
+    /// Ember's own priority byte rides along under its pre-1.7 id, so a
+    /// downgraded build still finds it; the eMule value stays authoritative.
+    #[test]
+    fn the_legacy_priority_tag_is_written_beside_emules() {
+        let mut own = KnownFileList::new();
+        own.parse_known_met(&met_with_u32_tags(&[(0x18, 4)]), true).unwrap();
+        assert_eq!(
+            priority_u8_to_str(own.files.get(&[0x44; 16]).unwrap().upload_priority),
+            "release"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-legacy-prio-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        own.save(&path).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let tag = |id: u8, value: u32| {
+            let mut t = vec![TAG_UINT32, 1, 0, id];
+            t.extend_from_slice(&value.to_le_bytes());
+            t
+        };
+        assert!(written.windows(8).any(|w| w == tag(0x18, 4).as_slice()), "legacy byte");
+        assert!(written.windows(8).any(|w| w == tag(0x19, 3).as_slice()), "PR_VERYHIGH");
+        let back = KnownFileList::from_bytes(&written).unwrap();
+        assert_eq!(
+            priority_u8_to_str(back.files.get(&[0x44; 16]).unwrap().upload_priority),
+            "release"
+        );
+    }
+
+    #[test]
+    fn every_priority_label_survives_the_emule_encoding() {
+        for label in ["verylow", "low", "normal", "high", "release", "auto"] {
+            let byte = priority_str_to_u8(label);
+            assert_eq!(priority_u8_to_str(priority_from_emule(priority_to_emule(byte))), label);
         }
     }
 

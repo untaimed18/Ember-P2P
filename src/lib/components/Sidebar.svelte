@@ -9,6 +9,7 @@
   import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
   import { awaitingChannelOffers, totalChannelUnread } from '$lib/stores/channels';
   import * as m from '$lib/paraglide/messages';
+  import { plural } from '$lib/plural';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import {
     navItems,
@@ -156,10 +157,18 @@
   let activeTransferCount = $derived(activeDownloadCount + activeUploadCount);
 
   function downloadsTitle(n: number): string {
-    return n === 1 ? m.sidebar_active_downloads_one() : m.sidebar_active_downloads_other({ count: n });
+    return plural(n, {
+      one: m.sidebar_active_downloads_one,
+      few: () => m.sidebar_active_downloads_few({ count: n }),
+      other: () => m.sidebar_active_downloads_other({ count: n }),
+    });
   }
   function uploadsTitle(n: number): string {
-    return n === 1 ? m.sidebar_active_uploads_one() : m.sidebar_active_uploads_other({ count: n });
+    return plural(n, {
+      one: m.sidebar_active_uploads_one,
+      few: () => m.sidebar_active_uploads_few({ count: n }),
+      other: () => m.sidebar_active_uploads_other({ count: n }),
+    });
   }
   function transfersTitle(downloads: number, uploads: number): string {
     const parts: string[] = [];
@@ -172,13 +181,15 @@
     const mod = shortcutModSymbol();
     if (unread <= 0) return open ? m.sidebar_chats_close({ mod }) : m.sidebar_chats_open({ mod });
     if (open) {
-      return unread === 1
-        ? m.sidebar_chats_close_unread_one({ mod })
-        : m.sidebar_chats_close_unread_other({ mod, count: unread });
+      return plural(unread, {
+        one: () => m.sidebar_chats_close_unread_one({ mod }),
+        other: () => m.sidebar_chats_close_unread_other({ mod, count: unread }),
+      });
     }
-    return unread === 1
-      ? m.sidebar_chats_open_unread_one({ mod })
-      : m.sidebar_chats_open_unread_other({ mod, count: unread });
+    return plural(unread, {
+      one: () => m.sidebar_chats_open_unread_one({ mod }),
+      other: () => m.sidebar_chats_open_unread_other({ mod, count: unread }),
+    });
   }
 
   // Pending incoming friend-request count. Mirrors the transfers badge
@@ -196,16 +207,20 @@
     const parts: string[] = [];
     if (requests > 0) {
       parts.push(
-        requests === 1
-          ? m.sidebar_friend_requests_title_one()
-          : m.sidebar_friend_requests_title_other({ count: requests }),
+        plural(requests, {
+          one: m.sidebar_friend_requests_title_one,
+          few: () => m.sidebar_friend_requests_title_few({ count: requests }),
+          other: () => m.sidebar_friend_requests_title_other({ count: requests }),
+        }),
       );
     }
     if (offers > 0) {
       parts.push(
-        offers === 1
-          ? m.sidebar_friend_offers_title_one()
-          : m.sidebar_friend_offers_title_other({ count: offers }),
+        plural(offers, {
+          one: m.sidebar_friend_offers_title_one,
+          few: () => m.sidebar_friend_offers_title_few({ count: offers }),
+          other: () => m.sidebar_friend_offers_title_other({ count: offers }),
+        }),
       );
     }
     return parts.join(' · ');
@@ -224,16 +239,20 @@
     const parts: string[] = [];
     if (unread > 0) {
       parts.push(
-        unread === 1
-          ? m.channels_unread_title_one()
-          : m.channels_unread_title_other({ count: unread }),
+        plural(unread, {
+          one: m.channels_unread_title_one,
+          few: () => m.channels_unread_title_few({ count: unread }),
+          other: () => m.channels_unread_title_other({ count: unread }),
+        }),
       );
     }
     if (offers > 0) {
       parts.push(
-        offers === 1
-          ? m.channels_offers_title_one()
-          : m.channels_offers_title_other({ count: offers }),
+        plural(offers, {
+          one: m.channels_offers_title_one,
+          few: () => m.channels_offers_title_few({ count: offers }),
+          other: () => m.channels_offers_title_other({ count: offers }),
+        }),
       );
     }
     return parts.join(' · ');
@@ -531,9 +550,11 @@
         <span
           class="chats-dot"
           aria-hidden="true"
-          title={totalUnreadChats === 1
-            ? m.sidebar_chats_unread_title_one()
-            : m.sidebar_chats_unread_title_other({ count: totalUnreadChats })}
+          title={plural(totalUnreadChats, {
+            one: m.sidebar_chats_unread_title_one,
+            few: () => m.sidebar_chats_unread_title_few({ count: totalUnreadChats }),
+            other: () => m.sidebar_chats_unread_title_other({ count: totalUnreadChats }),
+          })}
         ></span>
       {/if}
     </button>

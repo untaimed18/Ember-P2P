@@ -110,6 +110,21 @@ pub struct UpnpMappings {
     /// Don't retry discovery before this instant.
     next_discovery_at: Option<Instant>,
     revision: u64,
+    /// The gateway's own WAN address, read when TCP and UDP both mapped.
+    external_ip: Option<Ipv4Addr>,
+}
+
+/// The gateway's WAN address while it forwards every Ember port, else zero.
+static FORWARDED_EXTERNAL_IP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The router's WAN address while it forwards every port Ember listens on.
+/// When that is also the address peers see us at, nothing else sits between
+/// us and the internet and there is no NAT mapping to keep alive.
+pub fn forwarded_external_ip() -> Option<Ipv4Addr> {
+    match FORWARDED_EXTERNAL_IP.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        bits => Some(Ipv4Addr::from(bits)),
+    }
 }
 
 impl UpnpMappings {
@@ -126,7 +141,17 @@ impl UpnpMappings {
             discovery_failures: 0,
             next_discovery_at: None,
             revision: 0,
+            external_ip: None,
         }
+    }
+
+    fn publish_forwarding(&self) {
+        let quic_covered = self.quic_port.is_none() || self.quic_mapped;
+        let bits = match self.external_ip {
+            Some(ip) if self.tcp_mapped && self.udp_mapped && quic_covered => u32::from(ip),
+            _ => 0,
+        };
+        FORWARDED_EXTERNAL_IP.store(bits, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// `Gateway::add_port` under [`SOAP_TIMEOUT`]. `None` means it timed out.
@@ -277,6 +302,7 @@ impl UpnpMappings {
                 self.tcp_mapped = false;
                 self.udp_mapped = false;
                 self.quic_mapped = false;
+                self.publish_forwarding();
                 return false;
             };
             let tcp_ok = Self::try_add_port(
@@ -310,6 +336,15 @@ impl UpnpMappings {
                 }
                 None => false,
             };
+            let external_ip = if tcp_ok && udp_ok {
+                match tokio::time::timeout(SOAP_TIMEOUT, gateway.get_external_ip()).await {
+                    Ok(Ok(std::net::IpAddr::V4(ip))) => Some(ip),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            self.external_ip = external_ip;
             (tcp_ok, udp_ok, quic_ok)
         };
         if self.tcp_mapped != tcp_ok || self.udp_mapped != udp_ok || self.quic_mapped != quic_ok {
@@ -318,6 +353,7 @@ impl UpnpMappings {
         self.tcp_mapped = tcp_ok;
         self.udp_mapped = udp_ok;
         self.quic_mapped = quic_ok;
+        self.publish_forwarding();
         tcp_ok || udp_ok
     }
 
@@ -340,6 +376,7 @@ impl UpnpMappings {
                 self.quic_mapped = self.udp_mapped;
                 self.revision = self.revision.saturating_add(1);
             }
+            self.publish_forwarding();
             return self.udp_mapped;
         }
         let ok = {
@@ -362,6 +399,7 @@ impl UpnpMappings {
             self.quic_mapped = ok;
             self.revision = self.revision.saturating_add(1);
         }
+        self.publish_forwarding();
         ok
     }
 
@@ -497,9 +535,11 @@ impl UpnpMappings {
         self.tcp_mapped = false;
         self.udp_mapped = false;
         self.quic_mapped = false;
+        self.external_ip = None;
         self.last_map_attempt = None;
         self.next_discovery_at = None;
         self.revision = self.revision.saturating_add(1);
+        self.publish_forwarding();
     }
 
     pub fn is_mapped(&self) -> bool {

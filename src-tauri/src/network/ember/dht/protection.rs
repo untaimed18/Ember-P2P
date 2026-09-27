@@ -25,6 +25,17 @@ const MSG_WINDOW: Duration = Duration::from_secs(1);
 /// file reads the same way.
 const MAX_MSGS_PER_WINDOW: u32 = 40;
 
+/// Channel frames (`CHANNEL_MSG` / `CHANNEL_RELAY`) accepted from one address
+/// per [`MSG_WINDOW`], counted apart from [`MAX_MSGS_PER_WINDOW`].
+///
+/// Every room-transfer block rides one of these, and the sender answers a
+/// whole outstanding window of them at once, so under the DHT cap a transfer
+/// lost most of each window. The channel layer meters them per hop after the
+/// decrypt; this bounds only the work before it, at what that layer admits
+/// from one peer.
+const MAX_CHANNEL_FRAMES_PER_WINDOW: u32 = (super::super::channel::CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC
+    + super::super::channel::CHANNEL_XFER_IN_PER_PEER_PER_SEC) as u32;
+
 /// Sliding window for lookup queries (`FIND_NODE` / `FIND_VALUE` / `CALLBACK_REQ`).
 const LOOKUP_WINDOW: Duration = Duration::from_secs(10);
 /// Lookup queries accepted from one address per [`LOOKUP_WINDOW`].
@@ -192,6 +203,7 @@ pub enum StoreBudgetKey {
 /// Flood gate consulted before EmberDht::handle_message.
 pub struct DhtProtection {
     msg_counters: HashMap<IpAddr, WindowCounter>,
+    channel_counters: HashMap<IpAddr, WindowCounter>,
     store_counters: HashMap<StoreBudgetKey, WindowCounter>,
     /// Lookup budgets. Shares `StoreBudgetKey` so an identity can be used if a
     /// caller ever supplies one, but in practice this is address-keyed — see
@@ -230,6 +242,7 @@ impl DhtProtection {
     pub fn new() -> Self {
         Self {
             msg_counters: HashMap::new(),
+            channel_counters: HashMap::new(),
             store_counters: HashMap::new(),
             lookup_counters: HashMap::new(),
             dropped_rate: 0,
@@ -322,6 +335,31 @@ impl DhtProtection {
             return false;
         }
         true
+    }
+
+    /// [`Self::allow_frame`] for channel frames, on their own budget (see
+    /// [`MAX_CHANNEL_FRAMES_PER_WINDOW`]). Charges on success, like it.
+    pub fn allow_channel_frame(&mut self, ip: IpAddr) -> bool {
+        self.allow_channel_frame_at(ip, Instant::now())
+    }
+
+    fn allow_channel_frame_at(&mut self, ip: IpAddr, now: Instant) -> bool {
+        self.maybe_trim(now);
+
+        if self.channel_counters.len() >= MAX_IP_ENTRIES && !self.channel_counters.contains_key(&ip)
+        {
+            self.dropped_rate = self.dropped_rate.saturating_add(1);
+            return false;
+        }
+        let ok = self.channel_counters.entry(ip).or_default().allow(
+            now,
+            MSG_WINDOW,
+            MAX_CHANNEL_FRAMES_PER_WINDOW,
+        );
+        if !ok {
+            self.dropped_rate = self.dropped_rate.saturating_add(1);
+        }
+        ok
     }
 
     /// The per-type budgets — STORE and lookup — for a frame that has already
@@ -538,16 +576,24 @@ impl DhtProtection {
             .trimmed_at
             .is_none_or(|at| now.saturating_duration_since(at) >= self.trim_interval);
         let wants = |len: usize| len > MAX_IP_ENTRIES / 2 && (due || len >= TRIM_EVERY_FRAME_AT);
-        let (msg, store, lookup) = (
+        let (msg, channel, store, lookup) = (
             wants(self.msg_counters.len()),
+            wants(self.channel_counters.len()),
             wants(self.store_counters.len()),
             wants(self.lookup_counters.len()),
         );
-        if due && (msg || store || lookup) {
+        if due && (msg || channel || store || lookup) {
             self.trimmed_at = Some(now);
         }
         if msg {
             self.msg_counters.retain(|_, c| {
+                c.last_activity()
+                    .map(|s| now.saturating_duration_since(s) < MSG_WINDOW * 4)
+                    .unwrap_or(false)
+            });
+        }
+        if channel {
+            self.channel_counters.retain(|_, c| {
                 c.last_activity()
                     .map(|s| now.saturating_duration_since(s) < MSG_WINDOW * 4)
                     .unwrap_or(false)
@@ -575,6 +621,20 @@ mod tests {
     use super::super::messages::MSG_PING;
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn a_transfer_window_fits_the_channel_budget_without_spending_the_dht_one() {
+        let mut p = DhtProtection::new();
+        let addr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let now = Instant::now();
+        for _ in 0..super::super::super::channel::XFER_WINDOW_BLOCKS {
+            assert!(p.allow_channel_frame_at(addr, now));
+        }
+        for _ in 0..MAX_MSGS_PER_WINDOW {
+            assert!(p.allow_frame_at(addr, now));
+        }
+        assert!(!p.allow_frame_at(addr, now));
+    }
 
     #[test]
     fn rate_limits_messages_per_ip() {

@@ -52,6 +52,7 @@
   import { copyToClipboard, formatClockTime, formatNumber, formatSize } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { plural } from '$lib/plural';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
 
@@ -988,10 +989,12 @@
               <div class="browse-count">
                 {#if isFiltered}
                   {m.browse_count_filtered({ filtered: filteredFiles.length, total: files.length })}
-                {:else if files.length === 1}
-                  {m.browse_count_one()}
                 {:else}
-                  {m.browse_count_other({ count: files.length })}
+                  {plural(files.length, {
+                    one: m.browse_count_one,
+                    few: () => m.browse_count_few({ count: files.length }),
+                    other: () => m.browse_count_other({ count: files.length }),
+                  })}
                 {/if}
                 <span aria-hidden="true">·</span>
                 {formatSize(filteredTotalSize)}
@@ -1090,7 +1093,10 @@
           {/if}
           {#if queuedCount > 0}
             <div class="browse-banner browse-banner-success" role="status">
-              <span>{queuedCount === 1 ? m.browse_added_one() : m.browse_added_other({ count: formatNumber(queuedCount) })}</span>
+              <span>{plural(queuedCount, {
+                one: m.browse_added_one,
+                other: () => m.browse_added_other({ count: formatNumber(queuedCount) }),
+              })}</span>
               <button type="button" class="browse-link-btn" onclick={viewTransfers}>{m.browse_view_transfers()}</button>
             </div>
           {/if}

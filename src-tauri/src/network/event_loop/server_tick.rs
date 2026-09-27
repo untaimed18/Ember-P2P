@@ -1,7 +1,8 @@
-//! The 2 s eD2K server tick: polls the server connection and handles what it
-//! sends (server list, status, search results, sources, callback requests, ID
-//! changes), times out server searches, and reconnects to the preferred server
-//! when the connection drops.
+//! The 2 s eD2K server tick: takes what the server link's reader task has
+//! decoded (server list, status, search results, sources, callback requests,
+//! ID changes) and handles it, times out server searches, and reconnects to the
+//! preferred server when the connection drops. Nothing here waits on the
+//! server socket; see `ServerLink`.
 
 use super::*;
 
@@ -37,37 +38,20 @@ pub(in crate::network) async fn on_server_tick(
         let mut finished_search_requests: Vec<u64> = Vec::new();
         let mut pending_source_start_tids: Vec<String> = Vec::new();
         let mut server_disconnect_reason: Option<String> = None;
-        let mut conn_to_restore: Option<Ed2kServerConnection> = None;
+        let mut conn_to_restore: Option<ServerLink> = None;
         if let Some(mut conn) = state.server_connection.take() {
-            // Any holder of the connection (commands, the callback drain,
-            // download events) may have left it unwritable since the last
-            // tick; its writes already fail fast, so this is where the
-            // session actually gets dropped.
-            server_disconnect_reason = server_write_failure_reason(&conn);
-            // Poll for incoming messages (OP_SERVERLIST responses, status updates, etc.).
-            // poll_messages() decodes untrusted server bytes inline on the
-            // event loop, so wrap it in catch_unwind and treat a parse panic
-            // as a disconnect — the connection is suspect anyway, and one
-            // malformed packet must not unwind the whole network loop.
-            let poll_result = if server_disconnect_reason.is_none() {
-                std::panic::AssertUnwindSafe(conn.poll_messages())
-                    .catch_unwind()
-                    .await
-            } else {
-                Ok(Ok(Vec::new()))
-            };
-            let events = match poll_result {
-                Ok(Ok(events)) => events,
-                Ok(Err(e)) => {
-                    server_disconnect_reason = Some(e.to_string());
-                    Vec::new()
-                }
-                Err(p) => {
-                    server_disconnect_reason =
-                        Some(format!("server poll panicked: {}", describe_panic(&*p)));
-                    Vec::new()
-                }
-            };
+            // Whatever the reader decoded since the last tick, in arrival
+            // order, drained even when the session is about to be dropped: a
+            // server that kicks us usually says why first (a ban, "too many
+            // files"), and that notice is the one message worth logging. A
+            // reader that has stopped (EOF, a corrupt stream, a parse panic)
+            // says so after the events that preceded it.
+            let (events, closed) = conn.drain_events(ed2k::server::SERVER_EVENT_QUEUE);
+            // The writer task marks the link unusable when a write fails or
+            // times out; later sends already fail fast, so this is where the
+            // session actually gets dropped. That failure is the root cause
+            // when both happened.
+            server_disconnect_reason = server_write_failure_reason(&conn).or(closed);
             if !events.is_empty() {
                 *last_server_activity_at = chrono::Utc::now().timestamp();
             }
@@ -93,15 +77,11 @@ pub(in crate::network) async fn on_server_tick(
                                 &addr.ip().to_string(), addr.port(), users, files, 0,
                             );
                         }
-                        if let Some(session) = conn.session.as_mut() {
-                            session.user_count = users;
-                            session.file_count = files;
-                        }
+                        conn.session.user_count = users;
+                        conn.session.file_count = files;
                     }
                     ed2k::server::ServerEvent::ServerIdent { name } => {
-                        if let Some(session) = conn.session.as_mut() {
-                            session.server_name = name.clone();
-                        }
+                        conn.session.server_name = name.clone();
                         if let Some(addr) = state.server_addr {
                             if state.server_list.update_server_name_from_ident(
                                 &addr.ip().to_string(),
@@ -113,7 +93,7 @@ pub(in crate::network) async fn on_server_tick(
                             }
                         }
                     }
-                    ed2k::server::ServerEvent::SearchResult { results } => {
+                    ed2k::server::ServerEvent::SearchResult { results, more } => {
                         let count = results.len();
                         info!("Server returned {count} search results via poll");
                         let search_results: Vec<SearchResult> = results.iter().map(|sr| {
@@ -198,12 +178,14 @@ pub(in crate::network) async fn on_server_tick(
                                 // live SearchFiles, which always sets tx: None).
                                 let mut local = pending.results;
                                 local.extend(search_results);
-                                if count >= 200
-                                    && local.len() < 1000
-                                    && state.server_search_more_requests
-                                        < MAX_SERVER_MORE_REQUESTS
-                                {
-                                    state.server_search_more_needed = true;
+                                if server_should_ask_for_more(
+                                    more,
+                                    state.server_search_more_requests,
+                                    local.len() < 1000,
+                                ) {
+                                    state.server_search_more_due_at = Some(
+                                        std::time::Instant::now() + SERVER_MORE_RESULTS_DELAY,
+                                    );
                                     state.pending_server_search = Some(PendingServerSearch {
                                         tx: Some(tx),
                                         results: local,
@@ -331,32 +313,19 @@ pub(in crate::network) async fn on_server_tick(
                                     .filter(|active| active.request_id == request_id)
                                     .map(|active| active.server_result_count < 1000)
                                     .unwrap_or(true);
-                                // A full batch means the server has
-                                // more to give, and the two limits
-                                // that belong here are already
-                                // stated: at most 1000 results and
-                                // at most `MAX_SERVER_MORE_REQUESTS`
-                                // pages.
-                                //
-                                // This used to carry a third term —
-                                // `ed2k_found_sources <= 100` — which
-                                // could never hold alongside the
-                                // first. `note_ed2k_search_results`
-                                // has already charged this batch, and
-                                // every emitted row adds at least 1,
-                                // so `count >= 200` guaranteed the
-                                // counter was over 200. The five-page
-                                // budget below was unreachable on any
-                                // search a filter had not already
-                                // gutted: page two was never asked
-                                // for, on exactly the queries where
-                                // the server said it had more.
-                                if count >= 200
-                                    && under_result_cap
-                                    && state.server_search_more_requests
-                                        < MAX_SERVER_MORE_REQUESTS
-                                {
-                                    state.server_search_more_needed = true;
+                                // Only the server's own "more" byte
+                                // says there is more to give; a full
+                                // page does not. The next page is
+                                // asked for on a later tick, never in
+                                // this one.
+                                if server_should_ask_for_more(
+                                    more,
+                                    state.server_search_more_requests,
+                                    under_result_cap,
+                                ) {
+                                    state.server_search_more_due_at = Some(
+                                        std::time::Instant::now() + SERVER_MORE_RESULTS_DELAY,
+                                    );
                                     state.pending_server_search = Some(PendingServerSearch {
                                         tx: None,
                                         results: Vec::new(),
@@ -836,12 +805,10 @@ pub(in crate::network) async fn on_server_tick(
                         let was_low = state.low_id;
                         let is_low = client_id > 0 && client_id < ed2k::server::LOWID_THRESHOLD;
                         ed2k::server::set_server_flags_mirror(server_flags);
-                        if let Some(session) = conn.session.as_mut() {
-                            session.client_id = client_id;
-                            session.server_flags = server_flags;
-                            if server_reported_ip != 0 {
-                                session.server_reported_ip = server_reported_ip;
-                            }
+                        conn.session.client_id = client_id;
+                        conn.session.server_flags = server_flags;
+                        if server_reported_ip != 0 {
+                            conn.session.server_reported_ip = server_reported_ip;
                         }
                         state.server_client_id = client_id;
                         state.low_id = is_low;
@@ -955,13 +922,22 @@ pub(in crate::network) async fn on_server_tick(
                 }
             }
             if server_disconnect_reason.is_none()
-                && state.server_search_more_needed
                 && state.pending_server_search.is_some()
+                && state
+                    .server_search_more_due_at
+                    .is_some_and(|due| std::time::Instant::now() >= due)
                 && state.server_search_more_requests < MAX_SERVER_MORE_REQUESTS
             {
-                state.server_search_more_needed = false;
-                state.server_search_more_requests += 1;
-                let _ = conn.request_more_results().await;
+                state.server_search_more_due_at = None;
+                match conn.request_more_results() {
+                    Ok(()) => {
+                        state.server_search_more_requests += 1;
+                        // The wait for the next page starts now, not when
+                        // the previous one arrived.
+                        state.server_search_age = 0;
+                    }
+                    Err(e) => debug!("OP_QUERY_MORE_RESULT not sent: {e}"),
+                }
             }
 
             // Second half of a related search's server leg: the
@@ -972,9 +948,14 @@ pub(in crate::network) async fn on_server_tick(
             // with a usable title never put that title to the one
             // leg most likely to answer it. Gated on the leg still
             // being pending, which is a flag only a first request
-            // that actually reached the wire ever set.
+            // that actually reached the wire ever set, and paced like a
+            // More page rather than sent in the tick that retired the
+            // first search.
             let followup_ready = server_disconnect_reason.is_none()
                 && state.pending_server_search.is_none()
+                && state
+                    .server_followup_due_at
+                    .is_none_or(|due| std::time::Instant::now() >= due)
                 && match (&state.server_followup_search, &state.active_search_request) {
                     (Some((rid, _)), Some(active)) => {
                         *rid == active.request_id && active.server_pending
@@ -983,11 +964,12 @@ pub(in crate::network) async fn on_server_tick(
                 };
             if followup_ready {
                 if let Some((followup_id, expr)) = state.server_followup_search.take() {
-                    match conn.send_search_expr_bytes(&expr).await {
+                    state.server_followup_due_at = None;
+                    match conn.send_search_expr_bytes(&expr) {
                         Ok(()) => {
                             // Its own More budget: this is a second
                             // search, not another page of the first.
-                            state.server_search_more_needed = false;
+                            state.server_search_more_due_at = None;
                             state.server_search_more_requests = 0;
                             state.pending_server_search = Some(PendingServerSearch {
                                 tx: None,
@@ -1023,10 +1005,12 @@ pub(in crate::network) async fn on_server_tick(
                 state.server_poll_count += 1;
                 if state.server_poll_count >= 30 {
                     state.server_poll_count = 0;
-                    if let Err(e) = conn.keep_alive().await {
-                        server_disconnect_reason = Some(e.to_string());
-                    } else {
-                        *last_server_activity_at = chrono::Utc::now().timestamp();
+                    // A refusal here is a full writer queue, which the stuck
+                    // write behind it resolves one way or the other, or a
+                    // broken session, which the check below drops.
+                    match conn.keep_alive() {
+                        Ok(()) => *last_server_activity_at = chrono::Utc::now().timestamp(),
+                        Err(e) => debug!("Server keep-alive not queued: {e}"),
                     }
                 }
             }
@@ -1034,10 +1018,10 @@ pub(in crate::network) async fn on_server_tick(
                 server_disconnect_reason = server_write_failure_reason(&conn);
             }
             // Handed to the rate-limited drain in the event loop, which sends
-            // at most MAX_LOWID_CALLBACKS_PER_TURN per turn, stops at the first
-            // failure and marks only what it got out as sent. One
-            // OP_FOUNDSOURCES reply can carry hundreds of LowID sources, each
-            // a server write bounded only by SERVER_WRITE_TIMEOUT_SECS.
+            // at most MAX_LOWID_CALLBACKS_PER_TURN per LOWID_CALLBACK_INTERVAL,
+            // stops at the first refusal and marks only what it got out as
+            // sent. One OP_FOUNDSOURCES reply can carry hundreds of LowID
+            // sources, far more than the server writer's queue holds.
             if server_disconnect_reason.is_none() && state.server_connected && !pending_lowid_callbacks.is_empty() && !state.low_id {
                 let queued = queue_lowid_callbacks(
                     pending_lowid_callback_queue,
@@ -1142,14 +1126,7 @@ pub(in crate::network) async fn on_server_tick(
                 &format!("could not reach preferred server {ip}:{port}"),
             );
         } else {
-        let backoff_secs = match state.server_reconnect_failures {
-            0 => 0,
-            1 => 3,
-            2 => 5,
-            3 => 10,
-            4 => 20,
-            _ => 30,
-        };
+        let backoff_secs = server_reconnect_backoff_secs(state.server_reconnect_failures);
         let elapsed_ok = state.server_last_connect_attempt
             .map(|t| t.elapsed().as_secs() >= backoff_secs)
             .unwrap_or(true);
@@ -1250,7 +1227,7 @@ pub(in crate::network) async fn on_server_tick(
     }
 }
 
-fn server_write_failure_reason(conn: &Ed2kServerConnection) -> Option<String> {
+fn server_write_failure_reason(conn: &ServerLink) -> Option<String> {
     conn.write_failure()
         .map(|reason| format!("server write failed, stream unusable: {reason}"))
 }
