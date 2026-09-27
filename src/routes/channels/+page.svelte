@@ -212,7 +212,7 @@
   /** The room list's width follows the space the page has, not the names in
    *  it: a column sized to its rooms would jump as Discover streams them in.
    *  360 keeps a small window's conversation usable; 440 holds a full-length
-   *  name and its language flag whole. */
+   *  name and its language flag on one line. Narrower, a long name wraps. */
   const LIST_WIDTH_MIN = 360;
   const LIST_WIDTH_MAX = 440;
   const LIST_WIDTH_SHARE = 0.32;
@@ -2619,7 +2619,7 @@
                          by its name, and everything else about it is one click
                          away inside. -->
                     <span class="chan-title">
-                      <span class="chan-name" title={ch.name}><bdi dir="auto">{ch.name}</bdi></span>
+                      <span class="chan-name"><bdi dir="auto">{ch.name}</bdi></span>
                       {#if isChannelLanguage(ch.language)}
                         {@const languageName = channelLanguageName(ch.language)}
                         <img
@@ -2831,7 +2831,7 @@
               </div>
               <div class="conv-heading">
                 <div class="conv-title">
-                  <h3 title={selected.name}><bdi dir="auto">{selected.name}</bdi></h3>
+                  <h3><bdi dir="auto">{selected.name}</bdi></h3>
                   {#if isChannelLanguage(selected.language)}
                     {@const languageName = channelLanguageName(selected.language)}
                     <img
@@ -3919,9 +3919,9 @@
      `--list-width` is measured from the workspace (see `listWidth`): 360px in
      a small window, growing with it to 440px. Names cap at 32 characters; at
      360px the name gets some 190px once the avatar, language flag, member
-     count and door button have taken theirs, and at 440px a full name fits
-     whole. Past what fits it ellipsises, with the full name in the row's
-     tooltip and the room header. Sized to the window rather than to the rooms:
+     count and door button have taken theirs, and at 440px a full name fits on
+     one line. A name that does not fit wraps (see `.chan-title`) rather than
+     being cut off. Sized to the window rather than to the rooms:
      a column that resized itself would do so repeatedly while Discover streams
      rooms in. The narrower members-open track is gone for the same reason — a
      name should not shorten because a roster opened beside it. */
@@ -4424,31 +4424,30 @@
 
   .lock-dot svg { width: 8px; height: 8px; }
 
-  /* The name is the only thing that gives way when the row is tight. The
-     count is two glyphs, and hiding it would make a busy room look empty. */
+  /* The name is the only thing that gives way when the row is tight, and it
+     gives way by wrapping rather than being cut off: a room is picked by its
+     name, and two rooms sharing a long prefix were indistinguishable once
+     ellipsised. Names cap at 32 characters, so even the narrowest list takes
+     two lines. The count is two glyphs, and hiding it would make a busy room
+     look empty. */
   .chan-title {
-    display: flex;
-    align-items: center;
-    gap: 6px;
     flex: 1;
     min-width: 0;
+    line-height: 1.3;
   }
 
   .chan-name {
-    flex: 0 1 auto;
-    min-width: 0;
     font-weight: 600;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
   }
 
-  /* A recognition aid beside the name, so it stays small and stays put when
-     a long name ellipsises. */
+  /* Inline after the last word, so it follows the name onto a second line. */
   .chan-flag {
-    flex-shrink: 0;
+    display: inline-block;
     width: 14px;
     height: 14px;
+    margin-inline-start: 6px;
+    vertical-align: -2px;
     border-radius: 50%;
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--text-primary) 14%, transparent);
   }
@@ -4532,15 +4531,14 @@
     min-width: 0;
   }
 
+  /* Wraps like the list's names rather than being cut off. */
   .conv-heading h3 {
     margin: 0;
     min-width: 0;
     font-size: 14px;
     font-weight: 650;
     line-height: 1.2;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
   }
 
   .conv-flag {
