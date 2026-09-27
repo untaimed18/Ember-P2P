@@ -208,6 +208,42 @@
    *  never took — clicking the next room closed it again. */
   let listCollapsed = $state(false);
   const LIST_COLLAPSED_KEY = 'channels-list-collapsed';
+
+  /** The room list's width follows the space the page has, not the names in
+   *  it: a column sized to its rooms would jump as Discover streams them in.
+   *  360 keeps a small window's conversation usable; 440 holds a full-length
+   *  name and its language flag whole. */
+  const LIST_WIDTH_MIN = 360;
+  const LIST_WIDTH_MAX = 440;
+  const LIST_WIDTH_SHARE = 0.32;
+  let workspaceEl = $state<HTMLDivElement>();
+  let listWidth = $state(LIST_WIDTH_MIN);
+  /** Set for the frames a window resize moves the list, so the collapse
+   *  transition does not make it trail the edge being dragged. */
+  let listWidthSnapping = $state(false);
+
+  $effect(() => {
+    const el = workspaceEl;
+    if (!el) return;
+    let unsnap = 0;
+    const observer = new ResizeObserver(([entry]) => {
+      const next = Math.round(
+        Math.min(LIST_WIDTH_MAX, Math.max(LIST_WIDTH_MIN, entry.contentRect.width * LIST_WIDTH_SHARE)),
+      );
+      if (next === listWidth) return;
+      listWidthSnapping = true;
+      listWidth = next;
+      cancelAnimationFrame(unsnap);
+      unsnap = requestAnimationFrame(() => {
+        unsnap = requestAnimationFrame(() => (listWidthSnapping = false));
+      });
+    });
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(unsnap);
+    };
+  });
   let listCollapsedLoaded = $state(false);
   let roomInfoOpen = $state(false);
   let listQuery = $state('');
@@ -2452,6 +2488,9 @@
     {:else}
       <div
         class="workspace"
+        bind:this={workspaceEl}
+        style:--list-width="{listWidth}px"
+        class:list-snapping={listWidthSnapping}
         class:has-members={!!selected}
         class:members-open={membersOpen && !!selected}
         class:list-collapsed={listCollapsed && !!selected}
@@ -3872,37 +3911,42 @@
     color: var(--danger);
   }
 
-  /* Fixed track widths rather than minmax(): collapsing the list animates
-     `grid-template-columns`, and browsers only interpolate that when the track
-     values are plain lengths. With minmax() the sidebar would jump.
+  /* Plain-length track widths rather than minmax() or clamp(): collapsing the
+     list animates `grid-template-columns`, and browsers only interpolate that
+     reliably when the track values are plain lengths. With minmax() the
+     sidebar would jump.
 
-     Names cap at 32 characters. The name gets about 210px here once the
-     avatar, member count and door button have taken theirs, which holds some
-     26 characters whole; past that it ellipsises, with the full name in the
-     row's tooltip and the room header. Holding all 32 would take about 410px,
-     and at the smallest window that leaves the conversation some 230px.
-     Held at one width rather than measured per room: a column that resized
-     itself would do so repeatedly while Discover streams rooms in. The
-     narrower members-open track is gone for the same reason — a name should
-     not shorten because a roster opened beside it. */
+     `--list-width` is measured from the workspace (see `listWidth`): 360px in
+     a small window, growing with it to 440px. Names cap at 32 characters; at
+     360px the name gets some 190px once the avatar, language flag, member
+     count and door button have taken theirs, and at 440px a full name fits
+     whole. Past what fits it ellipsises, with the full name in the row's
+     tooltip and the room header. Sized to the window rather than to the rooms:
+     a column that resized itself would do so repeatedly while Discover streams
+     rooms in. The narrower members-open track is gone for the same reason — a
+     name should not shorten because a roster opened beside it. */
   .workspace {
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns: 360px minmax(0, 1fr);
+    grid-template-columns: var(--list-width, 360px) minmax(0, 1fr);
     gap: 10px;
     position: relative;
     transition: grid-template-columns var(--transition-slow) ease;
   }
 
+  .workspace.list-snapping {
+    transition: none;
+  }
+
   /* Keep a zero-width members track while a room is open so the roster can
-     ease in and out instead of popping. The list stays 360px either way. */
+     ease in and out instead of popping. The list keeps its width either way. */
   .workspace.has-members {
-    grid-template-columns: 360px minmax(0, 1fr) 0;
+    grid-template-columns: var(--list-width, 360px) minmax(0, 1fr) 0;
   }
 
   .workspace.members-open {
-    grid-template-columns: 360px minmax(0, 1fr) 228px;
+    grid-template-columns: var(--list-width, 360px) minmax(0, 1fr) 228px;
   }
 
   .workspace.list-collapsed {
@@ -5541,7 +5585,7 @@
     .workspace,
     .workspace.has-members,
     .workspace.members-open {
-      grid-template-columns: 360px minmax(0, 1fr);
+      grid-template-columns: var(--list-width, 360px) minmax(0, 1fr);
     }
 
     /* The members pane floats over the chat at this width, so a collapsed list
