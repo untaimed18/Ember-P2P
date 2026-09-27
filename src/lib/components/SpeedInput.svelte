@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import * as m from '$lib/paraglide/messages';
 
   type Unit = 'B/s' | 'KB/s' | 'MB/s';
@@ -49,6 +50,8 @@
   // wizard) was swallowed — leaving the box showing an abandoned value that
   // no longer matched the setting underneath it.
   let lastSyncedValue = -1;
+  let inputEl: HTMLInputElement | undefined = $state(undefined);
+  let unlimitedEl: HTMLDivElement | undefined = $state(undefined);
   const inputId = $derived(
     [
       'speed-input',
@@ -133,19 +136,25 @@
     // `lastSyncedValue === value`), leaving the numeric input showing the
     // stale/empty `displayValue` while the bound value is actually 512 KB/s.
     syncFromBytes(value);
+    // The control that was just activated is swapped out of the DOM, which
+    // would otherwise drop focus to the body.
+    void tick().then(() => (value === 0 ? unlimitedEl : inputEl)?.focus());
   }
 </script>
 
 {#if label}
-  <label class="speed-label" for={inputId}>{label}</label>
+  <!-- No `for` while unlimited: the number input it names is not rendered,
+       and the button that replaces it carries the label in its own name. -->
+  <label class="speed-label" for={showUnlimited ? undefined : inputId}>{label}</label>
 {/if}
 <div class="speed-input" class:unlimited={showUnlimited}>
   {#if showUnlimited}
     <div
+      bind:this={unlimitedEl}
       class="unlimited-display"
       role="button"
       tabindex="0"
-      aria-label={label ? `${label}: ${m.speed_input_unlimited()}` : m.speed_input_unlimited_aria()}
+      aria-label={label ? `${label}: ${m.speed_input_unlimited_aria()}` : m.speed_input_unlimited_aria()}
       onclick={toggleUnlimited}
       onkeydown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
@@ -159,6 +168,7 @@
     </div>
   {:else}
     <input
+      bind:this={inputEl}
       id={inputId}
       type="number"
       min="0"

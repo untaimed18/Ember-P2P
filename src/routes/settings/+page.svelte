@@ -130,11 +130,11 @@
       ? m.settings_nodes_downloaded_applied({
           parsed: result.parsedCount,
           applied: result.appliedCount,
-          bytes: result.byteCount,
+          bytes: formatSize(result.byteCount),
         })
       : m.settings_nodes_downloaded_deferred({
           parsed: result.parsedCount,
-          bytes: result.byteCount,
+          bytes: formatSize(result.byteCount),
         });
   }
 
@@ -143,17 +143,17 @@
       case 'applied':
         return m.settings_ipfilter_downloaded_applied({
             entries: result.entryCount,
-            bytes: result.byteCount,
+            bytes: formatSize(result.byteCount),
           });
       case 'failed':
         return m.settings_ipfilter_downloaded_failed({
             entries: result.entryCount,
-            bytes: result.byteCount,
+            bytes: formatSize(result.byteCount),
           });
       default:
         return m.settings_ipfilter_downloaded_deferred({
             entries: result.entryCount,
-            bytes: result.byteCount,
+            bytes: formatSize(result.byteCount),
           });
     }
   }
@@ -269,16 +269,16 @@
   let backupPassphraseConfirm = $state('');
   let backupBusy = $state(false);
   let backupMessage: string | null = $state(null);
-  let backupIsError = $state(false);
+  let backupMessageKind: 'progress' | 'success' | 'error' = $state('progress');
   let restorePassphrase = $state('');
   let restoreSource: string | null = $state(null);
   let restorePreview: BackupPreview | null = $state(null);
   let restoreStaged: RestoreSummary | null = $state(null);
   let pendingRestore: PendingRestoreStatus | null = $state(null);
 
-  function showBackupMsg(msg: string, isError: boolean) {
+  function showBackupMsg(msg: string, kind: 'progress' | 'success' | 'error') {
     backupMessage = msg;
-    backupIsError = isError;
+    backupMessageKind = kind;
   }
 
   async function refreshPendingRestore() {
@@ -308,9 +308,9 @@
       await discardPendingRestore();
       pendingRestore = null;
       restoreStaged = null;
-      showBackupMsg(m.settings_backup_pending_discarded(), false);
+      showBackupMsg(m.settings_backup_pending_discarded(), 'success');
     } catch (e) {
-      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), 'error');
     } finally {
       backupBusy = false;
     }
@@ -327,18 +327,18 @@
     try {
       await clearPickedBackup();
     } catch (e) {
-      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), 'error');
     }
   }
 
   async function handleExportBackup() {
     if (backupBusy) return;
     if (backupPassphrase !== backupPassphraseConfirm) {
-      showBackupMsg(m.settings_backup_passphrase_mismatch(), true);
+      showBackupMsg(m.settings_backup_passphrase_mismatch(), 'error');
       return;
     }
     backupBusy = true;
-    showBackupMsg(m.settings_backup_exporting(), false);
+    showBackupMsg(m.settings_backup_exporting(), 'progress');
     try {
       const summary = await exportBackup(backupPassphrase);
       if (!summary) {
@@ -353,10 +353,10 @@
           size: formatSize(summary.bytes),
           path: summary.path,
         }),
-        false,
+        'success',
       );
     } catch (e) {
-      showBackupMsg(translateError(e, m.settings_backup_export_failed()), true);
+      showBackupMsg(translateError(e, m.settings_backup_export_failed()), 'error');
     } finally {
       backupBusy = false;
     }
@@ -371,7 +371,7 @@
         backupMessage = null;
       }
     } catch (e) {
-      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), 'error');
     }
   }
 
@@ -380,16 +380,16 @@
   async function handlePreviewBackup() {
     if (backupBusy || !restoreSource) return;
     backupBusy = true;
-    showBackupMsg(m.settings_backup_reading(), false);
+    showBackupMsg(m.settings_backup_reading(), 'progress');
     try {
       restorePreview = await previewBackup(restorePassphrase);
       backupMessage = null;
       if (restorePreview.schema_too_new) {
-        showBackupMsg(m.settings_backup_schema_too_new(), true);
+        showBackupMsg(m.settings_backup_schema_too_new(), 'error');
       }
     } catch (e) {
       restorePreview = null;
-      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), 'error');
     } finally {
       backupBusy = false;
     }
@@ -398,7 +398,7 @@
   async function handleImportBackup() {
     if (backupBusy || !restoreSource) return;
     backupBusy = true;
-    showBackupMsg(m.settings_backup_restoring(), false);
+    showBackupMsg(m.settings_backup_restoring(), 'progress');
     try {
       restoreStaged = await importBackup(restorePassphrase);
       resetLocalRestoreFields();
@@ -409,7 +409,7 @@
       await refreshPendingRestore();
       showRestoreRestartPrompt = true;
     } catch (e) {
-      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), 'error');
     } finally {
       backupBusy = false;
     }
@@ -567,6 +567,16 @@
   // `$state` proxying makes an in-place write reactive either way.
   function ruleById(id: string): BandwidthScheduleRule | undefined {
     return settings?.bandwidth_schedule.find((r) => r.id === id);
+  }
+
+  /** Accessible name for one of a rule's controls. Every rule has the same set,
+   *  so the action alone would name a dozen buttons identically. */
+  function ruleControlLabel(action: string, rule: BandwidthScheduleRule, index: number): string {
+    return m.schedule_rule_control_aria({
+      action,
+      rule: rule.label.trim() || m.schedule_unnamed_rule(),
+      position: index + 1,
+    });
   }
 
   function setRuleDays(id: string, weekday: number) {
@@ -1349,7 +1359,7 @@
   }
 
   async function handleSave() {
-    if (!settings || saving) return;
+    if (!settings || saving || scheduleHasError) return;
     const antileechDirtyAtSave = antileechDraftDirty;
     const validation = validateSettings(settings);
     if (validation.error) {
@@ -1634,6 +1644,18 @@
       const msg = translateError(e, m.settings_folder_picker_generic_error());
       showSaveMsg(m.settings_folder_picker_failed({ error: msg }), true, 5000);
     }
+  }
+
+  /** The two subfolders the backend creates under the download folder
+   *  (`Downloads` and `Temp`), joined with the folder's own separator so a
+   *  Windows path does not end in a forward slash. */
+  function folderLayoutHint(folder: string): string {
+    const sep = folder.includes('\\') ? '\\' : '/';
+    const base = folder.replace(/[\\/]+$/, '');
+    return m.settings_folder_layout_hint({
+      downloads: `${base}${sep}Downloads`,
+      temp: `${base}${sep}Temp`,
+    });
   }
 
   function showIpFilterDownloadOutcome(result: IpFilterDownloadResult) {
@@ -2066,10 +2088,16 @@
 
   /** Strips as you type, so the field can only ever hold a legal handle. A
    *  named function rather than an inline handler: inside the template the
-   *  callback outlives the `{#if settings}` narrowing around it. */
-  function setChannelUsername(raw: string) {
+   *  callback outlives the `{#if settings}` narrowing around it.
+   *
+   *  The box is one-way bound, and when the stripped text equals what is
+   *  already stored Svelte has nothing to re-render, so the rejected
+   *  characters would stay on screen — hence the direct write-back. */
+  function setChannelUsername(input: HTMLInputElement) {
     if (!settings) return;
-    settings.channel_username = sanitizeChannelUsernameInput(raw);
+    const clean = sanitizeChannelUsernameInput(input.value);
+    settings.channel_username = clean;
+    if (input.value !== clean) input.value = clean;
   }
 
   function handleRadioGroupKey(
@@ -2753,7 +2781,7 @@
                 <input id="download-folder" value={settings.download_folder} readonly />
                 <button class="folder-btn" onclick={pickDownloadFolder}>{m.settings_browse()}</button>
               </div>
-              <span class="hint">{m.settings_folder_layout_hint({ folder: settings.download_folder })}</span>
+              <span class="hint">{folderLayoutHint(settings.download_folder)}</span>
             </div>
           </div>
 
@@ -2901,7 +2929,7 @@
                 <span class="hint hint-error" role="alert">{historyStatsError}</span>
               {/if}
               {#if historyClearMsg}
-                <span class="hint">{historyClearMsg}</span>
+                <span class="hint" role="status">{historyClearMsg}</span>
               {/if}
             </div>
           </div>
@@ -2952,6 +2980,7 @@
                     <button
                       class="action-btn ghost webservice-remove"
                       onclick={() => removeWebService(index)}
+                      aria-label={m.settings_webservice_remove_aria({ name: service.name })}
                     >{m.webservices_remove()}</button>
                   </li>
                 {/each}
@@ -3194,7 +3223,7 @@
                   <div class="schedule-rule-head">
                     <ToggleSwitch
                       bind:checked={rule.enabled}
-                      ariaLabel={m.schedule_rule_enabled_aria()}
+                      ariaLabel={ruleControlLabel(m.schedule_rule_enabled_aria(), rule, index)}
                     />
                     <input
                       class="schedule-name"
@@ -3213,7 +3242,7 @@
                         class="icon-btn"
                         onclick={() => moveScheduleRule(index, -1)}
                         disabled={index === 0}
-                        aria-label={m.schedule_move_up()}
+                        aria-label={ruleControlLabel(m.schedule_move_up(), rule, index)}
                         title={m.schedule_move_up()}
                       >&#9650;</button>
                       <button
@@ -3221,20 +3250,20 @@
                         class="icon-btn"
                         onclick={() => moveScheduleRule(index, 1)}
                         disabled={index === settings.bandwidth_schedule.length - 1}
-                        aria-label={m.schedule_move_down()}
+                        aria-label={ruleControlLabel(m.schedule_move_down(), rule, index)}
                         title={m.schedule_move_down()}
                       >&#9660;</button>
                       <button
                         type="button"
                         class="icon-btn danger"
                         onclick={() => removeScheduleRule(rule.id)}
-                        aria-label={m.schedule_remove_rule()}
+                        aria-label={ruleControlLabel(m.schedule_remove_rule(), rule, index)}
                         title={m.schedule_remove_rule()}
                       >&times;</button>
                     </div>
                   </div>
 
-                  <div class="schedule-days" role="group" aria-label={m.schedule_days_label()}>
+                  <div class="schedule-days" role="group" aria-label={ruleControlLabel(m.schedule_days_label(), rule, index)}>
                     {#each weekdayLabels as dayLabel, weekday (weekday)}
                       <button
                         type="button"
@@ -3326,6 +3355,10 @@
                   <span>{m.settings_speed_recommended_upload()}</span>
                   <span class="speed-value">{formatSpeed(speedResult.recommended_upload_limit)}</span>
                 </div>
+                <div class="speed-row recommended">
+                  <span>{m.settings_speed_recommended_download()}</span>
+                  <span class="speed-value">{formatSpeed(speedResult.recommended_download_limit)}</span>
+                </div>
                 <button class="apply-btn" onclick={applyRecommended}>{m.settings_apply_recommended()}</button>
               </div>
             {/if}
@@ -3357,19 +3390,22 @@
         <div class="card-body">
           <div class="field-row">
             <div class="field half">
+              <!-- The badge is hidden from the label's accessible name, which
+                   would otherwise read "TCP port Restart required", and
+                   announced as the input's description instead. -->
               <label for="tcp-port">
                 {m.settings_tcp_port()}
-                <span class="restart-badge">{m.settings_restart_badge()}</span>
+                <span class="restart-badge" id="tcp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
               </label>
-              <input id="tcp-port" type="number" min="1" max="65535" bind:value={settings.tcp_port} />
+              <input id="tcp-port" type="number" min="1" max="65535" aria-describedby="tcp-port-restart" bind:value={settings.tcp_port} />
               <span class="hint">{m.settings_tcp_port_hint()}</span>
             </div>
             <div class="field half">
               <label for="udp-port">
                 {m.settings_udp_port()}
-                <span class="restart-badge">{m.settings_restart_badge()}</span>
+                <span class="restart-badge" id="udp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
               </label>
-              <input id="udp-port" type="number" min="1" max="65535" bind:value={settings.udp_port} />
+              <input id="udp-port" type="number" min="1" max="65535" aria-describedby="udp-port-restart" bind:value={settings.udp_port} />
               <span class="hint">{m.settings_udp_port_hint()}</span>
             </div>
           </div>
@@ -3759,7 +3795,7 @@
               autocomplete="username"
               autocapitalize="off"
               placeholder={m.settings_channel_username_placeholder()}
-              oninput={(e) => setChannelUsername(e.currentTarget.value)}
+              oninput={(e) => setChannelUsername(e.currentTarget)}
             />
             <span class="hint">{m.settings_channel_username_hint()}</span>
           </div>
@@ -4093,7 +4129,10 @@
           </div>
 
           {#if backupMessage}
-            <span class="hint" style={backupIsError ? 'color: var(--danger)' : 'color: var(--success)'}>
+            <span
+              class={backupMessageKind === 'progress' ? 'hint' : `feedback ${backupMessageKind}`}
+              role={backupMessageKind === 'error' ? 'alert' : 'status'}
+            >
               {backupMessage}
             </span>
           {/if}
@@ -5717,6 +5756,12 @@
     padding-top: 6px;
     color: var(--text-primary);
     font-weight: 600;
+  }
+
+  .speed-row.recommended + .speed-row.recommended {
+    border-top: none;
+    margin-top: 0;
+    padding-top: 2px;
   }
 
   .speed-value {

@@ -13,7 +13,7 @@
     clearServerLogHistory,
   } from '$lib/api/server';
   import type { ServerInfo, ServerPriority } from '$lib/types';
-  import { onMount, untrack } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import { fade } from 'svelte/transition';
   import { flip } from 'svelte/animate';
@@ -21,6 +21,7 @@
   import { translateError } from '$lib/i18n';
   import { copyToClipboard, formatClockTime, formatCompactCount, formatNumber } from '$lib/utils';
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
+  import { menuKeydown } from '$lib/a11y';
   import { toastError } from '$lib/stores/toast';
   import { serverLog, appendServerLog, clearServerLog } from '$lib/stores/serverLog';
   import IconX from '$lib/components/IconX.svelte';
@@ -104,6 +105,9 @@
 
   // Context menu
   let ctxMenu: { x: number; y: number; server: ServerInfo } | null = $state(null);
+  let ctxMenuEl: HTMLDivElement | undefined = $state(undefined);
+  /** The row a keyboard-opened menu came from, so Escape can hand focus back. */
+  let ctxReturnFocus: HTMLElement | null = null;
 
   let connecting = $state(false);
   // Monotonic id bumped whenever the user cancels/disconnects. A connect
@@ -234,9 +238,12 @@
       } else {
         hadFailure = true;
       }
+      // Only clear the error this poll raised: validation, connect and
+      // remove failures also live in `error`, and the 5 s poll would
+      // otherwise wipe them before they were read.
       if (hadFailure) {
         error = m.servers_refresh_failed();
-      } else {
+      } else if (error === m.servers_refresh_failed()) {
         error = null;
       }
     } catch (e: unknown) {
@@ -319,7 +326,8 @@
     connecting = false;
     const prev = connectedServer;
     try {
-      const msg = await disconnectServer();
+      await disconnectServer();
+      const msg = m.servers_disconnected();
       log(msg);
       flash(msg);
       await refresh();
@@ -380,7 +388,8 @@
     error = null;
     addingServer = true;
     try {
-      const msg = await addServer(ip, port, name);
+      await addServer(ip, port, name);
+      const msg = m.servers_added({ address: `${ip}:${port}` });
       log(msg);
       flash(msg);
       newIp = '';
@@ -402,7 +411,8 @@
   async function doRemoveServer(server: ServerInfo) {
     error = null;
     try {
-      const msg = await removeServer(server.ip, server.port);
+      await removeServer(server.ip, server.port);
+      const msg = m.servers_removed_one();
       log(msg);
       flash(msg);
       const key = serverKey(server);
@@ -554,7 +564,7 @@
     handleConnect(server);
   }
 
-  function selectServer(server: ServerInfo, e: MouseEvent) {
+  function selectServer(server: ServerInfo, e: MouseEvent | KeyboardEvent) {
     const key = serverKey(server);
     if (e.ctrlKey || e.metaKey) {
       const next = new Set(selectedServers);
@@ -602,6 +612,7 @@
 
   function handleContextMenu(e: MouseEvent, server: ServerInfo) {
     e.preventDefault();
+    ctxReturnFocus = null;
     const key = serverKey(server);
     if (!selectedServers.has(key)) {
       selectedServers = new Set([key]);
@@ -611,13 +622,44 @@
     ctxMenu = { x: e.clientX, y: e.clientY, server };
   }
 
+  function handleRowKeydown(e: KeyboardEvent, server: ServerInfo) {
+    // Leave the row's own buttons (the ✕) their native keyboard behavior.
+    if (e.target !== e.currentTarget) return;
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      void handleConnect(server);
+    } else if (e.key === ' ') {
+      e.preventDefault();
+      selectServer(server, e);
+    } else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
+      e.preventDefault();
+      e.stopPropagation();
+      const row = e.currentTarget as HTMLElement;
+      const rect = row.getBoundingClientRect();
+      handleContextMenu(
+        new MouseEvent('contextmenu', {
+          clientX: rect.left + Math.min(24, rect.width / 2),
+          clientY: rect.top + Math.min(16, rect.height / 2),
+        }),
+        server,
+      );
+      // The menu is rendered at the end of the page, so without this a
+      // keyboard user would have to Tab through everything to reach it.
+      ctxReturnFocus = row;
+      void tick().then(() => ctxMenuEl?.querySelector<HTMLButtonElement>('.ctx-item')?.focus());
+    }
+  }
+
   function closeContextMenu() {
     ctxMenu = null;
+    ctxReturnFocus = null;
   }
 
   async function ctxAction(action: string) {
     const target = ctxMenu?.server;
+    const returnTo = ctxReturnFocus;
     closeContextMenu();
+    if (returnTo?.isConnected) returnTo.focus();
     if (action === 'connect' && target) {
       await handleConnect(target);
     } else if (action === 'disconnect') {
@@ -820,7 +862,7 @@
 
   async function handleManualRefresh() {
     await refresh();
-    if (!error) flash(m.servers_list_refreshed());
+    if (error !== m.servers_refresh_failed()) flash(m.servers_list_refreshed());
   }
 
   $effect(() => {
@@ -843,7 +885,9 @@
 <svelte:document onclick={closeContextMenu} onkeydown={(e) => {
   if (e.key !== 'Escape') return;
   if (ctxMenu) {
+    const returnTo = ctxReturnFocus;
     closeContextMenu();
+    if (returnTo && document.contains(returnTo)) returnTo.focus();
     e.preventDefault();
     e.stopPropagation();
   } else if (e.target instanceof HTMLInputElement && e.target.classList.contains('server-filter-input') && serverFilter) {
@@ -888,6 +932,7 @@
     <div class="stat-card">
       <div class="label">{m.servers_stat_in_list()}</div>
       <div class="value">{formatNumber(servers.length)}</div>
+      <div class="sub">{m.servers_stat_users_files({ users: formatCount(totalListedUsers), files: formatCount(totalListedFiles) })}</div>
     </div>
     <div class="stat-card">
       <div class="label">{m.servers_stat_connected()}</div>
@@ -903,7 +948,6 @@
     <div class="stat-card">
       <div class="label">{m.servers_stat_high_failure()}</div>
       <div class="value">{formatNumber(failedServerCount)}</div>
-      <div class="sub">{m.servers_stat_users_files({ users: formatCount(totalListedUsers), files: formatCount(totalListedFiles) })}</div>
     </div>
   </div>
 
@@ -1012,9 +1056,12 @@
                   class:connected={isConnected(server)}
                   class:selected={isSelected(server)}
                   class:failed-server={server.fail_count >= 3}
+                  tabindex="0"
+                  aria-selected={isSelected(server)}
                   onclick={(e: MouseEvent) => selectServer(server, e)}
                   ondblclick={() => handleDoubleClick(server)}
                   oncontextmenu={(e: MouseEvent) => handleContextMenu(e, server)}
+                  onkeydown={(e) => handleRowKeydown(e, server)}
                   in:fade={{ duration: 150 }}
                   animate:flip={{ duration: 180 }}
                 >
@@ -1044,7 +1091,7 @@
                        else. -->
                   <td>{server.is_static ? m.common_yes() : m.common_no()}</td>
                   <td>
-                    <button type="button" class="server-remove" onclick={(e: MouseEvent) => { e.stopPropagation(); handleRemoveServer(server); }} title={m.common_remove()} aria-label={m.common_remove()}><IconX size={12} /></button>
+                    <button type="button" class="server-remove" onclick={(e: MouseEvent) => { e.stopPropagation(); handleRemoveServer(server); }} title={m.common_remove()} aria-label={m.servers_remove_aria({ name: server.name || `${server.ip}:${server.port}` })}><IconX size={12} /></button>
                   </td>
                 </tr>
               {/each}
@@ -1220,7 +1267,14 @@
 </div>
 
 {#if ctxMenu}
-  <div class="ctx-menu" role="menu" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
+  <div
+    class="ctx-menu"
+    role="menu"
+    tabindex="-1"
+    bind:this={ctxMenuEl}
+    onkeydown={(e) => menuKeydown(e, e.currentTarget)}
+    use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}
+  >
     <div class="ctx-header" role="presentation">
       <bdi dir="auto">{ctxMenu.server.name || `${ctxMenu.server.ip}:${ctxMenu.server.port}`}</bdi>
     </div>
@@ -1238,13 +1292,13 @@
     <div class="ctx-sep" role="separator"></div>
     <div class="ctx-header" role="presentation">{m.servers_col_priority()}</div>
     <button class="ctx-item" role="menuitemradio" aria-checked={ctxMenu.server.priority === 'high'} onclick={() => ctxAction('priority_high')}>
-      {ctxMenu.server.priority === 'high' ? '\u2713 ' : ''}{m.servers_priority_high()}
+      {m.servers_priority_high()}
     </button>
     <button class="ctx-item" role="menuitemradio" aria-checked={ctxMenu.server.priority === 'normal'} onclick={() => ctxAction('priority_normal')}>
-      {ctxMenu.server.priority === 'normal' ? '\u2713 ' : ''}{m.servers_priority_normal()}
+      {m.servers_priority_normal()}
     </button>
     <button class="ctx-item" role="menuitemradio" aria-checked={ctxMenu.server.priority === 'low'} onclick={() => ctxAction('priority_low')}>
-      {ctxMenu.server.priority === 'low' ? '\u2713 ' : ''}{m.servers_priority_low()}
+      {m.servers_priority_low()}
     </button>
     <div class="ctx-sep" role="separator"></div>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_ip')}>{m.servers_copy_ip_port()}</button>
@@ -1269,7 +1323,9 @@
 <ConfirmDialog
   bind:open={confirmRemoveOpen}
   title={m.servers_confirm_remove_title()}
-  message={m.servers_confirm_remove_message({ count: pendingRemoveServers.length })}
+  message={pendingRemoveServers.length === 1
+    ? m.servers_confirm_remove_message_one()
+    : m.servers_confirm_remove_message_other({ count: pendingRemoveServers.length })}
   confirmLabel={m.common_remove()}
   danger={true}
   onconfirm={confirmPendingRemoval}
@@ -1476,6 +1532,11 @@
 
   .server-table tbody tr.selected {
     background: var(--accent-fill);
+  }
+
+  .server-table tbody tr:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
 
   .server-table tbody tr.connected td {

@@ -130,6 +130,7 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    if (e.isComposing || e.keyCode === 229) return;
     if (showRecent && recent.length > 0) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
@@ -187,10 +188,11 @@
     // list — drop any highlight (possibly left behind by mouse hover) so
     // Delete can't unexpectedly remove a saved search.
     activeIndex = -1;
+    showRecent = !!recentKey && historyEnabled && recent.length > 0 && value === '';
   }
 
   function handleFocus() {
-    if (recentKey && historyEnabled && recent.length > 0) {
+    if (recentKey && historyEnabled && recent.length > 0 && value === '') {
       showRecent = true;
     }
   }
@@ -267,7 +269,16 @@
       />
     {/if}
     {#if value}
-      <button type="button" class="clear-btn" onclick={() => (value = '')} aria-label={m.search_bar_clear()}>
+      <button
+        type="button"
+        class="clear-btn"
+        onclick={() => {
+          value = '';
+          inputEl?.focus();
+        }}
+        title={m.search_bar_clear()}
+        aria-label={m.search_bar_clear()}
+      >
         <IconX size={11} />
       </button>
     {/if}

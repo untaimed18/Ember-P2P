@@ -72,7 +72,9 @@ export function menuKeydown(e: KeyboardEvent, container: HTMLElement | null | un
   if (!container) return;
   if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp' && e.key !== 'Home' && e.key !== 'End') return;
   const items = [
-    ...container.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])'),
+    ...container.querySelectorAll<HTMLElement>(
+      ':is([role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"]):not([disabled])',
+    ),
   ].filter((el) => el.getAttribute('aria-disabled') !== 'true');
   if (items.length === 0) return;
   e.preventDefault();

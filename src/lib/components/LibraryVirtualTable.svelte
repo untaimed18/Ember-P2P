@@ -2,7 +2,7 @@
   import type { FileInfo } from '$lib/types';
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
-  import { formatSize, formatDateTime, formatDateWithYear as formatDate } from '$lib/utils';
+  import { formatSize, formatNumber, formatDateTime, formatDateWithYear as formatDate } from '$lib/utils';
   import { onMount, onDestroy, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
 
@@ -645,9 +645,9 @@
                   {/if}
                 </td>
               {:else if col.key === 'requests'}
-                <td class="cell-num">{file.requests}{file.alltime_requests ? ` (${file.alltime_requests})` : ''}</td>
+                <td class="cell-num">{formatNumber(file.requests)}{file.alltime_requests ? ` (${formatNumber(file.alltime_requests)})` : ''}</td>
               {:else if col.key === 'accepted'}
-                <td class="cell-num">{file.accepted}{file.alltime_accepted ? ` (${file.alltime_accepted})` : ''}</td>
+                <td class="cell-num">{formatNumber(file.accepted)}{file.alltime_accepted ? ` (${formatNumber(file.alltime_accepted)})` : ''}</td>
               {:else if col.key === 'transferred'}
                 <td class="cell-num">{formatTransferred(file.bytes_transferred, file.alltime_transferred)}</td>
               {:else if col.key === 'folder'}
@@ -655,7 +655,7 @@
               {:else if col.key === 'modified'}
                 <td class="cell-date" title={file.modified_at ? formatDateTime(file.modified_at) : ''}>{formatDate(file.modified_at)}</td>
               {:else if col.key === 'sources'}
-                <td class="cell-num">{file.complete_sources || '\u2014'}</td>
+                <td class="cell-num">{file.complete_sources ? formatNumber(file.complete_sources) : '\u2014'}</td>
               {:else if col.key === 'shared'}
                 <!-- Every row in the Library is a file peers can download, so
                      a "yes" tick on all of them said nothing. What varies is
@@ -663,7 +663,7 @@
                 <td class="cell-shared">
                   {#if !file.hash}
                     <span class="hashing-label">{m.common_pending()}</span>
-                  {:else if file.friends_only || file.shared_kad || file.shared_ed2k || file.shared_ember || file.aich_hash}
+                  {:else if file.friends_only || file.shared_kad || file.shared_ed2k || file.shared_ember}
                     <span class="shared-badges">
                       {#if file.friends_only}<span class="shared-badge friends" title={m.library_friends_only_badge_title()}>{m.library_friends_only_badge()}</span>{/if}
                       {#if file.shared_kad}<span class="shared-badge kad" title={m.library_published_kad()}>KAD</span>{/if}
@@ -673,6 +673,11 @@
                     </span>
                   {:else}
                     <span class="not-published" title={m.library_not_published_yet()}>&#x2014;</span>
+                    <!-- Repair data, not a place the file has reached, so it
+                         rides along without counting as published. -->
+                    {#if file.aich_hash}
+                      <span class="shared-badges"><span class="shared-badge aich" title={m.library_aich_available()}>AICH</span></span>
+                    {/if}
                   {/if}
                 </td>
               {/if}

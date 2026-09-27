@@ -181,6 +181,8 @@
   let playerStopToken = $state(0);
 
   let hashedLibraryFiles = $derived.by(() => files.filter((f) => !!f.hash));
+  /** The collection picker selects by hash, so its total counts hashes too. */
+  let hashedUniqueCount = $derived(new Set(hashedLibraryFiles.map((f) => f.hash)).size);
 
   // --- Collections ---
   let collectionsOpen = $state(false);
@@ -210,7 +212,10 @@
       if (!collection) return;
       collectionsOpen = true;
       loadedCollection = collection;
-      toastSuccess(m.library_collection_loaded({ name: loadedCollection.name, count: loadedCollection.files.length }));
+      const count = loadedCollection.files.length;
+      toastSuccess(count === 1
+        ? m.library_collection_loaded_one({ name: loadedCollection.name })
+        : m.library_collection_loaded({ name: loadedCollection.name, count: formatNumber(count) }));
     } catch (e: unknown) {
       toastError(toErr(e));
     } finally {
@@ -249,14 +254,20 @@
         }
       }
       if (queued > 0) {
-        toastSuccess(m.library_queued_files_download({ count: queued }));
+        toastSuccess(queued === 1
+          ? m.library_queued_files_download_one()
+          : m.library_queued_files_download({ count: formatNumber(queued) }));
       }
       if (skipped > 0 || oversize > 0) {
         const totalSkipped = skipped + oversize;
-        toastWarning(m.library_collection_entries_skipped({ count: totalSkipped }));
+        toastWarning(totalSkipped === 1
+          ? m.library_collection_entries_skipped_one()
+          : m.library_collection_entries_skipped({ count: formatNumber(totalSkipped) }));
       }
       if (failed > 0) {
-        toastWarning(m.library_collection_start_failed({ count: failed }));
+        toastWarning(failed === 1
+          ? m.library_collection_start_failed_one()
+          : m.library_collection_start_failed({ count: formatNumber(failed) }));
       }
       if (firstError) throw firstError;
     } catch (e: unknown) {
@@ -398,7 +409,10 @@
         isBinary,
       );
       if (!msg) return;
-      toastSuccess(msg || m.library_collection_created({ name: newCollName.trim(), count: collFiles.length }));
+      const name = newCollName.trim();
+      toastSuccess(collFiles.length === 1
+        ? m.library_collection_created_one({ name })
+        : m.library_collection_created({ name, count: formatNumber(collFiles.length) }));
       closeCreateDialog();
     } catch (e: unknown) {
       toastError(toErr(e));
@@ -630,7 +644,7 @@
   }
 
   function folderDisplayName(path: string | null): string {
-    if (!path) return m.library_all_folders();
+    if (!path) return m.library_all_files();
     return path.split(/[\\/]/).filter(Boolean).pop() || path;
   }
 
@@ -1025,7 +1039,9 @@
       if (!mounted) return;
       if (priority) {
         folderPriorities = { ...folderPriorities, [path]: priority };
-        toastSuccess(m.library_folder_priority_set({ count: formatNumber(count) }));
+        toastSuccess(count === 1
+          ? m.library_folder_priority_set_one()
+          : m.library_folder_priority_set({ count: formatNumber(count) }));
       } else {
         const next = { ...folderPriorities };
         delete next[path];
@@ -1454,8 +1470,8 @@
       const count = await runBulkBatches(targets, paths => setFilesFriendsOnly(paths, friendsOnly));
       toastSuccess(
         friendsOnly
-          ? m.library_friends_only_on_count({ count })
-          : m.library_friends_only_off_count({ count }),
+          ? count === 1 ? m.library_friends_only_on_count_one() : m.library_friends_only_on_count({ count: formatNumber(count) })
+          : count === 1 ? m.library_friends_only_off_count_one() : m.library_friends_only_off_count({ count: formatNumber(count) }),
       );
     } catch (e: unknown) { error = toErr(e); }
     finally {
@@ -1572,12 +1588,24 @@
   let sortedFiles = $derived.by(() => {
     const copy = [...filteredFiles];
     const dir = sortAsc ? 1 : -1;
+    // The Type column shows the category label where there is one, so sort by
+    // that label rather than the raw extension.
+    const typeLabels = new Map<string, string>();
+    const typeSortKey = (f: LibraryRow): string => {
+      if (!f.matchType) return f.extension;
+      let label = typeLabels.get(f.matchType);
+      if (label === undefined) {
+        label = fileTypeFilterLabel(f.matchType);
+        typeLabels.set(f.matchType, label);
+      }
+      return label;
+    };
     copy.sort((a, b) => {
       let cmp = 0;
       switch (sortField) {
         case 'name': cmp = collator.compare(a.name, b.name); break;
         case 'size': cmp = a.size - b.size; break;
-        case 'extension': cmp = collator.compare(a.extension, b.extension); break;
+        case 'extension': cmp = collator.compare(typeSortKey(a), typeSortKey(b)) || collator.compare(a.extension, b.extension); break;
         case 'priority': cmp = (priorityOrder[a.priority] ?? 2) - (priorityOrder[b.priority] ?? 2); break;
         case 'hash': cmp = collator.compare(a.hash, b.hash); break;
         case 'requests': cmp = a.requests - b.requests; break;
@@ -1715,7 +1743,7 @@
 
   function formatTransferred(session: number, alltime: number): string {
     if (session === 0 && alltime === 0) return '\u2014';
-    const s = session > 0 ? formatSize(session) : '0';
+    const s = formatSize(session);
     if (alltime > 0 && alltime !== session) return `${s} (${formatSize(alltime)})`;
     return s;
   }
@@ -1749,6 +1777,7 @@
     // new file's stored comment with an empty save before the fetch lands.
     ourComment = '';
     ourRating = 0;
+    commentLastSavedAt = null;
     commentBaselineRating = 0;
     commentBaselineText = '';
     if (commentSaveTimer) {
@@ -1762,7 +1791,6 @@
     if (!hash) {
       commentInfo = null;
       commentLoading = false;
-      commentLastSavedAt = null;
       return;
     }
     commentLoading = true;
@@ -1903,21 +1931,90 @@
       sendableFriends = [];
     }
   }
+  let ctxMenuEl: HTMLDivElement | undefined = $state(undefined);
+  /** What had focus when the menu opened, so it can be handed back rather
+   *  than dropped on the body when the menu unmounts. */
+  let ctxReturnFocus: HTMLElement | null = null;
+
+  /** Enabled items of one menu level, excluding those of submenus nested in it. */
+  function ctxMenuItems(menu: Element | null | undefined): HTMLElement[] {
+    if (!menu) return [];
+    return [...menu.querySelectorAll<HTMLElement>('[role^="menuitem"]:not(:disabled)')]
+      .filter((el) => el.closest('[role="menu"]') === menu);
+  }
+
   function onCtx(e: MouseEvent, f: FileInfo) {
     e.preventDefault();
     ctxPrioritySub = false;
     ctxCopySub = false;
+    ctxSendSub = false;
+    ctxWebSub = false;
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && active !== document.body && !ctxMenuEl?.contains(active)) {
+      ctxReturnFocus = active;
+    }
     // Highlight the target row without opening the properties drawer
     // (drawer stays tied to left-click / Properties menu item).
     // `ctxMenuPosition` measures the panel and keeps it inside the viewport;
     // the submenus pick their own side via `ctxSubmenuPlacement`.
     ctxMenu = { x: e.clientX, y: e.clientY, file: f };
+    // Without focus inside the menu, the arrow keys would keep moving the
+    // table selection underneath it.
+    void tick().then(() => ctxMenuItems(ctxMenuEl)[0]?.focus());
   }
   function closeCtx() {
     ctxMenu = null;
     ctxPrioritySub = false;
     ctxCopySub = false;
+    ctxSendSub = false;
     ctxWebSub = false;
+    ctxReturnFocus = null;
+  }
+  function closeCtxAndRefocus() {
+    const target = ctxReturnFocus;
+    closeCtx();
+    if (target?.isConnected) target.focus();
+  }
+
+  /** Arrow-key movement inside the open context menu. Returns true when handled. */
+  function handleCtxMenuKey(e: KeyboardEvent): boolean {
+    const active = document.activeElement instanceof HTMLElement && ctxMenuEl?.contains(document.activeElement)
+      ? document.activeElement
+      : null;
+    if (
+      e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Home' || e.key === 'End'
+      || e.key === 'PageUp' || e.key === 'PageDown'
+    ) {
+      e.preventDefault();
+      const items = ctxMenuItems(active?.closest('[role="menu"]') ?? ctxMenuEl);
+      if (items.length === 0) return true;
+      const i = active ? items.indexOf(active) : -1;
+      const next =
+        e.key === 'Home' || e.key === 'PageUp' ? 0
+        : e.key === 'End' || e.key === 'PageDown' ? items.length - 1
+        : e.key === 'ArrowDown' ? (i + 1) % items.length
+        : i <= 0 ? items.length - 1 : i - 1;
+      items[next].focus();
+      return true;
+    }
+    if (e.key === 'ArrowRight' && active?.getAttribute('aria-haspopup') === 'menu') {
+      // The item's own handler has just opened its submenu.
+      e.preventDefault();
+      void tick().then(() => ctxMenuItems(active.querySelector('[role="menu"]'))[0]?.focus());
+      return true;
+    }
+    if (e.key === 'ArrowLeft' && active) {
+      const parentItem = active.closest('[role="menu"]')?.closest<HTMLElement>('[aria-haspopup="menu"]');
+      if (!parentItem) return false;
+      e.preventDefault();
+      parentItem.focus();
+      ctxPrioritySub = false;
+      ctxCopySub = false;
+      ctxSendSub = false;
+      ctxWebSub = false;
+      return true;
+    }
+    return false;
   }
   function onDocClick() { if (mounted) closeCtx(); }
 
@@ -2008,7 +2105,8 @@
 
   function onPageKeyDown(e: KeyboardEvent) {
     if (!mounted) return;
-    if (ctxMenu && e.key === 'Escape') { closeCtx(); e.preventDefault(); e.stopPropagation(); return; }
+    if (ctxMenu && e.key === 'Escape') { closeCtxAndRefocus(); e.preventDefault(); e.stopPropagation(); return; }
+    if (ctxMenu && handleCtxMenuKey(e)) return;
 
     // Ignore shortcuts while a modal is open. Must run before Escape so a
     // discard/delete confirm isn't also treated as "deselect the row".
@@ -2021,6 +2119,7 @@
         e.preventDefault();
         e.stopPropagation();
         if (addFolderOpen) addFolderOpen = false;
+        else if (stopConfirmVisible) handleStopCancel();
       }
       return;
     }
@@ -2088,6 +2187,8 @@
 
     // Ctrl/Cmd+C copies links for the current check selection or selected row.
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'c' || e.key === 'C')) {
+      // Selected text (a path or comment in the drawer) keeps the normal copy.
+      if (window.getSelection()?.toString()) return;
       const hasChecked = checkedCount > 0;
       const hasSelected = !!selectedFile;
       if (!hasChecked && !hasSelected) return;
@@ -2183,7 +2284,7 @@
     // actions were unaffected either way, but copy_link, send_to_friend and
     // republish would carry the ed2k identity the file no longer has.
     const f = fileByPath.get(ctxMenu.file.path) ?? ctxMenu.file;
-    closeCtx();
+    closeCtxAndRefocus();
     try {
       switch (action) {
         case 'properties':
@@ -2955,9 +3056,13 @@
       class:active={showDuplicatesOnly}
       disabled={duplicateHashes.size === 0}
       onclick={() => (showDuplicatesOnly = !showDuplicatesOnly)}
-      title={duplicateHashes.size === 0 ? m.library_no_duplicates() : m.library_duplicates_tooltip({ files: duplicateFileCount, hashes: duplicateHashes.size })}
+      title={duplicateHashes.size === 0
+        ? m.library_no_duplicates()
+        : duplicateHashes.size === 1
+          ? m.library_duplicates_tooltip_one({ files: formatNumber(duplicateFileCount) })
+          : m.library_duplicates_tooltip({ files: formatNumber(duplicateFileCount), hashes: formatNumber(duplicateHashes.size) })}
     >
-      {m.library_duplicates()}{duplicateHashes.size > 0 ? ` (${duplicateFileCount})` : ''}
+      {m.library_duplicates()}{duplicateHashes.size > 0 ? ` (${formatNumber(duplicateFileCount)})` : ''}
     </button>
     <button
       class="dupes-toggle missing-toggle"
@@ -2971,18 +3076,18 @@
             ? m.library_no_missing()
             : missingScanTruncated
               ? m.library_missing_truncated({
-                  shown: missingPathSet.size,
-                  total: missingTotalCount,
-                  limit: 10_000,
+                  shown: formatNumber(missingPathSet.size),
+                  total: formatNumber(missingTotalCount),
+                  limit: formatNumber(10_000),
                 })
-              : m.library_missing_tooltip({ count: missingTotalCount })
+              : m.library_missing_tooltip({ count: formatNumber(missingTotalCount) })
       }
     >
       {#if missingScanInFlight}
         <span class="scan-spinner" aria-hidden="true"></span>
         {m.library_missing()}
       {:else}
-        {m.library_missing()}{missingTotalCount > 0 ? ` (${missingTotalCount})` : ''}
+        {m.library_missing()}{missingTotalCount > 0 ? ` (${formatNumber(missingTotalCount)})` : ''}
       {/if}
     </button>
     {#if showMissingOnly && missingPathSet.size > 0}
@@ -3003,7 +3108,9 @@
         filteredHashedFiles.length === 0
           ? m.library_copy_all_none()
           : hasActiveLibraryFilters
-            ? m.library_copy_all_filtered_title({ count: filteredHashedFiles.length })
+            ? filteredHashedFiles.length === 1
+              ? m.library_copy_all_filtered_title_one()
+              : m.library_copy_all_filtered_title({ count: formatNumber(filteredHashedFiles.length) })
             : m.library_copy_all_links_title()
       }
     >
@@ -3026,13 +3133,13 @@
       {m.library_columns_button()}
     </button>
     <span class="inline-stats">
-      <span class="inline-stat">{m.library_stat_files({ count: formatNumber(files.length) })}</span>
+      <span class="inline-stat">{files.length === 1 ? m.library_stat_files_one() : m.library_stat_files({ count: formatNumber(files.length) })}</span>
       <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{m.library_stat_hashed({ count: formatNumber(libraryHashedCount) })}</span>
+      <span class="inline-stat">{libraryHashedCount === 1 ? m.library_stat_hashed_one() : m.library_stat_hashed({ count: formatNumber(libraryHashedCount) })}</span>
       <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{m.library_stat_folders({ count: formatNumber(folders.length) })}</span>
+      <span class="inline-stat">{folders.length === 1 ? m.library_stat_folders_one() : m.library_stat_folders({ count: formatNumber(folders.length) })}</span>
       <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{m.stats_total_uploaded()}: {formatSize(aggregateUploaded)}</span>
+      <span class="inline-stat">{m.library_stat_total_uploaded({ size: formatSize(aggregateUploaded) })}</span>
     </span>
   </div>
 </div>
@@ -3048,7 +3155,7 @@
             <span class="collection-meta">
               {loadedCollection.files.length === 1
                 ? m.library_collection_meta_one({ author: loadedCollection.author || m.common_unknown() })
-                : m.library_collection_meta_other({ author: loadedCollection.author || m.common_unknown(), count: loadedCollection.files.length })}
+                : m.library_collection_meta_other({ author: loadedCollection.author || m.common_unknown(), count: formatNumber(loadedCollection.files.length) })}
             </span>
           {/if}
         </span>
@@ -3057,7 +3164,7 @@
         <button class="coll-action-btn download-all-btn" onclick={handleDownloadAll} disabled={downloadingCollection}>
           {downloadingCollection ? m.library_queueing() : m.library_download_all()}
         </button>
-        <button class="coll-action-btn ghost" onclick={handleCopyCollectionLinks} disabled={copyingCollectionLinks || loadedCollection.files.length === 0} title={m.library_copy_all_links_title()}>
+        <button class="coll-action-btn ghost" onclick={handleCopyCollectionLinks} disabled={copyingCollectionLinks || loadedCollection.files.length === 0} title={m.library_copy_collection_links_title()}>
           {copyingCollectionLinks ? m.library_copying() : m.library_copy_links()}
         </button>
         <button class="coll-action-btn ghost" onclick={() => { loadedCollection = null; collectionsOpen = false; }}>{m.common_close()}</button>
@@ -3171,7 +3278,7 @@
           </div>
         </div>
         <div class="form-row">
-          <span class="form-label">{m.library_coll_select_files({ selected: selectedFileHashes.size, total: hashedLibraryFiles.length })}</span>
+          <span class="form-label">{m.library_coll_select_files({ selected: formatNumber(selectedFileHashes.size), total: formatNumber(hashedUniqueCount) })}</span>
           <button class="ghost select-all-btn" onclick={toggleAllFileSelection}>
             {allHashedFilesSelected ? m.common_deselect_all() : m.common_select_all()}
           </button>
@@ -3289,6 +3396,8 @@
           tabindex="0"
           aria-expanded={row.hasChildren ? row.expanded : undefined}
           onkeydown={(e) => {
+            // The row holds its own buttons and a select; leave their keys alone.
+            if (e.target !== e.currentTarget) return;
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
               filterFolder = folder;
@@ -3517,9 +3626,9 @@
           {#if stoppingHashing}
             {m.library_stopping_hashing()}
           {:else if hashProgress && hashProgress.upgrading >= hashProgress.total && hashProgress.total > 0}
-            {m.library_upgrading_index({ current: hashProgress.current, total: hashProgress.total })}
+            {m.library_upgrading_index({ current: formatNumber(hashProgress.current), total: formatNumber(hashProgress.total) })}
           {:else if hashProgress}
-            {m.library_hashing_file({ current: hashProgress.current, total: hashProgress.total, name: hashProgress.file_name })}
+            {m.library_hashing_file({ current: formatNumber(hashProgress.current), total: formatNumber(hashProgress.total), name: hashProgress.file_name })}
           {:else}
             {m.library_scanning_files()}
           {/if}
@@ -3540,7 +3649,7 @@
            an AICH root, an Ember digest, or both — repair and verification data
            for whoever downloads it, never a condition of serving it. -->
       <div class="backfill-note">
-        {m.library_digest_backfill({ current: hashTopUp[0], total: hashTopUp[1] })}
+        {m.library_digest_backfill({ current: formatNumber(hashTopUp[0]), total: formatNumber(hashTopUp[1]) })}
       </div>
     {/if}
     {#if stopConfirmVisible}
@@ -3569,10 +3678,10 @@
     {/if}
     {#if scanTruncated}
       <div class="scan-banner scan-warning" role="status">
-        <span class="scan-text">{m.library_scan_truncated({ limit: 100000 })}</span>
+        <span class="scan-text">{m.library_scan_truncated({ limit: formatNumber(100000) })}</span>
       </div>
     {/if}
-    {#if sortedFiles.length === 0 && !scanning && hasActiveLibraryFilters && files.length > 0}
+    {#if sortedFiles.length === 0 && hasActiveLibraryFilters && files.length > 0}
       <div class="empty-state">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
           <circle cx="11" cy="11" r="8"></circle>
@@ -3825,7 +3934,7 @@
                   {#if selectedFile.shared_ember}<span class="meta-badge meta-badge-ember" title={m.library_published_ember()}>Ember</span>{/if}
                   {#if selectedFile.aich_hash}<span class="meta-badge meta-badge-aich" title={m.library_aich_available()}>AICH</span>{/if}
                 </span>
-                {#if !selectedFile.shared_kad && !selectedFile.shared_ed2k && !selectedFile.shared_ember && !selectedFile.aich_hash}
+                {#if !selectedFile.shared_kad && !selectedFile.shared_ed2k && !selectedFile.shared_ember}
                   <span class="shared-status">{m.library_not_published_yet()}</span>
                 {/if}
               {:else}
@@ -3890,21 +3999,21 @@
               <span class="activity-stat-label">{m.library_col_requests()}</span>
               <span class="activity-stat-value">{formatNumber(selectedFile.requests)}</span>
               {#if selectedFile.alltime_requests}
-                <span class="activity-stat-sub">{m.library_drawer_alltime()}: {formatNumber(selectedFile.alltime_requests)}</span>
+                <span class="activity-stat-sub">{m.library_drawer_alltime_value({ value: formatNumber(selectedFile.alltime_requests) })}</span>
               {/if}
             </div>
             <div class="activity-stat">
               <span class="activity-stat-label">{m.library_col_accepted()}</span>
               <span class="activity-stat-value">{formatNumber(selectedFile.accepted)}</span>
               {#if selectedFile.alltime_accepted}
-                <span class="activity-stat-sub">{m.library_drawer_alltime()}: {formatNumber(selectedFile.alltime_accepted)}</span>
+                <span class="activity-stat-sub">{m.library_drawer_alltime_value({ value: formatNumber(selectedFile.alltime_accepted) })}</span>
               {/if}
             </div>
             <div class="activity-stat">
               <span class="activity-stat-label">{m.library_col_transferred()}</span>
               <span class="activity-stat-value">{formatSize(selectedFile.bytes_transferred)}</span>
               {#if selectedFile.alltime_transferred}
-                <span class="activity-stat-sub">{m.library_drawer_alltime()}: {formatSize(selectedFile.alltime_transferred)}</span>
+                <span class="activity-stat-sub">{m.library_drawer_alltime_value({ value: formatSize(selectedFile.alltime_transferred) })}</span>
               {/if}
             </div>
           </div>
@@ -4037,9 +4146,13 @@
                   {#each commentInfo.peer_comments as pc, i (i)}
                     <div class="comment-peer-item">
                       <span class="comment-peer-name"><bdi dir="auto">{pc.user_name}</bdi></span>
-                      <span class="comment-peer-stars">
+                      <span
+                        class="comment-peer-stars"
+                        role="img"
+                        aria-label={pc.rating === 1 ? m.library_star_one() : m.library_star_other({ count: pc.rating })}
+                      >
                         {#each [1,2,3,4,5] as s}
-                          <span class="star-display">{s <= pc.rating ? '\u2605' : '\u2606'}</span>
+                          <span class="star-display" aria-hidden="true">{s <= pc.rating ? '\u2605' : '\u2606'}</span>
                         {/each}
                       </span>
                       {#if pc.comment}
@@ -4062,7 +4175,7 @@
 <!-- Context menu -->
 {#if ctxMenu}
   {@const fileHashed = !!ctxMenu.file.hash}
-  <div class="ctx-menu" role="menu" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
+  <div class="ctx-menu" role="menu" bind:this={ctxMenuEl} use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
     <div class="ctx-header" role="presentation">
       <bdi dir="auto">{ctxMenu.file.name}</bdi>
     </div>
@@ -4146,6 +4259,7 @@
         aria-expanded={ctxWebSub}
         onclick={(e) => { e.stopPropagation(); ctxWebSub = !ctxWebSub; }}
         onkeydown={(e) => {
+          if (e.target !== e.currentTarget) return;
           if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowRight') {
             e.preventDefault();
             ctxWebSub = true;

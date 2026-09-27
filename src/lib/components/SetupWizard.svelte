@@ -26,11 +26,10 @@
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { formatSpeed } from '$lib/utils';
 
   function fmtSpeedShort(bytesPerSec: number): string {
-    return bytesPerSec > 0
-      ? m.wizard_speed_kbps({ kb: Math.round(bytesPerSec / 1024) })
-      : m.wizard_summary_unlimited();
+    return bytesPerSec > 0 ? formatSpeed(bytesPerSec) : m.wizard_summary_unlimited();
   }
 
   let {
@@ -190,11 +189,16 @@
     return Math.min(max, Math.max(min, Math.trunc(n)));
   }
 
+  // The backend caps a nickname at 128 bytes, not characters; `maxlength` on
+  // the input counts UTF-16 units, so multi-byte text can pass it and still be
+  // refused on the final save.
+  let nicknameTooLong = $derived(new TextEncoder().encode(nickname.trim()).length > 128);
+
   /** Whether the current step's required fields pass validation. */
   let canAdvance = $derived.by(() => {
     switch (step) {
       case 3: // Identity
-        return nickname.trim().length > 0;
+        return nickname.trim().length > 0 && !nicknameTooLong;
       case 4: // Storage
         return downloadFolder.trim().length > 0;
       case 5: // Network
@@ -213,7 +217,8 @@
   let nextDisabledReason = $derived.by(() => {
     switch (step) {
       case 3:
-        return nickname.trim().length > 0 ? '' : m.wizard_validation_nickname();
+        if (!nickname.trim()) return m.wizard_validation_nickname();
+        return nicknameTooLong ? m.error_settings_nickname_too_long() : '';
       case 4:
         return downloadFolder.trim().length > 0 ? '' : m.wizard_validation_folder();
       case 5:
@@ -322,6 +327,7 @@
     // empty-nickname or port=0 config from sneaking past the per-step guard
     // if the user somehow reaches the last step with invalid state.
     if (!nickname.trim()) { saveError = m.wizard_validation_nickname(); step = 3; return; }
+    if (nicknameTooLong) { saveError = m.error_settings_nickname_too_long(); step = 3; return; }
     if (!downloadFolder.trim()) { saveError = m.wizard_validation_folder(); step = 4; return; }
     const tcp = clampInt(tcpPort, 1, 65535, 4662);
     const udp = clampInt(udpPort, 1, 65535, 4672);
@@ -751,11 +757,11 @@
             </div>
             <div class="summary-row">
               <span class="summary-label">{m.wizard_summary_upload_limit()}</span>
-              <span class="summary-value">{maxUploadSpeed === 0 ? m.wizard_summary_unlimited() : m.wizard_speed_kbps({ kb: Math.round(maxUploadSpeed / 1024) })}</span>
+              <span class="summary-value">{fmtSpeedShort(maxUploadSpeed)}</span>
             </div>
             <div class="summary-row">
               <span class="summary-label">{m.wizard_summary_download_limit()}</span>
-              <span class="summary-value">{maxDownloadSpeed === 0 ? m.wizard_summary_unlimited() : m.wizard_speed_kbps({ kb: Math.round(maxDownloadSpeed / 1024) })}</span>
+              <span class="summary-value">{fmtSpeedShort(maxDownloadSpeed)}</span>
             </div>
             <div class="summary-row">
               <span class="summary-label">{m.wizard_summary_theme()}</span>
@@ -857,11 +863,18 @@
 
       <div class="footer-right">
         {#if step < TOTAL_STEPS}
-          <span class="btn-next-wrap" title={nextDisabledReason || undefined}>
-            <button type="button" class="btn-next" onclick={goNext} disabled={!canAdvance}>
-              {step === 1 ? m.wizard_get_started() : m.common_next()}
-            </button>
-          </span>
+          {#if nextDisabledReason}
+            <span id="wizard-next-reason" class="next-reason">{nextDisabledReason}</span>
+          {/if}
+          <button
+            type="button"
+            class="btn-next"
+            onclick={goNext}
+            disabled={!canAdvance}
+            aria-describedby={nextDisabledReason ? 'wizard-next-reason' : undefined}
+          >
+            {step === 1 ? m.wizard_get_started() : m.common_next()}
+          </button>
         {:else}
           <button type="button" class="btn-finish" onclick={finish} disabled={saving || downloading || importing}>
             {#if saving}
@@ -1505,8 +1518,10 @@
     transition: background 0.15s;
   }
 
-  .btn-next-wrap {
-    display: inline-flex;
+  .next-reason {
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: right;
   }
 
   .btn-next:disabled {

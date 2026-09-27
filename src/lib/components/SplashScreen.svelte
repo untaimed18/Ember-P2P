@@ -11,7 +11,7 @@
       </div>
       <div class="wordmark">
         <h1>EMBER</h1>
-        <p class="subtitle">{m.splash_subtitle()}</p>
+        <p class="subtitle">{m.app_tagline()}</p>
       </div>
     </div>
 

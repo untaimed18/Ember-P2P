@@ -112,4 +112,11 @@
     z-index: 2;
     transition: clip-path 0.3s ease;
   }
+
+  @media (prefers-reduced-motion: reduce) {
+    .progress-fill,
+    .progress-text-fill {
+      transition: none;
+    }
+  }
 </style>

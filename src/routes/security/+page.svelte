@@ -447,10 +447,11 @@
     confirmRemoveOpen = true;
   }
 
+  // `pendingRemoveEntry` is deliberately not cleared: the dialog still renders
+  // its message during the outro. The next `handleRemoveRange` overwrites it.
   async function confirmRemoveRange() {
     if (!pendingRemoveEntry) return;
     const entry = pendingRemoveEntry;
-    pendingRemoveEntry = null;
     error = null;
     try {
       await removeIpFilterRange(entry.start_ip, entry.end_ip);
@@ -514,7 +515,7 @@
       aria-expanded={showUrlForm}
       aria-controls="ipfilter-url-form"
     >
-      {showUrlForm ? m.security_cancel_url() : m.security_from_url()}
+      {showUrlForm ? m.common_cancel() : m.security_from_url()}
     </button>
     <button class="ghost" onclick={() => void loadStats({ offset: listOffset })} disabled={loading}>{m.common_refresh()}</button>
   </div>
@@ -578,12 +579,20 @@
         </button>
       </div>
       <div class="controls-right">
-        <span class="inline-stat">{m.security_ranges_count({ count: formatNumber(stats.range_count) })}</span>
+        <span class="inline-stat">
+          {stats.range_count === 1
+            ? m.security_range_count_one()
+            : m.security_ranges_count({ count: formatNumber(stats.range_count) })}
+        </span>
         <span class="inline-sep">&middot;</span>
         <!-- Red only when there is something to be red about. A permanent
              danger-coloured "0 hits" trains the eye to ignore the one place
              on the page that reports blocks actually happening. -->
-        <span class="inline-stat" class:hits-stat={stats.total_hits > 0}>{m.security_hits_count({ count: formatNumber(stats.total_hits) })}</span>
+        <span class="inline-stat" class:hits-stat={stats.total_hits > 0}>
+          {stats.total_hits === 1
+            ? m.security_hits_count_one()
+            : m.security_hits_count({ count: formatNumber(stats.total_hits) })}
+        </span>
       </div>
     </div>
 
@@ -771,7 +780,6 @@
   confirmLabel={m.common_remove()}
   danger={true}
   onconfirm={confirmRemoveRange}
-  oncancel={() => { pendingRemoveEntry = null; }}
 />
 
 <style>

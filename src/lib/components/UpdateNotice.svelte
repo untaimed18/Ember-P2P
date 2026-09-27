@@ -87,7 +87,7 @@
         {/if}
       </div>
       {#if !inProgress}
-        <button type="button" class="notice-x" onclick={dismissNotice} aria-label={m.updater_dismiss_aria()}><IconX size={14} /></button>
+        <button type="button" class="notice-x" onclick={dismissNotice} title={m.updater_dismiss_aria()} aria-label={m.updater_dismiss_aria()}><IconX size={14} /></button>
       {/if}
     </div>
 

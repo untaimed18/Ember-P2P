@@ -196,7 +196,7 @@
           class="share-copy"
           class:copied
           onclick={() => void copyLink()}
-          disabled={!websiteUrl}
+          disabled={!websiteUrl && !loadError}
           aria-live="polite"
         >
           <span class="share-copy-icon" aria-hidden="true">

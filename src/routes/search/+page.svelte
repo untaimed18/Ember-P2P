@@ -531,6 +531,7 @@
     const clean = (result.clean_name ?? '').replace(DISPLAY_NAME_STRIP_RE, '').trim();
     return clean || (result.file.name ?? '').replace(DISPLAY_NAME_STRIP_RE, '');
   }
+  let selectedOriginalName = $derived((selectedResult?.file.name ?? '').replace(DISPLAY_NAME_STRIP_RE, ''));
 
   /**
    * What the Sources number on a row actually counted.
@@ -544,7 +545,7 @@
   function sourceCountHint(r: SearchResult): string | undefined {
     const origin = r.result_origin || '';
     if (!origin.includes('Ember')) return undefined;
-    if (origin !== 'Ember') return m.search_sources_ember_mixed_hint({ count: r.availability });
+    if (origin !== 'Ember') return m.search_sources_ember_mixed_hint();
     return r.availability === 1
       ? m.search_sources_ember_hint_one()
       : m.search_sources_ember_hint_other({ count: r.availability });
@@ -1178,6 +1179,11 @@
   let emberJoinActiveSince = $state<number | null>(null);
   let emberDiagnosticsStale = $state(false);
   let emberSearchUsable = $derived(emberEnabled && emberContacts > 0);
+  // The Ember option is not rendered while Ember is off, so a method restored
+  // from storage or a tab would leave the dropdown blank and Search disabled.
+  $effect(() => {
+    if ($appSettings && !emberEnabled && searchMethod === 'ember') searchMethod = 'global';
+  });
   // A wedged diagnostics poll leaves `emberContacts` at whatever it last was —
   // 0 for the whole session if the very first poll never landed. Gating submit
   // on that number then disables Search and blames the DHT for having no
@@ -1230,6 +1236,11 @@
 
   onMount(() => {
     loadPersistedPrefs();
+    const restoredTab = get(searchTabs).find((t) => t.id === get(activeSearchTabId));
+    if (restoredTab) {
+      barQuery = restoredTab.query;
+      restoreTabSearchParams(restoredTab);
+    }
     prefsRestored = true;
 
     // Arriving on this page puts the caret in the query box. Typing is what
@@ -3241,7 +3252,7 @@
 
     const parts: string[] = [];
     if (queued > 0) parts.push(m.search_bulk_queued({ count: queued }));
-    if (alreadyQueued > 0) parts.push(`${alreadyQueued}× ${m.search_already_in_queue()}`);
+    if (alreadyQueued > 0) parts.push(m.search_bulk_already_queued({ count: alreadyQueued }));
     if (skippedLocal > 0) parts.push(m.search_bulk_already_in_library({ count: skippedLocal }));
     if (failed > 0) parts.push(m.search_bulk_failed({ count: failed }));
     bulkDownloadMessage = parts.join(', ');
@@ -3367,7 +3378,7 @@
   if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C')) {
     const target = e.target as HTMLElement | null;
     if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
-    if (confirmOpen || !(window.getSelection()?.isCollapsed ?? true)) return;
+    if (confirmOpen || networkAlertOpen || selectedResult || !(window.getSelection()?.isCollapsed ?? true)) return;
     if (filteredResults.length === 0) return;
     e.preventDefault();
     if (checkedCount > 0) copyCheckedLinks();
@@ -3428,7 +3439,7 @@
       {m.common_stop()}
     </button>
   {:else}
-    <button onclick={() => handleSearch(barQuery)} disabled={searchSubmitBlocked}>{m.search_title()}</button>
+    <button onclick={() => handleSearch(barQuery)} disabled={searchSubmitBlocked} title={searchSubmitBlocked ? searchNetworkHint(searchMethod) : undefined}>{m.search_title()}</button>
   {/if}
 </div>
 
@@ -3447,11 +3458,11 @@
           tabindex={tab.id === $activeSearchTabId ? 0 : -1}
         >
           <span class="search-tab-label">{searchTabLabel(tab)}</span>
-          <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : m.search_results_aria({ count: tab.results.length })}>
+          <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : (tab.results.length === 1 ? m.search_results_aria_one() : m.search_results_aria({ count: tab.results.length }))}>
             {#if tab.isSearching}
               {m.search_searching_label()}
             {:else}
-              {tab.results.length}
+              {formatNumber(tab.results.length)}
             {/if}
           </span>
           {#if tab.isSearching}
@@ -3525,7 +3536,7 @@
       </select>
     </div>
 
-    <button class="ghost advanced-toggle" onclick={() => (showAdvancedFilters = !showAdvancedFilters)}>
+    <button class="ghost advanced-toggle" aria-expanded={showAdvancedFilters} aria-controls="search-advanced-filters" onclick={() => (showAdvancedFilters = !showAdvancedFilters)}>
       {showAdvancedFilters ? m.search_hide_advanced() : (advancedFilterCount > 0 ? m.search_advanced_filters_count({ count: advancedFilterCount }) : m.search_advanced_filters())}
     </button>
 
@@ -3535,7 +3546,7 @@
   </div>
 
   {#if showAdvancedFilters}
-    <div class="filter-advanced-row">
+    <div class="filter-advanced-row" id="search-advanced-filters">
       <div class="filter-toggles" role="group" aria-label={m.search_visibility_filters_aria()}>
         <label class="filter-toggle">
           <input type="checkbox" bind:checked={hideSpam} />
@@ -3552,7 +3563,7 @@
               onmouseleave={() => (showSpamHelp = false)}
               onfocus={() => (showSpamHelp = true)}
               onblur={() => (showSpamHelp = false)}
-              onclick={() => (showSpamHelp = !showSpamHelp)}
+              onclick={() => (showSpamHelp = true)}
             >
               <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <circle cx="8" cy="8" r="6.25"/>
@@ -3563,7 +3574,7 @@
             {#if showSpamHelp}
               <div class="filter-help-popover" role="tooltip">
                 {#if hideSpam && spamHiddenCount > 0}
-                  {m.search_spam_hidden_count({ count: spamHiddenCount })}
+                  {spamHiddenCount === 1 ? m.search_spam_hidden_count_one() : m.search_spam_hidden_count({ count: spamHiddenCount })}
                 {:else}
                   {m.search_spam_hidden_none()}
                 {/if}
@@ -3727,9 +3738,9 @@
       {#if activeTab.progress}
         {@const phase = searchPhaseLabel(activeTab.progress.phase)}
         <p class="search-detail">
-          {m.search_contacted_nodes({ count: activeTab.progress.nodes_contacted })}
+          {activeTab.progress.nodes_contacted === 1 ? m.search_contacted_nodes_one() : m.search_contacted_nodes({ count: activeTab.progress.nodes_contacted })}
           {#if activeTab.progress.results_so_far > 0}
-            &middot; {m.search_results_so_far({ count: activeTab.progress.results_so_far })}
+            &middot; {activeTab.progress.results_so_far === 1 ? m.search_results_so_far_one() : m.search_results_so_far({ count: formatNumber(activeTab.progress.results_so_far) })}
           {/if}
           {#if phase}
             &middot; {phase}
@@ -3764,9 +3775,11 @@
             <span class="searching-indicator">{m.search_searching_indicator()}</span>
           {/if}
           {#if filteredResults.length > 0}
-            {filteredResults.length === 1 ? m.search_showing_one() : m.search_showing_other({ count: filteredResults.length })}{#if resultsHidden > 0} {m.search_filtered_from({ total: visibleResults.length })}{/if}
+            {filteredResults.length === 1 ? m.search_showing_one() : m.search_showing_other({ count: formatNumber(filteredResults.length) })}{#if resultsHidden > 0} {m.search_filtered_from({ total: formatNumber(visibleResults.length) })}{/if}
+          {:else if visibleResults.length > 0 && !hasActiveFilters}
+            {visibleResults.length === 1 ? m.search_all_hidden_spam_one() : m.search_all_hidden_spam_other({ count: formatNumber(visibleResults.length) })}
           {:else if visibleResults.length > 0}
-            {visibleResults.length === 1 ? m.search_zero_of_one({ what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() }) : m.search_zero_of_other({ count: visibleResults.length, what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() })}
+            {visibleResults.length === 1 ? m.search_zero_of_one({ what: m.search_filters_word() }) : m.search_zero_of_other({ count: formatNumber(visibleResults.length), what: m.search_filters_word() })}
           {:else}
             {m.search_zero_results()}
           {/if}
@@ -3927,7 +3940,10 @@
             class:history-completed-row={!isInLibraryOnly(result) && downloadHistoryMap[result.file.hash] === 'completed'}
             class:history-cancelled-row={!isInLibraryOnly(result) && downloadHistoryMap[result.file.hash] === 'cancelled'}
             oncontextmenu={(e) => showContextMenu(e, result)}
-            ondblclick={() => { if (!blockingDl) download(result); }}
+            ondblclick={(e) => {
+              if ((e.target as HTMLElement).closest('input, button')) return;
+              if (!blockingDl) download(result);
+            }}
           >
             <td class="col-check">
               <input
@@ -4024,7 +4040,7 @@
               {:else if cs.kind === 'yes'}
                 <td class="col-complete" title={m.search_complete_single_part()}>{m.common_yes()}</td>
               {:else}
-                <td class="col-complete" title={`${cs.complete} / ${cs.sources}`}>{cs.percent}%</td>
+                <td class="col-complete" title={m.search_complete_ratio_title({ complete: cs.complete, sources: cs.sources })}>{cs.percent}%</td>
               {/if}
             {/if}
             {#if columnVis.length}
@@ -4118,8 +4134,13 @@
     </table>
     {#if filteredResults.length === 0 && visibleResults.length > 0}
       <div class="empty-state">
-        <p class="empty-title">{m.search_no_results_filters()}</p>
-        <button type="button" class="ghost empty-action" onclick={clearFilters}>{m.common_clear_filters()}</button>
+        {#if hasActiveFilters}
+          <p class="empty-title">{m.search_no_results_filters()}</p>
+          <button type="button" class="ghost empty-action" onclick={clearFilters}>{m.common_clear_filters()}</button>
+        {:else}
+          <p class="empty-title">{visibleResults.length === 1 ? m.search_all_hidden_spam_one() : m.search_all_hidden_spam_other({ count: formatNumber(visibleResults.length) })}</p>
+          <button type="button" class="ghost empty-action" onclick={() => (hideSpam = false)}>{m.search_show_spam()}</button>
+        {/if}
       </div>
     {/if}
 
@@ -4133,7 +4154,7 @@
       ></button>
       <div class="ctx-menu" role="menu" use:ctxMenuPosition={{ x: contextMenu.x, y: contextMenu.y }}>
         <div class="ctx-header" role="presentation">
-          <bdi dir="auto">{contextMenu.result.file.name}</bdi>
+          <bdi dir="auto">{displayName(contextMenu.result)}</bdi>
         </div>
         <button
           class="ctx-item"
@@ -4278,10 +4299,10 @@
                  separators — so the name it produces is a label. Shown only when
                  the two actually differ, which keeps it off most files, and this
                  is the name the file downloads and reshares under. -->
-            {#if selectedResult.file.name && selectedResult.file.name !== displayName(selectedResult)}
+            {#if selectedOriginalName && selectedOriginalName !== displayName(selectedResult)}
               <span class="detail-hero-original">
                 {m.search_detail_original_name()}
-                <bdi dir="auto">{selectedResult.file.name}</bdi>
+                <bdi dir="auto">{selectedOriginalName}</bdi>
               </span>
             {/if}
           </div>
@@ -4335,9 +4356,9 @@
               {:else if selectedSpam}
                 {selectedSpam.score}/{selectedSpam.threshold}
                 {#if selectedSpam.is_spam}
-                  <span class="spam-chip">{m.search_spam_flagged({ profile: selectedSpam.profile })}</span>
+                  <span class="spam-chip">{m.search_spam_flagged({ profile: spamProfileText(selectedSpam.profile) })}</span>
                 {:else}
-                  <span class="ham-chip">{m.search_spam_not_flagged({ profile: selectedSpam.profile })}</span>
+                  <span class="ham-chip">{m.search_spam_not_flagged({ profile: spamProfileText(selectedSpam.profile) })}</span>
                 {/if}
               {:else}
                 {selectedResult.spam_rating}
@@ -4443,7 +4464,7 @@
     : pendingConfirm?.kind === 'copy-all-links'
       ? m.search_copy_all_confirm_btn()
       : m.search_confirm_clear_btn()}
-  cancelLabel={m.search_confirm_keep()}
+  cancelLabel={pendingConfirm?.kind === 'copy-all-links' ? m.common_cancel() : m.search_confirm_keep()}
   danger={pendingConfirm?.kind !== 'copy-all-links'}
   onconfirm={handleConfirm}
   oncancel={handleConfirmCancel}

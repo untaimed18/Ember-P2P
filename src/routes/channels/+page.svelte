@@ -332,7 +332,9 @@
     const left = Math.ceil(selected.claim_after_days - elapsedDays);
     // Only worth mentioning once the owner has actually started to go quiet.
     if (left <= 0 || elapsedDays < selected.claim_after_days / 2) return '';
-    return m.channels_owner_inactive({ name: who, days: left });
+    return left === 1
+      ? m.channels_owner_inactive_one({ name: who })
+      : m.channels_owner_inactive({ name: who, days: left });
   });
   let selectedNotifyLevel = $derived<ChannelNotifyLevel>(
     selected ? notifyLevelOf($channelNotifyLevels, selected.channel_id) : 'all',
@@ -348,6 +350,13 @@
   function notifyLevelLabel(level: ChannelNotifyLevel): string {
     return (NOTIFY_CHOICES.find((choice) => choice.level === level) ?? NOTIFY_CHOICES[0]).label();
   }
+  /** A public room's key is in its public listing, so "encrypted" alone
+   *  would promise more than the padlock can keep. */
+  let selectedEncTitle = $derived(
+    selected?.visibility === 'private'
+      ? m.channels_encrypted_title_private()
+      : m.channels_encrypted_title_public(),
+  );
   let selectedChannelId = $derived(selected?.channel_id ?? '');
   let selectedName = $derived(selected?.name ?? '');
   let selectedBanned = $derived(selected?.you_are_banned ?? false);
@@ -704,6 +713,7 @@
   }
 
   function onListSearchKeydown(e: KeyboardEvent) {
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Escape') {
       if (!listQuery && listHighlightId === null) return;
       e.preventDefault();
@@ -722,7 +732,7 @@
     }
     if (e.key === 'Enter') {
       const row = searchEnterTarget(orderedRows, highlightedRow, listQuery);
-      if (!row || e.isComposing) return;
+      if (!row) return;
       e.preventDefault();
       void openListRow(row);
     }
@@ -2054,7 +2064,9 @@
           ? m.channels_xfer_sent({ name: who })
           : m.channels_xfer_received({ name: who });
       case 'declined':
-        return m.channels_xfer_declined({ name: who });
+        return t.direction === 'send'
+          ? m.channels_xfer_declined({ name: who })
+          : m.channels_xfer_you_declined();
       case 'busy':
         return m.channels_xfer_peer_busy({ name: who });
       case 'too_large':
@@ -2127,10 +2139,10 @@
   let roomOffersWaiting = $derived(roomTransfers.filter((t) => t.status === 'awaiting').length);
   let membersToggleLabel = $derived.by(() => {
     if (membersOpen) return m.channels_hide_members();
-    const show = m.channels_show_members();
-    return roomOffersWaiting > 0
-      ? `${show} (${m.channels_xfer_waiting_badge({ count: roomOffersWaiting })})`
-      : show;
+    if (roomOffersWaiting === 0) return m.channels_show_members();
+    return roomOffersWaiting === 1
+      ? m.channels_show_members_offers_one()
+      : m.channels_show_members_offers_other({ count: roomOffersWaiting });
   });
   let roomXferRate = $derived(
     roomTransfers.reduce(
@@ -2192,7 +2204,7 @@
     </button>
     <button
       class="add-btn primary"
-      class:danger={composeMode === 'create'}
+      class:active-toggle={composeMode === 'create'}
       onclick={() => toggleCompose('create')}
       disabled={emberOff || (needsUsername && composeMode !== 'create')}
       title={needsUsername && composeMode !== 'create' ? m.channels_username_required() : undefined}
@@ -2241,14 +2253,14 @@
             spellcheck="false"
             autocomplete="username"
             autocapitalize="off"
-            aria-label={m.channels_username_placeholder()}
+            aria-label={m.channels_username_aria()}
             use:autoFocus
             oninput={(e) => {
               usernameDraft = sanitizeChannelUsernameInput(e.currentTarget.value);
             }}
           />
           <button type="submit" disabled={!isValidChannelUsername(usernameDraft) || claimingUsername}>
-            {claimingUsername ? m.common_loading() : m.channels_username_save()}
+            {claimingUsername ? m.channels_saving() : m.channels_username_save()}
           </button>
         </div>
       </form>
@@ -2462,7 +2474,7 @@
                     type="button"
                     class="chan-row-main"
                     aria-current={ch.in_room && ch.channel_id === selectedId ? 'true' : undefined}
-                    aria-label={ch.in_room ? undefined : `${ch.name}. ${m.channels_join()}`}
+                    aria-label={ch.in_room ? undefined : m.channels_join_room_aria({ name: ch.name })}
                     aria-busy={!ch.in_room && joiningIds.includes(ch.channel_id) ? 'true' : undefined}
                     disabled={!ch.in_room && joiningIds.includes(ch.channel_id)}
                     onclick={() => {
@@ -2506,7 +2518,9 @@
                            3 sitting above a 5 reads as a broken sort. -->
                       {@const countLabel = ch.in_room
                         ? m.channels_members_here_of_total({ present: count, total: Math.max(ch.roster_count, count) })
-                        : m.channels_members_n({ count })}
+                        : count === 1
+                          ? m.channels_members_one()
+                          : m.channels_members_n({ count })}
                       <span class="chan-members" title={countLabel} aria-label={countLabel}>
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                           <circle cx="6" cy="6" r="2.2"/>
@@ -2717,7 +2731,7 @@
                     </svg>
                   </span>
                 {/if}
-                <span class="enc-lock" title={m.chat_encrypted_title()} aria-label={m.chat_encrypted_aria()}>
+                <span class="enc-lock" role="img" title={selectedEncTitle} aria-label={selectedEncTitle}>
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
                     <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
@@ -2728,9 +2742,9 @@
                     class="icon-btn"
                     class:on={roomInfoOpen}
                     onclick={() => (roomInfoOpen = !roomInfoOpen)}
-                    title={m.channels_edit_moderation()}
+                    title={m.channels_room_settings()}
                     aria-pressed={roomInfoOpen}
-                    aria-label={m.channels_edit_moderation()}
+                    aria-label={m.channels_room_settings()}
                   >
                     <!-- Drawn on a 24 grid rather than 16: the hand-fitted
                          path this replaces was a few hundredths out of true on
@@ -2800,7 +2814,7 @@
                 <!-- Splits the four view toggles from the two actions that
                      actually change something. -->
                 <span class="conv-actions-sep" aria-hidden="true"></span>
-                <button class="ghost conv-action" disabled={copyingInvite} onclick={handleCopyInvite}>{copyingInvite ? m.common_loading() : m.channels_invite()}</button>
+                <button class="ghost conv-action" disabled={copyingInvite} onclick={handleCopyInvite}>{copyingInvite ? m.channels_copying_invite() : m.channels_invite()}</button>
                 <!-- Delete room used to sit here, identical red text one gap
                      away from Leave. Only one of the two can be undone, so it
                      moved in beside the owner's other room settings. -->
@@ -2833,7 +2847,7 @@
                 <span>{nomineeNotice}</span>
                 {#if selected.can_claim}
                   <button class="ghost" disabled={claiming} onclick={handleClaim}>
-                    {claiming ? m.common_loading() : m.channels_claim_ownership()}
+                    {claiming ? m.channels_taking_over() : m.channels_claim_ownership()}
                   </button>
                 {/if}
               </div>
@@ -2861,7 +2875,7 @@
                     <button
                       type="submit"
                       disabled={renaming || renameTooLong || !renameDraft.trim() || renameDraft.trim() === selected.name}
-                    >{renaming ? m.common_loading() : m.channels_rename_save()}</button>
+                    >{renaming ? m.channels_renaming() : m.channels_rename_save()}</button>
                   </div>
                   {#if renameTooLong}
                     <p class="form-hint name-too-long" role="status">{m.channels_name_too_long_bytes()}</p>
@@ -2896,7 +2910,7 @@
                   oninput={() => (editingModeration = true)}
                 ></textarea>
                 <button type="submit" disabled={moderationBusy}>
-                  {savingModeration ? m.common_loading() : m.channels_save_moderation()}
+                  {savingModeration ? m.channels_saving() : m.channels_save_moderation()}
                 </button>
               </form>
               <div class="succession-form">
@@ -2946,7 +2960,7 @@
                     disabled={rotatingKey || moderationBusy}
                     onclick={() => (rotateOpen = true)}
                   >
-                    {rotatingKey ? m.common_loading() : m.channels_rotate_btn()}
+                    {rotatingKey ? m.channels_rotating() : m.channels_rotate_btn()}
                   </button>
                 </div>
               {/if}
@@ -2998,7 +3012,7 @@
                   disabled={deletingOwned}
                   onclick={() => (deleteOpen = true)}
                 >
-                  {deletingOwned ? m.common_loading() : m.channels_delete()}
+                  {deletingOwned ? m.channels_deleting() : m.channels_delete()}
                 </button>
               </div>
             {/if}
@@ -3038,7 +3052,7 @@
                   }}
                 />
                 <button type="submit" disabled={!searchQuery.trim() || searching}>
-                  {searching ? m.common_loading() : m.common_search()}
+                  {searching ? m.channels_discovering() : m.common_search()}
                 </button>
               </form>
               {#if searchRan}
@@ -3426,7 +3440,7 @@
                               onclick={() =>
                                 void openChannelFilesFolder().catch((e) => toastError(translateError(e)))}
                             >
-                              {m.library_open_folder()}
+                              {m.chat_attach_show()}
                             </button>
                           </div>
                         {/if}
@@ -3548,16 +3562,15 @@
     border-color: var(--accent-hover);
   }
 
-  .add-btn.primary.danger {
-    background: transparent;
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  .add-btn.primary.active-toggle {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
   }
 
-  .add-btn.primary.danger:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-    color: var(--danger);
-    border-color: var(--danger);
+  .add-btn.primary.active-toggle:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    border-color: var(--accent);
   }
 
   .channels-page {

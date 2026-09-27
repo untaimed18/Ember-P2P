@@ -553,8 +553,8 @@
     height: 22px;
   }
   .down-icon  { background: color-mix(in srgb, var(--accent)  14%, transparent); color: var(--accent); }
-  .up-icon    { background: color-mix(in srgb, var(--success) 14%, transparent); color: var(--success); }
-  .time-icon  { background: color-mix(in srgb, var(--warning) 14%, transparent); color: var(--warning); }
+  .up-icon    { background: color-mix(in srgb, var(--warning) 14%, transparent); color: var(--warning); }
+  .time-icon  { background: color-mix(in srgb, var(--success) 14%, transparent); color: var(--success); }
   .ratio-icon { background: color-mix(in srgb, var(--stat-ratio) 14%, transparent); color: var(--stat-ratio); }
   .hero-body { display: flex; flex-direction: column; min-width: 0; }
   .hero-value {
@@ -641,7 +641,7 @@
   }
 
   .down-color { color: var(--accent); }
-  .up-color   { color: var(--success); }
+  .up-color   { color: var(--warning); }
 
   /* ---- Cumulative grid ---- */
   .cum-grid {

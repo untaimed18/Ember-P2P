@@ -405,10 +405,9 @@ export async function initNetworkStore() {
     // reached the user as a silently-dead network layer.
     registered.push(await listen<string>('network-fatal-error', (event) => {
       lastEventUpdate = Date.now();
-      const message = typeof event.payload === 'string'
-        ? event.payload
-        : 'Network error: network task stopped.';
-      const translated = translateError(message, message);
+      const translated = typeof event.payload === 'string'
+        ? translateError(event.payload, event.payload)
+        : m.error_network_task_panicked();
       networkError.set(translated);
       // Long duration (15 s) — fatal failures deserve more than the
       // default 8 s of a regular error toast.

@@ -1446,11 +1446,12 @@
         unreadMarkerId = firstUnread?.id ?? null;
       }
       if (unreadMarkerId !== null) scrollToUnreadMarker();
-      else scrollToBottom();
+      else scrollToBottom(true);
     } catch (e: unknown) {
       if (gen !== loadGen) return;
       if (messages.length === 0) {
-        loadError = translateError(e, m.chat_failed_to_load());
+        const detail = translateError(e, '');
+        loadError = detail ? m.chat_load_error({ error: detail }) : m.chat_failed_to_load();
       }
     } finally {
       if (gen === loadGen) loading = false;
@@ -1745,9 +1746,9 @@
     return () => document.removeEventListener('visibilitychange', onVisibilityChange);
   });
 
-  function scrollToBottom() {
+  function scrollToBottom(instant = false) {
     requestAnimationFrame(() => {
-      messagesEnd?.scrollIntoView({ behavior: prefersReducedMotion.current ? 'auto' : 'smooth' });
+      messagesEnd?.scrollIntoView({ behavior: instant || prefersReducedMotion.current ? 'auto' : 'smooth' });
     });
   }
 
@@ -2739,12 +2740,21 @@
     }
   }
 
+  function formatClock(ts: number): string {
+    if (!ts) return '';
+    return formatClockTime(ts, { hour: 'numeric', minute: '2-digit' });
+  }
+
+  /** With the date for anything not from today. Message rows use
+   *  `formatClock` instead: every dated row sits under its day separator.
+   *  Attachments are placed between messages rather than dated, so they
+   *  can land under the previous day's separator and keep the date. */
   function formatTime(ts: number): string {
     if (!ts) return '';
     const d = new Date(ts * 1000);
     const now = new Date();
     const sameDay = d.toDateString() === now.toDateString();
-    const clock = formatClockTime(ts, { hour: '2-digit', minute: '2-digit' });
+    const clock = formatClock(ts);
     if (sameDay) return clock;
     return `${formatCalendarDate(ts, { month: 'short', day: 'numeric' })} ${clock}`;
   }
@@ -2796,7 +2806,7 @@
 
 {#snippet messageTimestamp(msg: ConvMessage)}
   <div class="bubble-time">
-    {formatTime(msg.timestamp)}
+    {formatClock(msg.timestamp)}
     {#if (msg.edited_at ?? 0) > 0}
       <span class="bubble-edited" title={m.channels_edited_at({ time: formatTime(msg.edited_at ?? 0) })}>
         {m.channels_edited()}
@@ -2904,7 +2914,7 @@
         being spelled out, and the full explanation is still one hover away in
         the tooltip and unchanged for screen readers.
       -->
-      <span class="conv-status encrypted icon-only" title={m.chat_encrypted_title()} aria-label={m.chat_encrypted_aria()}>
+      <span class="conv-status encrypted icon-only" role="img" title={m.chat_encrypted_title()} aria-label={m.chat_encrypted_aria()}>
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
           <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
@@ -2986,7 +2996,7 @@
       </div>
     {:else if loadError}
       <div class="conv-load-error" role="alert">
-        <span>{m.chat_load_error({ error: loadError })}</span>
+        <span>{loadError}</span>
         <button class="conv-load-retry" onclick={retryLoad} type="button">{m.common_retry()}</button>
       </div>
     {:else if messages.length === 0 && attachmentPlacement.count === 0}
@@ -2996,7 +3006,11 @@
         {:else if chatDisabled}
           {m.chat_empty_disabled()}
         {:else if isChannel}
-          <p class="conv-empty-title">{m.channels_empty_chat()}</p>
+          <p class="conv-empty-title">
+            {youAreBanned || youAreKeyBehind || announceOnly
+              ? m.channels_empty_chat_readonly()
+              : m.channels_empty_chat()}
+          </p>
           <p class="conv-empty-hint">{m.channels_empty_chat_hint()}</p>
         {:else}
           {m.chat_say_hello()}
@@ -3010,7 +3024,6 @@
             type="button"
             onclick={loadOlderMessages}
             disabled={loadingOlder}
-            aria-label={m.chat_load_older()}
           >
             {loadingOlder ? m.chat_loading_short() : (olderError ? m.common_retry() : m.chat_load_older())}
           </button>
@@ -3139,7 +3152,7 @@
                   class="fmt-codeblock-copy"
                   onclick={() => void copyCodeBlock(codeKey, block.text)}
                   title={m.chat_copy_code()}
-                  aria-label={m.chat_copy_code()}
+                  aria-label={copiedCodeKey === codeKey ? m.common_copied() : m.chat_copy_code()}
                 >{copiedCodeKey === codeKey ? m.common_copied() : m.common_copy()}</button></div>{/if}{/each}</div>
           {/if}
           {#if !isChannel && (row.endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0)}
@@ -3495,12 +3508,16 @@
       </div>
     {/if}
     <div class="conv-input-area">
+      <!-- Focus never leaves the textarea, so the highlighted suggestion is
+           spoken from here rather than by moving focus onto it. Always in the
+           DOM: a live region inserted with its text is not announced. -->
+      <span class="sr-only" aria-live="polite">{mentionOpen ? mentionMatches[Math.min(mentionIndex, mentionMatches.length - 1)] : ''}</span>
       {#if mentionOpen}
         <!-- A listbox the textarea owns rather than a focusable menu: focus has
              to stay in the composer so typing keeps narrowing the list. -->
         <ul class="mention-list" role="listbox" aria-label={m.chat_mention_list_label()}>
           {#each mentionMatches as name, i (name)}
-            <li>
+            <li role="none">
               <button
                 type="button"
                 class="mention-option"

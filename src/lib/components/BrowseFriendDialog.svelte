@@ -941,6 +941,15 @@
                   bind:value={filterQuery}
                   placeholder={m.browse_filter_placeholder()}
                   aria-label={m.browse_filter_placeholder()}
+                  onkeydown={(e) => {
+                    // Clear first, close second: otherwise Escape reaches the
+                    // modal and throws away the filter and selection with it.
+                    if (e.key === 'Escape' && filterQuery) {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      filterQuery = '';
+                    }
+                  }}
                 />
                 {#if filterQuery.trim()}
                   <button
@@ -1189,7 +1198,7 @@
                             onclick={() => downloadFile(file)}
                             disabled={downloadingHashes.has(file.hash)}
                             title={downloadingHashes.has(file.hash) ? m.browse_downloading() : m.browse_download()}
-                            aria-label={downloadingHashes.has(file.hash) ? m.browse_downloading() : m.browse_download()}
+                            aria-label={downloadingHashes.has(file.hash) ? m.browse_downloading() : m.browse_download_file({ name: file.name })}
                           >
                             {#if downloadingHashes.has(file.hash)}
                               <span class="dl-spinner" aria-hidden="true"></span>

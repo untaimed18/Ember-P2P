@@ -146,11 +146,12 @@
     }
   }
 
+  const IDLE_STATUSES = new Set(['completed', 'failed', 'paused', 'stopped', 'insufficient']);
   let activeDownloadCount = $derived(
-    $transfers.filter(t => t.direction === 'download' && t.status !== 'completed' && t.status !== 'failed').length
+    $transfers.filter(t => t.direction === 'download' && !IDLE_STATUSES.has(t.status)).length
   );
   let activeUploadCount = $derived(
-    $transfers.filter(t => t.direction === 'upload' && t.status !== 'completed' && t.status !== 'failed').length
+    $transfers.filter(t => t.direction === 'upload' && !IDLE_STATUSES.has(t.status)).length
   );
   let activeTransferCount = $derived(activeDownloadCount + activeUploadCount);
 
@@ -159,6 +160,25 @@
   }
   function uploadsTitle(n: number): string {
     return n === 1 ? m.sidebar_active_uploads_one() : m.sidebar_active_uploads_other({ count: n });
+  }
+  function transfersTitle(downloads: number, uploads: number): string {
+    const parts: string[] = [];
+    if (downloads > 0) parts.push(downloadsTitle(downloads));
+    if (uploads > 0) parts.push(uploadsTitle(uploads));
+    return parts.join(' · ');
+  }
+
+  function chatsAriaLabel(open: boolean, unread: number): string {
+    const mod = shortcutModSymbol();
+    if (unread <= 0) return open ? m.sidebar_chats_close({ mod }) : m.sidebar_chats_open({ mod });
+    if (open) {
+      return unread === 1
+        ? m.sidebar_chats_close_unread_one({ mod })
+        : m.sidebar_chats_close_unread_other({ mod, count: unread });
+    }
+    return unread === 1
+      ? m.sidebar_chats_open_unread_one({ mod })
+      : m.sidebar_chats_open_unread_other({ mod, count: unread });
   }
 
   // Pending incoming friend-request count. Mirrors the transfers badge
@@ -462,7 +482,7 @@
             </span>
             <span
               class="nav-badge nav-badge-collapsed"
-              title={`${downloadsTitle(activeDownloadCount)} · ${uploadsTitle(activeUploadCount)}`}
+              title={transfersTitle(activeDownloadCount, activeUploadCount)}
             >{activeTransferCount}</span>
           {/if}
           {#if item.id === 'friends' && pendingFriendInboxCount > 0}
@@ -495,9 +515,7 @@
       title={$chatDockOpen
         ? m.sidebar_chats_close({ mod: shortcutModSymbol() })
         : m.sidebar_chats_open({ mod: shortcutModSymbol() })}
-      aria-label={$chatDockOpen
-        ? m.sidebar_chats_close({ mod: shortcutModSymbol() })
-        : m.sidebar_chats_open({ mod: shortcutModSymbol() })}
+      aria-label={chatsAriaLabel($chatDockOpen, totalUnreadChats)}
       aria-pressed={$chatDockOpen}
       aria-keyshortcuts={`${shortcutModAria()}+/`}
     >
@@ -512,9 +530,7 @@
       {#if totalUnreadChats > 0}
         <span
           class="chats-dot"
-          aria-label={totalUnreadChats === 1
-            ? m.sidebar_chats_unread_title_one()
-            : m.sidebar_chats_unread_title_other({ count: totalUnreadChats })}
+          aria-hidden="true"
           title={totalUnreadChats === 1
             ? m.sidebar_chats_unread_title_one()
             : m.sidebar_chats_unread_title_other({ count: totalUnreadChats })}

@@ -73,7 +73,7 @@
           {/if}
         </span>
         <span class="toast-msg">{toast.message}</span>
-        <button type="button" class="toast-close" onclick={() => removeToast(toast.id)} aria-label={m.common_dismiss()}>
+        <button type="button" class="toast-close" onclick={() => removeToast(toast.id)} title={m.common_dismiss()} aria-label={m.common_dismiss()}>
           <IconX size={13} />
         </button>
       </div>

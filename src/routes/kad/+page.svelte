@@ -80,7 +80,10 @@
 
   // K25: debounce Connect/Disconnect so a user who double-clicks the
   // button doesn't queue two conflicting commands.
-  let connectPending = $state(false);
+  // Which way the in-flight click is going: the status alone can't say,
+  // since both a fresh connect and a Cancel spend time in 'connecting'.
+  let pendingAction: 'connect' | 'disconnect' | null = $state(null);
+  let connectPending = $derived(pendingAction !== null);
 
   onMount(() => {
     mounted = true;
@@ -217,12 +220,13 @@
     // flight. Without this an eager user who double-clicks flips the
     // state twice and can end up with the backend in an unexpected mode.
     if (connectPending) return;
-    connectPending = true;
     kadError = null;
     try {
       if ($networkStats.status === 'connected' || $networkStats.status === 'connecting') {
+        pendingAction = 'disconnect';
         await kadDisconnect();
       } else {
+        pendingAction = 'connect';
         loading = true;
         await kadConnect();
       }
@@ -230,7 +234,7 @@
       kadError = toErrMsg(e, m.kad_connection_failed());
       loading = false;
     } finally {
-      connectPending = false;
+      pendingAction = null;
     }
   }
 
@@ -281,6 +285,7 @@
         const result = await kadBootstrapUrl(url);
         toastSuccess(result || m.kad_bootstrap_loaded_url());
       } else {
+        if (contacts.length === 0) return;
         await kadBootstrapClients();
         toastSuccess(m.kad_bootstrap_from_known());
       }
@@ -375,12 +380,8 @@
   }
 
   function getConnectButtonLabel(): string {
-    if (connectPending && $networkStats.status !== 'connected' && $networkStats.status !== 'connecting') {
-      return m.kad_connecting();
-    }
-    if (connectPending && $networkStats.status === 'connected') {
-      return m.kad_disconnecting();
-    }
+    if (pendingAction === 'connect') return m.kad_connecting();
+    if (pendingAction === 'disconnect') return m.kad_disconnecting();
     if ($networkStats.status === 'connected') return m.servers_disconnect();
     if ($networkStats.status === 'connecting') return m.common_cancel();
     return m.servers_connect();
@@ -986,9 +987,10 @@
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
             <p class="empty-title">{m.kad_empty_no_contacts()}</p>
             <p class="empty-sub">{m.kad_empty_no_contacts_sub()}</p>
+            <!-- No "Known Contacts" here: it re-pings the routing table,
+                 which is exactly what is empty. -->
             <div class="empty-actions">
-              <button class="empty-action" onclick={() => openBootstrap('clients')}>{m.kad_bootstrap_from_clients()}</button>
-              <button class="empty-action ghost" onclick={() => openBootstrap('url')}>{m.kad_from_url()}</button>
+              <button class="empty-action" onclick={() => openBootstrap('url')}>{m.kad_from_url()}</button>
               <button class="empty-action ghost" onclick={() => openBootstrap('ip')}>{m.kad_by_ip()}</button>
             </div>
           </div>
@@ -1289,7 +1291,8 @@
             onclick={handleBootstrap}
             disabled={bootstrapPending
               || (bootstrapMode === 'ip' && !bootstrapIpHost.trim())
-              || (bootstrapMode === 'url' && !bootstrapUrl.trim())}
+              || (bootstrapMode === 'url' && !bootstrapUrl.trim())
+              || (bootstrapMode === 'clients' && contacts.length === 0)}
           >
             {#if bootstrapPending}
               <span class="spinner-inline" aria-hidden="true"></span> {m.kad_working()}

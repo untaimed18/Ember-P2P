@@ -140,6 +140,7 @@
     {
       title: () => m.shortcuts_section_search(),
       shortcuts: [
+        { keys: ['/'], label: () => m.shortcuts_library_focus_search() },
         { keys: [modifierKey, 'C'], label: () => m.shortcuts_search_copy_links() },
       ],
     },
@@ -147,6 +148,7 @@
       title: () => m.shortcuts_section_transfers(),
       shortcuts: [
         { keys: ['↑ / ↓'], label: () => m.shortcuts_transfers_navigate() },
+        { keys: ['F2'], label: () => m.shortcuts_transfers_rename() },
         { keys: ['Delete'], label: () => m.shortcuts_transfers_delete() },
       ],
     },
@@ -199,7 +201,7 @@
     >
       <div class="shortcut-header">
         <h3 id="kbd-shortcut-title">{m.shortcuts_dialog_title()}</h3>
-        <button type="button" class="shortcut-close" aria-label={m.common_close()} onclick={() => (open = false)}><IconX size={16} /></button>
+        <button type="button" class="shortcut-close" title={m.common_close()} aria-label={m.common_close()} onclick={() => (open = false)}><IconX size={16} /></button>
       </div>
       <div class="shortcut-body">
         {#each groups as group, gi (gi)}

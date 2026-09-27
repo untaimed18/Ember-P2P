@@ -37,7 +37,7 @@
   import { cancelIncomingCollection, presentIncomingCollection } from '$lib/stores/collection';
   import { toastSuccess, toastError } from '$lib/stores/toast';
   import { codedErrorOf, translateError } from '$lib/i18n';
-  import { formatBytes } from '$lib/utils';
+  import { formatBytes, formatNumber } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
 
   type ConfirmDecision = 'accept' | 'reject' | 'defer';
@@ -89,13 +89,24 @@
     return preview.name ?? '';
   }
 
+  function deepLinkConfirmLabel(preview: DeepLinkPreview): string {
+    switch (preview.kind) {
+      case 'file': return m.search_ctx_download();
+      case 'server': return m.servers_connect();
+      case 'serverList': return m.deeplink_confirm_update_server_list();
+      default: return m.deeplink_confirm_open();
+    }
+  }
+
   let confirmOpen = $state(false);
   let confirmMessage = $state('');
+  let confirmLabel = $state('');
   let confirmResolver: ((decision: ConfirmDecision) => void) | null = null;
 
   function requestConfirmation(preview: DeepLinkPreview): Promise<ConfirmDecision> {
     if (destroyed) return Promise.resolve('defer');
     confirmMessage = deepLinkConfirmationMessage(preview);
+    confirmLabel = deepLinkConfirmLabel(preview);
     confirmOpen = true;
     return new Promise((resolve) => {
       confirmResolver = resolve;
@@ -224,7 +235,9 @@
         }
         await presented;
         if (!destroyed) {
-          toastSuccess(m.library_collection_loaded({ name: coll.name, count: coll.files.length }));
+          toastSuccess(coll.files.length === 1
+            ? m.library_collection_loaded_one({ name: coll.name })
+            : m.library_collection_loaded({ name: coll.name, count: formatNumber(coll.files.length) }));
         }
       } else if (preview.kind === 'channel') {
         await goto(`/channels?join=${encodeURIComponent(payload)}`);
@@ -397,7 +410,7 @@
   bind:open={confirmOpen}
   title={m.deeplink_confirm_title()}
   message={confirmMessage}
-  confirmLabel={m.deeplink_confirm_open()}
+  confirmLabel={confirmLabel || m.deeplink_confirm_open()}
   cancelLabel={m.deeplink_confirm_ignore()}
   isolateMessage={true}
   onconfirm={() => resolveConfirmation('accept')}

@@ -159,6 +159,23 @@ describe('overnight windows', () => {
     // A full day is not overnight: it starts and ends inside the same day.
     expect(isOvernight(rule({ start_minute: 0, end_minute: MINUTES_PER_DAY }))).toBe(false);
   });
+
+  it('does not call an empty window overnight', () => {
+    // 09:00–09:00 is an empty window, not one that runs into the next day.
+    const empty = rule({ start_minute: 9 * 60, end_minute: 9 * 60 });
+    expect(isOvernight(empty)).toBe(false);
+    expect(ruleProblem(empty)).toBe('empty_window');
+  });
+
+  it('keeps 00:00–00:00 a full day rather than an empty or overnight window', () => {
+    const fullDay = rule({
+      start_minute: timeValueToMinutes('00:00')!,
+      end_minute: endTimeValueToMinutes('00:00')!,
+    });
+    expect(fullDay.end_minute).toBe(MINUTES_PER_DAY);
+    expect(isOvernight(fullDay)).toBe(false);
+    expect(ruleProblem(fullDay)).toBeNull();
+  });
 });
 
 describe('new rules', () => {

@@ -90,9 +90,14 @@ export function endTimeValueToMinutes(value: string): number | null {
   return minutes === 0 ? MINUTES_PER_DAY : minutes;
 }
 
-/** Whether a window crosses midnight (and so runs into the following day). */
+/**
+ * Whether a window crosses midnight (and so runs into the following day).
+ *
+ * Strictly less: equal start and end is an empty window, which `ruleProblem`
+ * reports, not an overnight one.
+ */
 export function isOvernight(rule: Pick<BandwidthScheduleRule, 'start_minute' | 'end_minute'>): boolean {
-  return rule.end_minute <= rule.start_minute;
+  return rule.end_minute < rule.start_minute;
 }
 
 /**

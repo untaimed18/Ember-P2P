@@ -320,6 +320,9 @@
   }
 
   function onSearchKeydown(e: KeyboardEvent) {
+    // WebKit reports the Enter that commits an IME composition as keyCode 229
+    // with `isComposing` already false.
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
       e.preventDefault();
       if (rows.length === 0) return;

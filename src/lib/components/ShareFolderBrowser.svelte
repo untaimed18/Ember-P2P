@@ -677,6 +677,8 @@
               tabindex="0"
               onclick={() => void showEntry(row.entry.id, { recordHistory: true })}
               onkeydown={(e) => {
+                // Leave the chevron button's own Enter/Space activation alone.
+                if (e.target !== e.currentTarget) return;
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
                   void showEntry(row.entry.id);

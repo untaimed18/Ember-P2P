@@ -25,8 +25,9 @@
   } from '$lib/types';
   import { copyToClipboard, formatDurationSecs, formatNumber } from '$lib/utils';
   import { getLocale } from '$lib/i18n';
-  import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
-  import { checkForUpdates, updater } from '$lib/stores/updater';
+  import { EMBER_DIAG_FAILURE_THRESHOLD } from '$lib/emberJoin';
+  import { emberJoinTimedOut } from '$lib/stores/emberJoin';
+  import { checkForUpdates, installUpdate, restartToUpdate, updater } from '$lib/stores/updater';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
   import * as m from '$lib/paraglide/messages';
 
@@ -42,24 +43,15 @@
   let inFlightDiag = false;
   let inFlightLists = false;
 
-  // Diagnostics-health + join-progress state. `diagStale` raises a banner
-  // once polling has failed several times in a row (the service is down,
-  // not just a transient blip), so the numbers below aren't silently
-  // mistaken for live ones. The join timer flips `joinTimedOut` so the
-  // "connecting…" state can't linger forever when no peers are reachable.
+  // Diagnostics-health state. `diagStale` raises a banner once polling has
+  // failed several times in a row (the service is down, not just a transient
+  // blip), so the numbers below aren't silently mistaken for live ones. The
+  // join timeout is the app-wide `emberJoinTimedOut`, shared with the status
+  // bar, so opening this page cannot restart a grace period the status bar
+  // has already given up on.
   let diagStale = $state(false);
-  let joinTimedOut = $state(false);
   let diagFailures = 0;
-  let activeSince: number | null = null;
-  let joinTimer: ReturnType<typeof setTimeout> | null = null;
   const DIAG_FAILURE_THRESHOLD = EMBER_DIAG_FAILURE_THRESHOLD;
-  // Long enough to span a couple of backend maintenance ticks (60s each),
-  // which is what actually drives the bridge that finds our first contacts.
-  // A shorter window used to be fine when joining kicked an immediate fetch
-  // from a central pool; without one, a fresh node can legitimately sit at
-  // zero contacts for a minute or two, and giving up at 30s made a healthy
-  // node look broken. Shared with Search and the status bar.
-  const JOINING_TIMEOUT_MS = EMBER_JOIN_TIMEOUT_MS;
 
   async function refreshDiag() {
     if (unmounted || inFlightDiag) return;
@@ -68,7 +60,6 @@
       diag = await getEmberDiagnostics();
       diagFailures = 0;
       diagStale = false;
-      recomputeJoinState();
     } catch {
       // Tolerate transient blips (keep the previous snapshot), but surface
       // a banner once the service has been unreachable for several polls.
@@ -140,26 +131,6 @@
     }
   }
 
-  // Drive the join-progress timer off each diagnostics snapshot (a plain
-  // function, not a reactive `$effect`, so there's no write-read feedback
-  // loop on `joinTimedOut`). While active with zero verified contacts we
-  // run a one-shot timer; a peer that has actually answered resets it.
-  function recomputeJoinState() {
-    const active = !!diag?.ember_native_enabled;
-    const contacts = diag?.ember_dht_verified_contacts ?? 0;
-    if (!active || contacts > 0) {
-      if (joinTimer) { clearTimeout(joinTimer); joinTimer = null; }
-      activeSince = null;
-      joinTimedOut = false;
-      return;
-    }
-    if (activeSince === null) {
-      activeSince = Date.now();
-      joinTimedOut = false;
-      joinTimer = setTimeout(() => { joinTimedOut = true; joinTimer = null; }, JOINING_TIMEOUT_MS);
-    }
-  }
-
   let copiedKey = $state<string | null>(null);
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -184,6 +155,20 @@
       (versionPeerOlder > 0 ||
         (versionMismatch > 0 && versionPeerNewer === 0 && versionPeerOlder === 0)),
   );
+  // The corner UpdateNotice stays silent for "up to date", for a failed check
+  // with no version yet, and for a version the user dismissed — so the
+  // banner's own "Check for updates" reports the outcome next to the button.
+  let updateResult = $derived(
+    $updater.phase === 'uptodate'
+      ? m.updater_uptodate()
+      : $updater.phase === 'available'
+        ? m.updater_available_status({ version: $updater.version ?? '' })
+        : $updater.phase === 'ready'
+          ? m.updater_ready_body({ version: $updater.version ?? '' })
+          : $updater.phase === 'error' || $updater.signatureMissing
+            ? m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })
+            : '',
+  );
   let peerCount = $derived(diag?.ember_dht_contacts ?? 0);
   let verifiedCount = $derived(diag?.ember_dht_verified_contacts ?? 0);
   let publishedCount = $derived(diag?.ember_dht_published_files ?? 0);
@@ -193,7 +178,7 @@
   // already light badges.
   let publishedTotal = $derived(Math.max(publishableCount, publishedCount));
   let publishedInProgress = $derived(publishedTotal > 0 && publishedCount < publishedTotal);
-  let joining = $derived(isActive && verifiedCount === 0 && !joinTimedOut);
+  let joining = $derived(isActive && verifiedCount === 0 && !$emberJoinTimedOut);
   let isConnected = $derived(isActive && verifiedCount > 0);
 
   // No "off" state: the backend forces the overlay on at load and on every
@@ -336,7 +321,7 @@
 
   function searchAvg(sum: number | undefined, outcomes: number): string {
     if (outcomes <= 0) return '\u2014';
-    return String(Math.round((sum ?? 0) / outcomes));
+    return formatNumber(Math.round((sum ?? 0) / outcomes));
   }
 
   function contactAnswered(c: EmberDhtContact): boolean {
@@ -355,87 +340,87 @@
   let metrics = $derived.by(() => {
     const outcomes = diag?.ember_dht_search_outcomes ?? 0;
     return [
-    { id: 'contacts', k: m.ember_stat_contacts(), v: String(peerCount) },
-    { id: 'verified-contacts', k: m.ember_stat_verified_contacts(), v: String(diag?.ember_dht_verified_contacts ?? 0) },
-    { id: 'verified-peak-today', k: m.ember_stat_verified_peak_today(), v: String(diag?.ember_dht_verified_highwater_today ?? 0) },
-    { id: 'verified-peak-all', k: m.ember_stat_verified_peak_alltime(), v: String(diag?.ember_dht_verified_highwater ?? 0) },
+    { id: 'contacts', k: m.ember_stat_contacts(), v: formatNumber(peerCount) },
+    { id: 'verified-contacts', k: m.ember_stat_verified_contacts(), v: formatNumber(diag?.ember_dht_verified_contacts ?? 0) },
+    { id: 'verified-peak-today', k: m.ember_stat_verified_peak_today(), v: formatNumber(diag?.ember_dht_verified_highwater_today ?? 0) },
+    { id: 'verified-peak-all', k: m.ember_stat_verified_peak_alltime(), v: formatNumber(diag?.ember_dht_verified_highwater ?? 0) },
     { id: 'network-size', k: m.ember_stat_network_size(), v: estimatedNodes },
     { id: 'last-inbound', k: m.ember_stat_last_inbound(), v: lastInboundLabel },
-    { id: 'republish-backlog', k: m.ember_stat_republish_backlog(), v: String(diag?.ember_dht_republish_backlog ?? 0) },
-    { id: 'cached-contacts', k: m.ember_stat_cached_contacts(), v: String(diag?.ember_dht_cached_contacts ?? 0) },
-    { id: 'session-contacts', k: m.ember_stat_session_contacts(), v: String(diag?.ember_dht_session_contacts ?? 0) },
-    { id: 'contacts-evicted', k: m.ember_stat_contacts_evicted(), v: String(diag?.ember_dht_contacts_evicted ?? 0) },
-    { id: 'contacts-demoted', k: m.ember_stat_contacts_demoted(), v: String(diag?.ember_dht_contacts_demoted ?? 0) },
-    { id: 'peer-lists', k: m.ember_stat_peer_lists_received(), v: String(diag?.ember_dht_peer_lists_received ?? 0) },
-    { id: 'gossip-contacts', k: m.ember_stat_gossip_contacts(), v: String(diag?.ember_dht_gossip_contacts ?? 0) },
-    { id: 'gossip-new', k: m.ember_stat_gossip_new(), v: String(diag?.ember_dht_gossip_new ?? 0) },
-    { id: 'gossip-refused', k: m.ember_stat_gossip_refused(), v: String(diag?.ember_dht_gossip_refused ?? 0) },
-    { id: 'gossip-rationed', k: m.ember_stat_gossip_leads_rationed(), v: String(diag?.ember_dht_gossip_leads_rationed ?? 0) },
-    { id: 'gossip-introducers-rationed', k: m.ember_stat_gossip_introducers_rationed(), v: String(diag?.ember_dht_gossip_introducers_rationed ?? 0) },
-    { id: 'friend-contact-asks', k: m.ember_stat_friend_contact_asks(), v: String(diag?.ember_dht_friend_contact_asks ?? 0) },
-    { id: 'friend-contacts-learned', k: m.ember_stat_friend_contacts_learned(), v: String(diag?.ember_dht_friend_contacts_learned ?? 0) },
-    { id: 'liveness-pings', k: m.ember_stat_liveness_pings(), v: String(diag?.ember_dht_liveness_pings_sent ?? 0) },
-    { id: 'pongs-received', k: m.ember_stat_pongs_received(), v: String(diag?.ember_dht_pongs_received ?? 0) },
-    { id: 'peers', k: m.ember_stat_peers(), v: String(diag?.ember_peers_known ?? 0) },
-    { id: 'sessions', k: m.ember_stat_sessions(), v: String(diag?.ember_sessions ?? 0) },
-    { id: 'records', k: m.ember_stat_records(), v: String(diag?.ember_dht_stored_records ?? 0) },
+    { id: 'republish-backlog', k: m.ember_stat_republish_backlog(), v: formatNumber(diag?.ember_dht_republish_backlog ?? 0) },
+    { id: 'cached-contacts', k: m.ember_stat_cached_contacts(), v: formatNumber(diag?.ember_dht_cached_contacts ?? 0) },
+    { id: 'session-contacts', k: m.ember_stat_session_contacts(), v: formatNumber(diag?.ember_dht_session_contacts ?? 0) },
+    { id: 'contacts-evicted', k: m.ember_stat_contacts_evicted(), v: formatNumber(diag?.ember_dht_contacts_evicted ?? 0) },
+    { id: 'contacts-demoted', k: m.ember_stat_contacts_demoted(), v: formatNumber(diag?.ember_dht_contacts_demoted ?? 0) },
+    { id: 'peer-lists', k: m.ember_stat_peer_lists_received(), v: formatNumber(diag?.ember_dht_peer_lists_received ?? 0) },
+    { id: 'gossip-contacts', k: m.ember_stat_gossip_contacts(), v: formatNumber(diag?.ember_dht_gossip_contacts ?? 0) },
+    { id: 'gossip-new', k: m.ember_stat_gossip_new(), v: formatNumber(diag?.ember_dht_gossip_new ?? 0) },
+    { id: 'gossip-refused', k: m.ember_stat_gossip_refused(), v: formatNumber(diag?.ember_dht_gossip_refused ?? 0) },
+    { id: 'gossip-rationed', k: m.ember_stat_gossip_leads_rationed(), v: formatNumber(diag?.ember_dht_gossip_leads_rationed ?? 0) },
+    { id: 'gossip-introducers-rationed', k: m.ember_stat_gossip_introducers_rationed(), v: formatNumber(diag?.ember_dht_gossip_introducers_rationed ?? 0) },
+    { id: 'friend-contact-asks', k: m.ember_stat_friend_contact_asks(), v: formatNumber(diag?.ember_dht_friend_contact_asks ?? 0) },
+    { id: 'friend-contacts-learned', k: m.ember_stat_friend_contacts_learned(), v: formatNumber(diag?.ember_dht_friend_contacts_learned ?? 0) },
+    { id: 'liveness-pings', k: m.ember_stat_liveness_pings(), v: formatNumber(diag?.ember_dht_liveness_pings_sent ?? 0) },
+    { id: 'pongs-received', k: m.ember_stat_pongs_received(), v: formatNumber(diag?.ember_dht_pongs_received ?? 0) },
+    { id: 'peers', k: m.ember_stat_peers(), v: formatNumber(diag?.ember_peers_known ?? 0) },
+    { id: 'sessions', k: m.ember_stat_sessions(), v: formatNumber(diag?.ember_sessions ?? 0) },
+    { id: 'records', k: m.ember_stat_records(), v: formatNumber(diag?.ember_dht_stored_records ?? 0) },
     { id: 'published-files', k: m.ember_stat_published_files(), v: publishedTotal > 0 ? m.ember_overview_published_of({ published: publishedCount, total: publishedTotal }) : String(publishedCount) },
-    { id: 'stored-keys', k: m.ember_stat_stored_keys(), v: String(diag?.ember_dht_stored_keys ?? 0) },
-    { id: 'stored-for-others', k: m.ember_stat_stored_for_others(), v: String(diag?.ember_dht_stored_for_others_records ?? 0) },
-    { id: 'publishes', k: m.ember_stat_active_publishes(), v: String(diag?.ember_dht_active_publishes ?? 0) },
-    { id: 'searches', k: m.ember_stat_active_searches(), v: String(diag?.ember_dht_active_searches ?? 0) },
-    { id: 'search-hits', k: m.ember_stat_search_hits(), v: String(diag?.ember_dht_search_hits ?? 0) },
-    { id: 'search-misses', k: m.ember_stat_search_misses(), v: String(diag?.ember_dht_search_misses ?? 0) },
+    { id: 'stored-keys', k: m.ember_stat_stored_keys(), v: formatNumber(diag?.ember_dht_stored_keys ?? 0) },
+    { id: 'stored-for-others', k: m.ember_stat_stored_for_others(), v: formatNumber(diag?.ember_dht_stored_for_others_records ?? 0) },
+    { id: 'publishes', k: m.ember_stat_active_publishes(), v: formatNumber(diag?.ember_dht_active_publishes ?? 0) },
+    { id: 'searches', k: m.ember_stat_active_searches(), v: formatNumber(diag?.ember_dht_active_searches ?? 0) },
+    { id: 'search-hits', k: m.ember_stat_search_hits(), v: formatNumber(diag?.ember_dht_search_hits ?? 0) },
+    { id: 'search-misses', k: m.ember_stat_search_misses(), v: formatNumber(diag?.ember_dht_search_misses ?? 0) },
     { id: 'search-avg-nodes', k: m.ember_stat_search_avg_nodes(), v: searchAvg(diag?.ember_dht_search_nodes_answered, outcomes) },
     { id: 'search-avg-ms', k: m.ember_stat_search_avg_ms(), v: outcomes <= 0 ? '\u2014' : msFormat.format(Math.round((diag?.ember_dht_search_elapsed_ms_sum ?? 0) / outcomes)) },
     { id: 'search-avg-records', k: m.ember_stat_search_avg_records(), v: searchAvg(diag?.ember_dht_search_records_sum, outcomes) },
-    { id: 'store-acks', k: m.ember_stat_stores_acked(), v: String(diag?.ember_dht_stores_acked ?? 0) },
-    { id: 'store-fails', k: m.ember_stat_stores_failed(), v: String(diag?.ember_dht_stores_failed ?? 0) },
-    { id: 'replication', k: m.ember_stat_avg_replication(), v: String(diag?.ember_dht_avg_replication ?? 0) },
-    { id: 'search-rounds', k: m.ember_stat_search_rounds(), v: String(diag?.ember_dht_search_rounds ?? 0) },
-    { id: 'find-values', k: m.ember_stat_find_values_sent(), v: String(diag?.ember_dht_find_values_sent ?? 0) },
-    { id: 'serve-hits', k: m.ember_stat_serve_hits(), v: String(diag?.ember_dht_find_value_hits ?? 0) },
-    { id: 'serve-misses', k: m.ember_stat_serve_misses(), v: String(diag?.ember_dht_find_value_misses ?? 0) },
-    { id: 'serve-truncated', k: m.ember_stat_truncated_answers(), v: String(diag?.ember_dht_found_value_truncated ?? 0) },
-    { id: 'serve-withheld', k: m.ember_stat_withheld_records(), v: String(diag?.ember_dht_found_value_withheld ?? 0) },
-    { id: 'buddy-pub', k: m.ember_stat_buddy_publishes(), v: String(diag?.ember_dht_buddy_publishes ?? 0) },
-    { id: 'buddy-fwd', k: m.ember_stat_buddy_forwards(), v: String(diag?.ember_dht_buddy_forwards ?? 0) },
-    { id: 'buddy-unendorsed', k: m.ember_stat_buddy_unendorsed(), v: String(diag?.ember_dht_buddy_unendorsed ?? 0) },
-    { id: 'callback-sent', k: m.ember_stat_callback_sent(), v: String(diag?.ember_dht_callback_sent ?? 0) },
-    { id: 'callback-fwd', k: m.ember_stat_callback_forwards(), v: String(diag?.ember_dht_callback_forwards ?? 0) },
-    { id: 'callback-conn', k: m.ember_stat_callback_connects(), v: String(diag?.ember_dht_callback_connects ?? 0) },
-    { id: 'malformed', k: m.ember_stat_malformed(), v: String(diag?.ember_dht_malformed ?? 0) },
-    { id: 'version-mismatch', k: m.ember_stat_version_mismatch(), v: String(diag?.ember_dht_version_mismatch ?? 0) },
-    { id: 'version-peer-older', k: m.ember_stat_version_peer_older(), v: String(diag?.ember_dht_version_peer_older ?? 0) },
-    { id: 'version-peer-newer', k: m.ember_stat_version_peer_newer(), v: String(diag?.ember_dht_version_peer_newer ?? 0) },
-    { id: 'rendezvous-listed', k: m.ember_stat_rendezvous_listed(), v: String(diag?.ember_dht_rendezvous_last_peers ?? 0) },
-    { id: 'rendezvous-lookups', k: m.ember_stat_rendezvous_lookups(), v: String(diag?.ember_dht_rendezvous_lookups ?? 0) },
-    { id: 'rendezvous-empty', k: m.ember_stat_rendezvous_empty(), v: String(diag?.ember_dht_rendezvous_empty ?? 0) },
+    { id: 'store-acks', k: m.ember_stat_stores_acked(), v: formatNumber(diag?.ember_dht_stores_acked ?? 0) },
+    { id: 'store-fails', k: m.ember_stat_stores_failed(), v: formatNumber(diag?.ember_dht_stores_failed ?? 0) },
+    { id: 'replication', k: m.ember_stat_avg_replication(), v: formatNumber(diag?.ember_dht_avg_replication ?? 0) },
+    { id: 'search-rounds', k: m.ember_stat_search_rounds(), v: formatNumber(diag?.ember_dht_search_rounds ?? 0) },
+    { id: 'find-values', k: m.ember_stat_find_values_sent(), v: formatNumber(diag?.ember_dht_find_values_sent ?? 0) },
+    { id: 'serve-hits', k: m.ember_stat_serve_hits(), v: formatNumber(diag?.ember_dht_find_value_hits ?? 0) },
+    { id: 'serve-misses', k: m.ember_stat_serve_misses(), v: formatNumber(diag?.ember_dht_find_value_misses ?? 0) },
+    { id: 'serve-truncated', k: m.ember_stat_truncated_answers(), v: formatNumber(diag?.ember_dht_found_value_truncated ?? 0) },
+    { id: 'serve-withheld', k: m.ember_stat_withheld_records(), v: formatNumber(diag?.ember_dht_found_value_withheld ?? 0) },
+    { id: 'buddy-pub', k: m.ember_stat_buddy_publishes(), v: formatNumber(diag?.ember_dht_buddy_publishes ?? 0) },
+    { id: 'buddy-fwd', k: m.ember_stat_buddy_forwards(), v: formatNumber(diag?.ember_dht_buddy_forwards ?? 0) },
+    { id: 'buddy-unendorsed', k: m.ember_stat_buddy_unendorsed(), v: formatNumber(diag?.ember_dht_buddy_unendorsed ?? 0) },
+    { id: 'callback-sent', k: m.ember_stat_callback_sent(), v: formatNumber(diag?.ember_dht_callback_sent ?? 0) },
+    { id: 'callback-fwd', k: m.ember_stat_callback_forwards(), v: formatNumber(diag?.ember_dht_callback_forwards ?? 0) },
+    { id: 'callback-conn', k: m.ember_stat_callback_connects(), v: formatNumber(diag?.ember_dht_callback_connects ?? 0) },
+    { id: 'malformed', k: m.ember_stat_malformed(), v: formatNumber(diag?.ember_dht_malformed ?? 0) },
+    { id: 'version-mismatch', k: m.ember_stat_version_mismatch(), v: formatNumber(diag?.ember_dht_version_mismatch ?? 0) },
+    { id: 'version-peer-older', k: m.ember_stat_version_peer_older(), v: formatNumber(diag?.ember_dht_version_peer_older ?? 0) },
+    { id: 'version-peer-newer', k: m.ember_stat_version_peer_newer(), v: formatNumber(diag?.ember_dht_version_peer_newer ?? 0) },
+    { id: 'rendezvous-listed', k: m.ember_stat_rendezvous_listed(), v: formatNumber(diag?.ember_dht_rendezvous_last_peers ?? 0) },
+    { id: 'rendezvous-lookups', k: m.ember_stat_rendezvous_lookups(), v: formatNumber(diag?.ember_dht_rendezvous_lookups ?? 0) },
+    { id: 'rendezvous-empty', k: m.ember_stat_rendezvous_empty(), v: formatNumber(diag?.ember_dht_rendezvous_empty ?? 0) },
     { id: 'rendezvous-key-load', k: m.ember_stat_rendezvous_key_load(), v: percentFormat.format((diag?.ember_dht_rendezvous_key_load ?? 0) / 100) },
-    { id: 'observed-votes', k: m.ember_stat_observed_votes(), v: String(diag?.ember_dht_observed_votes ?? 0) },
+    { id: 'observed-votes', k: m.ember_stat_observed_votes(), v: formatNumber(diag?.ember_dht_observed_votes ?? 0) },
     { id: 'observed-addr', k: m.ember_stat_observed_addr(), v: diag?.ember_dht_observed_addr || '—' },
-    { id: 'epx-events', k: m.ember_stat_epx_events(), v: String(diag?.epx_events_received ?? 0) },
-    { id: 'epx-offered', k: m.ember_stat_epx_sources_offered(), v: String(diag?.epx_sources_offered ?? 0) },
-    { id: 'epx-filtered', k: m.ember_stat_epx_sources_filtered(), v: String(diag?.epx_sources_filtered ?? 0) },
-    { id: 'epx-udp-oversized', k: m.ember_stat_epx_udp_oversized(), v: String(diag?.epx_udp_oversized_skipped ?? 0) },
-    { id: 'store-key-cap', k: m.ember_stat_store_key_cap(), v: String(diag?.ember_dht_store_key_cap_rejections ?? 0) },
-    { id: 'reject-verify', k: m.ember_stat_store_reject_verify(), v: String(diag?.ember_dht_store_reject_verify ?? 0) },
-    { id: 'reject-sig', k: m.ember_stat_store_reject_signature(), v: String(diag?.ember_dht_store_reject_signature ?? 0) },
-    { id: 'reject-time', k: m.ember_stat_store_reject_timestamp(), v: String(diag?.ember_dht_store_reject_timestamp ?? 0) },
-    { id: 'reject-ip', k: m.ember_stat_store_reject_source_ip(), v: String(diag?.ember_dht_store_reject_source_ip ?? 0) },
-    { id: 'reject-ip-cap', k: m.ember_stat_store_reject_source_ip_cap(), v: String(diag?.ember_dht_store_reject_source_ip_cap ?? 0) },
-    { id: 'reject-pub', k: m.ember_stat_store_reject_publisher_cap(), v: String(diag?.ember_dht_store_reject_publisher_cap ?? 0) },
-    { id: 'reject-key', k: m.ember_stat_store_reject_per_key_cap(), v: String(diag?.ember_dht_store_reject_per_key_cap ?? 0) },
-    { id: 'reject-prox', k: m.ember_stat_store_reject_proximity(), v: String(diag?.ember_dht_store_reject_proximity ?? 0) },
-    { id: 'keyword-key-off-name', k: m.ember_stat_keyword_key_off_name(), v: String(diag?.ember_dht_keyword_key_off_name ?? 0) },
-    { id: 'unknown-record-types', k: m.ember_stat_unknown_record_types(), v: String(diag?.ember_dht_unknown_record_types ?? 0) },
-    { id: 'version-advertisers', k: m.ember_stat_version_advertisers(), v: String(diag?.ember_dht_version_advertisers ?? 0) },
-    { id: 'recall-searches', k: m.ember_stat_recall_searches(), v: String(diag?.ember_dht_recall_searches ?? 0) },
-    { id: 'recall-both', k: m.ember_stat_recall_both(), v: String(diag?.ember_dht_recall_both ?? 0) },
-    { id: 'recall-kad-only', k: m.ember_stat_recall_kad_only(), v: String(diag?.ember_dht_recall_kad_only ?? 0) },
-    { id: 'recall-ember-only', k: m.ember_stat_recall_ember_only(), v: String(diag?.ember_dht_recall_ember_only ?? 0) },
-    { id: 'rate-limited', k: m.ember_stat_rate_limited(), v: String(diag?.ember_dht_rate_limited ?? 0) },
-    { id: 'store-addr-ceiling', k: m.ember_stat_store_addr_ceiling(), v: String(diag?.ember_dht_store_addr_ceiling ?? 0) },
+    { id: 'epx-events', k: m.ember_stat_epx_events(), v: formatNumber(diag?.epx_events_received ?? 0) },
+    { id: 'epx-offered', k: m.ember_stat_epx_sources_offered(), v: formatNumber(diag?.epx_sources_offered ?? 0) },
+    { id: 'epx-filtered', k: m.ember_stat_epx_sources_filtered(), v: formatNumber(diag?.epx_sources_filtered ?? 0) },
+    { id: 'epx-udp-oversized', k: m.ember_stat_epx_udp_oversized(), v: formatNumber(diag?.epx_udp_oversized_skipped ?? 0) },
+    { id: 'store-key-cap', k: m.ember_stat_store_key_cap(), v: formatNumber(diag?.ember_dht_store_key_cap_rejections ?? 0) },
+    { id: 'reject-verify', k: m.ember_stat_store_reject_verify(), v: formatNumber(diag?.ember_dht_store_reject_verify ?? 0) },
+    { id: 'reject-sig', k: m.ember_stat_store_reject_signature(), v: formatNumber(diag?.ember_dht_store_reject_signature ?? 0) },
+    { id: 'reject-time', k: m.ember_stat_store_reject_timestamp(), v: formatNumber(diag?.ember_dht_store_reject_timestamp ?? 0) },
+    { id: 'reject-ip', k: m.ember_stat_store_reject_source_ip(), v: formatNumber(diag?.ember_dht_store_reject_source_ip ?? 0) },
+    { id: 'reject-ip-cap', k: m.ember_stat_store_reject_source_ip_cap(), v: formatNumber(diag?.ember_dht_store_reject_source_ip_cap ?? 0) },
+    { id: 'reject-pub', k: m.ember_stat_store_reject_publisher_cap(), v: formatNumber(diag?.ember_dht_store_reject_publisher_cap ?? 0) },
+    { id: 'reject-key', k: m.ember_stat_store_reject_per_key_cap(), v: formatNumber(diag?.ember_dht_store_reject_per_key_cap ?? 0) },
+    { id: 'reject-prox', k: m.ember_stat_store_reject_proximity(), v: formatNumber(diag?.ember_dht_store_reject_proximity ?? 0) },
+    { id: 'keyword-key-off-name', k: m.ember_stat_keyword_key_off_name(), v: formatNumber(diag?.ember_dht_keyword_key_off_name ?? 0) },
+    { id: 'unknown-record-types', k: m.ember_stat_unknown_record_types(), v: formatNumber(diag?.ember_dht_unknown_record_types ?? 0) },
+    { id: 'version-advertisers', k: m.ember_stat_version_advertisers(), v: formatNumber(diag?.ember_dht_version_advertisers ?? 0) },
+    { id: 'recall-searches', k: m.ember_stat_recall_searches(), v: formatNumber(diag?.ember_dht_recall_searches ?? 0) },
+    { id: 'recall-both', k: m.ember_stat_recall_both(), v: formatNumber(diag?.ember_dht_recall_both ?? 0) },
+    { id: 'recall-kad-only', k: m.ember_stat_recall_kad_only(), v: formatNumber(diag?.ember_dht_recall_kad_only ?? 0) },
+    { id: 'recall-ember-only', k: m.ember_stat_recall_ember_only(), v: formatNumber(diag?.ember_dht_recall_ember_only ?? 0) },
+    { id: 'rate-limited', k: m.ember_stat_rate_limited(), v: formatNumber(diag?.ember_dht_rate_limited ?? 0) },
+    { id: 'store-addr-ceiling', k: m.ember_stat_store_addr_ceiling(), v: formatNumber(diag?.ember_dht_store_addr_ceiling ?? 0) },
     ];
   });
 
@@ -462,7 +447,6 @@
       }
       if (pollTimer) clearInterval(pollTimer);
       if (copyTimer) clearTimeout(copyTimer);
-      if (joinTimer) clearTimeout(joinTimer);
     };
   });
 </script>
@@ -508,15 +492,28 @@
 
   {#if showNewerVersionBanner}
     <div class="banner banner-warn banner-with-action" role="status">
-      <span>{m.ember_version_newer_banner()}</span>
-      <button
-        type="button"
-        class="banner-action"
-        onclick={() => void checkForUpdates()}
-        disabled={$updater.phase === 'checking' || $updater.phase === 'downloading' || $updater.phase === 'installing'}
-      >
-        {$updater.phase === 'checking' ? m.updater_checking() : m.settings_about_check_btn()}
-      </button>
+      <div class="banner-text">
+        <span>{m.ember_version_newer_banner()}</span>
+        {#if updateResult}<span class="banner-result">{updateResult}</span>{/if}
+      </div>
+      {#if $updater.phase === 'available'}
+        <button type="button" class="banner-action" onclick={() => void installUpdate()}>
+          {m.updater_install()}
+        </button>
+      {:else if $updater.phase === 'ready'}
+        <button type="button" class="banner-action" onclick={() => void restartToUpdate()}>
+          {m.updater_restart_now()}
+        </button>
+      {:else}
+        <button
+          type="button"
+          class="banner-action"
+          onclick={() => void checkForUpdates()}
+          disabled={$updater.phase === 'checking' || $updater.phase === 'downloading' || $updater.phase === 'installing'}
+        >
+          {$updater.phase === 'checking' ? m.updater_checking() : m.settings_about_check_btn()}
+        </button>
+      {/if}
     </div>
   {/if}
 
@@ -525,7 +522,7 @@
   {/if}
 
   {#if isActive}
-    <section class="stat-grid" aria-label={m.ember_health_title()}>
+    <section class="stat-grid" aria-label={m.ember_overview_aria()}>
       <div class="stat" title={peerCount > verifiedCount ? m.ember_overview_peers_of_hint({ verified: verifiedCount, total: peerCount }) : undefined}>
         <div class="stat-value">
           {#if peerCount > verifiedCount}
@@ -635,7 +632,15 @@
             <div class="v pubkey-row">
               <code class="pubkey">{row.value || '—'}</code>
               {#if row.value}
-                <button type="button" class="copy-btn" onclick={() => copyText(row.value, row.key)} title={m.ember_copy()} aria-label={m.ember_copy()}>
+                <!-- The label is only set while idle: during feedback the
+                     visible "Copied" / "Copy failed" must be the accessible name. -->
+                <button
+                  type="button"
+                  class="copy-btn"
+                  onclick={() => copyText(row.value, row.key)}
+                  title={m.ember_copy_aria({ label: row.label })}
+                  aria-label={copiedKey === row.key || copiedKey === `${row.key}:error` ? undefined : m.ember_copy_aria({ label: row.label })}
+                >
                   {#if copiedKey === row.key}{m.ember_copied()}
                   {:else if copiedKey === `${row.key}:error`}{m.ember_copy_failed()}
                   {:else}{m.ember_copy()}{/if}
@@ -717,8 +722,8 @@
                     <td>{emberSearchTypeLabel(s.type)}{#if s.keyword_count > 1} ({s.keyword_count}){/if}</td>
                     <td title={s.target}><code>{shortHex(s.target)}</code></td>
                     <td>{s.results}</td>
-                    <td>{s.responded}/{s.queried} · {s.in_flight}↑ · {s.pending}…</td>
-                    <td>{s.age_secs}s</td>
+                    <td title={m.ember_dht_search_progress_title({ responded: s.responded, queried: s.queried, in_flight: s.in_flight, pending: s.pending })}>{s.responded}/{s.queried} · {s.in_flight}↑ · {s.pending}…</td>
+                    <td>{formatDurationSecs(s.age_secs)}</td>
                   </tr>
                 {:else}
                   <tr><td colspan="6" class="empty">{m.ember_dht_searches_empty()}</td></tr>
@@ -1328,6 +1333,17 @@
     justify-content: space-between;
     flex-wrap: wrap;
     gap: 10px 12px;
+  }
+
+  .banner-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .banner-result {
+    font-weight: 600;
   }
 
   .banner-action {

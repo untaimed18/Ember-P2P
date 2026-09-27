@@ -30,6 +30,7 @@
     clearFileOffer,
     clearFileOffersForFriend,
     rememberFriendName,
+    friendNames as friendNamesStore,
     friendsList as friendsListStore,
     beginFriendsListFetch,
     commitFriendsList,
@@ -388,6 +389,8 @@
     } catch (e) {
       if (destroyed) return;
       recheckError = translateError(e, m.error_operation_failed());
+      recheckingFirewall = false;
+      return;
     }
     if (destroyed) return;
     clearTimeout(recheckTimer);
@@ -764,12 +767,25 @@
     const nick = editNickname.trim();
     try {
       await updateFriendNickname(hash, nick);
-      const idx = friends.findIndex((f) => f.user_hash === hash);
-      if (idx !== -1) friends[idx] = { ...friends[idx], nickname: nick };
+      friendsListStore.update((list) =>
+        list.map((f) => (f.user_hash === hash ? { ...f, nickname: nick } : f)),
+      );
       // Push the rename through to any open chat tab so the strip
       // and the conversation header don't keep the old nickname.
       renameChatTab(hash, nick || hash.slice(0, 8) + '\u2026');
-      rememberFriendName(hash, nick);
+      if (nick) {
+        rememberFriendName(hash, nick);
+      } else {
+        // `rememberFriendName` ignores an empty name, so a cleared nickname
+        // would keep labelling the dock and toasts from the cache.
+        const key = hash.toLowerCase();
+        friendNamesStore.update((names) => {
+          if (!names.has(key)) return names;
+          const next = new Map(names);
+          next.delete(key);
+          return next;
+        });
+      }
       // Blur-to-save means the user may already be renaming a different friend
       // by the time this resolves; only close the editor if it is still ours.
       if (editingHash === hash) editingHash = null;
@@ -1371,7 +1387,7 @@
                 <!-- Icon only: the encryption guarantee is identical for every
                      mutual online friend, so spelling it out on each card was
                      pure repetition. Wording stays in the tooltip. -->
-                <span class="lock-glyph" title={m.friends_encrypted_chat_title()} aria-label={m.friends_encrypted_chat()}>
+                <span class="lock-glyph" role="img" title={m.friends_encrypted_chat_title()} aria-label={m.friends_encrypted_chat()}>
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
                     <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
@@ -1410,7 +1426,7 @@
             onclick={() => openChat(f)}
             disabled={chatDisabled}
             title={chatDisabled
-              ? m.settings_friend_chat_disabled()
+              ? m.chat_dock_chat_disabled()
               : isOnline ? m.friends_encrypted_chat_title() : m.friends_action_chat()}
           >
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">

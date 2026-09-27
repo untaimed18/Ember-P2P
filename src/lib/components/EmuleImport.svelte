@@ -119,6 +119,32 @@
     declined = !importIt;
   }
 
+  /** Radio-group keys for the two choices. Only the checked one is in the tab
+   *  order, so arrows are how the keyboard reaches the other. */
+  function onChoiceKeydown(event: KeyboardEvent) {
+    let next: boolean;
+    switch (event.key) {
+      case 'ArrowRight':
+      case 'ArrowDown':
+      case 'ArrowLeft':
+      case 'ArrowUp':
+        next = !importChosen;
+        break;
+      case 'Home':
+        next = true;
+        break;
+      case 'End':
+        next = false;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    setChoice(next);
+    const group = (event.currentTarget as HTMLElement).closest('[role="radiogroup"]');
+    group?.querySelector<HTMLElement>(`[data-choice="${next ? 'import' : 'fresh'}"]`)?.focus();
+  }
+
   async function load(install: EmuleInstall) {
     reading = true;
     error = '';
@@ -452,7 +478,9 @@
                         <span class="item-meta warn">
                           {folder.subfolder_count_capped
                             ? m.emule_import_folder_subfolders_capped({ count: folder.newly_shared_subfolders })
-                            : m.emule_import_folder_subfolders({ count: folder.newly_shared_subfolders })}
+                            : folder.newly_shared_subfolders === 1
+                              ? m.emule_import_folder_subfolders_one()
+                              : m.emule_import_folder_subfolders_other({ count: folder.newly_shared_subfolders })}
                         </span>
                       {/if}
                     </span>
@@ -482,7 +510,9 @@
           <div class="toggle-info">
             <span class="toggle-title">{m.emule_import_credits_title()}</span>
             <span class="hint">
-              {m.emule_import_credits_desc({ count: preview.credits })}
+              {preview.credits === 1
+                ? m.emule_import_credits_desc_one()
+                : m.emule_import_credits_desc_other({ count: preview.credits })}
               {#if preview.expired_credits > 0}
                 {m.emule_import_credits_expired({ count: preview.expired_credits })}
               {/if}
@@ -536,7 +566,11 @@
         {#if preview.servers > 0}
           <div class="toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">{m.emule_import_servers({ count: preview.servers })}</span>
+              <span class="toggle-title">
+                {preview.servers === 1
+                  ? m.emule_import_servers_one()
+                  : m.emule_import_servers_other({ count: preview.servers })}
+              </span>
             </div>
             <ToggleSwitch bind:checked={wantServers} ariaLabel={m.emule_import_report_servers()} />
           </div>
@@ -637,8 +671,11 @@
           class="choice"
           class:selected={importChosen}
           aria-checked={importChosen}
+          tabindex={importChosen ? 0 : -1}
+          data-choice="import"
           data-autofocus={importChosen ? '' : undefined}
           onclick={() => setChoice(true)}
+          onkeydown={onChoiceKeydown}
         >
           <strong>{m.emule_import_choice_import()}</strong>
           <span>{m.emule_import_choice_import_desc()}</span>
@@ -649,8 +686,11 @@
           class="choice"
           class:selected={!importChosen}
           aria-checked={!importChosen}
+          tabindex={importChosen ? -1 : 0}
+          data-choice="fresh"
           data-autofocus={importChosen ? undefined : ''}
           onclick={() => setChoice(false)}
+          onkeydown={onChoiceKeydown}
         >
           <strong>{m.emule_import_choice_fresh()}</strong>
           <span>{m.emule_import_choice_fresh_desc()}</span>

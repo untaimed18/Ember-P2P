@@ -62,7 +62,7 @@
   <ChatDock windowed />
 {:else}
   <div class="chat-window-loading" aria-busy="true">
-    <div class="spinner"></div>
+    <div class="spinner" role="status" aria-label={m.chat_loading_messages()}></div>
   </div>
 {/if}
 <Toast />

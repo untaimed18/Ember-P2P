@@ -19,7 +19,7 @@
   import { banPeer } from '$lib/api/kad';
   import { getPeerReputationBatch, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
   import {
-    formatSize, formatSpeed, formatDate, formatDateWithYear, formatDuration,
+    formatSize, formatSpeed, formatDate, formatDateWithYear, formatDurationSecs,
     formatRemaining, formatRelativeTime, copyToClipboard, readFromClipboard,
   } from '$lib/utils';
   import { onMount, onDestroy, untrack } from 'svelte';
@@ -141,7 +141,7 @@
     { key: 'progress', get label() { return m.transfers_col_progress(); }, width: 170, minWidth: 96, className: 'col-dl-progress', sortField: 'progress' },
     { key: 'sources', get label() { return m.transfers_col_sources(); }, width: 60, minWidth: 56, className: 'col-dl-sources', sortField: 'sources' },
     { key: 'priority', get label() { return m.transfers_col_priority(); }, width: 60, minWidth: 60, className: 'col-dl-prio', sortField: 'priority' },
-    { key: 'status', get label() { return m.transfers_col_status(); }, width: 70, minWidth: 80, className: 'col-dl-status', sortField: 'status' },
+    { key: 'status', get label() { return m.transfers_col_status(); }, width: 100, minWidth: 80, className: 'col-dl-status', sortField: 'status' },
     { key: 'remaining', get label() { return m.transfers_col_remaining(); }, width: 110, minWidth: 88, className: 'col-dl-remain', sortField: 'remaining' },
     { key: 'last_seen_complete', get label() { return m.transfers_col_last_seen_complete(); }, width: 150, minWidth: 110, className: 'col-dl-lastseen', sortField: 'last_seen_complete' },
     { key: 'last_received', get label() { return m.transfers_col_last_reception(); }, width: 120, minWidth: 100, className: 'col-dl-lastrx', sortField: 'last_received' },
@@ -666,6 +666,13 @@
     }
   }
 
+  /// Retry for a failed source load. `toggleSourceDetail` on the open row
+  /// would collapse it, so reopen it from scratch instead.
+  function reloadSourceDetail(t: Transfer) {
+    if (expandedTransferId === t.id) expandedTransferId = null;
+    void toggleSourceDetail(t);
+  }
+
   // Consecutive empty API snapshots are tracked via emptySourceSnapshotStreak
   // (declared with the source-drawer state above).
 
@@ -945,6 +952,10 @@
   });
   let allDownloads = $derived(downloadPartition.all);
   let activeDownloads = $derived(downloadPartition.active);
+  /// The live download whose sources the Download Clients tab is showing.
+  let expandedClientsParent = $derived(
+    expandedTransferId ? (activeDownloads.find((d) => d.id === expandedTransferId) ?? null) : null,
+  );
   let completedDownloads = $derived(downloadPartition.completed);
   // Lower-cased hashes of files we're still downloading (have a `.part` for).
   // An upload whose hash is in this set is the eMule-style partial-file share:
@@ -1379,8 +1390,9 @@
 
   // Filtered + sorted view that the table actually iterates over. Search
   // matches any of: user_hash (full or truncated form the user might have
-  // copied), last IP, country code, or — when the row is a friend — the
-  // friend nickname. Empty filter passes through everything.
+  // copied), last IP, country code, the peer's Hello name, its client
+  // software, or — when the row is a friend — the friend nickname. Empty
+  // filter passes through everything.
   const KNOWN_CLIENT_DISPLAY_LIMIT = 1000;
   let filteredKnownClients = $derived.by(() => {
     const q = knownFilter.trim().toLowerCase();
@@ -1394,6 +1406,8 @@
       if (kc.country_code && kc.country_code.toLowerCase().includes(q)) return true;
       const nick = (ember ? friendNickById[ember] : undefined) || kc.nickname;
       if (nick && nick.toLowerCase().includes(q)) return true;
+      if (kc.peer_name && kc.peer_name.toLowerCase().includes(q)) return true;
+      if (kc.client_software && kc.client_software.toLowerCase().includes(q)) return true;
       return false;
     });
   });
@@ -2421,7 +2435,8 @@
         return m.transfers_dl_status_downloading();
       case 'searching': {
         if (t.health === 'degraded' && t.health_reason) return m.transfers_dl_status_searching_delayed();
-        if (t.sources > 0) return m.transfers_dl_status_searching_with_sources({ count: t.sources });
+        if (t.sources === 1) return m.transfers_dl_status_searching_with_sources_one();
+        if (t.sources > 1) return m.transfers_dl_status_searching_with_sources_other({ count: t.sources });
         const connected = $networkStats.status === 'connected' || $networkStats.status === 'connecting';
         return connected ? m.transfers_dl_status_searching() : m.transfers_dl_status_waiting();
       }
@@ -2982,7 +2997,7 @@
             transferError = m.transfers_no_ember_hash();
             break;
           }
-          const nick = friendNickById[kc.ember_hash.toLowerCase()];
+          const nick = kc.peer_name || undefined;
           await addFriend(kc.ember_hash, nick);
           await refreshFriendHashes();
           showInfo(m.transfers_added_friend({
@@ -3124,20 +3139,24 @@
   async function handlePauseAll() {
     const ids = globalDownloadTargets().filter((t) => canPause(t)).map((t) => t.id);
     if (!ids.length) { showInfo(m.transfers_nothing_to_pause()); return; }
-    try {
-      await pauseTransfersBatch(ids);
-      const filter = transferFilter.trim();
-      if (filter) showInfo(m.transfers_paused_matching({ count: ids.length, filter }));
-    } catch (e: unknown) { transferError = toErrorMsg(e); }
+    const ok = await runBatchCommand(ids, pauseTransfersBatch, m.transfers_batch_label_paused());
+    const filter = transferFilter.trim();
+    if (filter && ok) {
+      showInfo(ids.length === 1
+        ? m.transfers_paused_matching_one({ filter })
+        : m.transfers_paused_matching_other({ count: ids.length, filter }));
+    }
   }
   async function handleResumeAll() {
     const ids = globalDownloadTargets().filter((t) => canResume(t)).map((t) => t.id);
     if (!ids.length) { showInfo(m.transfers_nothing_to_resume()); return; }
-    try {
-      await resumeTransfersBatch(ids);
-      const filter = transferFilter.trim();
-      if (filter) showInfo(m.transfers_resumed_matching({ count: ids.length, filter }));
-    } catch (e: unknown) { transferError = toErrorMsg(e); }
+    const ok = await runBatchCommand(ids, resumeTransfersBatch, m.transfers_batch_label_resumed());
+    const filter = transferFilter.trim();
+    if (filter && ok) {
+      showInfo(ids.length === 1
+        ? m.transfers_resumed_matching_one({ filter })
+        : m.transfers_resumed_matching_other({ count: ids.length, filter }));
+    }
   }
 
   /** Downloads in the visible list that have a hash to build a link from. */
@@ -3516,7 +3535,9 @@
     const ok = await runBatchCommand(ids, stopTransfersBatch, m.transfers_batch_label_stopped());
     const filter = transferFilter.trim();
     if (filter && ok) {
-      showInfo(m.transfers_stopped_matching({ count: ids.length, filter }));
+      showInfo(ids.length === 1
+        ? m.transfers_stopped_matching_one({ filter })
+        : m.transfers_stopped_matching_other({ count: ids.length, filter }));
     }
   }
 
@@ -3531,6 +3552,17 @@
       removeIds: [],
       filter: transferFilter.trim(),
     };
+  }
+
+  function batchCancelMixedMessage(count: number, removed: number): string {
+    if (count === 1) {
+      return removed === 1
+        ? m.transfers_confirm_batch_cancel_mixed_one_one()
+        : m.transfers_confirm_batch_cancel_mixed_one_other({ removed });
+    }
+    return removed === 1
+      ? m.transfers_confirm_batch_cancel_mixed_other_one({ count })
+      : m.transfers_confirm_batch_cancel_mixed_other_other({ count, removed });
   }
 
   // --- Splitter ---
@@ -4426,21 +4458,27 @@
     }
     return;
   }
+  // Already handled by the control that has focus (the splitter, the tab
+  // strip) — the same arrow key must not also move the row selection.
+  if (e.defaultPrevented) return;
   // D33: keyboard nav for download rows. Only hijack when focus is not
   // in a text input and no dialogs are open, so we don't disrupt the
   // filter box or confirm dialogs.
   const target = e.target as HTMLElement | null;
   const inEditable = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
-  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted.open || confirmBatchCancel.open || confirmRecover.open || renameDialog.open) return;
+  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || columnMenu || uploadsPaneCtxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted.open || confirmBatchCancel.open || confirmRecover.open || renameDialog.open) return;
   if (e.key === 'F2') {
-    const t = [...selectedBatchTransfers].reverse().find((row) => canRename(row))
-      ?? (fileDetailsTransfer && canRename(fileDetailsTransfer) ? fileDetailsTransfer : null);
+    const t = fileDetailsId
+      ? (fileDetailsTransfer && canRename(fileDetailsTransfer) ? fileDetailsTransfer : null)
+      : [...selectedBatchTransfers].reverse().find((row) => canRename(row));
     if (t) {
       e.preventDefault();
       openRename(t);
     }
     return;
   }
+  // File Details is modal: the list behind it keeps its selection.
+  if (fileDetailsId) return;
   if (filteredSelectableDownloads.length === 0) return;
   const currentId = selectedDownloadIds[selectedDownloadIds.length - 1];
   const idx = currentId ? filteredSelectableDownloads.findIndex((t) => t.id === currentId) : -1;
@@ -4583,7 +4621,7 @@
                 ondrop={(e) => handleColumnDrop(e, 'downloads', column.key)}
                 ondragend={handleColumnDragEnd}
               >
-                <span class="header-content">
+                <span class="header-content" title={column.title}>
                   {column.label}{column.sortField ? sortArrow(dlSortField, column.sortField, dlSortAsc) : ''}
                 </span>
                 <button
@@ -4635,7 +4673,7 @@
                   <td class="progress-cell">
                     {#if t.status === 'searching' && t.sources === 0 && t.progress === 0}
                       <span class="searching-label">
-                        {dlStatusLabel(t)}...
+                        {m.transfers_status_ellipsis({ status: dlStatusLabel(t) })}
                         {#if searchStatus.get(t.id)}
                           <span class="search-detail">{searchStatus.get(t.id)}</span>
                         {/if}
@@ -4692,7 +4730,7 @@
                   <td class="source-child-cell" colspan={dlColCount}>
                     <span class="source-indent">
                       {sourceLoadError}
-                      <button class="source-inline-btn" onclick={() => toggleSourceDetail(t)}>{m.common_retry()}</button>
+                      <button class="source-inline-btn" onclick={() => reloadSourceDetail(t)}>{m.common_retry()}</button>
                     </span>
                   </td>
                 </tr>
@@ -4914,7 +4952,7 @@
           <button class="tb-btn" disabled={selectedResumableCount === 0} onclick={handleBatchResumeDownloads} title={m.transfers_batch_resume_title()}>{m.common_resume()}</button>
           <button class="tb-btn" disabled={selectedStoppableCount === 0} onclick={handleBatchStopDownloads} title={m.transfers_batch_stop_title()}>{m.common_stop()}</button>
           <button class="tb-btn danger-outline" disabled={selectedCancellableCount === 0} onclick={handleBatchCancelDownloads} title={m.transfers_batch_cancel_title()}>{m.common_cancel()}</button>
-          <button class="tb-btn" disabled={copyingAllDownloadLinks || linkableSelectedCount === 0} onclick={() => void copyDownloadLinks(selectedBatchTransfers)} title={m.transfers_copy_all_links()}>{m.transfers_copy_all_links_btn()}</button>
+          <button class="tb-btn" disabled={copyingAllDownloadLinks || linkableSelectedCount === 0} onclick={() => void copyDownloadLinks(selectedBatchTransfers)} title={m.transfers_copy_selected_links_title()}>{m.transfers_copy_links_btn()}</button>
           {#if selectedFinishedCount > 0}
             <button class="tb-btn" onclick={handleBatchRemoveDownloads} title={m.transfers_batch_remove_title()}>
               {m.transfers_batch_remove({ count: selectedFinishedCount })}
@@ -4924,6 +4962,8 @@
         </div>
       </div>
     {:else if selectedTransfer}
+      {@const selectedSourcesLabel = sourcesLabel(selectedTransfer)}
+      {@const selectedSourcesTotal = selectedTransfer.sources || ((selectedTransfer.active_sources || 0) + (selectedTransfer.queued_sources || 0))}
       <div class="selection-footer">
         <div class="selection-meta" title={selectedTransfer.file_name}>
           <strong>{selectedTransfer.file_name}</strong>
@@ -4934,7 +4974,7 @@
           -->
           <span>{formatSize(selectedTransfer.completed_size ?? selectedTransfer.transferred)} / {formatSize(selectedTransfer.total_size)}</span>
           <span>{dlStatusLabel(selectedTransfer)}</span>
-          <span>{sourcesLabel(selectedTransfer)} {m.transfers_src_suffix()}{#if selectedTransfer.ember_sources > 0} {m.transfers_epx_count({ count: selectedTransfer.ember_sources })}{/if}</span>
+          <span>{selectedSourcesLabel}{#if selectedSourcesLabel !== '\u2014'} {selectedSourcesTotal === 1 ? m.transfers_src_suffix_one() : m.transfers_src_suffix_other()}{/if}{#if selectedTransfer.ember_sources > 0} {m.transfers_epx_count({ count: selectedTransfer.ember_sources })}{/if}</span>
         </div>
         <div class="selection-actions">
           <span class="tb-btn-wrap" title={!canPause(selectedTransfer) ? m.transfers_action_cannot_pause() : undefined}>
@@ -5004,19 +5044,21 @@
           const order: typeof bottomView[] = ['uploading', 'queued', 'known_clients', 'known_ember', 'download_clients'];
           const idx = order.indexOf(bottomView);
           if (idx < 0) return;
+          let next: typeof bottomView;
           if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
-            e.preventDefault();
-            bottomView = order[(idx + 1) % order.length];
+            next = order[(idx + 1) % order.length];
           } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
-            e.preventDefault();
-            bottomView = order[(idx - 1 + order.length) % order.length];
+            next = order[(idx - 1 + order.length) % order.length];
           } else if (e.key === 'Home') {
-            e.preventDefault();
-            bottomView = order[0];
+            next = order[0];
           } else if (e.key === 'End') {
-            e.preventDefault();
-            bottomView = order[order.length - 1];
+            next = order[order.length - 1];
+          } else {
+            return;
           }
+          e.preventDefault();
+          bottomView = next;
+          e.currentTarget.querySelectorAll<HTMLElement>('[role="tab"]')[order.indexOf(next)]?.focus();
         }}
       >
         <button
@@ -5037,7 +5079,7 @@
           tabindex={bottomView === 'queued' ? 0 : -1}
           onclick={() => bottomView = 'queued'}
           title={m.transfers_tab_queued_title()}
-        >{uploadQueueLoaded ? m.transfers_tab_queued_count({ count: uploadQueueClients.length }) : m.transfers_tab_queued()}</button>
+        >{uploadQueueLoaded && !uploadQueueLoadFailed ? m.transfers_tab_queued_count({ count: uploadQueueClients.length }) : m.transfers_tab_queued()}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'known_clients'}
@@ -5159,9 +5201,9 @@
                   {:else if column.key === 'total_size'}
                     <td class="num-cell">{formatSize(t.total_size)}</td>
                   {:else if column.key === 'waited'}
-                    <td class="num-cell">{formatDuration(t.wait_time * 1000)}</td>
+                    <td class="num-cell">{t.wait_time > 0 ? formatDurationSecs(t.wait_time) : '\u2014'}</td>
                   {:else if column.key === 'upload_time'}
-                    <td class="num-cell">{formatDuration(t.upload_time)}</td>
+                    <td class="num-cell">{t.upload_time > 0 ? formatDurationSecs(Math.floor(t.upload_time / 1000)) : '\u2014'}</td>
                   {:else if column.key === 'status'}
                     <td class="status-cell"><span class="status-label st-{t.status}" title={ulStatusTooltip(t)}>{ulStatusLabel(t)}</span></td>
                   {:else if column.key === 'up_status'}
@@ -5308,7 +5350,7 @@
                   {:else if column.key === 'file_name'}
                     <td class="name-cell" title={q.file_name}><bdi dir="auto">{q.file_name}</bdi></td>
                   {:else if column.key === 'wait_time'}
-                    <td class="num-cell">{formatDuration(q.wait_seconds * 1000)}</td>
+                    <td class="num-cell">{q.wait_seconds > 0 ? formatDurationSecs(q.wait_seconds) : '\u2014'}</td>
                   {:else if column.key === 'queue_rank'}
                     <!-- Always a number. The rank is computed from the whole
                          queue, so it is known whether or not the peer happens
@@ -5407,14 +5449,13 @@
               <span class="known-stat" title={m.transfers_known_total_down_title()}>
                 &darr; <strong>{formatSize(knownStats.totalDown)}</strong>
               </span>
-              {#if knownFilter && filteredKnownClients.length !== knownStats.total}
-                <span class="known-stat known-stat-match" aria-live="polite">
-                  {m.transfers_known_showing_label()} <strong>{filteredKnownClients.length}</strong>
-                </span>
-              {/if}
               {#if displayedKnownClients.length < filteredKnownClients.length}
                 <span class="known-stat known-stat-match" aria-live="polite">
                   {m.transfers_known_showing_label()} <strong>{displayedKnownClients.length}</strong> / <strong>{filteredKnownClients.length}</strong>
+                </span>
+              {:else if knownFilter && filteredKnownClients.length !== knownStats.total}
+                <span class="known-stat known-stat-match" aria-live="polite">
+                  {m.transfers_known_showing_label()} <strong>{filteredKnownClients.length}</strong>
                 </span>
               {/if}
             </div>
@@ -5451,7 +5492,7 @@
                   ondrop={(e) => handleColumnDrop(e, 'known', column.key)}
                   ondragend={handleColumnDragEnd}
                 >
-                  <span class="header-content">
+                  <span class="header-content" title={column.title}>
                     {column.label}{column.sortField ? sortArrow(knSortField, column.sortField, knSortAsc) : ''}
                   </span>
                   <button
@@ -5493,7 +5534,7 @@
                         onclick={() => copyKnownHash(shownHash)}
                       >
                         {#if isFriend}
-                          <span class="known-friend-dot" aria-label={m.transfers_known_friend()} title={friendNick ? m.transfers_known_friend_named({ nick: friendNick }) : m.transfers_known_friend()}></span>
+                          <span class="known-friend-dot" role="img" aria-label={m.transfers_known_friend()} title={friendNick ? m.transfers_known_friend_named({ nick: friendNick }) : m.transfers_known_friend()}></span>
                         {/if}
                         {#if friendNick}
                           <span class="known-hash-nick"><bdi dir="auto">{friendNick}</bdi></span>
@@ -5623,7 +5664,7 @@
                   ondrop={(e) => handleColumnDrop(e, 'clients', column.key)}
                   ondragend={handleColumnDragEnd}
                 >
-                  <span class="header-content">
+                  <span class="header-content" title={column.title}>
                     {column.label}{column.sortField ? sortArrow(clSortField ?? '', column.sortField, clSortAsc) : ''}
                   </span>
                   <button
@@ -5716,6 +5757,28 @@
                   </svg>
                   <p class="empty-cell-title">{m.transfers_empty_finished_dl()}</p>
                   <p class="empty-cell-sub">{m.transfers_empty_finished_dl_sub()}</p>
+                </div>
+              </td></tr>
+            {:else if expandedClientsParent && sourceLoadError}
+              {@const parent = expandedClientsParent}
+              <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
+                <div class="empty-cell-body">
+                  <p class="empty-cell-title">{sourceLoadError}</p>
+                  <button class="empty-cell-action" type="button" onclick={() => reloadSourceDetail(parent)}>{m.common_retry()}</button>
+                </div>
+              </td></tr>
+            {:else if expandedClientsParent}
+              {@const parent = expandedClientsParent}
+              <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
+                <div class="empty-cell-body">
+                  <p class="empty-cell-title">
+                    {parent.sources > 0
+                      ? (parent.sources === 1
+                        ? m.transfers_connecting_sources_one()
+                        : m.transfers_connecting_sources_other({ count: parent.sources }))
+                      : m.transfers_no_source_details()}
+                  </p>
+                  <button class="empty-cell-action" type="button" onclick={() => findSourcesInline(parent)}>{m.transfers_find_sources()}</button>
                 </div>
               </td></tr>
             {:else if activeDownloads.length === 0}
@@ -5951,7 +6014,7 @@
         >{m.search_ctx_find_related_selected({ count: selectedDownloadCount })}</button>
       {/if}
       <div class="ctx-sep" role="separator"></div>
-      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
+      <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
       <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
     {:else if ctxMenu.section === 'completed'}
       <!--
@@ -5988,7 +6051,7 @@
         >{m.search_ctx_find_related_selected({ count: selectedDownloadCount })}</button>
       {/if}
       <div class="ctx-sep" role="separator"></div>
-      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
+      <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
       <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_ctx_remove_from_list()}</button>
     {:else}
       {@const uploadFriendHash = emberHashForUpload(ctxTransfer)}
@@ -6025,6 +6088,7 @@
     <div class="ctx-header" role="presentation">
       <bdi dir="auto">
         {knownCtxMenu.client.nickname
+          || knownCtxMenu.client.peer_name
           || knownCtxMenu.client.last_known_ip
           || knownCtxMenu.client.user_hash.slice(0, 12)}
       </bdi>
@@ -6108,7 +6172,9 @@
   bind:open={confirmClearCompleted.open}
   title={m.transfers_clear_completed()}
   message={confirmClearCompleted.filter
-    ? m.transfers_confirm_clear_completed_filtered({ count: confirmClearCompleted.count, filter: confirmClearCompleted.filter })
+    ? (confirmClearCompleted.count === 1
+      ? m.transfers_confirm_clear_completed_filtered_one({ filter: confirmClearCompleted.filter })
+      : m.transfers_confirm_clear_completed_filtered_other({ count: confirmClearCompleted.count, filter: confirmClearCompleted.filter }))
     : m.transfers_confirm_clear_completed_msg()}
   confirmLabel={m.common_clear()}
   onconfirm={async () => {
@@ -6154,9 +6220,11 @@
   bind:open={confirmBatchCancel.open}
   title={m.transfers_confirm_batch_cancel_title()}
   message={confirmBatchCancel.removeIds.length > 0
-    ? m.transfers_confirm_batch_cancel_mixed({ count: confirmBatchCancel.count, removed: confirmBatchCancel.removeIds.length })
+    ? batchCancelMixedMessage(confirmBatchCancel.count, confirmBatchCancel.removeIds.length)
     : confirmBatchCancel.filter
-      ? m.transfers_confirm_batch_cancel_filtered({ count: confirmBatchCancel.count, filter: confirmBatchCancel.filter })
+      ? (confirmBatchCancel.count === 1
+        ? m.transfers_confirm_batch_cancel_filtered_one({ filter: confirmBatchCancel.filter })
+        : m.transfers_confirm_batch_cancel_filtered_other({ count: confirmBatchCancel.count, filter: confirmBatchCancel.filter }))
       : confirmBatchCancel.count === 1
         ? m.transfers_confirm_batch_cancel_one()
         : m.transfers_confirm_batch_cancel_other({ count: confirmBatchCancel.count })}
@@ -7437,6 +7505,7 @@
     font-weight: 600;
     color: var(--text-muted);
     letter-spacing: 0.03em;
+    text-transform: uppercase;
   }
   .divider-toggle:hover {
     background: none;

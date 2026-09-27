@@ -747,8 +747,16 @@
       ? m.library_drop_many_confirm_title()
       : m.library_drop_parent_confirm_title()}
   message={dropPromptMessage}
-  confirmLabel={dropPrompt.reason === 'files' ? m.library_drop_share_files() : m.confirm_default_button()}
-  altLabel={dropPrompt.reason === 'files' ? m.library_drop_share_folder() : undefined}
+  confirmLabel={dropPrompt.reason === 'files'
+    ? m.library_drop_share_files()
+    : dropPrompt.reason === 'broad'
+      ? m.library_drop_share_anyway()
+      : m.library_drop_share_folders_confirm()}
+  altLabel={dropPrompt.reason === 'files'
+    ? dropPrompt.folders.length === 1
+      ? m.library_drop_share_folder()
+      : m.library_drop_share_folders()
+    : undefined}
   danger={dropPrompt.reason === 'broad'}
   isolateMessage
   onconfirm={() => {

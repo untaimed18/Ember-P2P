@@ -197,23 +197,6 @@ export function formatRelativeTime(ts: number, nowSecs: number = Math.floor(Date
   return RELATIVE_TIME_FORMATTER.format(-y, 'year');
 }
 
-/**
- * Format milliseconds as HH:MM (eMule CastSecondsToHM style).
- * Returns "\u2014" for zero or invalid values.
- *
- * @param ms - Duration in **milliseconds** (not seconds).
- *   Callers passing seconds should use {@link formatDurationSecs} instead.
- */
-export function formatDuration(ms: number): string {
-  if (!Number.isFinite(ms) || ms <= 0) return '\u2014';
-  const totalSecs = Math.floor(ms / 1000);
-  const hrs = Math.floor(totalSecs / 3600);
-  const mins = Math.floor((totalSecs % 3600) / 60);
-  if (hrs > 0) return `${hrs}:${String(mins).padStart(2, '0')}`;
-  if (mins > 0) return `${mins} min`;
-  return `${totalSecs}s`;
-}
-
 /** Format seconds as a human-readable duration (e.g. "2h 15m"). */
 export function formatDurationSecs(secs: number): string {
   if (!Number.isFinite(secs) || secs < 0) return '\u2014';
