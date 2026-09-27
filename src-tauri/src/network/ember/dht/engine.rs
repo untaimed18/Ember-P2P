@@ -180,7 +180,7 @@ const MAX_BUDDY_ENDORSE_ASKED: usize = 64;
 /// enough verified contacts due to spend the whole thing. One in four: enough
 /// that gossip keeps being promoted once the table is healthy, small enough
 /// that the contacts we actually route through stay refreshed.
-const LEAD_PING_RESERVE_DIVISOR: usize = 4;
+pub(crate) const LEAD_PING_RESERVE_DIVISOR: usize = 4;
 
 /// Peers whose advertised wire-version range we hold at once.
 ///

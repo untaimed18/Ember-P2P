@@ -803,6 +803,10 @@ pub(super) struct NetworkState {
     /// Unix time until which the staleness purge ages nothing out. 0 = never
     /// held. See `ember_stale_purge_hold`.
     pub(super) ember_stale_purge_held_until: i64,
+    /// Session contacts already pinged during the hold in force, so each is
+    /// asked once per hold rather than every tick. Emptied when no hold is in
+    /// force; bounded by `MAX_EMBER_SESSION_DHT_CONTACTS`.
+    pub(super) ember_session_hold_pinged: HashSet<(Ipv4Addr, u16)>,
     /// Nodes a real lookup found to be closest to a record key, per key, with
     /// the unix time we learned them.
     ///

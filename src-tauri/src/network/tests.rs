@@ -5018,31 +5018,97 @@ fn a_suspend_holds_the_stale_purge_for_one_liveness_window() {
     let before = 1_000_000i64;
     let resumed = before + EMBER_CONTACT_STALE_SECS + 3600;
 
+    let table = 100;
     assert_eq!(
-        ember_stale_purge_hold(Some(before), 0, before + interval),
+        ember_stale_purge_hold(Some(before), 0, before + interval, table),
         0,
         "an ordinary tick holds nothing"
     );
-    assert_eq!(ember_stale_purge_hold(None, 0, before), 0, "nor does the first");
+    assert_eq!(ember_stale_purge_hold(None, 0, before, table), 0, "nor does the first");
 
-    let held_until = ember_stale_purge_hold(Some(before), 0, resumed);
+    let held_until = ember_stale_purge_hold(Some(before), 0, resumed, table);
     assert_eq!(held_until, resumed + EMBER_CONTACT_PING_SECS);
 
     // The ticks after resume keep the hold until the window has passed.
     let next = resumed + interval;
-    assert_eq!(ember_stale_purge_hold(Some(resumed), held_until, next), held_until);
+    assert_eq!(ember_stale_purge_hold(Some(resumed), held_until, next, table), held_until);
     assert!(next < held_until, "still held one tick later");
     let after = held_until + interval;
     assert!(
-        ember_stale_purge_hold(Some(after - interval), held_until, after) <= after,
+        ember_stale_purge_hold(Some(after - interval), held_until, after, table) <= after,
         "and the purge runs again once it has"
     );
 
     // A clock stepped back a day must not stretch the hold by a day.
     let stepped_back = resumed - 86_400;
     assert_eq!(
-        ember_stale_purge_hold(Some(resumed), held_until, stepped_back),
+        ember_stale_purge_hold(Some(resumed), held_until, stepped_back, table),
         stepped_back + EMBER_CONTACT_PING_SECS
+    );
+}
+
+/// While the purge is held, the session contacts that answered us before and
+/// went quiet across the suspend are asked once; a LAN copy we never heard
+/// from, one heard recently, and one already asked this hold are not.
+#[test]
+fn the_suspend_hold_asks_each_quiet_session_contact_once() {
+    let now = 10_000_000i64;
+    let contact = |last: u8, last_seen: i64| ember::dht::EmberContact {
+        node_id: ember::dht::EmberNodeId([last; 16]),
+        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, last)), 4672),
+        noise_pub: [last; 32],
+        ed25519_pub: [last; 32],
+        last_seen,
+        failed_queries: 0,
+    };
+    let mut session: HostPortMap<ember::dht::EmberContact> = HostPortMap::new();
+    let slept_through = now - EMBER_CONTACT_STALE_SECS - 3600;
+    for c in [
+        contact(1, slept_through),
+        contact(2, slept_through),
+        contact(3, now - 30),
+        contact(4, 0),
+    ] {
+        record_ember_session_dht_contact(&mut session, c);
+    }
+    let mut asked = HashSet::new();
+    asked.insert((Ipv4Addr::new(192, 168, 1, 2), 4672));
+
+    let due = ember_session_contacts_to_ask_during_hold(&session, &asked, now);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].addr.ip(), IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+}
+
+/// A table larger than one liveness window's pings can cover is held long
+/// enough for them to reach every verified contact, and no longer than the
+/// silence the hold exists to excuse.
+#[test]
+fn the_suspend_hold_grows_with_the_table_it_has_to_re_ping() {
+    let interval = EMBER_MAINT_INTERVAL.as_secs() as i64;
+    let per_tick = EMBER_MAINT_MAX_PINGS_STARVED
+        - EMBER_MAINT_MAX_PINGS_STARVED.div_ceil(ember::dht::engine::LEAD_PING_RESERVE_DIVISOR);
+
+    assert_eq!(ember_suspend_hold_secs(0), EMBER_CONTACT_PING_SECS);
+    assert_eq!(ember_suspend_hold_secs(100), EMBER_CONTACT_PING_SECS);
+
+    let large = 600;
+    let hold = ember_suspend_hold_secs(large);
+    assert!(hold > EMBER_CONTACT_PING_SECS);
+    assert!(
+        (hold / interval) as usize * per_tick >= large,
+        "every verified contact gets a ping before the hold lifts"
+    );
+    assert_eq!(
+        ember_suspend_hold_secs(usize::MAX),
+        EMBER_CONTACT_STALE_SECS,
+        "never longer than the stale window"
+    );
+
+    let before = 1_000_000i64;
+    let resumed = before + EMBER_CONTACT_STALE_SECS + 3600;
+    assert_eq!(
+        ember_stale_purge_hold(Some(before), 0, resumed, large),
+        resumed + hold
     );
 }
 

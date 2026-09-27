@@ -933,17 +933,58 @@ pub(super) const EMBER_CONTACT_STALE_SECS: i64 = 2 * 3600;
 /// so the silence it produced says nothing about the contacts.
 pub(super) const EMBER_MAINT_GAP_SECS: i64 = EMBER_CONTACT_PING_SECS;
 
+/// How long the staleness purge is held after a suspend, for a table holding
+/// `verified` verified contacts: long enough for the liveness pings to reach
+/// every one of them.
+///
+/// [`ember_maint_ping_budget`] covers the table in one liveness window up to
+/// its ceiling of [`EMBER_MAINT_MAX_PINGS_STARVED`] a tick; past that the table
+/// takes more ticks than the window has. While leads are waiting the engine
+/// holds a share of the budget for them, so verified contacts are counted
+/// against what is left. Never shorter than the window and never longer than
+/// [`EMBER_CONTACT_STALE_SECS`], past which the hold would outlast the silence
+/// it exists to excuse.
+pub(super) fn ember_suspend_hold_secs(verified: usize) -> i64 {
+    let per_tick = EMBER_MAINT_MAX_PINGS_STARVED
+        - EMBER_MAINT_MAX_PINGS_STARVED.div_ceil(ember::dht::engine::LEAD_PING_RESERVE_DIVISOR);
+    let ticks = verified.div_ceil(per_tick) as i64;
+    ticks
+        .saturating_mul(EMBER_MAINT_INTERVAL.as_secs() as i64)
+        .clamp(EMBER_CONTACT_PING_SECS, EMBER_CONTACT_STALE_SECS)
+}
+
+/// Session contacts the maintenance tick pings while the staleness purge is
+/// held: ones that have answered us before, have gone a liveness window
+/// unheard, and have not been asked yet during this hold. A copy we have never
+/// heard from is not at risk — the purge keeps those — so it is not asked.
+pub(super) fn ember_session_contacts_to_ask_during_hold(
+    session: &HostPortMap<ember::dht::EmberContact>,
+    asked: &HashSet<(Ipv4Addr, u16)>,
+    now: i64,
+) -> Vec<ember::dht::EmberContact> {
+    session
+        .iter()
+        .filter(|(key, c)| {
+            c.last_seen > 0
+                && now.saturating_sub(c.last_seen) >= EMBER_CONTACT_PING_SECS
+                && !asked.contains(*key)
+        })
+        .map(|(_, c)| c.clone())
+        .collect()
+}
+
 /// Until when the staleness purge must age nothing out, given the unix time of
-/// the previous maintenance tick, the hold already in force, and `now`.
+/// the previous maintenance tick, the hold already in force, `now`, and how many
+/// verified contacts the table holds.
 ///
 /// The purge's premise is that the liveness pings kept running, so a contact
 /// still unheard after two hours is one the budget never reached. A suspend
 /// longer than that breaks it for every contact at once: an unheld first tick
 /// after resume would purge each verified contact before a single ping had gone
-/// out, leaving the node to rejoin from nothing. Held for one liveness window —
-/// the span [`ember_maint_ping_budget`] is sized to probe the whole table in —
-/// so every contact is asked first, and whatever still has not answered when
-/// the hold lifts is purged as before.
+/// out, leaving the node to rejoin from nothing. Held for as long as the pings
+/// need to reach the whole table — see [`ember_suspend_hold_secs`] — so every
+/// contact is asked first, and whatever still has not answered when the hold
+/// lifts is purged as before.
 ///
 /// Skipping the purge was preferred to demoting the stale contacts to leads.
 /// Demotion throws away the verified state the table leans on — the
@@ -953,10 +994,15 @@ pub(super) const EMBER_MAINT_GAP_SECS: i64 = EMBER_CONTACT_PING_SECS;
 /// risks only keeping dead contacts one window longer, the same exposure the
 /// three-strike eviction already accepts.
 ///
-/// Capped at one window past `now`, so a backwards clock step cannot hold the
+/// Capped at one hold past `now`, so a backwards clock step cannot hold the
 /// purge off for however far the clock moved.
-pub(super) fn ember_stale_purge_hold(last_run: Option<i64>, held_until: i64, now: i64) -> i64 {
-    let window_end = now.saturating_add(EMBER_CONTACT_PING_SECS);
+pub(super) fn ember_stale_purge_hold(
+    last_run: Option<i64>,
+    held_until: i64,
+    now: i64,
+    verified: usize,
+) -> i64 {
+    let window_end = now.saturating_add(ember_suspend_hold_secs(verified));
     let held_until = match last_run {
         Some(prev) if now.saturating_sub(prev) > EMBER_MAINT_GAP_SECS => window_end,
         _ => held_until,
@@ -1290,6 +1336,7 @@ pub(super) async fn run_ember_maintenance(
         state.ember_maint_last_run,
         state.ember_stale_purge_held_until,
         now_secs,
+        state.ember_dht.routing().verified_len(),
     );
     state.ember_maint_last_run = Some(now_secs);
     let stale_after = if now_secs < state.ember_stale_purge_held_until {
@@ -1329,10 +1376,16 @@ pub(super) async fn run_ember_maintenance(
     //      `SearchManager::nodes_in_use`: a search pins its own copies of these
     //      contacts onto its shortlist when it starts, so a walk in flight
     //      cannot lose a branch to this sweep the way it could to the table's.
+    //
+    //      Held with the table's purge after a suspend, for the same reason:
+    //      the silence is the node's, not theirs. Step 2b asks each of them
+    //      while the hold lasts.
     let session_extras_before = state.ember_session_dht_contacts.len();
-    state
-        .ember_session_dht_contacts
-        .retain(|_, c| ember_session_contact_is_live(c, now_secs));
+    if now_secs >= state.ember_stale_purge_held_until {
+        state
+            .ember_session_dht_contacts
+            .retain(|_, c| ember_session_contact_is_live(c, now_secs));
+    }
     let session_extras_purged = session_extras_before - state.ember_session_dht_contacts.len();
     if session_extras_purged > 0 {
         debug!(
@@ -1676,6 +1729,56 @@ pub(super) async fn run_ember_maintenance(
             // single time.
             fault_ember_contact(state, &contact.node_id, "unreachable");
         }
+    }
+
+    // 2b) The session contacts beside the table, while the staleness purge is
+    //     held. No liveness ping reaches them otherwise, and any signed frame
+    //     they send renews their entry, so without an ask each one that went
+    //     quiet only because we were asleep would be purged when the hold
+    //     lifts. Once per hold: there are at most
+    //     `MAX_EMBER_SESSION_DHT_CONTACTS`, and an answer is all it takes.
+    if now < state.ember_stale_purge_held_until {
+        let quiet = ember_session_contacts_to_ask_during_hold(
+            &state.ember_session_dht_contacts,
+            &state.ember_session_hold_pinged,
+            now,
+        );
+        for contact in quiet {
+            let std::net::IpAddr::V4(ip) = contact.addr.ip() else {
+                continue;
+            };
+            state
+                .ember_session_hold_pinged
+                .insert((ip, contact.addr.port()));
+            let (_, frame) = state.ember_dht.build_ping();
+            match state.ember_transport.prepare_outgoing(
+                contact.addr,
+                Some(&contact.noise_pub),
+                &frame,
+            ) {
+                ember::transport::OutgoingResult::Ready { packet }
+                | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                    if let Err(e) =
+                        send_ember_udp(socket, &packet, contact.addr, &state.ember_dht_overhead)
+                            .await
+                    {
+                        debug!(
+                            "Ember DHT maintenance: session ping to {} failed: {e}",
+                            contact.addr
+                        );
+                    }
+                }
+                ember::transport::OutgoingResult::Queued => {}
+                ember::transport::OutgoingResult::Error(e) => {
+                    debug!(
+                        "Ember DHT maintenance: transport error pinging session contact {}: {e}",
+                        contact.addr
+                    );
+                }
+            }
+        }
+    } else {
+        state.ember_session_hold_pinged.clear();
     }
 
     // 3) Republish — re-store records we hold to the current closest nodes

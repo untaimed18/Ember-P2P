@@ -909,6 +909,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_empty_rearmed_at: 0,
         ember_maint_last_run: None,
         ember_stale_purge_held_until: 0,
+        ember_session_hold_pinged: HashSet::new(),
         ember_publish_targets: HashMap::new(),
         ember_publish_target_queue: std::collections::VecDeque::new(),
         ember_publish_target_lookups: HashMap::new(),
