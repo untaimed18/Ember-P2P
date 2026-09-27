@@ -241,7 +241,8 @@ pub enum NetworkCommand {
     RenameDownload {
         transfer_id: String,
         file_name: String,
-        tx: oneshot::Sender<()>,
+        /// False when completion had already read the name.
+        tx: oneshot::Sender<bool>,
     },
     /// Snapshot of every persistent SecIdent credit record. Backs the
     /// "Known Clients" tab — this is the lifetime view from clients.met,

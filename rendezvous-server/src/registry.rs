@@ -575,7 +575,7 @@ impl ChannelRegistry {
 
     #[cfg(test)]
     pub fn flush_blocking(&self) -> bool {
-        self.take_persist_job().map_or(true, PersistJob::write)
+        self.take_persist_job().is_none_or(PersistJob::write)
     }
 
     pub fn claim_username(&mut self, pubkey_hex: &str, name: &str) -> Result<(), RegistryError> {
@@ -2990,8 +2990,8 @@ mod tests {
         let lapsed = room_id(2);
         assert!(reg.claim_channel_name_at(&lapsed, &user_key(2), "Attic", false, t0).is_ok());
         assert!(reg.reap_stale(t0 + NAME_RELEASE_SECS + 1));
-        assert!(reg.by_channel.get(&lapsed).is_none());
-        assert!(reg.by_skeleton.get(&confusable_key("attic")).is_none());
+        assert!(!reg.by_channel.contains_key(&lapsed));
+        assert!(!reg.by_skeleton.contains_key(&confusable_key("attic")));
         assert!(
             reg.by_skeleton.contains_key(&confusable_key("lobby")),
             "a tombstoned name keeps its skeleton"
@@ -3177,8 +3177,8 @@ mod tests {
         }
         let listed = reg.public_directory_at(flood_at);
         assert_eq!(listed.len(), MAX_DIRECTORY_LISTINGS, "the directory is capped");
-        for i in 0..10 {
-            assert_eq!(listed[i].channel_id, room_id(i), "established rooms rank first");
+        for (i, listing) in listed.iter().enumerate().take(10) {
+            assert_eq!(listing.channel_id, room_id(i), "established rooms rank first");
         }
         let (walked, pages) = walk_directory(&reg, DIRECTORY_PAGE_SIZE, flood_at);
         assert_eq!(walked.len(), MAX_DIRECTORY_LISTINGS);

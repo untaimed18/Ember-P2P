@@ -73,6 +73,8 @@
         return m.chat_attach_failed();
       case 'expired':
         return sent ? m.chat_attach_expired_sent({ name }) : m.chat_attach_expired_received();
+      default:
+        return m.chat_attach_failed();
     }
   });
 

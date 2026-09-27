@@ -15,7 +15,7 @@ import {
 } from '$lib/api/friends';
 import { toast, toastError, toastSuccess } from '$lib/stores/toast';
 import { notify, shouldNotify } from '$lib/notifications';
-import { chatWindowShows } from '$lib/windowRole';
+import { chatWindowShows, isChatWindow } from '$lib/windowRole';
 import * as m from '$lib/paraglide/messages';
 
 export const onlineFriends = writable<Set<string>>(new Set());
@@ -448,6 +448,13 @@ export async function initFriendsStore() {
       }),
     );
     registered.push(
+      await listen<{ user_hash: string; file_hash: string }>(FILE_OFFER_CLEARED_EVENT, (event) => {
+        const user_hash = validFriendHash(event.payload?.user_hash);
+        const file_hash = validFriendHash(event.payload?.file_hash);
+        if (user_hash && file_hash) dropFileOffer(user_hash, file_hash);
+      }),
+    );
+    registered.push(
       await listen<IncomingFileOffer>('ember:file-offer', (event) => {
         const user_hash = validFriendHash(event.payload?.user_hash);
         const file_hash = validFriendHash(event.payload?.file_hash);
@@ -604,7 +611,8 @@ export async function initFriendsStore() {
         void import('$lib/stores/chatTabs')
           .then(({ removeChatForFriend }) => removeChatForFriend(hash))
           .catch((e) => console.warn('friends: could not close the declined chat tab', e));
-        toast(m.friends_request_declined({ name }));
+        // Both windows hear the event; the main one says it, once.
+        if (!isChatWindow()) toast(m.friends_request_declined({ name }));
       }),
     );
     registered.push(
@@ -630,7 +638,7 @@ export async function initFriendsStore() {
         const nickname = safeEventText(event.payload?.nickname, 128);
         rememberFriendName(hash, nickname);
         const name = friendLabel(hash, nickname, get(friendNames));
-        toastSuccess(m.friends_auto_confirmed({ name }));
+        if (!isChatWindow()) toastSuccess(m.friends_auto_confirmed({ name }));
         scheduleFriendsListRefresh();
       }),
     );
@@ -873,11 +881,28 @@ export async function acceptIncomingFileOffer(offer: IncomingFileOffer) {
   return res;
 }
 
-/** Drop an offer once the user has accepted or dismissed it. */
+/** Frontend-only: a window accepted or dismissed a file offer. Both windows
+ *  collect offers from the same event, so the other one has to be told. */
+const FILE_OFFER_CLEARED_EVENT = 'ember-ui:file-offer-cleared';
+
+function dropFileOffer(userHash: string, fileHash: string) {
+  const user = userHash.toLowerCase();
+  const file = fileHash.toLowerCase();
+  fileOffers.update((offers) => {
+    const next = offers.filter(
+      (o) => !(o.user_hash.toLowerCase() === user && o.file_hash.toLowerCase() === file),
+    );
+    return next.length === offers.length ? offers : next;
+  });
+}
+
+/** Drop an offer once the user has accepted or dismissed it, in every window. */
 export function clearFileOffer(userHash: string, fileHash: string) {
-  fileOffers.update((offers) =>
-    offers.filter((o) => !(o.user_hash === userHash && o.file_hash === fileHash)),
-  );
+  dropFileOffer(userHash, fileHash);
+  void emit(FILE_OFFER_CLEARED_EVENT, {
+    user_hash: userHash.toLowerCase(),
+    file_hash: fileHash.toLowerCase(),
+  }).catch(() => {});
 }
 
 /** Drop every pending offer from an identity that was removed or blocked. */

@@ -90,7 +90,16 @@ pub struct TransferControl {
     /// Display name applied by Rename while a download is running. Completion
     /// and the `.part.met` sidecar both read this so a rename sticks even on
     /// the callback path, whose tracker is not in the shared registry.
-    pending_rename: std::sync::Mutex<Option<String>>,
+    pending_rename: std::sync::Mutex<PendingRename>,
+}
+
+/// A rename waiting for completion, and whether completion has already read
+/// the name it moves the file under. One lock for both, so a rename either
+/// lands before that read or is refused — never accepted after it.
+#[derive(Default)]
+struct PendingRename {
+    name: Option<String>,
+    sealed: bool,
 }
 
 impl std::fmt::Debug for TransferControl {
@@ -113,7 +122,7 @@ impl TransferControl {
             preview_priority: AtomicBool::new(false),
             preview_ready: AtomicBool::new(false),
             download_priority: AtomicU8::new(2),
-            pending_rename: std::sync::Mutex::new(None),
+            pending_rename: std::sync::Mutex::new(PendingRename::default()),
         })
     }
 
@@ -268,18 +277,32 @@ impl TransferControl {
         self.download_priority.load(Ordering::Acquire)
     }
 
-    pub fn set_pending_rename(&self, name: &str) {
-        *self
-            .pending_rename
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(name.to_string());
+    /// False once completion has read the name: the file is about to be (or
+    /// has been) moved under it, so a rename now would only relabel the row.
+    #[must_use]
+    pub fn set_pending_rename(&self, name: &str) -> bool {
+        let mut slot = self.pending_rename.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.sealed {
+            return false;
+        }
+        slot.name = Some(name.to_string());
+        true
     }
 
     pub fn pending_rename(&self) -> Option<String> {
         self.pending_rename
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .name
             .clone()
+    }
+
+    /// The rename completion must apply, read for the last time: later
+    /// renames are refused by [`Self::set_pending_rename`].
+    pub fn seal_pending_rename(&self) -> Option<String> {
+        let mut slot = self.pending_rename.lock().unwrap_or_else(|e| e.into_inner());
+        slot.sealed = true;
+        slot.name.clone()
     }
 }
 
@@ -2310,6 +2333,23 @@ impl TransferManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rename lands before completion reads the name or is refused — never
+    /// accepted after it, where it would relabel a row whose file on disk
+    /// already carries the old name.
+    #[test]
+    fn a_rename_after_completion_read_the_name_is_refused() {
+        let control = TransferControl::new();
+        assert!(control.set_pending_rename("first.mkv"));
+        assert!(control.set_pending_rename("second.mkv"));
+        assert_eq!(control.seal_pending_rename().as_deref(), Some("second.mkv"));
+        assert!(!control.set_pending_rename("too-late.mkv"));
+        assert_eq!(control.pending_rename().as_deref(), Some("second.mkv"));
+
+        let untouched = TransferControl::new();
+        assert_eq!(untouched.seal_pending_rename(), None);
+        assert!(!untouched.set_pending_rename("late.mkv"));
+    }
 
     /// Same contract as the failure codes: the frontend keys a table on these
     /// exact strings, so a duplicate or a stray character costs a translation.

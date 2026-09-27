@@ -87,6 +87,9 @@ this check, since room members are not friends; their grant check stays as is.
 
 ### 8. Shorter re-fetch window after delivery (info)
 
+Progress events already never revive a finished row (`emit_progress` reads the
+stored status first); this is only about how long the grant stays servable.
+
 A delivered attachment stays fetchable until its 24 h grant expires, so a failed
 save can retry. Consider shortening the window once the sender has seen delivery
 confirmed.
@@ -96,6 +99,49 @@ confirmed.
 The event loop re-checks friendship for offers but not for replies and cancels.
 Those are already limited to authenticated friend sessions and matched against
 the attachment's friend, so this is for symmetry only.
+
+## Sharing and library
+
+### Prune deletes on paged reloads of very large shares
+
+A share root over 100,000 files is walked in pages (`MAX_DISCOVERED_FILES` in
+`sharing/indexer.rs`); every page after the first is `partial`, so a full reload
+never reconciles deletions for such a root. File-system events cover the usual
+case, but a file deleted while hashing is paused (events deferred, then a paged
+full reload) stays in the index and offerable until "Remove missing". Fix: track
+the paths seen across one complete cursor cycle and reconcile once the last page
+lands.
+
+### "Share without subfolders" still walks the whole tree
+
+The allowlist keeps nested files off the wire (`shared = false`), but discovery
+is still recursive, so they are hashed and indexed locally. Walk only the
+allowlisted entries (depth 1 for a files-only allowlist).
+
+### eMule import: offer eMule's one-folder sharing
+
+Ember shares a folder with its subfolders; eMule shares exactly the folders
+listed. The import says so per folder ("{count} folders eMule did not share will
+be shared") and each folder can be unticked, but there is no way to import a
+folder the eMule way. Offer "without subfolders" per imported folder, reusing the
+allowlist.
+
+## App-wide
+
+### Localize native dialog titles
+
+Every native picker (`set_title(...)` in `commands/chat_attachments.rs`,
+`channels.rs`, `sharing.rs`, `settings.rs`, `emule_import.rs`) has an English
+title. Pass a translated title from the renderer.
+
+### Chat pop-out polish
+
+- Relaunching with the chat popped out remembers the mode but does not reopen
+  the chat window until a conversation is opened. Decide whether it should
+  reopen at launch.
+- For up to a second after the pop-out opens, before its first presence report,
+  a message can still notify and count as unread although the user is reading
+  it there. Treat an open chat window as focused until it reports.
 
 ## Friend Browse
 

@@ -478,6 +478,7 @@ pub fn run() {
             // re-launched the app to bring it to the front).
             let payloads = commands::deeplink::extract_deep_link_payloads(&args);
             if payloads.is_empty() {
+                commands::chat_window::set_chat_window_visible(app, true);
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.unminimize();
                     let _ = window.show();
@@ -1025,6 +1026,7 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "tray_show" => {
+                        commands::chat_window::set_chat_window_visible(app, true);
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.unminimize();
                             let _ = window.show();
@@ -1053,6 +1055,7 @@ pub fn run() {
                     } = event
                     {
                         let app = tray.app_handle();
+                        commands::chat_window::set_chat_window_visible(app, true);
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.unminimize();
                             let _ = window.show();
@@ -2355,6 +2358,7 @@ pub fn run() {
                 }
                 "tray" => {
                     api.prevent_close();
+                    commands::chat_window::set_chat_window_visible(app_handle, false);
                     if let Err(e) = window.hide() {
                         tracing::warn!("Failed to hide window for close-to-tray: {e}");
                     }

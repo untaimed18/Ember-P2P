@@ -159,7 +159,13 @@ pub(in crate::network) async fn on_cleanup_tick(
         let db_attachments = db.clone();
         let now = chrono::Utc::now().timestamp();
         match tokio::task::spawn_blocking(move || db_attachments.expire_chat_attachments(now)).await {
-            Ok(Ok(_)) => {}
+            // An open conversation shows these from its last update, which
+            // would otherwise still read "waiting".
+            Ok(Ok(expired)) => {
+                for xfer_hex in expired {
+                    crate::network::chat_attach::emit_expired(app_handle, db, &xfer_hex);
+                }
+            }
             Ok(Err(e)) => debug!("Chat attachment expiry sweep failed: {e}"),
             Err(e) => debug!("Chat attachment expiry sweep panicked: {e}"),
         }

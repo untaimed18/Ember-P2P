@@ -147,6 +147,15 @@ pub fn request_redock(window: &tauri::Window) {
     });
 }
 
+/// Hide the chat window with the main one when Ember goes to the tray, and
+/// bring it back with it. Left on screen alone it would be Ember with no way
+/// back to the rest of it.
+pub fn set_chat_window_visible(app: &tauri::AppHandle, visible: bool) {
+    if let Some(chat) = app.get_webview_window(CHAT_WINDOW_LABEL) {
+        let _ = if visible { chat.show() } else { chat.hide() };
+    }
+}
+
 /// Close the chat window, once the chat is docked back. Destroys rather than
 /// closes: a close would come back through the X's redock handling.
 #[tauri::command]

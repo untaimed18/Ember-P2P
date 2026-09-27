@@ -226,7 +226,7 @@ export async function stopTransfersBatch(transferIds: string[]): Promise<void> {
 }
 
 export async function cancelTransfersBatch(transferIds: string[]): Promise<void> {
-  return invoke('cancel_transfers_batch', { transferIds });
+  return invokeChunked('cancel_transfers_batch', transferIds);
 }
 
 export async function resumeAllTransfers(): Promise<void> {

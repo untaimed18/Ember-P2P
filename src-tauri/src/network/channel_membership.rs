@@ -2164,13 +2164,17 @@ pub(super) fn ingest_channel_moderation_records(
     // the registry and every member moved on.
     if applied {
         if let Some(name) = moderation.tail.room_name.as_deref().filter(|_| !ch.is_owner) {
-            let _ = db.apply_owner_room_name(&channel_id_hex, name);
+            if let Err(e) = db.apply_owner_room_name(&channel_id_hex, name) {
+                tracing::warn!("Channel {channel_id_hex}: could not apply the owner's room name: {e}");
+            }
         }
-        let _ = db.apply_owner_room_policy(
+        if let Err(e) = db.apply_owner_room_policy(
             &channel_id_hex,
             moderation.tail.announce_only == Some(true),
             &moderation.tail.pinned_msg_ids,
-        );
+        ) {
+            tracing::warn!("Channel {channel_id_hex}: could not apply the owner's pins and posting rule: {e}");
+        }
     }
     applied
 }

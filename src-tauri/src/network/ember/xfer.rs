@@ -478,6 +478,16 @@ impl RecvState {
         }
     }
 
+    /// A stream is still running. It reports progress only per 256 KiB chunk,
+    /// which on a slow or capped link can take longer than the stall window;
+    /// the stream enforces its own silence timeouts, so while its task lives
+    /// the transfer is not stalled.
+    pub fn note_stream_alive(&mut self) {
+        if self.streaming {
+            self.updated_at = Instant::now();
+        }
+    }
+
     /// Take over what a stream verified before it stopped, so the block
     /// protocol asks only for the rest. `verified` is a prefix of the file;
     /// a block counts only if it lies wholly inside it.

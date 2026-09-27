@@ -2091,6 +2091,7 @@ pub async fn download_ipfilter(
 
 #[tauri::command]
 pub fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
+    crate::commands::chat_window::set_chat_window_visible(&app, false);
     if let Some(window) = app.get_webview_window("main") {
         window.hide().map_err(|e| {
             coded_ctx(
@@ -2105,6 +2106,7 @@ pub fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    crate::commands::chat_window::set_chat_window_visible(&app, true);
     if let Some(window) = app.get_webview_window("main") {
         // Unminimize first — `show()` doesn't restore from minimized on
         // Windows, only from the hidden state. Without this the tray-icon

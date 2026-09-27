@@ -682,13 +682,24 @@ pub async fn sweep_orphan_part_files(
         } else {
             continue;
         };
-        if uuid::Uuid::parse_str(uuid_str).is_err() {
-            // Not an Ember-managed file; leave it alone.
-            continue;
-        }
-        if known_ids.contains(uuid_str) || owns_partial.contains(uuid_str) {
-            skipped_known += 1;
-            continue;
+        // A room transfer lives only in memory, so at startup every one of its
+        // part files belongs to a transfer that ended with the last run —
+        // except those `known_ids` names, accepted since this run began.
+        let room_xfer = !is_met && name.starts_with("ember-xfer-");
+        if room_xfer {
+            if known_ids.contains(uuid_str) {
+                skipped_known += 1;
+                continue;
+            }
+        } else {
+            if uuid::Uuid::parse_str(uuid_str).is_err() {
+                // Not an Ember-managed file; leave it alone.
+                continue;
+            }
+            if known_ids.contains(uuid_str) || owns_partial.contains(uuid_str) {
+                skipped_known += 1;
+                continue;
+            }
         }
         let allowed = vec![download_folder.to_string()];
         let deletion = tokio::task::spawn_blocking({
@@ -2092,7 +2103,11 @@ pub async fn rename_transfer(
         file_name: sanitized.clone(),
         tx,
     }) {
-        Ok(()) => await_reply(rx, "transfers_rename_failed", "Failed to rename download").await,
+        Ok(()) => match await_reply(rx, "transfers_rename_failed", "Failed to rename download").await {
+            // Completion read the name after the status check above.
+            Ok(false) => Err(coded("transfers_cannot_rename", "This download cannot be renamed")),
+            other => other.map(|_| ()),
+        },
         Err(e) => Err(coded_ctx("network_busy", "Network busy", e)),
     };
     if let Err(error) = handed_over {

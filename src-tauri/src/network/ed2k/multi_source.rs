@@ -1004,8 +1004,16 @@ fn try_admit_outbound_dial() -> Option<std::time::Duration> {
 /// after [`MAX_LISTENER_FLOOR_WAIT`] they reach into the listener's reserve as
 /// well. eMule never holds a socket while its window is full: the download
 /// simply does not connect that tick (`TooManySockets`).
-async fn acquire_dial_slot(priority_ord: u8) -> Option<GlobalConnPermit> {
+///
+/// Gives up without a slot once the download is cancelled or paused: a busy
+/// window can stay full for a long time, and the caller checks the control
+/// straight after.
+async fn acquire_dial_slot(control: &TransferControl) -> Option<GlobalConnPermit> {
     loop {
+        if control.is_cancelled() || control.is_paused() {
+            return None;
+        }
+        let priority_ord = control.download_priority_ordinal();
         if let Some(wait) = outbound_dial_window_wait() {
             tokio::time::sleep(wait.max(std::time::Duration::from_millis(1))).await;
             continue;
@@ -2127,9 +2135,13 @@ impl MultiSourceDownload {
                     transfer_id: self.transfer_id.clone(),
                 })
                 .await;
+            let zero_name = self
+                .control
+                .seal_pending_rename()
+                .unwrap_or_else(|| self.file_name.clone());
             let zero_final = super::transfer::finalize_zero_ed2k_file(
                 &self.transfer_id,
-                &self.file_name,
+                &zero_name,
                 self.file_hash,
                 &self.download_dir,
             )
@@ -2273,13 +2285,11 @@ impl MultiSourceDownload {
         // correct on resume (when the first part is already verified on disk)
         // before any new block arrives. The progress aggregator keeps it fresh
         // as parts verify during the download.
-        self.control.set_preview_ready(
-            self.expected_aich_master.is_none()
-                && tracker
-                    .read()
-                    .await
-                    .is_preview_ready(&self.file_name, self.file_size),
-        );
+        self.control.set_preview_ready(self.expected_aich_master.is_none() && {
+            let t = tracker.read().await;
+            let name = super::transfer::completed_download_name(t.file_name(), &self.file_name);
+            t.is_preview_ready(&name, self.file_size)
+        });
 
         // Shared rarest-first chunk selector for dynamic part assignment
         let part_count = {
@@ -2564,9 +2574,13 @@ impl MultiSourceDownload {
                                 // Refresh preview-readiness while we hold the
                                 // lock: cheap, and this is the cadence at which
                                 // the first part finishes + verifies mid-download.
+                                // By the tracker's name, which a rename updates.
+                                let name = super::transfer::completed_download_name(
+                                    t.file_name(),
+                                    &agg_file_name,
+                                );
                                 agg_control.set_preview_ready(
-                                    !agg_requires_final_aich
-                                        && t.is_preview_ready(&agg_file_name, file_size),
+                                    !agg_requires_final_aich && t.is_preview_ready(&name, file_size),
                                 );
                                 (t.progress_bytes().min(file_size), t.transferred())
                             };
@@ -2617,8 +2631,9 @@ impl MultiSourceDownload {
             // last source closes.
             let (capped, wire_total) = {
                 let t = agg_tracker.read().await;
+                let name = super::transfer::completed_download_name(t.file_name(), &agg_file_name);
                 agg_control.set_preview_ready(
-                    !agg_requires_final_aich && t.is_preview_ready(&agg_file_name, file_size),
+                    !agg_requires_final_aich && t.is_preview_ready(&name, file_size),
                 );
                 (t.progress_bytes().min(file_size), t.transferred())
             };
@@ -4874,7 +4889,7 @@ impl MultiSourceDownload {
                 let safe_name = {
                     let mut t = tracker.write().await;
                     t.mark_file_hash_verified();
-                    super::transfer::apply_control_rename(&self.control, &mut t);
+                    super::transfer::seal_control_rename(&self.control, &mut t);
                     super::transfer::completed_download_name(t.file_name(), &self.file_name)
                 };
                 let final_path = self.download_dir.join("Downloads").join(&safe_name);
@@ -5430,7 +5445,8 @@ async fn download_parts_from_source(
         // a machine-wide slot (eMule's `maxconnections`) once the "New
         // Connections / 5s" window has room, then spacing so a burst of source
         // starts can't storm the network.
-        _global_conn_permit = acquire_dial_slot(control.download_priority_ordinal()).await;
+        _global_conn_permit = acquire_dial_slot(&control).await;
+        check_control(&control).await?;
         space_outbound_dial().await;
 
         // Build the Hello payload once; it's identical across attempts.

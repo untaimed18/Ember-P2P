@@ -739,16 +739,19 @@ async fn sync_xfer_streams(
     }
 
     // Receiver: progress.
-    let running: Vec<([u8; 16], u64)> = state
+    let running: Vec<([u8; 16], u64, bool)> = state
         .xfer_streams
         .iter()
-        .map(|(id, f)| (*id, f.verified.load(Ordering::Relaxed)))
+        .map(|(id, f)| (*id, f.verified.load(Ordering::Relaxed), !f.handle.is_finished()))
         .collect();
-    for (xfer_id, verified) in running {
+    for (xfer_id, verified, alive) in running {
         let Some(recv) = state.xfer_recv.get_mut(&xfer_id) else {
             continue;
         };
         recv.note_streamed(verified);
+        if alive {
+            recv.note_stream_alive();
+        }
         if recv.progress_step().is_some() && verified < recv.size {
             let (channel_id, peer, name, size) =
                 (recv.channel_id, recv.peer, recv.name.clone(), recv.size);
@@ -873,6 +876,15 @@ pub(super) fn drop_channel_transfers_for(
         }
         true
     });
+    for (xfer_id, finishing) in &state.xfer_finishing {
+        if matches(&finishing.channel_id, &finishing.peer)
+            && !finishing
+                .abandoned
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            ended.push((*xfer_id, finishing.peer, finishing.name.clone(), finishing.size, "receive"));
+        }
+    }
     for (xfer_id, peer, name, size, direction) in ended {
         emit_xfer_update(
             app_handle,
@@ -1411,9 +1423,22 @@ pub(super) fn finish_xfer_recv(state: &mut NetworkState, xfer_id: [u8; 16]) {
     let Some(mut recv) = state.xfer_recv.remove(&xfer_id) else {
         return;
     };
+    let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state.xfer_finishing.insert(
+        xfer_id,
+        XferFinishing {
+            channel_id: recv.channel_id,
+            peer: recv.peer,
+            key: recv.key,
+            name: recv.name.clone(),
+            size: recv.size,
+            abandoned: abandoned.clone(),
+        },
+    );
     let tx = state.xfer_finish_tx.clone();
     state.xfer_finish_in_flight += 1;
     tokio::task::spawn_blocking(move || {
+        let mut final_path = None;
         let outcome = (|| -> std::io::Result<bool> {
             recv.finish()?;
             if recv.stream_verified {
@@ -1439,14 +1464,18 @@ pub(super) fn finish_xfer_recv(state: &mut NetworkState, xfer_id: [u8; 16]) {
             // also chose. `move_part_to_final_approved` re-pins the root, and
             // the recorded identity refuses a `.part` swapped underneath the
             // transfer.
+            if abandoned.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(std::io::Error::other("cancelled while it was being verified"));
+            }
             let target = unique_download_path(&recv.final_path);
-            ed2k::transfer::move_part_to_final_approved(
+            let landed = ed2k::transfer::move_part_to_final_approved(
                 &recv.part_path,
                 &target,
                 &recv.download_root,
                 &recv.part_identity,
             )
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+            final_path = Some(landed);
             Ok(true)
         })();
         let status = match outcome {
@@ -1474,8 +1503,40 @@ pub(super) fn finish_xfer_recv(state: &mut NetworkState, xfer_id: [u8; 16]) {
             name: recv.name,
             size: recv.size,
             status,
+            final_path,
         });
     });
+}
+
+/// A receive handed to [`finish_xfer_recv`], until its verdict is applied.
+pub(super) struct XferFinishing {
+    pub(super) channel_id: [u8; 16],
+    pub(super) peer: [u8; 32],
+    pub(super) key: [u8; 32],
+    pub(super) name: String,
+    pub(super) size: u64,
+    /// Set by a cancel, a leave or a ban that caught the transfer here. The
+    /// finish then keeps nothing, and the verdict is not announced again.
+    pub(super) abandoned: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Mark a finishing receive abandoned. Whoever calls this reports the end to
+/// the UI and the sender; [`apply_xfer_finish`] only cleans up after it.
+pub(super) fn abandon_xfer_finishing(
+    state: &NetworkState,
+    xfer_id: &[u8; 16],
+) -> Option<([u8; 16], [u8; 32], [u8; 32], String, u64)> {
+    let finishing = state.xfer_finishing.get(xfer_id)?;
+    if finishing.abandoned.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return None;
+    }
+    Some((
+        finishing.channel_id,
+        finishing.peer,
+        finishing.key,
+        finishing.name.clone(),
+        finishing.size,
+    ))
 }
 
 /// Tell the sender how a transfer ended and update the UI.
@@ -1491,6 +1552,18 @@ pub(super) async fn apply_xfer_finish(
     result: XferFinishResult,
 ) {
     state.xfer_finish_in_flight = state.xfer_finish_in_flight.saturating_sub(1);
+    let abandoned = state
+        .xfer_finishing
+        .remove(&result.xfer_id)
+        .is_some_and(|f| f.abandoned.load(std::sync::atomic::Ordering::Acquire));
+    if abandoned {
+        // Already reported as ended, to the UI and to the sender. A move that
+        // won the race still has to be taken back out.
+        if let Some(path) = result.final_path {
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
+        }
+        return;
+    }
     let complete = result.status == "complete";
     // Tell the sender how it ended either way. It has no other way to find
     // out: it answers requests and then hears nothing, so without this its

@@ -1066,6 +1066,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         xfer_recv: HashMap::new(),
         xfer_finish_tx,
         xfer_finish_in_flight: 0,
+        xfer_finishing: HashMap::new(),
         channel_member_touches: HashMap::new(),
         xfer_pending: HashMap::new(),
         xfer_grants: Default::default(),
@@ -2413,10 +2414,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         {
             pending_startup_cleanup = false;
             {
-                let known_ids: std::collections::HashSet<String> = {
+                let mut known_ids: std::collections::HashSet<String> = {
                     let mgr = transfer_manager.read().await;
                     mgr.get_all().into_iter().map(|t| t.id).collect()
                 };
+                // Room receives accepted since startup own their part files.
+                known_ids.extend(
+                    state
+                        .xfer_recv
+                        .keys()
+                        .chain(state.xfer_finishing.keys())
+                        .map(|id| format!("ember-xfer-{}", hex::encode(id))),
+                );
                 crate::commands::transfers::sweep_orphan_part_files(
                     &settings.download_folder,
                     &known_ids,

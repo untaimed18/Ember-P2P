@@ -3524,6 +3524,12 @@ async fn handle_command_inner(
                     send.size,
                     "send",
                 ));
+            } else if let Some((channel_id, peer, key, name, size)) =
+                abandon_xfer_finishing(state, &xfer_id)
+            {
+                // Every byte is in and it is being verified. The finish sees
+                // the mark before it moves the file, or takes it back out.
+                target = Some((channel_id, peer, key, name, size, "receive"));
             }
             let Some((channel_id, peer, key, name, size, direction)) = target else {
                 let _ = tx.send(Err(coded(
@@ -3642,14 +3648,19 @@ async fn handle_command_inner(
             file_name,
             tx,
         } => {
+            // The control first: it refuses once completion has read the name,
+            // and a refused rename must change nothing else.
+            let accepted = {
+                let mgr = transfer_manager.read().await;
+                mgr.get_control(&transfer_id)
+                    .is_none_or(|control| control.set_pending_rename(&file_name))
+            };
+            if !accepted {
+                let _ = tx.send(false);
+                return;
+            }
             if let Some(pd) = state.pending_downloads.get_mut(&transfer_id) {
                 pd.file_name = file_name.clone();
-            }
-            {
-                let mgr = transfer_manager.read().await;
-                if let Some(control) = mgr.get_control(&transfer_id) {
-                    control.set_pending_rename(&file_name);
-                }
             }
             let tracker = state.tracker_registry.lock().get(&transfer_id).cloned();
             if let Some(tracker) = tracker {
@@ -3663,7 +3674,7 @@ async fn handle_command_inner(
                     ed2k::part_tracker::save_snapshot_async(snap).await;
                 });
             }
-            let _ = tx.send(());
+            let _ = tx.send(true);
         }
         NetworkCommand::GetUploadQueueSnapshot { tx } => {
             let snap = upload_queue_snapshot(

@@ -431,6 +431,10 @@ export function retainChatTabs(friendHashes: Iterable<string>) {
     activeChatTab.set(next[0]?.hash ?? null);
     if (next.length === 0) chatDockOpen.set(false);
   }
+  // The chat window holds its own copy of the list; tell it, as closeTab does.
+  for (const gone of tabs) {
+    if (!next.includes(gone)) popout?.forward({ kind: 'close', hash: gone.hash.toLowerCase() });
+  }
 }
 
 /**

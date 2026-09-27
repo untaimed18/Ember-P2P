@@ -3075,15 +3075,20 @@ impl Database {
     ///
     /// Settled rows older than [`CHAT_ATTACHMENT_RETENTION_SECS`] are deleted
     /// on the same pass; nothing else ever removes a row.
-    pub fn expire_chat_attachments(&self, now: i64) -> anyhow::Result<usize> {
+    /// Settle rows whose time ran out, returning the ids that moved so a caller
+    /// can tell an open conversation.
+    pub fn expire_chat_attachments(&self, now: i64) -> anyhow::Result<Vec<String>> {
         let conn = self.conn.lock();
-        let moved = conn.execute(
-            "UPDATE chat_attachments SET status = 'expired'
-             WHERE expires_at <= ?1
-               AND ((direction = 'sent' AND status IN ('offered', 'accepted', 'active'))
-                 OR (direction = 'received' AND status = 'awaiting'))",
-            rusqlite::params![now],
-        )?;
+        let moved: Vec<String> = conn
+            .prepare(
+                "UPDATE chat_attachments SET status = 'expired'
+                 WHERE expires_at <= ?1
+                   AND ((direction = 'sent' AND status IN ('offered', 'accepted', 'active'))
+                     OR (direction = 'received' AND status = 'awaiting'))
+                 RETURNING xfer_id",
+            )?
+            .query_map(rusqlite::params![now], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
         Self::prune_settled_chat_attachments_locked(&conn, now)?;
         Ok(moved)
     }
@@ -12450,7 +12455,7 @@ mod tests {
 
         // Only the two that were still in flight move; a finished transfer is
         // not "expired" and is left saying what it did.
-        assert_eq!(db.expire_chat_attachments(now + 61).expect("sweep"), 2);
+        assert_eq!(db.expire_chat_attachments(now + 61).expect("sweep").len(), 2);
         assert_eq!(
             db.chat_attachment(&"00".repeat(8)).expect("row").status,
             "expired"
@@ -12507,7 +12512,7 @@ mod tests {
             .expect("insert");
         }
 
-        assert_eq!(db.expire_chat_attachments(now + 61).expect("sweep"), 1);
+        assert_eq!(db.expire_chat_attachments(now + 61).expect("sweep").len(), 1);
         assert_eq!(db.chat_attachment(&"aa".repeat(16)).expect("row").status, "active");
         assert_eq!(db.chat_attachment(&"bb".repeat(16)).expect("row").status, "expired");
         drop_attach_test_db(db, path);

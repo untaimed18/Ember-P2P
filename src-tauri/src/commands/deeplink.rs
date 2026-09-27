@@ -353,6 +353,7 @@ pub fn dispatch_deep_links(app: &AppHandle, payloads: Vec<String>) {
         return;
     }
 
+    crate::commands::chat_window::set_chat_window_visible(app, true);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();

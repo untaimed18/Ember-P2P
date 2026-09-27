@@ -593,6 +593,8 @@
    */
   function canEdit(msg: ConvMessage): boolean {
     if (!isChannel || msg.direction !== 'sent' || msg.id <= 0) return false;
+    // What the backend refuses an edit for, as it refuses a send.
+    if (youAreBanned || youAreKeyBehind || chatLocked) return false;
     if (!msg.msg_id || msg.msg_id.length !== 32) return false;
     return editClockNow / 1000 - msg.timestamp <= EDIT_WINDOW_SECS;
   }
@@ -891,7 +893,11 @@
 
   $effect(() => {
     if (!chatInputEl || youAreBanned || youAreKeyBehind) return;
-    const raf = requestAnimationFrame(() => chatInputEl?.focus());
+    // Not out from under an open dialog, which keeps focus inside itself.
+    const raf = requestAnimationFrame(() => {
+      if (document.querySelector('[aria-modal="true"]')) return;
+      chatInputEl?.focus();
+    });
     return () => cancelAnimationFrame(raf);
   });
 

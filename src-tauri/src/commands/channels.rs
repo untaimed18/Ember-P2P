@@ -3971,7 +3971,18 @@ pub async fn rename_channel(
         }
     }
 
-    commit_channel_moderation(&state, &owned, &topic, &welcome, &bans, &mods).await?;
+    // Past the registry and the local save the room is renamed, whatever this
+    // says: sizes were checked before the registry was asked, and the owner's
+    // periodic republish reads the new name back from the database. Failing
+    // here would tell the owner the rename did not happen and spend their one
+    // rename a day on it.
+    if let Err(e) = commit_channel_moderation(&state, &owned, &topic, &welcome, &bans, &mods).await {
+        tracing::warn!(
+            channel_id = %channel_id,
+            error = %e,
+            "renamed room's snapshot did not commit; the next republish carries the name"
+        );
+    }
     channel_info_from_id(&state, &channel_id).await
 }
 

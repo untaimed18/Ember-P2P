@@ -1799,7 +1799,7 @@
   "transfers_origin_ember": "Ember",
   "transfers_origin_exchange": "Обмен",
   "transfers_origin_title": "Найден через: {origin}",
-  "transfers_origin_unknown": "Источник неизвестен — не сохраняется для источников, восстановленных с диска",
+  "transfers_origin_unknown": "Источник неизвестен — сеть для этого источника не записана",
   "transfers_col_download_speed": "Скорость загрузки",
   "transfers_col_downloaded": "Загружено",
   "transfers_col_parts": "Части",

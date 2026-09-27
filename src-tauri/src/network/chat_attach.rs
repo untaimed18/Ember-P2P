@@ -143,6 +143,11 @@ fn emit_by_id(app: &tauri::AppHandle, db: &Database, xfer_hex: &str) {
     }
 }
 
+/// A row the periodic sweep just expired.
+pub(crate) fn emit_expired(app: &tauri::AppHandle, db: &Database, xfer_hex: &str) {
+    emit_by_id(app, db, xfer_hex);
+}
+
 /// A progress tick, built from a snapshot. The stored status is still read
 /// first: a cancel can land between two chunks, and a tick after it would set
 /// a stopped bubble moving again.
@@ -1375,7 +1380,15 @@ async fn receive_over_tcp(
             Err(FetchError::Transient(e)) => last = ReceiveFailure::Unreachable(e.to_string()),
         }
     }
-    Some(Err(last))
+    // A TCP path that only ever failed the way a network does is no verdict
+    // on the transfer: the remaining QUIC retries may still get through.
+    match last {
+        ReceiveFailure::Unreachable(detail) => {
+            info!("Chat attachment: TCP fallback gave up ({detail}); back to QUIC");
+            None
+        }
+        other => Some(Err(other)),
+    }
 }
 
 // --- Either side ---------------------------------------------------------------

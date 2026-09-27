@@ -1421,6 +1421,10 @@ pub(super) struct NetworkState {
     /// socket down, so a transfer that finished hashing as the user quit still
     /// gets its completion frame instead of being timed out by the sender.
     pub(super) xfer_finish_in_flight: usize,
+    /// Receives being verified and moved into place, by transfer id. Out of
+    /// `xfer_recv` by then, so this is what a cancel, a leave or a ban finds
+    /// them by.
+    pub(super) xfer_finishing: HashMap<[u8; 16], super::channel_xfer::XferFinishing>,
     /// `last_seen` touches waiting to be written, keyed by `(room, member)` and
     /// holding the newest timestamp seen. Drained by
     /// [`flush_channel_member_touches`] on its own interval.

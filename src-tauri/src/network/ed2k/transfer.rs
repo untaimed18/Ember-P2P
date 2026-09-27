@@ -2115,9 +2115,13 @@ impl Ed2kDownload {
                 );
             }
         }
+        let zero_name = self
+            .control
+            .seal_pending_rename()
+            .unwrap_or_else(|| self.file_name.clone());
         let final_path = finalize_zero_ed2k_file(
             &self.transfer_id,
-            &self.file_name,
+            &zero_name,
             self.file_hash,
             &self.download_dir,
         )
@@ -4625,8 +4629,9 @@ impl Ed2kDownload {
         // Publish initial preview-readiness onto the shared transfer control so
         // the UI's Preview button is correct on resume (first part already
         // verified on disk). Refreshed below as parts verify.
+        let preview_name = completed_download_name(tracker.file_name(), &self.file_name);
         self.control
-            .set_preview_ready(tracker.is_preview_ready(&self.file_name, self.file_size));
+            .set_preview_ready(tracker.is_preview_ready(&preview_name, self.file_size));
 
         // Per-file writer: dedicated thread + bounded channel replaces the
         // previous `Arc<Mutex<File>>`-with-`spawn_blocking`-per-block pattern
@@ -6082,8 +6087,12 @@ impl Ed2kDownload {
                     tracker.set_part_verified(part_idx);
                     // A newly verified part may make this download previewable
                     // (first part done + media type) — refresh the UI flag.
+                    // By the current name: a rename can change the type.
+                    apply_control_rename(&self.control, &mut tracker);
+                    let preview_name =
+                        completed_download_name(tracker.file_name(), &self.file_name);
                     self.control.set_preview_ready(
-                        tracker.is_preview_ready(&self.file_name, self.file_size),
+                        tracker.is_preview_ready(&preview_name, self.file_size),
                     );
                     // D12: flush the peer's pending credit bytes now that
                     // the part they contributed to actually verified.
@@ -6397,7 +6406,7 @@ impl Ed2kDownload {
         // files that have no per-part hashset, and acts as a belt-and-braces
         // reset for multi-part files).
         tracker.mark_file_hash_verified();
-        apply_control_rename(&self.control, &mut tracker);
+        seal_control_rename(&self.control, &mut tracker);
         let final_path = completed_dir.join(completed_download_name(
             tracker.file_name(),
             &self.file_name,
@@ -6512,6 +6521,18 @@ pub(super) fn apply_control_rename(
     tracker: &mut super::part_tracker::PartTracker,
 ) {
     if let Some(name) = control.pending_rename() {
+        tracker.set_file_name(&name);
+    }
+}
+
+/// [`apply_control_rename`] for the moment completion reads the name it moves
+/// the file under: renames after this are refused rather than left to relabel
+/// a row whose file already carries the old name.
+pub(super) fn seal_control_rename(
+    control: &crate::sharing::manager::TransferControl,
+    tracker: &mut super::part_tracker::PartTracker,
+) {
+    if let Some(name) = control.seal_pending_rename() {
         tracker.set_file_name(&name);
     }
 }

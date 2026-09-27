@@ -421,13 +421,19 @@
       if (cached) {
         applyListing(cached);
         loading = false;
+        // Shown while the fresh answer is fetched, and said to be: the refresh
+        // control spins, and a refresh that never answers marks it stale.
+        refreshing = true;
         void loadOwnership(cached.files, gen);
       }
       (async () => {
         try {
           const ok = await setupListener(gen, hash);
           if (!ok || gen !== listenerGen || !open) {
-            if (gen === listenerGen && open) loading = false;
+            if (gen === listenerGen && open) {
+              loading = false;
+              refreshing = false;
+            }
             return;
           }
           await requestBrowse(hash, true);

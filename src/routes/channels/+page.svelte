@@ -79,6 +79,7 @@
   import { addFriend } from '$lib/api/friends';
   import { friendsList, friendRequests, refreshFriendsList } from '$lib/stores/friends';
   import { clearDraft } from '$lib/stores/chatTabs';
+  import { setPendingReply } from '$lib/channelReply';
   import {
     activeChannelId,
     channels as channelsStore,
@@ -1318,7 +1319,7 @@
   }
 
   async function handleCreate() {
-    if (creating) return;
+    if (creating || !createName.trim() || createNameTooLong) return;
     if (needsUsername) {
       composeMode = 'create';
       return;
@@ -1414,6 +1415,7 @@
     try {
       await leaveChannel(id);
       clearDraft(`ch:${id}`);
+      setPendingReply(id, null);
       forgetChannelFavourite(id);
       void refreshChannels();
     } catch (e) {
@@ -1561,6 +1563,7 @@
       if (storedChannelIds.has(id)) await forgetChannel(id);
       deleted = true;
       clearDraft(`ch:${id}`);
+      setPendingReply(id, null);
       await refreshChannels();
     } catch (e) {
       if (!deleted) unhideChannel(id);
@@ -1590,6 +1593,7 @@
       // flush in a microtask, so clearing in this tick ran before that cleanup.
       await tick();
       clearDraft(`ch:${id}`);
+      setPendingReply(id, null);
       await refreshChannels();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -2268,7 +2272,7 @@
           <!-- The field simply stops accepting input at the cap, which reads as
                a broken key without a count next to it. `maxlength` already
                tells a screen reader the limit, so this is for the eye only. -->
-          <span class="name-count" class:over={createNameTooLong} aria-hidden="true">{createName.length}/{CHANNEL_NAME_MAX}</span>
+          <span class="name-count" class:over={createNameTooLong} aria-hidden="true">{[...createName].length}/{CHANNEL_NAME_MAX}</span>
           <ToggleSwitch bind:checked={createPrivate} label={m.channels_private_label()} />
           <button type="submit" disabled={!createName.trim() || createNameTooLong || creating}>{creating ? m.channels_creating() : m.channels_create()}</button>
         </div>
@@ -2853,7 +2857,7 @@
                       aria-label={m.channels_rename_title()}
                       disabled={renaming}
                     />
-                    <span class="name-count" class:over={renameTooLong} aria-hidden="true">{renameDraft.length}/{CHANNEL_NAME_MAX}</span>
+                    <span class="name-count" class:over={renameTooLong} aria-hidden="true">{[...renameDraft].length}/{CHANNEL_NAME_MAX}</span>
                     <button
                       type="submit"
                       disabled={renaming || renameTooLong || !renameDraft.trim() || renameDraft.trim() === selected.name}

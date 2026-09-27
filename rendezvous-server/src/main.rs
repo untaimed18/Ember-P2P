@@ -599,6 +599,7 @@ fn build_capability_lookup_v4_msg(
     m
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_relay_mailbox_offer_msg(
     initiator_id: &[u8; 32],
     responder_id: &[u8; 32],
@@ -634,6 +635,7 @@ fn build_relay_mailbox_poll_msg(responder_id: &[u8; 32], nonce: &[u8; 16], ts: i
     m
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_punch_register_v3_msg(
     from_id: &[u8; 32],
     target_id: &[u8; 32],
@@ -658,6 +660,7 @@ fn build_punch_register_v3_msg(
     message
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_punch_register_v4_msg(
     from_id: &[u8; 32],
     target_id: &[u8; 32],
@@ -1549,7 +1552,7 @@ struct MailboxServedPage {
 
 fn select_mailbox_candidate(
     tickets: &HashMap<String, RelayTicket>,
-    initiator: &String,
+    initiator: &str,
     ticket_id: &String,
     now: Instant,
     scanned: &mut usize,
@@ -1560,7 +1563,7 @@ fn select_mailbox_candidate(
         return false;
     }
     *scanned += 1;
-    *last_scanned = Some(initiator.clone());
+    *last_scanned = Some(initiator.to_owned());
     if tickets
         .get(ticket_id)
         .is_some_and(|ticket| !ticket.accepted && ticket.expires_at > now)
@@ -2383,6 +2386,9 @@ impl PunchStore {
     }
 }
 
+/// The scope of a status read: one `(initiator, ticket)` pair.
+type StatusReadScope = ([u8; 32], [u8; 32]);
+
 /// Bounded, scope-keyed nonce cache with O(expired) pruning. `K` is either
 /// one responder identity (poll) or one `(initiator, ticket)` pair (status).
 struct ScopedNonceCache<K> {
@@ -2502,7 +2508,7 @@ struct AppState {
     /// One stable status nonce per `(initiator, ticket)` pair. Keeping this
     /// separate bounds rapid initiator status checks without weakening the
     /// one-time mutation cache used by offer/accept.
-    status_read_nonces: Arc<RwLock<ScopedNonceCache<([u8; 32], [u8; 32])>>>,
+    status_read_nonces: Arc<RwLock<ScopedNonceCache<StatusReadScope>>>,
     started_at: Instant,
     /// Unique Channel usernames and room names. Persistence is a JSON file
     /// when `CHANNELS_REGISTRY_PATH` is set; otherwise names live only in
@@ -4715,7 +4721,7 @@ fn punch_live(entry: &PunchEntry, now: Instant) -> bool {
 }
 
 fn punch_available(entry: &PunchEntry, now: Instant) -> bool {
-    entry.leased_until.map_or(true, |until| until <= now)
+    entry.leased_until.is_none_or(|until| until <= now)
 }
 
 async fn legacy_punch_gone() -> StatusCode {
@@ -5777,6 +5783,7 @@ async fn run_peer1_loop(
 /// side — those bytes were already counted once by peer1's loop
 /// when they entered the relay; counting them again would
 /// double-charge the same payload.
+#[allow(clippy::too_many_arguments)]
 async fn bridge_relay(
     mut socket: WebSocket,
     peer1_inbox_tx: RelayQueueSender,
@@ -8473,7 +8480,7 @@ mod relay_ticket_tests {
             vec![format!("{:064x}", 200)],
             "accepted pair slots must not hide live pending offers"
         );
-        assert!(tickets.pending_by_responder.get(&responder_id).is_some());
+        assert!(tickets.pending_by_responder.contains_key(&responder_id));
     }
 
     /// `(now - ts).abs()` wrapped to `i64::MIN` for a crafted `ts`, which
@@ -8643,7 +8650,7 @@ mod relay_ticket_tests {
         assert!(!punches.remove_acked(&b, &"33".repeat(32), &[1; 32], 1), "acks are per target");
         assert!(punches.remove_acked(&a, &"33".repeat(32).to_uppercase(), &[1; 32], 1));
         assert_eq!(punches.len(), 1);
-        assert!(punches.by_target.get(&a).is_none(), "an emptied target is dropped");
+        assert!(!punches.by_target.contains_key(&a), "an emptied target is dropped");
     }
 
     #[test]
