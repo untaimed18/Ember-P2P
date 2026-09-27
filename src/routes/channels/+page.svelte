@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount, tick, untrack } from 'svelte';
-  import { fly, slide } from 'svelte/transition';
+  import { fade, fly, scale, slide } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
+  import { inertBackground, trapTabKey } from '$lib/a11y';
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -301,6 +303,43 @@
   let selected = $derived(
     channelList.find((c) => c.channel_id === selectedId && c.in_room) ?? null,
   );
+  let roomSettingsOverlayEl = $state<HTMLDivElement>();
+  let roomSettingsEl = $state<HTMLDivElement>();
+  let roomSettingsShown = $derived(!!selected?.is_owner && roomInfoOpen);
+  /** A drag that starts in a field and is released over the backdrop still
+   *  clicks the overlay, so closing waits for a press that began there. */
+  let roomSettingsBackdropPress = false;
+
+  $effect(() => {
+    if (!roomSettingsShown || !roomSettingsOverlayEl) return;
+    return inertBackground(roomSettingsOverlayEl);
+  });
+
+  // Focus moves into the window so Tab starts inside it and a screen reader
+  // hears its title, and goes back to whatever opened it — the gear — after.
+  $effect(() => {
+    if (!roomSettingsShown) return;
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    void tick().then(() => roomSettingsEl?.focus());
+    return () => {
+      if (opener?.isConnected) opener.focus();
+    };
+  });
+
+  function closeRoomSettings() {
+    roomInfoOpen = false;
+  }
+
+  function onRoomSettingsKey(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeRoomSettings();
+      return;
+    }
+    trapTabKey(e, roomSettingsEl);
+  }
+
   let needsUsername = $derived(!($appSettings?.channel_username ?? '').trim());
   let canModerate = $derived(!!selected && (selected.is_owner || selected.you_are_moderator));
   /**
@@ -669,19 +708,10 @@
       ) {
         return;
       }
-      // Switching rooms goes through `selectChannel`, which re-seeds the
-      // rename, topic and welcome drafts — so stepping away from a half-typed
-      // edit would throw it out. The composer is exempt: its draft is kept
-      // per room.
-      const renameDirty =
-        !!selected && selected.is_owner && roomInfoOpen && renameDraft !== selected.name;
-      if (
-        editingModeration
-        || renameDirty
-        || target?.closest('.succession-form, .moderation-form, .add-form')
-      ) {
-        return;
-      }
+      // A half-filled create or join form would be thrown out by the switch.
+      // The room settings drafts need no guard here: they live in a modal,
+      // and the check above already stands down while one is open.
+      if (target?.closest('.add-form')) return;
       const rooms = joinedInOrder;
       if (rooms.length === 0) return;
       e.preventDefault();
@@ -1610,6 +1640,7 @@
       forgetChannelNotifyLevel(id);
       forgetChannelFavourite(id);
       forgetChannelIgnores(id);
+      roomInfoOpen = false;
       activeChannelId.set(null);
       members = [];
       membersLoading = false;
@@ -2808,9 +2839,10 @@
                   <button
                     class="icon-btn"
                     class:on={roomInfoOpen}
-                    onclick={() => (roomInfoOpen = !roomInfoOpen)}
+                    onclick={() => (roomInfoOpen = true)}
                     title={m.channels_room_settings()}
-                    aria-pressed={roomInfoOpen}
+                    aria-haspopup="dialog"
+                    aria-expanded={roomInfoOpen}
                     aria-label={m.channels_room_settings()}
                   >
                     <!-- Drawn on a 24 grid rather than 16: the hand-fitted
@@ -2917,180 +2949,6 @@
                     {claiming ? m.channels_taking_over() : m.channels_claim_ownership()}
                   </button>
                 {/if}
-              </div>
-            {/if}
-            {#if selected.is_owner && roomInfoOpen}
-              {#if !selected.successor_id}
-                <form
-                  class="succession-form"
-                  onsubmit={(e) => {
-                    e.preventDefault();
-                    void handleRename();
-                  }}
-                >
-                  <p class="succession-title">{m.channels_rename_title()}</p>
-                  <p class="succession-hint">{m.channels_rename_hint()}</p>
-                  <div class="rename-row">
-                    <input
-                      bind:value={renameDraft}
-                      maxlength={CHANNEL_NAME_MAX}
-                      placeholder={m.channels_name_placeholder()}
-                      aria-label={m.channels_rename_title()}
-                      disabled={renaming}
-                    />
-                    <span class="name-count" class:over={renameTooLong} aria-hidden="true">{[...renameDraft].length}/{CHANNEL_NAME_MAX}</span>
-                    <button
-                      type="submit"
-                      disabled={renaming || renameTooLong || !renameDraft.trim() || renameDraft.trim() === selected.name}
-                    >{renaming ? m.channels_renaming() : m.channels_rename_save()}</button>
-                  </div>
-                  {#if renameTooLong}
-                    <p class="form-hint name-too-long" role="status">{m.channels_name_too_long_bytes()}</p>
-                  {/if}
-                </form>
-              {/if}
-              <form
-                class="moderation-form"
-                onsubmit={(e) => {
-                  e.preventDefault();
-                  handleSaveModeration();
-                }}
-              >
-                <p class="mod-label">{m.channels_edit_moderation()}</p>
-                <input
-                  bind:value={editTopic}
-                  maxlength="64"
-                  placeholder={m.channels_topic_placeholder()}
-                  aria-label={m.channels_topic_placeholder()}
-                  oninput={() => (editingModeration = true)}
-                />
-                <!-- Matches CHANNEL_WELCOME_MAX. The backend truncates past it
-                     rather than refusing, so a larger box silently ate half a
-                     long welcome. Bytes there, characters here, so non-ASCII
-                     can still be trimmed — but not by 2x. -->
-                <textarea
-                  bind:value={editWelcome}
-                  maxlength="256"
-                  rows="2"
-                  placeholder={m.channels_welcome_placeholder()}
-                  aria-label={m.channels_welcome_placeholder()}
-                  oninput={() => (editingModeration = true)}
-                ></textarea>
-                <button type="submit" disabled={moderationBusy}>
-                  {savingModeration ? m.channels_saving() : m.channels_save_moderation()}
-                </button>
-              </form>
-              <div class="succession-form">
-                <p class="succession-title">{m.channels_language_label()}</p>
-                <p class="succession-hint" id="room-language-hint">{m.channels_language_hint()}</p>
-                <ChannelLanguagePicker
-                  bind:value={roomLanguage}
-                  disabled={savingLanguage}
-                  describedby="room-language-hint"
-                  onchange={(v) => void handleLanguage(v)}
-                />
-              </div>
-              <div class="succession-form">
-                <p class="succession-title">{m.channels_invite_policy_title()}</p>
-                <p class="succession-hint">{m.channels_invite_policy_hint()}</p>
-                <ToggleSwitch
-                  bind:checked={inviteOwnerOnly}
-                  label={m.channels_invite_policy_label()}
-                  disabled={savingInvitePolicy}
-                  onchange={(v) => void handleInvitePolicy(v)}
-                />
-              </div>
-              <div class="succession-form">
-                <p class="succession-title">{m.channels_announce_title()}</p>
-                <p class="succession-hint">{m.channels_announce_hint()}</p>
-                <ToggleSwitch
-                  bind:checked={announceOnly}
-                  label={m.channels_announce_label()}
-                  disabled={savingAnnounce}
-                  onchange={(v) => void handleAnnounceOnly(v)}
-                />
-              </div>
-              <div class="succession-form">
-                <p class="succession-title">{m.channels_slow_mode_title()}</p>
-                <p class="succession-hint">{m.channels_slow_mode_hint()}</p>
-                <select
-                  aria-label={m.channels_slow_mode_title()}
-                  disabled={savingSlowMode}
-                  value={String(selected.slow_mode_secs)}
-                  onchange={(e) => void handleSlowMode(Number(e.currentTarget.value))}
-                >
-                  {#each SLOW_MODE_CHOICES as choice (choice)}
-                    <option value={String(choice)}>{slowModeLabel(choice)}</option>
-                  {/each}
-                </select>
-              </div>
-              <!-- Only private rooms have a key worth rotating: a public
-                   room's comes from its address, so there is nothing to
-                   change it to. -->
-              {#if selected.visibility === 'private'}
-                <div class="succession-form">
-                  <p class="succession-title">{m.channels_rotate_title()}</p>
-                  <p class="succession-hint">{m.channels_rotate_hint()}</p>
-                  <button
-                    type="button"
-                    class="ghost danger"
-                    disabled={rotatingKey || moderationBusy}
-                    onclick={() => (rotateOpen = true)}
-                  >
-                    {rotatingKey ? m.channels_rotating() : m.channels_rotate_btn()}
-                  </button>
-                </div>
-              {/if}
-              <div class="succession-form">
-                <p class="succession-title">{m.channels_succession()}</p>
-                <p class="succession-hint">{m.channels_succession_hint()}</p>
-                <label class="succession-field">
-                  <span>{m.channels_succession_who()}</span>
-                  <select
-                    disabled={moderationBusy}
-                    value={selected.successor_nominee}
-                    onchange={(e) => handleNominee(e.currentTarget.value)}
-                  >
-                    <option value="">{m.channels_succession_none()}</option>
-                    {#each sortedMembers as mem (mem.member_pubkey)}
-                      {#if !mem.is_self && !mem.banned}
-                        <option value={mem.member_pubkey}>
-                          {roomMemberLabel(mem)}
-                        </option>
-                      {/if}
-                    {/each}
-                  </select>
-                </label>
-                {#if selected.successor_nominee}
-                  <label class="succession-field">
-                    <span>{m.channels_succession_wait()}</span>
-                    <select
-                      aria-label={m.channels_succession_wait()}
-                      disabled={moderationBusy}
-                      value={String(selected.claim_after_days)}
-                      onchange={(e) =>
-                        handleNominee(selected.successor_nominee, Number(e.currentTarget.value))}
-                    >
-                      {#each CLAIM_WINDOWS as days (days)}
-                        <option value={String(days)}>{m.channels_succession_days({ days })}</option>
-                      {/each}
-                    </select>
-                  </label>
-                {/if}
-              </div>
-              <!-- Last, and the only irreversible control on the page. In the
-                   header it was one gap from Leave in the same red text. -->
-              <div class="succession-form danger-zone">
-                <p class="succession-title">{m.channels_delete()}</p>
-                <p class="succession-hint">{m.channels_delete_confirm_body({ name: selected.name })}</p>
-                <button
-                  type="button"
-                  class="conv-action conv-delete"
-                  disabled={deletingOwned}
-                  onclick={() => (deleteOpen = true)}
-                >
-                  {deletingOwned ? m.channels_deleting() : m.channels_delete()}
-                </button>
               </div>
             {/if}
             <!-- Everyone sees the room's rule, not just the owner who set it:
@@ -3534,6 +3392,222 @@
     {/if}
   {/if}
 </div>
+
+{#if selected?.is_owner && roomInfoOpen}
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="modal-overlay"
+    bind:this={roomSettingsOverlayEl}
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="room-settings-title"
+    tabindex="-1"
+    onpointerdown={(e) => (roomSettingsBackdropPress = e.target === e.currentTarget)}
+    onclick={(e) => {
+      if (roomSettingsBackdropPress && e.target === e.currentTarget) closeRoomSettings();
+    }}
+    onkeydown={onRoomSettingsKey}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+  >
+    <div
+      class="modal-content room-settings"
+      bind:this={roomSettingsEl}
+      tabindex="-1"
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
+      <div class="modal-header">
+        <div class="room-settings-heading">
+          <span id="room-settings-title" class="modal-title">{m.channels_room_settings()}</span>
+          <span class="room-settings-room" title={selected.name}><bdi dir="auto">{selected.name}</bdi></span>
+        </div>
+        <button type="button" class="modal-close" onclick={closeRoomSettings} title={m.common_close()} aria-label={m.common_close()}>
+          <IconX size={15} />
+        </button>
+      </div>
+      <div class="modal-body room-settings-body">
+        {#if !selected.successor_id}
+          <form
+            class="succession-form"
+            onsubmit={(e) => {
+              e.preventDefault();
+              void handleRename();
+            }}
+          >
+            <p class="succession-title">{m.channels_rename_title()}</p>
+            <p class="succession-hint">{m.channels_rename_hint()}</p>
+            <div class="rename-row">
+              <input
+                bind:value={renameDraft}
+                maxlength={CHANNEL_NAME_MAX}
+                placeholder={m.channels_name_placeholder()}
+                aria-label={m.channels_rename_title()}
+                disabled={renaming}
+              />
+              <span class="name-count" class:over={renameTooLong} aria-hidden="true">{[...renameDraft].length}/{CHANNEL_NAME_MAX}</span>
+              <button
+                type="submit"
+                disabled={renaming || renameTooLong || !renameDraft.trim() || renameDraft.trim() === selected.name}
+              >{renaming ? m.channels_renaming() : m.channels_rename_save()}</button>
+            </div>
+            {#if renameTooLong}
+              <p class="form-hint name-too-long" role="status">{m.channels_name_too_long_bytes()}</p>
+            {/if}
+          </form>
+        {/if}
+        <form
+          class="moderation-form"
+          onsubmit={(e) => {
+            e.preventDefault();
+            handleSaveModeration();
+          }}
+        >
+          <p class="succession-title">{m.channels_edit_moderation()}</p>
+          <input
+            bind:value={editTopic}
+            maxlength="64"
+            placeholder={m.channels_topic_placeholder()}
+            aria-label={m.channels_topic_placeholder()}
+            oninput={() => (editingModeration = true)}
+          />
+          <!-- Matches CHANNEL_WELCOME_MAX. The backend truncates past it
+               rather than refusing, so a larger box silently ate half a
+               long welcome. Bytes there, characters here, so non-ASCII
+               can still be trimmed — but not by 2x. -->
+          <textarea
+            bind:value={editWelcome}
+            maxlength="256"
+            rows="2"
+            placeholder={m.channels_welcome_placeholder()}
+            aria-label={m.channels_welcome_placeholder()}
+            oninput={() => (editingModeration = true)}
+          ></textarea>
+          <button type="submit" disabled={moderationBusy}>
+            {savingModeration ? m.channels_saving() : m.channels_save_moderation()}
+          </button>
+        </form>
+        <div class="succession-form">
+          <p class="succession-title">{m.channels_language_label()}</p>
+          <p class="succession-hint" id="room-language-hint">{m.channels_language_hint()}</p>
+          <ChannelLanguagePicker
+            bind:value={roomLanguage}
+            disabled={savingLanguage}
+            describedby="room-language-hint"
+            onchange={(v) => void handleLanguage(v)}
+          />
+        </div>
+        <div class="succession-form">
+          <p class="succession-title">{m.channels_invite_policy_title()}</p>
+          <p class="succession-hint">{m.channels_invite_policy_hint()}</p>
+          <ToggleSwitch
+            bind:checked={inviteOwnerOnly}
+            label={m.channels_invite_policy_label()}
+            disabled={savingInvitePolicy}
+            onchange={(v) => void handleInvitePolicy(v)}
+          />
+        </div>
+        <div class="succession-form">
+          <p class="succession-title">{m.channels_announce_title()}</p>
+          <p class="succession-hint">{m.channels_announce_hint()}</p>
+          <ToggleSwitch
+            bind:checked={announceOnly}
+            label={m.channels_announce_label()}
+            disabled={savingAnnounce}
+            onchange={(v) => void handleAnnounceOnly(v)}
+          />
+        </div>
+        <div class="succession-form">
+          <p class="succession-title">{m.channels_slow_mode_title()}</p>
+          <p class="succession-hint">{m.channels_slow_mode_hint()}</p>
+          <select
+            aria-label={m.channels_slow_mode_title()}
+            disabled={savingSlowMode}
+            value={String(selected.slow_mode_secs)}
+            onchange={(e) => void handleSlowMode(Number(e.currentTarget.value))}
+          >
+            {#each SLOW_MODE_CHOICES as choice (choice)}
+              <option value={String(choice)}>{slowModeLabel(choice)}</option>
+            {/each}
+          </select>
+        </div>
+        <!-- Only private rooms have a key worth rotating: a public
+             room's comes from its address, so there is nothing to
+             change it to. -->
+        {#if selected.visibility === 'private'}
+          <div class="succession-form">
+            <p class="succession-title">{m.channels_rotate_title()}</p>
+            <p class="succession-hint">{m.channels_rotate_hint()}</p>
+            <!-- `aria-disabled`, not `disabled`: the confirm hands focus back
+                 here while the rotation it started is running, and a
+                 disabled button would drop it to <body>. -->
+            <button
+              type="button"
+              class="ghost danger"
+              aria-disabled={rotatingKey || moderationBusy}
+              onclick={() => {
+                if (!rotatingKey && !moderationBusy) rotateOpen = true;
+              }}
+            >
+              {rotatingKey ? m.channels_rotating() : m.channels_rotate_btn()}
+            </button>
+          </div>
+        {/if}
+        <div class="succession-form">
+          <p class="succession-title">{m.channels_succession()}</p>
+          <p class="succession-hint">{m.channels_succession_hint()}</p>
+          <label class="succession-field">
+            <span>{m.channels_succession_who()}</span>
+            <select
+              disabled={moderationBusy}
+              value={selected.successor_nominee}
+              onchange={(e) => handleNominee(e.currentTarget.value)}
+            >
+              <option value="">{m.channels_succession_none()}</option>
+              {#each sortedMembers as mem (mem.member_pubkey)}
+                {#if !mem.is_self && !mem.banned}
+                  <option value={mem.member_pubkey}>
+                    {roomMemberLabel(mem)}
+                  </option>
+                {/if}
+              {/each}
+            </select>
+          </label>
+          {#if selected.successor_nominee}
+            <label class="succession-field">
+              <span>{m.channels_succession_wait()}</span>
+              <select
+                aria-label={m.channels_succession_wait()}
+                disabled={moderationBusy}
+                value={String(selected.claim_after_days)}
+                onchange={(e) =>
+                  handleNominee(selected.successor_nominee, Number(e.currentTarget.value))}
+              >
+                {#each CLAIM_WINDOWS as days (days)}
+                  <option value={String(days)}>{m.channels_succession_days({ days })}</option>
+                {/each}
+              </select>
+            </label>
+          {/if}
+        </div>
+        <!-- Last, and the only irreversible control in the window. In the
+             header it was one gap from Leave in the same red text. -->
+        <div class="succession-form danger-zone">
+          <p class="succession-title">{m.channels_delete()}</p>
+          <p class="succession-hint">{m.channels_delete_confirm_body({ name: selected.name })}</p>
+          <button
+            type="button"
+            class="conv-action conv-delete"
+            aria-disabled={deletingOwned}
+            onclick={() => {
+              if (!deletingOwned) deleteOpen = true;
+            }}
+          >
+            {deletingOwned ? m.channels_deleting() : m.channels_delete()}
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <ConfirmDialog
   bind:open={leaveOpen}
@@ -4533,8 +4607,117 @@
 
   .conv-delete:hover:not(:disabled) { background: var(--danger-hover); }
 
-  .danger-zone {
+  /* Room settings window, laid out like the Library's Share Folders one. */
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    background: var(--overlay-bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .modal-content {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: inset 0 1px 0 var(--surface-highlight), var(--shadow-lg);
+    display: flex;
+    flex-direction: column;
+    max-height: 85vh;
+  }
+
+  .modal-content:focus {
+    outline: none;
+  }
+
+  .room-settings {
+    width: min(620px, calc(100vw - 2rem));
+    height: min(760px, calc(100vh - 3rem));
+  }
+
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .room-settings-heading {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .modal-title {
+    font-weight: 600;
+    font-size: 14px;
+  }
+
+  .room-settings-room {
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .modal-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    cursor: pointer;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text-secondary);
+  }
+
+  .modal-close:hover {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+  }
+
+  .room-settings-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px;
+  }
+
+  /* Cards rather than the full-width ruled bands these forms draw by default. */
+  .room-settings-body :is(.succession-form, .moderation-form) {
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+  }
+
+  .room-settings-body .moderation-form {
+    padding: 12px 14px 14px;
+    gap: 10px;
+  }
+
+  .room-settings-body .danger-zone {
     border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
+  }
+
+  /* Busy rather than `disabled`, so focus can come back to them; this is the
+     look `disabled` would have given. */
+  .room-settings-body button[aria-disabled='true'] {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 
   .back-btn { display: none; }
@@ -4955,8 +5138,6 @@
     background: var(--bg-surface);
     flex-shrink: 0;
   }
-
-  .mod-label { margin: 0; font-size: 12px; color: var(--text-secondary); }
 
   .room-notice {
     margin: 0;

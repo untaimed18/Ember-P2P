@@ -216,7 +216,9 @@
   </svg>
 </button>
 
-<div use:portal>
+<!-- Moved under <body>, so a dialog around the picker would otherwise make it
+     inert along with the rest of the background. -->
+<div use:portal data-a11y-no-inert>
   {#if open}
     <div
       bind:this={popoverEl}
@@ -384,9 +386,12 @@
     color: var(--text-muted);
   }
 
+  /* The modal layer's own value: this sits last in <body>, so it paints above
+     the dialog it is opened from. Any pointer or focus outside closes it, so
+     nothing raised later has to clear it. */
   .lang-popover {
     position: fixed;
-    z-index: 1000;
+    z-index: 10000;
     display: flex;
     flex-direction: column;
     overflow: hidden;
