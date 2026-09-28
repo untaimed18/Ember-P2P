@@ -1403,7 +1403,7 @@
                     <td>{kadSearchNameLabel(search.name) || '—'}</td>
                   {:else if column.key === 'status'}
                     <td>
-                      <span class="badge {search.status}">
+                      <span class="badge {search.status === 'stopping' ? 'tone-warning' : search.status}">
                         {search.status === 'active' ? m.kad_search_status_active() : m.kad_search_status_stopping()}
                       </span>
                     </td>
@@ -2079,14 +2079,6 @@
 
   .unverified {
     opacity: 0.6;
-  }
-
-  /* Local badge variants. Follow the same tinted-chip recipe as the
-     global badges in app.css so the KAD page matches in both themes. */
-  .badge.stopping {
-    background: color-mix(in srgb, var(--warning) 15%, transparent);
-    border-color: color-mix(in srgb, var(--warning) 30%, transparent);
-    color: var(--badge-warning-text);
   }
 
   /* Per-row Cancel: compact danger chip that fits the 26px row and

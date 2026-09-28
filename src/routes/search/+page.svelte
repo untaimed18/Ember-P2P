@@ -1510,17 +1510,17 @@
 
   function dlBadgeClass(t: Transfer): string {
     switch (t.status) {
-      case 'completed': return 'dl-badge-success';
-      case 'active': return 'dl-badge-active';
+      case 'completed': return 'tone-success';
+      case 'active':
       case 'verifying':
       case 'completing':
-      case 'hashing': return 'dl-badge-progress';
+      case 'hashing': return 'tone-accent';
       case 'paused':
-      case 'stopped': return 'dl-badge-warning';
+      case 'stopped': return 'tone-warning';
       case 'failed':
       case 'insufficient':
-      case 'noneneeded': return 'dl-badge-danger';
-      default: return 'dl-badge-neutral';
+      case 'noneneeded': return 'tone-danger';
+      default: return 'tone-muted';
     }
   }
 
@@ -3999,7 +3999,7 @@
               <div class="name-cell-wrap">
                 <button class="ghost link-btn" onclick={() => showFileDetails(result)}><bdi dir="auto">{displayName(result)}</bdi></button>
                 {#if dlTransfer}
-                  <span class="dl-status-badge {dlBadgeClass(dlTransfer)}" title="{dlBadgeLabel(dlTransfer)}: {dlTransfer.file_name}">
+                  <span class="badge sm {dlBadgeClass(dlTransfer)}" title="{dlBadgeLabel(dlTransfer)}: {dlTransfer.file_name}">
                     {dlBadgeLabel(dlTransfer)}
                   </span>
                 {/if}
@@ -4093,11 +4093,11 @@
             {/if}
             <td class="col-history">
               {#if isInLibraryOnly(result)}
-                <span class="history-badge in-library" title={m.search_history_in_library_title()}>{m.search_history_in_library()}</span>
+                <span class="badge sm tone-accent" title={m.search_history_in_library_title()}>{m.search_history_in_library()}</span>
               {:else if downloadHistoryMap[result.file.hash] === 'completed'}
-                <span class="history-badge history-completed" title={m.search_history_downloaded_title()}>{m.search_history_downloaded()}</span>
+                <span class="badge sm tone-success" title={m.search_history_downloaded_title()}>{m.search_history_downloaded()}</span>
               {:else if downloadHistoryMap[result.file.hash] === 'cancelled'}
-                <span class="history-badge history-cancelled" title={m.search_history_cancelled_title()}>{m.search_history_cancelled()}</span>
+                <span class="badge sm tone-warning" title={m.search_history_cancelled_title()}>{m.search_history_cancelled()}</span>
               {/if}
             </td>
             <td class="col-action">
@@ -4425,7 +4425,7 @@
               <h4>{m.search_download_status()}</h4>
               <dl class="detail-grid">
                 <dt>{m.search_status_label()}</dt>
-                <dd><span class="dl-status-badge {dlBadgeClass(selectedDlTransfer)}">{dlBadgeLabel(selectedDlTransfer)}</span></dd>
+                <dd><span class="badge {dlBadgeClass(selectedDlTransfer)}">{dlBadgeLabel(selectedDlTransfer)}</span></dd>
                 {#if selectedDlTransfer.status === 'active' || selectedDlTransfer.progress > 0}
                   <dt>{m.search_progress_label()}</dt>
                   <!--
@@ -5291,30 +5291,6 @@
     opacity: 0.6;
   }
 
-  .history-badge {
-    display: inline-block;
-    padding: 1px 6px;
-    border-radius: var(--radius-sm);
-    font-size: var(--font-size-2xs);
-    font-weight: 600;
-    letter-spacing: 0.02em;
-  }
-
-  .in-library {
-    background: color-mix(in srgb, var(--accent) 20%, transparent);
-    color: var(--accent);
-  }
-
-  .history-completed {
-    background: color-mix(in srgb, var(--success) 20%, transparent);
-    color: var(--success);
-  }
-
-  .history-cancelled {
-    background: color-mix(in srgb, var(--warning) 20%, transparent);
-    color: var(--warning);
-  }
-
   :global(tr.in-library-row:not(.row-checked):not(:hover) td) {
     color: var(--accent);
   }
@@ -5842,40 +5818,6 @@
   }
   :global(tr.spam-row td:first-child) {
     box-shadow: inset 3px 0 0 0 var(--warning);
-  }
-
-  .dl-status-badge {
-    display: inline-block;
-    padding: 2px 7px;
-    border-radius: var(--radius-sm);
-    font-size: var(--font-size-xs);
-    font-weight: 500;
-    white-space: nowrap;
-    line-height: 1.3;
-  }
-  .dl-badge-success {
-    background: color-mix(in srgb, var(--success) 18%, transparent);
-    color: var(--success);
-  }
-  .dl-badge-active {
-    background: color-mix(in srgb, var(--accent) 18%, transparent);
-    color: var(--accent);
-  }
-  .dl-badge-progress {
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    color: var(--accent);
-  }
-  .dl-badge-warning {
-    background: color-mix(in srgb, var(--warning) 18%, transparent);
-    color: var(--warning);
-  }
-  .dl-badge-danger {
-    background: color-mix(in srgb, var(--danger) 18%, transparent);
-    color: var(--danger);
-  }
-  .dl-badge-neutral {
-    background: color-mix(in srgb, var(--text-secondary) 12%, transparent);
-    color: var(--text-secondary);
   }
 
   .row-dl-completed {

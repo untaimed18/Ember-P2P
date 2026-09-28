@@ -30,12 +30,12 @@
     <div class="stat-tile">
       <span class="stat-label">{m.kad_stat_firewall()}</span>
       {#if $networkStats.status === 'disconnected'}
-        <span class="badge unknown"><span class="badge-glyph" aria-hidden="true">?</span> {m.common_unknown()}</span>
+        <span class="badge tone-muted"><span class="badge-glyph" aria-hidden="true">?</span> {m.common_unknown()}</span>
       {:else if $networkStats.status === 'connecting'}
-        <span class="badge unknown"><span class="badge-glyph" aria-hidden="true">&#x25CB;</span> {m.kad_checking()}</span>
+        <span class="badge tone-muted"><span class="badge-glyph" aria-hidden="true">&#x25CB;</span> {m.kad_checking()}</span>
       {:else}
         <span
-          class="badge {$networkStats.firewalled ? 'firewalled' : 'open'}"
+          class="badge {$networkStats.firewalled ? 'tone-warning' : 'tone-success'}"
           role="status"
           aria-label={$networkStats.firewalled
             ? m.kad_firewall_aria_firewalled()
@@ -203,23 +203,5 @@
      so the tile column stays flexible. */
   .stat-tile .badge {
     align-self: flex-start;
-  }
-
-  .badge.open {
-    background: color-mix(in srgb, var(--success) 15%, transparent);
-    border-color: color-mix(in srgb, var(--success) 30%, transparent);
-    color: var(--badge-success-text);
-  }
-
-  .badge.firewalled {
-    background: color-mix(in srgb, var(--warning) 15%, transparent);
-    border-color: color-mix(in srgb, var(--warning) 30%, transparent);
-    color: var(--badge-warning-text);
-  }
-
-  .badge.unknown {
-    background: color-mix(in srgb, var(--text-muted) 18%, transparent);
-    border-color: color-mix(in srgb, var(--text-muted) 32%, transparent);
-    color: var(--text-secondary);
   }
 </style>

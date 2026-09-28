@@ -561,7 +561,7 @@
         <div class="check-body">
           <div class="check-head">
             <span class="check-label">{m.ember_health_reachability()}</span>
-            <span class="pill" class:ok={reachabilityTone === 'ok'} class:warn={reachabilityTone === 'warn'} class:muted={reachabilityTone === 'muted'}>{reachabilityLabel}</span>
+            <span class="badge" class:tone-success={reachabilityTone === 'ok'} class:tone-warning={reachabilityTone === 'warn'} class:tone-muted={reachabilityTone === 'muted'}>{reachabilityLabel}</span>
           </div>
           <p class="hint">{reachabilityHint}</p>
         </div>
@@ -580,7 +580,7 @@
         <div class="check-body">
           <div class="check-head">
             <span class="check-label">{m.ember_health_sharing()}</span>
-            <span class="pill" class:ok={sharingTone === 'ok'} class:warn={sharingTone === 'warn'} class:muted={sharingTone === 'muted'}>{sharingPillLabel}</span>
+            <span class="badge" class:tone-success={sharingTone === 'ok'} class:tone-warning={sharingTone === 'warn'} class:tone-muted={sharingTone === 'muted'}>{sharingPillLabel}</span>
           </div>
           <p class="hint">{sharingHint}</p>
         </div>
@@ -1039,33 +1039,6 @@
   .check-row .hint {
     margin: 5px 0 0;
     max-width: 70ch;
-  }
-
-  .pill {
-    font-size: var(--font-size-xs);
-    font-weight: 600;
-    padding: 2px 9px;
-    border-radius: var(--radius-pill);
-    border: 1px solid transparent;
-    white-space: nowrap;
-  }
-
-  .pill.ok {
-    color: var(--badge-success-text);
-    background: color-mix(in srgb, var(--success) 15%, transparent);
-    border-color: color-mix(in srgb, var(--success) 30%, transparent);
-  }
-
-  .pill.warn {
-    color: var(--badge-warning-text);
-    background: color-mix(in srgb, var(--warning) 15%, transparent);
-    border-color: color-mix(in srgb, var(--warning) 30%, transparent);
-  }
-
-  .pill.muted {
-    color: var(--text-secondary);
-    background: color-mix(in srgb, var(--text-muted) 15%, transparent);
-    border-color: color-mix(in srgb, var(--text-muted) 28%, transparent);
   }
 
   /* --- Technical details disclosure --- */

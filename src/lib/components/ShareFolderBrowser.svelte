@@ -767,12 +767,13 @@
                 </button>
                 {#if badge}
                   <span
-                    class="badge"
-                    class:already={isShared(entry)}
-                    class:partial={entry.share_status === 'partial'}
-                    class:warn={entry.share_status === 'overlap'
+                    class="badge sm row-badge {entry.share_status === 'overlap'
                       || entry.share_status === 'contains_shared'
-                      || entry.share_status === 'blocked'}
+                      || entry.share_status === 'blocked'
+                      ? 'tone-warning'
+                      : isShared(entry) && entry.share_status !== 'partial'
+                        ? 'tone-accent'
+                        : 'tone-muted'}"
                   >{badge}</span>
                 {:else if entry.kind === 'file' && entry.size != null}
                   <span class="list-size">{formatBytes(entry.size)}</span>
@@ -1072,30 +1073,9 @@
     background: var(--bg-hover);
     color: var(--text-primary);
   }
-  .badge {
+  .row-badge {
     margin-left: auto;
-    font-size: var(--font-size-2xs);
-    font-weight: 600;
-    padding: 1px 6px;
-    border-radius: var(--radius-pill);
-    border: 1px solid var(--border);
-    color: var(--text-muted);
     flex-shrink: 0;
-  }
-  .badge.already {
-    color: var(--badge-accent-text);
-    border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
-  }
-  .badge.partial {
-    color: var(--text-secondary);
-    border-color: var(--border-light);
-    background: var(--bg-surface);
-  }
-  .badge.warn {
-    color: var(--badge-warning-text);
-    border-color: color-mix(in srgb, var(--warning) 40%, var(--border));
-    background: color-mix(in srgb, var(--warning) 10%, transparent);
   }
   .empty {
     padding: 24px 12px;

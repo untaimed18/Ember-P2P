@@ -1187,9 +1187,9 @@
                 {#if connectedServer.client_id}
                   <span class="mono">{connectedServer.client_id}</span>
                   {#if connectedServer.is_low_id}
-                    <span class="badge lowid">{m.servers_lowid()}</span>
+                    <span class="badge sm lowid">{m.servers_lowid()}</span>
                   {:else}
-                    <span class="badge highid">{m.servers_highid()}</span>
+                    <span class="badge sm highid">{m.servers_highid()}</span>
                   {/if}
                 {:else}
                   <span class="muted">{m.servers_pending()}</span>
@@ -1774,12 +1774,6 @@
      state reads the same here as on the KAD page. */
   .badge {
     gap: 5px;
-  }
-
-  .badge.lowid,
-  .badge.highid {
-    font-size: var(--font-size-2xs);
-    padding: 1px 6px;
   }
 
   .servers-page {
