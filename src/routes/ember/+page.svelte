@@ -1341,7 +1341,7 @@
     .stat { transition: none; }
   }
 
-  @media (max-width: 640px) {
+  @media (max-width: 760px) {
     .stat-grid {
       grid-template-columns: 1fr 1fr;
     }

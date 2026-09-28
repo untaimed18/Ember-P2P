@@ -1880,7 +1880,7 @@
     }
   }
 
-  @media (max-width: 720px) {
+  @media (max-width: 760px) {
     .page-header {
       align-items: flex-start;
       gap: 10px;

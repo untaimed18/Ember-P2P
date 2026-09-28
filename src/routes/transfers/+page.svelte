@@ -6717,7 +6717,7 @@
     overflow-wrap: anywhere;
   }
 
-  @media (max-width: 560px) {
+  @media (max-width: 760px) {
     .modal-overlay {
       padding: 0;
       align-items: stretch;

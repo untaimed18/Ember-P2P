@@ -501,7 +501,7 @@
     grid-template-columns: repeat(4, 1fr);
     gap: 12px;
   }
-  @media (max-width: 900px) {
+  @media (max-width: 980px) {
     .hero-row { grid-template-columns: repeat(2, 1fr); }
   }
   /* The shared `.stat-card`, with an icon beside the number. */
@@ -581,7 +581,7 @@
     grid-template-columns: 1fr 1fr;
     gap: 12px;
   }
-  @media (max-width: 700px) {
+  @media (max-width: 760px) {
     .section-row { grid-template-columns: 1fr; }
   }
 
@@ -615,7 +615,7 @@
     grid-template-columns: repeat(3, 1fr);
     gap: 18px 24px;
   }
-  @media (max-width: 800px) {
+  @media (max-width: 760px) {
     .cum-grid { grid-template-columns: repeat(2, 1fr); }
   }
   .cum-item { display: flex; flex-direction: column; }

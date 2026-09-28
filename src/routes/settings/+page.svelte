@@ -5736,7 +5736,7 @@
     box-shadow: var(--shadow-sm);
   }
 
-  @media (max-width: 640px) {
+  @media (max-width: 760px) {
     .behavior-picker {
       grid-template-columns: 1fr;
     }

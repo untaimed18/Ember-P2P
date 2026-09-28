@@ -6111,18 +6111,6 @@
     font-style: italic;
   }
 
-  @media (max-width: 640px) {
-    .library-filter-row {
-      align-items: stretch;
-    }
-    .filter-search-wrap,
-    .filter-type {
-      max-width: none;
-      width: 100%;
-    }
-    .inline-stats { display: none; }
-  }
-
   /* Overlay the detail drawer earlier so the file table keeps usable width
      on 16" / mid laptop layouts (shared breakpoint --bp-lg ≈ 1200). */
   @media (max-width: 1200px) {
@@ -6138,12 +6126,15 @@
   }
 
   @media (max-width: 760px) {
-    .detail-drawer {
-      width: min(90vw, 420px);
+    .library-filter-row {
+      align-items: stretch;
     }
-  }
-
-  @media (max-width: 520px) {
+    .filter-search-wrap,
+    .filter-type {
+      max-width: none;
+      width: 100%;
+    }
+    .inline-stats { display: none; }
     .sidebar,
     .sidebar-divider { display: none; }
     .detail-drawer { width: min(100vw, 420px); }
