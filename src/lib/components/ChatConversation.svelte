@@ -1566,7 +1566,6 @@
   }
 
   function setFriendTyping(on: boolean) {
-    const was = friendTyping;
     friendTyping = on;
     if (typingHoldTimer) {
       clearTimeout(typingHoldTimer);
@@ -1577,7 +1576,6 @@
         friendTyping = false;
         typingHoldTimer = null;
       }, TYPING_HOLD_MS);
-      if (!was && isPinnedToBottom()) scrollToBottom();
     }
   }
 
@@ -1671,6 +1669,13 @@
    *  nobody typing to somebody, and not more than once per gap. */
   let roomTypingAnnouncement = $state('');
   let roomTypingActive = $derived(roomTypingSegments.length > 0 && !loading && !loadError);
+  let friendTypingShown = $derived(!isChannel && friendTyping && !loading && !loadError);
+  /** Only a friend's typing starting is announced; one person, so no gap
+   *  throttling is needed the way a busy room needs it. */
+  let friendTypingAnnouncement = $derived(
+    friendTypingShown ? m.chat_typing({ name: friendName || friendHash.slice(0, 8) }) : '',
+  );
+  let typingPillShown = $derived(isChannel ? roomTypingActive : friendTypingShown);
   let roomTypingWasActive = false;
   let roomTypingAnnouncedAt = -Infinity;
 
@@ -3346,14 +3351,6 @@
         {@render attachmentRow(a)}
       {/each}
     {/if}
-    {#if friendTyping && !isChannel && !loading && !loadError}
-      <div class="conv-msg received conv-typing-row">
-        <div class="conv-typing" role="status" aria-live="polite">
-          {m.chat_typing({ name: friendName || friendHash.slice(0, 8) })}
-          <span class="conv-typing-dots" aria-hidden="true"><span></span><span></span><span></span></span>
-        </div>
-      </div>
-    {/if}
     <div bind:this={messagesEnd}></div>
   </div>
   {#if showUnreadJump}
@@ -3377,7 +3374,7 @@
     <button
       class="conv-jump"
       class:has-unseen={missedWhileAway}
-      class:above-typing={roomTypingActive}
+      class:above-typing={typingPillShown}
       type="button"
       onclick={jumpToLatest}
       title={missedWhileAway ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
@@ -3391,26 +3388,28 @@
   {/if}
   </div>
 
-  {#if isChannel}
-    <!-- Floats over the foot of the transcript, like the jump control: a row
-         that came and went with every typist would shove the conversation up
-         and down under the reader. The live region is its own element and
-         stays mounted, so what it says is decided by `roomTypingAnnouncement`
-         rather than by every change to the visible line. -->
-    <div class="conv-room-typing-anchor">
-      <span class="sr-only" role="status" aria-live="polite">{roomTypingAnnouncement}</span>
-      {#if roomTypingActive}
-        <div class="conv-typing conv-room-typing">
-          <span class="conv-room-typing-text">
+  <!-- Floats over the space reserved at the foot of the transcript, like the
+       jump control: a row that came and went with every typist would shove
+       the conversation up and down under the reader. The live region is its
+       own element and stays mounted, so what it says is decided by the
+       announcement rather than by every change to the visible line. -->
+  <div class="conv-typing-anchor">
+    <span class="sr-only" role="status" aria-live="polite">{isChannel ? roomTypingAnnouncement : friendTypingAnnouncement}</span>
+    {#if typingPillShown}
+      <div class="conv-typing conv-typing-pill">
+        <span class="conv-typing-text">
+          {#if isChannel}
             {#each roomTypingSegments as segment, i (i)}
               {#if segment.kind === 'name'}<bdi dir="auto">{segment.text}</bdi>{:else}{segment.text}{/if}
             {/each}
-          </span>
-          <span class="conv-typing-dots" aria-hidden="true"><span></span><span></span><span></span></span>
-        </div>
-      {/if}
-    </div>
-  {/if}
+          {:else}
+            {m.chat_typing({ name: friendName || friendHash.slice(0, 8) })}
+          {/if}
+        </span>
+        <span class="conv-typing-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+      </div>
+    {/if}
+  </div>
 
   {#if sendError}
     <div class="conv-error" role="alert">{sendError}</div>
@@ -3641,11 +3640,13 @@
     position: relative;
   }
 
+  /* The extra room at the foot is where the typing pill floats, so it never
+     covers the newest line and the transcript never moves to make way. */
   .conv-messages {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    padding: 16px;
+    padding: 16px 16px 30px;
     display: flex;
     flex-direction: column;
     gap: 2px;
@@ -5078,11 +5079,6 @@
     flex-shrink: 0;
   }
 
-  .conv-typing-row {
-    align-self: flex-start;
-    max-width: 80%;
-  }
-
   .conv-typing-dots {
     display: inline-flex;
     gap: 3px;
@@ -5112,15 +5108,15 @@
     }
   }
 
-  /* Zero height in the column; its content hangs above it, over the foot of
-     the transcript. */
-  .conv-room-typing-anchor {
+  /* Zero height in the column; its content hangs above it, in the space the
+     transcript keeps free at its foot. */
+  .conv-typing-anchor {
     position: relative;
     height: 0;
     flex-shrink: 0;
   }
 
-  .conv-room-typing {
+  .conv-typing-pill {
     position: absolute;
     inset-inline-start: 14px;
     bottom: 4px;
@@ -5133,7 +5129,7 @@
     pointer-events: none;
   }
 
-  .conv-room-typing-text {
+  .conv-typing-text {
     min-width: 0;
     overflow: hidden;
     white-space: nowrap;

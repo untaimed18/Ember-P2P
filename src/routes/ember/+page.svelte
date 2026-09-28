@@ -459,7 +459,7 @@
 <header class="page-header">
   <div>
     <h2>{m.nav_ember_network()}</h2>
-    <p class="subtitle">{m.ember_page_subtitle()}</p>
+    <p class="page-subtitle">{m.ember_page_subtitle()}</p>
   </div>
 </header>
 
@@ -774,7 +774,7 @@
    * area so content is never clipped by the layout's `overflow: hidden`.
    */
   .ember-inner {
-    padding: 24px;
+    padding: var(--page-padding);
     max-width: 900px;
     margin: 0 auto;
     display: flex;
@@ -791,13 +791,6 @@
     gap: 10px;
   }
 
-  .subtitle {
-    margin: 6px 0 0;
-    color: var(--text-muted);
-    font-size: var(--font-size-md);
-    line-height: 1.5;
-    max-width: 70ch;
-  }
 
   .card {
     background: var(--bg-secondary);

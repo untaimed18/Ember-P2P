@@ -512,7 +512,10 @@
 </script>
 
 <div class="page-header">
-  <h2>{m.security_title()}</h2>
+  <div>
+    <h2>{m.security_title()}</h2>
+    <p class="page-subtitle">{m.security_page_subtitle()}</p>
+  </div>
   <div class="header-actions">
     <button onclick={handleDownload} disabled={downloading}>
       {downloading ? m.security_downloading() : m.security_download_ipfilter()}

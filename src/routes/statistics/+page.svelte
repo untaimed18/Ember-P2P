@@ -212,7 +212,10 @@
 </script>
 
 <div class="page-header">
-  <h2>{m.stats_title()}</h2>
+  <div>
+    <h2>{m.stats_title()}</h2>
+    <p class="page-subtitle">{m.stats_page_subtitle()}</p>
+  </div>
   <div class="header-actions">
     <button class="ghost" onclick={() => loadStats({ force: true })} disabled={loading}>{m.common_refresh()}</button>
   </div>
@@ -489,7 +492,7 @@
 
 <style>
   .page-content {
-    padding: 20px;
+    padding: var(--page-padding);
     display: flex;
     flex-direction: column;
     gap: 16px;

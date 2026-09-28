@@ -1338,7 +1338,8 @@
     <!--
       Compact friend row. Presence is stated once (the avatar dot) because the
       section headers above already group online vs offline, and unread is
-      stated once as a dot on Chat with the count in the status line. Reference
+      counted on the Chat button, the same pill the room list and the dock
+      use, whatever the status line is busy saying. Reference
       data (Friend ID, last address, added date) and the secondary actions live
       in the overflow menu so the resting card is name + status + Chat.
     -->
@@ -1442,7 +1443,16 @@
               <path d="M2 3h12v8H5l-3 3z"/>
             </svg>
             <span class="chat-btn-label">{m.friends_action_chat()}</span>
-            {#if unread > 0}<span class="unread-dot" aria-hidden="true"></span>{/if}
+            {#if unread > 0}
+              <span class="count-pill" aria-hidden="true">{unread > 99 ? '99+' : unread}</span>
+              <span class="sr-only">
+                {plural(unread, {
+                  one: m.friends_unread_one,
+                  few: () => m.friends_unread_few({ count: unread }),
+                  other: () => m.friends_unread_other({ count: unread }),
+                })}
+              </span>
+            {/if}
           </button>
 
           <details class="card-more">
@@ -2003,8 +2013,8 @@
   }
 
   .card-avatar {
-    width: 34px;
-    height: 34px;
+    width: var(--avatar-size);
+    height: var(--avatar-size);
     flex-shrink: 0;
     border-radius: 50%;
     background: var(--accent-dim);
@@ -2154,15 +2164,6 @@
   .chat-btn svg {
     width: 13px;
     height: 13px;
-    flex-shrink: 0;
-  }
-
-  /* Unread is a presence cue here; the count is in the status line. */
-  .unread-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--accent);
     flex-shrink: 0;
   }
 

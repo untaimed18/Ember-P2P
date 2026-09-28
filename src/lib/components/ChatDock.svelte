@@ -800,7 +800,7 @@
                 <span class="dock-row-name"><bdi dir="auto">{row.label}</bdi></span>
                 {#if row.unread > 0}
                   <span
-                    class="dock-row-unread"
+                    class="count-pill"
                     aria-label={plural(row.unread, {
                       one: m.chat_dock_unread_aria_one,
                       few: () => m.chat_dock_unread_aria_few({ count: row.unread }),
@@ -1214,19 +1214,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  .dock-row-unread {
-    background: var(--accent);
-    color: var(--on-accent);
-    font-size: var(--font-size-2xs);
-    font-weight: 700;
-    padding: 1px 6px;
-    border-radius: var(--radius-pill);
-    min-width: 18px;
-    text-align: center;
-    line-height: 1.2;
-    flex-shrink: 0;
   }
 
   .dock-row-close {

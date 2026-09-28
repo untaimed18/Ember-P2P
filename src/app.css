@@ -92,6 +92,18 @@
   --table-row-selected: var(--accent-fill);
   --table-row-divider: color-mix(in srgb, var(--border) 40%, transparent);
 
+  /* Avatars: people are circles and rooms rounded squares, at one of two
+     sizes, a primary list row (friends, rooms) or a compact one (members). */
+  --avatar-size: 32px;
+  --avatar-size-compact: 28px;
+
+  /* Page padding by kind of page. Dashboards (Ember, Statistics) are cards
+     with room to breathe; workspaces (Servers, KAD) are split panes that want
+     every pixel; table pages (Transfers, Library, Search, Security) run
+     edge to edge and have none. */
+  --page-padding: 24px;
+  --workspace-padding: 12px;
+
   --sidebar-width: 220px;
   --statusbar-height: 32px;
 
@@ -657,6 +669,28 @@ tr:hover td {
 }
 
 /*
+ * Unread count beside a conversation: the room list, the chat dock's switcher
+ * and a friend's Chat button, so waiting messages look the same wherever they
+ * are counted. Capped at 99+ by the caller.
+ */
+.count-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+/*
  * Preview chip for features that are live but still settling. Rose rather
  * than accent-blue so it does not compete with unread counts, and not
  * warning-orange so it does not read as a problem. Same height as the
@@ -924,6 +958,15 @@ tr:hover td {
   font-size: var(--font-size-xl);
   font-weight: 600;
   color: var(--text-primary);
+}
+
+/* One line under the title saying what the page is for. */
+.page-header .page-subtitle {
+  margin: 4px 0 0;
+  font-size: var(--font-size-md);
+  line-height: 1.5;
+  color: var(--text-muted);
+  max-width: 70ch;
 }
 
 .page-content {

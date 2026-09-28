@@ -2670,7 +2670,7 @@
                            would not interrupt for what it holds; see
                            `unreadBadgeTone`. -->
                       <span
-                        class="unread"
+                        class="count-pill unread"
                         class:silenced={unreadBadgeTone(notifyLevelOf($channelNotifyLevels, ch.channel_id), mentioned) === 'quiet'}
                         aria-label={mentioned
                           ? m.channels_unread_mention_aria({ count: ch.unread })
@@ -2679,7 +2679,7 @@
                               few: () => m.channels_unread_title_few({ count: ch.unread }),
                               other: () => m.channels_unread_title_other({ count: ch.unread }),
                             })}
-                      >{#if mentioned}<span class="unread-at" aria-hidden="true">@</span>{/if}{ch.unread}</span>
+                      >{#if mentioned}<span class="unread-at" aria-hidden="true">@</span>{/if}{ch.unread > 99 ? '99+' : ch.unread}</span>
                     {/if}
                   </button>
                   <div class="chan-door-col">
@@ -4397,8 +4397,8 @@
   /* Filled accent with a white hash, in the list and the header. A wash
      disappears against both the room card and the surface bar. */
   .chan-avatar {
-    width: 30px;
-    height: 30px;
+    width: var(--avatar-size);
+    height: var(--avatar-size);
     flex-shrink: 0;
     border-radius: var(--radius-sm);
     background: var(--accent);
@@ -4411,7 +4411,7 @@
   }
 
   .chan-avatar svg { width: 14px; height: 15px; }
-  .chan-avatar.sm { width: 28px; height: 28px; }
+  .chan-avatar.sm { width: var(--avatar-size-compact); height: var(--avatar-size-compact); }
   .chan-avatar.sm svg { width: 13px; height: 14px; }
 
   /* The only thing on the row that says a room is private, now that the badge
@@ -4461,21 +4461,6 @@
   }
 
   .chan-row.moved .chan-flag { opacity: 0.55; }
-
-  .unread {
-    min-width: 18px;
-    height: 18px;
-    border-radius: var(--radius-pill);
-    background: var(--accent);
-    color: var(--on-accent);
-    font-size: var(--font-size-xs);
-    font-weight: 700;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0 5px;
-    flex-shrink: 0;
-  }
 
   /* A silenced room still counts its unread, it just stops shouting about it. */
   .unread.silenced {
@@ -5327,8 +5312,8 @@
   .member-list li.banned { opacity: 0.65; }
 
   .member-avatar {
-    width: 28px;
-    height: 28px;
+    width: var(--avatar-size-compact);
+    height: var(--avatar-size-compact);
     flex-shrink: 0;
     border-radius: 50%;
     background: var(--accent-dim);

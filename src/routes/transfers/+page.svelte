@@ -6803,6 +6803,18 @@
     align-items: center;
     gap: 4px;
   }
+  /* Below the shared mid breakpoint the action row wraps under the pane title
+     rather than running off the pane; the advanced columns have already gone
+     at 1200 (see `applyViewportDownloadCompact`). */
+  @media (max-width: 980px) {
+    .pane-toolbar:not(.tabs-bar) {
+      flex-wrap: wrap;
+      row-gap: 4px;
+    }
+    .toolbar-actions {
+      flex-wrap: wrap;
+    }
+  }
   .toolbar-sep {
     width: 1px;
     height: 14px;

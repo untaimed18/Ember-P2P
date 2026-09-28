@@ -900,7 +900,10 @@
 }} />
 
 <div class="page-header">
-  <h2>{m.nav_ed2k_servers()}</h2>
+  <div>
+    <h2>{m.nav_ed2k_servers()}</h2>
+    <p class="page-subtitle">{m.servers_page_subtitle()}</p>
+  </div>
   <div class="header-actions">
     <button class="ghost" onclick={handleManualRefresh} disabled={loading}>{m.common_refresh()}</button>
     {#if selectionCount > 1}
@@ -1780,7 +1783,7 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
-    padding: 12px 16px 14px;
+    padding: var(--workspace-padding);
     overflow: auto;
   }
 
@@ -1842,7 +1845,7 @@
 
   @media (max-width: 980px) {
     .servers-page {
-      padding: 10px 12px 12px;
+      padding: 10px;
     }
 
     .server-upper {

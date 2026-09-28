@@ -1474,7 +1474,7 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    padding: 12px;
+    padding: var(--workspace-padding);
     gap: 12px;
     background: var(--bg-primary);
   }
@@ -1790,13 +1790,6 @@
     opacity: 0.6;
   }
 
-  .page-subtitle {
-    margin: 4px 0 0;
-    font-size: var(--font-size-md);
-    line-height: 1.5;
-    color: var(--text-muted);
-    max-width: 70ch;
-  }
 
   .compact-table {
     width: 100%;
