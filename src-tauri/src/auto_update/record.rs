@@ -123,10 +123,14 @@ pub fn note_check_attempt() {
     });
 }
 
+/// Every value `update_check_frequency` may take.
+pub const CHECK_FREQUENCIES: &[&str] = &["hourly", "daily", "weekly", "monthly"];
+
 /// Seconds between automatic checks for a `update_check_frequency` value.
 /// Anything unrecognised falls back to daily, the default.
 pub fn check_interval_secs(frequency: &str) -> i64 {
     match frequency {
+        "hourly" => 3600,
         "weekly" => 7 * 24 * 3600,
         "monthly" => 30 * 24 * 3600,
         _ => 24 * 3600,
@@ -180,9 +184,15 @@ mod tests {
     }
 
     #[test]
+    fn hourly_checks_once_an_hour() {
+        assert!(!check_due(Some(NOW - 3600 + 60), NOW, "hourly"));
+        assert!(check_due(Some(NOW - 3600), NOW, "hourly"));
+    }
+
+    #[test]
     fn unknown_frequency_is_daily() {
-        assert!(!check_due(Some(NOW - DAY + 60), NOW, "hourly"));
-        assert!(check_due(Some(NOW - DAY), NOW, "hourly"));
+        assert!(!check_due(Some(NOW - DAY + 60), NOW, "yearly"));
+        assert!(check_due(Some(NOW - DAY), NOW, "yearly"));
     }
 
     #[test]

@@ -768,7 +768,7 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     }
 
     let freq = settings.update_check_frequency.trim().to_ascii_lowercase();
-    if freq != "daily" && freq != "weekly" && freq != "monthly" {
+    if !crate::auto_update::record::CHECK_FREQUENCIES.contains(&freq.as_str()) {
         settings.update_check_frequency = "daily".to_string();
         changed = true;
     } else if freq != settings.update_check_frequency {
@@ -917,13 +917,12 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB,
         ));
     }
-    if settings.update_check_frequency != "daily"
-        && settings.update_check_frequency != "weekly"
-        && settings.update_check_frequency != "monthly"
+    if !crate::auto_update::record::CHECK_FREQUENCIES
+        .contains(&settings.update_check_frequency.as_str())
     {
         return Err(coded(
             "settings_update_check_frequency_invalid",
-            "Update check frequency must be 'daily', 'weekly', or 'monthly'",
+            "Update check frequency must be 'hourly', 'daily', 'weekly', or 'monthly'",
         ));
     }
     // Checked whether or not the timetable is switched on: the rules persist

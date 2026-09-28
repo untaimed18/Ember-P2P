@@ -443,7 +443,7 @@
       .catch((e) => console.error('Failed to register shared-folders-add-failed listener:', e));
 
     // Automatic update checks run in the backend on the user's
-    // daily/weekly/monthly cadence, at launch and for as long as Ember stays
+    // hourly/daily/weekly/monthly cadence, at launch and for as long as Ember stays
     // open (release builds only). Their results are applied exactly as a
     // silent check's would be, and surface non-blockingly via <UpdateNotice />.
     listen<SecureUpdateCheckResult>('ember:updater-check-result', (event) => {

@@ -4363,6 +4363,7 @@
               bind:value={settings.update_check_frequency}
               disabled={!settings.auto_check_updates}
             >
+              <option value="hourly">{m.settings_update_frequency_hourly()}</option>
               <option value="daily">{m.settings_update_frequency_daily()}</option>
               <option value="weekly">{m.settings_update_frequency_weekly()}</option>
               <option value="monthly">{m.settings_update_frequency_monthly()}</option>

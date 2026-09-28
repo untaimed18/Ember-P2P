@@ -3153,6 +3153,7 @@
   "settings_auto_check_updates_hint": "Verificar novas versões do Ember em segundo plano, na inicialização e enquanto o Ember continuar aberto. Você sempre pode verificar manualmente abaixo, independentemente desta configuração.",
   "settings_update_check_frequency_label": "Frequência de verificação",
   "settings_update_check_frequency_hint": "Com que frequência o Ember busca atualizações em segundo plano.",
+  "settings_update_frequency_hourly": "A cada hora",
   "settings_update_frequency_daily": "Diariamente",
   "settings_update_frequency_weekly": "Semanalmente",
   "settings_update_frequency_monthly": "Mensalmente",

@@ -3153,6 +3153,7 @@
   "settings_auto_check_updates_hint": "在启动时以及 Ember 保持打开期间于后台检查是否有新的 Ember 版本。无论此设置如何，您都可以随时在下方手动检查。",
   "settings_update_check_frequency_label": "检查频率",
   "settings_update_check_frequency_hint": "Ember 在后台检查更新的频率。",
+  "settings_update_frequency_hourly": "每小时",
   "settings_update_frequency_daily": "每天",
   "settings_update_frequency_weekly": "每周",
   "settings_update_frequency_monthly": "每月",

@@ -3156,6 +3156,7 @@
   "settings_auto_check_updates_hint": "Check for new Ember versions in the background, at launch and while Ember stays open. You can always check manually below, regardless of this setting.",
   "settings_update_check_frequency_label": "Check frequency",
   "settings_update_check_frequency_hint": "How often Ember looks for updates in the background.",
+  "settings_update_frequency_hourly": "Hourly",
   "settings_update_frequency_daily": "Daily",
   "settings_update_frequency_weekly": "Weekly",
   "settings_update_frequency_monthly": "Monthly",

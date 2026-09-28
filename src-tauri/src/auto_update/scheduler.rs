@@ -28,9 +28,10 @@ pub const CHECK_RESULT_EVENT: &str = "ember:updater-check-result";
 /// frontend's hand-off status query (1.5 s after mount) has settled first.
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(15);
 
-/// How often the scheduler asks whether a check is due. Coarse on purpose: the
-/// cadence it serves is daily at its fastest.
-const POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// How often the scheduler asks whether a check is due. Asking is only a config
+/// read and a small file read; the fastest cadence it serves is hourly, which
+/// this keeps within a few minutes of on time.
+const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Pause before restarting a panicked scheduler, so a panic that reproduces on
 /// every poll cannot become a busy loop.

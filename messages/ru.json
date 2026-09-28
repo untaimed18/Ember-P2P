@@ -3153,6 +3153,7 @@
   "settings_auto_check_updates_hint": "Проверять новые версии Ember в фоне — при запуске и пока Ember остаётся открытым. Вы всегда можете проверить вручную ниже, независимо от этой настройки.",
   "settings_update_check_frequency_label": "Частота проверки",
   "settings_update_check_frequency_hint": "Как часто Ember ищет обновления в фоне.",
+  "settings_update_frequency_hourly": "Ежечасно",
   "settings_update_frequency_daily": "Ежедневно",
   "settings_update_frequency_weekly": "Еженедельно",
   "settings_update_frequency_monthly": "Ежемесячно",

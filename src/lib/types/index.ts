@@ -1009,7 +1009,7 @@ export interface AppSettings {
    *  true (Ember's original always-check-on-launch behavior). */
   auto_check_updates: boolean;
   /** How often the automatic background update check may run. */
-  update_check_frequency: 'daily' | 'weekly' | 'monthly';
+  update_check_frequency: 'hourly' | 'daily' | 'weekly' | 'monthly';
   /** Install updates without asking, once nothing is transferring and the user
    *  is away, after a one-minute warning. Only on together with
    *  `auto_check_updates`. */

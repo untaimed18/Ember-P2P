@@ -3153,6 +3153,7 @@
   "settings_auto_check_updates_hint": "Recherche les nouvelles versions d'Ember en arrière-plan, au lancement et tant qu'Ember reste ouvert. Vous pouvez toujours lancer une recherche manuelle ci-dessous, quelle que soit cette option.",
   "settings_update_check_frequency_label": "Fréquence de recherche",
   "settings_update_check_frequency_hint": "Fréquence à laquelle Ember recherche les mises à jour en arrière-plan.",
+  "settings_update_frequency_hourly": "Toutes les heures",
   "settings_update_frequency_daily": "Tous les jours",
   "settings_update_frequency_weekly": "Toutes les semaines",
   "settings_update_frequency_monthly": "Tous les mois",

@@ -1714,7 +1714,7 @@ pub struct AppSettings {
     #[serde(default = "default_true")]
     pub auto_check_updates: bool,
     /// How often the automatic background check gated by `auto_check_updates`
-    /// may run: `"daily"`, `"weekly"`, or `"monthly"`. This is only the
+    /// may run: `"hourly"`, `"daily"`, `"weekly"`, or `"monthly"`. This is only the
     /// user's preference — the "was it long enough ago?" bookkeeping lives in
     /// `silent-update-state.json` (`auto_update::record`), where the backend
     /// scheduler reads it.

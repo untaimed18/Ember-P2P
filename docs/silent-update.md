@@ -89,9 +89,9 @@ an update, never pick what gets installed.
 
 ### Periodic check
 
-Fifteen seconds after launch, and then every 15 minutes, the scheduler
+Fifteen seconds after launch, and then every 5 minutes, the scheduler
 (`src-tauri/src/auto_update/scheduler.rs`) checks whether an update check is due
-under the existing `update_check_frequency` (daily / weekly / monthly), using
+under `update_check_frequency` (hourly / daily / weekly / monthly), using
 `last_check_at` from the state file. If one is due, it calls `run_check`, the
 same function behind `secure_updater_check`, sharing `UpdaterService.operation`,
 so it can never race a manual check or install. Every attempt, manual or
