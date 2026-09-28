@@ -5051,8 +5051,16 @@
     cursor: col-resize;
     background: var(--border);
     flex-shrink: 0;
+    transition: background var(--transition-fast);
   }
   .sidebar-divider:hover { background: var(--accent); }
+  /* Arrow keys resize it, so it needs to show where focus is, as the
+     Transfers splitter does. */
+  .sidebar-divider:focus-visible {
+    background: var(--accent);
+    outline: 2px solid var(--accent);
+    outline-offset: -1px;
+  }
 
   /* --- File list area --- */
   .file-list-area {
@@ -5409,30 +5417,6 @@
     background: color-mix(in srgb, var(--accent) 16%, transparent);
     white-space: nowrap;
   }
-  /* Toolbar-style buttons: the library page has no base .tb-btn rule, so without
-     this they fall back to the global accent-filled <button> style. Match the
-     clean bordered look used by the other toolbars. */
-  .bulk-action-bar .tb-btn {
-    font-size: var(--font-size-sm);
-    font-weight: 500;
-    padding: 4px 11px;
-    min-height: 26px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-    cursor: pointer;
-    white-space: nowrap;
-    transition: background var(--transition-fast) ease, border-color var(--transition-fast) ease, color var(--transition-fast) ease;
-  }
-  .bulk-action-bar .tb-btn:hover:not(:disabled) {
-    background: var(--bg-hover);
-    border-color: var(--border-light);
-  }
-  .bulk-action-bar .tb-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
   .bulk-sep {
     width: 1px;
     align-self: stretch;
@@ -5499,11 +5483,12 @@
     border-radius: var(--radius-sm);
     overflow: hidden;
   }
+  /* 22px inside the group's 1px border, level with the 24px `.tb-btn`s. */
   .bulk-prio-btn {
-    font-size: var(--font-size-xs);
+    font-size: var(--font-size-sm);
     font-weight: 500;
-    padding: 3px 9px;
-    min-height: 26px;
+    padding: 2px 9px;
+    min-height: 22px;
     border: none;
     border-left: 1px solid var(--border);
     border-radius: 0;
@@ -5517,15 +5502,6 @@
   .bulk-prio-btn:hover:not(:disabled) {
     background: var(--accent);
     color: var(--on-accent);
-  }
-
-  .tb-btn.tb-danger {
-    border-color: color-mix(in srgb, var(--danger) 40%, transparent);
-    color: var(--danger);
-  }
-  .tb-btn.tb-danger:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-    border-color: var(--danger);
   }
 
   /* --- Details meta grid --- */

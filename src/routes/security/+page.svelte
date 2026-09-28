@@ -1070,7 +1070,7 @@
     transition: background-color var(--transition-fast);
   }
   .ip-table tbody tr.row-alt td {
-    background: color-mix(in srgb, var(--bg-secondary) 90%, var(--bg-primary));
+    background: var(--table-row-alt);
   }
   .ip-table tbody tr:hover td {
     background: var(--bg-hover);

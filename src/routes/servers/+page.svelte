@@ -739,7 +739,7 @@
   }
 
   function sortIndicator(col: string): string {
-    if (sortCol !== col) return '';
+    if (sortCol !== col) return ' \u00A0';
     return sortAsc ? ' \u25B2' : ' \u25BC';
   }
 
@@ -1522,11 +1522,11 @@
   }
 
   .server-table tbody tr:nth-child(even):not(.selected):not(.connected) {
-    background: color-mix(in srgb, var(--bg-secondary) 84%, var(--bg-primary));
+    background: var(--table-row-alt);
   }
 
   .server-table tbody tr.selected {
-    background: var(--accent-fill);
+    background: var(--table-row-selected);
   }
 
   .server-table tbody tr:focus-visible {

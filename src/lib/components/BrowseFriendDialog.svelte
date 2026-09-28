@@ -1696,7 +1696,7 @@
   }
 
   .browse-table tbody tr.selected td {
-    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    background: var(--table-row-selected);
   }
 
   .sort-btn {

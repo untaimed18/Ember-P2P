@@ -79,6 +79,14 @@
   --border: #dadce0;
   --border-light: #c4c9d4;
 
+  /* Data tables. Every table's rows sit on the page canvas, so one stripe,
+     one selection and one header read the same whatever a table's density.
+     Derived from the theme colours, so they follow the theme on their own. */
+  --table-head-bg: var(--bg-secondary);
+  --table-row-alt: color-mix(in srgb, var(--bg-secondary) 60%, var(--bg-primary));
+  --table-row-selected: var(--accent-fill);
+  --table-row-divider: color-mix(in srgb, var(--border) 40%, transparent);
+
   --sidebar-width: 220px;
   --statusbar-height: 32px;
 
@@ -1304,6 +1312,52 @@ button.ctx-backdrop:active {
   background: color-mix(in srgb, var(--ctx-surface) 94%, transparent);
   backdrop-filter: blur(10px) saturate(1.1);
   -webkit-backdrop-filter: blur(10px) saturate(1.1);
+}
+
+/*
+ * Toolbar button for pane toolbars and selection bars above or below a table:
+ * quieter than `button.secondary`, one height everywhere so the Transfers
+ * panes and the Library selection bar read as the same control.
+ */
+.tb-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 24px;
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast) ease,
+    border-color var(--transition-fast) ease,
+    color var(--transition-fast) ease;
+}
+.tb-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border-light);
+  color: var(--text-primary);
+}
+.tb-btn:disabled {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.tb-btn.tb-danger {
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  color: var(--danger);
+}
+.tb-btn.tb-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 /*

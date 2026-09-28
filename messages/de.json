@@ -2009,7 +2009,6 @@
   "transfers_overview_label_active": "Aktiv",
   "transfers_overview_label_sources": "Quellen",
   "transfers_filter_aria": "Übertragungen filtern",
-  "transfers_filter_label": "Filter",
   "transfers_filter_placeholder": "Name, Hash, Kategorie, Peer…",
   "transfers_downloading_count": "{shown}/{total} werden heruntergeladen",
   "transfers_toggle_cols_title": "Zwischen vollständigen und kompakten Spalten wechseln",

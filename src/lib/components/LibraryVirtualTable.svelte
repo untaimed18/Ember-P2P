@@ -753,7 +753,7 @@
     white-space: nowrap;
     font-weight: 600;
     font-size: var(--font-size-xs);
-    background: var(--bg-surface);
+    background: var(--table-head-bg);
     border-bottom: 1px solid var(--border);
     user-select: none;
     box-sizing: border-box;
@@ -836,7 +836,7 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
+    border-bottom: 1px solid var(--table-row-divider);
     box-sizing: border-box;
     /* Rows are virtualized: <tr> nodes are reused as you scroll and their
        zebra (row-alt) parity flips on the reused node. A background-color
@@ -850,7 +850,7 @@
     transition: background-color var(--transition-fast) ease;
   }
   .lib-table tbody tr.row-alt td {
-    background: color-mix(in srgb, var(--bg-secondary) 90%, var(--bg-primary));
+    background: var(--table-row-alt);
   }
   .lib-table tbody tr:hover td {
     background: var(--bg-hover);
@@ -860,7 +860,7 @@
     outline-offset: -2px;
   }
   .lib-table tbody tr.selected td {
-    background: var(--accent-fill);
+    background: var(--table-row-selected);
     color: var(--text-primary);
     border-bottom-color: color-mix(in srgb, var(--accent) 30%, var(--border));
   }
@@ -969,7 +969,7 @@
 
   .prio-verylow { color: var(--priority-verylow); }
   .prio-low { color: var(--priority-low); }
-  .prio-normal { color: var(--text-primary); }
+  .prio-normal { color: var(--text-secondary); }
   .prio-high { color: var(--warning); }
   .prio-release { color: var(--danger); font-weight: 600; }
   .prio-auto { color: var(--priority-auto); }

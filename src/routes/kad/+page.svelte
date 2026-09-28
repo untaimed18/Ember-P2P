@@ -1887,7 +1887,7 @@
 
   .compact-table tbody tr.row-alt td,
   .compact-table tbody tr:nth-child(even):not(.virtual-row):not(.spacer-row) td {
-    background: color-mix(in srgb, var(--bg-secondary) 88%, var(--bg-primary));
+    background: var(--table-row-alt);
   }
 
   /*

@@ -2009,7 +2009,6 @@
   "transfers_overview_label_active": "活跃",
   "transfers_overview_label_sources": "来源",
   "transfers_filter_aria": "筛选传输",
-  "transfers_filter_label": "筛选",
   "transfers_filter_placeholder": "名称、hash、分类、节点…",
   "transfers_downloading_count": "{shown}/{total} 正在下载",
   "transfers_toggle_cols_title": "在完整列与紧凑列之间切换",

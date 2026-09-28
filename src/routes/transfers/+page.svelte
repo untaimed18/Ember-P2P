@@ -1842,7 +1842,7 @@
     }
   }
   function sortArrow(current: string, field: string, asc: boolean): string {
-    if (current !== field) return '';
+    if (current !== field) return ' \u00A0';
     return asc ? ' \u25B2' : ' \u25BC';
   }
 
@@ -4596,14 +4596,26 @@
     <div class="transfer-overview-bar">
       <span class="overview-chip"><span class="overview-label">{m.transfers_overview_label_active()}</span> {transferringDownloads}</span>
       <span class="overview-chip"><span class="overview-label">{m.transfers_overview_label_sources()}</span> {activeConnectedSources}/{totalKnownSources}</span>
-      <label class="filter-wrap" aria-label={m.transfers_filter_aria()}>
-        <span class="filter-label">{m.transfers_filter_label()}</span>
+      <label class="pill-search dl-filter">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <circle cx="7" cy="7" r="4.5"/>
+          <line x1="10.5" y1="10.5" x2="14" y2="14"/>
+        </svg>
         <input
           class="filter-input"
           type="text"
           placeholder={m.transfers_filter_placeholder()}
+          aria-label={m.transfers_filter_aria()}
           bind:value={transferFilter}
         />
+        {#if transferFilter}
+          <button
+            type="button"
+            class="pill-search-clear"
+            aria-label={m.transfers_known_clear_filter()}
+            onclick={() => (transferFilter = '')}
+          ><IconX size={13} /></button>
+        {/if}
       </label>
     </div>
     <div class="pane-toolbar">
@@ -5004,7 +5016,7 @@
           <button class="tb-btn" disabled={selectedPausableCount === 0} onclick={handleBatchPauseDownloads} title={m.transfers_batch_pause_title()}>{m.common_pause()}</button>
           <button class="tb-btn" disabled={selectedResumableCount === 0} onclick={handleBatchResumeDownloads} title={m.transfers_batch_resume_title()}>{m.common_resume()}</button>
           <button class="tb-btn" disabled={selectedStoppableCount === 0} onclick={handleBatchStopDownloads} title={m.transfers_batch_stop_title()}>{m.common_stop()}</button>
-          <button class="tb-btn danger-outline" disabled={selectedCancellableCount === 0} onclick={handleBatchCancelDownloads} title={m.transfers_batch_cancel_title()}>{m.common_cancel()}</button>
+          <button class="tb-btn tb-danger" disabled={selectedCancellableCount === 0} onclick={handleBatchCancelDownloads} title={m.transfers_batch_cancel_title()}>{m.common_cancel()}</button>
           <button class="tb-btn" disabled={copyingAllDownloadLinks || linkableSelectedCount === 0} onclick={() => void copyDownloadLinks(selectedBatchTransfers)} title={m.transfers_copy_selected_links_title()}>{m.transfers_copy_links_btn()}</button>
           {#if selectedFinishedCount > 0}
             <button class="tb-btn" onclick={handleBatchRemoveDownloads} title={m.transfers_batch_remove_title()}>
@@ -5464,7 +5476,7 @@
           totals reflect the full ledger, not the filtered view.
         -->
         <div class="known-toolbar" role="group" aria-label={showingEmberKnown ? m.transfers_known_ember_filter_aria() : m.transfers_known_filter_aria()}>
-          <label class="known-search">
+          <label class="pill-search known-search">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
               <circle cx="7" cy="7" r="4.5"/>
               <line x1="10.5" y1="10.5" x2="14" y2="14"/>
@@ -5478,7 +5490,7 @@
             {#if knownFilter}
               <button
                 type="button"
-                class="known-search-clear"
+                class="pill-search-clear"
                 aria-label={m.transfers_known_clear_filter()}
                 onclick={() => (knownFilter = '')}
               ><IconX size={13} /></button>
@@ -6764,30 +6776,12 @@
     color: var(--text-muted);
     margin-right: 2px;
   }
-  .filter-wrap {
+  /* The Known Clients search, at the right of the downloads overview bar. */
+  .pill-search.dl-filter {
     margin-left: auto;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: var(--font-size-xs);
-    color: var(--text-muted);
-  }
-  .filter-label {
-    white-space: nowrap;
-  }
-  .filter-input {
-    width: 220px;
-    max-width: 45vw;
-    padding: 2px 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--bg-primary);
-    color: var(--text-primary);
-    font-size: var(--font-size-xs);
-  }
-  .filter-input:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 2px var(--accent-halo);
+    flex: 0 1 240px;
+    padding-top: 1px;
+    padding-bottom: 1px;
   }
   .pane-toolbar {
     display: flex;
@@ -6815,46 +6809,20 @@
     background: var(--border);
     margin: 0 2px;
   }
-  .tb-btn {
-    font-size: var(--font-size-xs);
-    padding: 1px 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--bg-primary);
-    color: var(--text-primary);
-    cursor: pointer;
-    transition: background var(--transition-normal);
-    min-height: 20px;
-  }
-  .tb-btn:hover {
-    background: var(--bg-hover);
-  }
-  .tb-btn:disabled {
-    opacity: 0.5;
-    cursor: default;
-    background: var(--bg-primary);
-  }
   .tb-btn-wrap {
     display: inline-flex;
   }
   .tb-btn-wrap .tb-btn:disabled {
     pointer-events: none;
   }
+  /* A view option rather than an action: dashed until pointed at. */
   .tb-btn.tb-toggle {
     color: var(--text-muted);
     border-style: dashed;
-    font-size: var(--font-size-2xs);
   }
-  .tb-btn.tb-toggle:hover {
+  .tb-btn.tb-toggle:hover:not(:disabled) {
     color: var(--text-primary);
     border-style: solid;
-  }
-  .tb-btn.danger-outline {
-    border-color: var(--danger);
-    color: var(--danger);
-  }
-  .tb-btn.danger-outline:hover {
-    background: color-mix(in srgb, var(--danger) 12%, var(--bg-primary));
   }
   .toolbar-more {
     position: relative;
@@ -7071,12 +7039,12 @@
     position: sticky;
     top: 0;
     z-index: 1;
-    background: var(--bg-secondary);
+    background: var(--table-head-bg);
     padding: 3px 6px;
     font-size: var(--font-size-xs);
-    font-weight: 500;
+    font-weight: 600;
     text-align: left;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     border-bottom: 1px solid var(--border);
     white-space: nowrap;
     user-select: none;
@@ -7088,6 +7056,7 @@
   }
   .transfer-table th.sortable:hover {
     color: var(--text-primary);
+    background: var(--bg-hover);
   }
   .transfer-table th.drag-enabled {
     cursor: grab;
@@ -7147,15 +7116,15 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
+    border-bottom: 1px solid var(--table-row-divider);
   }
   .transfer-table tbody tr:nth-child(even of :not(.source-child-row):not(.section-divider-row):not(.src-failed-summary):not(.dl-row):not(.vpad-row)) {
-    background: color-mix(in srgb, var(--bg-secondary) 40%, var(--bg-primary));
+    background: var(--table-row-alt);
   }
   /* Download rows are windowed, so which of them is an even child changes
      as the table scrolls; they carry their stripe from their list index. */
   .transfer-table tbody tr.dl-row.row-alt {
-    background: color-mix(in srgb, var(--bg-secondary) 40%, var(--bg-primary));
+    background: var(--table-row-alt);
   }
   .transfer-table tbody tr.vpad-row,
   .transfer-table tbody tr.vpad-row:hover {
@@ -7169,8 +7138,11 @@
   .transfer-table tbody tr:hover {
     background: var(--bg-hover);
   }
-  .dl-row.selected {
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  /* As specific as the stripe and hover rules above, and after them, so a
+     selected row stays selected on a striped line and under the pointer. */
+  .transfer-table tbody tr.dl-row.selected,
+  .transfer-table tbody tr.dl-row.selected:hover {
+    background: var(--table-row-selected);
   }
 
   .col-dl-check {
@@ -7607,7 +7579,7 @@
     top: 0;
     z-index: 1;
   }
-  .known-search {
+  .pill-search {
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -7619,17 +7591,17 @@
     max-width: 360px;
     transition: border-color var(--transition-fast);
   }
-  .known-search:focus-within {
+  .pill-search:focus-within {
     border-color: var(--accent);
     box-shadow: 0 0 0 2px var(--accent-halo);
   }
-  .known-search svg {
+  .pill-search svg {
     width: 14px;
     height: 14px;
     color: var(--text-muted);
     flex-shrink: 0;
   }
-  .known-search input {
+  .pill-search input {
     flex: 1;
     border: none;
     background: transparent;
@@ -7640,10 +7612,10 @@
     box-shadow: none;
     min-width: 0;
   }
-  .known-search input::placeholder {
+  .pill-search input::placeholder {
     color: var(--text-muted);
   }
-  .known-search-clear {
+  .pill-search-clear {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -7658,7 +7630,7 @@
     line-height: 1;
     transition: color var(--transition-fast), background var(--transition-fast);
   }
-  .known-search-clear:hover {
+  .pill-search-clear:hover {
     color: var(--text-primary);
     background: var(--bg-hover);
   }

@@ -2009,7 +2009,6 @@
   "transfers_overview_label_active": "Ativas",
   "transfers_overview_label_sources": "Fontes",
   "transfers_filter_aria": "Filtrar transferências",
-  "transfers_filter_label": "Filtrar",
   "transfers_filter_placeholder": "nome, hash, categoria, par…",
   "transfers_downloading_count": "{shown}/{total} baixando",
   "transfers_toggle_cols_title": "Alternar entre colunas completas e compactas",

@@ -1022,7 +1022,7 @@
   }
 
   function sortIndicator(field: SortField): string {
-    if (sortField !== field) return '';
+    if (sortField !== field) return ' \u00A0';
     return sortDir === 'asc' ? ' \u25B2' : ' \u25BC';
   }
 
@@ -5128,7 +5128,7 @@
   }
 
   :global(tr.row-checked td) {
-    background: var(--accent-fill) !important;
+    background: var(--table-row-selected) !important;
   }
 
   .col-check {
@@ -5301,13 +5301,14 @@
 
   .search-results-table th {
     padding: 6px 10px;
-    font-size: var(--font-size-sm);
+    font-size: var(--font-size-xs);
   }
 
   .search-results-table td {
     padding: 4px 10px;
     font-size: var(--font-size-sm);
     line-height: 1.2;
+    border-bottom-color: var(--table-row-divider);
   }
 
   .search-results-table tbody tr {
@@ -5343,14 +5344,14 @@
     position: sticky;
     top: 0;
     z-index: 2;
-    background: var(--bg-secondary);
+    background: var(--table-head-bg);
   }
 
   /* Striping follows the row's place in the whole list, not its place in the
      DOM: the window renders a slice, and `:nth-child` would restripe the
      table on every scroll (and count the spacer rows while doing it). */
   tbody tr.row-alt td {
-    background: color-mix(in srgb, var(--bg-secondary) 82%, var(--bg-primary));
+    background: var(--table-row-alt);
   }
 
   .source-count {
