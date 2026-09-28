@@ -118,7 +118,7 @@
 
   .render-error-details {
     max-width: min(560px, 100%);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     text-align: start;
   }
 

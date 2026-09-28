@@ -231,7 +231,7 @@
   }
   .media-error {
     margin: 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--danger);
     line-height: 1.35;
   }

@@ -794,7 +794,7 @@
   .subtitle {
     margin: 6px 0 0;
     color: var(--text-muted);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     line-height: 1.5;
     max-width: 70ch;
   }
@@ -807,7 +807,7 @@
   }
 
   .card h2 {
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-weight: 600;
     color: var(--text-primary);
     margin: 0 0 12px;
@@ -826,9 +826,9 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     transition:
-      background 0.35s ease,
-      border-color 0.35s ease,
-      box-shadow 0.35s ease;
+      background var(--transition-slow) ease,
+      border-color var(--transition-slow) ease,
+      box-shadow var(--transition-slow) ease;
   }
 
   .hero-glow {
@@ -890,7 +890,7 @@
     border-radius: 50%;
     flex-shrink: 0;
     background: var(--text-muted);
-    transition: background 0.25s ease, box-shadow 0.25s ease;
+    transition: background var(--transition-slow) ease, box-shadow var(--transition-slow) ease;
   }
 
   .status-dot.pending {
@@ -927,7 +927,7 @@
 
   .hint {
     color: var(--text-muted);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     line-height: 1.5;
   }
 
@@ -945,7 +945,7 @@
     border-radius: var(--radius-lg);
     padding: 18px 16px;
     text-align: center;
-    transition: border-color 0.2s ease;
+    transition: border-color var(--transition-normal) ease;
   }
 
   .stat:hover {
@@ -962,7 +962,7 @@
 
   .stat-label {
     margin-top: 6px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
     color: var(--text-muted);
   }
@@ -1031,7 +1031,7 @@
   }
 
   .check-label {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
   }
@@ -1042,7 +1042,7 @@
   }
 
   .pill {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     padding: 2px 9px;
     border-radius: var(--radius-pill);
@@ -1100,7 +1100,7 @@
   .chevron {
     display: inline-flex;
     color: var(--text-muted);
-    transition: transform 0.15s ease;
+    transition: transform var(--transition-normal) ease;
     flex-shrink: 0;
   }
 
@@ -1116,13 +1116,13 @@
   }
 
   .summary-title {
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-weight: 600;
     color: var(--text-primary);
   }
 
   .summary-hint {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
 
@@ -1140,7 +1140,7 @@
   }
 
   .sub-card h3 {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
     margin: 0 0 4px;
@@ -1168,7 +1168,7 @@
   }
 
   .metric-k {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1176,7 +1176,7 @@
   }
 
   .metric-v {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
@@ -1205,7 +1205,7 @@
     border-radius: var(--radius-pill);
     background: var(--bg-primary);
     color: var(--text-primary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
 
   .table-wrap {
@@ -1218,7 +1218,7 @@
   .dht-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .dht-table th,
@@ -1235,13 +1235,13 @@
     background: var(--bg-secondary);
     color: var(--text-muted);
     font-weight: 600;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     text-transform: uppercase;
     letter-spacing: 0.4px;
   }
 
   .dht-table code {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
 
   .dht-table .empty {
@@ -1264,7 +1264,7 @@
   }
 
   .k {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-muted);
   }
 
@@ -1277,7 +1277,7 @@
 
   .pubkey {
     font-family: var(--font-mono, ui-monospace, monospace);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     overflow-wrap: anywhere;
     min-width: 0;
@@ -1290,9 +1290,9 @@
     color: var(--text-secondary);
     border-radius: var(--radius-md);
     padding: 4px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     cursor: pointer;
-    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+    transition: background var(--transition-normal) ease, color var(--transition-normal) ease, border-color var(--transition-normal) ease;
   }
 
   .copy-btn:hover {
@@ -1304,7 +1304,7 @@
   .banner {
     border-radius: var(--radius-md);
     padding: 10px 14px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     line-height: 1.5;
     display: flex;
     align-items: center;
@@ -1353,7 +1353,7 @@
     color: inherit;
     border-radius: var(--radius-sm, 6px);
     padding: 4px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -1403,7 +1403,7 @@
       gap: 4px;
     }
     .status-label {
-      font-size: 20px;
+      font-size: var(--font-size-2xl);
     }
   }
 </style>

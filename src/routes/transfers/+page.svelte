@@ -6570,7 +6570,7 @@
 
   .modal-title {
     font-weight: 600;
-    font-size: 14px;
+    font-size: var(--font-size-base);
   }
 
   .modal-close {
@@ -6587,7 +6587,7 @@
     color: var(--text-secondary);
     cursor: pointer;
     line-height: 1;
-    transition: background 0.12s, border-color 0.12s, color 0.12s;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
   }
 
   .modal-close:hover {
@@ -6625,7 +6625,7 @@
 
   .dl-details-name {
     font-weight: 600;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     overflow-wrap: anywhere;
   }
 
@@ -6658,7 +6658,7 @@
 
   .rename-label {
     display: block;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     margin-bottom: 6px;
   }
@@ -6685,13 +6685,13 @@
 
   .dl-details-sub,
   .dl-chunk-legend {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
   }
 
   .dl-details-note {
     margin: 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
   }
 
@@ -6703,7 +6703,7 @@
   }
 
   .dl-chunk-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -6715,7 +6715,7 @@
     grid-template-columns: minmax(0, auto) minmax(0, 1fr);
     gap: 6px 16px;
     margin: 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .dl-details-grid dt {
@@ -6774,7 +6774,7 @@
     flex-wrap: wrap;
   }
   .overview-chip {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
     border: 1px solid var(--border);
@@ -6792,7 +6792,7 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
   }
   .filter-label {
@@ -6806,7 +6806,7 @@
     border-radius: var(--radius-sm);
     background: var(--bg-primary);
     color: var(--text-primary);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
   .filter-input:focus {
     border-color: var(--accent);
@@ -6823,7 +6823,7 @@
     gap: 6px;
   }
   .pane-title {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-secondary);
   }
@@ -6839,14 +6839,14 @@
     margin: 0 2px;
   }
   .tb-btn {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     padding: 1px 8px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--bg-primary);
     color: var(--text-primary);
     cursor: pointer;
-    transition: background 0.15s;
+    transition: background var(--transition-normal);
     min-height: 20px;
   }
   .tb-btn:hover {
@@ -6866,7 +6866,7 @@
   .tb-btn.tb-toggle {
     color: var(--text-muted);
     border-style: dashed;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
   }
   .tb-btn.tb-toggle:hover {
     color: var(--text-primary);
@@ -6905,7 +6905,7 @@
   }
   .toolbar-more-menu button {
     text-align: left;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 6px 10px;
     border: none;
     border-radius: var(--radius-sm);
@@ -6954,7 +6954,7 @@
     position: relative;
     display: inline-flex;
     align-items: center;
-    font-size: 11.5px;
+    font-size: var(--font-size-sm);
     font-family: inherit;
     min-height: 30px;
     padding: 6px 13px 7px;
@@ -6966,10 +6966,10 @@
     cursor: pointer;
     white-space: nowrap;
     transition:
-      background-color 0.15s ease,
-      border-color 0.15s ease,
-      color 0.15s ease,
-      box-shadow 0.15s ease;
+      background-color var(--transition-normal) ease,
+      border-color var(--transition-normal) ease,
+      color var(--transition-normal) ease,
+      box-shadow var(--transition-normal) ease;
   }
   .tab-btn:hover {
     background: color-mix(in srgb, var(--bg-hover) 80%, transparent);
@@ -7033,7 +7033,7 @@
     transform: none;
     box-shadow: none;
     will-change: auto;
-    transition: background 0.1s;
+    transition: background var(--transition-fast);
   }
   .splitter-bar::after {
     content: '';
@@ -7048,7 +7048,7 @@
     border-radius: 2px;
     box-sizing: border-box;
     pointer-events: none;
-    transition: border-color 0.1s, background 0.1s;
+    transition: border-color var(--transition-fast), background var(--transition-fast);
   }
   .splitter-bar:hover,
   .splitter-bar.dragging {
@@ -7087,7 +7087,7 @@
   .transfer-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     table-layout: fixed;
   }
   .transfer-table th {
@@ -7096,7 +7096,7 @@
     z-index: 1;
     background: var(--bg-secondary);
     padding: 3px 6px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 500;
     text-align: left;
     color: var(--text-muted);
@@ -7154,7 +7154,7 @@
     width: 1px;
     transform: translateX(-50%);
     background: transparent;
-    transition: background 0.12s ease;
+    transition: background var(--transition-fast) ease;
   }
   .transfer-table th:hover .col-resize-handle::after,
   .transfer-table th.resizing .col-resize-handle::after,
@@ -7222,7 +7222,7 @@
     margin-left: 6px;
     padding: 0 6px;
     border-radius: var(--radius-pill);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     line-height: 16px;
     white-space: nowrap;
@@ -7277,17 +7277,17 @@
   }
   .sw-cell {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .date-cell {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
   .cat-cell {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
   .progress-cell {
     padding: 2px 6px;
@@ -7306,13 +7306,13 @@
   }
   .no-bar {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
   .empty-cell {
     text-align: center;
     padding: 30px 16px !important;
     color: var(--text-muted);
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
   .empty-row td.empty-cell {
     padding: 40px 16px !important;
@@ -7333,7 +7333,7 @@
     opacity: 0.65;
   }
   .empty-cell-title {
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-weight: 500;
     color: var(--text-secondary);
     margin: 0;
@@ -7341,7 +7341,7 @@
   .empty-cell-action {
     margin-top: 4px;
     padding: 4px 12px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
     color: var(--text-secondary);
     background: var(--bg-secondary);
@@ -7356,7 +7356,7 @@
     border-color: var(--accent);
   }
   .empty-cell-sub {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     margin: 0;
   }
@@ -7381,7 +7381,7 @@
     align-items: center;
     gap: 8px;
     min-width: 0;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
     overflow: hidden;
     white-space: nowrap;
@@ -7396,7 +7396,7 @@
     padding: 2px 8px;
   }
   .selection-idle-hint {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
   }
   .selection-actions {
@@ -7427,7 +7427,7 @@
     margin-top: 0;
   }
   .status-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 500;
   }
   .status-label::before {
@@ -7471,7 +7471,7 @@
     display: inline-block;
     padding: 2px 8px;
     border-radius: var(--radius-pill);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     line-height: 1.3;
     border: 1px solid transparent;
@@ -7504,9 +7504,9 @@
   }
   /* Monospace cell — used for raw user-hash columns where alignment
      across rows matters more than narrow rendering. */
-  .mono { font-family: var(--font-mono, ui-monospace, 'Cascadia Code', Consolas, monospace); font-size: 11px; }
+  .mono { font-family: var(--font-mono, ui-monospace, 'Cascadia Code', Consolas, monospace); font-size: var(--font-size-xs); }
   .failure-hint {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--danger);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -7516,7 +7516,7 @@
   /* --- Priority badges --- */
   .prio-cell { text-align: center; }
   .prio-badge {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 500;
     padding: 0;
     border-radius: 0;
@@ -7533,7 +7533,7 @@
   /* --- Section divider --- */
   .section-divider-row td {
     background: var(--bg-secondary);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     color: var(--text-muted);
     padding: 2px 6px !important;
@@ -7551,7 +7551,7 @@
     border-radius: var(--radius-sm);
     background: none;
     font: inherit;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     color: var(--text-muted);
     letter-spacing: 0.03em;
@@ -7572,7 +7572,7 @@
        collapse/expand reads as one continuous motion. Expanded = pointing
        down (90deg); collapsed = pointing right (0deg). */
     transform: rotate(90deg);
-    transition: transform 0.15s ease;
+    transition: transform var(--transition-normal) ease;
   }
   .divider-chevron.collapsed {
     transform: rotate(0deg);
@@ -7580,7 +7580,7 @@
 
   .completed-row { opacity: 1; }
   .searching-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--warning);
     font-style: italic;
     animation: pulse 1.5s ease-in-out infinite;
@@ -7589,7 +7589,7 @@
     gap: 1px;
   }
   .search-detail {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     font-style: normal;
     animation: none;
@@ -7614,7 +7614,7 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 5px 12px;
   }
   .paste-link-icon {
@@ -7633,7 +7633,7 @@
     align-items: center;
     justify-content: space-between;
     padding: 6px 16px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     flex-shrink: 0;
   }
 
@@ -7642,7 +7642,7 @@
     align-items: center;
     justify-content: space-between;
     padding: 6px 16px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     flex-shrink: 0;
   }
 
@@ -7723,7 +7723,7 @@
     border: none;
     background: transparent;
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 2px 0;
     outline: none;
     box-shadow: none;
@@ -7755,7 +7755,7 @@
     display: inline-flex;
     align-items: center;
     gap: 14px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     flex-wrap: wrap;
   }
@@ -7823,7 +7823,7 @@
   }
   .known-hash-hex {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-variant-numeric: tabular-nums;
     min-width: 0;
     overflow: hidden;
@@ -7837,7 +7837,7 @@
   .known-hash-copied {
     margin-left: auto;
     font-family: var(--font-sans, inherit);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     color: var(--success);
     text-transform: uppercase;
@@ -7862,7 +7862,7 @@
     border-bottom: 1px solid var(--border);
   }
   .source-child-cell {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
     white-space: nowrap;
     overflow: hidden;
@@ -7964,7 +7964,7 @@
   .source-client {
     color: var(--text-primary);
     font-weight: 600;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     max-width: 200px;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -7978,7 +7978,7 @@
      lighter weight so the name still leads the row. */
   .source-software {
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     max-width: 150px;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -7993,18 +7993,18 @@
   .source-addr {
     color: var(--text-muted);
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     letter-spacing: -0.2px;
   }
   .source-state {
     font-weight: 600;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     padding: 1px 7px;
     border-radius: var(--radius-sm);
     line-height: 1.4;
   }
   .source-tag {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     background: color-mix(in srgb, var(--bg-hover) 60%, var(--bg-secondary));
     border: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
@@ -8020,7 +8020,7 @@
   }
   .source-inline-btn {
     margin-left: 8px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     padding: 2px 8px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -8074,11 +8074,11 @@
   .source-failed-note {
     font-style: italic;
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
   }
   .flag-cell {
     text-align: center;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     line-height: 1;
     padding: 2px 0 !important;
     white-space: nowrap;
@@ -8091,7 +8091,7 @@
     align-items: center;
     gap: 6px;
     padding-left: 20px;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
   }
   .source-summary strong {
@@ -8099,7 +8099,7 @@
     font-weight: 700;
   }
   .ss-chip {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     padding: 0 5px;
     border-radius: var(--radius-sm);
     font-variant-numeric: tabular-nums;

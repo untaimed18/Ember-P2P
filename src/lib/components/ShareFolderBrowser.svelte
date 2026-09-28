@@ -875,7 +875,7 @@
     padding: 12px 16px;
     border-bottom: 1px solid var(--border);
   }
-  .modal-title { font-weight: 600; font-size: 14px; }
+  .modal-title { font-weight: 600; font-size: var(--font-size-base); }
   .modal-close {
     display: inline-flex;
     align-items: center;
@@ -952,7 +952,7 @@
     background: transparent;
     color: var(--text-primary);
     font: inherit;
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
   .path-input:focus {
     outline: none;
@@ -963,7 +963,7 @@
   .error {
     margin: 0 12px 10px;
     padding: 6px 8px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--badge-danger-text);
     background: color-mix(in srgb, var(--danger) 10%, var(--bg-secondary));
     border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
@@ -996,7 +996,7 @@
     gap: 6px;
     min-height: 32px;
     padding: 2px 8px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-secondary);
     cursor: pointer;
     border-radius: var(--radius-sm);
@@ -1049,7 +1049,7 @@
     border-bottom: 1px solid var(--border);
     border-radius: 0;
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     letter-spacing: 0.02em;
   }
@@ -1063,7 +1063,7 @@
   }
   .list-size {
     justify-self: end;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-variant-numeric: tabular-nums;
     color: var(--text-muted);
     white-space: nowrap;
@@ -1092,7 +1092,7 @@
   }
   .badge {
     margin-left: auto;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     padding: 1px 6px;
     border-radius: var(--radius-pill);
@@ -1119,7 +1119,7 @@
     padding: 24px 12px;
     text-align: center;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
   .modal-footer {
     display: flex;
@@ -1139,7 +1139,7 @@
   .selection-meta {
     margin: 0;
     min-height: 2.8em;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.4;
     color: var(--text-secondary);
   }
@@ -1150,7 +1150,7 @@
     column-gap: 8px;
     row-gap: 2px;
     min-height: 20px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
     font-variant-numeric: tabular-nums;
@@ -1171,7 +1171,7 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 400;
     color: var(--text-muted);
   }
@@ -1188,7 +1188,7 @@
   }
   .summary-hint {
     margin-left: 4px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 400;
     color: var(--text-muted);
   }
@@ -1196,7 +1196,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 12.5px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     cursor: pointer;
   }

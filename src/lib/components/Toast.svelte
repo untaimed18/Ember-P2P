@@ -118,7 +118,7 @@
     gap: 10px;
     padding: 10px 12px 10px 14px;
     border-radius: var(--radius-md);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     background: var(--bg-secondary);
     border: 1px solid var(--border);
@@ -183,7 +183,7 @@
     padding: 0;
     opacity: 0.85;
     flex-shrink: 0;
-    transition: opacity 0.12s, background 0.12s, color 0.12s;
+    transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
   }
   .toast-close:hover {
     opacity: 1;

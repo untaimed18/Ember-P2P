@@ -754,7 +754,7 @@
   .hint {
     display: block;
     margin: 0;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     line-height: 1.5;
     color: var(--text-muted);
   }
@@ -763,7 +763,7 @@
   }
   .error {
     margin: 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--danger);
   }
   .mono {
@@ -783,7 +783,7 @@
   }
   .subsection-title {
     margin: 0 0 -7px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 700;
     letter-spacing: 0.06em;
     text-transform: uppercase;
@@ -795,7 +795,7 @@
     gap: 8px;
   }
   .row-label {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 500;
     color: var(--text-secondary);
   }
@@ -817,7 +817,7 @@
     gap: 4px;
   }
   .toggle-title {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 500;
     line-height: 1.4;
     color: var(--text-primary);
@@ -860,15 +860,15 @@
     min-width: 0;
   }
   .item-name {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     overflow-wrap: anywhere;
   }
   .item-name.mono {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
   .item-meta {
-    font-size: 11.5px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
   .item-meta.warn {
@@ -902,7 +902,7 @@
     border: none;
     background: transparent;
     padding: 7px 10px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     outline: none;
     box-shadow: none;
@@ -914,11 +914,11 @@
     background: var(--bg-surface);
     color: var(--text-secondary);
     padding: 0 14px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     white-space: nowrap;
     cursor: pointer;
-    transition: background 0.15s, color 0.15s;
+    transition: background var(--transition-normal), color var(--transition-normal);
   }
   .folder-btn:hover:not(:disabled) {
     background: var(--bg-hover);
@@ -932,7 +932,7 @@
     flex-wrap: wrap;
   }
   .action-btn {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     padding: 6px 14px;
     background: var(--bg-surface);
@@ -940,7 +940,7 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     white-space: nowrap;
-    transition: background 0.15s, color 0.15s, border-color 0.15s;
+    transition: background var(--transition-normal), color var(--transition-normal), border-color var(--transition-normal);
   }
   .action-btn:hover:not(:disabled) {
     background: var(--bg-hover);
@@ -994,7 +994,7 @@
     min-width: 0;
   }
   .notice-title {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
   }

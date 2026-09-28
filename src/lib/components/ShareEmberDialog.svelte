@@ -314,7 +314,7 @@
   }
 
   .share-brand h2 {
-    font-size: 16px;
+    font-size: var(--font-size-lg);
     font-weight: 700;
     color: var(--text-primary);
     margin: 0 0 4px;
@@ -323,7 +323,7 @@
 
   .share-lede {
     margin: 0;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     line-height: 1.45;
     color: var(--text-secondary);
   }
@@ -340,7 +340,7 @@
     flex: 1;
     min-width: 0;
     font-family: var(--font-mono, ui-monospace, monospace);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     background: var(--bg-tertiary);
     border: 1px solid var(--border);
@@ -358,7 +358,7 @@
     align-items: center;
     gap: 6px;
     padding: 8px 12px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     font-family: inherit;
     border-radius: var(--radius-md);
@@ -405,7 +405,7 @@
 
   .share-on {
     margin: 0 0 8px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     letter-spacing: 0.04em;
     text-transform: uppercase;
@@ -427,7 +427,7 @@
     border-radius: var(--radius-md);
     background: transparent;
     color: var(--text-primary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-family: inherit;
     text-align: left;
     cursor: pointer;
@@ -470,7 +470,7 @@
 
   .share-error {
     color: var(--danger);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     margin: 12px 0 0;
   }
 
@@ -482,7 +482,7 @@
 
   .share-close {
     padding: 8px 18px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     font-family: inherit;
     border-radius: var(--radius-md);

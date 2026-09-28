@@ -921,7 +921,7 @@
   }
 
   .relaunch-sub {
-    font-size: 14px;
+    font-size: var(--font-size-base);
     color: var(--text-muted);
     margin: 0;
   }
@@ -968,12 +968,12 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 700;
     border: 2px solid var(--border);
     color: var(--text-muted);
     background: var(--bg-surface);
-    transition: all 0.2s ease;
+    transition: all var(--transition-normal) ease;
   }
 
   .progress-dot.active .dot {
@@ -1011,7 +1011,7 @@
     background: var(--border);
     margin: 0 2px;
     margin-bottom: 18px;
-    transition: background 0.2s ease;
+    transition: background var(--transition-normal) ease;
   }
 
   .progress-line.filled {
@@ -1023,7 +1023,7 @@
     flex: 1;
     overflow-y: auto;
     padding: 24px 28px;
-    transition: opacity 0.18s ease, transform 0.18s ease;
+    transition: opacity var(--transition-normal) ease, transform var(--transition-normal) ease;
   }
 
   .step-content {
@@ -1031,20 +1031,20 @@
   }
 
   .step-title {
-    font-size: 20px;
+    font-size: var(--font-size-2xl);
     font-weight: 700;
     color: var(--text-primary);
     margin: 0 0 6px;
   }
 
   .welcome-title {
-    font-size: 24px;
+    font-size: var(--font-size-3xl);
     color: var(--accent);
     margin: 0;
   }
 
   .welcome-subtitle {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 1.5px;
@@ -1076,14 +1076,14 @@
   }
 
   .step-desc {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-secondary);
     line-height: 1.6;
     margin: 0 0 16px;
   }
 
   .step-hint {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     margin: 12px 0 0;
   }
@@ -1133,13 +1133,13 @@
 
   .info-card strong {
     display: block;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     margin-bottom: 2px;
   }
 
   .info-card span {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     line-height: 1.5;
   }
@@ -1151,7 +1151,7 @@
 
   .field label {
     display: block;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-secondary);
     margin-bottom: 6px;
@@ -1166,10 +1166,10 @@
     border-radius: var(--radius-sm);
     background: var(--bg-input);
     color: var(--text-primary);
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-family: inherit;
     outline: none;
-    transition: border-color 0.15s;
+    transition: border-color var(--transition-normal);
     box-sizing: border-box;
   }
 
@@ -1196,7 +1196,7 @@
     flex: 1;
     min-width: 0;
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
   }
 
@@ -1206,10 +1206,10 @@
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--accent);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     cursor: pointer;
-    transition: background 0.15s, color 0.15s;
+    transition: background var(--transition-normal), color var(--transition-normal);
     white-space: nowrap;
   }
 
@@ -1241,9 +1241,9 @@
     border-radius: var(--radius-sm);
     background: var(--bg-surface);
     color: var(--text-secondary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     cursor: pointer;
-    transition: border-color 0.15s, color 0.15s;
+    transition: border-color var(--transition-normal), color var(--transition-normal);
   }
 
   .speed-test-btn:hover:not(:disabled) {
@@ -1257,7 +1257,7 @@
   }
 
   .speed-result {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--success);
     margin: 8px 0 0;
   }
@@ -1286,13 +1286,13 @@
 
   .connect-option strong {
     display: block;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     margin-bottom: 2px;
   }
 
   .connect-option span {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     line-height: 1.5;
   }
@@ -1334,12 +1334,12 @@
     padding: 14px;
     background: var(--bg-surface);
     cursor: pointer;
-    transition: border-color 0.2s, box-shadow 0.2s;
+    transition: border-color var(--transition-normal), box-shadow var(--transition-normal);
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 10px;
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-weight: 600;
     color: var(--text-primary);
   }
@@ -1452,13 +1452,13 @@
   }
 
   .summary-label {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-secondary);
     font-weight: 500;
   }
 
   .summary-value {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     font-weight: 600;
     text-align: right;
@@ -1470,7 +1470,7 @@
 
   .summary-value.mono {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
 
   /* Footer */
@@ -1489,10 +1489,10 @@
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-secondary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     cursor: pointer;
-    transition: border-color 0.15s, color 0.15s;
+    transition: border-color var(--transition-normal), color var(--transition-normal);
   }
 
   .btn-back:hover {
@@ -1512,14 +1512,14 @@
     border-radius: var(--radius-sm);
     background: var(--accent);
     color: var(--on-accent);
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-weight: 600;
     cursor: pointer;
-    transition: background 0.15s;
+    transition: background var(--transition-normal);
   }
 
   .next-reason {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     text-align: right;
   }
@@ -1534,7 +1534,7 @@
 
   .btn-finish {
     padding: 10px 32px;
-    font-size: 15px;
+    font-size: var(--font-size-base);
     display: inline-flex;
     align-items: center;
     gap: 8px;
@@ -1551,7 +1551,7 @@
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--danger) 12%, transparent);
     color: var(--danger);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     line-height: 1.4;
   }
 
@@ -1567,7 +1567,7 @@
   }
 
   .dl-heading {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-secondary);
     text-transform: uppercase;
@@ -1579,7 +1579,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
   }
 
@@ -1602,7 +1602,7 @@
   }
 
   .dl-warn {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
 

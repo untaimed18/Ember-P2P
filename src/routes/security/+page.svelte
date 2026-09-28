@@ -825,7 +825,7 @@
     background: var(--bg-primary);
     color: var(--text-primary);
     font-family: inherit;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
   .ipfilter-url-form input[type='url']:focus {
     border-color: var(--accent);
@@ -841,7 +841,7 @@
     align-items: center;
     justify-content: space-between;
     padding: 8px 16px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
   /* --- Controls bar (combines toggles + inline stats) --- */
   .controls-bar {
@@ -864,7 +864,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     white-space: nowrap;
   }
@@ -873,7 +873,7 @@
   .hits-stat { color: var(--danger); font-weight: 600; }
 
   .add-range-btn {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 4px 10px;
   }
 
@@ -899,7 +899,7 @@
     min-width: 140px;
   }
   .add-field-label {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     font-weight: 600;
     text-transform: uppercase;
@@ -908,15 +908,15 @@
   .ip-input {
     width: 156px;
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
   .desc-input {
     width: 100%;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
   .range-sep {
     color: var(--text-muted);
-    font-size: 14px;
+    font-size: var(--font-size-base);
     flex-shrink: 0;
     align-self: end;
     padding-bottom: 6px;
@@ -945,7 +945,7 @@
     border-radius: var(--radius-pill);
     padding: 0 8px;
     background: var(--bg-input);
-    transition: border-color 0.15s, box-shadow 0.15s;
+    transition: border-color var(--transition-normal), box-shadow var(--transition-normal);
   }
   .search-wrap:focus-within {
     border-color: var(--accent);
@@ -963,7 +963,7 @@
     border: none;
     background: transparent;
     padding: 6px 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: inherit;
     outline: none;
     box-shadow: none;
@@ -987,7 +987,7 @@
     background: var(--bg-hover);
   }
   .result-count {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
@@ -1020,7 +1020,7 @@
   .ip-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     table-layout: fixed;
   }
   .ip-table thead {
@@ -1033,7 +1033,7 @@
     text-align: left;
     white-space: nowrap;
     font-weight: 600;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     background: var(--bg-surface);
     border-bottom: 1px solid var(--border);
     user-select: none;
@@ -1074,7 +1074,7 @@
     box-sizing: border-box;
   }
   .ip-table tbody tr {
-    transition: background-color 0.1s;
+    transition: background-color var(--transition-fast);
   }
   .ip-table tbody tr.row-alt td {
     background: color-mix(in srgb, var(--bg-secondary) 90%, var(--bg-primary));
@@ -1099,7 +1099,7 @@
 
   .ip-cell {
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
   }
@@ -1109,7 +1109,7 @@
   .range-arrow {
     color: var(--text-muted);
     margin: 0 4px;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
   }
   .desc-cell {
     overflow: hidden;
@@ -1120,7 +1120,7 @@
   .hits-cell {
     text-align: right;
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-variant-numeric: tabular-nums;
   }
   .hit-count {
@@ -1153,7 +1153,7 @@
     cursor: pointer;
     line-height: 1;
     opacity: 0.7;
-    transition: opacity 0.15s, background 0.12s, border-color 0.12s, color 0.12s;
+    transition: opacity var(--transition-normal), background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
   }
   .btn-remove:hover {
     color: var(--on-danger);

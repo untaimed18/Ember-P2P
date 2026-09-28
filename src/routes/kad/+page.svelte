@@ -1474,7 +1474,7 @@
     justify-content: space-between;
     gap: 12px;
     padding: 8px 20px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
 
   .kad-layout {
@@ -1526,7 +1526,7 @@
 
   .toolbar-label {
     padding: 9px 14px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-secondary);
     white-space: nowrap;
@@ -1538,7 +1538,7 @@
     max-width: 280px;
     margin: 4px 6px 4px 0;
     padding: 5px 12px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     background: var(--bg-secondary);
     color: var(--text-primary);
     border: 1px solid var(--border);
@@ -1555,7 +1555,7 @@
   .filter-select {
     margin: 4px 6px 4px 0;
     padding: 5px 24px 5px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     background-color: var(--bg-secondary);
     color: var(--text-primary);
     border: 1px solid var(--border);
@@ -1615,7 +1615,7 @@
     padding: 14px 20px;
     border-bottom: 1px solid var(--border);
   }
-  .modal-header h3 { margin: 0; font-size: 16px; font-weight: 600; }
+  .modal-header h3 { margin: 0; font-size: var(--font-size-lg); font-weight: 600; }
   .modal-close {
     display: inline-flex;
     align-items: center;
@@ -1651,7 +1651,7 @@
     margin-bottom: 12px;
   }
   .form-label {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-secondary);
     width: 80px;
@@ -1660,7 +1660,7 @@
   .form-input {
     flex: 1;
     padding: 7px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     background: var(--bg-input);
@@ -1687,7 +1687,7 @@
     border: none;
     border-bottom: 2px solid transparent;
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
   }
   .bootstrap-tabs button:hover {
@@ -1698,7 +1698,7 @@
     border-bottom-color: var(--accent);
   }
   .bootstrap-hint {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     margin: 0 0 12px 0;
     line-height: 1.5;
@@ -1723,7 +1723,7 @@
   }
 
   .panel-title {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -1785,7 +1785,7 @@
     align-items: center;
     justify-content: center;
     gap: 6px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 7px 10px;
     white-space: nowrap;
   }
@@ -1826,7 +1826,7 @@
   .stat-label {
     color: var(--text-muted);
     font-weight: 500;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     text-transform: uppercase;
     letter-spacing: 0.5px;
     white-space: nowrap;
@@ -1837,7 +1837,7 @@
   .stat-value {
     color: var(--text-primary);
     font-weight: 600;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1848,7 +1848,7 @@
      counts read at a glance. Tabular numerals keep digits aligned
      across rows. */
   .stat-numeric {
-    font-size: 18px;
+    font-size: var(--font-size-xl);
     font-weight: 700;
     font-variant-numeric: tabular-nums;
     letter-spacing: -0.3px;
@@ -1878,7 +1878,7 @@
     align-items: center;
     gap: 8px;
     padding: 9px 14px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-secondary);
     background: var(--bg-surface);
@@ -1894,7 +1894,7 @@
 
   .page-subtitle {
     margin: 4px 0 0;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     line-height: 1.5;
     color: var(--text-muted);
     max-width: 70ch;
@@ -1903,12 +1903,12 @@
   .compact-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
 
   .compact-table th {
     padding: 5px 8px;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     position: sticky;
     top: 0;
     z-index: 1;
@@ -1918,7 +1918,7 @@
 
   .compact-table td {
     padding: 3px 8px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     line-height: 1.2;
   }
 
@@ -1989,7 +1989,7 @@
     width: 1px;
     transform: translateX(-50%);
     background: transparent;
-    transition: background 0.12s ease;
+    transition: background var(--transition-fast) ease;
   }
 
   .searches-table th:hover .col-resize-handle::after,
@@ -2013,13 +2013,13 @@
    */
   .contact-id {
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
   }
 
   .distance {
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-secondary);
   }
 
@@ -2046,7 +2046,7 @@
     align-items: center;
     justify-content: center;
     opacity: 0;
-    transition: opacity 0.1s, color 0.1s, background 0.1s;
+    transition: opacity var(--transition-fast), color var(--transition-fast), background var(--transition-fast);
     color: var(--text-secondary);
     line-height: 1;
     background: none;
@@ -2070,7 +2070,7 @@
   }
 
   .contact-type {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 500;
     display: inline-flex;
     align-items: center;

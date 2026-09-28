@@ -846,7 +846,7 @@
     color: var(--on-accent);
     text-decoration: none;
     font-weight: 600;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     border-radius: 0 0 var(--radius-md) 0;
   }
 

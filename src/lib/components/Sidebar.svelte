@@ -715,7 +715,7 @@
   }
 
   .logo-sub {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 1px;
@@ -757,7 +757,7 @@
   }
 
   .nav-group-label {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     letter-spacing: 0.08em;
     text-transform: uppercase;
@@ -817,7 +817,7 @@
     border-radius: 0;
     background: transparent;
     color: var(--text-muted);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-family: inherit;
     cursor: pointer;
     text-align: left;
@@ -904,7 +904,7 @@
     color: var(--text-secondary);
     text-decoration: none;
     transition: background-color var(--transition-normal), color var(--transition-normal), padding var(--transition-normal);
-    font-size: 14px;
+    font-size: var(--font-size-base);
     overflow: hidden;
   }
 
@@ -1032,7 +1032,7 @@
     border-radius: var(--radius-pill);
     background: var(--accent);
     color: var(--on-accent);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     display: inline-flex;
     align-items: center;
@@ -1067,14 +1067,14 @@
     height: 18px;
     padding: 0 6px 0 4px;
     border-radius: var(--radius-pill);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     line-height: 1;
     font-variant-numeric: tabular-nums;
   }
 
   .tc-arrow {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     line-height: 1;
   }
 

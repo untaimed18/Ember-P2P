@@ -1347,7 +1347,7 @@
     align-items: center;
     justify-content: space-between;
     padding: 8px 20px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
 
   .server-layout {
@@ -1384,7 +1384,7 @@
 
   .toolbar-label {
     padding: 8px 16px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-secondary);
   }
@@ -1398,7 +1398,7 @@
 
   .btn-sm {
     padding: 3px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .toolbar-count {
@@ -1415,7 +1415,7 @@
     border-radius: var(--radius-pill);
     background: var(--bg-input);
     overflow: hidden;
-    transition: border-color 0.15s ease;
+    transition: border-color var(--transition-normal) ease;
   }
 
   .server-filter-wrap:focus-within {
@@ -1428,7 +1428,7 @@
     border: none;
     outline: none;
     background: transparent;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 6px 8px;
     color: var(--text-primary);
     box-shadow: none;
@@ -1484,12 +1484,12 @@
   .server-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .server-table th {
     padding: 6px 10px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     position: sticky;
     top: 0;
     z-index: 1;
@@ -1499,7 +1499,7 @@
 
   .server-table td {
     padding: 5px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     cursor: default;
     /* Global app.css adds td border-bottom; keep only the header row line */
     border-bottom: none;
@@ -1522,7 +1522,7 @@
   }
 
   .server-table tbody tr {
-    transition: background 0.1s;
+    transition: background var(--transition-fast);
   }
 
   .server-table tbody tr:hover {
@@ -1577,7 +1577,7 @@
     border-radius: var(--radius-sm);
     background: var(--bg-tertiary);
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     flex-shrink: 0;
   }
@@ -1589,7 +1589,7 @@
 
   .ip-cell {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
     white-space: nowrap;
   }
@@ -1644,7 +1644,7 @@
   }
 
   .side-title {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -1665,13 +1665,13 @@
   }
 
   .form-field label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     font-weight: 500;
   }
 
   .form-field input {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 7px 10px;
   }
 
@@ -1685,7 +1685,7 @@
 
   .add-btn {
     align-self: flex-end;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 5px 16px;
   }
 
@@ -1703,7 +1703,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 2px 0;
   }
 
@@ -1726,7 +1726,7 @@
 
   .info-value.mono {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
 
   /* Bottom log area */
@@ -1752,7 +1752,7 @@
     overflow-y: auto;
     padding: 8px 16px;
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     background: var(--bg-primary);
     min-height: 0;
   }
@@ -1805,7 +1805,7 @@
 
   .badge.lowid,
   .badge.highid {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     padding: 1px 6px;
   }
 
@@ -1829,7 +1829,7 @@
   }
 
   .stats-row .stat-card .value {
-    font-size: 20px;
+    font-size: var(--font-size-2xl);
     line-height: 1.15;
   }
 
@@ -1870,7 +1870,7 @@
   }
 
   .form-field label {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .form-field input {

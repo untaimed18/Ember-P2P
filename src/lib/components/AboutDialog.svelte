@@ -170,7 +170,7 @@
   }
 
   .about-wordmark h2 {
-    font-size: 20px;
+    font-size: var(--font-size-2xl);
     font-weight: 700;
     letter-spacing: 1.5px;
     color: var(--accent);
@@ -179,7 +179,7 @@
   }
 
   .about-tagline {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 1px;
@@ -188,7 +188,7 @@
   }
 
   .about-version {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
     margin: 0 0 10px;
@@ -196,20 +196,20 @@
 
   .about-description {
     color: var(--text-secondary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     line-height: 1.5;
     margin: 0 0 12px;
   }
 
   .about-license {
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     margin: 0 0 18px;
   }
 
   .about-website-error {
     color: var(--danger);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     margin: -10px 0 14px;
   }
 
@@ -222,7 +222,7 @@
 
   .about-website {
     padding: 8px 4px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     border: none;
     background: transparent;
@@ -244,7 +244,7 @@
 
   .about-close {
     padding: 8px 18px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     border-radius: var(--radius-md);
     border: 1px solid var(--border);

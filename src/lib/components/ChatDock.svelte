@@ -999,7 +999,7 @@
     background: transparent;
     color: var(--text-primary);
     font: inherit;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     text-align: left;
     cursor: pointer;
@@ -1075,7 +1075,7 @@
     background: var(--accent);
     color: var(--on-accent);
     font: inherit;
-    font-size: 10.5px;
+    font-size: var(--font-size-xs);
     font-weight: 700;
     line-height: 1.4;
     cursor: pointer;
@@ -1160,7 +1160,7 @@
     background: var(--bg-secondary);
     color: var(--text-primary);
     font: inherit;
-    font-size: 12.5px;
+    font-size: var(--font-size-md);
   }
 
   .dock-search-input:focus {
@@ -1179,7 +1179,7 @@
   .dock-list-section {
     margin: 6px 0 4px;
     padding: 0 8px;
-    font-size: 10.5px;
+    font-size: var(--font-size-xs);
     font-weight: 700;
     letter-spacing: 0.04em;
     text-transform: uppercase;
@@ -1193,7 +1193,7 @@
     padding: 7px 8px;
     border-radius: var(--radius-sm);
     color: var(--text-primary);
-    font-size: 12.5px;
+    font-size: var(--font-size-md);
     cursor: pointer;
   }
 
@@ -1218,7 +1218,7 @@
   .dock-row-unread {
     background: var(--accent);
     color: var(--on-accent);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     padding: 1px 6px;
     border-radius: var(--radius-pill);
@@ -1259,7 +1259,7 @@
     margin: 0;
     padding: 14px 10px;
     color: var(--text-muted);
-    font-size: 12.5px;
+    font-size: var(--font-size-md);
     text-align: center;
   }
 
@@ -1274,7 +1274,7 @@
 
   .dock-offers-title {
     margin-bottom: 8px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-secondary);
   }
@@ -1299,7 +1299,7 @@
   }
 
   .dock-offer-name {
-    font-size: 12.5px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1307,7 +1307,7 @@
   }
 
   .dock-offer-meta {
-    font-size: 11.5px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
 
@@ -1320,7 +1320,7 @@
   .dock-offer-accept,
   .dock-offer-dismiss {
     font: inherit;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 4px 8px;
     border-radius: var(--radius-sm);
     cursor: pointer;
@@ -1362,20 +1362,20 @@
 
   .empty-title {
     margin: 4px 0 0;
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-weight: 600;
     color: var(--text-primary);
   }
 
   .empty-hint {
     margin: 0;
-    font-size: 12.5px;
+    font-size: var(--font-size-md);
     line-height: 1.5;
     max-width: 280px;
   }
 
   .empty-cta {
     margin-top: 8px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
 </style>

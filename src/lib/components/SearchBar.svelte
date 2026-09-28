@@ -363,7 +363,7 @@
       var(--bg-input)
     );
     box-shadow: var(--shadow-sm);
-    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    transition: border-color var(--transition-normal) ease, box-shadow var(--transition-normal) ease;
   }
 
   .search-bar:focus-within {
@@ -380,7 +380,7 @@
     border-radius: 50%;
     background: var(--accent-fill);
     color: var(--text-accent);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 700;
     flex-shrink: 0;
   }
@@ -390,7 +390,7 @@
     border: none;
     background: none;
     padding: 10px 0;
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-weight: 500;
     color: var(--text-primary);
     min-width: 0;
@@ -447,7 +447,7 @@
     justify-content: space-between;
     align-items: center;
     padding: 6px 12px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     text-transform: uppercase;
     letter-spacing: 0.5px;
     color: var(--text-muted);
@@ -459,7 +459,7 @@
     background: none;
     border: none;
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     text-transform: none;
     letter-spacing: normal;
     cursor: pointer;
@@ -482,7 +482,7 @@
     border: none;
     background: transparent;
     color: var(--text-primary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     text-align: left;
     cursor: pointer;
   }

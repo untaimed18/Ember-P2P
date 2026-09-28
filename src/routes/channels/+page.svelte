@@ -3723,7 +3723,7 @@
   }
 
   .header-count {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
     color: var(--text-muted);
     white-space: nowrap;
@@ -3751,7 +3751,7 @@
     cursor: pointer;
     font-family: inherit;
     font-weight: 600;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .add-btn.primary:hover:not(:disabled) {
@@ -3794,7 +3794,7 @@
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-primary);
     cursor: pointer;
@@ -3822,7 +3822,7 @@
   .how-lede,
   .how-limits {
     margin: 0 0 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.5;
     color: var(--text-muted);
     max-width: 52rem;
@@ -3858,7 +3858,7 @@
 
   .form-title {
     margin: 0 0 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.4px;
@@ -3902,12 +3902,12 @@
   }
 
   .create-language-label {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
   }
 
   .name-count {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
     flex-shrink: 0;
@@ -4066,7 +4066,7 @@
     border-radius: var(--radius-pill);
     background: var(--bg-input);
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .search-clear {
@@ -4099,7 +4099,7 @@
     overflow: auto;
   }
 
-  .list-empty { padding: 16px 10px; text-align: center; font-size: 12px; }
+  .list-empty { padding: 16px 10px; text-align: center; font-size: var(--font-size-sm); }
 
   /* Sized like the dock switcher's section labels, so the two lists read as
      one family. A fixed height keeps the header from growing when its action
@@ -4118,7 +4118,7 @@
 
   .list-section-label {
     margin: 0;
-    font-size: 10.5px;
+    font-size: var(--font-size-xs);
     font-weight: 700;
     letter-spacing: 0.04em;
     text-transform: uppercase;
@@ -4126,7 +4126,7 @@
   }
 
   .list-section-action {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-family: inherit;
     padding: 2px 6px;
     border: none;
@@ -4144,7 +4144,7 @@
 
   .form-hint {
     margin: 0 0 10px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-secondary);
   }
 
@@ -4281,7 +4281,7 @@
   }
 
   .chan-door {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 5px 12px;
     min-width: 62px;
     text-align: center;
@@ -4330,7 +4330,7 @@
     align-items: center;
     gap: 3px;
     flex-shrink: 0;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
     line-height: 1;
@@ -4467,7 +4467,7 @@
     border-radius: var(--radius-pill);
     background: var(--accent);
     color: var(--on-accent);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 700;
     display: inline-flex;
     align-items: center;
@@ -4542,7 +4542,7 @@
   .conv-heading h3 {
     margin: 0;
     min-width: 0;
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-weight: 650;
     line-height: 1.2;
     overflow-wrap: anywhere;
@@ -4558,7 +4558,7 @@
 
   .topic {
     margin: 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -4587,7 +4587,7 @@
   .topic-mark {
     color: var(--accent);
     font-weight: 700;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1;
     flex-shrink: 0;
   }
@@ -4626,7 +4626,7 @@
 
   .conv-action {
     padding: 5px 12px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     border-radius: var(--radius-pill);
   }
 
@@ -4704,11 +4704,11 @@
 
   .modal-title {
     font-weight: 600;
-    font-size: 14px;
+    font-size: var(--font-size-base);
   }
 
   .room-settings-room {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -4812,7 +4812,7 @@
     padding: 8px 14px;
     border-bottom: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));
     background: color-mix(in srgb, var(--warning) 12%, transparent);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--badge-warning-text);
     flex-shrink: 0;
   }
@@ -4824,13 +4824,13 @@
     padding: 8px 14px;
     border-bottom: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
     background: color-mix(in srgb, var(--danger) 10%, transparent);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     flex-shrink: 0;
   }
 
   .key-behind-banner strong {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
   }
 
@@ -4884,7 +4884,7 @@
     border-radius: var(--radius-pill);
     background: color-mix(in srgb, var(--text-muted) 16%, transparent);
     color: var(--text-secondary);
-    font-size: 10.5px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     line-height: 18px;
     text-align: center;
@@ -4892,7 +4892,7 @@
   }
 
   .xfer-drawer-rate {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     color: var(--accent);
     font-variant-numeric: tabular-nums;
@@ -4980,7 +4980,7 @@
   }
 
   .xfer-name {
-    font-size: 12.5px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
     overflow: hidden;
@@ -4989,14 +4989,14 @@
   }
 
   .xfer-meta {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
   }
 
   .xfer-status {
     margin: 0;
-    font-size: 11.5px;
+    font-size: var(--font-size-sm);
     line-height: 1.35;
     color: var(--text-secondary);
     overflow-wrap: anywhere;
@@ -5047,7 +5047,7 @@
     align-items: baseline;
     gap: 8px;
     margin-top: -2px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
@@ -5078,7 +5078,7 @@
     flex: 1;
     min-width: 0;
     padding: 5px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
   }
 
@@ -5104,7 +5104,7 @@
     border-radius: var(--radius-pill);
     background: var(--accent);
     color: var(--on-accent);
-    font-size: 9.5px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     line-height: 15px;
     text-align: center;
@@ -5134,14 +5134,14 @@
 
   .succession-title {
     margin: 0;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
   }
 
   .succession-hint {
     margin: -4px 0 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
     color: var(--text-secondary);
   }
@@ -5150,7 +5150,7 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
     color: var(--text-secondary);
   }
@@ -5164,7 +5164,7 @@
     padding: 8px 14px;
     border-bottom: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
     background: color-mix(in srgb, var(--accent) 8%, var(--bg-tertiary));
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     line-height: 1.45;
     flex-shrink: 0;
@@ -5194,7 +5194,7 @@
     border-bottom: 1px solid var(--border);
     background: var(--bg-surface);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
     flex-shrink: 0;
   }
@@ -5225,7 +5225,7 @@
     align-items: baseline;
     gap: 8px;
     padding: 7px 14px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     width: 100%;
     text-align: left;
     border: 0;
@@ -5266,7 +5266,7 @@
   .search-hit-when {
     color: var(--text-muted);
     flex-shrink: 0;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
 
   .transcript {
@@ -5291,7 +5291,7 @@
   }
 
   .members-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -5299,7 +5299,7 @@
   }
 
   .members-count {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
   }
 
@@ -5391,7 +5391,7 @@
   }
 
   .member-seen {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     white-space: nowrap;
   }
@@ -5408,14 +5408,14 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 500;
   }
 
   .member-badges { display: flex; flex-wrap: wrap; gap: 4px; }
 
   .badge {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     color: var(--text-secondary);
     border: 1px solid var(--border);
@@ -5481,7 +5481,7 @@
 
   .card-more-menu button {
     text-align: left;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-family: inherit;
     padding: 6px 10px;
     border: none;
@@ -5514,7 +5514,7 @@
 
   .menu-heading {
     padding: 4px 10px 2px;
-    font-size: 10.5px;
+    font-size: var(--font-size-xs);
     font-weight: 700;
     letter-spacing: 0.04em;
     text-transform: uppercase;
@@ -5541,7 +5541,7 @@
     gap: 2px;
     max-width: 220px;
     white-space: normal;
-    font-size: 11.5px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
   }
 
@@ -5698,7 +5698,7 @@
     .conversation-pane.hidden-when-list { display: none; }
 
     .conv-actions .ghost,
-    .conv-actions .conv-action { padding: 5px 9px; font-size: 12px; }
+    .conv-actions .conv-action { padding: 5px 9px; font-size: var(--font-size-sm); }
   }
 
   @media (max-width: 760px) {

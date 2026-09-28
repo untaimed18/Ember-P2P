@@ -1611,7 +1611,7 @@
     padding: 8px 16px;
     border-radius: var(--radius-md);
     margin-bottom: 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .error-banner {
@@ -1671,7 +1671,7 @@
   }
 
   .my-id-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -1680,7 +1680,7 @@
 
   .my-id-hash {
     font-family: var(--font-mono);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     letter-spacing: 0.4px;
     user-select: all;
@@ -1688,7 +1688,7 @@
   }
 
   .my-id-hint {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     margin-top: 2px;
   }
@@ -1700,7 +1700,7 @@
     margin-top: 4px;
     padding: 2px 8px;
     border-radius: var(--radius-pill);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
   }
 
@@ -1728,7 +1728,7 @@
     border-radius: var(--radius-md);
     background: transparent;
     color: var(--accent);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -1766,7 +1766,7 @@
   }
 
   .my-id-reset {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     padding: 4px 10px;
     white-space: nowrap;
   }
@@ -1781,7 +1781,7 @@
   }
 
   .how-title {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-primary);
     margin-bottom: 6px;
@@ -1793,7 +1793,7 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
     color: var(--text-secondary);
   }
@@ -1830,7 +1830,7 @@
 
   .add-btn {
     font-weight: 600;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .add-btn.primary {
@@ -1849,7 +1849,7 @@
   }
 
   .inline-stat {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     font-weight: 500;
     white-space: nowrap;
@@ -1878,7 +1878,7 @@
     border-radius: var(--radius-md);
     background: var(--bg-input);
     color: var(--text-primary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-family: inherit;
   }
 
@@ -1900,7 +1900,7 @@
   }
 
   .field-error {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--danger);
     margin-top: 8px;
     padding-left: 2px;
@@ -1929,7 +1929,7 @@
     border-radius: var(--radius-pill);
     background: var(--bg-input);
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-family: inherit;
   }
 
@@ -1966,7 +1966,7 @@
   }
 
   .result-count {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
 
@@ -2044,7 +2044,7 @@
   }
 
   .card-substatus {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -2052,7 +2052,7 @@
   }
 
   .card-legacy-hint {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--warning);
     line-height: 1.35;
   }
@@ -2072,7 +2072,7 @@
     background: none;
     color: var(--text-primary);
     font-weight: 600;
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-family: inherit;
     padding: 2px 4px;
     margin: -2px -4px;
@@ -2099,7 +2099,7 @@
     border-radius: var(--radius-sm);
     background: var(--bg-input);
     color: var(--text-primary);
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-family: inherit;
     font-weight: 600;
   }
@@ -2131,7 +2131,7 @@
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--accent) 12%, transparent);
     color: var(--accent);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -2213,7 +2213,7 @@
 
   .card-more-menu button {
     text-align: left;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-family: inherit;
     padding: 6px 10px;
     border: none;
@@ -2240,7 +2240,7 @@
 
   .menu-item-sub {
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     letter-spacing: 0.2px;
     color: var(--text-muted);
   }
@@ -2262,7 +2262,7 @@
   }
 
   .card-more-fact {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
   }
 
@@ -2352,7 +2352,7 @@
   }
 
   .section-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -2481,7 +2481,7 @@
   }
 
   .requests-title {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -2490,7 +2490,7 @@
 
   .requests-explainer {
     padding: 8px 16px 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     line-height: 1.45;
   }
@@ -2504,7 +2504,7 @@
     border-radius: var(--radius-pill);
     background: var(--accent);
     color: var(--on-accent);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     padding: 0 5px;
     line-height: 1;
@@ -2552,7 +2552,7 @@
   }
 
   .request-name {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
     overflow: hidden;
@@ -2565,7 +2565,7 @@
 
   .request-hash {
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     letter-spacing: 0.3px;
   }
@@ -2579,7 +2579,7 @@
   .request-badge {
     display: inline-flex;
     align-items: center;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.4px;
@@ -2610,7 +2610,7 @@
     border-radius: var(--radius-md);
     background: var(--accent);
     color: var(--on-accent);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -2627,7 +2627,7 @@
     border-radius: var(--radius-md);
     background: transparent;
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -2645,7 +2645,7 @@
     border-radius: var(--radius-md);
     background: transparent;
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -2679,7 +2679,7 @@
     border: none;
     background: transparent;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -2710,7 +2710,7 @@
     border-radius: var(--radius-pill);
     background: var(--bg-tertiary);
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     padding: 0 5px;
     line-height: 1;
@@ -2742,7 +2742,7 @@
   }
 
   .blocked-name {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-secondary);
     overflow: hidden;
@@ -2752,13 +2752,13 @@
 
   .blocked-hash {
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
   }
 
   .blocked-hint {
     margin: 8px 2px 0;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
   }
 
@@ -2821,7 +2821,7 @@
   }
 
   .firewall-text {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.5;
   }
 
@@ -2835,7 +2835,7 @@
     border-radius: var(--radius-md);
     background: transparent;
     color: var(--warning);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -2846,7 +2846,7 @@
 
   .firewall-recheck-error {
     margin-left: 10px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--danger);
     align-self: center;
     flex-basis: 100%;

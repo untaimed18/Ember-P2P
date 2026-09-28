@@ -461,7 +461,7 @@
     background: var(--bg-secondary);
     color: var(--text-primary);
     box-shadow: var(--shadow-md);
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
 
   .deferred-link-notice span {

@@ -156,7 +156,7 @@
   .stat-label {
     color: var(--text-muted);
     font-weight: 500;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     text-transform: uppercase;
     letter-spacing: 0.5px;
     white-space: nowrap;
@@ -167,7 +167,7 @@
   .stat-value {
     color: var(--text-primary);
     font-weight: 600;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -176,7 +176,7 @@
 
   .stat-ip {
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .stat-link {

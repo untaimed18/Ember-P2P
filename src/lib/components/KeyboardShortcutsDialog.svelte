@@ -267,7 +267,7 @@
 
   .shortcut-header h3 {
     margin: 0;
-    font-size: 16px;
+    font-size: var(--font-size-lg);
     font-weight: 600;
   }
 
@@ -284,7 +284,7 @@
     color: var(--text-secondary);
     cursor: pointer;
     line-height: 1;
-    transition: background 0.12s, border-color 0.12s, color 0.12s;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
   }
 
   .shortcut-close:hover {
@@ -304,7 +304,7 @@
 
   .shortcut-group h4 {
     margin: 0 0 8px 0;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.6px;
@@ -341,13 +341,13 @@
 
   .shortcut-row dd {
     margin: 0;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-secondary);
   }
 
   .shortcut-plus {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     padding: 0 1px;
   }
 
@@ -363,7 +363,7 @@
     border-bottom-width: 2px;
     border-radius: var(--radius-sm);
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     color: var(--text-primary);
     line-height: 1;
@@ -382,13 +382,13 @@
     display: flex;
     justify-content: flex-end;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .shortcut-hint kbd {
     min-width: auto;
     height: 18px;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     padding: 0 5px;
     margin: 0 2px;
   }

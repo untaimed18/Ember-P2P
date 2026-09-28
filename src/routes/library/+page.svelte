@@ -4473,7 +4473,7 @@
     background: var(--overlay-bg);
     backdrop-filter: blur(2px);
     border: 3px dashed var(--accent);
-    transition: background 0.12s ease;
+    transition: background var(--transition-fast) ease;
   }
   .dnd-overlay.hover { background: color-mix(in srgb, var(--accent) 22%, transparent); }
   .dnd-hint {
@@ -4487,8 +4487,8 @@
     max-width: 360px;
   }
   .dnd-icon { color: var(--accent); margin-bottom: 6px; }
-  .dnd-title { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
-  .dnd-sub { font-size: 12px; color: var(--text-muted); }
+  .dnd-title { font-size: var(--font-size-lg); font-weight: 600; margin-bottom: 4px; }
+  .dnd-sub { font-size: var(--font-size-sm); color: var(--text-muted); }
 
   /* --- Layout --- */
   .page-header {
@@ -4522,7 +4522,7 @@
     align-items: center;
     justify-content: space-between;
     padding: 8px 20px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
 
   .scan-banner {
@@ -4533,7 +4533,7 @@
     background: color-mix(in srgb, var(--accent) 8%, var(--bg-secondary));
     border-bottom: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
     color: var(--badge-accent-text);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     flex-shrink: 0;
   }
   .scan-text { flex: 1; }
@@ -4544,7 +4544,7 @@
     background: var(--bg-secondary);
     border-bottom: 1px solid var(--border);
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     flex-shrink: 0;
   }
   .hash-progress-track {
@@ -4567,7 +4567,7 @@
     background: color-mix(in srgb, var(--danger) 9%, var(--bg-secondary));
     border-bottom: 1px solid color-mix(in srgb, var(--danger) 36%, var(--border));
     color: var(--badge-danger-text);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     flex-shrink: 0;
   }
   .confirm-text { flex: 1; }
@@ -4583,7 +4583,7 @@
   }
   .scan-btn {
     padding: 2px 10px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
     cursor: pointer;
@@ -4629,7 +4629,7 @@
     align-items: center;
     gap: 8px;
     padding: 5px 8px 5px 12px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -4649,7 +4649,7 @@
   .sidebar-add-btn {
     flex-shrink: 0;
     padding: 3px 9px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     /* Both inherit from the uppercase section caption beside it. */
     text-transform: none;
@@ -4676,7 +4676,7 @@
     border: none;
     border-bottom: 1px solid var(--border);
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -4702,13 +4702,13 @@
   .top-metric-switch button {
     flex: 1;
     padding: 3px 6px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     background: var(--bg-primary);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     color: var(--text-muted);
     cursor: pointer;
-    transition: background 0.12s, color 0.12s, border-color 0.12s;
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
   }
   .top-metric-switch button:hover { color: var(--text-primary); }
   .top-metric-switch button.active {
@@ -4729,7 +4729,7 @@
     gap: 8px;
     padding: 4px 10px 6px;
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-variant-numeric: tabular-nums;
   }
   .top-total strong {
@@ -4738,7 +4738,7 @@
   }
   .top-empty {
     padding: 10px 8px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     font-style: italic;
     line-height: 1.4;
@@ -4757,7 +4757,7 @@
     cursor: pointer;
     font: inherit;
     text-align: left;
-    transition: background 0.12s, border-color 0.12s;
+    transition: background var(--transition-fast), border-color var(--transition-fast);
   }
   .top-row:hover {
     background: var(--bg-hover);
@@ -4772,7 +4772,7 @@
     flex-shrink: 0;
     width: 16px;
     text-align: right;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
   }
@@ -4784,7 +4784,7 @@
     flex: 1;
   }
   .top-name {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -4804,7 +4804,7 @@
     transition: width 0.25s ease;
   }
   .top-value {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
   }
@@ -4820,10 +4820,10 @@
     border-radius: var(--radius-md);
     background: var(--bg-surface);
     box-shadow: inset 3px 0 0 transparent;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     cursor: pointer;
     color: var(--text-secondary);
-    transition: background 0.12s, border-color 0.12s, color 0.12s, box-shadow 0.12s;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast), box-shadow var(--transition-fast);
   }
   .tree-item.child {
     flex-direction: row;
@@ -4915,7 +4915,7 @@
     overflow-wrap: anywhere;
     word-break: break-word;
     line-height: 1.3;
-    font-size: 12.5px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
   }
@@ -4923,7 +4923,7 @@
     display: inline-flex;
     align-items: center;
     height: 22px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 500;
     font-variant-numeric: tabular-nums;
     color: var(--text-secondary);
@@ -4961,7 +4961,7 @@
     line-height: 1;
     overflow: visible;
     transform: none;
-    transition: background 0.12s, border-color 0.12s, color 0.12s;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
   }
   button.tree-btn svg {
     width: 13px;
@@ -5010,7 +5010,7 @@
     flex-shrink: 0;
     height: 22px;
     padding: 0 8px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 500;
     line-height: 20px;
     white-space: nowrap;
@@ -5048,7 +5048,7 @@
     height: 22px;
     margin: 0;
     padding: 0 18px 0 6px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 500;
     line-height: 20px;
     border-radius: var(--radius-sm);
@@ -5114,7 +5114,7 @@
   }
   .drawer-title {
     font-weight: 700;
-    font-size: 14px;
+    font-size: var(--font-size-base);
     line-height: 1.3;
     color: var(--text-primary);
     overflow: hidden;
@@ -5131,7 +5131,7 @@
     flex-wrap: wrap;
     align-items: center;
     gap: 4px 6px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     line-height: 1.3;
   }
@@ -5143,7 +5143,7 @@
     background: var(--accent-fill);
     border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
     color: var(--accent);
-    font-size: 10.5px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     line-height: 16px;
   }
@@ -5168,7 +5168,7 @@
     flex-shrink: 0;
     margin-top: 1px;
     line-height: 1;
-    transition: background 0.12s, border-color 0.12s, color 0.12s;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
   }
   .drawer-close:hover {
     color: var(--danger);
@@ -5182,7 +5182,7 @@
     flex: 1;
     overflow-y: auto;
     padding: 10px 12px 16px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     display: flex;
     flex-direction: column;
     gap: 10px;
@@ -5201,7 +5201,7 @@
   .drawer-block-title {
     margin: 0;
     font-weight: 700;
-    font-size: 10.5px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -5216,7 +5216,7 @@
     gap: 10px;
     padding: 8px 10px;
     border-radius: var(--radius-sm);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.35;
   }
   .drawer-alert-danger {
@@ -5232,7 +5232,7 @@
   .drawer-alert-btn {
     flex-shrink: 0;
     padding: 3px 8px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     border-radius: var(--radius-sm);
     border: 1px solid currentColor;
     background: transparent;
@@ -5248,7 +5248,7 @@
   }
   .drawer-section-title {
     font-weight: 700;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     text-transform: uppercase;
     letter-spacing: 0.35px;
@@ -5264,7 +5264,7 @@
   }
   .status-bar {
     padding: 6px 12px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     border-top: 1px solid var(--border);
     background: var(--bg-secondary);
@@ -5309,7 +5309,7 @@
     align-items: center;
     gap: 6px;
     margin-left: auto;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     white-space: nowrap;
     flex-shrink: 0;
@@ -5347,7 +5347,7 @@
     border: none;
     background: transparent;
     padding: 7px 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: inherit;
   }
 
@@ -5379,7 +5379,7 @@
 
   .filter-type {
     padding: 7px 28px 7px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background-color: var(--bg-primary);
@@ -5388,19 +5388,19 @@
   }
 
   .clear-library-filters {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 7px 12px;
   }
   .dupes-toggle {
     padding: 7px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--bg-primary);
     color: inherit;
     cursor: pointer;
     white-space: nowrap;
-    transition: background 0.12s, border-color 0.12s, color 0.12s;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -5447,7 +5447,7 @@
     gap: 8px;
     flex-wrap: wrap;
     flex-shrink: 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
   .bulk-count {
     font-weight: 600;
@@ -5461,7 +5461,7 @@
      this they fall back to the global accent-filled <button> style. Match the
      clean bordered look used by the other toolbars. */
   .bulk-action-bar .tb-btn {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
     padding: 4px 11px;
     min-height: 26px;
@@ -5471,7 +5471,7 @@
     color: var(--text-primary);
     cursor: pointer;
     white-space: nowrap;
-    transition: background 0.13s ease, border-color 0.13s ease, color 0.13s ease;
+    transition: background var(--transition-fast) ease, border-color var(--transition-fast) ease, color var(--transition-fast) ease;
   }
   .bulk-action-bar .tb-btn:hover:not(:disabled) {
     background: var(--bg-hover);
@@ -5500,7 +5500,7 @@
     gap: 6px;
     flex: 0 0 auto;
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
@@ -5508,7 +5508,7 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     color: var(--warning);
     background: color-mix(in srgb, var(--warning) 14%, transparent);
@@ -5519,7 +5519,7 @@
     cursor: pointer;
     white-space: nowrap;
     font-family: inherit;
-    transition: background 0.12s ease, border-color 0.12s ease;
+    transition: background var(--transition-fast) ease, border-color var(--transition-fast) ease;
   }
   .bulk-hidden-note:hover {
     background: color-mix(in srgb, var(--warning) 24%, transparent);
@@ -5531,7 +5531,7 @@
   }
   .bulk-label {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     white-space: nowrap;
   }
   .bulk-prio-group {
@@ -5548,7 +5548,7 @@
     overflow: hidden;
   }
   .bulk-prio-btn {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 500;
     padding: 3px 9px;
     min-height: 26px;
@@ -5559,7 +5559,7 @@
     color: var(--text-secondary);
     cursor: pointer;
     white-space: nowrap;
-    transition: background 0.13s ease, color 0.13s ease;
+    transition: background var(--transition-fast) ease, color var(--transition-fast) ease;
   }
   .bulk-prio-btn:first-child { border-left: none; }
   .bulk-prio-btn:hover:not(:disabled) {
@@ -5601,7 +5601,7 @@
   }
   .meta-label {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     text-align: left;
     white-space: nowrap;
     max-width: 130px;
@@ -5611,7 +5611,7 @@
   .meta-value {
     color: var(--text-primary);
     word-break: break-word;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     min-width: 0;
   }
   .meta-copyable {
@@ -5640,7 +5640,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-family: var(--font-mono, monospace);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     line-height: 20px;
     color: var(--text-secondary);
   }
@@ -5657,7 +5657,7 @@
     background: transparent;
     color: var(--text-muted);
     cursor: pointer;
-    transition: background 0.12s, color 0.12s, border-color 0.12s;
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
   }
   .copy-icon-btn svg { width: 13px; height: 13px; }
   .copy-icon-btn:hover {
@@ -5673,7 +5673,7 @@
   .drawer-select {
     max-width: 100%;
     padding: 3px 8px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -5695,7 +5695,7 @@
     gap: 10px;
   }
   .meta-hint {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     line-height: 1.4;
     color: var(--text-muted);
   }
@@ -5706,7 +5706,7 @@
     gap: 6px;
   }
   .shared-status {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     padding: 1px 7px;
     border-radius: var(--radius-pill);
@@ -5736,25 +5736,25 @@
   }
   .activity-ratio {
     margin: 0;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
   }
   .activity-stat-label {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.3px;
     color: var(--text-muted);
   }
   .activity-stat-value {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 700;
     color: var(--text-primary);
     font-variant-numeric: tabular-nums;
   }
   .activity-stat-sub {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     line-height: 1.3;
   }
@@ -5772,14 +5772,14 @@
     align-items: center;
     gap: 5px;
     padding: 5px 12px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--bg-surface);
     color: var(--text-secondary);
     cursor: pointer;
-    transition: background 0.12s, color 0.12s, border-color 0.12s;
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
   }
   .drawer-action-btn:hover {
     background: var(--bg-hover);
@@ -5794,7 +5794,7 @@
      (LibraryVirtualTable's .shared-badge) so KAD/eD2K/AICH read as the
      same concept — and the same color — in both places. */
   .meta-badge {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     padding: 1px 6px;
     border-radius: var(--radius-pill);
@@ -5830,7 +5830,7 @@
 
   /* --- Comment panel --- */
   .comment-last-saved {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
   }
   .comment-loading {
@@ -5853,7 +5853,7 @@
     flex-wrap: wrap;
   }
   .comment-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     margin-right: 4px;
     font-weight: 600;
@@ -5862,7 +5862,7 @@
     background: none;
     border: none;
     cursor: pointer;
-    font-size: 16px;
+    font-size: var(--font-size-lg);
     color: var(--warning);
     padding: 0 1px;
     line-height: 1;
@@ -5892,7 +5892,7 @@
   .comment-input {
     flex: 1;
     padding: 6px 8px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-family: inherit;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
@@ -5908,7 +5908,7 @@
   .comment-input:focus { border-color: var(--accent); }
   .comment-save {
     padding: 6px 12px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     border: 1px solid var(--accent);
     border-radius: var(--radius-sm);
     background: var(--accent);
@@ -5920,7 +5920,7 @@
   .comment-save:hover { opacity: 0.85; }
   .comment-save-state {
     margin-top: 6px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--success);
     font-weight: 600;
   }
@@ -5950,7 +5950,7 @@
   }
   .comment-peer-stars {
     color: var(--warning);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     letter-spacing: 1px;
   }
   .star-display { pointer-events: none; }
@@ -5965,7 +5965,7 @@
   .comment-empty {
     color: var(--text-muted);
     font-style: italic;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     padding: 10px 2px;
   }
 
@@ -5991,18 +5991,18 @@
     background: none;
     color: inherit;
     font: inherit;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     cursor: pointer;
     text-align: left;
   }
   .collection-toggle:hover { background: var(--bg-hover); }
-  .toggle-arrow { font-size: 10px; color: var(--text-muted); flex-shrink: 0; display: inline-block; transition: transform var(--transition-normal) ease; }
+  .toggle-arrow { font-size: var(--font-size-2xs); color: var(--text-muted); flex-shrink: 0; display: inline-block; transition: transform var(--transition-normal) ease; }
   .toggle-arrow.open { transform: rotate(90deg); }
   .collection-title { flex: 1; font-weight: 600; }
-  .collection-meta { font-weight: 400; color: var(--text-muted); font-size: 12px; margin-left: 6px; }
+  .collection-meta { font-weight: 400; color: var(--text-muted); font-size: var(--font-size-sm); margin-left: 6px; }
   .coll-action-btn {
     padding: 3px 10px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
     cursor: pointer;
@@ -6021,12 +6021,12 @@
     gap: 8px;
     padding: 12px 16px;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
-  .coll-table { font-size: 12px; }
+  .coll-table { font-size: var(--font-size-sm); }
   .coll-table th {
     padding: 5px 10px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     background: var(--bg-secondary);
     border-bottom: 1px solid var(--border);
@@ -6042,7 +6042,7 @@
     text-overflow: ellipsis;
   }
   .coll-col-size { width: 90px; text-align: right; }
-  .coll-col-hash { width: 160px; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+  .coll-col-hash { width: 160px; font-family: var(--font-mono); font-size: var(--font-size-xs); color: var(--text-muted); }
 
   /* --- Create Collection modal --- */
   .modal-overlay {
@@ -6092,7 +6092,7 @@
     padding: 12px 16px;
     border-bottom: 1px solid var(--border);
   }
-  .modal-title { font-weight: 600; font-size: 14px; }
+  .modal-title { font-weight: 600; font-size: var(--font-size-base); }
   .modal-close {
     display: inline-flex;
     align-items: center;
@@ -6105,7 +6105,7 @@
     border-radius: var(--radius-sm);
     background: none;
     color: var(--text-secondary);
-    transition: background 0.12s, border-color 0.12s, color 0.12s;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
   }
   .modal-close:hover {
     color: var(--danger);
@@ -6127,7 +6127,7 @@
     margin-bottom: 10px;
   }
   .form-label {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-secondary);
     width: 80px;
@@ -6136,7 +6136,7 @@
   .form-input {
     flex: 1;
     padding: 5px 8px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--bg-input);
@@ -6159,7 +6159,7 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     cursor: pointer;
-    transition: background 0.12s, border-color 0.12s;
+    transition: background var(--transition-fast), border-color var(--transition-fast);
   }
   .format-option:hover { background: var(--bg-hover); }
   .format-option input[type="radio"] { margin-top: 2px; flex-shrink: 0; cursor: pointer; }
@@ -6173,16 +6173,16 @@
     gap: 2px;
     line-height: 1.3;
   }
-  .format-name { font-size: 12px; font-weight: 600; color: var(--text-primary); }
-  .format-desc { font-size: 11px; color: var(--text-muted); }
+  .format-name { font-size: var(--font-size-sm); font-weight: 600; color: var(--text-primary); }
+  .format-desc { font-size: var(--font-size-xs); color: var(--text-muted); }
 
-  .select-all-btn { font-size: 11px; margin-left: auto; padding: 2px 8px; }
+  .select-all-btn { font-size: var(--font-size-xs); margin-left: auto; padding: 2px 8px; }
   .coll-search-row {
     margin-bottom: 6px;
   }
   .coll-search-input {
     width: 100%;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
   .coll-file-picker {
     max-height: 260px;
@@ -6196,9 +6196,9 @@
     align-items: center;
     gap: 8px;
     padding: 4px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     cursor: pointer;
-    transition: background 0.1s;
+    transition: background var(--transition-fast);
   }
   .coll-pick-row:hover { background: var(--bg-hover); }
   .coll-pick-name {
@@ -6207,12 +6207,12 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .coll-pick-size { color: var(--text-muted); flex-shrink: 0; font-size: 11px; }
+  .coll-pick-size { color: var(--text-muted); flex-shrink: 0; font-size: var(--font-size-xs); }
   .coll-pick-empty {
     padding: 16px;
     text-align: center;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-style: italic;
   }
 

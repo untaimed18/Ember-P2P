@@ -66,12 +66,12 @@
     position: relative;
     width: 40px;
     height: 22px;
-    border-radius: 11px;
+    border-radius: var(--radius-pill);
     background: color-mix(in srgb, var(--text-muted) 28%, var(--bg-tertiary));
     border: none;
     padding: 0;
     cursor: inherit;
-    transition: background 0.2s ease;
+    transition: background var(--transition-normal) ease;
     flex-shrink: 0;
   }
 
@@ -93,7 +93,7 @@
     border-radius: 50%;
     background: var(--toggle-knob);
     box-shadow: var(--shadow-sm);
-    transition: transform 0.2s ease;
+    transition: transform var(--transition-normal) ease;
   }
 
   .track.on .knob {
@@ -101,7 +101,7 @@
   }
 
   .toggle-text {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     line-height: 1.4;
   }

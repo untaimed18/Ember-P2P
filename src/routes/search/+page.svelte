@@ -4526,7 +4526,7 @@
 
   .type-select {
     padding: 7px 28px 7px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
@@ -4562,7 +4562,7 @@
     overflow: hidden;
     flex-shrink: 0;
     box-shadow: var(--shadow-sm);
-    transition: transform 0.12s ease, box-shadow 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+    transition: transform var(--transition-fast) ease, box-shadow var(--transition-normal) ease, border-color var(--transition-normal) ease, background-color var(--transition-normal) ease;
   }
 
   .search-tab:hover {
@@ -4588,7 +4588,7 @@
     border: none;
     background: transparent;
     color: var(--text-primary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 500;
     cursor: pointer;
     text-align: left;
@@ -4615,7 +4615,7 @@
   }
 
   .search-tab-meta {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     background: color-mix(in srgb, var(--bg-hover) 78%, var(--bg-secondary));
     border: 1px solid var(--border);
@@ -4675,9 +4675,9 @@
     cursor: pointer;
     flex-shrink: 0;
     transition:
-      color 0.14s ease,
-      background-color 0.14s ease,
-      transform 0.1s ease;
+      color var(--transition-fast) ease,
+      background-color var(--transition-fast) ease,
+      transform var(--transition-fast) ease;
   }
 
   .search-tab-action:focus-visible {
@@ -4757,7 +4757,7 @@
     border-radius: var(--radius-pill);
     overflow: hidden;
     background: var(--bg-surface);
-    transition: border-color 0.15s;
+    transition: border-color var(--transition-normal);
     min-height: 34px;
   }
 
@@ -4768,7 +4768,7 @@
 
   .column-select {
     background-color: var(--bg-input);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 6px 28px 6px 8px;
     min-width: 110px;
     color: var(--text-secondary);
@@ -4779,7 +4779,7 @@
     border: none;
     outline: none;
     box-shadow: none;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     padding: 5px 8px;
     background: transparent;
     color: var(--text-primary);
@@ -4818,7 +4818,7 @@
   }
 
   .filter-group label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.4px;
@@ -4826,7 +4826,7 @@
 
   .filter-group select,
   .filter-group input {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     padding: 6px 8px;
     min-width: 0;
   }
@@ -4858,24 +4858,24 @@
   }
 
   .clear-filters {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 6px 12px;
   }
 
   .advanced-toggle {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 6px 12px;
   }
 
   .filter-help {
     margin-top: 4px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
   }
 
   .filter-help code {
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     background: var(--bg-hover);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -4896,7 +4896,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-weight: 700;
     color: var(--text-secondary);
     border: 1px solid var(--border);
@@ -4938,7 +4938,7 @@
 
   .search-syntax-ed2k {
     margin: 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
     color: var(--text-secondary);
   }
@@ -4949,7 +4949,7 @@
     align-items: flex-start;
     gap: 8px;
     padding: 7px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
     color: var(--text-secondary);
     background: color-mix(in srgb, var(--ember-color) 8%, var(--bg-surface));
@@ -4960,7 +4960,7 @@
   .search-syntax-ember-tag {
     flex-shrink: 0;
     margin-top: 1px;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     letter-spacing: 0.04em;
     text-transform: uppercase;
@@ -4972,7 +4972,7 @@
 
   .results-info {
     padding: 10px 20px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     border-bottom: 1px solid var(--border);
     background: var(--bg-secondary);
@@ -4993,7 +4993,7 @@
   }
 
   .clear-results-btn {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 4px 10px;
   }
 
@@ -5011,7 +5011,7 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 4px 10px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -5063,7 +5063,7 @@
     gap: 8px;
     padding: 6px 8px;
     border-radius: var(--radius-sm);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     cursor: pointer;
   }
@@ -5087,21 +5087,21 @@
   }
 
   .bulk-count {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-accent);
   }
 
   .bulk-download-btn {
     padding: 5px 14px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     border: none;
     border-radius: var(--radius-md);
     background: var(--accent);
     color: var(--on-accent);
     cursor: pointer;
-    transition: opacity 0.15s;
+    transition: opacity var(--transition-normal);
   }
 
   .bulk-download-btn:hover:not(:disabled) {
@@ -5115,12 +5115,12 @@
 
   .bulk-clear-btn,
   .bulk-copy-btn {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 5px 10px;
   }
 
   .copy-links-btn {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 4px 10px;
   }
 
@@ -5165,7 +5165,7 @@
 
   .col-origin {
     width: 12%;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
   }
 
@@ -5255,7 +5255,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
   }
 
@@ -5310,7 +5310,7 @@
     display: inline-block;
     padding: 1px 6px;
     border-radius: var(--radius-sm);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     letter-spacing: 0.02em;
   }
@@ -5340,12 +5340,12 @@
 
   .search-results-table th {
     padding: 6px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .search-results-table td {
     padding: 4px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.2;
   }
 
@@ -5398,7 +5398,7 @@
     text-align: center;
     padding: 1px 5px;
     border-radius: var(--radius-pill);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     background: var(--bg-hover);
   }
@@ -5421,7 +5421,7 @@
     cursor: pointer;
     flex-shrink: 0;
     box-shadow: var(--shadow-sm);
-    transition: background-color 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
+    transition: background-color var(--transition-normal) ease, transform var(--transition-fast) ease, box-shadow var(--transition-normal) ease;
   }
 
   .stop-btn:hover {
@@ -5451,25 +5451,25 @@
   }
 
   .hint, .search-detail {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-muted);
   }
 
   .error-msg {
     color: var(--danger);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     margin-left: 8px;
   }
 
   .success-msg {
     color: var(--success);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     margin-left: 8px;
   }
 
   .search-readiness-hint {
     padding: 9px 20px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--badge-warning-text);
     background: color-mix(in srgb, var(--warning) 9%, var(--bg-secondary));
     border-bottom: 1px solid color-mix(in srgb, var(--warning) 36%, var(--border));
@@ -5484,7 +5484,7 @@
     align-items: center;
     justify-content: space-between;
     padding: 10px 20px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
 
   /* --- File details modal --- */
@@ -5527,7 +5527,7 @@
 
   .modal-title {
     font-weight: 600;
-    font-size: 14px;
+    font-size: var(--font-size-base);
   }
 
   .modal-close {
@@ -5544,7 +5544,7 @@
     color: var(--text-secondary);
     cursor: pointer;
     line-height: 1;
-    transition: background 0.12s, border-color 0.12s, color 0.12s;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
   }
 
   .modal-close:hover {
@@ -5581,14 +5581,14 @@
   }
 
   .detail-hero-name {
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-weight: 600;
     line-height: 1.35;
     overflow-wrap: anywhere;
   }
 
   .detail-hero-original {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     overflow-wrap: anywhere;
   }
@@ -5600,7 +5600,7 @@
     grid-template-columns: max-content minmax(0, 1fr);
     gap: 4px 12px;
     margin: 0 0 12px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
 
   .detail-grid dt {
@@ -5616,14 +5616,14 @@
 
   .detail-grid code {
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     /* A 32-char hash is the one value worth selecting by hand. */
     user-select: all;
   }
 
   .detail-row {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     margin-bottom: 6px;
   }
 
@@ -5644,7 +5644,7 @@
     margin-left: 8px;
     padding: 1px 8px;
     border-radius: var(--radius-pill);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
   }
 
@@ -5672,7 +5672,7 @@
   .note-item {
     padding: 6px 0;
     border-bottom: 1px solid var(--border);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     /* Peer-supplied and up to 4096 chars; without this an unbroken run turns
        the details panel into a horizontal scroller. */
     overflow-wrap: anywhere;
@@ -5683,7 +5683,7 @@
   }
 
   .publish-note h4 {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     margin-bottom: 8px;
   }
 
@@ -5695,7 +5695,7 @@
   }
 
   .note-form label {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
 
@@ -5746,7 +5746,7 @@
     border: 1px solid color-mix(in srgb, var(--danger) 55%, var(--border));
     background: color-mix(in srgb, var(--danger) 15%, transparent);
     color: var(--danger);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     letter-spacing: 0.02em;
     line-height: 1.5;
@@ -5768,7 +5768,7 @@
     background: var(--bg-secondary);
     box-shadow: var(--shadow-md);
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     line-height: 1.35;
   }
 
@@ -5803,7 +5803,7 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-pill);
@@ -5811,7 +5811,7 @@
     padding: 5px 10px;
     cursor: pointer;
     user-select: none;
-    transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+    transition: border-color var(--transition-normal) ease, background-color var(--transition-normal) ease, color var(--transition-normal) ease;
   }
 
   .filter-toggle:hover {
@@ -5831,7 +5831,7 @@
   }
 
   .filter-count {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
   }
 
@@ -5849,7 +5849,7 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     border: 1px solid var(--border);
     background: var(--bg-secondary);
@@ -5873,7 +5873,7 @@
     border: 1px solid var(--border);
     background: var(--bg-secondary);
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     line-height: 1.35;
     box-shadow: var(--shadow-md);
   }
@@ -5894,7 +5894,7 @@
     display: inline-block;
     padding: 2px 7px;
     border-radius: var(--radius-sm);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 500;
     white-space: nowrap;
     line-height: 1.3;

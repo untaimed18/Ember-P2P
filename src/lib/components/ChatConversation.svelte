@@ -3664,7 +3664,7 @@
     text-align: center;
     color: var(--text-muted);
     padding: 24px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
 
   .conv-loading {
@@ -3681,7 +3681,7 @@
 
   .conv-empty-hint {
     margin-top: 8px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
     opacity: 0.85;
   }
@@ -3693,7 +3693,7 @@
     align-items: center;
     padding: 16px;
     color: var(--danger);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     text-align: center;
   }
 
@@ -3710,7 +3710,7 @@
     background: color-mix(in srgb, var(--warning) 12%, transparent);
     border-radius: var(--radius-sm);
     color: color-mix(in srgb, var(--warning) 80%, var(--text-primary));
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .conv-load-retry {
@@ -3719,7 +3719,7 @@
     border: 1px solid var(--border);
     background: var(--bg-surface);
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     cursor: pointer;
     flex-shrink: 0;
   }
@@ -3737,7 +3737,7 @@
   }
 
   .conv-load-older-error {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--danger);
   }
 
@@ -3747,7 +3747,7 @@
     border: 1px solid var(--border);
     background: var(--bg-surface);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     cursor: pointer;
     transition: background var(--transition-fast), color var(--transition-fast);
   }
@@ -3771,7 +3771,7 @@
     border-radius: var(--radius-pill);
     background: var(--bg-tertiary);
     color: var(--text-muted);
-    font-size: 10.5px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     letter-spacing: 0.4px;
     text-transform: uppercase;
@@ -3795,7 +3795,7 @@
     gap: 8px;
     margin: 10px 0 2px;
     color: var(--accent);
-    font-size: 10.5px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     letter-spacing: 0.4px;
     text-transform: uppercase;
@@ -3814,7 +3814,7 @@
     max-width: 80%;
     padding: 8px 12px;
     border-radius: var(--radius-lg);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     line-height: 1.4;
     word-wrap: break-word;
     overflow-wrap: anywhere;
@@ -3848,7 +3848,7 @@
     width: 100%;
     padding: 24px 12px 8px;
     line-height: 1.4;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     box-shadow: none;
   }
 
@@ -4031,7 +4031,7 @@
     border-radius: 5px;
     background: color-mix(in srgb, currentColor 10%, transparent);
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
     white-space: pre;
     overflow-wrap: normal;
@@ -4053,7 +4053,7 @@
     border-radius: 4px;
     background: color-mix(in srgb, currentColor 8%, transparent);
     color: inherit;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     cursor: pointer;
     opacity: 0.8;
@@ -4093,7 +4093,7 @@
   }
 
   .bubble-who {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     opacity: 0.75;
     margin-bottom: 2px;
@@ -4113,7 +4113,7 @@
     background: color-mix(in srgb, var(--accent) 12%, var(--bg-secondary));
     border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
     color: var(--text-accent);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     letter-spacing: 0.2px;
     line-height: 1.2;
@@ -4140,7 +4140,7 @@
   }
 
   .bubble-time {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     padding: 0 2px;
     line-height: 1.2;
@@ -4178,7 +4178,7 @@
     align-items: center;
     gap: 6px;
     margin-top: 2px;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     line-height: 1.2;
     color: var(--text-muted);
@@ -4335,7 +4335,7 @@
     background: color-mix(in srgb, currentColor 9%, transparent);
     color: inherit;
     font: inherit;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.35;
     text-align: start;
     white-space: nowrap;
@@ -4385,7 +4385,7 @@
     border-top: 1px solid var(--border);
     background: var(--bg-surface);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     flex-shrink: 0;
     min-width: 0;
   }
@@ -4493,7 +4493,7 @@
     border-bottom: 1px solid var(--border);
     background: var(--bg-surface);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     flex-shrink: 0;
     min-width: 0;
   }
@@ -4551,11 +4551,11 @@
     flex-shrink: 0;
     padding: 1px 6px;
     border: 1px solid var(--border);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: transparent;
     color: var(--text-muted);
     font: inherit;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-variant-numeric: tabular-nums;
     cursor: pointer;
   }
@@ -4614,7 +4614,7 @@
     width: 100%;
     padding: 5px 7px;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: var(--bg-primary);
     color: var(--text-primary);
     font: inherit;
@@ -4623,7 +4623,7 @@
 
   .bubble-edit-error {
     color: var(--danger);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
 
   .bubble-edit-actions {
@@ -4634,7 +4634,7 @@
 
   .bubble-edit-hint {
     flex: 1 1 auto;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     opacity: 0.7;
   }
 
@@ -4645,7 +4645,7 @@
     border-radius: 5px;
     background: var(--bg-surface);
     color: var(--text-primary);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     cursor: pointer;
   }
 
@@ -4748,17 +4748,17 @@
     height: 24px;
     padding: 2px 5px;
     border: 1px solid transparent;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: transparent;
     color: var(--reaction-gold);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-variant-numeric: tabular-nums;
     cursor: pointer;
     transition:
       background var(--transition-fast) ease,
       color var(--transition-fast) ease,
       border-color var(--transition-fast) ease,
-      transform 0.16s ease;
+      transform var(--transition-normal) ease;
   }
 
   .conversation.channel .reaction-btn {
@@ -4908,7 +4908,7 @@
   /* Emoji chips carry their own colour, so the gold wash stays on the frame and
      the count; the glyph is sized to sit level with the drawn icons. */
   .reaction-emoji {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     line-height: 1;
   }
 
@@ -4975,10 +4975,10 @@
     border: 1px solid transparent;
     border-radius: var(--radius-sm);
     background: transparent;
-    font-size: 18px;
+    font-size: var(--font-size-xl);
     line-height: 1;
     cursor: pointer;
-    transition: background var(--transition-fast) ease, transform 0.12s ease;
+    transition: background var(--transition-fast) ease, transform var(--transition-fast) ease;
   }
 
   .reaction-picker-item:hover {
@@ -5025,7 +5025,7 @@
     border-radius: 4px;
     background: transparent;
     color: var(--danger);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.3px;
@@ -5055,10 +5055,10 @@
     gap: 5px;
     padding: 5px 10px;
     border: 1px solid var(--border);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: var(--bg-surface);
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     box-shadow: var(--shadow-md);
     cursor: pointer;
@@ -5096,7 +5096,7 @@
     padding: 8px 14px;
     background: color-mix(in srgb, var(--danger) 14%, transparent);
     color: var(--danger);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     text-align: center;
   }
 
@@ -5105,7 +5105,7 @@
     border-top: 1px solid var(--border);
     background: var(--bg-surface);
     color: var(--text-muted);
-    font-size: 12.5px;
+    font-size: var(--font-size-md);
     text-align: center;
     flex-shrink: 0;
   }
@@ -5116,7 +5116,7 @@
     gap: 8px;
     padding: 4px 2px;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     flex-shrink: 0;
   }
 
@@ -5170,7 +5170,7 @@
     max-width: 60%;
     padding: 2px 10px;
     border: 1px solid var(--border);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: var(--bg-surface);
     pointer-events: none;
   }
@@ -5237,7 +5237,7 @@
     background: none;
     color: var(--text-primary);
     font: inherit;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     text-align: start;
     cursor: pointer;
   }
@@ -5260,10 +5260,10 @@
     height: 26px;
     padding: 0;
     border: none;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 700;
     cursor: pointer;
   }
@@ -5289,7 +5289,7 @@
     background: var(--bg-surface);
     box-shadow: var(--shadow-md);
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .conv-format-row {
@@ -5301,14 +5301,14 @@
 
   .conv-format-row > code:first-child {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
   }
 
   .conv-format-note {
     margin: 3px 0 0;
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
 
   /* Aligned to the bottom of the row so it sits level with the send button
@@ -5316,7 +5316,7 @@
   .conv-slow-mode {
     align-self: flex-end;
     padding-bottom: 10px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-variant-numeric: tabular-nums;
     color: var(--text-secondary);
     white-space: nowrap;
@@ -5329,7 +5329,7 @@
     border-radius: var(--radius-lg);
     background: var(--bg-primary);
     color: var(--text-primary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-family: inherit;
     resize: none;
     outline: none;

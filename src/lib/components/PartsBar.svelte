@@ -197,7 +197,7 @@
   .parts-fill {
     position: absolute;
     inset: 0;
-    transition: background 0.3s ease;
+    transition: background var(--transition-slow) ease;
   }
 
   @media (prefers-reduced-motion: reduce) {

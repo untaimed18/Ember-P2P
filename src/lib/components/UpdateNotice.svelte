@@ -196,7 +196,7 @@
 
   .notice-title {
     flex: 1;
-    font-size: 13.5px;
+    font-size: var(--font-size-md);
     font-weight: 700;
     color: var(--text-primary);
   }
@@ -225,7 +225,7 @@
 
   .notice-body {
     margin: 0;
-    font-size: 12.5px;
+    font-size: var(--font-size-md);
     line-height: 1.45;
     color: var(--text-secondary);
   }
@@ -259,7 +259,7 @@
     border: none;
     background: transparent;
     color: var(--accent);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     cursor: pointer;
     padding: 0;
@@ -268,7 +268,7 @@
   .notice-notes {
     max-height: 120px;
     overflow-y: auto;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.5;
     color: var(--text-secondary);
     white-space: pre-wrap;
@@ -287,7 +287,7 @@
 
   .notice-actions button {
     padding: 6px 13px;
-    font-size: 12.5px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     border-radius: var(--radius-md);
     cursor: pointer;

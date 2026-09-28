@@ -269,7 +269,7 @@
     justify-content: space-between;
     gap: 12px;
     padding: 0 16px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     flex-shrink: 0;
     overflow: hidden;
   }

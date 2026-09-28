@@ -87,7 +87,7 @@
   }
 
   .subtitle {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 1px;
@@ -154,7 +154,7 @@
     }
 
     .wordmark h1 {
-      font-size: 19px;
+      font-size: var(--font-size-2xl);
       letter-spacing: 2px;
     }
   }

@@ -321,7 +321,7 @@
   }
 
   .attach-name {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -332,7 +332,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 11.5px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
   }
@@ -341,7 +341,7 @@
     padding: 0 5px;
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--text-muted) 14%, transparent);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     letter-spacing: 0.3px;
     line-height: 16px;
@@ -386,7 +386,7 @@
     display: flex;
     align-items: baseline;
     gap: 8px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
   }
@@ -418,7 +418,7 @@
   .attach-left {
     flex-shrink: 0;
     margin-left: auto;
-    font-size: 11.5px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     white-space: nowrap;
   }
@@ -436,7 +436,7 @@
     justify-content: center;
     gap: 6px;
     font: inherit;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     padding: 6px 10px;
     border-radius: var(--radius-sm);
@@ -492,7 +492,7 @@
 
   .attach-time {
     margin-top: -2px;
-    font-size: 10.5px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     align-self: flex-end;
   }

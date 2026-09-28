@@ -535,14 +535,14 @@
   .ratio-icon { background: color-mix(in srgb, var(--stat-ratio) 14%, transparent); color: var(--stat-ratio); }
   .hero-body { display: flex; flex-direction: column; min-width: 0; }
   .hero-value {
-    font-size: 1.25rem;
+    font-size: var(--font-size-xl);
     font-weight: 700;
     color: var(--text-primary);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
   .hero-label {
-    font-size: 0.75rem;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     margin-top: 1px;
   }
@@ -564,7 +564,7 @@
     border-bottom: 1px solid var(--border);
   }
   .card-head h3 {
-    font-size: 0.95rem;
+    font-size: var(--font-size-base);
     font-weight: 600;
     color: var(--text-primary);
     margin: 0;
@@ -581,7 +581,7 @@
   }
   .head-aside {
     margin-left: auto;
-    font-size: 0.8rem;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
   }
@@ -604,13 +604,13 @@
   }
   .big-stat { display: flex; flex-direction: column; align-items: center; }
   .big-value {
-    font-size: 1.5rem;
+    font-size: var(--font-size-2xl);
     font-weight: 700;
     color: var(--text-primary);
     font-variant-numeric: tabular-nums;
   }
   .big-sub {
-    font-size: 0.75rem;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     margin-top: 2px;
     text-transform: uppercase;
@@ -631,14 +631,14 @@
   }
   .cum-item { display: flex; flex-direction: column; }
   .cum-label {
-    font-size: 0.75rem;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.04em;
     margin-bottom: 4px;
   }
   .cum-value {
-    font-size: 1.1rem;
+    font-size: var(--font-size-lg);
     font-weight: 600;
     color: var(--text-primary);
     font-variant-numeric: tabular-nums;
@@ -660,12 +660,12 @@
     gap: 10px;
   }
   .oh-label {
-    font-size: 0.82rem;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     white-space: nowrap;
   }
   .oh-value {
-    font-size: 0.82rem;
+    font-size: var(--font-size-sm);
     color: var(--text-primary);
     font-variant-numeric: tabular-nums;
     text-align: right;
@@ -696,7 +696,7 @@
   .oh-empty {
     text-align: center;
     color: var(--text-muted);
-    font-size: 0.82rem;
+    font-size: var(--font-size-sm);
     padding: 8px 0;
   }
 
@@ -727,13 +727,13 @@
     gap: 4px;
   }
   .rep-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
   }
   .rep-value {
-    font-size: 18px;
+    font-size: var(--font-size-xl);
     font-weight: 600;
     color: var(--text-primary);
     font-variant-numeric: tabular-nums;
@@ -744,7 +744,7 @@
   .rep-unavailable {
     margin: 0;
     padding: 4px 2px 2px;
-    font-size: 0.85rem;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
 </style>

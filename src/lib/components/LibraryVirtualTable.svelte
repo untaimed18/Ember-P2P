@@ -743,7 +743,7 @@
   .lib-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     table-layout: fixed;
   }
   .lib-table th {
@@ -752,7 +752,7 @@
     text-align: left;
     white-space: nowrap;
     font-weight: 600;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     background: var(--bg-surface);
     border-bottom: 1px solid var(--border);
     user-select: none;
@@ -819,7 +819,7 @@
     width: 1px;
     transform: translateX(-50%);
     background: transparent;
-    transition: background 0.1s;
+    transition: background var(--transition-fast);
   }
   .lib-table th:hover .col-resize-handle::after,
   .lib-table th.resizing .col-resize-handle::after,
@@ -847,7 +847,7 @@
   .lib-table tbody tr {
     cursor: pointer;
     box-sizing: border-box;
-    transition: background-color 0.12s ease;
+    transition: background-color var(--transition-fast) ease;
   }
   .lib-table tbody tr.row-alt td {
     background: color-mix(in srgb, var(--bg-secondary) 90%, var(--bg-primary));
@@ -886,7 +886,7 @@
   }
   .cell-hash {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
   }
@@ -895,7 +895,7 @@
   }
   .cell-date {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
   .cell-shared {
     text-align: center;
@@ -904,7 +904,7 @@
 
   .hashing-label {
     color: var(--warning);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-style: italic;
   }
   .not-published {

@@ -196,7 +196,7 @@
 <style>
   .speed-label {
     display: block;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-secondary);
     margin-bottom: 6px;
   }
@@ -208,7 +208,7 @@
     border-radius: var(--radius-md);
     overflow: hidden;
     background: var(--bg-input);
-    transition: border-color 0.15s;
+    transition: border-color var(--transition-normal);
   }
 
   .speed-input:focus-within {
@@ -222,7 +222,7 @@
     background: transparent;
     color: var(--text-primary);
     padding: 7px 10px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     outline: none;
     box-shadow: none;
     min-width: 0;
@@ -243,7 +243,7 @@
     background-color: var(--bg-surface);
     color: var(--text-secondary);
     padding: 0 24px 0 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     cursor: pointer;
     outline: none;
@@ -264,11 +264,11 @@
     border-left: 1px solid var(--border);
     background: var(--bg-surface);
     color: var(--text-muted);
-    font-size: 16px;
+    font-size: var(--font-size-lg);
     cursor: pointer;
     padding: 0;
     border-radius: 0;
-    transition: color 0.15s, background 0.15s;
+    transition: color var(--transition-normal), background var(--transition-normal);
   }
 
   .unlimited-btn:hover {
@@ -286,13 +286,13 @@
   }
 
   .unlimited-text {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-muted);
   }
 
   .unlimited-hint {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     opacity: 0.6;
   }

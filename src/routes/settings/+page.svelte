@@ -4525,12 +4525,12 @@
     gap: 6px;
     padding: 7px 20px;
     font-weight: 600;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     border-radius: var(--radius-md);
   }
 
   .unsaved-indicator {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--warning);
     font-weight: 500;
     animation: pulse 2s ease-in-out infinite;
@@ -4556,7 +4556,7 @@
   }
 
   .save-status {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--success);
     padding: 4px 12px;
@@ -4593,7 +4593,7 @@
   }
 
   .settings-nav-title {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     text-transform: uppercase;
     letter-spacing: 0.4px;
     color: var(--text-muted);
@@ -4613,7 +4613,7 @@
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-secondary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     text-align: left;
     cursor: pointer;
   }
@@ -4717,7 +4717,7 @@
 
   .settings-filter-status {
     margin: 0 8px 8px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
   }
 
@@ -4740,7 +4740,7 @@
   /* Names the run of fields under it. */
   .subsection-title {
     margin: 0;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 700;
     letter-spacing: 0.06em;
     text-transform: uppercase;
@@ -4791,7 +4791,7 @@
   }
 
   .card-icon {
-    font-size: 20px;
+    font-size: var(--font-size-2xl);
     width: 36px;
     height: 36px;
     display: flex;
@@ -4809,7 +4809,7 @@
   }
 
   .card-header h3 {
-    font-size: 15px;
+    font-size: var(--font-size-base);
     font-weight: 600;
     color: var(--text-primary);
     margin: 0;
@@ -4817,7 +4817,7 @@
   }
 
   .card-desc {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     margin: 0;
     line-height: 1.3;
@@ -4846,7 +4846,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-secondary);
     margin-bottom: 0;
     font-weight: 500;
@@ -4871,7 +4871,7 @@
   }
 
   .hint {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     margin-top: 0;
     display: block;
@@ -4898,7 +4898,7 @@
   /* ── Restart badge ─────────────────────────────── */
   .restart-badge {
     display: inline-block;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.3px;
@@ -4930,7 +4930,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 500;
     color: var(--text-primary);
     line-height: 1.4;
@@ -4942,7 +4942,7 @@
 
   .always-on-badge {
     flex-shrink: 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-secondary);
     white-space: nowrap;
@@ -4969,7 +4969,7 @@
     border-radius: var(--radius-sm);
     overflow: hidden;
     background: var(--bg-input);
-    transition: border-color 0.15s;
+    transition: border-color var(--transition-normal);
   }
 
   .folder-input:focus-within {
@@ -4982,7 +4982,7 @@
     border: none;
     background: transparent;
     padding: 7px 10px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     outline: none;
     box-shadow: none;
@@ -4997,10 +4997,10 @@
     background: var(--bg-surface);
     color: var(--text-secondary);
     padding: 0 14px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     cursor: pointer;
-    transition: background 0.15s, color 0.15s;
+    transition: background var(--transition-normal), color var(--transition-normal);
     white-space: nowrap;
   }
 
@@ -5018,14 +5018,14 @@
   }
 
   .action-btn {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     padding: 6px 14px;
     background: var(--bg-surface);
     color: var(--text-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    transition: background 0.15s, color 0.15s, border-color 0.15s;
+    transition: background var(--transition-normal), color var(--transition-normal), border-color var(--transition-normal);
   }
 
   .action-btn:hover {
@@ -5086,7 +5086,7 @@
 
   .about-wordmark {
     margin: 0 0 3px;
-    font-size: 18px;
+    font-size: var(--font-size-xl);
     font-weight: 700;
     letter-spacing: 1.5px;
     color: var(--accent);
@@ -5095,7 +5095,7 @@
 
   .about-tagline {
     margin: 0 0 8px;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     letter-spacing: 0.9px;
     text-transform: uppercase;
@@ -5107,7 +5107,7 @@
     display: inline-block;
     margin: 0;
     padding: 2px 8px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     color: var(--badge-accent-text);
     background: color-mix(in srgb, var(--accent) 14%, transparent);
@@ -5118,14 +5118,14 @@
 
   .about-description {
     margin: 0 0 6px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     line-height: 1.45;
     color: var(--text-secondary);
   }
 
   .about-license {
     margin: 0 0 12px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
 
@@ -5136,7 +5136,7 @@
     border-radius: var(--radius-md);
     background: color-mix(in srgb, var(--warning) 9%, transparent);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
   }
 
@@ -5148,7 +5148,7 @@
   }
 
   .channels-pref-count {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     font-variant-numeric: tabular-nums;
     color: var(--text-secondary);
@@ -5177,7 +5177,7 @@
   }
 
   .ignored-name {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -5187,7 +5187,7 @@
   .ignored-scope {
     display: block;
     margin-top: 2px;
-    font-size: 11.5px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -5246,20 +5246,20 @@
   }
 
   .about-action-title {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
   }
 
   .about-action-desc {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
     color: var(--text-secondary);
   }
 
   .about-action-path {
     margin-top: 2px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     user-select: text;
     overflow-wrap: anywhere;
@@ -5337,7 +5337,7 @@
   }
 
   .feedback {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
   }
 
@@ -5352,7 +5352,7 @@
     gap: 8px;
   }
   .antileech-label {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
   .antileech-textarea {
@@ -5360,7 +5360,7 @@
     min-height: 180px;
     padding: 8px 10px;
     font-family: var(--font-mono, ui-monospace, 'Cascadia Code', Consolas, monospace);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.4;
     color: var(--text-primary);
     background: var(--bg-secondary);
@@ -5417,7 +5417,7 @@
     flex: 1;
   }
   .webservice-name {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -5429,7 +5429,7 @@
      is also what makes a `#hashid` placeholder legible as a placeholder. */
   .webservice-url {
     font-family: var(--font-mono, monospace);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -5469,7 +5469,7 @@
   }
   .webservice-field input {
     font-family: var(--font-mono, monospace);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 6px 8px;
     color: var(--text-primary);
     background: var(--bg-secondary);
@@ -5489,7 +5489,7 @@
     margin-top: 6px;
   }
   .antileech-path {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     margin-left: auto;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -5502,7 +5502,7 @@
     background: var(--bg-secondary);
     border: 1px solid var(--danger);
     border-radius: var(--radius-sm);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
   .antileech-errors-title {
     color: var(--danger);
@@ -5538,7 +5538,7 @@
     border-radius: var(--radius-md);
     background: transparent;
     cursor: pointer;
-    transition: border-color 0.2s, box-shadow 0.2s;
+    transition: border-color var(--transition-normal), box-shadow var(--transition-normal);
     overflow: hidden;
     width: 120px;
   }
@@ -5616,7 +5616,7 @@
     border-radius: 50%;
     background: var(--accent);
     color: var(--on-accent);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -5624,7 +5624,7 @@
   }
 
   .swatch-label {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
     color: var(--text-secondary);
     padding: 6px 0 8px;
@@ -5651,7 +5651,7 @@
     color: var(--text-primary);
     text-align: left;
     cursor: pointer;
-    transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+    transition: border-color var(--transition-normal) ease, background var(--transition-normal) ease, box-shadow var(--transition-normal) ease, transform var(--transition-normal) ease;
   }
 
   .behavior-card:hover {
@@ -5715,14 +5715,14 @@
   }
 
   .behavior-title {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
     line-height: 1.25;
   }
 
   .behavior-desc {
-    font-size: 11.5px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     line-height: 1.35;
   }
@@ -5736,7 +5736,7 @@
     border-radius: 50%;
     background: var(--accent);
     color: var(--on-accent);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 700;
     display: flex;
     align-items: center;
@@ -5770,7 +5770,7 @@
 
   .speed-test-btn {
     padding: 4px 12px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
     background: var(--bg-tertiary);
@@ -5792,7 +5792,7 @@
     padding: 8px 12px;
     background: var(--bg-tertiary);
     border-radius: var(--radius-md);
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
 
   .speed-row {
@@ -5825,7 +5825,7 @@
     margin-top: 8px;
     width: 100%;
     padding: 6px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     border-radius: var(--radius-sm);
     border: none;
@@ -5842,7 +5842,7 @@
     display: block;
     margin-top: 6px;
     color: var(--danger);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   /* Shared "this is happening right now" marker: the sleep inhibitor being
@@ -5854,7 +5854,7 @@
     border-radius: var(--radius-pill);
     background: color-mix(in srgb, var(--accent) 16%, transparent);
     color: var(--accent);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     white-space: nowrap;
   }
@@ -5869,7 +5869,7 @@
     border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--accent) 8%, transparent);
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
 
   .live-dot {
@@ -5902,7 +5902,7 @@
   .schedule-empty {
     margin: 0;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .schedule-rule {
@@ -5951,7 +5951,7 @@
     border-radius: var(--radius-sm);
     background: var(--bg-surface);
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1;
     cursor: pointer;
   }
@@ -5983,7 +5983,7 @@
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     cursor: pointer;
   }
 
@@ -6005,7 +6005,7 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
 
@@ -6016,7 +6016,7 @@
   .schedule-overnight {
     padding-bottom: 6px;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .schedule-limits {
@@ -6027,7 +6027,7 @@
 
   .schedule-error {
     color: var(--danger);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .schedule-add {
@@ -6037,7 +6037,7 @@
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-secondary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     cursor: pointer;
   }
 
@@ -6069,12 +6069,12 @@
   }
 
   .spam-stat span {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
   }
 
   .spam-stat strong {
-    font-size: 15px;
+    font-size: var(--font-size-lg);
     color: var(--text-primary);
   }
 
@@ -6184,14 +6184,14 @@
   }
 
   .history-stat-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 500;
     color: var(--text-muted);
     letter-spacing: 0.01em;
   }
 
   .history-stat-value {
-    font-size: 24px;
+    font-size: var(--font-size-3xl);
     font-weight: 700;
     line-height: 1.1;
     color: var(--text-primary);
@@ -6199,7 +6199,7 @@
   }
 
   .history-stat-value.is-loading {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
     color: var(--text-muted);
   }
@@ -6213,11 +6213,11 @@
     border-radius: 0;
     background: color-mix(in srgb, var(--bg-primary) 55%, transparent);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     cursor: pointer;
     text-align: left;
-    transition: background 0.15s, color 0.15s;
+    transition: background var(--transition-normal), color var(--transition-normal);
   }
 
   .history-clear-btn:hover {
@@ -6264,7 +6264,7 @@
     .settings-nav-item {
       width: auto;
       padding: 7px 10px;
-      font-size: 12px;
+      font-size: var(--font-size-sm);
       flex-shrink: 0;
     }
   }
@@ -6304,7 +6304,7 @@
   }
 
   .restart-sub {
-    font-size: 14px;
+    font-size: var(--font-size-base);
     color: var(--text-muted);
     margin: 0;
   }
@@ -6325,7 +6325,7 @@
     border-radius: var(--radius-sm);
     overflow: hidden;
     background: var(--bg-input);
-    transition: border-color 0.15s;
+    transition: border-color var(--transition-normal);
   }
 
   .unit-input:focus-within {
@@ -6352,7 +6352,7 @@
     border-left: 1px solid var(--border);
     background: var(--bg-surface);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
   }
 
