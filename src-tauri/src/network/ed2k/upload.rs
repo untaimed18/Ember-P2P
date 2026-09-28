@@ -1264,7 +1264,7 @@ const MAX_CONNECTIONS_PER_IP: usize = 3;
 /// [`MAX_CONNECTIONS_PER_IP`] this also counts disconnected but
 /// still-queued entries (via [`QueueEntry::last_ip`]), so a peer cannot
 /// churn connections with rotating user-hashes to dilute the queue.
-const MAX_QUEUE_ENTRIES_PER_IP: usize = 3;
+pub(crate) const MAX_QUEUE_ENTRIES_PER_IP: usize = 3;
 // The listener's connection ceiling is not a constant here. It is
 // `AppSettings::max_connections` — eMule's `maxconnections`, gating accepts
 // through `CListenSocket::TooManySockets` (`ListenSocket.cpp:2181`) — and it is

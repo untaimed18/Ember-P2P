@@ -283,6 +283,18 @@ re-established when the peer re-asks on its normal ~29-minute cadence. Entries
 past the purge window are discarded, as eMule would. This is the difference
 between "Ember came back" and "Ember came back and nobody lost their place".
 
+Restored rows do not join the live queue straight away
+(`network/ed2k/upload_queue_store.rs`). At launch the library index is empty
+until the startup scan has run, so the queue's own purge would evict every
+restored waiter as one for a file Ember does not share, and a push-grant dialled
+in that window would offer a file it cannot yet find. They are held until the
+startup scan's first shared-files reconcile, or three minutes for a node with no
+shared folders, and only rows for files Ember shares or is downloading are
+merged, under the live queue's own per-IP and size caps. A peer that re-asked
+before the merge keeps its live row and inherits the older wait only from the
+same address. Rows naming a private or special-use address are dropped, since a
+restored HighID row is one the queue may dial.
+
 **Not restored, on purpose:** open dialogs, unsaved Settings edits, and chat
 drafts. The idle rule (no input for 10 minutes) means none of these should exist
 when an update starts.

@@ -5624,6 +5624,18 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::SharedFilesChangedAck { tx: reconcile_ack } => {
+            // The startup scan's first reconcile is the first moment the index
+            // says which files we serve, so it is when last session's waiters
+            // can rejoin the upload queue.
+            if let Some(pending) = state.restored_upload_queue.take() {
+                ed2k::upload_queue_store::merge_pending(
+                    pending,
+                    upload_queue,
+                    local_index,
+                    transfer_manager,
+                )
+                .await;
+            }
             // One pass under the read guard, keeping only the hashes and the
             // rows whose record drifted. Startup hashing fires this every 30 s,
             // and cloning the whole index each time was most of its cost.

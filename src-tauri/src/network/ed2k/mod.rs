@@ -25,6 +25,7 @@ pub mod sources;
 pub mod tcp_obfuscation;
 pub mod transfer;
 pub mod upload;
+pub mod upload_queue_store;
 pub mod write_coordinator;
 
 /// Legacy Ember PoP/friend opcodes remain parseable for compatibility tests,

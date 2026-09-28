@@ -617,6 +617,11 @@ pub(super) struct NetworkState {
     pub(super) last_tcp_remap_reconnect_at: Option<std::time::Instant>,
     /// Background server connection task (non-blocking)
     pub(super) pending_server_connect: Option<tokio::task::JoinHandle<ServerConnectResult>>,
+    /// Upload waiters saved by the last session, held until the startup scan's
+    /// first reconcile says which files we serve (see
+    /// `ed2k::upload_queue_store`). Taken once.
+    pub(super) restored_upload_queue:
+        Option<crate::network::ed2k::upload_queue_store::PendingRestore>,
     /// Shared set of user hashes expected as incoming buddy connections (checked by upload listener)
     pub(super) pending_buddy_hashes: PendingBuddySet,
     /// Shared buddy info for Hello tags (updated when buddy connects/disconnects)

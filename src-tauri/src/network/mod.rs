@@ -846,6 +846,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         server_login_tcp_port: None,
         last_tcp_remap_reconnect_at: None,
         pending_server_connect: None,
+        restored_upload_queue: ed2k::upload_queue_store::restore(&data_dir),
         pending_buddy_hashes: pending_buddy_hashes.clone(),
         shared_buddy_info: shared_buddy_info.clone(),
         shared_ip_filter: shared_ip_filter.clone(),
@@ -1600,7 +1601,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // Upload queue shared between the upload listener (owner/writer) and
     // the UDP reask-ack handler (reader that needs to answer the real queue
     // rank for a peer pinging us over UDP). Holding the shared handle here
-    // avoids a placeholder 0 rank reply.
+    // avoids a placeholder 0 rank reply. Whoever was still waiting when the
+    // last session shut down rejoins it once the library has loaded
+    // (`state.restored_upload_queue`).
     let upload_queue_handle: ed2k::upload::UploadQueueRef =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
@@ -3336,6 +3339,23 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'cleanup_timer' panicked: {}", describe_panic(&*__p));
                 }
+                // A node with no shared folders never runs the startup
+                // reconcile that merges last session's upload waiters.
+                if state
+                    .restored_upload_queue
+                    .as_ref()
+                    .is_some_and(|pending| pending.overdue())
+                {
+                    if let Some(pending) = state.restored_upload_queue.take() {
+                        ed2k::upload_queue_store::merge_pending(
+                            pending,
+                            &upload_queue_handle,
+                            &local_index,
+                            &transfer_manager,
+                        )
+                        .await;
+                    }
+                }
             }
 
             // Broker tick + event drain. Used to live inside the
@@ -4630,6 +4650,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         upnp_enabled,
         &mut upnp_mappings,
         &mut xfer_finish_rx,
+        &upload_queue_handle,
     )
     .await;
 

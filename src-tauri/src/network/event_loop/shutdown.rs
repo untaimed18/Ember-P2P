@@ -33,6 +33,7 @@ pub(in crate::network) async fn save_on_shutdown(
     upnp_enabled: bool,
     upnp_mappings: &mut upnp::UpnpMappings,
     xfer_finish_rx: &mut mpsc::UnboundedReceiver<XferFinishResult>,
+    upload_queue: &ed2k::upload::UploadQueueRef,
 ) {
     // Apply any transfer verification the blocking pool is still working on,
     // before anything below tears down the paths its completion frame needs.
@@ -201,6 +202,35 @@ pub(in crate::network) async fn save_on_shutdown(
              {rotations} slow-source rotations",
         );
     }
+    // The upload waiting queue, so the peers queued here keep their place
+    // across a restart (`ed2k::upload_queue_store`). Bounded like every phase
+    // here: the listener may still hold the lock, and a queue that cannot be
+    // saved in time costs the waiters their place, not the user their data.
+    let queue_phase_deadline =
+        shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(2));
+    match tokio::time::timeout_at(queue_phase_deadline, upload_queue.lock()).await {
+        Ok(queue) => {
+            let mut entries = queue.clone();
+            drop(queue);
+            // Last session's waiters, if this one ended before they could
+            // rejoin. Live rows come first, so they win a duplicate.
+            if let Some(pending) = state.restored_upload_queue.take() {
+                entries.extend(pending.into_entries());
+            }
+            let dir = state.data_dir.clone();
+            let writer = tokio::task::spawn_blocking(move || {
+                ed2k::upload_queue_store::save(&dir, &entries)
+            });
+            match tokio::time::timeout_at(queue_phase_deadline, writer).await {
+                Ok(Ok(Ok(count))) => info!("Saved {count} upload queue waiter(s) on shutdown"),
+                Ok(Ok(Err(e))) => error!("Failed to save the upload queue on shutdown: {e}"),
+                Ok(Err(e)) => error!("Upload queue shutdown writer failed: {e}"),
+                Err(_) => warn!("Upload queue save did not finish within its shutdown phase"),
+            }
+        }
+        Err(_) => warn!("Skipping the upload queue save: the queue stayed locked into shutdown"),
+    }
+
     let contacts = state.routing_table.export_bootstrap_contacts(200);
     let nodes_path = state.data_dir.join("nodes.dat");
     match tokio::time::timeout_at(
