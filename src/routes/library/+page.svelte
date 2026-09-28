@@ -5147,10 +5147,11 @@
     font-weight: 600;
     line-height: 16px;
   }
+  /* Keep in step with `.shared-badge.friends` in LibraryVirtualTable. */
   .drawer-status.drawer-status-friends {
-    background: color-mix(in srgb, var(--success) 12%, transparent);
-    border-color: color-mix(in srgb, var(--success) 35%, transparent);
-    color: var(--success);
+    background: color-mix(in srgb, var(--warning) 15%, transparent);
+    border-color: color-mix(in srgb, var(--warning) 32%, transparent);
+    color: var(--warning);
   }
   .drawer-close {
     width: 28px;

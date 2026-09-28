@@ -643,6 +643,9 @@
             aria-label={isOnline(activeTab.hash)
               ? m.chat_online_label()
               : m.chat_offline_label()}
+            title={isOnline(activeTab.hash)
+              ? m.chat_online_label()
+              : m.chat_offline_label()}
           ></span>
           <span class="dock-current-name"><bdi dir="auto">{activeTabLabel}</bdi></span>
         {:else}
@@ -661,6 +664,15 @@
           <path d="M4 6.5l4 4 4-4"/>
         </svg>
       </button>
+
+      {#if activeTab}
+        <span class="dock-encrypted" role="img" title={m.chat_encrypted_title()} aria-label={m.chat_encrypted_aria()}>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
+            <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
+          </svg>
+        </span>
+      {/if}
 
       {#if unreadElsewhere > 0}
         <!-- A count that goes somewhere. Without this the only report of a
@@ -1036,6 +1048,22 @@
   .dock-presence.online {
     background: var(--status-connected);
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-connected) 18%, transparent);
+  }
+
+  .dock-encrypted {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    padding: 4px;
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--accent);
+  }
+
+  .dock-encrypted svg {
+    width: 12px;
+    height: 12px;
   }
 
   .dock-elsewhere {

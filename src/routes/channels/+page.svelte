@@ -3067,7 +3067,6 @@
                 friendHash=""
                 friendName={selectedName}
                 channelId={selectedChannelId}
-                hideHeader
                 youAreBanned={selectedBanned}
                 youAreKeyBehind={selectedKeyBehind}
                 slowModeSecs={selectedSlowMode}

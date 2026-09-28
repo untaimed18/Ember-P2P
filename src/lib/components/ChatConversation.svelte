@@ -45,7 +45,7 @@
     setPendingReply,
     type PendingReply,
   } from '$lib/channelReply';
-  import { activeChatHash, clearUnread, friendLabel, friendNames, onlineFriends } from '$lib/stores/friends';
+  import { activeChatHash, clearUnread, onlineFriends } from '$lib/stores/friends';
   import { clearChannelUnread, noteChannelOnScreen } from '$lib/stores/channels';
   import {
     editChannelMessage,
@@ -117,7 +117,6 @@
     friendHash: string;
     friendName: string;
     channelId?: string;
-    hideHeader?: boolean;
     youAreBanned?: boolean;
     /** Private room whose content key has rotated past what this device holds. */
     youAreKeyBehind?: boolean;
@@ -187,7 +186,6 @@
     friendHash,
     friendName,
     channelId = '',
-    hideHeader = false,
     youAreBanned = false,
     youAreKeyBehind = false,
     slowModeSecs = 0,
@@ -216,15 +214,6 @@
   // opened.
   let isOnline = $derived(
     !isChannel && friendHash ? $onlineFriends.has(friendHash.toLowerCase()) : false,
-  );
-
-  /** Header name. For a friend it carries the short hash whenever the name
-   *  could pass for another friend's, since the header is what says who the
-   *  conversation is with. */
-  let headerName = $derived(
-    !isChannel && friendHash
-      ? friendLabel(friendHash, friendName, $friendNames)
-      : friendName || friendHash.slice(0, 8) + '\u2026',
   );
 
   // The user can disable chat entirely in Settings; when off, the backend
@@ -304,6 +293,27 @@
   let messagesEnd: HTMLDivElement | undefined = $state();
   let messagesContainerEl: HTMLDivElement | undefined = $state();
   let chatInputEl: HTMLTextAreaElement | undefined = $state();
+
+  /**
+   * Grow the composer with its draft up to the CSS max-height, past which it
+   * scrolls. Keyed on `inputText` rather than the input event, so a restored
+   * draft, a sent message and an inserted mention resize it too. The composer
+   * takes its height from the transcript, which would otherwise slide the
+   * newest lines under it.
+   */
+  $effect(() => {
+    void inputText;
+    const el = chatInputEl;
+    if (!el) return;
+    const before = el.offsetHeight;
+    const pinned = untrack(() => isPinnedToBottom());
+    el.style.height = 'auto';
+    // Border-box sizing: scrollHeight leaves out the border the height includes.
+    el.style.height = `${el.scrollHeight + el.offsetHeight - el.clientHeight}px`;
+    const box = untrack(() => messagesContainerEl);
+    if (pinned && box && el.offsetHeight !== before) box.scrollTop = box.scrollHeight;
+  });
+
   let unlisten: UnlistenFn | null = null;
   let unlistenDelivery: UnlistenFn | null = null;
   let unlistenTyping: UnlistenFn | null = null;
@@ -2880,50 +2890,6 @@
     >{node.text}</button>{:else if node.type === 'code'}<code class="fmt-code">{node.text}</code>{:else if node.type === 'bold'}<strong>{@render inlineNodes(node.children)}</strong>{:else if node.type === 'italic'}<em>{@render inlineNodes(node.children)}</em>{:else}<s>{@render inlineNodes(node.children)}</s>{/if}{/each}{/snippet}
 
 <div class="conversation" class:channel={isChannel}>
-  {#if !hideHeader}
-  <div class="conv-header">
-    <div class="conv-header-info">
-      <div class="conv-avatar" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.418 3.582-8 8-8s8 3.582 8 8"/>
-        </svg>
-      </div>
-      <span class="conv-name" title={friendName || friendHash}>
-        <span class="sr-only">{m.chat_friend_with_prefix()} </span><bdi dir="auto">{headerName}</bdi>
-      </span>
-      {#if isOnline}
-        <span class="conv-status online" title={m.chat_online_title()} aria-label={m.chat_online_aria()}>
-          <svg viewBox="0 0 16 16" fill="currentColor" stroke="none" aria-hidden="true">
-            <circle cx="8" cy="8" r="4"/>
-          </svg>
-          <span>{m.chat_online_label()}</span>
-        </span>
-      {:else}
-        <span class="conv-status offline" title={m.chat_offline_title()} aria-label={m.chat_offline_aria()}>
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="8" cy="8" r="6"/>
-            <path d="M8 5v3M8 11v.01"/>
-          </svg>
-          <span>{m.chat_offline_label()}</span>
-        </span>
-      {/if}
-      <!--
-        Icon only. Its label read "Encrypted in transit + locally", which in a
-        ~420px dock consumed more width than the friend's name and squeezed it
-        to an ellipsis on every conversation. A padlock is understood without
-        being spelled out, and the full explanation is still one hover away in
-        the tooltip and unchanged for screen readers.
-      -->
-      <span class="conv-status encrypted icon-only" role="img" title={m.chat_encrypted_title()} aria-label={m.chat_encrypted_aria()}>
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
-          <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
-        </svg>
-      </span>
-    </div>
-  </div>
-  {/if}
-
   {#if isChannel && pinEntries.length > 0}
     {@const pin = pinEntries[shownPinIndex]}
     <!-- Its own row above the transcript rather than floating over it, so the
@@ -3663,91 +3629,6 @@
 
   :global([data-theme="dark"]) .conversation.channel {
     background: var(--bg-secondary);
-  }
-
-  .conv-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 10px 14px;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg-surface);
-    flex-shrink: 0;
-  }
-
-  .conv-header-info {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    min-width: 0;
-  }
-
-  .conv-avatar {
-    width: 28px;
-    height: 28px;
-    border-radius: 50%;
-    background: var(--accent-dim);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: var(--accent);
-    flex-shrink: 0;
-  }
-
-  .conv-avatar svg {
-    width: 14px;
-    height: 14px;
-  }
-
-  .conv-name {
-    font-weight: 600;
-    font-size: 13px;
-    color: var(--text-primary);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .conv-status {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 2px 8px;
-    border-radius: var(--radius-pill);
-    font-size: 11px;
-    font-weight: 600;
-    line-height: 1;
-    flex-shrink: 0;
-  }
-
-  .conv-status svg {
-    width: 11px;
-    height: 11px;
-  }
-
-  .conv-status.icon-only {
-    padding: 4px;
-    gap: 0;
-  }
-
-  .conv-status.icon-only svg {
-    width: 12px;
-    height: 12px;
-  }
-
-  .conv-status.online {
-    background: color-mix(in srgb, var(--success) 16%, transparent);
-    color: var(--success);
-  }
-
-  .conv-status.offline {
-    background: var(--bg-tertiary);
-    color: var(--text-muted);
-  }
-
-  .conv-status.encrypted {
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-    color: var(--accent);
   }
 
   /* Anchors both `.conv-jump` pills, which float over the transcript rather

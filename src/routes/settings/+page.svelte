@@ -41,6 +41,8 @@
     setAntileechPatterns,
     setAntileechEnabled,
     resetAntileechToDefaults,
+    setBlockPrivateIps,
+    setIpFilterEnabled,
   } from '$lib/api/security';
   import type { AntiLeechSnapshot } from '$lib/types';
   import { invoke } from '@tauri-apps/api/core';
@@ -1956,6 +1958,38 @@
     }
   }
 
+  /**
+   * The IP filter and private-range switches apply the moment they flip, as
+   * the same switches on the Security page do. Queued so a quick on-off-on
+   * reaches the backend in the order it was clicked.
+   */
+  let ipToggleQueue: Promise<void> = Promise.resolve();
+  function applyIpToggleLive(field: 'ip_filter_enabled' | 'block_private_ips', next: boolean) {
+    ipToggleQueue = ipToggleQueue.then(async () => {
+      try {
+        if (field === 'ip_filter_enabled') await setIpFilterEnabled(next);
+        else await setBlockPrivateIps(next);
+        if (unmounted) return;
+        // Already on disk, so it is not an unsaved change. Patch only this
+        // field so other genuinely-unsaved edits stay flagged.
+        if (originalSettings) {
+          try {
+            const base = JSON.parse(originalSettings) as AppSettings;
+            base[field] = next;
+            originalSettings = JSON.stringify(base);
+          } catch { /* malformed baseline; leave as-is */ }
+        }
+        const persisted = await getSettings().catch(() => null);
+        if (persisted) setAppSettings(persisted);
+        showSaveMsg(m.settings_saved_automatically(), false, 2000);
+      } catch (e: unknown) {
+        if (unmounted) return;
+        if (settings) settings[field] = !next;
+        showSaveMsg(translateError(e, m.settings_save_failed()), true, 6000);
+      }
+    });
+  }
+
   async function handleAntileechToggle(checked: boolean, gen: number) {
     try {
       await setAntileechEnabled(checked);
@@ -3570,8 +3604,13 @@
             <div class="toggle-info">
               <span class="toggle-title">{m.settings_ip_filter_label()}</span>
               <span class="hint">{m.settings_ip_filter_hint()}</span>
+              <span class="hint hint-live">{m.settings_applies_immediately()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.ip_filter_enabled} ariaLabel={m.settings_ip_filter_label()} />
+            <ToggleSwitch
+              bind:checked={settings.ip_filter_enabled}
+              ariaLabel={m.settings_ip_filter_label()}
+              onchange={(v) => applyIpToggleLive('ip_filter_enabled', v)}
+            />
           </div>
           {#if settings.ip_filter_enabled}
             <div class="field nested">
@@ -3599,8 +3638,13 @@
             <div class="toggle-info">
               <span class="toggle-title">{m.settings_block_private_label()}</span>
               <span class="hint">{m.settings_block_private_hint()}</span>
+              <span class="hint hint-live">{m.settings_applies_immediately()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.block_private_ips} ariaLabel={m.settings_block_private_label()} />
+            <ToggleSwitch
+              bind:checked={settings.block_private_ips}
+              ariaLabel={m.settings_block_private_label()}
+              onchange={(v) => applyIpToggleLive('block_private_ips', v)}
+            />
           </div>
 
           <div class="field toggle-row">

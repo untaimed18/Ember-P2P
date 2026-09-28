@@ -86,6 +86,10 @@
   let problem = $derived(
     attachment.status !== 'complete' && CHAT_ATTACHMENT_TERMINAL.has(attachment.status),
   );
+  /** Ended without the file through nobody's choice. Cancelled, declined and
+   *  expired stay muted. Keep in step with `XFER_FAILED` on the Channels page. */
+  const FAILED_STATUSES = new Set(['failed', 'source_gone', 'unreachable', 'busy', 'too_large', 'not_allowed']);
+  let failed = $derived(FAILED_STATUSES.has(attachment.status));
   let done = $derived(attachment.status === 'complete');
   let waitingOnMe = $derived(attachment.status === 'awaiting');
   /** Moving, but nothing through yet: the bar says "working" without a figure. */
@@ -132,6 +136,7 @@
   class="attach"
   class:sent
   class:problem
+  class:failed
   class:done
   class:waiting={waitingOnMe}
   role="group"
@@ -301,6 +306,7 @@
   .attach.sent .attach-dir { background: var(--accent); }
   .attach.done .attach-dir { background: var(--success); }
   .attach.problem .attach-dir { background: var(--text-muted); }
+  .attach.failed .attach-dir { background: var(--danger); }
 
   .attach-dir svg {
     width: 10px;
@@ -400,6 +406,7 @@
   .attach.done .attach-status { color: var(--success); }
 
   .attach.problem .attach-status { color: var(--text-muted); }
+  .attach.failed .attach-status { color: var(--danger); }
 
   .attach-speed {
     flex-shrink: 0;
