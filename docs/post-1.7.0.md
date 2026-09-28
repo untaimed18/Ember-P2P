@@ -91,13 +91,6 @@ how long each responder has been a verified contact.
 
 ## Friend chat attachments
 
-### 6. Warn about executable files (UX)
-
-Opening already refuses to launch executables and disguised files (they are shown
-in their folder instead). The cards could also say so up front: flag names such
-as `report.pdf.exe`, `.bat`, `.lnk`, `.scr` in the chat card and the room
-transfer drawer.
-
 ### 7. Refuse non-friend dials earlier (low)
 
 Any Ember user can complete the QUIC or Noise handshake and open a chat
@@ -149,20 +142,11 @@ allowlist.
 
 ## App-wide
 
-### Localize native dialog titles
-
-Every native picker (`set_title(...)` in `commands/chat_attachments.rs`,
-`channels.rs`, `sharing.rs`, `settings.rs`, `emule_import.rs`) has an English
-title. Pass a translated title from the renderer.
-
 ### Chat pop-out polish
 
-- Relaunching with the chat popped out remembers the mode but does not reopen
-  the chat window until a conversation is opened. Decide whether it should
-  reopen at launch.
-- For up to a second after the pop-out opens, before its first presence report,
-  a message can still notify and count as unread although the user is reading
-  it there. Treat an open chat window as focused until it reports.
+Relaunching with the chat popped out remembers the mode but does not reopen the
+chat window until a conversation is opened. Decide whether it should reopen at
+launch.
 
 ## Friend Browse
 

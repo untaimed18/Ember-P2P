@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import * as m from '$lib/paraglide/messages';
 
 /** An eMule or aMule folder the backend found or the user picked. `id` is what
  *  every later call names it by; the path is for display only. */
@@ -127,7 +128,7 @@ export async function detectEmuleInstalls(): Promise<EmuleInstall[]> {
 
 /** Native folder picker; `null` when cancelled. */
 export async function pickEmuleFolder(): Promise<EmuleInstall | null> {
-  return invoke('pick_emule_folder');
+  return invoke('pick_emule_folder', { title: m.picker_emule_folder() });
 }
 
 export async function previewEmuleImport(sourceId: number): Promise<EmulePreview> {

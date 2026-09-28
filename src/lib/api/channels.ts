@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import * as m from '$lib/paraglide/messages';
 
 export interface ChannelInfo {
   channel_id: string;
@@ -522,6 +523,8 @@ export interface ChannelTransferInfo {
   size: number;
   transferred: number;
   status: ChannelTransferStatus;
+  /** A program, shortcut or script, or one named like a document. */
+  risky?: boolean;
 }
 
 /** Offer one file to one member. Returns the transfer id, or `null` if the
@@ -534,7 +537,11 @@ export async function pickAndOfferChannelTransfer(
   channelId: string,
   memberPubkey: string,
 ): Promise<string | null> {
-  return invoke('pick_and_offer_channel_transfer', { channelId, memberPubkey });
+  return invoke('pick_and_offer_channel_transfer', {
+    channelId,
+    memberPubkey,
+    title: m.picker_file_to_send(),
+  });
 }
 
 export async function respondChannelTransfer(xferId: string, accept: boolean): Promise<void> {

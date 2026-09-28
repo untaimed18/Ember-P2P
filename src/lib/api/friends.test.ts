@@ -11,6 +11,7 @@ const row = (status: ChatAttachment['status'], transferred = 0): ChatAttachment 
   status,
   created_at: 1_700_000_000,
   has_file: status === 'complete',
+  risky: false,
 });
 
 describe('mergeChatAttachment', () => {

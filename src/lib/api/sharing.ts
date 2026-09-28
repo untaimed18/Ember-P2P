@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import * as m from '$lib/paraglide/messages';
 import { withTimeout } from '$lib/utils';
 import type { FileInfo, MediaMetadata } from '$lib/types';
 
@@ -19,7 +20,7 @@ export interface SharedFolderPick {
 
 /** Open the backend-owned native picker and add every selected folder. */
 export async function addSharedFolder(): Promise<SharedFolderPick> {
-  return invoke('pick_shared_folder');
+  return invoke('pick_shared_folder', { title: m.picker_shared_folders() });
 }
 
 export type ShareBrowserKind =

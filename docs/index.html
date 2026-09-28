@@ -1093,7 +1093,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="" width="80" height="80">
-      <h3>Get Ember 1.6.7</h3>
+      <h3>Get Ember 1.7.0</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11, and for x86-64 Linux as a <code>.deb</code> or an AppImage.</p>
       <span class="download-meta">Windows installer &middot; Linux <code>.deb</code> / AppImage &middot; no extra runtimes</span>
       <div class="btn-group">
@@ -1201,7 +1201,7 @@
 
     <h3>Social</h3>
     <ul>
-      <li><strong>Ember Friends</strong> &mdash; Ember-exclusive friend system powered by a rendezvous server. Share a <strong>v2 Friend Code</strong>, exchange mutual requests, then enjoy real-time online status, remote file browsing, friends-only shares, file offers, priority upload slots, durable offline chat, and <strong>end-to-end encrypted</strong> messaging. See the <a href="#friends">Friends section</a> for details.</li>
+      <li><strong>Ember Friends</strong> &mdash; Ember-exclusive friend system powered by a rendezvous server. Share a <strong>Friend Code</strong>, exchange mutual requests, then enjoy real-time online status, remote file browsing, friends-only shares, file offers, priority upload slots, durable offline chat, and <strong>end-to-end encrypted</strong> messaging. See the <a href="#friends">Friends section</a> for details.</li>
       <li><strong>E2E Friend Chat</strong> &mdash; Mutual-friend messages use static X25519 ECDH + AEAD end-to-end encryption after session setup. The chat UI shows an <strong>Encrypted</strong> badge; plaintext fallbacks are rejected. Conversation history is encrypted in the local database, and outbound messages queue until the friend is reachable again. Being a static exchange, it provides no forward secrecy and covers message bodies only &mdash; see <a href="#friends-encryption">E2E Encryption</a>.</li>
       <li><strong>Noise-Secured Friend Sessions</strong> &mdash; Friend connections use <strong>Noise IK</strong> secure streams with Ed25519 proof-of-possession before chat, browse, offers, and verified friend privileges unlock. Friend file transfers can also run over the same secure path when ordinary HighID/callback routes are unavailable.</li>
       <li><strong>Channels</strong> <span class="beta-badge">Beta</span> &mdash; Group rooms carried over the Ember Network itself. Create a public room anyone can find or a private one that needs an invite, moderate it with bans, moderators, owner-only invites and slow mode, edit and react to messages, and send a file to one member at a time &mdash; encrypted to that member, not to the room. Nobody publishes their IP address to the room. See the <a href="#channels">Channels section</a> for details.</li>
@@ -1345,7 +1345,7 @@
       <li><strong>Multi-keyword recall is approximate</strong> &mdash; See the note above.</li>
       <li><strong>A busy keyword is answered a page at a time</strong> &mdash; One packet still only carries a few records, but a searcher can ask the same peer for the next page, so recall under a common word is bounded by how many peers the search walks and how deep it pages rather than by one datagram. A peer is held to a quarter of a search&rsquo;s budget while the walk still has somewhere to go, and may serve the rest of it once there is nothing left to ask &mdash; so a single node holding an uncommon word can hand over its whole index instead of the first slice of it. Publishing has its own ceiling: a key holds 1000 records and any one publisher at most 150 of them, matching KAD&rsquo;s numbers, so if you share far more than 150 files under one common word not all of them are findable under it. The Ember page counts how often an answer was truncated or records were withheld.</li>
       <li><strong>Gossip is unverified until it answers</strong> &mdash; A peer another node told us about is a lead, not a fact, until it replies directly. The Ember page, status bar, and Search readiness wait for a verified answer before calling the overlay connected, so a table full of gossip does not look like a successful join. Admission caps bound the damage, but there is no reputation scoring on gossip itself.</li>
-      <li><strong>Library content still moves over eD2K</strong> &mdash; Ember finds the source; the bytes travel the eMule wire. The exception is a file sent between two members of a channel, which goes over the overlay itself (accept-first, up to 100 MB). Putting ordinary downloads on the same footing is the largest remaining piece.</li>
+      <li><strong>Library content still moves over eD2K</strong> &mdash; Ember finds the source; the bytes travel the eMule wire. The exceptions are a file sent to a friend in chat or to a member of a room, which goes directly between the two of you (accept-first, up to 2 GB). Putting ordinary downloads on the same footing is the largest remaining piece.</li>
       <li><strong>Some paths are not yet exercised end to end</strong> &mdash; Notably publishing while firewalled through a buddy relay, and a cold join from an empty contact file with no KAD.</li>
     </ul>
   </section>
@@ -1423,7 +1423,7 @@ peer_count    (u16 LE)
     <p>Ember includes a built-in friend system that works exclusively between Ember users. It is powered by a separate cryptographic identity called the <strong>Ember Hash</strong> (also known as your <strong>Friend ID</strong>), which is distinct from the standard ed2k <code>user_hash</code> used for protocol operations and credits.</p>
 
     <h3>How it works</h3>
-    <p>Each Ember client generates a unique 16-byte Ember Hash on first launch. Share a <strong>v2 Friend Code</strong> (shown on the Friends page) with someone so they can find you on the network. Friend Codes carry the identity needed for privacy-preserving rendezvous lookup without exposing a long-lived raw hash in casual sharing.</p>
+    <p>Each Ember client generates a unique 16-byte Ember Hash on first launch. Share a <strong>Friend Code</strong> (shown on the Friends page) with someone so they can find you on the network. A Friend Code (<code>ember3:</code>) carries your identity plus a random secret, so only someone you gave it to can look up where you are &mdash; a public key seen in a room roster is not enough. Friends &gt; Reset code makes a new secret; Ember still accepts older <code>ember2:</code> codes and bare Friend IDs.</p>
     <p>Friend discovery is powered by a lightweight <strong>rendezvous server</strong>. When you connect, Ember registers presence using hashed capabilities (never your raw Friend ID in the clear). When you search for a friend, Ember queries the server and gets back an IP and port for a direct connection. Adding or accepting a friend forces a presence refresh so discovery does not wait on the normal heartbeat interval.</p>
     <p>Once a friend is found, Ember opens a direct TCP connection and establishes a <strong>Noise IK</strong> secure stream with Ed25519 proof-of-possession. After both sides accept the friend request, chat, file browsing, file offers, friends-only shares, and priority uploads unlock on that secured session. When both friends are behind difficult NAT, Ember can still move friend file traffic over the secure session (and optional peer relay) without waiting for HighID.</p>
 
@@ -1433,10 +1433,11 @@ peer_count    (u16 LE)
 
     <h3 id="friends-features">Features</h3>
     <ul>
-      <li><strong>v2 Friend Codes</strong> &mdash; Share a Friend Code from the Friends page instead of only a raw Friend ID. Codes support privacy-preserving pairwise presence so mutual chat and browse can unlock once both sides have added each other.</li>
+      <li><strong>Friend Codes</strong> &mdash; Share a Friend Code from the Friends page instead of only a raw Friend ID. Codes support privacy-preserving pairwise presence so mutual chat and browse can unlock once both sides have added each other. Codes made by 1.7.0 start with <code>ember3:</code>, which 1.6.x cannot read.</li>
       <li><strong>Mutual Friend Requests</strong> &mdash; The recipient sees an incoming request on the Friends page and can accept or reject it. Chat, file browsing, offers, and priority upload features only activate once both sides have accepted <strong>and</strong> a secure friend session is established.</li>
       <li><strong>Real-Time Online Status</strong> &mdash; Ember detects when a friend comes online and shows a live online/offline indicator on their card. The Friends page also surfaces when you are not currently discoverable on the rendezvous network.</li>
-      <li><strong>End-to-End Encrypted Chat</strong> &mdash; Send and receive messages with mutual friends through a slide-out sidebar. After session setup, messages are encrypted end-to-end; the UI shows an <strong>Encrypted</strong> badge. Outbound messages queue locally and retry when the friend reconnects. See <a href="#friends-encryption">E2E Encryption</a>.</li>
+      <li><strong>End-to-End Encrypted Chat</strong> &mdash; Send and receive messages with mutual friends through a slide-out sidebar. After session setup, messages are encrypted end-to-end; the UI shows an <strong>Encrypted</strong> badge. Outbound messages queue locally and retry when the friend reconnects. The chat can also pop out into its own window. See <a href="#friends-encryption">E2E Encryption</a>.</li>
+      <li><strong>Send Files in Chat</strong> &mdash; Attach a file to a conversation and it goes directly to that friend, up to 2&nbsp;GB, over QUIC or, when the sender&rsquo;s UDP port is not reachable, an encrypted stream on their TCP upload port. Each piece is checked against the offered hash as it arrives. Received files are saved to a <strong>Chat Files</strong> folder, small ones can download automatically, and programs, scripts and disguised files carry a warning. Both of you need 1.7.0, and files are not sent through relays.</li>
       <li><strong>Remote File Browsing</strong> &mdash; Browse a mutual friend&rsquo;s shared file library while they are online and start downloads directly from the browse results.</li>
       <li><strong>Friends-Only Shares</strong> &mdash; Mark Library files as friends-only so they stay out of public search and only mutual friends can request them.</li>
       <li><strong>Friend File Offers</strong> &mdash; Push a specific shared file to a mutual friend from the Friends page. Offers appear as actionable notifications the recipient can accept or decline.</li>
@@ -1488,7 +1489,7 @@ peer_count    (u16 LE)
       </li>
       <li>
         <strong>Create a room, or join one</strong><br>
-        <span style="color: var(--text-secondary)">A room name is up to 20 characters and is claimed once, first come first served. To join someone else&rsquo;s, paste the <code>ember-channel:</code> invite they sent you.</span>
+        <span style="color: var(--text-secondary)">A room name is up to 32 characters and is claimed first come first served; the owner can rename the room later. To join someone else&rsquo;s, paste the <code>ember-channel:</code> invite they sent you.</span>
       </li>
       <li>
         <strong>Or find one with Discover</strong><br>
@@ -1505,9 +1506,13 @@ peer_count    (u16 LE)
     <p>A private room&rsquo;s owner can rotate its key, which cuts off anyone holding an older invite &mdash; the remedy when a link has been shared further than you meant.</p>
 
     <h3 id="channels-owner">Running a room</h3>
-    <p>Whoever creates a room owns it. Owner tools live in the room&rsquo;s info panel.</p>
+    <p>Whoever creates a room owns it. Owner tools open in a room settings window from the gear in the room header.</p>
     <ul>
+      <li><strong>Rename</strong> &mdash; give the room a new name, up to 32 characters.</li>
       <li><strong>Topic and welcome</strong> &mdash; a line at the top of the room and a greeting new members see.</li>
+      <li><strong>Language</strong> &mdash; mark the language the room is held in. It shows as a small flag beside the name in the room list, the header and Discover.</li>
+      <li><strong>Pins</strong> &mdash; pin up to 3 messages to the top of the room, from a message&rsquo;s own menu.</li>
+      <li><strong>Announcements only</strong> &mdash; only you and your moderators can post; members can still read and react. Each member&rsquo;s own app enforces it, so a member on an older build is not held to it.</li>
       <li><strong>Moderators</strong> &mdash; up to 6 members who can ban and unban on your behalf. They cannot ban you, and they cannot delete the room.</li>
       <li><strong>Bans</strong> &mdash; up to 12 at a time.</li>
       <li><strong>Owner-only invites</strong> &mdash; stops a member re-sharing the room without thinking. Every member holds the key either way, so treat this as a guard against carelessness rather than against someone determined.</li>
@@ -1523,14 +1528,18 @@ peer_count    (u16 LE)
     <h3 id="channels-messages">Messages</h3>
     <ul>
       <li><strong>Edit your own message</strong> for 15 minutes after sending it. Every receiver checks the author&rsquo;s signature and both clocks itself, so &ldquo;only the author may edit&rdquo; is not something the sending client is trusted about. Members who were away are handed the corrected line rather than the original followed by a revision.</li>
-      <li><strong>React</strong> with a thumb up, a thumb down or a heart. One reaction per person per message, and changing yours replaces it.</li>
+      <li><strong>Reply to a message</strong> and your line quotes the one it answers. A member on 1.6.x sees the reply as an ordinary line.</li>
+      <li><strong>React</strong> with one of 20 reactions. One reaction per person per message, and changing yours replaces it. The original thumb up, thumb down and heart work with 1.6.1 and newer; the others need 1.7.0.</li>
+      <li><strong>Format</strong> with <code>**bold**</code>, <code>*italic*</code>, <code>~~strike~~</code> and <code>`code`</code>. Formatting is only how the line is shown; an older Ember shows the marks as typed.</li>
+      <li><strong>See who is typing,</strong> on 1.7.0.</li>
       <li><strong>Remove a message from this device.</strong> Local only &mdash; the protocol has no way to unsend, so every other member keeps their copy. What it does guarantee is that the line stays gone here, including when another member replays it later.</li>
       <li><strong>Mention a member</strong> by typing <code>@</code>, which completes handles from the room&rsquo;s member list.</li>
     </ul>
     <p>Edits and reactions need both sides on 1.6.1 or newer. An older client does not recognise them and drops them rather than passing them on, so in a mixed room they reach only the members who have updated.</p>
 
     <h3 id="channels-files">Sending files</h3>
-    <p>You can send a file to one member of a room at a time, up to <strong>100 MB</strong>, and only after they accept the offer. An offer that goes unanswered lapses after 5 minutes, and up to 4 transfers can run at once. Files go directly between the two of you, not to the whole room, and the payload is encrypted to that member rather than to the room. Transfers count against your upload speed limit like any other upload. If both of you are firewalled the transfer needs a relay, and may not start at all.</p>
+    <p>You can send a file to one member of a room at a time, up to <strong>2 GB</strong>, and only after they accept the offer. An offer that goes unanswered lapses after 5 minutes, and up to 4 transfers can run at once. Files go directly between the two of you, not to the whole room, and the payload is encrypted to that member rather than to the room. Transfers count against your upload speed limit like any other upload, and appear in a drawer under the member list with their speed and time left.</p>
+    <p>Between two members on 1.7.0 the file moves over a direct QUIC stream, or an encrypted stream on the sender&rsquo;s TCP upload port when their UDP port cannot be reached, and each piece is checked against the offer as it lands. If neither can be opened &mdash; a member on 1.6.x, or two firewalled members who can only meet through a relay &mdash; the transfer falls back to the older block protocol, which is much slower, keeps what was already verified, and is limited to 100&nbsp;MB for a 1.6.x member. Received files are saved to a <strong>Channel Files</strong> folder, which is not shared, and programs, scripts and disguised files carry a warning.</p>
 
     <h3 id="channels-limits">What to expect</h3>
     <div class="callout-warn callout">
@@ -1793,7 +1802,7 @@ npm run tauri build</code></pre>
         How do Friends work? Can I add non-Ember users?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
-      <div class="faq-a">Friends are an Ember-exclusive feature. Share a <strong>v2 Friend Code</strong> from the Friends page with another Ember user. Ember finds them through its rendezvous server and sends a friend request. Once both sides accept and a secure Noise session is established, mutual friends unlock online status, <strong>end-to-end encrypted</strong> chat, remote file browsing, friends-only shares, file offers, priority uploads, and transfers that can work without HighID. You can also block a Friend ID to reject future contact. Non-Ember clients do not have a Friend ID / Friend Code and cannot participate.</div>
+      <div class="faq-a">Friends are an Ember-exclusive feature. Share a <strong>Friend Code</strong> from the Friends page with another Ember user. Ember finds them through its rendezvous server and sends a friend request. Once both sides accept and a secure Noise session is established, mutual friends unlock online status, <strong>end-to-end encrypted</strong> chat, remote file browsing, friends-only shares, file offers, priority uploads, and transfers that can work without HighID. You can also block a Friend ID to reject future contact. Non-Ember clients do not have a Friend ID / Friend Code and cannot participate.</div>
     </div>
 
     <div class="faq-item">
@@ -1851,6 +1860,122 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Every Ember release, newest first. These are the same notes we publish on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
+
+    <article class="release" id="release-1-7-0">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.0" target="_blank" rel="noopener">Ember v1.7.0</a></h3>
+        <time class="release-date" datetime="2026-09-28">September 28, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.0" target="_blank" rel="noopener"><code>v1.7.0</code></a></p>
+      <div class="release-notes">
+        <p>The first feature release since 1.6.0, and most of it is about sending someone a file. You can now send a friend a file straight from the chat, and a file offered in a room no longer crawls: rooms used to move files a kilobyte at a time at about 190&nbsp;KB/s, capped at 100&nbsp;MB, and they now use the same direct, checked stream as chat, up to 2&nbsp;GB. Rooms also gained replies, pins, an announcement mode, a typing indicator, more reactions, formatting and a language flag; the chat can pop out into its own window; and an eMule or aMule install can be imported on first run. Around that sat a long run of audits &mdash; the eMule, KAD and server paths checked again against eMule&rsquo;s own source so Ember stays on the right side of their ban rules, the Ember DHT, the rendezvous server, security, and finally a page-by-page pass over the interface so every screen looks and behaves like the others.</p>
+
+        <h4>Before you upgrade</h4>
+
+        <ul>
+          <li><strong>The Ember DHT wire version is unchanged at version 4,</strong> so 1.7.0 and every 1.6 release see each other on the overlay normally. This is a compatible update; anything older than 1.6.0 is still invisible to all of them</li>
+          <li><strong>Friend codes now start with <code>ember3:</code>, and 1.6.x cannot read one.</strong> The new code carries a random secret, so a public key seen in a room roster can no longer be used to look up anyone&rsquo;s address. If a friend is still on 1.6.x, ask them to update or to send you their code instead &mdash; 1.7.0 still reads <code>ember2:</code> codes and bare IDs. Friends you already have carry over; while one of them stays on an older build, Ember keeps the old lookup for them for a limited time and their card says so. Friends &gt; Reset code makes a new secret</li>
+          <li><strong>Sending a file in Friend Chat needs both of you on 1.7.0.</strong> A friend on 1.6.x will not see the offer</li>
+          <li><strong>Room transfers between two 1.7.0 members use the new stream; with a 1.6.x member they fall back to the old block protocol.</strong> A 1.6.x member cannot accept a file over 100&nbsp;MB and drops the offer without answering, and the offer says so when it expires. Received room files now land in a new, unshared <strong>Channel Files</strong> folder beside Chat Files instead of in Downloads, which is shared by default</li>
+          <li><strong>The new room features degrade gracefully on 1.6.x.</strong> A reply reaches an older member as an ordinary line, formatting shows as the asterisks and backticks that were typed, the typing indicator and the new reactions are ignored, and the room&rsquo;s language is relayed without being shown. Announcement mode is enforced by each member&rsquo;s own app, so a member still on 1.6.x can post in an announcement-only room until they update</li>
+        </ul>
+
+        <h4>What&rsquo;s New</h4>
+
+        <h5>Sending files to friends</h5>
+        <ul>
+          <li><strong>Send a friend a file from the chat.</strong> The file goes directly between the two of you over QUIC and is checked against the hash it was offered with as each piece arrives, so a file swapped or corrupted on the way is refused rather than saved. Received files land in a <strong>Chat Files</strong> folder, open only from there, and small ones can download automatically up to a size you set in Settings</li>
+          <li><strong>A firewalled sender still works.</strong> If the sender&rsquo;s QUIC port cannot be reached, the file falls back to an encrypted stream on their TCP upload port after about three seconds, and two computers on the same home network find each other directly</li>
+          <li><strong>Progress moves as the bytes do.</strong> The card shows speed and time left and updates as data arrives, instead of jumping once per 256&nbsp;KB checked chunk and looking stalled in between</li>
+          <li><strong>A warning on files that can run code.</strong> A program, shortcut or script &mdash; or a file disguised as something else, like <code>report.pdf.exe</code> &mdash; carries a note to open it only if you trust the sender, in chat and on room transfers</li>
+          <li><strong>Free space is checked before a transfer is accepted,</strong> and a friend who is only reachable through a relay is shown as such, since files are not sent through relays</li>
+        </ul>
+
+        <h5>Room transfers</h5>
+        <ul>
+          <li><strong>Room files move over a direct stream, up to 2&nbsp;GB,</strong> encrypted to the member they were offered to and checked as they land. When the stream cannot be made, the transfer falls back to the block protocol and keeps what was already verified</li>
+          <li><strong>Transfers live in a drawer under the member list,</strong> with speed and time left, an Open Folder button once a file arrives, and no offers from members you have ignored</li>
+        </ul>
+
+        <h5>Rooms</h5>
+        <ul>
+          <li><strong>Replies, pins and more reactions.</strong> Reply to a line and it quotes what it answers; the owner can pin up to three messages to the top of the room; reactions grow to twenty; and messages support formatting</li>
+          <li><strong>Announcement mode and typing.</strong> An owner can make a room announcement-only, and members see who is typing</li>
+          <li><strong>A room can be renamed,</strong> and names can be up to 32 characters. The room list and header always show the whole name, wrapping rather than cutting it off</li>
+          <li><strong>A default language for each room,</strong> chosen from a searchable flag picker and shown as a small flag in the room list, the header and Discover before you join. Room search matches language names too</li>
+          <li><strong>Room settings open in their own window,</strong> with rename, topic, welcome, language, invite policy, announcements, slow mode, key rotation, succession and delete laid out as cards</li>
+          <li><strong>The room list sorts, searches and sizes itself to the window,</strong> a room stays open while you look at another page, and a half-typed line is still there when you come back</li>
+        </ul>
+
+        <h5>Chat</h5>
+        <ul>
+          <li><strong>Pop the chat out into its own window</strong> and back again. The dock slides in and out, remembers the width you give it, and finds a conversation as you type its name</li>
+          <li><strong>Unread counts show the number,</strong> the same capped count everywhere, including on each friend&rsquo;s Chat button, and declining a friend request now tells the other person</li>
+        </ul>
+
+        <h5>Library and sharing</h5>
+        <ul>
+          <li><strong>Import from eMule or aMule</strong> on first run or any time from Settings &gt; Import (<a href="https://github.com/untaimed18/Ember-P2P/issues/126" target="_blank" rel="noopener">#126</a>)</li>
+          <li><strong>Choose what to share without leaving the app,</strong> see how many files a folder will offer before you share it, and see subfolders marked as shared &mdash; or share a folder without them</li>
+          <li><strong>File details were reworked:</strong> a type icon, who the file is shared with, priority and friends-only changed in place, copy buttons for the path, hashes and eD2K link, and the upload ratio</li>
+          <li><strong>Friend Browse gained the Library&rsquo;s categories, sorting, multi-select and ownership badges,</strong> and shows how many files a friend shares. Ember also tells you when someone views your shared files</li>
+          <li><strong>Rename a download while it runs,</strong> and see which network each source came from, which client it runs, and when the download folder refuses a write</li>
+          <li><strong>On Linux, an approved removable drive stays approved</strong> across a replug or reboot, recognised by its filesystem ID</li>
+        </ul>
+
+        <h5>Look and feel</h5>
+        <ul>
+          <li><strong>One design language across every page.</strong> Type sizes, dialogs, spinners, banners, empty states, status badges, tables, network tiles, chat bubbles, avatars and page spacing now come from shared definitions, and every page collapses at the same window widths</li>
+          <li><strong>Translations were filled in and tidied.</strong> Channel errors that seven languages still showed in English are translated, German uses the formal <em>Sie</em> throughout, counts read &ldquo;1 file&rdquo; rather than &ldquo;1 files&rdquo;, and the system file pickers are titled in your language</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <h5>Staying in good standing on eMule, KAD and servers</h5>
+        <ul>
+          <li><strong>One connection per peer, and re-asks paced across restarts,</strong> so restarting Ember no longer looks like a client asking too often. Handshakes match vanilla eMule</li>
+          <li><strong>KAD traffic runs through an outbound governor</strong> matching eMule 0.72a&rsquo;s tracker, and &ldquo;New Connections / 5s&rdquo; now limits the connections Ember opens rather than the ones it accepts</li>
+          <li><strong>Server work moved off the event loop,</strong> with shared-file offers and source requests paced the way servers expect, and a re-share is no longer read by a server as a republish</li>
+          <li><strong>One peer could end a keyword search</strong> that everyone else was still answering, and a pre-Unicode client could not read our folder names</li>
+        </ul>
+
+        <h5>Downloads and uploads</h5>
+        <ul>
+          <li><strong>Large files on slow drives were re-hashed on every launch.</strong> A hash now gives up only after five minutes without reading anything, instead of five minutes in total, so a multi-gigabyte archive on a USB drive finishes once and is remembered</li>
+          <li><strong>A download could strand just short of 100%</strong> on a gap smaller than 16 bytes, and a stall in the middle of a packet now ends the connection instead of reading on out of step</li>
+          <li><strong>A waiting download no longer holds a connection slot while it dials,</strong> disconnected waiters keep their place in your upload queue while they re-ask over UDP, and a reachable node stays reachable while KAD is disconnected</li>
+          <li><strong>Upload columns no longer add up to more than the limit,</strong> a live download no longer flashes Stalled, and a download no source has queued yet reads Waiting rather than Queued</li>
+          <li><strong>Marking a search result as spam no longer freezes the table,</strong> and the tab is re-rated the way eMule does it</li>
+        </ul>
+
+        <h5>Security and privacy</h5>
+        <ul>
+          <li><strong>Friends-only files stay friends-only</strong> on the friend who downloads them, instead of becoming public when they re-share</li>
+          <li><strong>A stranger can no longer probe whether a file hash belongs to a friend,</strong> and an unknown or friends-only file is answered exactly as not found</li>
+          <li><strong>Room message IDs are bound to their author,</strong> so an edit cannot claim someone else&rsquo;s message, and hidden direction-changing characters are stripped from names in search results, collections and eD2K links</li>
+          <li><strong>The rendezvous server is harder to crowd out:</strong> relay sessions and connections are capped per client network and per IPv6 /64, replay protection is kept per key, and sealed intro registrations are verified</li>
+          <li><strong>Restoring a backup no longer sets the media player,</strong> and a network path is refused as one</li>
+        </ul>
+
+        <h5>The Ember DHT</h5>
+        <ul>
+          <li><strong>An audit of the DHT closed a dozen gaps,</strong> including relay and callback caps that could be dodged by rotating node IDs, a lookup a single responder could stall, one node being able to mint a file&rsquo;s publishers, a Max Size of 0 hiding every Ember result, a publish schedule lost on every launch, and a false &ldquo;Direct&rdquo; on the Ember page</li>
+          <li><strong>Each incoming frame costs less,</strong> with junk and replayed records refused before any signature check, and a waking laptop keeps its contacts until they have had time to answer</li>
+        </ul>
+
+        <h5>Speed and the interface</h5>
+        <ul>
+          <li><strong>The event loop no longer waits on the database or the disk,</strong> the Library rescans only what changed, and only changed transfers are sent to the window</li>
+          <li><strong>Settings no longer waits for Save to apply the IP filter and private-address switches,</strong> which already took effect at once on the Security page</li>
+          <li><strong>A page-by-page review fixed</strong> keys reaching lists behind open dialogs, errors wiped by background refreshes, a search query lost on return, a Clear filters that could not clear spam hiding, a friend rename that never reached its card, and a selected download that lost its highlight on a striped row</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.6.7...v1.7.0" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.6.7...v1.7.0</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-6-7">
       <div class="release-header">

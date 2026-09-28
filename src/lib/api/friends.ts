@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import * as m from '$lib/paraglide/messages';
 
 export interface FriendInfo {
   user_hash: string;
@@ -202,6 +203,8 @@ export interface ChatAttachment {
   created_at: number;
   /** A received file that finished and can be opened. */
   has_file: boolean;
+  /** A program, shortcut or script, or one named like a document. */
+  risky: boolean;
 }
 
 /** Statuses a transfer never leaves. */
@@ -239,7 +242,7 @@ export function mergeChatAttachment(prev: ChatAttachment, next: ChatAttachment):
 export async function pickAndSendChatAttachment(
   userHashHex: string,
 ): Promise<ChatAttachment | null> {
-  return invoke('pick_and_send_chat_attachment', { userHashHex });
+  return invoke('pick_and_send_chat_attachment', { userHashHex, title: m.picker_file_to_send() });
 }
 
 export async function respondChatAttachment(xferId: string, accept: boolean): Promise<void> {
@@ -291,6 +294,7 @@ export function parseChatAttachment(raw: unknown): ChatAttachment | null {
     status,
     created_at: num(r.created_at),
     has_file: r.has_file === true,
+    risky: r.risky === true,
   };
 }
 

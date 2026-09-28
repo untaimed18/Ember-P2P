@@ -32,7 +32,9 @@ pub async fn detect_emule_installs() -> Result<Vec<EmuleInstall>, String> {
 pub async fn pick_emule_folder(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
+    title: Option<String>,
 ) -> Result<Option<EmuleInstall>, String> {
+    let dialog_title = super::picker_title(title, "Choose your eMule or aMule folder");
     if window.label() != "main" {
         return Err(coded(
             "emule_import_wrong_window",
@@ -42,7 +44,7 @@ pub async fn pick_emule_folder(
     let picked = tokio::task::spawn_blocking(move || {
         app.dialog()
             .file()
-            .set_title("Choose your eMule or aMule folder")
+            .set_title(dialog_title)
             .blocking_pick_folder()
             .and_then(|folder| folder.into_path().ok())
     })

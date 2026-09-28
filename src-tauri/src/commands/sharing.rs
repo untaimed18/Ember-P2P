@@ -3800,7 +3800,9 @@ pub async fn pick_shared_folder(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
+    title: Option<String>,
 ) -> Result<SharedFolderPick, String> {
+    let dialog_title = super::picker_title(title, "Choose folders to share");
     if window.label() != "main" {
         return Err(coded(
             "sharing_picker_wrong_window",
@@ -3815,7 +3817,7 @@ pub async fn pick_shared_folder(
         picker_app
             .dialog()
             .file()
-            .set_title("Choose folders to share")
+            .set_title(dialog_title)
             .blocking_pick_folders()
             .map(|folders| {
                 folders

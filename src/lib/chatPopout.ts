@@ -131,6 +131,17 @@ const hook: ChatPopoutHook = {
 export async function showChatWindow(): Promise<void> {
   try {
     await openChatWindow(m.chat_window_title(), loadBounds());
+    // Opening it puts it in front of the user, with the conversation that was
+    // active. Until its first presence report arrives, which can take a
+    // second, say so, or a message the user is reading there would notify
+    // and count as unread. The report replaces this; a close clears it.
+    if (get(chatWindowPresence) === null) {
+      chatWindowPresence.set({
+        activeHash: validHash(get(activeChatTab)),
+        visible: true,
+        focused: true,
+      });
+    }
   } catch (e) {
     toastError(translateError(e, m.error_chat_window_open_failed()));
     chatPoppedOut.set(false);

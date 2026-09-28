@@ -374,7 +374,9 @@ pub(crate) fn elide_for_dialog(value: &str) -> String {
 pub async fn pick_download_folder(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
+    title: Option<String>,
 ) -> Result<Option<String>, String> {
+    let dialog_title = super::picker_title(title, "Choose where downloads are saved");
     if window.label() != "main" {
         return Err(coded(
             "settings_download_folder_picker_failed",
@@ -386,7 +388,7 @@ pub async fn pick_download_folder(
         picker_app
             .dialog()
             .file()
-            .set_title("Choose where downloads are saved")
+            .set_title(dialog_title)
             .blocking_pick_folder()
             .map(|folder| {
                 folder.into_path().map_err(|error| {
@@ -429,7 +431,9 @@ pub async fn pick_download_folder(
 pub async fn pick_preview_player(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
+    title: Option<String>,
 ) -> Result<Option<String>, String> {
+    let dialog_title = super::picker_title(title, "Choose a media player for Preview");
     if window.label() != "main" {
         return Err(coded(
             "settings_preview_player_picker_failed",
@@ -441,7 +445,7 @@ pub async fn pick_preview_player(
         let dialog = picker_app
             .dialog()
             .file()
-            .set_title("Choose a media player for Preview");
+            .set_title(dialog_title);
         // Filtered on Windows only. There an executable *is* its extension, so
         // the filter is a real help; on Linux the thing to pick has no
         // extension at all (`/usr/bin/mpv`) and a filter would hide every valid
@@ -2632,13 +2636,15 @@ pub async fn open_web_service(
 #[tauri::command]
 pub async fn pick_and_import_webservices_file(
     app: tauri::AppHandle,
+    title: Option<String>,
 ) -> Result<Option<Vec<crate::webservices::WebService>>, String> {
+    let dialog_title = super::picker_title(title, "Choose an eMule webservices.dat");
     let picker = app.clone();
     let selected = tokio::task::spawn_blocking(move || {
         picker
             .dialog()
             .file()
-            .set_title("Choose an eMule webservices.dat")
+            .set_title(dialog_title)
             .add_filter("eMule web services", &["dat", "txt"])
             .blocking_pick_file()
             .map(|file| {

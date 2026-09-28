@@ -999,6 +999,7 @@ pub(super) fn emit_xfer_update(
             "size": size,
             "transferred": transferred,
             "status": status,
+            "risky": crate::security::is_dangerous_extension(name),
         }),
     );
 }

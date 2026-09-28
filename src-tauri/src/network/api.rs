@@ -752,6 +752,9 @@ pub struct ChannelTransferSnapshot {
     pub transferred: u64,
     /// `"offered"`, `"awaiting"`, `"active"`.
     pub status: String,
+    /// The name is a program, shortcut or script, or one dressed up as a
+    /// document (`report.pdf.exe`); see `security::is_dangerous_extension`.
+    pub risky: bool,
 }
 
 /// One Ember DHT routing-table contact, flattened to strings for IPC.

@@ -5703,7 +5703,9 @@ pub async fn pick_and_offer_channel_transfer(
     state: tauri::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
+    title: Option<String>,
 ) -> Result<Option<String>, String> {
+    let dialog_title = super::picker_title(title, "Choose a file to send");
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
     let peer = parse_member_pubkey(&member_pubkey)?;
@@ -5746,7 +5748,7 @@ pub async fn pick_and_offer_channel_transfer(
         picker
             .dialog()
             .file()
-            .set_title("Choose a file to send")
+            .set_title(dialog_title)
             .blocking_pick_file()
             .map(|file| {
                 file.into_path()

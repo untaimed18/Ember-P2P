@@ -186,6 +186,16 @@
     </div>
   {/if}
 
+  {#if !sent && attachment.risky}
+    <p class="file-risk" role="note">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M8 1.8 14.6 13.5H1.4z"/>
+        <path d="M8 6.2v3.4M8 11.6v.1"/>
+      </svg>
+      <span>{m.common_risky_file()}</span>
+    </p>
+  {/if}
+
   <div class="attach-status" aria-live={moving ? 'off' : 'polite'}>
     {#if problem}
       <svg class="attach-status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">

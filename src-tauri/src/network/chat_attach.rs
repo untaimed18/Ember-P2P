@@ -111,6 +111,9 @@ pub(crate) struct ChatAttachmentInfo {
     /// A received file that finished and can be opened. Never true on the
     /// sending side: our own copy's path is not something the UI needs.
     pub has_file: bool,
+    /// The name is a program, shortcut or script, or one dressed up as a
+    /// document (`report.pdf.exe`); see `security::is_dangerous_extension`.
+    pub risky: bool,
 }
 
 impl ChatAttachmentInfo {
@@ -131,6 +134,7 @@ impl ChatAttachmentInfo {
             has_file: row.direction == "received"
                 && row.status == "complete"
                 && row.dest_path.is_some(),
+            risky: crate::security::is_dangerous_extension(&row.file_name),
         }
     }
 }
@@ -1769,6 +1773,22 @@ mod tests {
         assert!(!ChatAttachmentInfo::from_row(&row("complete", "sent", Some("x"))).has_file);
         assert!(!ChatAttachmentInfo::from_row(&row("active", "received", Some("x"))).has_file);
         assert!(!ChatAttachmentInfo::from_row(&row("complete", "received", None)).has_file);
+    }
+
+    /// The card warns before anything is opened, from the same list the open
+    /// path refuses to launch.
+    #[test]
+    fn a_program_or_a_disguised_one_is_flagged_risky() {
+        let named = |name: &str| {
+            let mut r = row("awaiting", "received", None);
+            r.file_name = name.into();
+            ChatAttachmentInfo::from_row(&r).risky
+        };
+        assert!(named("setup.exe"));
+        assert!(named("report.pdf.exe"));
+        assert!(named("invoice.pdf.LNK"));
+        assert!(!named("holiday.jpg"));
+        assert!(!named("notes.txt"));
     }
 
     #[test]

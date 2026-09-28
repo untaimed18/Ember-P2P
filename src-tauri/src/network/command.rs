@@ -3579,6 +3579,7 @@ async fn handle_command_inner(
                     size: offer.size,
                     transferred: 0,
                     status: "awaiting".into(),
+                    risky: crate::security::is_dangerous_extension(&offer.name),
                 });
             }
             for (xfer_id, recv) in &state.xfer_recv {
@@ -3591,6 +3592,7 @@ async fn handle_command_inner(
                     size: recv.size,
                     transferred: recv.bytes_received(),
                     status: "active".into(),
+                    risky: crate::security::is_dangerous_extension(&recv.name),
                 });
             }
             for (xfer_id, send) in &state.xfer_send {
@@ -3606,6 +3608,7 @@ async fn handle_command_inner(
                         .saturating_mul(ember::channel::XFER_BLOCK_SIZE as u64)
                         .min(send.size),
                     status: if send.accepted { "active" } else { "offered" }.into(),
+                    risky: crate::security::is_dangerous_extension(&send.name),
                 });
             }
             let _ = tx.send(out);

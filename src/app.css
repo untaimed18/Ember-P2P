@@ -669,6 +669,30 @@ tr:hover td {
 }
 
 /*
+ * On a file someone is sending you that can run code: a program, script or
+ * shortcut, or one named to pass for a document (`report.pdf.exe`). Friend
+ * chat cards and the room transfer drawer both carry it.
+ */
+.file-risk {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  color: var(--badge-warning-text);
+  font-size: var(--font-size-xs);
+  line-height: 1.4;
+}
+.file-risk svg {
+  flex-shrink: 0;
+  width: 13px;
+  height: 13px;
+  margin-top: 1px;
+}
+
+/*
  * Unread count beside a conversation: the room list, the chat dock's switcher
  * and a friend's Chat button, so waiting messages look the same wherever they
  * are counted. Capped at 99+ by the caller.

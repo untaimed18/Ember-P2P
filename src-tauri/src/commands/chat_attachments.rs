@@ -75,7 +75,9 @@ pub async fn pick_and_send_chat_attachment(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
+    title: Option<String>,
 ) -> Result<Option<ChatAttachmentInfo>, String> {
+    let dialog_title = super::picker_title(title, "Choose a file to send");
     let friend = parse_friend(&user_hash_hex)?;
     if !state.friend_hashes.read().await.contains(&friend) {
         return Err(coded("peers_not_friend", "Can only send files to friends"));
@@ -102,7 +104,7 @@ pub async fn pick_and_send_chat_attachment(
         picker
             .dialog()
             .file()
-            .set_title("Choose a file to send")
+            .set_title(dialog_title)
             .blocking_pick_file()
             .map(|file| {
                 file.into_path()

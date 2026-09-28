@@ -72,6 +72,7 @@ describe('parseChatAttachment', () => {
     status: 'active',
     created_at: 1_700_000_000,
     has_file: false,
+    risky: false,
   };
 
   it('accepts a well-formed payload', () => {
@@ -96,6 +97,13 @@ describe('parseChatAttachment', () => {
 
   it('only believes has_file when it is literally true', () => {
     expect(parseChatAttachment({ ...good, has_file: 'yes' })?.has_file).toBe(false);
+  });
+
+  it('carries the risky-file flag only when it is literally true', () => {
+    expect(parseChatAttachment({ ...good, risky: true })?.risky).toBe(true);
+    expect(parseChatAttachment({ ...good, risky: 'yes' })?.risky).toBe(false);
+    const { risky: _omitted, ...older } = good;
+    expect(parseChatAttachment(older)?.risky).toBe(false);
   });
 
   it('refuses things that are not objects', () => {
