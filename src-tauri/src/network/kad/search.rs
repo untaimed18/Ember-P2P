@@ -33,6 +33,14 @@ pub const STORE_PUBLISH_TARGET_TOTAL: usize = 10;
 /// popular file.
 const SOURCE_SEARCH_STOP_THRESHOLD: usize = 300;
 const NOTES_SEARCH_STOP_THRESHOLD: usize = 50;
+/// Raw entries one search will hold before it stops accepting more.
+///
+/// Well above the stop thresholds above, which count answers rather than
+/// rows, so reaching it means a keyword so broad that the index nodes are
+/// still pouring out pages. Hitting it is logged once per search: the rows
+/// past it are dropped, and a silent drop is indistinguishable from the
+/// network having nothing more to give.
+const MAX_SEARCH_RESULT_ENTRIES: usize = 5000;
 /// eMule caps a FindBuddy search at `SEARCHFINDBUDDY` (10) distinct
 /// contacts queried. Both the stop-querying check and the reservation
 /// cap below must use this same value — a previous `+ 1` fudge factor
@@ -191,6 +199,10 @@ pub struct SearchState {
     /// `pending` (which tracks routing KadReq queries) to avoid breaking convergence.
     pub store_pending: HashSet<KadId>,
     store_pending_times: HashMap<KadId, i64>,
+    /// Publish candidates the outbound governor held back. Left out of
+    /// `next_publish_candidates` so they do not fill every batch while their
+    /// budget refills; the completion pass still tries them once.
+    publish_deferred: HashSet<KadId>,
     find_buddy_sent: HashSet<KadId>,
     /// eMule `CSearch::m_uAnswers` for Store searches: count of
     /// KADEMLIA2_PUBLISH_RES acks received (incremented by
@@ -256,6 +268,7 @@ impl SearchState {
             store_sent: HashSet::new(),
             store_pending: HashSet::new(),
             store_pending_times: HashMap::new(),
+            publish_deferred: HashSet::new(),
             find_buddy_sent: HashSet::new(),
             store_acks_received: 0,
             parked_at: None,
@@ -313,6 +326,7 @@ impl SearchState {
         self.closest.iter().any(|c| {
             self.responded_during_lookup.contains(&c.id)
                 && !self.store_sent.contains(&c.id)
+                && !self.publish_deferred.contains(&c.id)
                 && within_search_tolerance(&self.target, &c.id)
         })
     }
@@ -511,6 +525,40 @@ impl SearchState {
         }
     }
 
+    /// Give up on `contact_id` for this search after the outbound governor
+    /// held its request back (`kad_io::is_kad_request_paced`).
+    ///
+    /// Unlike [`Self::rollback_unsent_query`] the contact is not offered again.
+    /// Its budget stays spent for up to a minute, so re-queuing it first put
+    /// it at the head of every following batch and stalled the whole walk on
+    /// it. Treated like a query that went unanswered, without the timeout.
+    pub fn skip_paced_query(&mut self, contact_id: KadId, message: &KadMessage) {
+        self.pending.remove(&contact_id);
+        self.pending_times.remove(&contact_id);
+        match message {
+            KadMessage::SearchKeyReq { .. }
+            | KadMessage::SearchSourceReq { .. }
+            | KadMessage::SearchNotesReq { .. } => {
+                // Both reservations stay, so neither Fetch nor JumpStart picks
+                // the contact again; only the wait for its answer goes.
+                self.fetched.insert(contact_id);
+                self.store_sent.insert(contact_id);
+                self.store_pending.remove(&contact_id);
+                self.store_pending_times.remove(&contact_id);
+            }
+            KadMessage::KadReq { .. } => {
+                self.queried.insert(contact_id);
+                self.priority_queries.retain(|c| c.id != contact_id);
+                if self.lookup_reask_more_target == Some(contact_id) {
+                    self.lookup_reask_more_target = None;
+                }
+            }
+            _ => {}
+        }
+        self.check_phase_transition();
+        self.check_completion();
+    }
+
     /// Commit endpoint tracking only after the caller confirms `send_to`
     /// succeeded. This keeps anti-poisoning's `tried` map from accepting a
     /// response for a packet that was merely reserved but never transmitted.
@@ -589,6 +637,7 @@ impl SearchState {
             }
             if self.responded_during_lookup.contains(&contact.id)
                 && !self.store_sent.contains(&contact.id)
+                && !self.publish_deferred.contains(&contact.id)
                 && within_search_tolerance(&self.target, &contact.id)
             {
                 contacts.push(contact.clone());
@@ -602,6 +651,12 @@ impl SearchState {
         self.store_sent.insert(contact.id);
         self.tried
             .insert((contact.ip, contact.udp_port), contact.id);
+    }
+
+    /// The outbound governor held back the publish to `contact`: stop offering
+    /// it from [`Self::next_publish_candidates`] for the rest of the lookup.
+    pub fn defer_publish(&mut self, contact: &KadContact) {
+        self.publish_deferred.insert(contact.id);
     }
 
     /// Build a fetch-phase message (keyword/source/notes search request) for a
@@ -748,10 +803,18 @@ impl SearchState {
         self.store_pending_times.remove(from);
 
         let count = entries.len();
+        let before = self.results.len();
         for entry in entries {
-            if self.results.len() < 5000 {
+            if self.results.len() < MAX_SEARCH_RESULT_ENTRIES {
                 self.results.push(entry);
             }
+        }
+        if before < MAX_SEARCH_RESULT_ENTRIES && self.results.len() >= MAX_SEARCH_RESULT_ENTRIES {
+            info!(
+                "KAD search {} reached the {} entry cap; further results are dropped",
+                self.target.to_hex(),
+                MAX_SEARCH_RESULT_ENTRIES,
+            );
         }
 
         const FETCH_PAGE_SIZE: usize = 200;
@@ -767,7 +830,7 @@ impl SearchState {
         let page_complete = *page_received >= FETCH_PAGE_SIZE;
         if page_complete
             && !self.stop_querying
-            && self.results.len() < 5000
+            && self.results.len() < MAX_SEARCH_RESULT_ENTRIES
             && matches!(
                 self.search_type,
                 SearchType::FindKeyword | SearchType::FindSource { .. }
@@ -1789,10 +1852,12 @@ mod tests {
         assert!(state.should_stop_querying());
 
         // The window that buys back: it used to be a flat 20s.
-        assert!(
-            PENDING_TIMEOUT_SECS < 20,
-            "the margin is meant to be the query timeout, not a larger round number"
-        );
+        const {
+            assert!(
+                PENDING_TIMEOUT_SECS < 20,
+                "the margin is meant to be the query timeout, not a larger round number"
+            )
+        };
     }
 
     #[test]
@@ -1875,6 +1940,57 @@ mod tests {
         assert_eq!(state.next_publish_candidates()[0].id, contact.id);
         assert_eq!(state.next_publish_candidates()[0].id, contact.id);
         assert!(state.store_sent.is_empty());
+    }
+
+    /// A publish the governor held back must not keep that node at the head of
+    /// every batch, nor count as published.
+    #[test]
+    fn a_deferred_publish_candidate_stops_heading_every_batch() {
+        let target = near_kad_id(0);
+        let mut state = SearchState::new(SearchId(1), target, SearchType::StoreKeyword);
+        let contacts: Vec<KadContact> = (1..=5).map(|i| contact(near_kad_id(i), i)).collect();
+        for c in &contacts {
+            state.responded_during_lookup.insert(c.id);
+        }
+        state.closest = contacts;
+
+        let first = state.next_publish_candidates();
+        state.defer_publish(&first[0]);
+        let next = state.next_publish_candidates();
+        assert!(next.iter().all(|c| c.id != first[0].id));
+        assert_eq!(next.len(), ALPHA, "the next node moves up");
+        assert!(state.store_sent.is_empty(), "deferred is not published");
+    }
+
+    /// A lookup or fetch query the governor held back is written off for the
+    /// search instead of being retried ahead of everyone else.
+    #[test]
+    fn a_paced_query_is_skipped_instead_of_heading_the_next_batch() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        state.closest = (1..=4).map(|i| contact(near_kad_id(i), i)).collect();
+        let first = state.next_to_query();
+        assert_eq!(first.len(), ALPHA);
+        let paced = first[0].clone();
+        let msg = state.build_query_message(&paced);
+        assert!(matches!(msg, KadMessage::KadReq { .. }));
+        state.skip_paced_query(paced.id, &msg);
+        let next = state.next_to_query();
+        assert!(next.iter().all(|c| c.id != paced.id));
+        assert_eq!(next.len(), 1, "only the fourth contact is left unasked");
+        assert!(!state.pending.contains(&paced.id));
+
+        let mut fetch = SearchState::new(SearchId(2), near_kad_id(0), SearchType::FindKeyword);
+        fetch.closest = (1..=4).map(|i| contact(near_kad_id(i), i)).collect();
+        for c in &fetch.closest {
+            fetch.responded_during_lookup.insert(c.id);
+        }
+        fetch.phase = SearchPhase::Fetch;
+        let asked = fetch.next_to_query();
+        let paced = asked[0].clone();
+        let msg = fetch.build_query_message(&paced);
+        assert!(matches!(msg, KadMessage::SearchKeyReq { .. }));
+        fetch.skip_paced_query(paced.id, &msg);
+        assert!(fetch.next_to_query().iter().all(|c| c.id != paced.id));
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub mod ip_filter;
 pub mod legacy_challenge;
 pub mod messages;
 pub mod obfuscation;
+pub mod outbound;
 pub mod protection;
 pub mod publish;
 pub mod routing;

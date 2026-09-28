@@ -575,18 +575,23 @@ impl ServerList {
     }
 
     /// Record that this server sent us *any* UDP reply (status response
-    /// or found-sources). Resets the failure counter and timestamps the
-    /// reply for the periodic UDP-health log.
+    /// or found-sources). Resets both failure counters, as eMule's
+    /// `ResetFailedCount` on every server UDP packet does
+    /// (`UDPSocket.cpp:217-220`): a server that answers is alive whatever our
+    /// last TCP attempt ran into, and without this a few failed logins — or
+    /// our own network being down — excluded it from UDP use and eventually
+    /// deleted it. Also timestamps the reply for the periodic UDP-health log.
     pub fn record_udp_reply(&mut self, ip: &str, port: u16) {
         if let Some(entry) = self
             .servers
             .iter_mut()
             .find(|s| s.ip == ip && s.port == port)
         {
-            if entry.udp_consecutive_failures != 0 {
+            if entry.udp_consecutive_failures != 0 || entry.fail_count != 0 {
                 self.needs_sort = true;
             }
             entry.udp_consecutive_failures = 0;
+            entry.fail_count = 0;
             entry.last_udp_reply_at = chrono::Utc::now().timestamp();
         }
     }

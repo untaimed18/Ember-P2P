@@ -795,17 +795,346 @@ pub fn corrupt_blocks_from_aich_recovery(
     Some(hs.find_corrupt_blocks(part_index, part_data, part_size))
 }
 
+/// [`corrupt_blocks_from_aich_recovery`] on the blocking pool. Hashing a whole
+/// 9.28 MB part is tens of milliseconds of SHA-1, too long for a Tokio worker.
+pub async fn corrupt_blocks_from_aich_recovery_blocking(
+    trusted_master: [u8; 20],
+    recovery_data: Vec<u8>,
+    part_index: usize,
+    part_data: std::sync::Arc<Vec<u8>>,
+    part_size: usize,
+    file_size: u64,
+) -> Option<Vec<usize>> {
+    tokio::task::spawn_blocking(move || {
+        corrupt_blocks_from_aich_recovery(
+            trusted_master,
+            &recovery_data,
+            part_index,
+            &part_data,
+            part_size,
+            file_size,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("AICH recovery task for part {part_index} failed: {e}");
+        None
+    })
+}
+
+/// Root and leaf count of a part's own AICH tree, for mismatch diagnostics,
+/// computed on the blocking pool.
+pub async fn part_aich_summary_blocking(
+    part_data: std::sync::Arc<Vec<u8>>,
+) -> Option<([u8; 20], usize)> {
+    tokio::task::spawn_blocking(move || {
+        let hs = AICHRecoveryHashSet::build_from_data(&part_data);
+        (hs.root_hash, hs.leaf_count())
+    })
+    .await
+    .ok()
+}
+
+/// [`compute_aich_part`] on the blocking pool.
+pub async fn compute_aich_part_blocking(
+    part_data: std::sync::Arc<Vec<u8>>,
+    part_index: usize,
+    num_parts: usize,
+) -> Option<[u8; 20]> {
+    tokio::task::spawn_blocking(move || compute_aich_part(&part_data, part_index, num_parts))
+        .await
+        .ok()
+}
+
 /// eMule known2_64.met file format version
 const KNOWN2_MET_VERSION: u8 = 0x02;
-/// Upper bound for app-managed known2_64.met before reading it into memory.
-/// 64 MiB is enough for roughly 3.3M AICH leaves (~600 GiB of shared data at
-/// 180 KiB per leaf), while preventing a corrupt local file from being slurped
-/// wholesale into RAM.
-const MAX_KNOWN2_MET_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_KNOWN2_LEAVES_PER_SET: usize = (MAX_KNOWN2_MET_BYTES as usize) / 20;
+
+/// Number of AICH leaves (180 KiB blocks) a file of `file_size` bytes has.
+pub(crate) fn leaf_count_for_size(file_size: u64) -> usize {
+    if file_size == 0 {
+        return 0;
+    }
+    let num_parts = file_size.div_ceil(PARTSIZE as u64) as usize;
+    (0..num_parts)
+        .map(|part| blocks_in_part(file_size, part, num_parts))
+        .sum()
+}
+
+/// `known2_64.met` read the way eMule reads it: an index of where each master
+/// hash's leaves sit, built by one streaming pass, with leaves read on demand.
+///
+/// It used to be read whole into memory, refused above 64 MiB and trimmed to
+/// 10,000 sets, so an eMule archive of a few tens of thousands of files — a
+/// 5.9 GB `known2_64.met` in the report that prompted this — lost all of it.
+/// eMule itself keeps only `m_mapAICHHashsStored` (hash to offset) resident.
+pub struct Known2Store {
+    path: std::path::PathBuf,
+    index: HashMap<[u8; 20], (u64, u32)>,
+    /// End of the last complete record. A torn tail past it, from a crash
+    /// mid-append, is cut off before the next append.
+    valid_len: u64,
+}
+
+impl Known2Store {
+    /// Index `path`, which need not exist yet.
+    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        // `save_known2_met` publishes through `atomic_write`, whose Windows
+        // replace-fallback can park the only copy under the backup name. Treating
+        // that absence as "no hashsets yet" means every shared file has to be
+        // re-hashed before it can serve an AICH recovery request again.
+        crate::security::recover_interrupted_replace(path);
+        let mut store = Self {
+            path: path.to_path_buf(),
+            index: HashMap::new(),
+            valid_len: 0,
+        };
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(store),
+            Err(e) => return Err(e),
+        };
+        let file_len = file.metadata()?.len();
+        if file_len == 0 {
+            return Ok(store);
+        }
+        // Unbuffered on purpose: only the 24-byte headers are read, and a
+        // buffered reader discards its buffer on every seek past the leaves.
+        let mut reader = file;
+        let mut version = [0u8; 1];
+        reader.read_exact(&mut version)?;
+        if version[0] != KNOWN2_MET_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported known2.met version: 0x{:02X}", version[0]),
+            ));
+        }
+        let mut pos: u64 = 1;
+        store.valid_len = 1;
+        let mut header = [0u8; 24];
+        while pos + 24 <= file_len {
+            reader.read_exact(&mut header)?;
+            let mut root = [0u8; 20];
+            root.copy_from_slice(&header[..20]);
+            let count = u32::from_le_bytes([header[20], header[21], header[22], header[23]]);
+            let leaves_at = pos + 24;
+            let end = leaves_at + u64::from(count) * 20;
+            if end > file_len {
+                tracing::warn!(
+                    "known2_64.met truncated: record at offset {pos} claims {count} leaves past the end"
+                );
+                break;
+            }
+            // First occurrence wins; eMule appends and never rewrites either.
+            store.index.entry(root).or_insert((leaves_at, count));
+            reader.seek(SeekFrom::Start(end))?;
+            pos = end;
+            store.valid_len = end;
+        }
+        Ok(store)
+    }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    pub fn contains(&self, root: &[u8; 20]) -> bool {
+        self.index.contains_key(root)
+    }
+
+    fn read_leaves(&self, leaves_at: u64, count: u32) -> std::io::Result<Vec<[u8; 20]>> {
+        let mut file = std::fs::File::open(&self.path)?;
+        file.seek(SeekFrom::Start(leaves_at))?;
+        let mut bytes = vec![0u8; count as usize * 20];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes
+            .chunks_exact(20)
+            .map(|chunk| {
+                let mut leaf = [0u8; 20];
+                leaf.copy_from_slice(chunk);
+                leaf
+            })
+            .collect())
+    }
+
+    /// The recovery set for a file of `file_size` bytes whose AICH master is
+    /// `root`, if one is stored and its leaves really do rebuild that master.
+    pub fn load_set(
+        &self,
+        root: &[u8; 20],
+        file_size: u64,
+    ) -> std::io::Result<Option<AICHRecoveryHashSet>> {
+        let Some(&(leaves_at, count)) = self.index.get(root) else {
+            return Ok(None);
+        };
+        if count as usize != leaf_count_for_size(file_size) {
+            return Ok(None);
+        }
+        let leaves = self.read_leaves(leaves_at, count)?;
+        if hierarchical_root(&leaves, file_size) != *root {
+            return Ok(None);
+        }
+        Ok(Some(AICHRecoveryHashSet {
+            root_hash: *root,
+            leaf_hashes: leaves,
+            file_size,
+        }))
+    }
+
+    fn open_for_append(&mut self) -> std::io::Result<std::fs::File> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.path)?;
+        let len = file.metadata()?.len();
+        if len == 0 {
+            file.write_all(&[KNOWN2_MET_VERSION])?;
+            self.valid_len = 1;
+        } else if len > self.valid_len {
+            file.set_len(self.valid_len)?;
+        }
+        file.seek(SeekFrom::Start(self.valid_len))?;
+        Ok(file)
+    }
+
+    /// Append the sets whose master is not stored yet. Returns how many were written.
+    pub fn append(&mut self, sets: &[AICHRecoveryHashSet]) -> std::io::Result<usize> {
+        use std::io::Write;
+        let fresh: Vec<&AICHRecoveryHashSet> = sets
+            .iter()
+            .filter(|hs| !hs.leaf_hashes.is_empty() && !self.contains(&hs.root_hash))
+            .collect();
+        if fresh.is_empty() {
+            return Ok(0);
+        }
+        let file = self.open_for_append()?;
+        let mut writer = std::io::BufWriter::new(file);
+        let mut pos = self.valid_len;
+        let mut added = Vec::with_capacity(fresh.len());
+        for hs in &fresh {
+            let count = hs.leaf_hashes.len() as u32;
+            writer.write_all(&hs.root_hash)?;
+            writer.write_all(&count.to_le_bytes())?;
+            for leaf in &hs.leaf_hashes {
+                writer.write_all(leaf)?;
+            }
+            added.push((hs.root_hash, pos + 24, count));
+            pos += 24 + u64::from(count) * 20;
+        }
+        let file = writer.into_inner().map_err(|e| e.into_error())?;
+        file.sync_data()?;
+        for (root, leaves_at, count) in added {
+            self.index.entry(root).or_insert((leaves_at, count));
+        }
+        self.valid_len = pos;
+        Ok(fresh.len())
+    }
+
+    /// Copy every set in another `known2_64.met` (an eMule one being imported)
+    /// that this store lacks, streaming so its size does not matter.
+    /// `progress` is told how many of the sets to copy are done, out of how many.
+    pub fn copy_missing_from(
+        &mut self,
+        other: &std::path::Path,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> std::io::Result<usize> {
+        use std::io::{BufReader, BufWriter, Write};
+        let source = Self::open(other)?;
+        let missing: Vec<([u8; 20], u64, u32)> = source
+            .index
+            .iter()
+            .filter(|(root, _)| !self.contains(root))
+            .map(|(root, &(at, count))| (*root, at, count))
+            .collect();
+        if missing.is_empty() {
+            return Ok(0);
+        }
+        let mut sorted = missing;
+        sorted.sort_by_key(|&(_, at, _)| at);
+        let mut reader = BufReader::with_capacity(1 << 20, std::fs::File::open(other)?);
+        let mut writer = BufWriter::with_capacity(1 << 20, self.open_for_append()?);
+        let mut pos = self.valid_len;
+        let mut added = Vec::with_capacity(sorted.len());
+        // `seek_relative` keeps the buffer when the target is inside it, which
+        // for records read in file order it almost always is.
+        let mut cursor: u64 = 0;
+        let total = sorted.len() as u64;
+        for (done, (root, at, count)) in sorted.iter().enumerate() {
+            if done % 256 == 0 {
+                progress(done as u64, total);
+            }
+            let leaves = u64::from(*count) * 20;
+            reader.seek_relative(*at as i64 - cursor as i64)?;
+            writer.write_all(root)?;
+            writer.write_all(&count.to_le_bytes())?;
+            let copied = std::io::copy(&mut (&mut reader).take(leaves), &mut writer)?;
+            if copied != leaves {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "known2_64.met shrank while it was being copied",
+                ));
+            }
+            cursor = *at + leaves;
+            added.push((*root, pos + 24, *count));
+            pos += 24 + leaves;
+        }
+        let file = writer.into_inner().map_err(|e| e.into_error())?;
+        file.sync_data()?;
+        progress(total, total);
+        let copied = added.len();
+        for (root, leaves_at, count) in added {
+            self.index.entry(root).or_insert((leaves_at, count));
+        }
+        self.valid_len = pos;
+        Ok(copied)
+    }
+}
+
+static KNOWN2_STORE: std::sync::OnceLock<parking_lot::RwLock<Option<Known2Store>>> =
+    std::sync::OnceLock::new();
+
+/// The process's `known2_64.met`, installed by the network task's deferred
+/// disk load. Shared with the upload server, which reads recovery sets from it
+/// instead of re-hashing a whole file to answer `OP_AICHREQUEST`.
+pub fn known2_store() -> &'static parking_lot::RwLock<Option<Known2Store>> {
+    KNOWN2_STORE.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Append `sets` to the installed store. Errors when none is installed yet, so
+/// the caller keeps them queued for the next attempt.
+pub fn append_known2_sets(sets: &[AICHRecoveryHashSet]) -> std::io::Result<usize> {
+    let mut guard = known2_store().write();
+    match guard.as_mut() {
+        Some(store) => store.append(sets),
+        None => Err(std::io::Error::other("known2_64.met is not loaded yet")),
+    }
+}
+
+/// A stored recovery set for this file, read from disk and verified.
+pub fn known2_load_set(root: &[u8; 20], file_size: u64) -> Option<AICHRecoveryHashSet> {
+    let guard = known2_store().read();
+    let store = guard.as_ref()?;
+    match store.load_set(root, file_size) {
+        Ok(set) => set,
+        Err(e) => {
+            tracing::debug!("known2_64.met read failed for {}: {e}", hex::encode(root));
+            None
+        }
+    }
+}
 
 /// Save AICH hash sets to known2_64.met (eMule SHAHashSet.cpp format).
 /// Format: version(u8) + repeated [master_hash(20) + hash_count(u32) + hashes(20*count)]
+///
+/// Only tests write a whole file now; the running app appends through
+/// [`Known2Store`].
+#[cfg(test)]
 pub fn save_known2_met(
     path: &std::path::Path,
     hash_sets: &[AICHRecoveryHashSet],
@@ -822,92 +1151,6 @@ pub fn save_known2_met(
         }
     }
     crate::security::atomic_write(path, &buf, false)
-}
-
-/// Load AICH hash sets from known2_64.met.
-pub fn load_known2_met(path: &std::path::Path) -> std::io::Result<Vec<([u8; 20], Vec<[u8; 20]>)>> {
-    // `save_known2_met` publishes through `atomic_write`, whose Windows
-    // replace-fallback can park the only copy under the backup name. Treating
-    // that absence as "no hashsets yet" means every shared file has to be
-    // re-hashed before it can serve an AICH recovery request again.
-    crate::security::recover_interrupted_replace(path);
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.len() > MAX_KNOWN2_MET_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "known2_64.met too large ({} bytes, max {})",
-                    meta.len(),
-                    MAX_KNOWN2_MET_BYTES
-                ),
-            ));
-        }
-    }
-    let data = std::fs::read(path)?;
-    if data.is_empty() {
-        return Ok(Vec::new());
-    }
-    let version = data[0];
-    if version != KNOWN2_MET_VERSION {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("unsupported known2.met version: 0x{version:02X}"),
-        ));
-    }
-    let mut offset = 1;
-    let mut result = Vec::new();
-    while offset + 24 <= data.len() {
-        let mut master = [0u8; 20];
-        master.copy_from_slice(&data[offset..offset + 20]);
-        offset += 20;
-        let count = u32::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]) as usize;
-        offset += 4;
-        if count > MAX_KNOWN2_LEAVES_PER_SET {
-            tracing::warn!(
-                "known2_64.met record at offset {} claims {} leaves, exceeding cap {}",
-                offset - 24,
-                count,
-                MAX_KNOWN2_LEAVES_PER_SET
-            );
-            break;
-        }
-        // `count` is attacker-controlled only via local file tampering, but
-        // compute the record end with checked arithmetic so a corrupt count can
-        // never wrap `usize` (32-bit) and slip past the truncation guard into an
-        // over-sized read/allocation.
-        let record_end = match count.checked_mul(20).and_then(|n| offset.checked_add(n)) {
-            Some(end) => end,
-            None => {
-                tracing::warn!(
-                    "known2_64.met record at offset {} claims an overflowing leaf count {}",
-                    offset - 24,
-                    count
-                );
-                break;
-            }
-        };
-        if record_end > data.len() {
-            tracing::warn!(
-                "known2_64.met truncated: record at offset {} claims {} leaves but only {} bytes remain",
-                offset - 24, count, data.len() - offset
-            );
-            break;
-        }
-        let mut leaves = Vec::with_capacity(count);
-        for _ in 0..count {
-            let mut h = [0u8; 20];
-            h.copy_from_slice(&data[offset..offset + 20]);
-            offset += 20;
-            leaves.push(h);
-        }
-        result.push((master, leaves));
-    }
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -1329,14 +1572,97 @@ mod tests {
         std::fs::rename(&path, &backup).unwrap();
         assert!(!path.exists());
 
-        let recovered = load_known2_met(&path).expect("parked hashsets must still load");
+        let recovered = Known2Store::open(&path).expect("parked hashsets must still load");
         let restored_in_place = path.exists();
+        let leaves = recovered
+            .index
+            .get(&[0x77; 20])
+            .map(|&(at, count)| recovered.read_leaves(at, count).unwrap());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&backup);
 
         assert_eq!(recovered.len(), 1, "the parked hashset must be recovered");
-        assert_eq!(recovered[0].0, [0x77; 20]);
-        assert_eq!(recovered[0].1, vec![[0x88; 20], [0x99; 20]]);
+        assert_eq!(leaves, Some(vec![[0x88; 20], [0x99; 20]]));
         assert!(restored_in_place, "the parked copy should be restored in place");
+    }
+
+    fn temp_known2(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ember-known2-{name}-{}-{:016x}.met",
+            std::process::id(),
+            rand::random::<u64>()
+        ))
+    }
+
+    fn real_set(seed: u8, blocks: usize) -> AICHRecoveryHashSet {
+        let data: Vec<u8> = (0..blocks * AICH_BLOCK_SIZE)
+            .map(|i| seed.wrapping_add((i % 251) as u8))
+            .collect();
+        AICHRecoveryHashSet::build_from_data(&data)
+    }
+
+    /// Past the old 64 MiB / 10,000-set limits only matters with real data, but
+    /// the shape is the same: index on open, read leaves on demand, append.
+    #[test]
+    fn a_stored_set_is_indexed_read_back_and_verified() {
+        let path = temp_known2("roundtrip");
+        let a = real_set(1, 3);
+        let b = real_set(2, 60);
+        {
+            let mut store = Known2Store::open(&path).unwrap();
+            assert_eq!(store.append(&[a.clone(), b.clone()]).unwrap(), 2);
+            assert_eq!(store.append(std::slice::from_ref(&a)).unwrap(), 0, "no duplicates");
+        }
+        let store = Known2Store::open(&path).unwrap();
+        assert_eq!(store.len(), 2);
+        let loaded = store.load_set(&b.root_hash, b.file_size).unwrap().expect("stored");
+        assert_eq!(loaded.leaf_hashes, b.leaf_hashes);
+        assert!(
+            store.load_set(&b.root_hash, a.file_size).unwrap().is_none(),
+            "a size that does not fit the tree must not be served"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_torn_append_is_cut_off_and_the_rest_survives() {
+        let path = temp_known2("torn");
+        let a = real_set(3, 2);
+        Known2Store::open(&path).unwrap().append(std::slice::from_ref(&a)).unwrap();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[0xAB; 30]).unwrap();
+        }
+        let mut store = Known2Store::open(&path).unwrap();
+        assert_eq!(store.len(), 1);
+        let c = real_set(4, 2);
+        store.append(std::slice::from_ref(&c)).unwrap();
+        let reopened = Known2Store::open(&path).unwrap();
+        assert_eq!(reopened.len(), 2);
+        assert!(reopened.load_set(&c.root_hash, c.file_size).unwrap().is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_imported_known2_contributes_only_what_is_missing() {
+        let ours_path = temp_known2("ours");
+        let theirs_path = temp_known2("theirs");
+        let shared = real_set(5, 2);
+        let only_theirs = real_set(6, 70);
+        save_known2_met(&theirs_path, &[shared.clone(), only_theirs.clone()]).unwrap();
+        let mut ours = Known2Store::open(&ours_path).unwrap();
+        ours.append(std::slice::from_ref(&shared)).unwrap();
+
+        assert_eq!(ours.copy_missing_from(&theirs_path, &mut |_, _| {}).unwrap(), 1);
+        let reopened = Known2Store::open(&ours_path).unwrap();
+        assert_eq!(reopened.len(), 2);
+        let loaded = reopened
+            .load_set(&only_theirs.root_hash, only_theirs.file_size)
+            .unwrap()
+            .expect("copied");
+        assert_eq!(loaded.leaf_hashes, only_theirs.leaf_hashes);
+        let _ = std::fs::remove_file(&ours_path);
+        let _ = std::fs::remove_file(&theirs_path);
     }
 }

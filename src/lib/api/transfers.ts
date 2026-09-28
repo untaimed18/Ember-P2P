@@ -110,6 +110,24 @@ export async function getTransfers(): Promise<Transfer[]> {
   return invoke('get_transfers');
 }
 
+/** `TransferDelta` in `sharing/manager.rs`. */
+export interface TransferDelta {
+  epoch: number;
+  revision: number;
+  /** `transfers` is every row; replace rather than merge. */
+  full: boolean;
+  transfers: Transfer[];
+  removed: string[];
+}
+
+/** Rows changed since `since` of `epoch`. Pass `null`/`0` for a full snapshot. */
+export async function getTransfersSince(
+  epoch: number | null,
+  since: number,
+): Promise<TransferDelta> {
+  return invoke('get_transfers_since', { epoch, since });
+}
+
 /** Snapshot of peers waiting in our upload queue (transfers/uploads pane,
  *  "Queued" tab). Polled on demand while the tab is visible. */
 export async function getUploadQueue(): Promise<UploadQueueClient[]> {
@@ -170,6 +188,11 @@ export async function setTransferCategory(transferId: string, category: string):
   return invoke('set_transfer_category', { transferId, category });
 }
 
+/** Rename a download while it is still in progress. Returns the sanitized name. */
+export async function renameTransfer(transferId: string, fileName: string): Promise<string> {
+  return invoke('rename_transfer', { transferId, fileName });
+}
+
 export async function setPreviewPriority(transferId: string, enabled: boolean): Promise<void> {
   return invoke('set_preview_priority', { transferId, enabled });
 }
@@ -178,20 +201,32 @@ export async function pauseAllTransfers(): Promise<void> {
   return invoke('pause_all_transfers');
 }
 
+/** `MAX_BATCH_TRANSFER_IDS` in `commands/transfers.rs`: a larger request is
+ *  refused outright with `transfers_batch_too_large`. */
+const MAX_BATCH_TRANSFER_IDS = 500;
+
+/** Send `transferIds` through a batch command in backend-sized chunks, in
+ *  order, stopping at the first chunk that fails. */
+async function invokeChunked(command: string, transferIds: string[]): Promise<void> {
+  for (let i = 0; i < transferIds.length; i += MAX_BATCH_TRANSFER_IDS) {
+    await invoke<void>(command, { transferIds: transferIds.slice(i, i + MAX_BATCH_TRANSFER_IDS) });
+  }
+}
+
 export async function pauseTransfersBatch(transferIds: string[]): Promise<void> {
-  return invoke('pause_transfers_batch', { transferIds });
+  return invokeChunked('pause_transfers_batch', transferIds);
 }
 
 export async function resumeTransfersBatch(transferIds: string[]): Promise<void> {
-  return invoke('resume_transfers_batch', { transferIds });
+  return invokeChunked('resume_transfers_batch', transferIds);
 }
 
 export async function stopTransfersBatch(transferIds: string[]): Promise<void> {
-  return invoke('stop_transfers_batch', { transferIds });
+  return invokeChunked('stop_transfers_batch', transferIds);
 }
 
 export async function cancelTransfersBatch(transferIds: string[]): Promise<void> {
-  return invoke('cancel_transfers_batch', { transferIds });
+  return invokeChunked('cancel_transfers_batch', transferIds);
 }
 
 export async function resumeAllTransfers(): Promise<void> {

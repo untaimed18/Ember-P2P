@@ -502,19 +502,6 @@ pub async fn download_collection_files(
             tracing::debug!("Skipping collection entry '{}': invalid AICH", file.name);
             continue;
         }
-        let ember_file_hash = match crate::security::parse_ember_file_hash(
-            (!file.ember_file_hash.is_empty()).then_some(file.ember_file_hash.as_str()),
-        ) {
-            Ok(value) => value,
-            Err(_) => {
-                skipped_count += 1;
-                tracing::debug!(
-                    "Skipping collection entry '{}': invalid Ember digest",
-                    file.name
-                );
-                continue;
-            }
-        };
         if max_dl_bytes > 0 && file.size > max_dl_bytes {
             oversize_count += 1;
             tracing::debug!(
@@ -592,12 +579,18 @@ pub async fn download_collection_files(
             user_hash: None,
             ember_hash: None,
             expected_aich: expected_aich.clone(),
-            ember_file_hash: ember_file_hash.clone(),
+            // A collection's `eh=` digest is as untrusted as a pasted link's
+            // and gets the same treatment (see `DeepLinkPreview::ember`): it
+            // is never pinned. A wrong pin is only caught once the whole file
+            // has downloaded and matched its ed2k hash, and then fails it for
+            // good.
+            ember_file_hash: None,
             completed_path: None,
             up_part_status: None,
             up_part_count: None,
             up_peer_part_status: None,
             ember_verified: false,
+            friends_only: false,
         };
 
         let (active_now, persisted_transfer) = {
@@ -605,12 +598,9 @@ pub async fn download_collection_files(
             if let Some(existing_id) = mgr.pending_transfer_id_for_hash(&file.hash) {
                 let existing = mgr.get_transfer(&existing_id);
                 let existing_pin = existing.and_then(|transfer| transfer.expected_aich.clone());
-                let existing_ember = existing.and_then(|transfer| transfer.ember_file_hash.clone());
-                // Either pin disagreeing with the queued transfer is a refusal:
-                // the row already downloading is not the file being asked for.
-                if (expected_aich.is_some() && existing_pin != expected_aich)
-                    || (ember_file_hash.is_some() && existing_ember != ember_file_hash)
-                {
+                // A pin disagreeing with the queued transfer is a refusal: the
+                // row already downloading is not the file being asked for.
+                if expected_aich.is_some() && existing_pin != expected_aich {
                     failed_count += 1;
                 } else {
                     skipped_count += 1;
@@ -663,7 +653,7 @@ pub async fn download_collection_files(
                     // addresses; the network task handles full source
                     // discovery for each.
                     extra_sources: Vec::new(),
-                    ember_file_hash: ember_file_hash.clone().unwrap_or_default(),
+                    ember_file_hash: String::new(),
                     expected_aich: expected_aich.clone(),
                     transfer_id: transfer_id.clone(),
                     control: control.clone(),
@@ -720,7 +710,7 @@ pub async fn download_collection_files(
                     peer_ip: String::new(),
                     peer_port: 0,
                     extra_sources: Vec::new(),
-                    ember_file_hash: ember_file_hash.unwrap_or_default(),
+                    ember_file_hash: String::new(),
                     expected_aich: expected_aich.clone(),
                     transfer_id: transfer_id.clone(),
                     control,

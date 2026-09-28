@@ -1,10 +1,17 @@
 import { describe, expect, it } from 'vitest';
+import { getLocale } from '$lib/i18n';
 import {
+  confusableSkeleton,
   disambiguatedMemberName,
   formatBytes,
+  formatCalendarDate,
+  formatClockTime,
+  formatDateTime,
+  formatNumber,
   insertMention,
   linkifyMessage,
   mentionTokenAt,
+  mixesLookalikeScripts,
   shortPubkey,
   type MessageSegment,
 } from './utils';
@@ -101,6 +108,46 @@ describe('linkifyMessage', () => {
     const long = `https://example.com/${'a'.repeat(2100)}`;
     expect(links(linkifyMessage(long))).toEqual([]);
     expect(plain(linkifyMessage(long))).toBe(long);
+  });
+
+  it('trims a run of closing brackets in linear time', () => {
+    // Recounting brackets for every trimmed character made this ~30 ms a
+    // message; a room of them froze on open.
+    const tail = ')'.repeat(2000);
+    const text = `(http://a${tail} x`;
+    const started = performance.now();
+    for (let i = 0; i < 50; i++) linkifyMessage(text);
+    expect(performance.now() - started).toBeLessThan(250);
+    const segments = linkifyMessage(text);
+    expect(links(segments)).toEqual(['http://a']);
+    expect(plain(segments)).toBe(text);
+  });
+
+  it('refuses an oversized match before spending time trimming it', () => {
+    const text = `http://a${')'.repeat(4088)}`;
+    const started = performance.now();
+    for (let i = 0; i < 100; i++) linkifyMessage(text);
+    expect(performance.now() - started).toBeLessThan(250);
+    expect(links(linkifyMessage(text))).toEqual([]);
+    expect(plain(linkifyMessage(text))).toBe(text);
+  });
+
+  it('judges the length after trimming, not before', () => {
+    const at = (n: number) => `https://example.com/${'a'.repeat(n - 20)}`;
+    // Raw match is two longer than the link: `).` goes back to the sentence.
+    for (const n of [2047, 2048]) {
+      const url = at(n);
+      expect(url.length).toBe(n);
+      const text = `(${url}).`;
+      expect(links(linkifyMessage(text))).toEqual([url]);
+      expect(plain(linkifyMessage(text))).toBe(text);
+    }
+    expect(links(linkifyMessage(`(${at(2049)}).`))).toEqual([]);
+  });
+
+  it('keeps balanced brackets while trimming unbalanced ones after them', () => {
+    expect(links(linkifyMessage('(see https://x.test/a_(b)))'))).toEqual(['https://x.test/a_(b)']);
+    expect(links(linkifyMessage('https://x.test/{a}]).'))).toEqual(['https://x.test/{a}']);
   });
 
   it('sets href to exactly the text it renders', () => {
@@ -224,5 +271,76 @@ describe('disambiguatedMemberName', () => {
     const shown = disambiguatedMemberName('Ada', key, ['Ada', 'ada', 'Grace']);
     expect(shown).not.toBe('Ada');
     expect(shown).toContain(shortPubkey(key));
+  });
+
+  it('appends a key fragment when two nicknames only look alike', () => {
+    for (const [a, b] of [
+      ['Alice', 'AIice'],
+      ['mallory', 'rnallory'],
+      ['bob', 'b0b'],
+      ['wendy', 'vvendy'],
+      ['Alice', '\u0410lice'], // Cyrillic А
+      ['Ada', 'Ad\u03b1'], // Greek α
+      ['Alice', 'Al\u00efce'], // accented i
+    ]) {
+      expect(disambiguatedMemberName(a, key, [a, b])).toContain(shortPubkey(key));
+      expect(disambiguatedMemberName(b, key, [a, b])).toContain(shortPubkey(key));
+    }
+  });
+});
+
+describe('confusableSkeleton', () => {
+  it('folds lookalikes together and leaves distinct names apart', () => {
+    expect(confusableSkeleton('AIice')).toBe(confusableSkeleton('alice'));
+    expect(confusableSkeleton('rnallory')).toBe(confusableSkeleton('Mallory'));
+    expect(confusableSkeleton('\u0412\u043e\u0432')).toBe(confusableSkeleton('Bob')); // Cyrillic Вов
+    expect(confusableSkeleton('Alice')).not.toBe(confusableSkeleton('Grace'));
+  });
+
+  it('still folds accents on Latin, Greek and Cyrillic letters', () => {
+    expect(confusableSkeleton('Alic\u00e9')).toBe(confusableSkeleton('Alice'));
+    expect(confusableSkeleton('Ali\u0301\u0308ce')).toBe(confusableSkeleton('Alice'));
+    expect(confusableSkeleton('\u0391\u0301da')).toBe(confusableSkeleton('Ada'));
+    expect(confusableSkeleton('\u0412\u043e\u0306\u0432')).toBe(confusableSkeleton('Bob'));
+  });
+
+  it('keeps the marks that are letters in other scripts', () => {
+    // Devanagari vowel signs and virama.
+    expect(confusableSkeleton('\u0930\u093e\u092e')).not.toBe(confusableSkeleton('\u0930\u092e\u093e'));
+    expect(confusableSkeleton('\u0915\u094d\u0937')).not.toBe(confusableSkeleton('\u0915\u0937'));
+    // Thai vowels above the consonant.
+    expect(confusableSkeleton('\u0e01\u0e34\u0e19')).not.toBe(confusableSkeleton('\u0e01\u0e31\u0e19'));
+    // Kana dakuten and handakuten, precomposed or not.
+    expect(confusableSkeleton('\u3070\u3070')).not.toBe(confusableSkeleton('\u306f\u306f'));
+    expect(confusableSkeleton('\u304c')).not.toBe(confusableSkeleton('\u304b'));
+    expect(confusableSkeleton('\u3071')).not.toBe(confusableSkeleton('\u3070'));
+    expect(confusableSkeleton('\u304b\u3099')).toBe(confusableSkeleton('\u304c'));
+  });
+
+  it('only drops a Latin-block accent when it sits on a lookalike letter', () => {
+    expect(confusableSkeleton('\u0930\u0301')).not.toBe(confusableSkeleton('\u0930'));
+  });
+});
+
+describe('mixesLookalikeScripts', () => {
+  it('flags a Latin name carrying a Cyrillic or Greek letter', () => {
+    expect(mixesLookalikeScripts('\u0410lice')).toBe(true);
+    expect(mixesLookalikeScripts('Ad\u03b1')).toBe(true);
+  });
+
+  it('leaves single-script names alone', () => {
+    expect(mixesLookalikeScripts('Alice')).toBe(false);
+    expect(mixesLookalikeScripts('\u0412\u0430\u043d\u044f')).toBe(false);
+    expect(mixesLookalikeScripts('Taro \u592a\u90ce')).toBe(false);
+  });
+});
+
+describe('locale formatting', () => {
+  it('formats counts and treats missing timestamps as unknown', () => {
+    expect(formatNumber(1234567)).toBe(new Intl.NumberFormat(getLocale()).format(1234567));
+    expect(formatNumber(Number.NaN)).toBe('\u2014');
+    expect(formatDateTime(0)).toBe('\u2014');
+    expect(formatCalendarDate(-5)).toBe('\u2014');
+    expect(formatClockTime(1_700_000_000)).not.toBe('\u2014');
   });
 });

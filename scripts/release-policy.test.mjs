@@ -643,8 +643,8 @@ test("a release cannot be signed without the Linux packages it publishes", () =>
   // Windows built. It is the Linux half that disappears, from a release that
   // otherwise looks complete.
   const fixture = tamperedWorkflow(
-    "    needs: [verify, build, build-linux]",
-    "    needs: [verify, build]",
+    "    needs: [verify, build, build-windows, build-linux]",
+    "    needs: [verify, build, build-windows]",
   );
   try {
     assert.throws(
@@ -653,6 +653,73 @@ test("a release cannot be signed without the Linux packages it publishes", () =>
     );
   } finally {
     rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("nothing is built or installed with scripts while the signing key is present", () => {
+  // Every npm install script, Vite plugin, build.rs and proc-macro that runs in
+  // the signing job runs with the updater key in its environment. The Windows
+  // build used to happen there, inside tauri-action.
+  for (const [from, to, expected] of [
+    [
+      "        run: npm ci --ignore-scripts --no-audit --no-fund",
+      "        run: npm ci",
+      /must not run npm ci without --ignore-scripts/,
+    ],
+    [
+      "        run: node scripts/compose-update-manifest.mjs",
+      "        run: node scripts/compose-update-manifest.mjs && npm run tauri build",
+      /must not build the app/,
+    ],
+    [
+      "      - name: Download the Windows installers\n",
+      "      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2\n      - name: Download the Windows installers\n",
+      /must not run tauri-action/,
+    ],
+    [
+      "      - name: Download the Windows installers\n",
+      "      - run: cargo build --release\n      - name: Download the Windows installers\n",
+      /must not run cargo/,
+    ],
+  ]) {
+    const fixture = tamperedWorkflow(from, to);
+    try {
+      assert.throws(() => verifyWorkflow({ root: fixture }), expected);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }
+});
+
+test("the Windows installers are built without the key and signed afterwards", () => {
+  for (const [from, to, expected] of [
+    [
+      "    name: Build Windows installers\n",
+      "    name: Build Windows installers\n    environment: release-signing\n",
+      /only sign-publish may enter the release-signing environment, not build-windows/,
+    ],
+    [
+      "    needs: [verify, build, build-windows, build-linux]",
+      "    needs: [verify, build, build-linux]",
+      /it is missing build-windows/,
+    ],
+    [
+      `          npm run tauri build -- --bundles nsis,msi \\\n            --config '{"bundle":{"createUpdaterArtifacts":false}}'`,
+      "          npm run tauri build -- --bundles nsis,msi",
+      /build-windows holds no signing key, so it must disable createUpdaterArtifacts/,
+    ],
+    [
+      "gh release create \"$GITHUB_REF_NAME\" --draft --verify-tag",
+      "gh release create \"$GITHUB_REF_NAME\" --verify-tag",
+      /release must remain a draft/,
+    ],
+  ]) {
+    const fixture = tamperedWorkflow(from, to);
+    try {
+      assert.throws(() => verifyWorkflow({ root: fixture }), expected);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
   }
 });
 

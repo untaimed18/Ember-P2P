@@ -80,7 +80,17 @@ pub fn result_matches_client_filters(
         }
     }
     if let Some(min_av) = min_availability {
-        if r.availability < min_av {
+        // A row that came only out of the local library carries `availability:
+        // 1` as a stand-in — `file_to_local_result` has nobody to count, since
+        // the file is on this disk rather than in a swarm. Judging it against
+        // "Min sources" hid every library hit the moment the user asked for
+        // more than one source, which reads as the library search being
+        // broken. The same reasoning as the complete-source filter, which lets
+        // a row whose count is unknown through rather than judging it on a
+        // figure that means nothing. A file also seen on a network has that
+        // network's count merged in and its origin is no longer bare `Local`,
+        // so it is filtered on the real number.
+        if r.availability < min_av && r.result_origin != ORIGIN_LOCAL {
             return false;
         }
     }
@@ -708,6 +718,34 @@ mod tests {
         ));
         assert!(!result_matches_client_filters(
             &big, None, None, Some(99), None, None
+        ));
+    }
+
+    /// A library-only row's `availability` is the placeholder `1` that
+    /// `file_to_local_result` fills in, not a count of anyone sharing it, so
+    /// "Min sources" cannot judge it. It used to, which hid every hit from the
+    /// user's own library the moment they asked for more than one source.
+    #[test]
+    fn min_sources_does_not_judge_a_library_only_row() {
+        let local = sample("aa", 1, ORIGIN_LOCAL);
+        assert!(result_matches_client_filters(
+            &local, None, None, None, None, Some(10)
+        ));
+
+        // A file the network answered for carries that count and a wider
+        // origin, so it is filtered on the real number like anything else.
+        let mut also_on_kad = sample("aa", 1, ORIGIN_LOCAL);
+        also_on_kad.result_origin = combine_origin(ORIGIN_KAD, ORIGIN_LOCAL);
+        assert!(!result_matches_client_filters(
+            &also_on_kad, None, None, None, None, Some(10)
+        ));
+
+        let network = sample("bb", 3, ORIGIN_SERVER_TCP);
+        assert!(!result_matches_client_filters(
+            &network, None, None, None, None, Some(10)
+        ));
+        assert!(result_matches_client_filters(
+            &network, None, None, None, None, Some(3)
         ));
     }
 

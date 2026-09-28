@@ -10,6 +10,8 @@ const REPUBLISH_KEYWORD_SECS: i64 = 20 * 3600;
 const REPUBLISH_SOURCE_SECS: i64 = 5 * 3600;
 const MAX_FILES_PER_KEYWORD_PUBLISH: usize = 150;
 const MAX_FILES_PER_KEYWORD_PACKET: usize = 50;
+/// eMule's 150 files at 50 per packet, and what one node may take per window.
+const MAX_KEYWORD_PACKETS_PER_PUBLISH: usize = super::outbound::PUBLISH_KEY_REQS_PER_WINDOW;
 
 /// Byte budget for one `PublishKeyReq` body.
 ///
@@ -58,25 +60,37 @@ fn keyword_entry_wire_size(entry: &PublishEntry) -> usize {
 ///
 /// A single entry larger than the budget still gets its own packet — better
 /// to attempt an oversized one than to drop the file silently.
-fn chunk_keyword_entries(entries: Vec<PublishEntry>) -> Vec<Vec<PublishEntry>> {
+///
+/// At most [`MAX_KEYWORD_PACKETS_PER_PUBLISH`] packets: the send sites only
+/// count a node as reached once it has the whole batch, and the outbound
+/// governor lets exactly that many `PublishKeyReq` reach one node per window,
+/// so a longer batch could never complete and its keyword was republished
+/// forever. Returns the packets and how many leading entries they hold; the
+/// rest wait for a later rotation.
+fn chunk_keyword_entries(entries: Vec<PublishEntry>) -> (Vec<Vec<PublishEntry>>, usize) {
     let mut chunks: Vec<Vec<PublishEntry>> = Vec::new();
     let mut current: Vec<PublishEntry> = Vec::new();
     let mut current_bytes = 0usize;
+    let mut taken = 0usize;
     for entry in entries {
         let size = keyword_entry_wire_size(&entry);
         let full = current.len() >= MAX_FILES_PER_KEYWORD_PACKET
             || (!current.is_empty() && current_bytes + size > MAX_KEYWORD_PACKET_BODY_BYTES);
         if full {
+            if chunks.len() + 1 >= MAX_KEYWORD_PACKETS_PER_PUBLISH {
+                break;
+            }
             chunks.push(std::mem::take(&mut current));
             current_bytes = 0;
         }
         current_bytes += size;
         current.push(entry);
+        taken += 1;
     }
     if !current.is_empty() {
         chunks.push(current);
     }
-    chunks
+    (chunks, taken)
 }
 
 /// K15's load-based backoff (see [`PublishManager::record_keyword_publish_load`])
@@ -149,6 +163,9 @@ struct KeywordRecord {
     /// backoff on the keyword hash so one popular word does not suppress
     /// unrelated keywords from the same file.
     backoff_shift: u32,
+    /// Where the next batch starts in this keyword's files sorted by hash,
+    /// when more back it than one batch holds (eMule `RotateReferences`).
+    next_file_offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +174,8 @@ pub struct KeywordPublishBatch {
     pub keyword: String,
     pub messages: Vec<KadMessage>,
     pub file_hashes: Vec<KadId>,
+    /// `KeywordRecord::next_file_offset` once this batch is published.
+    next_file_offset: usize,
 }
 
 /// Manages publishing files to the KAD network.
@@ -422,10 +441,14 @@ impl PublishManager {
     }
 
     /// Gather up to 150 complete, keyword-publishable files backing
-    /// `keyword_hash` and split them into 50-entry `PublishKeyReq` packets.
-    /// Returns `None` if no live file currently backs this keyword (e.g.
-    /// the last one was unshared but the keyword record hasn't been pruned
-    /// yet).
+    /// `keyword_hash` and split them into at most three `PublishKeyReq`
+    /// packets. Returns `None` if no live file currently backs this keyword
+    /// (e.g. the last one was unshared but the keyword record hasn't been
+    /// pruned yet).
+    ///
+    /// When more files back the keyword than one batch holds, the batch
+    /// starts where the last published one stopped, as eMule's
+    /// `RotateReferences` does, so every file gets its turn.
     fn build_batch_for_keyword(
         &self,
         keyword_hash: KadId,
@@ -447,28 +470,32 @@ impl PublishManager {
         };
         file_hashes.sort();
 
-        let mut entries = Vec::new();
-        let mut selected_hashes = Vec::new();
-        for file_hash in file_hashes {
-            let Some(record) = self.records.get(&file_hash) else {
-                continue;
-            };
-            if !record.file.keyword_publishable {
-                continue;
-            }
-            entries.push(Self::build_keyword_entry(&record.file));
-            selected_hashes.push(record.file.file_hash);
-            if entries.len() >= MAX_FILES_PER_KEYWORD_PUBLISH {
-                break;
-            }
-        }
-        let file_hashes = selected_hashes;
-
-        if entries.is_empty() {
+        let eligible: Vec<&PublishableFile> = file_hashes
+            .iter()
+            .filter_map(|file_hash| self.records.get(file_hash))
+            .filter(|record| record.file.keyword_publishable)
+            .map(|record| &record.file)
+            .collect();
+        if eligible.is_empty() {
             return None;
         }
+        let start = keyword_record.next_file_offset % eligible.len();
+        let ordered: Vec<&PublishableFile> = eligible[start..]
+            .iter()
+            .chain(&eligible[..start])
+            .take(MAX_FILES_PER_KEYWORD_PUBLISH)
+            .copied()
+            .collect();
+        let entries = ordered.iter().map(|file| Self::build_keyword_entry(file)).collect();
+        let (chunks, taken) = chunk_keyword_entries(entries);
+        let file_hashes = ordered[..taken].iter().map(|file| file.file_hash).collect();
+        let next_file_offset = if taken >= eligible.len() {
+            0
+        } else {
+            (start + taken) % eligible.len()
+        };
 
-        let messages = chunk_keyword_entries(entries)
+        let messages = chunks
             .into_iter()
             .map(|chunk| KadMessage::PublishKeyReq {
                 target: keyword_hash,
@@ -481,6 +508,7 @@ impl PublishManager {
             keyword: keyword_record.keyword.clone(),
             messages,
             file_hashes,
+            next_file_offset,
         })
     }
 
@@ -488,6 +516,15 @@ impl PublishManager {
     pub fn mark_keyword_published(&mut self, keyword_hash: &KadId) {
         if let Some(record) = self.keyword_records.get_mut(keyword_hash) {
             record.last_publish = chrono::Utc::now().timestamp();
+        }
+    }
+
+    /// Mark `batch` published, and start the keyword's next batch on the
+    /// files this one could not hold.
+    pub fn mark_keyword_batch_published(&mut self, batch: &KeywordPublishBatch) {
+        self.mark_keyword_published(&batch.keyword_hash);
+        if let Some(record) = self.keyword_records.get_mut(&batch.keyword_hash) {
+            record.next_file_offset = batch.next_file_offset;
         }
     }
 
@@ -739,6 +776,7 @@ impl PublishManager {
                     keyword,
                     last_publish: 0,
                     backoff_shift: 0,
+                    next_file_offset: 0,
                 });
             self.keyword_index
                 .entry(keyword_hash)
@@ -1007,15 +1045,11 @@ mod tests {
             .map(|i| keyword_entry(&format!("Some.Movie.Title.{i}.1080p.BluRay.x264-GROUP.mkv")))
             .collect();
 
-        let chunks = chunk_keyword_entries(entries);
+        let (chunks, taken) = chunk_keyword_entries(entries);
 
-        // eMule: 150 files at 50 per packet = 3 packets. Anything up to four
-        // stays inside the receiver's burst allowance.
-        assert!(
-            chunks.len() <= 4,
-            "{} packets for one keyword; a storing eMule keeps only the first four",
-            chunks.len()
-        );
+        // eMule: 150 files at 50 per packet = 3 packets.
+        assert_eq!(chunks.len(), MAX_KEYWORD_PACKETS_PER_PUBLISH);
+        assert_eq!(taken, MAX_FILES_PER_KEYWORD_PUBLISH);
         assert!(chunks.iter().all(|c| c.len() <= MAX_FILES_PER_KEYWORD_PACKET));
 
         // And every chunk must still survive `encode_packet`, which is where an
@@ -1034,6 +1068,67 @@ mod tests {
             // eMule's client UDP socket reads into 8192 bytes; longer is truncated.
             assert!(packet.len() <= 8192);
         }
+    }
+
+    /// Long names fit fewer than 50 entries in a packet. The batch still stops
+    /// at the three packets one node may take per window: a fourth could never
+    /// be sent, so no node would count as reached and the keyword would be
+    /// republished for ever.
+    #[test]
+    fn a_keyword_batch_never_exceeds_the_per_node_packet_budget() {
+        let long = "x".repeat(150);
+        let entries: Vec<PublishEntry> = (0..MAX_FILES_PER_KEYWORD_PUBLISH)
+            .map(|i| keyword_entry(&format!("{long}.{i}.mkv")))
+            .collect();
+        let (chunks, taken) = chunk_keyword_entries(entries);
+        assert_eq!(chunks.len(), MAX_KEYWORD_PACKETS_PER_PUBLISH);
+        assert!(taken < MAX_FILES_PER_KEYWORD_PUBLISH, "long names cannot all fit");
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), taken);
+    }
+
+    /// The files one batch cannot hold lead the next batch, and a batch that is
+    /// never published is rebuilt unchanged.
+    #[test]
+    fn keyword_batches_rotate_through_every_backing_file() {
+        let mut p = make_publisher(false);
+        let long = "y".repeat(150);
+        for i in 0..MAX_FILES_PER_KEYWORD_PUBLISH as u16 {
+            let mut hash = [0u8; 16];
+            hash[..2].copy_from_slice(&i.to_be_bytes());
+            p.add_file(PublishableFile {
+                file_hash: KadId(hash),
+                file_name: format!("sharedword {long} {i:04}.mkv"),
+                file_size: 1024,
+                file_type: "Video".to_string(),
+                complete_sources: 1,
+                keyword_publishable: true,
+                last_source_publish: 0,
+            });
+        }
+        let keyword = keyword_to_kad_id("sharedword");
+        let build = |p: &PublishManager| {
+            p.build_batch_for_keyword(keyword, &p.keyword_records[&keyword])
+                .expect("files back the keyword")
+        };
+
+        let first = build(&p);
+        assert!(first.messages.len() <= MAX_KEYWORD_PACKETS_PER_PUBLISH);
+        assert!(first.file_hashes.len() < MAX_FILES_PER_KEYWORD_PUBLISH);
+        assert_eq!(build(&p).file_hashes, first.file_hashes, "unpublished: same batch");
+
+        p.mark_keyword_batch_published(&first);
+        let second = build(&p);
+        let mut after_first = [0u8; 16];
+        after_first[..2].copy_from_slice(&(first.file_hashes.len() as u16).to_be_bytes());
+        assert_eq!(second.file_hashes[0], KadId(after_first));
+
+        let covered: std::collections::HashSet<KadId> = first
+            .file_hashes
+            .iter()
+            .chain(&second.file_hashes)
+            .copied()
+            .collect();
+        assert_eq!(covered.len(), MAX_FILES_PER_KEYWORD_PUBLISH.min(first.file_hashes.len() * 2));
     }
 
     /// An index only works while every client agrees on what a word is, so each

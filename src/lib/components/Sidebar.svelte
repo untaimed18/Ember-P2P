@@ -7,8 +7,9 @@
   import { transfers } from '$lib/stores/transfers';
   import { friendRequests, fileOffers } from '$lib/stores/friends';
   import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
-  import { totalChannelUnread } from '$lib/stores/channels';
+  import { awaitingChannelOffers, totalChannelUnread } from '$lib/stores/channels';
   import * as m from '$lib/paraglide/messages';
+  import { plural } from '$lib/plural';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import {
     navItems,
@@ -146,19 +147,49 @@
     }
   }
 
+  const IDLE_STATUSES = new Set(['completed', 'failed', 'paused', 'stopped', 'insufficient']);
   let activeDownloadCount = $derived(
-    $transfers.filter(t => t.direction === 'download' && t.status !== 'completed' && t.status !== 'failed').length
+    $transfers.filter(t => t.direction === 'download' && !IDLE_STATUSES.has(t.status)).length
   );
   let activeUploadCount = $derived(
-    $transfers.filter(t => t.direction === 'upload' && t.status !== 'completed' && t.status !== 'failed').length
+    $transfers.filter(t => t.direction === 'upload' && !IDLE_STATUSES.has(t.status)).length
   );
   let activeTransferCount = $derived(activeDownloadCount + activeUploadCount);
 
   function downloadsTitle(n: number): string {
-    return n === 1 ? m.sidebar_active_downloads_one() : m.sidebar_active_downloads_other({ count: n });
+    return plural(n, {
+      one: m.sidebar_active_downloads_one,
+      few: () => m.sidebar_active_downloads_few({ count: n }),
+      other: () => m.sidebar_active_downloads_other({ count: n }),
+    });
   }
   function uploadsTitle(n: number): string {
-    return n === 1 ? m.sidebar_active_uploads_one() : m.sidebar_active_uploads_other({ count: n });
+    return plural(n, {
+      one: m.sidebar_active_uploads_one,
+      few: () => m.sidebar_active_uploads_few({ count: n }),
+      other: () => m.sidebar_active_uploads_other({ count: n }),
+    });
+  }
+  function transfersTitle(downloads: number, uploads: number): string {
+    const parts: string[] = [];
+    if (downloads > 0) parts.push(downloadsTitle(downloads));
+    if (uploads > 0) parts.push(uploadsTitle(uploads));
+    return parts.join(' · ');
+  }
+
+  function chatsAriaLabel(open: boolean, unread: number): string {
+    const mod = shortcutModSymbol();
+    if (unread <= 0) return open ? m.sidebar_chats_close({ mod }) : m.sidebar_chats_open({ mod });
+    if (open) {
+      return plural(unread, {
+        one: () => m.sidebar_chats_close_unread_one({ mod }),
+        other: () => m.sidebar_chats_close_unread_other({ mod, count: unread }),
+      });
+    }
+    return plural(unread, {
+      one: () => m.sidebar_chats_open_unread_one({ mod }),
+      other: () => m.sidebar_chats_open_unread_other({ mod, count: unread }),
+    });
   }
 
   // Pending incoming friend-request count. Mirrors the transfers badge
@@ -176,16 +207,20 @@
     const parts: string[] = [];
     if (requests > 0) {
       parts.push(
-        requests === 1
-          ? m.sidebar_friend_requests_title_one()
-          : m.sidebar_friend_requests_title_other({ count: requests }),
+        plural(requests, {
+          one: m.sidebar_friend_requests_title_one,
+          few: () => m.sidebar_friend_requests_title_few({ count: requests }),
+          other: () => m.sidebar_friend_requests_title_other({ count: requests }),
+        }),
       );
     }
     if (offers > 0) {
       parts.push(
-        offers === 1
-          ? m.sidebar_friend_offers_title_one()
-          : m.sidebar_friend_offers_title_other({ count: offers }),
+        plural(offers, {
+          one: m.sidebar_friend_offers_title_one,
+          few: () => m.sidebar_friend_offers_title_few({ count: offers }),
+          other: () => m.sidebar_friend_offers_title_other({ count: offers }),
+        }),
       );
     }
     return parts.join(' · ');
@@ -197,6 +232,36 @@
   // which required navigating there to notice activity.
   let totalUnreadChats = $derived($totalUnread);
   let totalUnreadChannels = $derived($totalChannelUnread);
+  let awaitingChannelOfferCount = $derived($awaitingChannelOffers);
+  let channelInboxCount = $derived(totalUnreadChannels + awaitingChannelOfferCount);
+
+  /** Every nav count caps the same way; the exact figure is in each title. */
+  function navCount(n: number): string {
+    return n > 99 ? '99+' : String(n);
+  }
+
+  function channelInboxTitle(unread: number, offers: number): string {
+    const parts: string[] = [];
+    if (unread > 0) {
+      parts.push(
+        plural(unread, {
+          one: m.channels_unread_title_one,
+          few: () => m.channels_unread_title_few({ count: unread }),
+          other: () => m.channels_unread_title_other({ count: unread }),
+        }),
+      );
+    }
+    if (offers > 0) {
+      parts.push(
+        plural(offers, {
+          one: m.channels_offers_title_one,
+          few: () => m.channels_offers_title_few({ count: offers }),
+          other: () => m.channels_offers_title_other({ count: offers }),
+        }),
+      );
+    }
+    return parts.join(' · ');
+  }
 
   function isActive(item: NavItem, pathname: string): boolean {
     return pathname === item.href || (item.aliases?.includes(pathname) ?? false);
@@ -430,33 +495,32 @@
             <span class="nav-transfer-counts">
               {#if activeDownloadCount > 0}
                 <span class="tc-chip tc-down" title={downloadsTitle(activeDownloadCount)}>
-                  <span class="tc-arrow" aria-hidden="true">↓</span>{activeDownloadCount}
+                  <span class="tc-arrow" aria-hidden="true">↓</span>{navCount(activeDownloadCount)}
                 </span>
               {/if}
               {#if activeUploadCount > 0}
                 <span class="tc-chip tc-up" title={uploadsTitle(activeUploadCount)}>
-                  <span class="tc-arrow" aria-hidden="true">↑</span>{activeUploadCount}
+                  <span class="tc-arrow" aria-hidden="true">↑</span>{navCount(activeUploadCount)}
                 </span>
               {/if}
             </span>
             <span
               class="nav-badge nav-badge-collapsed"
-              title={`${downloadsTitle(activeDownloadCount)} · ${uploadsTitle(activeUploadCount)}`}
-            >{activeTransferCount}</span>
+              title={transfersTitle(activeDownloadCount, activeUploadCount)}
+            >{navCount(activeTransferCount)}</span>
           {/if}
           {#if item.id === 'friends' && pendingFriendInboxCount > 0}
             <span
               class="nav-badge nav-badge-attention"
               title={friendInboxTitle(pendingFriendRequestCount, pendingFileOfferCount)}
-            >{pendingFriendInboxCount}</span>
+            >{navCount(pendingFriendInboxCount)}</span>
           {/if}
-          {#if item.id === 'channels' && totalUnreadChannels > 0}
+          {#if item.id === 'channels' && channelInboxCount > 0}
             <span
               class="nav-badge"
-              title={totalUnreadChannels === 1
-                ? m.channels_unread_title_one()
-                : m.channels_unread_title_other({ count: totalUnreadChannels })}
-            >{totalUnreadChannels > 99 ? '99+' : totalUnreadChannels}</span>
+              class:nav-badge-attention={awaitingChannelOfferCount > 0}
+              title={channelInboxTitle(totalUnreadChannels, awaitingChannelOfferCount)}
+            >{navCount(channelInboxCount)}</span>
           {/if}
         </a>
       </li>
@@ -475,9 +539,7 @@
       title={$chatDockOpen
         ? m.sidebar_chats_close({ mod: shortcutModSymbol() })
         : m.sidebar_chats_open({ mod: shortcutModSymbol() })}
-      aria-label={$chatDockOpen
-        ? m.sidebar_chats_close({ mod: shortcutModSymbol() })
-        : m.sidebar_chats_open({ mod: shortcutModSymbol() })}
+      aria-label={chatsAriaLabel($chatDockOpen, totalUnreadChats)}
       aria-pressed={$chatDockOpen}
       aria-keyshortcuts={`${shortcutModAria()}+/`}
     >
@@ -492,12 +554,12 @@
       {#if totalUnreadChats > 0}
         <span
           class="chats-dot"
-          aria-label={totalUnreadChats === 1
-            ? m.sidebar_chats_unread_title_one()
-            : m.sidebar_chats_unread_title_other({ count: totalUnreadChats })}
-          title={totalUnreadChats === 1
-            ? m.sidebar_chats_unread_title_one()
-            : m.sidebar_chats_unread_title_other({ count: totalUnreadChats })}
+          aria-hidden="true"
+          title={plural(totalUnreadChats, {
+            one: m.sidebar_chats_unread_title_one,
+            few: () => m.sidebar_chats_unread_title_few({ count: totalUnreadChats }),
+            other: () => m.sidebar_chats_unread_title_other({ count: totalUnreadChats }),
+          })}
         ></span>
       {/if}
     </button>
@@ -658,7 +720,7 @@
   }
 
   .logo-sub {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 1px;
@@ -700,7 +762,7 @@
   }
 
   .nav-group-label {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     letter-spacing: 0.08em;
     text-transform: uppercase;
@@ -760,7 +822,7 @@
     border-radius: 0;
     background: transparent;
     color: var(--text-muted);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-family: inherit;
     cursor: pointer;
     text-align: left;
@@ -847,7 +909,7 @@
     color: var(--text-secondary);
     text-decoration: none;
     transition: background-color var(--transition-normal), color var(--transition-normal), padding var(--transition-normal);
-    font-size: 14px;
+    font-size: var(--font-size-base);
     overflow: hidden;
   }
 
@@ -975,7 +1037,7 @@
     border-radius: var(--radius-pill);
     background: var(--accent);
     color: var(--on-accent);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     display: inline-flex;
     align-items: center;
@@ -1010,14 +1072,14 @@
     height: 18px;
     padding: 0 6px 0 4px;
     border-radius: var(--radius-pill);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     line-height: 1;
     font-variant-numeric: tabular-nums;
   }
 
   .tc-arrow {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     line-height: 1;
   }
 

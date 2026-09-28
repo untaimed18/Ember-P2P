@@ -11,8 +11,8 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use super::messages::{
-    MSG_BUDDY_ENDORSE_REQ, MSG_CALLBACK_REQ, MSG_FIND_NODE, MSG_FIND_VALUE, MSG_PROXY_STORE,
-    MSG_STORE_BATCH, MSG_STORE_RECORD,
+    MSG_ANNOUNCE_PEER, MSG_BUDDY_ENDORSE_REQ, MSG_CALLBACK_REQ, MSG_FIND_NODE, MSG_FIND_VALUE,
+    MSG_PROXY_STORE, MSG_STORE_BATCH, MSG_STORE_RECORD,
 };
 
 /// Sliding window for per-IP message counts.
@@ -24,6 +24,17 @@ const MSG_WINDOW: Duration = Duration::from_secs(1);
 /// [`MAX_LOOKUPS_PER_WINDOW`], which explains the arithmetic. Every limit in this
 /// file reads the same way.
 const MAX_MSGS_PER_WINDOW: u32 = 40;
+
+/// Channel frames (`CHANNEL_MSG` / `CHANNEL_RELAY`) accepted from one address
+/// per [`MSG_WINDOW`], counted apart from [`MAX_MSGS_PER_WINDOW`].
+///
+/// Every room-transfer block rides one of these, and the sender answers a
+/// whole outstanding window of them at once, so under the DHT cap a transfer
+/// lost most of each window. The channel layer meters them per hop after the
+/// decrypt; this bounds only the work before it, at what that layer admits
+/// from one peer.
+const MAX_CHANNEL_FRAMES_PER_WINDOW: u32 = (super::super::channel::CHANNEL_GOSSIP_IN_PER_PEER_PER_SEC
+    + super::super::channel::CHANNEL_XFER_IN_PER_PEER_PER_SEC) as u32;
 
 /// Sliding window for lookup queries (`FIND_NODE` / `FIND_VALUE` / `CALLBACK_REQ`).
 const LOOKUP_WINDOW: Duration = Duration::from_secs(10);
@@ -69,6 +80,21 @@ const STORE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_STORE_IDENTITIES_PER_ADDR: u32 = 8;
 
 const MAX_IP_ENTRIES: usize = 10_000;
+
+/// How often a counter map past half of [`MAX_IP_ENTRIES`] is swept for idle
+/// entries.
+///
+/// An idle entry has been idle for at least a full window of its own, so the
+/// next frame from its address resets it to exactly the state a fresh entry
+/// starts in: keeping it a while longer changes nothing but the map's size.
+const TRIM_INTERVAL: Duration = Duration::from_secs(1);
+
+/// From this size a map is swept on every frame, whatever the interval says.
+///
+/// A frame adds at most two keys to a map before the next sweep (a STORE's
+/// node and address budgets), so sweeping from two short of the cap means the
+/// capacity refusals always see the map a per-frame sweep would have left.
+const TRIM_EVERY_FRAME_AT: usize = MAX_IP_ENTRIES - 2;
 
 /// A two-bucket approximation of a sliding window.
 ///
@@ -143,6 +169,18 @@ impl WindowCounter {
         self.count = self.count.saturating_add(cost);
     }
 
+    /// Hand back a `cost` that [`Self::commit_n`] spent on work that then did
+    /// not happen.
+    ///
+    /// Exact only while the charge and the refund fall in the same half-window,
+    /// because that is the only bucket this can subtract from. Both callers are
+    /// a few microseconds apart inside one datagram's handling, so the window
+    /// cannot have aged between them; a refund that did somehow straddle an
+    /// ageing would under-refund, never over-refund.
+    fn refund_n(&mut self, cost: u32) {
+        self.count = self.count.saturating_sub(cost);
+    }
+
     /// When this counter last saw traffic, for the idle-entry sweep.
     fn last_activity(&self) -> Option<Instant> {
         self.window_start
@@ -165,6 +203,7 @@ pub enum StoreBudgetKey {
 /// Flood gate consulted before EmberDht::handle_message.
 pub struct DhtProtection {
     msg_counters: HashMap<IpAddr, WindowCounter>,
+    channel_counters: HashMap<IpAddr, WindowCounter>,
     store_counters: HashMap<StoreBudgetKey, WindowCounter>,
     /// Lookup budgets. Shares `StoreBudgetKey` so an identity can be used if a
     /// caller ever supplies one, but in practice this is address-keyed — see
@@ -187,6 +226,10 @@ pub struct DhtProtection {
     /// STORE frames allowed per peer per [`STORE_WINDOW`], refreshed from the
     /// routing table's view of network size.
     max_stores: u32,
+    /// When the counter maps were last swept on the interval.
+    trimmed_at: Option<Instant>,
+    /// [`TRIM_INTERVAL`], as a field so a test can sweep on every frame.
+    trim_interval: Duration,
 }
 
 impl Default for DhtProtection {
@@ -199,11 +242,14 @@ impl DhtProtection {
     pub fn new() -> Self {
         Self {
             msg_counters: HashMap::new(),
+            channel_counters: HashMap::new(),
             store_counters: HashMap::new(),
             lookup_counters: HashMap::new(),
             dropped_rate: 0,
             dropped_store_addr_ceiling: 0,
             max_stores: super::scale::NetworkScale::Bootstrap.max_stores_per_minute(),
+            trimmed_at: None,
+            trim_interval: TRIM_INTERVAL,
         }
     }
 
@@ -268,7 +314,10 @@ impl DhtProtection {
     /// Charges on success, so a caller must call this exactly once per frame
     /// and pass only frames it admitted to [`Self::allow_typed`].
     pub fn allow_frame(&mut self, ip: IpAddr) -> bool {
-        let now = Instant::now();
+        self.allow_frame_at(ip, Instant::now())
+    }
+
+    fn allow_frame_at(&mut self, ip: IpAddr, now: Instant) -> bool {
         self.maybe_trim(now);
 
         if self.msg_counters.len() >= MAX_IP_ENTRIES && !self.msg_counters.contains_key(&ip) {
@@ -286,6 +335,31 @@ impl DhtProtection {
             return false;
         }
         true
+    }
+
+    /// [`Self::allow_frame`] for channel frames, on their own budget (see
+    /// [`MAX_CHANNEL_FRAMES_PER_WINDOW`]). Charges on success, like it.
+    pub fn allow_channel_frame(&mut self, ip: IpAddr) -> bool {
+        self.allow_channel_frame_at(ip, Instant::now())
+    }
+
+    fn allow_channel_frame_at(&mut self, ip: IpAddr, now: Instant) -> bool {
+        self.maybe_trim(now);
+
+        if self.channel_counters.len() >= MAX_IP_ENTRIES && !self.channel_counters.contains_key(&ip)
+        {
+            self.dropped_rate = self.dropped_rate.saturating_add(1);
+            return false;
+        }
+        let ok = self.channel_counters.entry(ip).or_default().allow(
+            now,
+            MSG_WINDOW,
+            MAX_CHANNEL_FRAMES_PER_WINDOW,
+        );
+        if !ok {
+            self.dropped_rate = self.dropped_rate.saturating_add(1);
+        }
+        ok
     }
 
     /// The per-type budgets — STORE and lookup — for a frame that has already
@@ -308,8 +382,17 @@ impl DhtProtection {
         sender_id: Option<[u8; 16]>,
         store_records: u32,
     ) -> bool {
-        let now = Instant::now();
+        self.allow_typed_at(ip, msg_type, sender_id, store_records, Instant::now())
+    }
 
+    fn allow_typed_at(
+        &mut self,
+        ip: IpAddr,
+        msg_type: u8,
+        sender_id: Option<[u8; 16]>,
+        store_records: u32,
+        now: Instant,
+    ) -> bool {
         if matches!(
             msg_type,
             MSG_STORE_RECORD | MSG_PROXY_STORE | MSG_STORE_BATCH
@@ -398,10 +481,17 @@ impl DhtProtection {
         }
 
         // `BUDDY_ENDORSE_REQ` shares this budget because answering one costs a
-        // signature, the same order of work as serving a lookup.
+        // signature, the same order of work as serving a lookup. `ANNOUNCE_PEER`
+        // is a lookup in all but name — it is answered with the same signed
+        // contact list as `FIND_NODE` — and costs more besides, since every
+        // contact it carries is offered to the routing table.
         if matches!(
             msg_type,
-            MSG_FIND_NODE | MSG_FIND_VALUE | MSG_CALLBACK_REQ | MSG_BUDDY_ENDORSE_REQ
+            MSG_FIND_NODE
+                | MSG_FIND_VALUE
+                | MSG_CALLBACK_REQ
+                | MSG_BUDDY_ENDORSE_REQ
+                | MSG_ANNOUNCE_PEER
         ) {
             let budget_key = match sender_id {
                 Some(id) => StoreBudgetKey::Node(id),
@@ -435,22 +525,88 @@ impl DhtProtection {
         }
     }
 
+    /// Return the STORE budget [`Self::allow_typed`] charged for a frame that
+    /// then failed to authenticate. Arguments must be the ones it was called
+    /// with, or this refunds the wrong budget.
+    ///
+    /// The gate runs before the signature check on purpose — the point of a
+    /// cheap gate is to reject junk before paying for crypto — but the charge
+    /// outliving the frame is not part of that bargain. A record's cost is the
+    /// two Ed25519 verifications the store pays for it, and a frame whose own
+    /// signature does not verify never reaches them: the whole datagram costs
+    /// one verification, which is what [`Self::allow_frame`] already rations.
+    ///
+    /// Left charged, the minute's publish allowance could be spent entirely on
+    /// frames that were thrown away. That mattered most where the budget is
+    /// shared: a verified peer's cost also lands on its address ceiling, so
+    /// junk from one instance behind a NAT was refusing its neighbours' real
+    /// publishes.
+    pub fn refund_store(
+        &mut self,
+        ip: IpAddr,
+        msg_type: u8,
+        sender_id: Option<[u8; 16]>,
+        store_records: u32,
+    ) {
+        if !matches!(
+            msg_type,
+            MSG_STORE_RECORD | MSG_PROXY_STORE | MSG_STORE_BATCH
+        ) {
+            return;
+        }
+        let cost = store_records.max(1);
+        let budget_key = match sender_id {
+            Some(id) => StoreBudgetKey::Node(id),
+            None => StoreBudgetKey::Addr(ip),
+        };
+        if let Some(counter) = self.store_counters.get_mut(&budget_key) {
+            counter.refund_n(cost);
+        }
+        // Mirrors the charge: the address ceiling is only spent alongside a
+        // node budget, never on its own.
+        if sender_id.is_some() {
+            if let Some(counter) = self.store_counters.get_mut(&StoreBudgetKey::Addr(ip)) {
+                counter.refund_n(cost);
+            }
+        }
+    }
+
     fn maybe_trim(&mut self, now: Instant) {
-        if self.msg_counters.len() > MAX_IP_ENTRIES / 2 {
+        let due = self
+            .trimmed_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= self.trim_interval);
+        let wants = |len: usize| len > MAX_IP_ENTRIES / 2 && (due || len >= TRIM_EVERY_FRAME_AT);
+        let (msg, channel, store, lookup) = (
+            wants(self.msg_counters.len()),
+            wants(self.channel_counters.len()),
+            wants(self.store_counters.len()),
+            wants(self.lookup_counters.len()),
+        );
+        if due && (msg || channel || store || lookup) {
+            self.trimmed_at = Some(now);
+        }
+        if msg {
             self.msg_counters.retain(|_, c| {
                 c.last_activity()
                     .map(|s| now.saturating_duration_since(s) < MSG_WINDOW * 4)
                     .unwrap_or(false)
             });
         }
-        if self.store_counters.len() > MAX_IP_ENTRIES / 2 {
+        if channel {
+            self.channel_counters.retain(|_, c| {
+                c.last_activity()
+                    .map(|s| now.saturating_duration_since(s) < MSG_WINDOW * 4)
+                    .unwrap_or(false)
+            });
+        }
+        if store {
             self.store_counters.retain(|_, c| {
                 c.last_activity()
                     .map(|s| now.saturating_duration_since(s) < STORE_WINDOW * 2)
                     .unwrap_or(false)
             });
         }
-        if self.lookup_counters.len() > MAX_IP_ENTRIES / 2 {
+        if lookup {
             self.lookup_counters.retain(|_, c| {
                 c.last_activity()
                     .map(|s| now.saturating_duration_since(s) < LOOKUP_WINDOW * 2)
@@ -467,6 +623,20 @@ mod tests {
     use std::net::Ipv4Addr;
 
     #[test]
+    fn a_transfer_window_fits_the_channel_budget_without_spending_the_dht_one() {
+        let mut p = DhtProtection::new();
+        let addr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let now = Instant::now();
+        for _ in 0..super::super::super::channel::XFER_WINDOW_BLOCKS {
+            assert!(p.allow_channel_frame_at(addr, now));
+        }
+        for _ in 0..MAX_MSGS_PER_WINDOW {
+            assert!(p.allow_frame_at(addr, now));
+        }
+        assert!(!p.allow_frame_at(addr, now));
+    }
+
+    #[test]
     fn rate_limits_messages_per_ip() {
         let mut p = DhtProtection::new();
         let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
@@ -475,6 +645,40 @@ mod tests {
         }
         assert!(!p.allow_message(ip, MSG_PING, None, 1));
         assert_eq!(p.dropped_rate_limited(), 1);
+    }
+
+    /// The gate runs before the signature check, so the charge has to be
+    /// reversible. A frame that never authenticated cost one Ed25519
+    /// verification — which `allow_frame` rations — not the two-per-record the
+    /// store budget is denominated in, and leaving it charged let junk spend a
+    /// publisher's whole minute. Worst where the cost is shared: a verified
+    /// peer's charge also lands on its address ceiling, so one instance behind a
+    /// NAT was refusing its neighbours' real publishes.
+    #[test]
+    fn a_store_that_never_authenticated_costs_nothing() {
+        let mut p = DhtProtection::new();
+        p.set_max_stores_for_test(5);
+        let ip = IpAddr::V4(Ipv4Addr::new(7, 7, 7, 7));
+        let sender = Some([3u8; 16]);
+
+        // Far more than either window would admit — the node budget is 5 and the
+        // address ceiling 5 * MAX_STORE_IDENTITIES_PER_ADDR — all of it on frames
+        // that then fail to verify.
+        for _ in 0..40 {
+            assert!(
+                p.allow_typed(ip, MSG_STORE_BATCH, sender, 5),
+                "a refunded charge must not accumulate"
+            );
+            p.refund_store(ip, MSG_STORE_BATCH, sender, 5);
+        }
+
+        assert!(
+            p.allow_typed(ip, MSG_STORE_BATCH, sender, 5),
+            "the allowance has to survive for the peer's genuine publishes"
+        );
+        // And it is a refund, not an exemption: the charge that stuck is still
+        // charged, so the budget past it still refuses.
+        assert!(!p.allow_typed(ip, MSG_STORE_BATCH, sender, 5));
     }
 
     #[test]
@@ -556,6 +760,28 @@ mod tests {
         // A cheap frame is not charged to it at all.
         assert!(p.allow_message(quiet, MSG_PING, None, 1));
         assert_eq!(p.lookup_counters.len(), 2);
+    }
+
+    /// `ANNOUNCE_PEER` is answered with the same signed contact list as
+    /// `FIND_NODE`, and every contact it carries is offered to the routing
+    /// table, so it cannot be the one lookup that escapes the lookup budget.
+    #[test]
+    fn announce_peer_draws_on_the_lookup_budget() {
+        let mut p = DhtProtection::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
+        let now = Instant::now();
+        let counter = p.lookup_counters.entry(StoreBudgetKey::Addr(ip)).or_default();
+        for _ in 0..MAX_LOOKUPS_PER_WINDOW {
+            assert!(counter.allow(now, LOOKUP_WINDOW, MAX_LOOKUPS_PER_WINDOW));
+        }
+        assert!(
+            !p.allow_typed(ip, MSG_ANNOUNCE_PEER, None, 1),
+            "a spent lookup budget must refuse ANNOUNCE_PEER too"
+        );
+        assert!(
+            p.allow_typed(ip, MSG_PING, None, 1),
+            "while frames that cost nothing to answer still pass"
+        );
     }
 
     /// Two instances behind one NAT must not eat each other's STORE budget.
@@ -752,5 +978,118 @@ mod tests {
         // A full window of silence resets cleanly.
         let t2 = t1 + window * 2;
         assert!(c.allow(t2, window, limit));
+    }
+
+    /// The idle-entry sweep runs on an interval rather than on every frame once
+    /// a map is past half full. Every admission decision and every counter has
+    /// to come out exactly as a sweep on every frame would leave them — in
+    /// particular the capacity refusals, which are the only place the entries
+    /// the interval leaves behind could show.
+    #[test]
+    fn sweeping_on_an_interval_decides_exactly_as_sweeping_every_frame() {
+        let mut every_frame = DhtProtection::new();
+        every_frame.trim_interval = Duration::ZERO;
+        let mut interval = DhtProtection::new();
+
+        let ip = |n: u32| IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + n));
+        let t0 = Instant::now();
+        // Idle in every map from the first frame on.
+        let idle_since = t0;
+        let mut now = t0 + STORE_WINDOW * 3;
+        let counter = |start: Instant| WindowCounter {
+            count: 3,
+            previous: 2,
+            window_start: Some(start),
+        };
+        let fill = |p: &mut DhtProtection, first: u32, n: u32, start: Instant| {
+            for i in first..first + n {
+                p.msg_counters.insert(ip(i), counter(start));
+                p.store_counters
+                    .insert(StoreBudgetKey::Addr(ip(i)), counter(start));
+                p.lookup_counters
+                    .insert(StoreBudgetKey::Addr(ip(i)), counter(start));
+            }
+        };
+        // Busy addresses just short of the cap under a layer of idle ones that
+        // leaves each map short of sweeping on every frame, so new addresses
+        // soon hit the capacity refusals.
+        const BUSY: u32 = MAX_IP_ENTRIES as u32 - 30;
+        for p in [&mut every_frame, &mut interval] {
+            fill(p, 0, BUSY, now);
+            fill(p, BUSY, 20, idle_since);
+        }
+
+        let mut seed = 0xA076_1D64_78BD_642Fu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let types = [MSG_PING, MSG_STORE_RECORD, MSG_STORE_BATCH, MSG_FIND_NODE, MSG_FIND_VALUE];
+        let mut skipped_a_sweep = false;
+        for frame in 0..3_000u32 {
+            now += Duration::from_millis(30);
+            match frame {
+                // Idle entries enough to pass half the cap: only the interval
+                // sweeps them.
+                1_000 => {
+                    for p in [&mut every_frame, &mut interval] {
+                        fill(p, 20_000, 6_000, idle_since);
+                    }
+                }
+                // And the cap again, from a fresh set of busy addresses.
+                2_000 => {
+                    for p in [&mut every_frame, &mut interval] {
+                        fill(p, 40_000, BUSY, now);
+                        fill(p, 40_000 + BUSY, 20, idle_since);
+                    }
+                }
+                _ => {}
+            }
+            let r = next();
+            let busy_base = if frame < 2_000 { 0 } else { 40_000 };
+            let from = if r.is_multiple_of(3) {
+                ip(busy_base + (r >> 8) as u32 % BUSY)
+            } else {
+                ip(60_000 + (r >> 8) as u32 % 300)
+            };
+            let msg_type = types[(r >> 40) as usize % types.len()];
+            let sender = match (r >> 48) % 4 {
+                0 => None,
+                n => Some([n as u8 ^ (r >> 56) as u8; 16]),
+            };
+            let records = 1 + (r >> 20) as u32 % 4;
+
+            let a = every_frame.allow_frame_at(from, now)
+                && every_frame.allow_typed_at(from, msg_type, sender, records, now);
+            let b = interval.allow_frame_at(from, now)
+                && interval.allow_typed_at(from, msg_type, sender, records, now);
+            assert_eq!(a, b, "frame {frame}");
+            assert_eq!(
+                every_frame.dropped_rate_limited(),
+                interval.dropped_rate_limited(),
+                "frame {frame}"
+            );
+            assert_eq!(
+                every_frame.dropped_store_addr_ceiling(),
+                interval.dropped_store_addr_ceiling(),
+                "frame {frame}"
+            );
+            skipped_a_sweep |= interval.msg_counters.len() > every_frame.msg_counters.len();
+            // What the interval leaves behind never takes a map past the cap.
+            for (held, swept) in [
+                (interval.msg_counters.len(), every_frame.msg_counters.len()),
+                (interval.store_counters.len(), every_frame.store_counters.len()),
+                (interval.lookup_counters.len(), every_frame.lookup_counters.len()),
+            ] {
+                assert!(held <= swept.max(MAX_IP_ENTRIES), "frame {frame}: {held} vs {swept}");
+            }
+        }
+        assert!(skipped_a_sweep, "the interval has to have left idle entries in place");
+        assert!(
+            every_frame.dropped_rate_limited() > 0,
+            "the maps have to reach their cap for the comparison to mean anything"
+        );
     }
 }

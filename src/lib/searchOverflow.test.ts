@@ -9,7 +9,7 @@ import type { SearchResult } from '$lib/types';
  * smaller, so every Ember row sorted below every ordinary one and a tab that
  * overflowed lost them all — the only rows no other network could have found.
  */
-function row(hash: string, availability: number, origin: string): SearchResult {
+function row(hash: string, availability: number, origin: string, isSpam = false): SearchResult {
   return {
     file: {
       id: hash,
@@ -41,8 +41,8 @@ function row(hash: string, availability: number, origin: string): SearchResult {
     availability,
     file_type: 'Pro',
     source_addresses: [],
-    spam_rating: 0,
-    is_spam: false,
+    spam_rating: isSpam ? 80 : 0,
+    is_spam: isSpam,
     clean_name: '',
     result_origin: origin,
   } as unknown as SearchResult;
@@ -80,6 +80,60 @@ describe('shedWeakestRows', () => {
     const rows = [row('a', 1, 'KAD'), row('b', 2, 'Ember')];
     shedWeakestRows(rows, 10);
     expect(rows.map((r) => r.file.hash)).toEqual(['a', 'b']);
+  });
+
+  it('sheds spam before any unflagged row, whatever the spam claims', () => {
+    // The inflated count is the polluter's own claim, and "Hide spam" means
+    // the rows it would have evicted are the only ones on screen.
+    const rows = [
+      row('spam-loud', 900, 'KAD', true),
+      row('spam-louder', 800, 'KAD', true),
+      row('honest-quiet', 1, 'KAD'),
+      row('honest-silent', 0, 'KAD'),
+    ];
+
+    shedWeakestRows(rows, 2);
+
+    expect(rows.map((r) => r.file.hash).sort()).toEqual(['honest-quiet', 'honest-silent']);
+  });
+
+  it('still ranks spam against spam by availability once only spam is left', () => {
+    const rows = [
+      row('spam-weak', 2, 'KAD', true),
+      row('spam-strong', 40, 'KAD', true),
+      row('honest', 5, 'KAD'),
+    ];
+
+    shedWeakestRows(rows, 2);
+
+    expect(rows.map((r) => r.file.hash)).toEqual(['honest', 'spam-strong']);
+  });
+
+  it('sheds a flagged row near the top of its class before a clean row lower in another', () => {
+    // Ranked only by position within each class, the Ember spam row sat at
+    // position 5 and beat every clean KAD row from position 6 down.
+    const rows = [
+      ...Array.from({ length: 5 }, (_, i) => row(`ember${i}`, 10 - i, 'Ember')),
+      row('ember-spam', 1, 'Ember', true),
+      ...Array.from({ length: 12 }, (_, i) => row(`kad${i}`, 100 - i, 'KAD')),
+    ];
+
+    shedWeakestRows(rows, 17);
+
+    expect(rows).toHaveLength(17);
+    expect(rows.some((r) => r.is_spam)).toBe(false);
+  });
+
+  it('interleaves flagged rows across classes once only spam is left to keep', () => {
+    const rows = [
+      row('honest', 5, 'KAD'),
+      ...Array.from({ length: 3 }, (_, i) => row(`kad-spam${i}`, 50 - i, 'KAD', true)),
+      ...Array.from({ length: 3 }, (_, i) => row(`ember-spam${i}`, 3 - i, 'Ember', true)),
+    ];
+
+    shedWeakestRows(rows, 3);
+
+    expect(rows.map((r) => r.file.hash)).toEqual(['honest', 'kad-spam0', 'ember-spam0']);
   });
 
   it('treats a mixed origin as Ember, since the publisher count is in the number', () => {

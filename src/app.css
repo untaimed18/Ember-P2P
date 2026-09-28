@@ -63,14 +63,46 @@
   --ed2k-color: #9b59b6;
   --ember-color: #c2185b;
   --aich-color: #27ae60;
+  /* File-type tiles (FileTypeIcon), one hue per Library type category. */
+  --type-audio: #7c4ddb;
+  --type-video: #d9486f;
+  --type-image: #129393;
+  --type-archive: var(--warning);
+  --type-document: var(--accent);
+  --type-disc: #5f6e84;
   --priority-verylow: #888888;
   --priority-low: #5599bb;
   --priority-auto: #7cb342;
   --stat-ratio: #9c27b0;
   --ember-dht-color: #00838f;
+  /* Room reaction chips: a star and a heart, and the glossy highlight across
+     a chip that has been reacted to. */
+  --reaction-gold: #ffd34a;
+  --reaction-heart: #ff4f5c;
+  --reaction-gloss: #ffffff;
 
   --border: #dadce0;
   --border-light: #c4c9d4;
+
+  /* Data tables. Every table's rows sit on the page canvas, so one stripe,
+     one selection and one header read the same whatever a table's density.
+     Derived from the theme colours, so they follow the theme on their own. */
+  --table-head-bg: var(--bg-secondary);
+  --table-row-alt: color-mix(in srgb, var(--bg-secondary) 60%, var(--bg-primary));
+  --table-row-selected: var(--accent-fill);
+  --table-row-divider: color-mix(in srgb, var(--border) 40%, transparent);
+
+  /* Avatars: people are circles and rooms rounded squares, at one of two
+     sizes, a primary list row (friends, rooms) or a compact one (members). */
+  --avatar-size: 32px;
+  --avatar-size-compact: 28px;
+
+  /* Page padding by kind of page. Dashboards (Ember, Statistics) are cards
+     with room to breathe; workspaces (Servers, KAD) are split panes that want
+     every pixel; table pages (Transfers, Library, Search, Security) run
+     edge to edge and have none. */
+  --page-padding: 24px;
+  --workspace-padding: 12px;
 
   --sidebar-width: 220px;
   --statusbar-height: 32px;
@@ -90,6 +122,19 @@
   --radius-md: 8px;
   --radius-lg: 12px;
   --radius-pill: 999px;
+
+  /* Type scale. Dense chrome (tables, badges, meta) sits at 10–12, body copy
+     at 13–14, titles from 16 up. A size between two steps is a bug, not a
+     choice; relative `em` sizes are for text that scales with its parent. */
+  --font-size-2xs: 10px;
+  --font-size-xs: 11px;
+  --font-size-sm: 12px;
+  --font-size-md: 13px;
+  --font-size-base: 14px;
+  --font-size-lg: 16px;
+  --font-size-xl: 18px;
+  --font-size-2xl: 20px;
+  --font-size-3xl: 24px;
 
   --font-mono: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable', 'Segoe UI', Roboto, sans-serif;
@@ -124,7 +169,7 @@
   --preview-dark-accent-dim: #1e3a5c;
 
   font-family: var(--font-sans);
-  font-size: 14px;
+  font-size: var(--font-size-base);
   line-height: 1.5;
   color: var(--text-primary);
   background-color: var(--bg-primary);
@@ -198,11 +243,22 @@
   --ed2k-color: #c08cd9;
   --ember-color: #ea87ac;
   --aich-color: #5ecb87;
+  --type-audio: #a98bf0;
+  --type-video: #ef8aa6;
+  --type-image: #4cc4c4;
+  --type-archive: var(--warning);
+  --type-document: var(--accent);
+  --type-disc: #93a1b5;
   --priority-verylow: #9a9fa8;
   --priority-low: #7fb6d9;
   --priority-auto: #9ccc65;
   --stat-ratio: #c792d9;
   --ember-dht-color: #4db6ac;
+  /* Softer on the dark canvas, where the light theme's gold and full-white
+     gloss glare. */
+  --reaction-gold: #e7c35c;
+  --reaction-heart: #ec6b76;
+  --reaction-gloss: rgba(255, 255, 255, 0.4);
 
   /* Borders are barely there — 4–5% lighter than the bg they sit against. */
   --border: #2a3038;
@@ -297,7 +353,7 @@
   background: var(--border);
   border: 2px solid transparent;
   background-clip: padding-box;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
 }
 [data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
   background: var(--border-light);
@@ -461,7 +517,7 @@ input, select, textarea {
   border-radius: var(--radius-sm);
   padding: 6px 10px;
   outline: none;
-  transition: border-color 0.15s;
+  transition: border-color var(--transition-normal);
 }
 
 select {
@@ -533,7 +589,7 @@ select:-webkit-autofill {
 table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 13px;
+  font-size: var(--font-size-md);
   font-variant-numeric: tabular-nums;
 }
 
@@ -598,11 +654,64 @@ tr:hover td {
   gap: 4px;
   padding: 2px 9px;
   border-radius: var(--radius-pill);
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.3px;
   border: 1px solid transparent;
+  white-space: nowrap;
+}
+/* Beside a file name or in a table row, where the full badge crowds the text. */
+.badge.sm {
+  padding: 1px 6px;
+  font-size: var(--font-size-2xs);
+  letter-spacing: 0.2px;
+}
+
+/*
+ * On a file someone is sending you that can run code: a program, script or
+ * shortcut, or one named to pass for a document (`report.pdf.exe`). Friend
+ * chat cards and the room transfer drawer both carry it.
+ */
+.file-risk {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  color: var(--badge-warning-text);
+  font-size: var(--font-size-xs);
+  line-height: 1.4;
+}
+.file-risk svg {
+  flex-shrink: 0;
+  width: 13px;
+  height: 13px;
+  margin-top: 1px;
+}
+
+/*
+ * Unread count beside a conversation: the room list, the chat dock's switcher
+ * and a friend's Chat button, so waiting messages look the same wherever they
+ * are counted. Capped at 99+ by the caller.
+ */
+.count-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
 }
 
 /*
@@ -649,7 +758,7 @@ tr:hover td {
   align-items: center;
   justify-content: center;
   min-width: 10px;
-  font-size: 10px;
+  font-size: var(--font-size-2xs);
   font-weight: 700;
   line-height: 1;
   flex-shrink: 0;
@@ -657,35 +766,42 @@ tr:hover td {
   letter-spacing: 0;
 }
 
+/* Named states, plus `tone-*` for a state with no name here. A page that
+   needs a status chip picks a tone rather than drawing its own. */
 .badge.connected,
 .badge.completed,
-.badge.highid {
+.badge.highid,
+.badge.tone-success {
   background: color-mix(in srgb, var(--success) 15%, transparent);
   border-color: color-mix(in srgb, var(--success) 30%, transparent);
   color: var(--badge-success-text);
 }
 .badge.connecting,
 .badge.paused,
-.badge.upload {
+.badge.upload,
+.badge.tone-warning {
   background: color-mix(in srgb, var(--warning) 15%, transparent);
   border-color: color-mix(in srgb, var(--warning) 30%, transparent);
   color: var(--badge-warning-text);
 }
 .badge.disconnected,
 .badge.failed,
-.badge.lowid {
+.badge.lowid,
+.badge.tone-danger {
   background: color-mix(in srgb, var(--danger) 15%, transparent);
   border-color: color-mix(in srgb, var(--danger) 30%, transparent);
   color: var(--badge-danger-text);
 }
 .badge.active,
-.badge.download {
+.badge.download,
+.badge.tone-accent {
   background: color-mix(in srgb, var(--accent) 15%, transparent);
   border-color: color-mix(in srgb, var(--accent) 30%, transparent);
   color: var(--badge-accent-text);
 }
 .badge.queued,
-.badge.searching {
+.badge.searching,
+.badge.tone-muted {
   background: color-mix(in srgb, var(--text-muted) 18%, transparent);
   border-color: color-mix(in srgb, var(--text-muted) 32%, transparent);
   color: var(--text-secondary);
@@ -699,33 +815,38 @@ tr:hover td {
  */
 :where([data-theme="dark"]) .badge.connected,
 :where([data-theme="dark"]) .badge.completed,
-:where([data-theme="dark"]) .badge.highid {
+:where([data-theme="dark"]) .badge.highid,
+:where([data-theme="dark"]) .badge.tone-success {
   background: color-mix(in srgb, var(--success) 18%, transparent);
   border-color: color-mix(in srgb, var(--success) 32%, transparent);
   color: var(--badge-success-text);
 }
 :where([data-theme="dark"]) .badge.connecting,
 :where([data-theme="dark"]) .badge.paused,
-:where([data-theme="dark"]) .badge.upload {
+:where([data-theme="dark"]) .badge.upload,
+:where([data-theme="dark"]) .badge.tone-warning {
   background: color-mix(in srgb, var(--warning) 18%, transparent);
   border-color: color-mix(in srgb, var(--warning) 32%, transparent);
   color: var(--badge-warning-text);
 }
 :where([data-theme="dark"]) .badge.disconnected,
 :where([data-theme="dark"]) .badge.failed,
-:where([data-theme="dark"]) .badge.lowid {
+:where([data-theme="dark"]) .badge.lowid,
+:where([data-theme="dark"]) .badge.tone-danger {
   background: color-mix(in srgb, var(--danger) 18%, transparent);
   border-color: color-mix(in srgb, var(--danger) 32%, transparent);
   color: var(--badge-danger-text);
 }
 :where([data-theme="dark"]) .badge.active,
-:where([data-theme="dark"]) .badge.download {
+:where([data-theme="dark"]) .badge.download,
+:where([data-theme="dark"]) .badge.tone-accent {
   background: color-mix(in srgb, var(--accent) 18%, transparent);
   border-color: color-mix(in srgb, var(--accent) 32%, transparent);
   color: var(--badge-accent-text);
 }
 :where([data-theme="dark"]) .badge.queued,
-:where([data-theme="dark"]) .badge.searching {
+:where([data-theme="dark"]) .badge.searching,
+:where([data-theme="dark"]) .badge.tone-muted {
   background: color-mix(in srgb, var(--text-muted) 22%, transparent);
   border-color: color-mix(in srgb, var(--text-muted) 38%, transparent);
   color: var(--text-secondary);
@@ -740,6 +861,11 @@ tr:hover td {
   color: var(--text-muted);
   text-align: center;
   gap: 12px;
+}
+
+/* Inside a table, a side pane or anywhere the full 60px would crowd it. */
+.empty-state.compact {
+  padding: 40px 16px;
 }
 
 .empty-state .icon {
@@ -762,14 +888,14 @@ tr:hover td {
  */
 .empty-state .empty-title {
   margin: 0 0 6px;
-  font-size: 15px;
+  font-size: var(--font-size-lg);
   font-weight: 600;
   color: var(--text-secondary);
 }
 
 .empty-state .empty-sub {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   color: var(--text-muted);
   line-height: 1.5;
 }
@@ -785,7 +911,7 @@ tr:hover td {
 .empty-state .empty-action {
   margin-top: 16px;
   padding: 7px 20px;
-  font-size: 12px;
+  font-size: var(--font-size-sm);
 }
 
 /* An action inside `.empty-actions` is already spaced by the row's margin. */
@@ -795,19 +921,36 @@ tr:hover td {
 
 /*
  * Strip banners under page headers. Tinted fill + soft edge, matching
- * the badge/toast recipe, so errors don't read as a hard red rule.
+ * the badge/toast recipe, so errors don't read as a hard red rule. The layout
+ * is shared too: a page that restates the padding is how Transfers, Search
+ * and Library came to disagree about it.
  */
+:is(.error-banner, .search-error-banner, .success-banner, .info-banner, .warning-banner) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
+  padding: 8px 20px;
+  font-size: var(--font-size-md);
+}
 .error-banner,
 .search-error-banner {
   background: color-mix(in srgb, var(--danger) 9%, var(--bg-secondary));
   border-bottom: 1px solid color-mix(in srgb, var(--danger) 36%, var(--border));
   color: var(--badge-danger-text);
 }
-.info-banner,
 .success-banner {
   background: color-mix(in srgb, var(--success) 9%, var(--bg-secondary));
   border-bottom: 1px solid color-mix(in srgb, var(--success) 36%, var(--border));
   color: var(--badge-success-text);
+}
+/* Neutral news ("nothing to pause", "3 paused"): accent, so it neither claims
+   success nor raises an alarm. */
+.info-banner {
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-secondary));
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+  color: var(--badge-accent-text);
 }
 /* For a state that is the user's own choice rather than a fault: the app is
    working as asked, but the consequence is worth saying out loud. Danger red
@@ -836,9 +979,18 @@ tr:hover td {
 }
 
 .page-header h2 {
-  font-size: 18px;
+  font-size: var(--font-size-xl);
   font-weight: 600;
   color: var(--text-primary);
+}
+
+/* One line under the title saying what the page is for. */
+.page-header .page-subtitle {
+  margin: 4px 0 0;
+  font-size: var(--font-size-md);
+  line-height: 1.5;
+  color: var(--text-muted);
+  max-width: 70ch;
 }
 
 .page-content {
@@ -889,40 +1041,102 @@ tr:hover td {
   --scroll-shadow: rgba(0, 0, 0, 0.34);
 }
 
+/*
+ * Overview tile: the frame every page's headline numbers sit in (Servers,
+ * Ember, Statistics). Pages arrange what is inside it — centred, with an
+ * icon — but not the frame or the size of the number.
+ */
 .stat-card {
-  background: var(--bg-surface);
+  min-width: 0;
+  background: var(--bg-secondary);
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 16px;
+  border-radius: var(--radius-lg);
+  padding: 14px 16px;
   box-shadow: var(--shadow-sm);
 }
 
 .stat-card .label {
-  font-size: 12px;
+  font-size: var(--font-size-xs);
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
 
 .stat-card .value {
-  font-size: 24px;
+  font-size: var(--font-size-2xl);
   font-weight: 700;
+  line-height: 1.15;
   color: var(--text-primary);
   margin-top: 4px;
   font-variant-numeric: tabular-nums;
 }
 
 .stat-card .sub {
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   color: var(--text-secondary);
   margin-top: 2px;
 }
 
+/*
+ * Network status tiles: a small uppercase label over its value, laid out in
+ * groups divided by a hairline. Shared by `NetworkStatusTiles` and the KAD
+ * panel that sits beside it, which has to read as one block. The parent sets
+ * `container-type: inline-size` so the groups can collapse with it.
+ */
+.stat-group {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+}
+.stat-group-grid {
+  grid-template-columns: repeat(4, 1fr);
+  gap: 2px 8px;
+}
+@container (max-width: 330px) {
+  .stat-group-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@container (max-width: 220px) {
+  .stat-group,
+  .stat-group-grid { grid-template-columns: 1fr; }
+}
+.stat-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 0;
+  min-width: 0;
+}
+.stat-tile .stat-label {
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: var(--font-size-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stat-tile .stat-value {
+  color: var(--text-primary);
+  font-weight: 600;
+  font-size: var(--font-size-md);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Badges sit at their natural width rather than stretching across the tile. */
+.stat-tile .badge {
+  align-self: flex-start;
+}
+
 /* Heading scale */
-h1 { font-size: 24px; font-weight: 700; color: var(--text-primary); }
-h2 { font-size: 18px; font-weight: 600; color: var(--text-primary); }
-h3 { font-size: 16px; font-weight: 600; color: var(--text-primary); }
-h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
+h1 { font-size: var(--font-size-3xl); font-weight: 700; color: var(--text-primary); }
+h2 { font-size: var(--font-size-xl); font-weight: 600; color: var(--text-primary); }
+h3 { font-size: var(--font-size-lg); font-weight: 600; color: var(--text-primary); }
+h4 { font-size: var(--font-size-base); font-weight: 600; color: var(--text-primary); }
 
 /* Screen reader only utility */
 .sr-only {
@@ -950,6 +1164,14 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
 }
 .spinner.lg { width: 32px; height: 32px; border-width: 3px; }
 .spinner.sm { width: 14px; height: 14px; border-width: 2px; }
+/* Inline with a line of small text, a table cell or a badge. */
+.spinner.xs { width: 11px; height: 11px; border-width: 2px; vertical-align: -1px; flex-shrink: 0; }
+/* Inside a button or a tinted badge: takes the text colour, which the accent
+   would vanish into on a primary button. */
+.spinner.current {
+  border-color: color-mix(in srgb, currentColor 30%, transparent);
+  border-top-color: currentColor;
+}
 
 /* Skeleton shimmer utility */
 @keyframes shimmer {
@@ -991,7 +1213,7 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
   box-shadow:
     inset 0 1px 0 var(--surface-highlight),
     var(--ctx-shadow);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   color: var(--text-primary);
 }
 
@@ -1029,7 +1251,7 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
   padding: 4px 9px 7px;
   margin-bottom: 4px;
   border-bottom: 1px solid var(--ctx-divider);
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   font-weight: 600;
   color: var(--text-secondary);
 }
@@ -1044,7 +1266,7 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
 
 .ctx-label {
   padding: 5px 9px 4px;
-  font-size: 10px;
+  font-size: var(--font-size-2xs);
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -1068,7 +1290,7 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
   background: none;
   color: inherit;
   font: inherit;
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   line-height: 1.35;
   text-align: left;
   white-space: nowrap;
@@ -1115,7 +1337,7 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
   left: 9px;
   top: 50%;
   transform: translateY(-50%);
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   font-weight: 700;
   line-height: 1;
   color: var(--accent);
@@ -1130,7 +1352,7 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
   margin-left: auto;
   padding-left: 14px;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   font-weight: 400;
 }
 
@@ -1231,6 +1453,85 @@ button.ctx-backdrop:active {
   -webkit-backdrop-filter: blur(10px) saturate(1.1);
 }
 
+/*
+ * Toolbar button for pane toolbars and selection bars above or below a table:
+ * quieter than `button.secondary`, one height everywhere so the Transfers
+ * panes and the Library selection bar read as the same control.
+ */
+.tb-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 24px;
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast) ease,
+    border-color var(--transition-fast) ease,
+    color var(--transition-fast) ease;
+}
+.tb-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border-light);
+  color: var(--text-primary);
+}
+.tb-btn:disabled {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.tb-btn.tb-danger {
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  color: var(--danger);
+}
+.tb-btn.tb-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/*
+ * Header close for dialogs, drawers and detail panels: a quiet 28px square
+ * that turns danger-tinted on hover. The icon inside is the caller's. Element-
+ * qualified so it outranks the generic and dark-theme `button` rules.
+ */
+button.icon-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-secondary);
+  font-weight: 500;
+  line-height: 1;
+  transition:
+    background var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
+}
+button.icon-close:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+button.icon-close:active:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 20%, transparent);
+}
+
 /* Confirm dialog overlay */
 .confirm-overlay {
   position: fixed;
@@ -1262,14 +1563,20 @@ button.ctx-backdrop:active {
  */
 [data-theme="dark"] :is(.confirm-overlay, .about-overlay, .share-overlay, .dnd-overlay) {
   background: var(--overlay-bg);
-  backdrop-filter: blur(6px) saturate(1.15);
-  -webkit-backdrop-filter: blur(6px) saturate(1.15);
 }
-[data-theme="dark"] .policy-reset-backdrop {
-  backdrop-filter: blur(6px) saturate(1.15);
-  -webkit-backdrop-filter: blur(6px) saturate(1.15);
-}
-[data-theme="dark"] :is(.modal-overlay) {
+/* Every modal backdrop in the app, so a new dialog frosts by joining this
+   list rather than restating the filter. Light mode stays unblurred. */
+[data-theme="dark"] :is(
+  .confirm-overlay,
+  .about-overlay,
+  .share-overlay,
+  .dnd-overlay,
+  .modal-overlay,
+  .close-overlay,
+  .shortcut-overlay,
+  .browse-overlay,
+  .policy-reset-backdrop
+) {
   backdrop-filter: blur(6px) saturate(1.15);
   -webkit-backdrop-filter: blur(6px) saturate(1.15);
 }
@@ -1285,12 +1592,12 @@ button.ctx-backdrop:active {
 }
 .confirm-dialog h3 {
   margin-bottom: 10px;
-  font-size: 16px;
+  font-size: var(--font-size-lg);
   font-weight: 600;
 }
 .confirm-dialog p {
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: var(--font-size-md);
   margin-bottom: 20px;
   line-height: 1.5;
   overflow-wrap: anywhere;
@@ -1303,14 +1610,9 @@ button.ctx-backdrop:active {
 .confirm-dialog .dialog-actions {
   display: flex;
   justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 8px;
 }
-@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
-@keyframes dialog-in {
-  from { opacity: 0; transform: scale(0.96); }
-  to   { opacity: 1; transform: scale(1); }
-}
-
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;

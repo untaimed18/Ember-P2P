@@ -238,10 +238,64 @@ fn resolve_player(configured: &str) -> Option<PathBuf> {
         return None;
     }
     let path = PathBuf::from(configured);
-    // Deliberately only "is it still a file". The path's authority came from
-    // the native picker at the moment it was set (see
-    // `pick_preview_player`), not from anything checkable here.
-    path.is_file().then_some(path)
+    // The path's authority came from the native picker at the moment it was
+    // set (see `pick_preview_player`), but config.json can also arrive from a
+    // restored backup.
+    player_is_usable(&path).then_some(path)
+}
+
+/// Whether Preview would start `path`: a regular file on a local drive whose
+/// real location, after links, is local too. The one check both the picker
+/// and the launch use, so a player the picker accepts is never then ignored.
+pub(crate) fn player_is_usable(path: &Path) -> bool {
+    // Before anything touches the path: merely opening a UNC path makes
+    // Windows authenticate to that host.
+    if !player_path_is_local(path) || !path.is_file() {
+        return false;
+    }
+    // A local path can still be a link onto a share.
+    std::fs::canonicalize(path).is_ok_and(|real| player_path_is_local(&real))
+}
+
+/// Whether `path` names a program on a local drive: absolute, and on Windows
+/// a drive-letter path whose drive is not a network mapping. UNC, device and
+/// relative paths are refused.
+///
+/// Does not touch `path` itself, so it is safe to ask about a path that has
+/// not been vetted yet. A drive that is merely absent passes; the caller's
+/// own file check handles that.
+pub(crate) fn player_path_is_local(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let letter = match path.components().next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        if !path.is_absolute() || !letter.is_ascii_alphabetic() {
+            return false;
+        }
+        drive_is_not_remote(letter)
+    }
+    #[cfg(not(windows))]
+    {
+        path.is_absolute()
+    }
+}
+
+#[cfg(windows)]
+fn drive_is_not_remote(letter: u8) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    const DRIVE_REMOTE: u32 = 4;
+    let root: Vec<u16> = format!("{}:\\", letter as char)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `root` is a NUL-terminated UTF-16 string that outlives the call.
+    unsafe { GetDriveTypeW(root.as_ptr()) != DRIVE_REMOTE }
 }
 
 /// Launch the user's media player for the file, or the system default.
@@ -276,7 +330,8 @@ pub fn launch_preview(file_path: &Path, configured_player: &str) -> anyhow::Resu
         None => {
             if !configured_player.is_empty() {
                 tracing::warn!(
-                    "The configured media player is no longer there; using the default handler"
+                    "The configured media player is no longer there or is not on a local drive; \
+                     using the default handler"
                 );
             }
             crate::security::filesystem::open_with_default_app(file_path)?;
@@ -352,6 +407,29 @@ mod tests {
             "a configured player that is still there is used"
         );
         let _ = std::fs::remove_file(&player);
+    }
+
+    /// config.json can come from a restored backup, so the player path cannot
+    /// be trusted to be one the picker produced.
+    #[test]
+    fn a_player_that_is_not_on_a_local_drive_is_refused() {
+        assert!(!player_path_is_local(Path::new("relative\\player.exe")));
+        assert!(!player_path_is_local(Path::new("relative/player")));
+        #[cfg(windows)]
+        {
+            for remote in [
+                r"\\attacker\share\p.exe",
+                r"\\?\UNC\attacker\share\p.exe",
+                r"\\.\pipe\p.exe",
+                r"\Windows\System32\cmd.exe",
+                "C:player.exe",
+            ] {
+                assert!(!player_path_is_local(Path::new(remote)), "{remote}");
+                assert_eq!(resolve_player(remote), None, "{remote}");
+            }
+            let local = std::env::temp_dir().join("player.exe");
+            assert!(player_path_is_local(&local));
+        }
     }
 
     #[test]

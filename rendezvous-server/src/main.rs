@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     future::Future,
     hash::Hash,
     io,
@@ -35,6 +35,18 @@ mod registry;
 
 const MAX_HTTP_CONNECTIONS: usize = 256;
 const RESERVED_HEALTH_CONNECTIONS: usize = 16;
+/// Ordinary connections one client network (see [`client_network`]) may hold
+/// at once: a tenth of the ordinary pool, so starving it takes at least ten
+/// distinct /24s or /64s. Every non-upgrade response closes its connection, so
+/// a household NAT full of well-behaved clients holds a slot only for the
+/// duration of each request and stays far below this.
+///
+/// The client is whatever [`extract_client_ip`] derives, so this (like every
+/// per-network limit) is only meaningful when `TRUST_PROXY`/`TRUSTED_PROXY_HOPS`
+/// match the deployment: behind an unconfigured reverse proxy, all traffic is
+/// one network. Loopback is exempt so a local reverse proxy is not capped as a
+/// single client, and `/health` is exempt so monitoring is never refused here.
+const MAX_HTTP_CONNECTIONS_PER_NETWORK: usize = 24;
 const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A body can make byte-level progress forever, so the idle timeout alone
@@ -45,6 +57,80 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn http_path_admitted(reserve_only: bool, path: &str) -> bool {
     !reserve_only || path == "/health"
+}
+
+/// Concurrent ordinary connections per client network. A slot is released
+/// when its [`NetworkConnectionSlot`] drops, which for an upgraded WebSocket
+/// is as soon as the upgrade completes — exactly like the admission permits.
+/// Relay sockets are bounded by [`MAX_RELAY_SESSIONS_PER_NETWORK`] instead.
+#[derive(Clone, Default)]
+struct NetworkConnectionLimiter {
+    counts: Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
+}
+
+struct NetworkConnectionSlot {
+    limiter: NetworkConnectionLimiter,
+    network: IpAddr,
+}
+
+impl NetworkConnectionLimiter {
+    fn try_acquire(&self, client_ip: IpAddr, limit: usize) -> Option<NetworkConnectionSlot> {
+        let network = client_network(client_ip);
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if counts.get(&network).copied().unwrap_or(0) >= limit {
+            return None;
+        }
+        *counts.entry(network).or_insert(0) += 1;
+        Some(NetworkConnectionSlot {
+            limiter: self.clone(),
+            network,
+        })
+    }
+}
+
+/// Charges a connection to the client network its first request names. This
+/// waits for headers even for direct peers: behind the trusted proxy the peer
+/// address is the proxy's, and charging at accept would refuse `/health`
+/// before its path is known.
+fn admit_client_network(
+    limiter: &NetworkConnectionLimiter,
+    slot: &std::sync::Mutex<Option<NetworkConnectionSlot>>,
+    path: &str,
+    client_ip: IpAddr,
+) -> bool {
+    if path == "/health" || canonical_ip(client_ip).is_loopback() {
+        return true;
+    }
+    let mut slot = slot.lock().unwrap_or_else(|poison| poison.into_inner());
+    if slot.is_some() {
+        return true;
+    }
+    match limiter.try_acquire(client_ip, MAX_HTTP_CONNECTIONS_PER_NETWORK) {
+        Some(acquired) => {
+            *slot = Some(acquired);
+            true
+        }
+        None => false,
+    }
+}
+
+impl Drop for NetworkConnectionSlot {
+    fn drop(&mut self) {
+        let mut counts = self
+            .limiter
+            .counts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(count) = counts.get_mut(&self.network) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.network);
+            }
+        }
+    }
 }
 
 struct IdleTimeoutStream {
@@ -168,6 +254,9 @@ const OP_CHANNEL_HANDOVER_V4: u8 = 0x2a;
 /// Channel-name claim that also commits to the published display string.
 /// See [`build_channel_name_display_v4_msg`].
 const OP_CHANNEL_NAME_DISPLAY_V4: u8 = 0x2b;
+/// Rename of a room's registry name. Its own opcode, so no claim signature —
+/// which an owner's client re-sends on a timer — can ever be read as one.
+const OP_CHANNEL_RENAME_V4: u8 = 0x2c;
 
 /// Canonical signed-IP encoding: `4 || ipv4` or `6 || ipv6`.
 const SIGNED_IP_V4: u8 = 4;
@@ -200,6 +289,25 @@ fn canonical_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Prefix lengths treated as one client for per-client caps: a /24 is the
+/// smallest IPv4 block routed on the internet, and a /64 is one IPv6 subnet,
+/// which a single host usually controls in its entirety. Keying on the exact
+/// address let one operator multiply every per-client cap by rotating
+/// addresses inside a block it already holds.
+const CLIENT_NETWORK_V4_PREFIX: u32 = 24;
+const CLIENT_NETWORK_V6_PREFIX: u32 = 64;
+
+fn client_network(ip: IpAddr) -> IpAddr {
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => IpAddr::V4(Ipv4Addr::from(
+            u32::from(v4) & (u32::MAX << (32 - CLIENT_NETWORK_V4_PREFIX)),
+        )),
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(
+            u128::from(v6) & (u128::MAX << (128 - CLIENT_NETWORK_V6_PREFIX)),
+        )),
+    }
+}
+
 fn parse_routable_ip(s: &str) -> Option<IpAddr> {
     let ip = canonical_ip(s.parse::<IpAddr>().ok()?);
     match ip {
@@ -213,20 +321,39 @@ fn parse_routable_ip(s: &str) -> Option<IpAddr> {
 /// in a signed request. 5 minutes covers normal NTP-skewed clients
 /// without giving an attacker a useful replay window.
 const MAX_TIMESTAMP_SKEW_SECS: i64 = 300;
-const REPLAY_CACHE_TTL: Duration = Duration::from_secs((MAX_TIMESTAMP_SKEW_SECS as u64) * 2);
-const MAX_REPLAY_CACHE_ENTRIES: usize = 100_000;
+/// Signing keys with live replay state. See [`ReplayGuard`].
+const MAX_REPLAY_KEYS: usize = 100_000;
+/// Scope marks across all keys.
+const MAX_REPLAY_MARKS: usize = 200_000;
+/// Scope marks one key may hold. Punch registration takes one per target, and
+/// the per-IP punch budget keeps an honest client well below this within one
+/// second, which is the burst that must never be squeezed.
+const MAX_REPLAY_MARKS_PER_KEY: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReplayCacheAdmission {
-    Remembered,
+enum ReplayAdmission {
+    Accepted,
+    /// Byte-identical repeat of the newest request in an idempotent scope.
+    Repeat,
     Replay,
+    /// Outside the freshness window as of the guard's clock.
+    Stale,
     Full,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayMode {
+    /// Every request in the scope is accepted at most once.
+    OneTime,
+    /// A scope whose request sets state: re-sending the newest request
+    /// re-applies the state it already set, so it is allowed; anything older
+    /// would roll that state back and is refused.
+    IdempotentRepeat,
 }
 
 /// Read-only ticket poll/status requests intentionally reuse a stable nonce
 /// and are safe to serve idempotently. Keep just one nonce per read scope,
-/// rather than one entry per periodic request, so normal polling cannot
-/// exhaust the mutation replay cache.
+/// rather than one entry per periodic request.
 #[derive(Clone, Copy)]
 struct IdempotentReadNonce {
     nonce: [u8; 16],
@@ -251,7 +378,10 @@ fn now_unix_secs() -> i64 {
 }
 
 fn timestamp_fresh(ts: i64) -> bool {
-    let now = now_unix_secs();
+    fresh_at(ts, now_unix_secs())
+}
+
+fn fresh_at(ts: i64, now: i64) -> bool {
     // `ts` is unauthenticated request data, and `(now - ts).abs()` overflows for
     // `ts == now - i64::MIN`: the subtraction wraps to `i64::MIN`, whose `abs`
     // wraps to itself, which compares `<=` and passes the gate. A security
@@ -469,6 +599,7 @@ fn build_capability_lookup_v4_msg(
     m
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_relay_mailbox_offer_msg(
     initiator_id: &[u8; 32],
     responder_id: &[u8; 32],
@@ -504,6 +635,7 @@ fn build_relay_mailbox_poll_msg(responder_id: &[u8; 32], nonce: &[u8; 16], ts: i
     m
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_punch_register_v3_msg(
     from_id: &[u8; 32],
     target_id: &[u8; 32],
@@ -528,6 +660,7 @@ fn build_punch_register_v3_msg(
     message
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_punch_register_v4_msg(
     from_id: &[u8; 32],
     target_id: &[u8; 32],
@@ -681,6 +814,32 @@ fn build_channel_name_display_v4_msg(
     message
 }
 
+/// Signed form of a rename: the same layout as
+/// [`build_channel_name_display_v4_msg`] under [`OP_CHANNEL_RENAME_V4`].
+fn build_channel_rename_v4_msg(
+    channel_id: &[u8; 16],
+    pubkey: &[u8; 32],
+    normalized: &str,
+    display: &str,
+    private: bool,
+    ts: i64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(
+        RDV_V4_DOMAIN.len() + 1 + 16 + 32 + 4 + normalized.len() + 4 + display.len() + 1 + 8,
+    );
+    message.extend_from_slice(RDV_V4_DOMAIN);
+    message.push(OP_CHANNEL_RENAME_V4);
+    message.extend_from_slice(channel_id);
+    message.extend_from_slice(pubkey);
+    message.extend_from_slice(&(normalized.len() as u32).to_le_bytes());
+    message.extend_from_slice(normalized.as_bytes());
+    message.extend_from_slice(&(display.len() as u32).to_le_bytes());
+    message.extend_from_slice(display.as_bytes());
+    message.push(u8::from(private));
+    message.extend_from_slice(&ts.to_le_bytes());
+    message
+}
+
 fn build_channel_delete_v4_msg(channel_id: &[u8; 16], pubkey: &[u8; 32], ts: i64) -> Vec<u8> {
     let mut message = Vec::with_capacity(RDV_V4_DOMAIN.len() + 1 + 16 + 32 + 8);
     message.extend_from_slice(RDV_V4_DOMAIN);
@@ -752,6 +911,10 @@ fn registry_error_status(err: registry::RegistryError) -> StatusCode {
         // Not the caller's fault and not about the name they asked for, so
         // neither 400 nor 409: the server has no capacity to record it.
         registry::RegistryError::Full => StatusCode::SERVICE_UNAVAILABLE,
+        registry::RegistryError::ReadOnly => StatusCode::SERVICE_UNAVAILABLE,
+        // Distinct from 429, which is the per-IP limiter: the client tells the
+        // owner when they can rename again rather than to slow down.
+        registry::RegistryError::RenameTooSoon => StatusCode::TOO_EARLY,
     }
 }
 
@@ -772,11 +935,22 @@ fn load_channels_registry() -> Arc<RwLock<registry::ChannelRegistry>> {
     }
 }
 
-fn signed_request_replay_key(message: &[u8], sig: &[u8; 64]) -> [u8; 32] {
+fn signed_request_digest(message: &[u8], sig: &[u8; 64]) -> u128 {
     let mut sha = Sha256::new();
     sha.update(message);
     sha.update(sig);
-    sha.finalize().into()
+    let digest: [u8; 32] = sha.finalize().into();
+    u128::from_le_bytes(digest[..16].try_into().expect("16-byte prefix"))
+}
+
+/// Replay scope of an operation, optionally narrowed to its target. A
+/// collision merges two of one signer's scopes, which only ever refuses more.
+fn replay_scope(operation: u8, subject: &[u8]) -> u64 {
+    let mut sha = Sha256::new();
+    sha.update([operation]);
+    sha.update(subject);
+    let digest: [u8; 32] = sha.finalize().into();
+    u64::from_le_bytes(digest[..8].try_into().expect("8-byte prefix"))
 }
 
 const ENTRY_TTL: Duration = Duration::from_secs(300);
@@ -801,7 +975,8 @@ const PUNCH_TTL: Duration = Duration::from_secs(30);
 /// realistic worst case (2 downloads × 8 peers × 2 retries within a
 /// minute = 32) with comfortable headroom.
 const MAX_PUNCH_PER_MINUTE: u64 = 60;
-/// New channel names one IP may claim per hour.
+/// New channel names, usernames and tombstones one [`rate_key`] (an IPv4
+/// address or an IPv6 /64) may create per hour.
 ///
 /// A room name is reserved the moment it is claimed and held for a long time
 /// afterwards, so mass creation is not a load problem — it is a land grab that
@@ -814,6 +989,16 @@ const MAX_PUNCH_PER_MINUTE: u64 = 60;
 /// like creation. Retries after a failed create do spend budget, which is
 /// intended: a client looping on create is exactly what this bounds.
 const MAX_CHANNEL_CREATES_PER_HOUR: u64 = 6;
+/// The same budget pooled across one [`client_network`] (/24 or /64).
+///
+/// What this budget guards is permanent: usernames are held for a year and
+/// tombstones forever, and the registry refuses every new claim once a map is
+/// full. Per-address alone, one rented /24 bought 256 x 6 of those an hour.
+/// The pool is deliberately larger than one address's share rather than equal
+/// to it, because carrier-grade NAT puts many unrelated subscribers in one
+/// /24; refreshes are never charged, so only genuinely new names compete for
+/// it. For IPv6 both tiers key on the /64, so this adds nothing there.
+const MAX_CHANNEL_CREATES_PER_NETWORK_PER_HOUR: u64 = 24;
 const CHANNEL_CREATE_WINDOW: Duration = Duration::from_secs(3600);
 /// Cap on simultaneous pending punch entries per `target_id`. Bounds
 /// the impact of `punch_register` spam against a victim once the
@@ -824,11 +1009,11 @@ const MAX_PUNCH_PER_TARGET: usize = 8;
 /// Of [`MAX_PUNCH_PER_TARGET`], how many slots requesters authorized only by a
 /// public friend-code intro capability may hold at once. Everyone else's claim
 /// rests on a pairwise capability the target itself handed out, so reserving the
-/// remainder keeps a stranger with the target's `ember2:` code from crowding its
+/// remainder keeps a stranger with the target's friend code from crowding its
 /// actual friends out of the queue.
 const MAX_PUNCH_PER_TARGET_OPEN_INTRO: usize = 2;
 const MAX_PUNCH_REQUESTS_TOTAL: usize = 100_000;
-/// Per-IP relay session cap. Was `2`, which was the cause of every
+/// Relay session cap per client network. Was `2`, which was the cause of every
 /// `WebSocket protocol error: Sending after closing is not allowed`
 /// failure the Ember client saw on adoption: the server accepts the
 /// WS handshake (so `connect_async` returns Ok), THEN this check
@@ -845,7 +1030,14 @@ const MAX_PUNCH_REQUESTS_TOTAL: usize = 100_000;
 /// IP. `32` covers that with a small buffer; the global cap
 /// (`MAX_GLOBAL_RELAY_SESSIONS = 200`) still bounds total resource
 /// consumption to ~6 maxed-out clients before backpressure kicks in.
-const MAX_RELAY_SESSIONS_PER_IP: usize = 32;
+///
+/// Counted per [`client_network`] rather than per address, so those ~6
+/// clients must sit in distinct /24s or /64s: identities are free, and an
+/// exact-address key let one IPv6 host (or a handful of IPv4 addresses in one
+/// rented block) hold every relay slot. Not lowered below `32` because
+/// carrier-grade NAT puts many subscribers in one /24, and they are the users
+/// most likely to need the relay.
+const MAX_RELAY_SESSIONS_PER_NETWORK: usize = 32;
 const MAX_GLOBAL_RELAY_SESSIONS: usize = 200;
 /// Combined (both directions summed) byte ceiling for a single relay
 /// session — see `RelaySessionEntry` for why both directions share one
@@ -975,7 +1167,8 @@ struct PairwisePresenceEntry {
     /// Ignored when `open_intro` is set (friend-code intro presence).
     peer_pubkey: [u8; 32],
     /// When true, any currently-registered requester may look up / punch this
-    /// capability. Used for friend-code intro presence (holders of `ember2:`).
+    /// capability. Used for friend-code intro presence (holders of the owner's
+    /// `ember3:` code, or of any identifier for an older client).
     open_intro: bool,
     pubkey: [u8; 32],
     epoch: i64,
@@ -1001,15 +1194,10 @@ fn capability_allows_peer(
 /// `(target, from)`, so without this a handful of throwaway keys filled all of
 /// [`MAX_PUNCH_PER_TARGET`] — the cap's own rationale assumes an attacker must
 /// source from many IPs, which the open-intro path removes.
-fn open_intro_punch_slots_exhausted(
-    punches: &HashMap<(String, String), PunchEntry>,
-    target: &str,
-) -> bool {
-    punches
-        .iter()
-        .filter(|((candidate, _), entry)| candidate == target && entry.via_open_intro)
-        .count()
-        >= MAX_PUNCH_PER_TARGET_OPEN_INTRO
+fn open_intro_punch_slots_exhausted(punches: &PunchStore, target: &str) -> bool {
+    punches.by_target.get(target).map_or(0, |entries| {
+        entries.values().filter(|entry| entry.via_open_intro).count()
+    }) >= MAX_PUNCH_PER_TARGET_OPEN_INTRO
 }
 
 /// A live capability remains owned by the identity that first registered it.
@@ -1034,25 +1222,144 @@ fn derive_intro_presence_capability(owner_pubkey: &[u8; 32], epoch: i64) -> [u8;
     blake3::derive_key(&context, owner_pubkey)
 }
 
+/// Recompute a sealed (`ember3:`) intro capability from the owner's public key
+/// and the per-epoch key it sent with the registration.
+///
+/// Must stay byte-identical to the client's
+/// `derive_sealed_intro_capability_from_key`. The epoch key comes from a secret
+/// only the owner and holders of its friend code know, so the capability can no
+/// longer be derived from a roster-visible public key — but the server still
+/// binds the namespace to the registering key exactly as for the legacy form,
+/// without ever learning the long-lived secret.
+fn derive_sealed_intro_presence_capability(
+    owner_pubkey: &[u8; 32],
+    epoch_key: &[u8; 32],
+    epoch: i64,
+) -> [u8; 32] {
+    let context = format!("ember-intro-presence-v2:{epoch}");
+    let mut input = [0u8; 64];
+    input[..32].copy_from_slice(owner_pubkey);
+    input[32..].copy_from_slice(epoch_key);
+    blake3::derive_key(&context, &input)
+}
+
+/// Status for a sealed intro registration whose `intro_key` is malformed,
+/// misplaced, or does not derive the capability. Deliberately unused by any
+/// other check: clients treat it — and only it — as "this server will not take
+/// my sealed intro" and fall back to the legacy one, while the 400s and 403s
+/// shared with every registration (stale timestamp, owner not registered after
+/// a restart) are retried as sealed on the next heartbeat.
+const SEALED_INTRO_REJECTED: StatusCode = StatusCode::UNPROCESSABLE_ENTITY;
+
+/// The intro capability `pubkey` is entitled to register for `epoch`: sealed
+/// when the request carries an epoch key, legacy otherwise (older clients).
+fn expected_intro_capability(
+    pubkey: &[u8; 32],
+    intro_key: Option<&[u8; 32]>,
+    epoch: i64,
+) -> [u8; 32] {
+    match intro_key {
+        Some(epoch_key) => derive_sealed_intro_presence_capability(pubkey, epoch_key, epoch),
+        None => derive_intro_presence_capability(pubkey, epoch),
+    }
+}
+
 #[derive(Clone)]
 struct RateEntry {
     count: u64,
     window_start: Instant,
 }
 
-/// Shortest gap between two runs of the inline purge in
-/// [`check_rate_limit_bucket_in`]. The periodic sweeper is the primary reaper;
-/// this only has to keep a map full of old churn from 429-ing every
-/// first-time caller in between sweeps.
-const RATE_PURGE_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// Key a general rate-limit bucket charges: the exact address for IPv4, the
+/// /64 for IPv6.
+///
+/// IPv4 stays per-address because carrier-grade NAT puts many unrelated
+/// subscribers in one /24, and a per-minute request budget shared across them
+/// would 429 ordinary users. IPv6 cannot stay per-address: a single host
+/// usually owns its whole /64, so an exact-address key handed it 2^64 fresh
+/// budgets and let it fill a bucket's map on its own.
+fn rate_key(ip: IpAddr) -> IpAddr {
+    match canonical_ip(ip) {
+        v4 @ IpAddr::V4(_) => v4,
+        v6 @ IpAddr::V6(_) => client_network(v6),
+    }
+}
 
-/// One rate-limit bucket: the per-IP windows, plus the clock that paces the
-/// inline purge.
+/// One rate-limit bucket: the per-key windows (see [`rate_key`]), plus an age
+/// index over them.
+///
+/// At capacity the bucket evicts its oldest window instead of refusing the
+/// newcomer. Refusing meant a flood of distinct keys, once it filled the map,
+/// 429'd every legitimate client the server had not already seen until the
+/// flood's entries aged out. Evicting only ever hands a key a fresh budget,
+/// which any unseen key already gets, so it grants the flood nothing extra.
+/// The index keeps that eviction O(log n): a scan for the oldest entry, run
+/// on every request from an unseen key under exactly that flood, would turn
+/// the limiter into the amplifier.
 #[derive(Default)]
 struct RateBucket {
     entries: HashMap<IpAddr, RateEntry>,
-    /// When the inline purge last ran, or `None` if it never has.
-    last_purge: Option<Instant>,
+    /// Exactly one `(window_start, key)` per entry in `entries`.
+    by_age: std::collections::BTreeSet<(Instant, IpAddr)>,
+}
+
+impl RateBucket {
+    fn charge(
+        &mut self,
+        key: IpAddr,
+        max_requests: u64,
+        window: Duration,
+        now: Instant,
+        max_entries: usize,
+    ) -> bool {
+        match self.entries.get_mut(&key) {
+            Some(entry) if now.duration_since(entry.window_start) >= window => {
+                self.by_age.remove(&(entry.window_start, key));
+                entry.count = 1;
+                entry.window_start = now;
+                self.by_age.insert((now, key));
+                true
+            }
+            Some(entry) => {
+                entry.count += 1;
+                entry.count <= max_requests
+            }
+            None => {
+                while self.entries.len() >= max_entries.max(1) {
+                    let Some((_, oldest)) = self.by_age.pop_first() else {
+                        break;
+                    };
+                    self.entries.remove(&oldest);
+                }
+                self.entries.insert(
+                    key,
+                    RateEntry {
+                        count: 1,
+                        window_start: now,
+                    },
+                );
+                self.by_age.insert((now, key));
+                max_requests >= 1
+            }
+        }
+    }
+
+    fn exhausted(&self, key: IpAddr, max_requests: u64, window: Duration, now: Instant) -> bool {
+        self.entries.get(&key).is_some_and(|entry| {
+            now.duration_since(entry.window_start) < window && entry.count >= max_requests
+        })
+    }
+
+    /// Drop every window that started at least `retain_for` ago.
+    fn prune(&mut self, now: Instant, retain_for: Duration) {
+        while let Some(&(started, key)) = self.by_age.first() {
+            if now.duration_since(started) < retain_for {
+                break;
+            }
+            self.by_age.pop_first();
+            self.entries.remove(&key);
+        }
+    }
 }
 
 type RateLimitBucket = Arc<RwLock<RateBucket>>;
@@ -1245,7 +1552,7 @@ struct MailboxServedPage {
 
 fn select_mailbox_candidate(
     tickets: &HashMap<String, RelayTicket>,
-    initiator: &String,
+    initiator: &str,
     ticket_id: &String,
     now: Instant,
     scanned: &mut usize,
@@ -1256,7 +1563,7 @@ fn select_mailbox_candidate(
         return false;
     }
     *scanned += 1;
-    *last_scanned = Some(initiator.clone());
+    *last_scanned = Some(initiator.to_owned());
     if tickets
         .get(ticket_id)
         .is_some_and(|ticket| !ticket.accepted && ticket.expires_at > now)
@@ -1353,7 +1660,7 @@ impl RelayTicketStore {
             }
             if ticket.initiator_reservation.is_some() || ticket.responder_reservation.is_some() {
                 // A pre-upgrade capacity reservation is outstanding. Removing
-                // the ticket now would strand its `relay_ip_counts` increment
+                // the ticket now would strand its `relay_network_counts` increment
                 // forever, because `rollback_relay_ticket_reservation` bails
                 // out when the ticket is gone and never decrements the count.
                 // Retain the ticket until the reservation watchdog window has
@@ -1605,33 +1912,482 @@ impl RelayTicketStore {
     }
 }
 
-#[derive(Default)]
-struct ReplayCache {
-    entries: HashMap<[u8; 32], Instant>,
-    expirations: VecDeque<(Instant, [u8; 32])>,
+/// Whether `ts` is below the freshness window at `now`.
+fn lapsed_at(ts: i64, now: i64) -> bool {
+    ts < now.saturating_sub(MAX_TIMESTAMP_SKEW_SECS)
 }
 
-impl ReplayCache {
-    fn prune_expired(&mut self, now: Instant) {
-        while self
-            .expirations
-            .front()
-            .is_some_and(|(expires_at, _)| *expires_at <= now)
-        {
-            let (_, key) = self
-                .expirations
-                .pop_front()
-                .expect("front was checked above");
-            if self
-                .entries
-                .get(&key)
-                .is_some_and(|expires_at| *expires_at <= now)
-            {
-                self.entries.remove(&key);
-            }
+/// The replay guard's clock.
+///
+/// Client timestamps are checked against `wall`, so a server whose clock was
+/// wrong and then corrected accepts correctly timed requests again. What a
+/// backward step must not do is re-admit a request whose protection was
+/// already dropped; the guard refuses everything at or below the newest
+/// timestamp it ever dropped for that (see `ReplayGuard::dropped_through`).
+/// Dropping itself runs at [`Self::prune_clock`]: never ahead of the wall
+/// clock, so after a backward step nothing more is dropped until wall time
+/// catches up, and never ahead of monotonic time since startup (`lapse`), so
+/// a forward jump that is later undone drops nothing early either.
+#[derive(Clone, Copy, Debug)]
+struct ReplayNow {
+    lapse: i64,
+    wall: i64,
+}
+
+impl ReplayNow {
+    fn from_parts(start_wall: i64, elapsed_secs: i64, wall: i64) -> Self {
+        Self {
+            lapse: start_wall.saturating_add(elapsed_secs),
+            wall,
+        }
+    }
+
+    fn prune_clock(&self) -> i64 {
+        self.lapse.min(self.wall)
+    }
+
+    fn current() -> Self {
+        static START: OnceLock<(i64, Instant)> = OnceLock::new();
+        let (start_wall, started) = *START.get_or_init(|| (now_unix_secs(), Instant::now()));
+        let elapsed = i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX);
+        Self::from_parts(start_wall, elapsed, now_unix_secs())
+    }
+
+    #[cfg(test)]
+    fn at(now: i64) -> Self {
+        Self {
+            lapse: now,
+            wall: now,
         }
     }
 }
+
+#[derive(Clone, Copy)]
+struct ReplayMark {
+    scope: u64,
+    ts: i64,
+    digest: u128,
+}
+
+struct KeyReplayState {
+    /// Every request signed by this key with `ts < floor` is refused.
+    floor: i64,
+    /// Upper bound on every timestamp this state protects (`floor - 1` and
+    /// each mark's `ts`). Never decreases.
+    horizon: i64,
+    /// Per scope, the requests seen at that scope's newest timestamp, in
+    /// arrival order. A scope's older requests need no mark: they are below
+    /// its newest timestamp and refused for that.
+    marks: Vec<ReplayMark>,
+}
+
+/// Replay protection keyed by signing key.
+///
+/// Each signed operation names a scope (the operation, plus its target where
+/// the operation has one). Within a scope a key's requests must not go back in
+/// time: one older than the scope's newest is refused, and at the newest
+/// timestamp each distinct request is accepted once. So a key needs one mark
+/// per scope it used in the last few minutes, not one per request, and
+/// replaying an older state-setting request cannot roll that state back.
+///
+/// Bounds, and why none of them reopens a replay:
+/// - A mark below the freshness window is dropped: the freshness gate
+///   (re-checked here) already refuses everything it protected, and keeps
+///   refusing it after a backward clock step through `dropped_through`.
+/// - Past [`MAX_REPLAY_MARKS_PER_KEY`], or when the global pool is full, a key
+///   gives up its own oldest mark and raises its `floor` above it, which
+///   refuses everything that mark protected and more. Only that key pays.
+/// - A key's whole state is evicted, oldest `horizon` first, only once the
+///   horizon has left the freshness window. A key that is still inside it is
+///   never evicted: a new key is refused (`Full`) instead. Idempotent
+///   endpoints never create state, so that refusal cannot reach them.
+struct ReplayGuard {
+    keys: HashMap<[u8; 32], KeyReplayState>,
+    by_horizon: BTreeSet<(i64, [u8; 32])>,
+    marks: usize,
+    max_keys: usize,
+    max_marks: usize,
+    max_marks_per_key: usize,
+    /// Newest timestamp whose protection was dropped (a lapsed mark or an
+    /// evicted key's horizon). Every one-time request at or below it is
+    /// refused, so a wall clock stepping back cannot make a dropped request
+    /// fresh again. Normally below the freshness window and so never binding;
+    /// after a backward step it holds such requests back only until wall time
+    /// passes it.
+    dropped_through: i64,
+}
+
+impl Default for ReplayGuard {
+    fn default() -> Self {
+        Self::with_limits(MAX_REPLAY_KEYS, MAX_REPLAY_MARKS, MAX_REPLAY_MARKS_PER_KEY)
+    }
+}
+
+impl ReplayGuard {
+    fn with_limits(max_keys: usize, max_marks: usize, max_marks_per_key: usize) -> Self {
+        Self {
+            keys: HashMap::new(),
+            by_horizon: BTreeSet::new(),
+            marks: 0,
+            max_keys: max_keys.max(1),
+            max_marks: max_marks.max(1),
+            max_marks_per_key: max_marks_per_key.max(1),
+            dropped_through: i64::MIN,
+        }
+    }
+
+    fn fresh(&self, ts: i64, now: ReplayNow) -> bool {
+        fresh_at(ts, now.wall) && ts > self.dropped_through
+    }
+
+    /// Evict every key whose horizon has left the freshness window.
+    fn prune(&mut self, now: ReplayNow) {
+        let clock = now.prune_clock();
+        while let Some(&(horizon, key)) = self.by_horizon.first() {
+            if !lapsed_at(horizon, clock) {
+                break;
+            }
+            self.by_horizon.pop_first();
+            if let Some(state) = self.keys.remove(&key) {
+                self.marks -= state.marks.len();
+                self.dropped_through = self.dropped_through.max(horizon);
+            }
+        }
+    }
+
+    /// For endpoints that keep no replay state: refuse only what a
+    /// state-setting request from this key has already superseded.
+    ///
+    /// Checked against the wall clock alone, not `dropped_through`: these are
+    /// register keep-alives and reads, which a replay can only repeat, and
+    /// after a large backward clock step the watermark would refuse every
+    /// presence registration on the server until wall time caught up.
+    fn check_floor(&self, key: &[u8; 32], ts: i64, now: ReplayNow) -> ReplayAdmission {
+        if !fresh_at(ts, now.wall) {
+            return ReplayAdmission::Stale;
+        }
+        match self.keys.get(key) {
+            Some(state) if ts < state.floor => ReplayAdmission::Replay,
+            _ => ReplayAdmission::Accepted,
+        }
+    }
+
+    /// Room for one more key, evicting only lapsed ones.
+    fn make_room_for_key(&mut self, now: ReplayNow) -> bool {
+        self.prune(now);
+        self.keys.len() < self.max_keys && self.marks < self.max_marks
+    }
+
+    fn state_mut(&mut self, key: [u8; 32], now: ReplayNow) -> Option<&mut KeyReplayState> {
+        if !self.keys.contains_key(&key) && !self.make_room_for_key(now) {
+            return None;
+        }
+        Some(self.keys.entry(key).or_insert(KeyReplayState {
+            floor: i64::MIN,
+            horizon: i64::MIN,
+            marks: Vec::new(),
+        }))
+    }
+
+    fn reindex(&mut self, key: [u8; 32], old_horizon: i64) {
+        let Some(state) = self.keys.get_mut(&key) else {
+            return;
+        };
+        let newest = state.marks.iter().map(|mark| mark.ts).max().unwrap_or(i64::MIN);
+        state.horizon = state
+            .horizon
+            .max(newest)
+            .max(state.floor.saturating_sub(1));
+        if state.horizon != old_horizon || !self.by_horizon.contains(&(old_horizon, key)) {
+            self.by_horizon.remove(&(old_horizon, key));
+            self.by_horizon.insert((state.horizon, key));
+        }
+    }
+
+    /// Raise `floor` to `new_floor` and drop the marks it now covers.
+    fn raise_floor_of(state: &mut KeyReplayState, new_floor: i64) -> usize {
+        state.floor = state.floor.max(new_floor);
+        let before = state.marks.len();
+        let floor = state.floor;
+        state.marks.retain(|mark| mark.ts >= floor);
+        before - state.marks.len()
+    }
+
+    fn admit(
+        &mut self,
+        key: [u8; 32],
+        scope: u64,
+        ts: i64,
+        digest: u128,
+        mode: ReplayMode,
+        now: ReplayNow,
+    ) -> ReplayAdmission {
+        if !self.fresh(ts, now) {
+            return ReplayAdmission::Stale;
+        }
+        self.prune(now);
+        let pool_full = self.marks >= self.max_marks;
+        let max_per_key = self.max_marks_per_key;
+        let clock = now.prune_clock();
+        let Some(state) = self.state_mut(key, now) else {
+            return ReplayAdmission::Full;
+        };
+        let old_horizon = state.horizon;
+        let mut released = 0;
+        let dropped = state
+            .marks
+            .iter()
+            .filter(|mark| lapsed_at(mark.ts, clock))
+            .map(|mark| mark.ts)
+            .max();
+        let before = state.marks.len();
+        state.marks.retain(|mark| !lapsed_at(mark.ts, clock));
+        released += before - state.marks.len();
+
+        let outcome = 'decide: {
+            if ts < state.floor {
+                break 'decide ReplayAdmission::Replay;
+            }
+            let newest = state
+                .marks
+                .iter()
+                .filter(|mark| mark.scope == scope)
+                .map(|mark| mark.ts)
+                .max();
+            match newest {
+                Some(newest) if ts < newest => break 'decide ReplayAdmission::Replay,
+                Some(newest) if ts == newest => {
+                    let latest = state.marks.iter().rev().find(|mark| mark.scope == scope);
+                    if mode == ReplayMode::IdempotentRepeat
+                        && latest.is_some_and(|mark| mark.digest == digest)
+                    {
+                        break 'decide ReplayAdmission::Repeat;
+                    }
+                    if state
+                        .marks
+                        .iter()
+                        .any(|mark| mark.scope == scope && mark.digest == digest)
+                    {
+                        break 'decide ReplayAdmission::Replay;
+                    }
+                }
+                Some(_) => {
+                    let before = state.marks.len();
+                    state.marks.retain(|mark| mark.scope != scope);
+                    released += before - state.marks.len();
+                }
+                None => {}
+            }
+            let pool_full = pool_full && released == 0;
+            if state.marks.len() >= max_per_key || (pool_full && !state.marks.is_empty()) {
+                let oldest = state
+                    .marks
+                    .iter()
+                    .map(|mark| mark.ts)
+                    .min()
+                    .expect("a key at its mark limit holds marks");
+                released += Self::raise_floor_of(state, oldest.saturating_add(1));
+                if ts < state.floor {
+                    break 'decide ReplayAdmission::Replay;
+                }
+            } else if pool_full {
+                break 'decide ReplayAdmission::Full;
+            }
+            state.marks.push(ReplayMark { scope, ts, digest });
+            ReplayAdmission::Accepted
+        };
+        self.marks -= released;
+        if outcome == ReplayAdmission::Accepted {
+            self.marks += 1;
+        }
+        if let Some(dropped) = dropped {
+            self.dropped_through = self.dropped_through.max(dropped);
+        }
+        self.reindex(key, old_horizon);
+        outcome
+    }
+
+    /// Refuse every earlier request from this key (unregister).
+    fn raise_floor(&mut self, key: [u8; 32], ts: i64, now: ReplayNow) -> ReplayAdmission {
+        if !self.fresh(ts, now) {
+            return ReplayAdmission::Stale;
+        }
+        self.prune(now);
+        let Some(state) = self.state_mut(key, now) else {
+            return ReplayAdmission::Full;
+        };
+        if ts < state.floor {
+            return ReplayAdmission::Replay;
+        }
+        let old_horizon = state.horizon;
+        let released = Self::raise_floor_of(state, ts.saturating_add(1));
+        self.marks -= released;
+        self.reindex(key, old_horizon);
+        ReplayAdmission::Accepted
+    }
+}
+
+/// Minimum spacing between full expiry scans of a presence map that is at
+/// [`MAX_STORE_ENTRIES`]. The sweeper does the same scan every
+/// [`SWEEP_INTERVAL`]; this only lets a full map recover sooner.
+const STORE_PURGE_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// At capacity, every registration for a new id used to run a full `retain`
+/// over the map under its write lock, so a flood of new ids at the cap turned
+/// each request into a 100k-entry scan.
+#[derive(Default)]
+struct PurgeThrottle {
+    last: std::sync::Mutex<Option<Instant>>,
+}
+
+impl PurgeThrottle {
+    /// Whether the caller may run a full purge now; if so, it is recorded.
+    fn try_begin(&self, now: Instant) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(|poison| poison.into_inner());
+        if last.is_some_and(|at| now.saturating_duration_since(at) < STORE_PURGE_MIN_INTERVAL) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+}
+
+/// Pending punch requests indexed by target, so a register, poll or ack
+/// touches only its target's (at most [`MAX_PUNCH_PER_TARGET`]) entries, and
+/// expiry costs only what expired.
+#[derive(Default)]
+struct PunchStore {
+    by_target: HashMap<String, HashMap<String, PunchEntry>>,
+    len: usize,
+    /// `(expires_at, target, from)` in insertion order. An item whose entry
+    /// was replaced or acked since is skipped when it comes up.
+    expirations: VecDeque<(Instant, String, String)>,
+}
+
+impl PunchStore {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn contains(&self, target: &str, from: &str) -> bool {
+        self.by_target
+            .get(target)
+            .is_some_and(|entries| entries.contains_key(from))
+    }
+
+    fn target_len(&self, target: &str) -> usize {
+        self.by_target.get(target).map_or(0, HashMap::len)
+    }
+
+    fn remove(&mut self, target: &str, from: &str) -> Option<PunchEntry> {
+        let entries = self.by_target.get_mut(target)?;
+        let removed = entries.remove(from)?;
+        if entries.is_empty() {
+            self.by_target.remove(target);
+        }
+        self.len -= 1;
+        Some(removed)
+    }
+
+    fn insert(&mut self, target: String, from: String, entry: PunchEntry) {
+        self.expirations
+            .push_back((entry.created_at + PUNCH_TTL, target.clone(), from.clone()));
+        if self
+            .by_target
+            .entry(target)
+            .or_default()
+            .insert(from, entry)
+            .is_none()
+        {
+            self.len += 1;
+        }
+    }
+
+    fn prune_expired(&mut self, now: Instant) -> usize {
+        let mut removed = 0;
+        while self
+            .expirations
+            .front()
+            .is_some_and(|(expires_at, _, _)| *expires_at <= now)
+        {
+            let (_, target, from) = self
+                .expirations
+                .pop_front()
+                .expect("front was checked above");
+            let expired = self
+                .by_target
+                .get(&target)
+                .and_then(|entries| entries.get(&from))
+                .is_some_and(|entry| !punch_live(entry, now));
+            if expired && self.remove(&target, &from).is_some() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Lease the oldest entry for `target` that `version` may observe: an
+    /// unleased one if any, else (an idempotent re-poll mid-handshake) the
+    /// oldest leased one.
+    fn lease_next(
+        &mut self,
+        target: &str,
+        version: RendezvousVersion,
+        now: Instant,
+    ) -> Option<&PunchEntry> {
+        let entries = self.by_target.get_mut(target)?;
+        // v4 clients must only observe IP-bound registrations. Serving a
+        // legacy entry on /v4/punch/poll would force the desktop to either
+        // fail open (previous bug) or 404 mid-handshake.
+        let visible = |entry: &PunchEntry| {
+            punch_live(entry, now)
+                && (version == RendezvousVersion::LegacyV3
+                    || entry.proof_version == RendezvousVersion::IpBoundV4)
+        };
+        let from = entries
+            .iter()
+            .filter(|(_, entry)| visible(entry) && punch_available(entry, now))
+            .min_by_key(|(_, entry)| entry.created_at)
+            .or_else(|| {
+                entries
+                    .iter()
+                    .filter(|(_, entry)| visible(entry))
+                    .min_by_key(|(_, entry)| entry.created_at)
+            })
+            .map(|(from, _)| from.clone())?;
+        let entry = entries.get_mut(&from)?;
+        entry.leased_until = Some(now + PUNCH_LEASE);
+        Some(entry)
+    }
+
+    fn remove_acked(
+        &mut self,
+        target: &str,
+        punch_id: &str,
+        capability: &[u8; 32],
+        epoch: i64,
+    ) -> bool {
+        let from = self.by_target.get(target).and_then(|entries| {
+            entries
+                .iter()
+                .find(|(_, entry)| {
+                    entry.punch_id.eq_ignore_ascii_case(punch_id)
+                        && entry.capability == *capability
+                        && entry.epoch == epoch
+                })
+                .map(|(from, _)| from.clone())
+        });
+        from.is_some_and(|from| self.remove(target, &from).is_some())
+    }
+}
+
+/// The scope of a status read: one `(initiator, ticket)` pair.
+type StatusReadScope = ([u8; 32], [u8; 32]);
 
 /// Bounded, scope-keyed nonce cache with O(expired) pruning. `K` is either
 /// one responder identity (poll) or one `(initiator, ticket)` pair (status).
@@ -1689,8 +2445,9 @@ struct AppState {
     /// Public reachability is indexed only by rotating pairwise capability,
     /// never by the stable Friend ID kept in `store` for mailbox auth.
     capability_store: Arc<RwLock<HashMap<String, PairwisePresenceEntry>>>,
-    /// Per-IP rate-limit window for the **general** API surface
-    /// (`register`, `lookup`, `unregister`, `relay-invite`, etc.).
+    /// Rate-limit window for the **general** API surface
+    /// (`register`, `lookup`, `unregister`, `relay-invite`, etc.). Every
+    /// bucket here is keyed by [`rate_key`].
     /// Punch traffic now lives in `punch_rate_limits` so a flood of
     /// punch registrations no longer steals the budget from unrelated
     /// endpoints — earlier this map was shared, and a single LowID
@@ -1710,33 +2467,40 @@ struct AppState {
     /// `MAX_PUNCH_PER_MINUTE` budget is the only thing throttling
     /// punch attempts.
     punch_rate_limits: RateLimitBucket,
-    /// Per-IP, per-*hour* budget for first-time channel name claims. Separate
+    /// Per-*hour* budget for first-time channel name claims. Separate
     /// map because it is the only bucket measured over an hour rather than a
     /// minute; sharing one would either let a minute's worth of room creation
     /// through unchecked or throttle ordinary traffic to a creation rate.
     channel_create_rate_limits: RateLimitBucket,
+    /// The pooled tier of the same budget, keyed by [`client_network`]. Its
+    /// own map because a /24 key would collide with the exact address that
+    /// ends in `.0` in the per-address tier.
+    channel_create_network_rate_limits: RateLimitBucket,
     /// Pending hole-punch registrations, keyed by `(target_id, from_id)`.
     /// Keying by both IDs (rather than just `target_id`) prevents an
     /// unauthenticated attacker from overwriting a legit registrant's
     /// slot for a given victim — the worst they can do now is fill an
     /// extra slot under their own attacker-controlled `from_id`, which
     /// the per-target cap below bounds.
-    punch_requests: Arc<RwLock<HashMap<(String, String), PunchEntry>>>,
+    punch_requests: Arc<RwLock<PunchStore>>,
     relay_sessions: Arc<RwLock<HashMap<String, RelaySessionEntry>>>,
     bridged_relays: Arc<RwLock<HashMap<String, BridgedRelayEntry>>>,
     relay_admissions: Arc<RwLock<HashMap<(String, RelayRole), IpAddr>>>,
-    relay_ip_counts: Arc<RwLock<HashMap<IpAddr, usize>>>,
+    /// Joined or reserved relay sockets, keyed by [`client_network`].
+    relay_network_counts: Arc<RwLock<HashMap<IpAddr, usize>>>,
     next_relay_reservation_id: Arc<AtomicU64>,
     relay_tickets: Arc<RwLock<RelayTicketStore>>,
     /// Process-lifetime secret used to issue role tokens on demand. Ticket
     /// records retain only SHA-256 token hashes; rotating this key on restart
     /// invalidates every outstanding short-lived ticket.
     relay_token_key: [u8; 32],
-    /// Recently accepted signed mutating requests. Timestamps keep messages
-    /// fresh; this cache prevents replaying a captured fresh register or
-    /// unregister within that allowed skew window. It intentionally excludes
-    /// idempotent ticket reads; see the scope-bounded caches below.
-    replay_cache: Arc<RwLock<ReplayCache>>,
+    /// Per-signing-key replay protection for signed requests inside the
+    /// timestamp skew window. Ticket reads use the scope-bounded caches below.
+    replay_guard: Arc<RwLock<ReplayGuard>>,
+    /// Throttles the full expiry scan a registration runs when `store` or
+    /// `capability_store` is at [`MAX_STORE_ENTRIES`].
+    store_purge: Arc<PurgeThrottle>,
+    capability_purge: Arc<PurgeThrottle>,
     /// One stable poll nonce per live responder identity. Replays are
     /// idempotent reads, while a different nonce for the same identity is
     /// rejected until the entry expires.
@@ -1744,12 +2508,13 @@ struct AppState {
     /// One stable status nonce per `(initiator, ticket)` pair. Keeping this
     /// separate bounds rapid initiator status checks without weakening the
     /// one-time mutation cache used by offer/accept.
-    status_read_nonces: Arc<RwLock<ScopedNonceCache<([u8; 32], [u8; 32])>>>,
+    status_read_nonces: Arc<RwLock<ScopedNonceCache<StatusReadScope>>>,
     started_at: Instant,
     /// Unique Channel usernames and room names. Persistence is a JSON file
     /// when `CHANNELS_REGISTRY_PATH` is set; otherwise names live only in
     /// this process and vanish on restart.
     channels_registry: Arc<RwLock<registry::ChannelRegistry>>,
+    registry_persister: Arc<RegistryPersister>,
 }
 
 #[derive(Deserialize)]
@@ -1801,6 +2566,10 @@ struct CapabilityRegisterRequest {
     /// logical/rate-limited admission, avoiding a second mutation request.
     #[serde(default)]
     legacy_sig: Option<String>,
+    /// Per-epoch key proving a sealed (`ember3:`) intro capability belongs to
+    /// `pubkey`. Absent on legacy intro registrations; refused without `intro`.
+    #[serde(default)]
+    intro_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1995,6 +2764,12 @@ impl ProxyConfig {
     fn trusts_hop(&self, ip: IpAddr) -> bool {
         self.trusted_hops.iter().any(|network| network.contains(ip))
     }
+
+    /// Whether a connection from `peer` names its real client in
+    /// `Fly-Client-IP`, so the client is unknown until request headers arrive.
+    fn forwards_client_ip(&self, peer: IpAddr) -> bool {
+        self.mode == ProxyMode::Fly && self.trusts_hop(peer)
+    }
 }
 
 fn proxy_config() -> &'static ProxyConfig {
@@ -2011,7 +2786,7 @@ fn extract_client_ip_with_config(
     // deployment explicitly selected Fly mode, and the immediate TCP peer is
     // in the operator-configured proxy allowlist. This prevents a public
     // client from supplying Fly-Client-IP directly to evade rate/session caps.
-    if config.mode == ProxyMode::Fly && config.trusts_hop(addr.ip()) {
+    if config.forwards_client_ip(addr.ip()) {
         if let Some(val) = headers.get("fly-client-ip") {
             if let Ok(s) = val.to_str() {
                 if let Ok(ip) = s.trim().parse::<IpAddr>() {
@@ -2033,47 +2808,13 @@ async fn check_rate_limit_bucket_in(
     max_requests: u64,
     window: Duration,
 ) -> bool {
-    let mut limits = limits.write().await;
-    let now = Instant::now();
-    if limits.entries.len() >= MAX_RATE_ENTRIES && !limits.entries.contains_key(&ip) {
-        // Same rationale as the store cap in `register`: purge
-        // entries that are stale by the sweep's own definition before
-        // failing closed on a brand-new IP, so a map that's merely
-        // full of old churn doesn't 429 every first-time caller until
-        // the next sweep cycle happens to run.
-        //
-        // Paced, because the condition that gets us here is a flood from many
-        // distinct addresses — exactly what the map exists to mitigate. In
-        // that state every entry is fresh, so the retain frees nothing and
-        // without the pacing it ran for *every* request from an unseen IP: a
-        // 200,000-element scan holding the exclusive lock that gates every
-        // rate-limited endpoint, bought with a single HTTP request. That turns
-        // the mitigation into the amplifier.
-        let due = limits
-            .last_purge
-            .is_none_or(|at| now.duration_since(at) >= RATE_PURGE_MIN_INTERVAL);
-        if due {
-            limits.last_purge = Some(now);
-            limits
-                .entries
-                .retain(|_, entry| now.duration_since(entry.window_start) < window * 2);
-        }
-        if limits.entries.len() >= MAX_RATE_ENTRIES && !limits.entries.contains_key(&ip) {
-            return false;
-        }
-    }
-    let entry = limits.entries.entry(ip).or_insert(RateEntry {
-        count: 0,
-        window_start: now,
-    });
-    if now.duration_since(entry.window_start) >= window {
-        entry.count = 1;
-        entry.window_start = now;
-        true
-    } else {
-        entry.count += 1;
-        entry.count <= max_requests
-    }
+    limits.write().await.charge(
+        rate_key(ip),
+        max_requests,
+        window,
+        Instant::now(),
+        MAX_RATE_ENTRIES,
+    )
 }
 
 async fn check_rate_limit_bucket(
@@ -2088,6 +2829,62 @@ async fn check_rate_limit(state: &AppState, ip: IpAddr) -> bool {
     check_rate_limit_bucket(&state.rate_limits, ip, MAX_REQUESTS_PER_MINUTE).await
 }
 
+/// Read-only counterpart of [`check_rate_limit_bucket`]: whether `ip` has
+/// already spent this window's budget. Never charges the bucket.
+async fn rate_budget_exhausted(limits: &RateLimitBucket, ip: IpAddr, max_requests: u64) -> bool {
+    limits
+        .read()
+        .await
+        .exhausted(rate_key(ip), max_requests, RATE_WINDOW, Instant::now())
+}
+
+/// Which bucket a JSON route's handler charges, so the pre-body gate peeks at
+/// the same one.
+#[derive(Clone, Copy)]
+enum BodyRateGate {
+    General,
+    TicketRead,
+    Punch,
+}
+
+/// Handlers charge their bucket only after the `Json` extractor has read the
+/// body, which a slow sender can stretch to `HTTP_REQUEST_TIMEOUT`. An address
+/// that is already over budget is refused before that read. Charging stays in
+/// the handlers, so malformed requests still cost nothing.
+async fn reject_exhausted_rate_budget(
+    State((state, gate)): State<(AppState, BodyRateGate)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let client_ip = extract_client_ip(request.headers(), addr);
+    let exhausted = match gate {
+        BodyRateGate::General => {
+            rate_budget_exhausted(&state.rate_limits, client_ip, MAX_REQUESTS_PER_MINUTE).await
+        }
+        BodyRateGate::TicketRead => {
+            rate_budget_exhausted(
+                &state.ticket_read_rate_limits,
+                client_ip,
+                MAX_TICKET_READS_PER_MINUTE,
+            )
+            .await
+        }
+        BodyRateGate::Punch => {
+            rate_budget_exhausted(
+                &state.punch_rate_limits,
+                canonical_ip(client_ip),
+                MAX_PUNCH_PER_MINUTE,
+            )
+            .await
+        }
+    };
+    if exhausted {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    next.run(request).await
+}
+
 async fn check_ticket_read_rate_limit(state: &AppState, ip: IpAddr) -> bool {
     check_rate_limit_bucket(
         &state.ticket_read_rate_limits,
@@ -2100,74 +2897,88 @@ async fn check_ticket_read_rate_limit(state: &AppState, ip: IpAddr) -> bool {
 /// Budget for standing up a room nobody has claimed before. Charged only once
 /// the request has proved itself genuine, so a bad signature cannot spend the
 /// allowance of the address it was sent from.
+///
+/// Two tiers: [`MAX_CHANNEL_CREATES_PER_HOUR`] per [`rate_key`], then
+/// [`MAX_CHANNEL_CREATES_PER_NETWORK_PER_HOUR`] per [`client_network`].
 async fn check_channel_create_rate_limit(state: &AppState, ip: IpAddr) -> bool {
-    check_rate_limit_bucket_in(
-        &state.channel_create_rate_limits,
-        ip,
+    // Always taken in this order; nothing else holds both.
+    let mut per_address = state.channel_create_rate_limits.write().await;
+    let mut per_network = state.channel_create_network_rate_limits.write().await;
+    admit_channel_create(&mut per_address, &mut per_network, ip, Instant::now())
+}
+
+/// Charges both tiers only when both admit. Charging one tier for a request
+/// the other refuses spends budget on nothing: an over-limit address retrying
+/// would drain its network's pool, and an address retrying against an
+/// exhausted pool would burn its own allowance and stay locked out after the
+/// pool recovers.
+fn admit_channel_create(
+    per_address: &mut RateBucket,
+    per_network: &mut RateBucket,
+    ip: IpAddr,
+    now: Instant,
+) -> bool {
+    let address_key = rate_key(ip);
+    let network_key = rate_key(client_network(ip));
+    if per_address.exhausted(address_key, MAX_CHANNEL_CREATES_PER_HOUR, CHANNEL_CREATE_WINDOW, now)
+        || per_network.exhausted(
+            network_key,
+            MAX_CHANNEL_CREATES_PER_NETWORK_PER_HOUR,
+            CHANNEL_CREATE_WINDOW,
+            now,
+        )
+    {
+        return false;
+    }
+    let address_ok = per_address.charge(
+        address_key,
         MAX_CHANNEL_CREATES_PER_HOUR,
         CHANNEL_CREATE_WINDOW,
-    )
-    .await
+        now,
+        MAX_RATE_ENTRIES,
+    );
+    let network_ok = per_network.charge(
+        network_key,
+        MAX_CHANNEL_CREATES_PER_NETWORK_PER_HOUR,
+        CHANNEL_CREATE_WINDOW,
+        now,
+        MAX_RATE_ENTRIES,
+    );
+    address_ok && network_ok
 }
 
-#[cfg(test)]
-fn admit_replay_key(
-    cache: &mut ReplayCache,
-    key: [u8; 32],
-    now: Instant,
-    max_entries: usize,
-) -> ReplayCacheAdmission {
-    cache.prune_expired(now);
-    if cache.entries.contains_key(&key) {
-        return ReplayCacheAdmission::Replay;
-    }
-    if cache.entries.len() >= max_entries {
-        // A still-fresh replay entry is security state. Evicting it to make
-        // room would re-open its replay window, so fail closed instead.
-        return ReplayCacheAdmission::Full;
-    }
-    let expires_at = now + REPLAY_CACHE_TTL;
-    cache.entries.insert(key, expires_at);
-    cache.expirations.push_back((expires_at, key));
-    ReplayCacheAdmission::Remembered
+/// Admit one signed request into its replay scope. See [`ReplayGuard`].
+async fn admit_signed_request(
+    state: &AppState,
+    signer: &[u8; 32],
+    scope: u64,
+    ts: i64,
+    message: &[u8],
+    sig: &[u8; 64],
+    mode: ReplayMode,
+) -> Result<(), StatusCode> {
+    let digest = signed_request_digest(message, sig);
+    let admission = state.replay_guard.write().await.admit(
+        *signer,
+        scope,
+        ts,
+        digest,
+        mode,
+        ReplayNow::current(),
+    );
+    replay_status(admission)
 }
 
-fn admit_replay_keys(
-    cache: &mut ReplayCache,
-    keys: &[[u8; 32]],
-    now: Instant,
-    max_entries: usize,
-) -> ReplayCacheAdmission {
-    cache.prune_expired(now);
-    for (index, key) in keys.iter().enumerate() {
-        if cache.entries.contains_key(key) || keys[..index].contains(key) {
-            return ReplayCacheAdmission::Replay;
-        }
-    }
-    if keys.len() > max_entries.saturating_sub(cache.entries.len()) {
-        return ReplayCacheAdmission::Full;
-    }
-    let expires_at = now + REPLAY_CACHE_TTL;
-    for key in keys {
-        cache.entries.insert(*key, expires_at);
-        cache.expirations.push_back((expires_at, *key));
-    }
-    ReplayCacheAdmission::Remembered
-}
-
-async fn remember_signed_request(state: &AppState, key: [u8; 32]) -> ReplayCacheAdmission {
-    let mut cache = state.replay_cache.write().await;
-    admit_replay_keys(
-        &mut cache,
-        std::slice::from_ref(&key),
-        Instant::now(),
-        MAX_REPLAY_CACHE_ENTRIES,
-    )
-}
-
-async fn remember_signed_requests(state: &AppState, keys: &[[u8; 32]]) -> ReplayCacheAdmission {
-    let mut cache = state.replay_cache.write().await;
-    admit_replay_keys(&mut cache, keys, Instant::now(), MAX_REPLAY_CACHE_ENTRIES)
+/// For requests replay can only repeat, not roll back: no state is kept, but
+/// anything the signer has since superseded (see [`ReplayGuard::raise_floor`])
+/// is refused.
+async fn check_replay_floor(state: &AppState, signer: &[u8; 32], ts: i64) -> Result<(), StatusCode> {
+    let admission = state
+        .replay_guard
+        .read()
+        .await
+        .check_floor(signer, ts, ReplayNow::current());
+    replay_status(admission)
 }
 
 fn admit_idempotent_read_nonce<K: Eq + Hash + Copy>(
@@ -2248,11 +3059,12 @@ async fn remember_ticket_status_nonce(
     )
 }
 
-fn replay_cache_status(admission: ReplayCacheAdmission) -> Result<(), StatusCode> {
+fn replay_status(admission: ReplayAdmission) -> Result<(), StatusCode> {
     match admission {
-        ReplayCacheAdmission::Remembered => Ok(()),
-        ReplayCacheAdmission::Replay => Err(StatusCode::CONFLICT),
-        ReplayCacheAdmission::Full => Err(StatusCode::SERVICE_UNAVAILABLE),
+        ReplayAdmission::Accepted | ReplayAdmission::Repeat => Ok(()),
+        ReplayAdmission::Replay => Err(StatusCode::CONFLICT),
+        ReplayAdmission::Stale => Err(StatusCode::BAD_REQUEST),
+        ReplayAdmission::Full => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
 
@@ -2382,15 +3194,15 @@ fn issue_relay_role_token(state: &AppState, ticket_id: &str, role: RelayRole) ->
     hex::encode(hasher.finalize())
 }
 
-/// Verify a signature made by a currently registered identity. The presence
-/// entry's pinned key is the authority, so callers never provide a
-/// freely-chosen pubkey.
+/// Verify a signature made by a currently registered identity, returning its
+/// key. The presence entry's pinned key is the authority, so callers never
+/// provide a freely-chosen pubkey.
 async fn verify_signed_relay_identity_signature(
     state: &AppState,
     identity_id: &str,
     message: &[u8],
     sig: &[u8; 64],
-) -> Result<(), StatusCode> {
+) -> Result<[u8; 32], StatusCode> {
     let pubkey = {
         let store = state.store.read().await;
         store
@@ -2403,22 +3215,7 @@ async fn verify_signed_relay_identity_signature(
     if !ed25519_verify(&pubkey, message, sig) {
         return Err(StatusCode::FORBIDDEN);
     }
-    Ok(())
-}
-
-/// Verify and one-time-admit a mutating ticket action. Poll/status reads use
-/// their own bounded idempotent nonce caches instead.
-async fn verify_signed_relay_identity(
-    state: &AppState,
-    identity_id: &str,
-    message: &[u8],
-    sig: &[u8; 64],
-) -> Result<(), StatusCode> {
-    verify_signed_relay_identity_signature(state, identity_id, message, sig).await?;
-    replay_cache_status(
-        remember_signed_request(state, signed_request_replay_key(message, sig)).await,
-    )?;
-    Ok(())
+    Ok(pubkey)
 }
 
 fn prune_expired_relay_tickets(tickets: &mut RelayTicketStore, now: Instant) {
@@ -2471,7 +3268,7 @@ async fn reserve_relay_ticket_join(
     if ticket.expires_at <= now {
         // The prune above retains an expired ticket only while a pre-upgrade
         // reservation is outstanding (so its rollback can still release the
-        // per-IP count). That retention must not admit new joins past expiry.
+        // per-network count). That retention must not admit new joins past expiry.
         return Err(StatusCode::GONE);
     }
     if !ticket.accepted {
@@ -2499,16 +3296,17 @@ async fn reserve_relay_ticket_join(
     if *already_joined || reservation.is_some() {
         return Err(StatusCode::CONFLICT);
     }
+    let network = client_network(client_ip);
 
     // The ticket lock stays held until capacity is reserved so a failed
     // pre-upgrade check neither burns the token nor returns a false 101.
-    let mut counts = state.relay_ip_counts.write().await;
+    let mut counts = state.relay_network_counts.write().await;
     let global_total: usize = counts.values().sum();
     if global_total >= MAX_GLOBAL_RELAY_SESSIONS {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let count = counts.entry(client_ip).or_insert(0);
-    if *count >= MAX_RELAY_SESSIONS_PER_IP {
+    let count = counts.entry(network).or_insert(0);
+    if *count >= MAX_RELAY_SESSIONS_PER_NETWORK {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     *count += 1;
@@ -2571,13 +3369,7 @@ async fn rollback_relay_ticket_reservation(state: &AppState, reservation: &Relay
         }
     };
     if released {
-        let mut counts = state.relay_ip_counts.write().await;
-        if let Some(count) = counts.get_mut(&reservation.client_ip) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                counts.remove(&reservation.client_ip);
-            }
-        }
+        release_relay_network_slots(state, [reservation.client_ip]).await;
     }
 }
 
@@ -2701,11 +3493,6 @@ async fn register(
     if !ed25519_verify(&pubkey, &msg, &sig_bytes) {
         return StatusCode::FORBIDDEN;
     }
-    if let Err(status) = replay_cache_status(
-        remember_signed_request(&state, signed_request_replay_key(&msg, &sig_bytes)).await,
-    ) {
-        return status;
-    }
 
     let entry = PresenceEntry {
         expires_at: Instant::now() + ENTRY_TTL,
@@ -2713,6 +3500,14 @@ async fn register(
     };
 
     let mut store = state.store.write().await;
+    // A register is a keep-alive of the pinned key: replaying one only
+    // re-extends presence its owner signed for moments ago, so it keeps no
+    // replay state. What it must not do is undo an unregister, which raises
+    // the key's floor. Checked under the store lock that unregister's removal
+    // also takes, so the two cannot interleave into a resurrection.
+    if let Err(status) = check_replay_floor(&state, &pubkey, body.ts).await {
+        return status;
+    }
     let key = body.id.to_lowercase();
     if let Some(existing) = store.get(&key) {
         // First-write-wins on pubkey: any later /register for this id
@@ -2723,15 +3518,14 @@ async fn register(
             return StatusCode::FORBIDDEN;
         }
     } else if store.len() >= MAX_STORE_ENTRIES {
-        // Before failing closed on a brand-new id, opportunistically
-        // purge already-expired entries — a map that's merely full of
-        // stale junk (normal churn between sweep cycles) shouldn't
-        // lock out legitimate new registrants the same way a genuine
-        // sustained flood would. This is cheap (O(n) scan, no
-        // allocation beyond the retain) and bounded to the same work
-        // the periodic sweep already does every `SWEEP_INTERVAL`.
+        // Before failing closed on a brand-new id, purge already-expired
+        // entries — a map that's merely full of stale junk (normal churn
+        // between sweep cycles) shouldn't lock out legitimate new
+        // registrants the same way a genuine sustained flood would.
         let now = Instant::now();
-        store.retain(|_, e| e.expires_at > now);
+        if state.store_purge.try_begin(now) {
+            store.retain(|_, e| e.expires_at > now);
+        }
         if store.len() >= MAX_STORE_ENTRIES {
             return StatusCode::SERVICE_UNAVAILABLE;
         }
@@ -2762,6 +3556,10 @@ async fn protocol_v4() -> Json<serde_json::Value> {
         "version": 4,
         "domain": "ember-rdv-v4",
         "legacy_v3_rollout": true,
+        // Clients only register an `ember3:` intro (proved with `intro_key`)
+        // where this is advertised, and fall back to the legacy intro
+        // elsewhere, since older servers refuse the sealed form.
+        "sealed_intro": true,
     }))
 }
 
@@ -2842,8 +3640,18 @@ async fn claim_channel_username_v4(
     if !ed25519_verify(&pubkey, &signed, &sig) {
         return StatusCode::FORBIDDEN;
     }
-    if let Err(status) =
-        replay_cache_status(remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await)
+    // One scope per key: replaying the handle a user renamed away from would
+    // take it back.
+    if let Err(status) = admit_signed_request(
+        &state,
+        &pubkey,
+        replay_scope(OP_CHANNEL_USERNAME_V4, &[]),
+        body.ts,
+        &signed,
+        &sig,
+        ReplayMode::IdempotentRepeat,
+    )
+    .await
     {
         return status;
     }
@@ -2863,10 +3671,10 @@ async fn claim_channel_username_v4(
         return StatusCode::TOO_MANY_REQUESTS;
     }
     let mut registry = state.channels_registry.write().await;
-    match registry.claim_username(&hex::encode(pubkey), &normalized) {
-        Ok(()) => StatusCode::OK,
-        Err(err) => registry_error_status(err),
-    }
+    let result = registry.claim_username(&hex::encode(pubkey), &normalized);
+    let durable_generation = registry.durable_generation();
+    drop(registry);
+    acknowledge_registry_write(&state, result, durable_generation).await
 }
 
 async fn claim_channel_name_v4(
@@ -2920,8 +3728,17 @@ async fn claim_channel_name_v4(
         }
         (legacy, normalized.clone())
     };
-    if let Err(status) =
-        replay_cache_status(remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await)
+    // Replaying an older claim would flip `private` or the display name back.
+    if let Err(status) = admit_signed_request(
+        &state,
+        &pubkey,
+        replay_scope(OP_CHANNEL_NAME_V4, &[]),
+        body.ts,
+        &signed,
+        &sig,
+        ReplayMode::IdempotentRepeat,
+    )
+    .await
     {
         return status;
     }
@@ -2934,11 +3751,85 @@ async fn claim_channel_name_v4(
         return StatusCode::TOO_MANY_REQUESTS;
     }
     let mut registry = state.channels_registry.write().await;
-    match registry.claim_channel_name(&channel_hex, &hex::encode(pubkey), &publish_name, body.private)
-    {
-        Ok(()) => StatusCode::OK,
-        Err(err) => registry_error_status(err),
+    let result =
+        registry.claim_channel_name(&channel_hex, &hex::encode(pubkey), &publish_name, body.private);
+    let durable_generation = registry.durable_generation();
+    drop(registry);
+    acknowledge_registry_write(&state, result, durable_generation).await
+}
+
+/// `POST /v4/channels/rename` — same body as `/v4/channels/name`, signed with
+/// [`build_channel_rename_v4_msg`]. Kept apart from claims so that only an
+/// owner who asked to rename can: see `ChannelRegistry::claim_channel_name_at`.
+async fn rename_channel_name_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<ChannelNameRequest>,
+) -> StatusCode {
+    if !timestamp_fresh(body.ts) {
+        return StatusCode::BAD_REQUEST;
     }
+    let Some(normalized) = registry::normalize_channel_name(&body.name) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let (Some(channel_id), Some(pubkey), Some(sig)) = (
+        decode_hex_channel_id(&body.channel_id),
+        decode_hex_pubkey(&body.pubkey),
+        decode_hex_sig(&body.sig),
+    ) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if !channel_id_matches_pubkey(&pubkey, &channel_id) {
+        return StatusCode::FORBIDDEN;
+    }
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    // No legacy form: every client that knows this endpoint signs the display.
+    let display = registry::strip_invisible(&body.name);
+    let signed =
+        build_channel_rename_v4_msg(&channel_id, &pubkey, &normalized, &display, body.private, body.ts);
+    if !ed25519_verify(&pubkey, &signed, &sig) {
+        return StatusCode::FORBIDDEN;
+    }
+    // Replaying an older rename would move the room back to a name it left.
+    // The newest may repeat: it names the room's current name, which the
+    // registry answers as a refresh, so a retry after a lost answer succeeds.
+    if let Err(status) = admit_signed_request(
+        &state,
+        &pubkey,
+        replay_scope(OP_CHANNEL_RENAME_V4, &[]),
+        body.ts,
+        &signed,
+        &sig,
+        ReplayMode::IdempotentRepeat,
+    )
+    .await
+    {
+        return status;
+    }
+    let channel_hex = hex::encode(channel_id);
+    // A rename of a room the registry already knows writes no new room, so it
+    // is never charged the creation budget. One it has never seen is a claim
+    // in all but name, and is charged exactly as `claim_channel_name_v4`
+    // would charge it.
+    let is_new_room = !state.channels_registry.read().await.has_channel(&channel_hex);
+    if is_new_room && !check_channel_create_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    let mut registry = state.channels_registry.write().await;
+    let result = registry.rename_channel_name_at(
+        &channel_hex,
+        &hex::encode(pubkey),
+        &body.name,
+        body.private,
+        now_unix_secs(),
+    );
+    let durable_generation = registry.durable_generation();
+    drop(registry);
+    acknowledge_registry_write(&state, result, durable_generation).await
 }
 
 async fn delete_channel_v4(
@@ -2968,11 +3859,8 @@ async fn delete_channel_v4(
     if !ed25519_verify(&pubkey, &signed, &sig) {
         return StatusCode::FORBIDDEN;
     }
-    if let Err(status) =
-        replay_cache_status(remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await)
-    {
-        return status;
-    }
+    // No replay state: a tombstone is permanent, so a replayed delete can only
+    // repeat itself, and a repeat is free below.
     // A delete writes a tombstone that is kept forever, so it mints more
     // durable state than a name claim does and must not be cheaper to issue.
     // Only charged when it would actually record something new: re-deleting an
@@ -2987,10 +3875,10 @@ async fn delete_channel_v4(
         return StatusCode::TOO_MANY_REQUESTS;
     }
     let mut registry = state.channels_registry.write().await;
-    match registry.delete_channel(&channel_hex, &hex::encode(pubkey)) {
-        Ok(()) => StatusCode::OK,
-        Err(err) => registry_error_status(err),
-    }
+    let result = registry.delete_channel(&channel_hex, &hex::encode(pubkey));
+    let durable_generation = registry.durable_generation();
+    drop(registry);
+    acknowledge_registry_write(&state, result, durable_generation).await
 }
 
 async fn set_channel_nominee_v4(
@@ -3036,8 +3924,17 @@ async fn set_channel_nominee_v4(
     if !ed25519_verify(&pubkey, &signed, &sig) {
         return StatusCode::FORBIDDEN;
     }
-    if let Err(status) =
-        replay_cache_status(remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await)
+    // Replaying a nomination after its withdrawal would re-grant succession.
+    if let Err(status) = admit_signed_request(
+        &state,
+        &pubkey,
+        replay_scope(OP_CHANNEL_NOMINEE_V4, &[]),
+        body.ts,
+        &signed,
+        &sig,
+        ReplayMode::IdempotentRepeat,
+    )
+    .await
     {
         return status;
     }
@@ -3047,15 +3944,15 @@ async fn set_channel_nominee_v4(
         hex::encode(nominee)
     };
     let mut registry = state.channels_registry.write().await;
-    match registry.set_channel_nominee(
+    let result = registry.set_channel_nominee(
         &hex::encode(channel_id),
         &hex::encode(pubkey),
         &nominee_hex,
         body.claim_after_days,
-    ) {
-        Ok(()) => StatusCode::OK,
-        Err(err) => registry_error_status(err),
-    }
+    );
+    let durable_generation = registry.durable_generation();
+    drop(registry);
+    acknowledge_registry_write(&state, result, durable_generation).await
 }
 
 async fn handover_channel_name_v4(
@@ -3095,39 +3992,82 @@ async fn handover_channel_name_v4(
     if !ed25519_verify(&signer, &signed, &sig) {
         return StatusCode::FORBIDDEN;
     }
-    if let Err(status) =
-        replay_cache_status(remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await)
+    if let Err(status) = admit_signed_request(
+        &state,
+        &signer,
+        replay_scope(OP_CHANNEL_HANDOVER_V4, &old_channel_id),
+        body.ts,
+        &signed,
+        &sig,
+        ReplayMode::IdempotentRepeat,
+    )
+    .await
     {
         return status;
     }
     let mut registry = state.channels_registry.write().await;
-    match registry.handover_channel_name(
+    let result = registry.handover_channel_name(
         &hex::encode(old_channel_id),
         &hex::encode(new_channel_id),
         &hex::encode(new_pubkey),
         &hex::encode(signer),
         now_unix_secs(),
-    ) {
-        Ok(()) => StatusCode::OK,
-        Err(err) => registry_error_status(err),
-    }
+    );
+    let durable_generation = registry.durable_generation();
+    drop(registry);
+    acknowledge_registry_write(&state, result, durable_generation).await
 }
 
+/// Longest directory cursor accepted. Ours are at most 52 characters.
+const MAX_DIRECTORY_CURSOR_LEN: usize = 128;
+
+#[derive(Deserialize, Default)]
+struct DirectoryQuery {
+    /// `next_cursor` from the previous page. Omitted for the first page.
+    #[serde(default)]
+    cursor: Option<String>,
+    /// Same as `cursor`, spelled like `/v4/channels/deleted`'s parameter.
+    #[serde(default)]
+    after: Option<String>,
+}
+
+/// `GET /v4/channels/directory[?cursor=<next_cursor>]`
+///
+/// Responds `{"channels": [...], "next_cursor": <string or null>}` with at
+/// most [`registry::DIRECTORY_PAGE_SIZE`] listings per page, oldest claim
+/// first, [`registry::MAX_DIRECTORY_LISTINGS`] in total. `next_cursor` is
+/// non-null exactly when more listings follow. A client that predates paging
+/// sends no cursor, ignores `next_cursor`, and gets the first page — the most
+/// established rooms — which is bounded well under its 256 KiB limit.
 async fn channel_directory_v4(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Query(query): Query<DirectoryQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let client_ip = extract_client_ip(&headers, addr);
     if !check_rate_limit(&state, client_ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-    // Read-only: `public_directory` already hides listings the owner has
-    // stopped refreshing, so serving Discover never needs the write lock that
-    // reaping takes.
+    let raw_cursor = query
+        .cursor
+        .as_deref()
+        .or(query.after.as_deref())
+        .filter(|cursor| !cursor.is_empty());
+    let cursor = match raw_cursor {
+        None => None,
+        Some(raw) if raw.len() > MAX_DIRECTORY_CURSOR_LEN => return Err(StatusCode::BAD_REQUEST),
+        Some(raw) => {
+            Some(registry::DirectoryCursor::parse(raw).ok_or(StatusCode::BAD_REQUEST)?)
+        }
+    };
+    // Read-only: listings the owner stopped refreshing are filtered out, not
+    // reaped, so serving Discover never needs the write lock.
     let registry = state.channels_registry.read().await;
+    let page = registry.directory_page(cursor.as_ref(), registry::DIRECTORY_PAGE_SIZE);
     Ok(Json(serde_json::json!({
-        "channels": registry.public_directory(),
+        "channels": page.channels,
+        "next_cursor": page.next_cursor,
     })))
 }
 
@@ -3267,9 +4207,12 @@ async fn identity_lookup_v4(
     if !ed25519_verify(&requester_pubkey, &signed, &sig) {
         return Err(StatusCode::FORBIDDEN);
     }
-    replay_cache_status(
-        remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await,
-    )?;
+    // A read keeps no per-request marks: clients issue lookups for many peers
+    // concurrently, so one mark per key would refuse ones that arrive out of
+    // order, and one per target would exhaust the key's budget. A replay only
+    // repeats a lookup the signer was authorized for, within the skew window;
+    // the floor still refuses anything signed before an unregister.
+    check_replay_floor(&state, &requester_pubkey, body.ts).await?;
     let store = state.store.read().await;
     let entry = store
         .get(&body.target_id.to_lowercase())
@@ -3328,15 +4271,28 @@ async fn capability_register_impl(
     if body.intro && peer_pubkey != pubkey {
         return StatusCode::BAD_REQUEST;
     }
-    // An intro capability is derived from the owner's public key and the epoch,
-    // both of which travel in a public `ember2:` friend code. Anyone holding
-    // that code can therefore derive a victim's current capability and sign a
-    // valid registration for it with their own key. Recomputing the derivation
-    // binds the namespace to its owner, so a stranger cannot claim it at all —
-    // neither to replace a live entry nor to squat an epoch before the owner
-    // registers, which the owner pin alone would still permit.
-    if body.intro && capability != derive_intro_presence_capability(&pubkey, body.epoch) {
-        return StatusCode::FORBIDDEN;
+    let intro_key = match body.intro_key.as_deref() {
+        None => None,
+        Some(value) if body.intro && validate_hex_id(value) => decode_hex_id(value),
+        Some(_) => return SEALED_INTRO_REJECTED,
+    };
+    // A legacy intro capability is derived from the owner's public key and the
+    // epoch, both public; a sealed one also from the owner's intro secret,
+    // which every holder of its `ember3:` code knows. Either way someone other
+    // than the owner can derive the current capability and sign a valid
+    // registration for it with their own key. Recomputing the derivation under
+    // the registrant's key binds the namespace to its owner, so nobody else
+    // can claim it at all — neither to replace a live entry nor to squat an
+    // epoch before the owner registers, which the owner pin alone would still
+    // permit.
+    if body.intro
+        && capability != expected_intro_capability(&pubkey, intro_key.as_ref(), body.epoch)
+    {
+        return if intro_key.is_some() {
+            SEALED_INTRO_REJECTED
+        } else {
+            StatusCode::FORBIDDEN
+        };
     }
     let Ok(ip) = body.ip.parse::<IpAddr>() else {
         return StatusCode::BAD_REQUEST;
@@ -3412,11 +4368,12 @@ async fn capability_register_impl(
             return StatusCode::FORBIDDEN;
         }
     }
-    let mut replay_keys = vec![signed_request_replay_key(&signed, &sig)];
-    if let (Some(legacy_sig), Some(legacy_signed)) = (legacy_sig, legacy_signed.as_ref()) {
-        replay_keys.push(signed_request_replay_key(legacy_signed, &legacy_sig));
-    }
-    if let Err(status) = replay_cache_status(remember_signed_requests(&state, &replay_keys).await) {
+    // A capability registration is a periodic refresh, sent for every friend
+    // and neighbour each heartbeat, so it keeps no per-request replay state.
+    // Replaying one within the skew window re-extends an address its owner
+    // signed moments ago; what a replay must not do is roll a newer address
+    // back, which the timestamp comparison under the lock below refuses.
+    if let Err(status) = check_replay_floor(&state, &pubkey, body.ts).await {
         return status;
     }
     let mut capabilities = state.capability_store.write().await;
@@ -3452,7 +4409,9 @@ async fn capability_register_impl(
         return StatusCode::FORBIDDEN;
     }
     if capabilities.len() >= MAX_STORE_ENTRIES && !capabilities.contains_key(&key) {
-        capabilities.retain(|_, entry| entry.expires_at > now);
+        if state.capability_purge.try_begin(now) {
+            capabilities.retain(|_, entry| entry.expires_at > now);
+        }
         if capabilities.len() >= MAX_STORE_ENTRIES {
             return StatusCode::SERVICE_UNAVAILABLE;
         }
@@ -3465,6 +4424,25 @@ async fn capability_register_impl(
             && entry.pubkey == pubkey
             && entry.epoch == body.epoch
     });
+    // The owner's live entry was signed no earlier than this request: keeping
+    // it alive is harmless, replacing it with what this request says is a
+    // rollback — including within the same second, since timestamps cannot
+    // order two registrations signed in it. Comparing against both proofs also
+    // covers a v3 refresh landing between a v4 request and its replay. An
+    // owner whose clock stepped back is only refused if it also changed
+    // address meanwhile.
+    let superseded = capabilities.get(&key).is_some_and(|entry| {
+        entry.expires_at > now
+            && entry.pubkey == pubkey
+            && entry
+                .legacy_proof
+                .into_iter()
+                .chain(entry.v4_proof)
+                .any(|(signed_ts, _)| signed_ts >= body.ts)
+    });
+    if superseded && !matching {
+        return StatusCode::CONFLICT;
+    }
     if !matching {
         capabilities.insert(
             key.clone(),
@@ -3485,12 +4463,18 @@ async fn capability_register_impl(
         .get_mut(&key)
         .expect("matching or inserted capability remains while lock is held");
     entry.expires_at = Instant::now() + ENTRY_TTL;
+    // Lookups hand these proofs to peers, so never swap one for an older one.
+    let keep_newest = |slot: &mut Option<(i64, [u8; 64])>, proof: [u8; 64]| {
+        if slot.is_none_or(|(signed_ts, _)| signed_ts <= body.ts) {
+            *slot = Some((body.ts, proof));
+        }
+    };
     match version {
-        RendezvousVersion::LegacyV3 => entry.legacy_proof = Some((body.ts, sig)),
+        RendezvousVersion::LegacyV3 => keep_newest(&mut entry.legacy_proof, sig),
         RendezvousVersion::IpBoundV4 => {
-            entry.v4_proof = Some((body.ts, sig));
+            keep_newest(&mut entry.v4_proof, sig);
             if let Some(legacy_sig) = legacy_sig {
-                entry.legacy_proof = Some((body.ts, legacy_sig));
+                keep_newest(&mut entry.legacy_proof, legacy_sig);
             }
         }
     }
@@ -3574,9 +4558,8 @@ async fn capability_lookup_impl(
     if !ed25519_verify(&requester_pubkey, &signed, &sig) {
         return Err(StatusCode::FORBIDDEN);
     }
-    replay_cache_status(
-        remember_signed_request(&state, signed_request_replay_key(&signed, &sig)).await,
-    )?;
+    // A read, like `identity_lookup_v4`: floor only.
+    check_replay_floor(&state, &requester_pubkey, body.ts).await?;
     let capabilities = state.capability_store.read().await;
     let entry = capabilities
         .get(&body.capability.to_lowercase())
@@ -3644,12 +4627,20 @@ async fn unregister(
         // connection IP. The signature is the authority across address churn.
         let msg = build_unregister_msg(&id_raw, body.ts);
         if ed25519_verify(&pubkey, &msg, &sig_bytes) {
-            if let Err(status) = replay_cache_status(
-                remember_signed_request(&state, signed_request_replay_key(&msg, &sig_bytes)).await,
-            ) {
+            // Raising the floor refuses a replay of this unregister, which
+            // would knock a re-registered user offline, and of any register
+            // signed before it, which would resurrect them. It must land
+            // before the removal below; see `register`.
+            let admission =
+                state
+                    .replay_guard
+                    .write()
+                    .await
+                    .raise_floor(pubkey, body.ts, ReplayNow::current());
+            if let Err(status) = replay_status(admission) {
                 return status;
             }
-            // Crypto and replay-cache work is deliberately outside the global
+            // Crypto and replay work is deliberately outside the global
             // presence write lock. Re-check the pinned key before removal in
             // case the entry was refreshed while verification ran.
             let mut store = state.store.write().await;
@@ -3725,12 +4716,12 @@ struct PunchResponse {
     from_pubkey: Option<String>,
 }
 
-fn prune_expired_punches(punches: &mut HashMap<(String, String), PunchEntry>, now: Instant) {
-    punches.retain(|_, entry| now.duration_since(entry.created_at) < PUNCH_TTL);
+fn punch_live(entry: &PunchEntry, now: Instant) -> bool {
+    now.saturating_duration_since(entry.created_at) < PUNCH_TTL
 }
 
 fn punch_available(entry: &PunchEntry, now: Instant) -> bool {
-    entry.leased_until.map_or(true, |until| until <= now)
+    entry.leased_until.is_none_or(|until| until <= now)
 }
 
 async fn legacy_punch_gone() -> StatusCode {
@@ -3824,9 +4815,12 @@ async fn punch_register_impl(
             body.ts,
         ),
     };
-    if let Err(status) = verify_signed_relay_identity(&state, &body.from_id, &signed, &sig).await {
-        return status;
-    }
+    let signer = match verify_signed_relay_identity_signature(&state, &body.from_id, &signed, &sig)
+        .await
+    {
+        Ok(signer) => signer,
+        Err(status) => return status,
+    };
     let target = body.target_id.to_lowercase();
     let (target_pubkey, from_pubkey) = {
         let store = state.store.read().await;
@@ -3866,18 +4860,30 @@ async fn punch_register_impl(
     if !capability_authorized {
         return StatusCode::FORBIDDEN;
     }
+    // One-time per request, scoped to the target. A replay would re-queue a
+    // punch its initiator already finished, or overwrite a newer one with an
+    // older port — and a legacy v3 registration does not sign its address, so
+    // a replay from another host would have the target punch toward it.
+    if let Err(status) = admit_signed_request(
+        &state,
+        &signer,
+        replay_scope(OP_PUNCH_REGISTER_V4, &target_raw),
+        body.ts,
+        &signed,
+        &sig,
+        ReplayMode::OneTime,
+    )
+    .await
+    {
+        return status;
+    }
     let from = body.from_id.to_lowercase();
-    let key = (target.clone(), from.clone());
-    let now = Instant::now();
     let mut punches = state.punch_requests.write().await;
-    prune_expired_punches(&mut punches, now);
-    if !punches.contains_key(&key)
+    let now = Instant::now();
+    punches.prune_expired(now);
+    if !punches.contains(&target, &from)
         && (punches.len() >= MAX_PUNCH_REQUESTS_TOTAL
-            || punches
-                .keys()
-                .filter(|(candidate, _)| candidate == &target)
-                .count()
-                >= MAX_PUNCH_PER_TARGET)
+            || punches.target_len(&target) >= MAX_PUNCH_PER_TARGET)
     {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
@@ -3888,13 +4894,14 @@ async fn punch_register_impl(
     // source from many IPs, which the open-intro path removes. Friends bound to a
     // pairwise capability keep the rest.
     if via_open_intro
-        && !punches.contains_key(&key)
+        && !punches.contains(&target, &from)
         && open_intro_punch_slots_exhausted(&punches, &target)
     {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
     punches.insert(
-        key,
+        target,
+        from.clone(),
         PunchEntry {
             punch_id: random_relay_secret_hex(),
             from_id: from,
@@ -3959,40 +4966,29 @@ async fn punch_poll_impl(
         RendezvousVersion::LegacyV3 => build_punch_poll_v3_msg(&target_raw, &nonce, body.ts),
         RendezvousVersion::IpBoundV4 => build_punch_poll_v4_msg(&target_raw, &nonce, body.ts),
     };
-    verify_signed_relay_identity(&state, &body.target_id, &signed, &sig).await?;
+    // A replayed poll would lease the target's current queue head — possibly
+    // registered after the original poll — to whoever holds it. Polls come
+    // one at a time from each client, so a single one-time scope per key
+    // (shared by v3 and v4) costs one mark and never refuses an honest poll.
+    let signer =
+        verify_signed_relay_identity_signature(&state, &body.target_id, &signed, &sig).await?;
+    admit_signed_request(
+        &state,
+        &signer,
+        replay_scope(OP_PUNCH_POLL_V4, &[]),
+        body.ts,
+        &signed,
+        &sig,
+        ReplayMode::OneTime,
+    )
+    .await?;
     let target = body.target_id.to_lowercase();
-    let now = Instant::now();
     let mut punches = state.punch_requests.write().await;
-    prune_expired_punches(&mut punches, now);
-    let key = punches
-        .iter()
-        .filter(|((candidate, _), entry)| {
-            candidate == &target
-                && punch_available(entry, now)
-                // v4 clients must only observe IP-bound registrations. Serving a
-                // legacy entry on /v4/punch/poll would force the desktop to either
-                // fail open (previous bug) or 404 mid-handshake.
-                && (version == RendezvousVersion::LegacyV3
-                    || entry.proof_version == RendezvousVersion::IpBoundV4)
-        })
-        .min_by_key(|(_, entry)| entry.created_at)
-        .map(|(key, _)| key.clone())
-        .or_else(|| {
-            // Idempotent re-poll: if every entry is still leased to us, refresh
-            // the oldest lease rather than 404 mid-handshake.
-            punches
-                .iter()
-                .filter(|((candidate, _), entry)| {
-                    candidate == &target
-                        && (version == RendezvousVersion::LegacyV3
-                            || entry.proof_version == RendezvousVersion::IpBoundV4)
-                })
-                .min_by_key(|(_, entry)| entry.created_at)
-                .map(|(key, _)| key.clone())
-        })
+    let now = Instant::now();
+    punches.prune_expired(now);
+    let entry = punches
+        .lease_next(&target, version, now)
         .ok_or(StatusCode::NOT_FOUND)?;
-    let entry = punches.get_mut(&key).ok_or(StatusCode::NOT_FOUND)?;
-    entry.leased_until = Some(now + PUNCH_LEASE);
     Ok(Json(PunchResponse {
         punch_id: entry.punch_id.clone(),
         from_id: entry.from_id.clone(),
@@ -4084,24 +5080,25 @@ async fn punch_ack_impl(
             body.ts,
         ),
     };
-    if let Err(status) = verify_signed_relay_identity(&state, &body.target_id, &signed, &sig).await
-    {
+    // No per-request marks: an ack removes the entry carrying this random
+    // `punch_id`, and a re-registration always gets a new one, so a replay can
+    // only miss.
+    let signer =
+        match verify_signed_relay_identity_signature(&state, &body.target_id, &signed, &sig).await
+        {
+            Ok(signer) => signer,
+            Err(status) => return status,
+        };
+    if let Err(status) = check_replay_floor(&state, &signer, body.ts).await {
         return status;
     }
     let target = body.target_id.to_lowercase();
     let mut punches = state.punch_requests.write().await;
-    let key = punches
-        .iter()
-        .find(|((candidate, _), entry)| {
-            candidate == &target
-                && entry.punch_id.eq_ignore_ascii_case(&body.punch_id)
-                && entry.capability == capability
-                && entry.epoch == body.epoch
-        })
-        .map(|(key, _)| key.clone());
-    match key.and_then(|key| punches.remove(&key)) {
-        Some(_) => StatusCode::OK,
-        None => StatusCode::NOT_FOUND,
+    punches.prune_expired(Instant::now());
+    if punches.remove_acked(&target, &body.punch_id, &capability, body.epoch) {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
     }
 }
 
@@ -4159,7 +5156,8 @@ async fn relay_mailbox_offer(
         &nonce,
         body.ts,
     );
-    verify_signed_relay_identity(&state, &body.initiator_id, &signed, &sig).await?;
+    let signer =
+        verify_signed_relay_identity_signature(&state, &body.initiator_id, &signed, &sig).await?;
 
     // The opaque capability must name live presence owned by the intended
     // responder. Knowing only its stable mailbox ID cannot satisfy this.
@@ -4189,6 +5187,19 @@ async fn relay_mailbox_offer(
     if !capability_live {
         return Err(StatusCode::FORBIDDEN);
     }
+    // One-time per request, scoped to the responder. Once the ticket expires
+    // a replay would re-create it under the same id, and role tokens derive
+    // from that id, so the replayer would be handed the initiator token.
+    admit_signed_request(
+        &state,
+        &signer,
+        replay_scope(OP_RELAY_MAILBOX_OFFER, &responder_raw),
+        body.ts,
+        &signed,
+        &sig,
+        ReplayMode::OneTime,
+    )
+    .await?;
 
     let ticket_id = canonical_relay_ticket_id(&body.ticket_id).ok_or(StatusCode::BAD_REQUEST)?;
     let initiator_token = issue_relay_role_token(&state, &ticket_id, RelayRole::Initiator);
@@ -4254,7 +5265,9 @@ async fn relay_mailbox_poll(
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     let signed = build_relay_mailbox_poll_msg(&responder_raw, &nonce, body.ts);
-    verify_signed_relay_identity_signature(&state, &body.responder_id, &signed, &sig).await?;
+    let signer =
+        verify_signed_relay_identity_signature(&state, &body.responder_id, &signed, &sig).await?;
+    check_replay_floor(&state, &signer, body.ts).await?;
     let admission = remember_ticket_poll_nonce(&state, responder_raw, nonce, body.ts).await;
     idempotent_read_status(admission)?;
 
@@ -4326,7 +5339,12 @@ async fn relay_ticket_accept(
         &nonce,
         body.ts,
     );
-    verify_signed_relay_identity(&state, &body.identity_id, &signed, &sig).await?;
+    // No replay state: acceptance is one-time in the ticket itself (a second
+    // accept is refused below), and offers are replay-protected, so a ticket
+    // id is never re-created for a replayed accept to hit.
+    let signer =
+        verify_signed_relay_identity_signature(&state, &body.identity_id, &signed, &sig).await?;
+    check_replay_floor(&state, &signer, body.ts).await?;
 
     let now = Instant::now();
     let mut tickets = state.relay_tickets.write().await;
@@ -4391,7 +5409,9 @@ async fn relay_ticket_status(
         &nonce,
         body.ts,
     );
-    verify_signed_relay_identity_signature(&state, &body.identity_id, &signed, &sig).await?;
+    let signer =
+        verify_signed_relay_identity_signature(&state, &body.identity_id, &signed, &sig).await?;
+    check_replay_floor(&state, &signer, body.ts).await?;
 
     let now = Instant::now();
     let tickets = state.relay_tickets.read().await;
@@ -4763,6 +5783,7 @@ async fn run_peer1_loop(
 /// side — those bytes were already counted once by peer1's loop
 /// when they entered the relay; counting them again would
 /// double-charge the same payload.
+#[allow(clippy::too_many_arguments)]
 async fn bridge_relay(
     mut socket: WebSocket,
     peer1_inbox_tx: RelayQueueSender,
@@ -4879,14 +5900,23 @@ async fn cleanup_relay(state: &AppState, session_id: &str, role: RelayRole) {
         .write()
         .await
         .remove(&(session_id.to_owned(), role));
-    let Some(client_ip) = client_ip else {
-        return;
-    };
-    let mut counts = state.relay_ip_counts.write().await;
-    if let Some(count) = counts.get_mut(&client_ip) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            counts.remove(&client_ip);
+    if let Some(client_ip) = client_ip {
+        release_relay_network_slots(state, [client_ip]).await;
+    }
+}
+
+async fn release_relay_network_slots(
+    state: &AppState,
+    client_ips: impl IntoIterator<Item = IpAddr>,
+) {
+    let mut counts = state.relay_network_counts.write().await;
+    for client_ip in client_ips {
+        let network = client_network(client_ip);
+        if let Some(count) = counts.get_mut(&network) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&network);
+            }
         }
     }
 }
@@ -4908,15 +5938,7 @@ async fn cleanup_relay_session_all(state: &AppState, session_id: &str) {
     if removed_ips.is_empty() {
         return;
     }
-    let mut counts = state.relay_ip_counts.write().await;
-    for ip in removed_ips {
-        if let Some(count) = counts.get_mut(&ip) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                counts.remove(&ip);
-            }
-        }
-    }
+    release_relay_network_slots(state, removed_ips).await;
 }
 
 async fn stats_handler(
@@ -4931,9 +5953,10 @@ async fn stats_handler(
     let relay_count =
         state.relay_sessions.read().await.len() + state.bridged_relays.read().await.len();
     let punch_count = state.punch_requests.read().await.len();
-    let relay_ip_count = state.relay_ip_counts.read().await.len();
+    let relay_ip_count = state.relay_network_counts.read().await.len();
     let presence_count = state.store.read().await.len();
     let uptime_secs = state.started_at.elapsed().as_secs();
+    let channels_registry_read_only = state.channels_registry.read().await.is_read_only();
 
     Ok(Json(serde_json::json!({
         "active_relay_sessions": relay_count,
@@ -4942,6 +5965,7 @@ async fn stats_handler(
         "registered_peers": presence_count,
         "uptime_seconds": uptime_secs,
         "max_global_relays": MAX_GLOBAL_RELAY_SESSIONS,
+        "channels_registry_read_only": channels_registry_read_only,
     })))
 }
 
@@ -4949,7 +5973,136 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// How often the sweeper reaps abandoned channel names and usernames.
+const REGISTRY_REAP_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// Debounce window for channel registry refreshes: every mutation in it lands
+/// in one snapshot. Durable mutations wake the flusher instead of waiting.
+const REGISTRY_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+/// How long a durable registry write may wait for its snapshot to land before
+/// the request is answered 503. Inside `HTTP_REQUEST_TIMEOUT`.
+const REGISTRY_DURABLE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(10)
+};
+
+/// Lets a handler wait until its registry mutation is on disk. Every write
+/// publishes the generation its snapshot covered, so concurrent durable
+/// writes share one snapshot rather than each serialising the registry.
+struct RegistryPersister {
+    wake: tokio::sync::Notify,
+    persisted: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for RegistryPersister {
+    fn default() -> Self {
+        Self {
+            wake: tokio::sync::Notify::new(),
+            persisted: tokio::sync::watch::channel(0).0,
+        }
+    }
+}
+
+async fn write_persist_job(job: registry::PersistJob, persister: &RegistryPersister) -> bool {
+    let generation = job.generation();
+    let written = tokio::task::spawn_blocking(move || job.write())
+        .await
+        .unwrap_or(false);
+    if written {
+        persister
+            .persisted
+            .send_modify(|persisted| *persisted = (*persisted).max(generation));
+    }
+    written
+}
+
+/// Write the registry if it changed since the last snapshot. The snapshot is
+/// serialised under a read lock and written after it is released.
+async fn flush_channels_registry(
+    registry: &RwLock<registry::ChannelRegistry>,
+    persister: &RegistryPersister,
+) -> bool {
+    let job = registry.read().await.take_persist_job();
+    match job {
+        Some(job) => write_persist_job(job, persister).await,
+        None => true,
+    }
+}
+
+/// Final write at shutdown. Closing under the write lock first means nothing
+/// acknowledged afterwards can miss the snapshot: later writes get 503.
+async fn close_channels_registry(
+    registry: &RwLock<registry::ChannelRegistry>,
+    persister: &RegistryPersister,
+) -> bool {
+    let job = {
+        let mut registry = registry.write().await;
+        registry.close_for_shutdown();
+        registry.take_persist_job()
+    };
+    match job {
+        Some(job) => write_persist_job(job, persister).await,
+        None => true,
+    }
+}
+
+async fn flush_channels_registry_periodically(
+    registry: Arc<RwLock<registry::ChannelRegistry>>,
+    persister: Arc<RegistryPersister>,
+) {
+    let mut interval = tokio::time::interval(REGISTRY_FLUSH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = persister.wake.notified() => {}
+        }
+        flush_channels_registry(&registry, &persister).await;
+    }
+}
+
+/// Answer a successful registry write only once every durable mutation up to
+/// `durable_generation` (sampled under the lock, after this write) is on disk.
+/// A tombstone, handover or first claim lost to a crash after its 200 has no
+/// retry path.
+///
+/// Waiting on the registry-wide generation rather than on whether this call
+/// bumped it matters for retries: a write answered 503 stays applied in
+/// memory, so its retry is a no-op that would otherwise be acknowledged while
+/// the original change is still only in memory. With nothing pending this
+/// returns at once, so refreshes stay debounced.
+async fn acknowledge_registry_write(
+    state: &AppState,
+    result: Result<(), registry::RegistryError>,
+    durable_generation: u64,
+) -> StatusCode {
+    if let Err(err) = result {
+        return registry_error_status(err);
+    }
+    let persister = &state.registry_persister;
+    let mut persisted = persister.persisted.subscribe();
+    if *persisted.borrow_and_update() >= durable_generation {
+        return StatusCode::OK;
+    }
+    persister.wake.notify_one();
+    let durable = matches!(
+        tokio::time::timeout(
+            REGISTRY_DURABLE_TIMEOUT,
+            persisted.wait_for(|generation| *generation >= durable_generation),
+        )
+        .await,
+        Ok(Ok(_))
+    );
+    if durable {
+        StatusCode::OK
+    } else {
+        warn!("channel registry write not yet durable; answering 503");
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 async fn sweep_expired(state: AppState) {
+    let mut last_registry_reap = Instant::now();
     loop {
         tokio::time::sleep(SWEEP_INTERVAL).await;
         let now = Instant::now();
@@ -4963,40 +6116,38 @@ async fn sweep_expired(state: AppState) {
         // whole sweep cycle. Scoping keeps the critical sections
         // minimal and lets register/lookup/punch requests interleave
         // with the sweep.
-        {
-            let mut limits = state.rate_limits.write().await;
-            limits.entries.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
-        }
-        {
-            let mut limits = state.legacy_identity_rate_limits.write().await;
-            limits.entries.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
-        }
-        {
-            let mut limits = state.ticket_read_rate_limits.write().await;
-            limits.entries.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
-        }
+        state.rate_limits.write().await.prune(now, RATE_WINDOW * 2);
+        state
+            .legacy_identity_rate_limits
+            .write()
+            .await
+            .prune(now, RATE_WINDOW * 2);
+        state
+            .ticket_read_rate_limits
+            .write()
+            .await
+            .prune(now, RATE_WINDOW * 2);
 
         // Sweep the punch-specific rate-limit map on the same cadence
         // as the general one so the per-IP entries don't pile up after
         // a punch burst goes quiet.
-        {
-            let mut limits = state.punch_rate_limits.write().await;
-            limits.entries.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
-        }
+        state.punch_rate_limits.write().await.prune(now, RATE_WINDOW * 2);
 
         // Swept against its own hour-long window. Using the general one here
         // would drop entries that are still inside their budget and hand the
         // creator a fresh six rooms every couple of minutes.
-        {
-            let mut limits = state.channel_create_rate_limits.write().await;
-            limits
-                .entries.retain(|_, entry| now.duration_since(entry.window_start) < CHANNEL_CREATE_WINDOW);
-        }
+        state
+            .channel_create_rate_limits
+            .write()
+            .await
+            .prune(now, CHANNEL_CREATE_WINDOW);
+        state
+            .channel_create_network_rate_limits
+            .write()
+            .await
+            .prune(now, CHANNEL_CREATE_WINDOW);
 
-        {
-            let mut replay = state.replay_cache.write().await;
-            replay.prune_expired(now);
-        }
+        state.replay_guard.write().await.prune(ReplayNow::current());
         {
             let mut nonces = state.poll_read_nonces.write().await;
             nonces.prune_expired(now);
@@ -5008,13 +6159,21 @@ async fn sweep_expired(state: AppState) {
 
         // Sweep expired punch requests
         {
-            let mut punches = state.punch_requests.write().await;
-            let punch_before = punches.len();
-            punches.retain(|_, e| now.duration_since(e.created_at) < PUNCH_TTL);
-            let punch_removed = punch_before - punches.len();
+            let punch_removed = state.punch_requests.write().await.prune_expired(now);
             if punch_removed > 0 {
                 info!("swept {} expired punch requests", punch_removed);
             }
+        }
+
+        // Claims reap only the names they touch, so everything else abandoned
+        // is forgotten here. Written out by the next registry flush.
+        if last_registry_reap.elapsed() >= REGISTRY_REAP_INTERVAL {
+            last_registry_reap = Instant::now();
+            state
+                .channels_registry
+                .write()
+                .await
+                .reap_stale(now_unix_secs());
         }
 
         {
@@ -5079,86 +6238,65 @@ async fn sweep_expired(state: AppState) {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ember_rendezvous=info".into()),
-        )
-        .init();
-
-    let state = AppState {
-        store: Arc::new(RwLock::new(HashMap::new())),
-        capability_store: Arc::new(RwLock::new(HashMap::new())),
-        rate_limits: Arc::new(RwLock::new(RateBucket::default())),
-        legacy_identity_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
-        ticket_read_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
-        punch_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
-        channel_create_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
-        punch_requests: Arc::new(RwLock::new(HashMap::new())),
-        relay_sessions: Arc::new(RwLock::new(HashMap::new())),
-        bridged_relays: Arc::new(RwLock::new(HashMap::new())),
-        relay_admissions: Arc::new(RwLock::new(HashMap::new())),
-        relay_ip_counts: Arc::new(RwLock::new(HashMap::new())),
-        next_relay_reservation_id: Arc::new(AtomicU64::new(1)),
-        relay_tickets: Arc::new(RwLock::new(RelayTicketStore::default())),
-        relay_token_key: {
-            let mut key = [0u8; 32];
-            OsRng.fill_bytes(&mut key);
-            key
-        },
-        replay_cache: Arc::new(RwLock::new(ReplayCache::default())),
-        poll_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
-        status_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
-        started_at: Instant::now(),
-        channels_registry: load_channels_registry(),
+fn build_router(state: AppState) -> Router {
+    let rate_gate = |gate| {
+        axum::middleware::from_fn_with_state((state.clone(), gate), reject_exhausted_rate_budget)
     };
-
-    tokio::spawn(sweep_expired(state.clone()));
-
-    let app = Router::new()
+    // Every route that extracts a JSON body sits in exactly one of these three
+    // groups, matching the bucket its handler charges.
+    let general_body_routes = Router::new()
         .route("/register", post(register))
-        .route("/lookup/{id}", get(legacy_presence_lookup_gone))
         .route("/unregister", delete(unregister))
-        .route("/v3/identity/{id}", get(legacy_identity_lookup))
         .route("/v3/presence/register", post(capability_register_v3))
         .route("/v3/presence/lookup", post(capability_lookup_v3))
-        .route("/v4/protocol", get(protocol_v4))
         .route("/v4/identity/lookup", post(identity_lookup_v4))
         .route("/v4/presence/register", post(capability_register_v4))
         .route("/v4/presence/lookup", post(capability_lookup_v4))
+        .route("/v3/punch/poll", post(punch_poll_v3))
+        .route("/v3/punch/ack", post(punch_ack_v3))
+        .route("/v4/punch/poll", post(punch_poll_v4))
+        .route("/v4/punch/ack", post(punch_ack_v4))
+        .route("/v4/channels/username", post(claim_channel_username_v4))
+        .route("/v4/channels/name", post(claim_channel_name_v4))
+        .route("/v4/channels/rename", post(rename_channel_name_v4))
+        .route("/v4/channels/delete", post(delete_channel_v4))
+        .route("/v4/channels/nominee", post(set_channel_nominee_v4))
+        .route("/v4/channels/handover", post(handover_channel_name_v4))
+        .route("/v4/relay-mailbox/offer", post(relay_mailbox_offer))
+        .route(
+            "/v2/relay-tickets/{ticket_id}/accept",
+            post(relay_ticket_accept),
+        )
+        .route_layer(rate_gate(BodyRateGate::General));
+    let ticket_read_body_routes = Router::new()
+        .route("/v4/relay-mailbox/poll", post(relay_mailbox_poll))
+        .route(
+            "/v2/relay-tickets/{ticket_id}/status",
+            post(relay_ticket_status),
+        )
+        .route_layer(rate_gate(BodyRateGate::TicketRead));
+    let punch_body_routes = Router::new()
+        .route("/v3/punch/register", post(punch_register_v3))
+        .route("/v4/punch/register", post(punch_register_v4))
+        .route_layer(rate_gate(BodyRateGate::Punch));
+
+    Router::new()
+        .merge(general_body_routes)
+        .merge(ticket_read_body_routes)
+        .merge(punch_body_routes)
+        .route("/lookup/{id}", get(legacy_presence_lookup_gone))
+        .route("/v3/identity/{id}", get(legacy_identity_lookup))
+        .route("/v4/protocol", get(protocol_v4))
         .route("/punch", post(legacy_punch_gone))
         .route("/punch/{id}", get(legacy_punch_gone))
         .route("/v2/punch/register", post(legacy_punch_gone))
         .route("/v2/punch/poll", post(legacy_punch_gone))
         .route("/v2/punch/ack", post(legacy_punch_gone))
-        .route("/v3/punch/register", post(punch_register_v3))
-        .route("/v3/punch/poll", post(punch_poll_v3))
-        .route("/v3/punch/ack", post(punch_ack_v3))
-        .route("/v4/punch/register", post(punch_register_v4))
-        .route("/v4/punch/poll", post(punch_poll_v4))
-        .route("/v4/punch/ack", post(punch_ack_v4))
-        .route("/v4/channels/username", post(claim_channel_username_v4))
-        .route("/v4/channels/name", post(claim_channel_name_v4))
-        .route("/v4/channels/delete", post(delete_channel_v4))
-        .route("/v4/channels/nominee", post(set_channel_nominee_v4))
-        .route("/v4/channels/handover", post(handover_channel_name_v4))
         .route("/v4/channels/directory", get(channel_directory_v4))
         .route("/v4/channels/deleted", get(channel_deleted_v4))
         .route("/v2/relay-tickets/offer", post(legacy_punch_gone))
         .route("/v2/relay-tickets/poll", post(legacy_punch_gone))
         .route("/v3/relay-tickets/poll", post(legacy_punch_gone))
-        .route("/v4/relay-mailbox/offer", post(relay_mailbox_offer))
-        .route("/v4/relay-mailbox/poll", post(relay_mailbox_poll))
-        .route(
-            "/v2/relay-tickets/{ticket_id}/accept",
-            post(relay_ticket_accept),
-        )
-        .route(
-            "/v2/relay-tickets/{ticket_id}/status",
-            post(relay_ticket_status),
-        )
         .route("/v2/relay/{ticket_id}", get(relay_ws))
         .route("/relay/{session_id}", get(legacy_relay_gone))
         .route("/relay-invite", post(legacy_relay_gone))
@@ -5172,7 +6310,60 @@ async fn main() {
         .route("/health", get(health))
         .route("/stats", get(stats_handler))
         .layer(DefaultBodyLimit::max(64 * 1024))
-        .with_state(state);
+        .with_state(state)
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "ember_rendezvous=info".into()),
+        )
+        .init();
+
+    // Pins the replay guard's monotonic base to the wall clock at startup.
+    ReplayNow::current();
+    let state = AppState {
+        store: Arc::new(RwLock::new(HashMap::new())),
+        capability_store: Arc::new(RwLock::new(HashMap::new())),
+        rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+        legacy_identity_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+        ticket_read_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+        punch_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+        channel_create_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+        channel_create_network_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+        punch_requests: Arc::new(RwLock::new(PunchStore::default())),
+        relay_sessions: Arc::new(RwLock::new(HashMap::new())),
+        bridged_relays: Arc::new(RwLock::new(HashMap::new())),
+        relay_admissions: Arc::new(RwLock::new(HashMap::new())),
+        relay_network_counts: Arc::new(RwLock::new(HashMap::new())),
+        next_relay_reservation_id: Arc::new(AtomicU64::new(1)),
+        relay_tickets: Arc::new(RwLock::new(RelayTicketStore::default())),
+        relay_token_key: {
+            let mut key = [0u8; 32];
+            OsRng.fill_bytes(&mut key);
+            key
+        },
+        replay_guard: Arc::new(RwLock::new(ReplayGuard::default())),
+        store_purge: Arc::new(PurgeThrottle::default()),
+        capability_purge: Arc::new(PurgeThrottle::default()),
+        poll_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
+        status_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
+        started_at: Instant::now(),
+        channels_registry: load_channels_registry(),
+        registry_persister: Arc::new(RegistryPersister::default()),
+    };
+
+    tokio::spawn(sweep_expired(state.clone()));
+    let channels_registry = state.channels_registry.clone();
+    let registry_persister = state.registry_persister.clone();
+    tokio::spawn(flush_channels_registry_periodically(
+        channels_registry.clone(),
+        registry_persister.clone(),
+    ));
+
+    let app = build_router(state);
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -5193,6 +6384,7 @@ async fn main() {
         MAX_HTTP_CONNECTIONS - RESERVED_HEALTH_CONNECTIONS,
     ));
     let health_reserve = Arc::new(tokio::sync::Semaphore::new(RESERVED_HEALTH_CONNECTIONS));
+    let network_limiter = NetworkConnectionLimiter::default();
     let mut shutdown = Box::pin(shutdown_signal());
     loop {
         tokio::select! {
@@ -5205,6 +6397,7 @@ async fn main() {
                         continue;
                     }
                 };
+                let network_slot = Arc::new(std::sync::Mutex::new(None));
                 let (permit, reserve_only) = match ordinary.clone().try_acquire_owned() {
                     Ok(permit) => (permit, false),
                     Err(_) => match health_reserve.clone().try_acquire_owned() {
@@ -5216,12 +6409,15 @@ async fn main() {
                     },
                 };
                 let app = app.clone();
+                let network_limiter = network_limiter.clone();
                 tokio::spawn(async move {
                     use tower::ServiceExt;
                     let _permit = permit;
                     let service = hyper::service::service_fn(
                         move |request: hyper::Request<hyper::body::Incoming>| {
                             let app = app.clone();
+                            let network_limiter = network_limiter.clone();
+                            let network_slot = network_slot.clone();
                             async move {
                                 let path = request.uri().path().to_owned();
                                 if !http_path_admitted(reserve_only, &path) {
@@ -5229,6 +6425,21 @@ async fn main() {
                                         .status(StatusCode::SERVICE_UNAVAILABLE)
                                         .header("connection", "close")
                                         .body(axum::body::Body::from("reserved for health"))
+                                        .expect("static HTTP response is valid");
+                                    return Ok::<_, std::convert::Infallible>(response);
+                                }
+                                if !admit_client_network(
+                                    &network_limiter,
+                                    &network_slot,
+                                    &path,
+                                    extract_client_ip(request.headers(), peer_addr),
+                                ) {
+                                    let response = hyper::Response::builder()
+                                        .status(StatusCode::TOO_MANY_REQUESTS)
+                                        .header("connection", "close")
+                                        .body(axum::body::Body::from(
+                                            "too many connections from this network",
+                                        ))
                                         .expect("static HTTP response is valid");
                                     return Ok::<_, std::convert::Infallible>(response);
                                 }
@@ -5293,6 +6504,11 @@ async fn main() {
             }
         }
     }
+    if close_channels_registry(&channels_registry, &registry_persister).await {
+        info!("channels registry flushed for shutdown");
+    } else {
+        warn!("could not flush the channels registry at shutdown");
+    }
 }
 
 async fn shutdown_signal() {
@@ -5335,19 +6551,23 @@ mod relay_ticket_tests {
             ticket_read_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
             punch_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
             channel_create_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
-            punch_requests: Arc::new(RwLock::new(HashMap::new())),
+            channel_create_network_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+            punch_requests: Arc::new(RwLock::new(PunchStore::default())),
             relay_sessions: Arc::new(RwLock::new(HashMap::new())),
             bridged_relays: Arc::new(RwLock::new(HashMap::new())),
             relay_admissions: Arc::new(RwLock::new(HashMap::new())),
-            relay_ip_counts: Arc::new(RwLock::new(HashMap::new())),
+            relay_network_counts: Arc::new(RwLock::new(HashMap::new())),
             next_relay_reservation_id: Arc::new(AtomicU64::new(1)),
             relay_tickets: Arc::new(RwLock::new(RelayTicketStore::default())),
             relay_token_key: [0x5a; 32],
-            replay_cache: Arc::new(RwLock::new(ReplayCache::default())),
+            replay_guard: Arc::new(RwLock::new(ReplayGuard::default())),
+            store_purge: Arc::new(PurgeThrottle::default()),
+            capability_purge: Arc::new(PurgeThrottle::default()),
             poll_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
             status_read_nonces: Arc::new(RwLock::new(ScopedNonceCache::new())),
             started_at: Instant::now(),
             channels_registry: Arc::new(RwLock::new(registry::ChannelRegistry::in_memory())),
+            registry_persister: Arc::new(RegistryPersister::default()),
         }
     }
 
@@ -5484,6 +6704,7 @@ mod relay_ticket_tests {
                     sig: hex::encode(bob.sign(&register_message).to_bytes()),
                     intro: true,
                     legacy_sig: Some(hex::encode(bob.sign(&legacy_register_message).to_bytes())),
+                    intro_key: None,
                 }),
             )
             .await,
@@ -5559,6 +6780,7 @@ mod relay_ticket_tests {
                     sig: hex::encode(alice.sign(&attacker_message).to_bytes()),
                     intro: true,
                     legacy_sig: Some(hex::encode(alice.sign(&attacker_legacy_message).to_bytes(),)),
+                    intro_key: None,
                 }),
             )
             .await,
@@ -5614,6 +6836,7 @@ mod relay_ticket_tests {
                 // Skipping the derivation proof is the whole point of the squat.
                 intro: false,
                 legacy_sig: None,
+                intro_key: None,
             }
         };
 
@@ -5654,6 +6877,7 @@ mod relay_ticket_tests {
                     sig: hex::encode(victim.sign(&owner_message).to_bytes()),
                     intro: true,
                     legacy_sig: None,
+                    intro_key: None,
                 }),
             )
             .await,
@@ -5724,6 +6948,7 @@ mod relay_ticket_tests {
                     sig: hex::encode(alice.sign(&squat_message).to_bytes()),
                     intro: true,
                     legacy_sig: None,
+                    intro_key: None,
                 }),
             )
             .await,
@@ -5734,6 +6959,292 @@ mod relay_ticket_tests {
             state.capability_store.read().await.is_empty(),
             "a refused squat must not leave presence behind"
         );
+    }
+
+    /// The client's per-epoch key derivation, kept here only so the tests can
+    /// produce what a real `ember3:` owner sends.
+    fn client_intro_epoch_key(owner: &[u8; 32], intro_secret: &[u8; 16], epoch: i64) -> [u8; 32] {
+        let mut input = [0u8; 48];
+        input[..32].copy_from_slice(owner);
+        input[32..].copy_from_slice(intro_secret);
+        blake3::derive_key(&format!("ember-intro-epoch-key-v2:{epoch}"), &input)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn intro_register_request(
+        key: &ed25519_dalek::SigningKey,
+        capability: &[u8; 32],
+        epoch: i64,
+        port: u16,
+        octet: u8,
+        intro: bool,
+        intro_key: Option<String>,
+    ) -> CapabilityRegisterRequest {
+        let pubkey = key.verifying_key().to_bytes();
+        let ts = now_unix_secs();
+        let message = build_capability_register_v4_msg(
+            capability,
+            epoch,
+            port,
+            &encode_signed_ip(IpAddr::V4(Ipv4Addr::new(octet, 8, 4, 4))),
+            &pubkey,
+            &pubkey,
+            ts,
+        );
+        CapabilityRegisterRequest {
+            capability: hex::encode(capability),
+            epoch,
+            port,
+            ip: format!("{octet}.8.4.4"),
+            pubkey: hex::encode(pubkey),
+            peer_pubkey: hex::encode(pubkey),
+            ts,
+            sig: hex::encode(key.sign(&message).to_bytes()),
+            intro,
+            legacy_sig: None,
+            intro_key,
+        }
+    }
+
+    async fn register_v4(state: &AppState, request: CapabilityRegisterRequest) -> StatusCode {
+        capability_register_v4(
+            State(state.clone()),
+            ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(request),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_protocol_probe_advertises_sealed_intro() {
+        let Json(body) = protocol_v4().await;
+        assert_eq!(body["version"], 4);
+        assert_eq!(body["sealed_intro"], true);
+    }
+
+    #[test]
+    fn sealed_intro_derivation_matches_the_client() {
+        let owner = [0x42u8; 32];
+        let epoch_key = client_intro_epoch_key(&owner, &[0x07; 16], 9);
+        let mut input = [0u8; 64];
+        input[..32].copy_from_slice(&owner);
+        input[32..].copy_from_slice(&epoch_key);
+        assert_eq!(
+            derive_sealed_intro_presence_capability(&owner, &epoch_key, 9),
+            blake3::derive_key("ember-intro-presence-v2:9", &input)
+        );
+        assert_ne!(
+            derive_sealed_intro_presence_capability(&owner, &epoch_key, 9),
+            derive_intro_presence_capability(&owner, 9)
+        );
+    }
+
+    /// An `ember3:` owner registers a capability the server cannot derive from
+    /// the public key, proves it with the epoch key, and gets open-intro
+    /// presence any registered peer can resolve.
+    #[tokio::test]
+    async fn sealed_intro_registration_is_accepted_as_open_intro() {
+        let state = test_state();
+        let (bob, _bob_id, bob_pubkey) = insert_test_identity(&state, 5).await;
+        let (alice, alice_id, alice_pubkey) = insert_test_identity(&state, 3).await;
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let epoch_key = client_intro_epoch_key(&bob_pubkey, &[0x5A; 16], epoch);
+        let capability = derive_sealed_intro_presence_capability(&bob_pubkey, &epoch_key, epoch);
+
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&bob, &capability, epoch, 4662, 8, true, Some(hex::encode(epoch_key))),
+            )
+            .await,
+            StatusCode::OK
+        );
+        let entry = state
+            .capability_store
+            .read()
+            .await
+            .get(&hex::encode(capability))
+            .cloned()
+            .expect("sealed intro stored");
+        assert!(entry.open_intro);
+        assert_eq!(entry.pubkey, bob_pubkey);
+
+        let nonce = [0x2B; 16];
+        let lookup_ts = now_unix_secs();
+        let alice_raw = decode_hex_id(&alice_id).unwrap();
+        let lookup_message = build_capability_lookup_v4_msg(
+            &capability,
+            epoch,
+            &alice_raw,
+            &alice_pubkey,
+            &nonce,
+            lookup_ts,
+        );
+        let response = capability_lookup_v4(
+            State(state.clone()),
+            ConnectInfo("1.1.1.1:2000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(CapabilityLookupRequest {
+                capability: hex::encode(capability),
+                epoch,
+                requester_id: alice_id,
+                requester_pubkey: hex::encode(alice_pubkey),
+                nonce: hex::encode(nonce),
+                ts: lookup_ts,
+                sig: hex::encode(alice.sign(&lookup_message).to_bytes()),
+            }),
+        )
+        .await
+        .expect("a code holder can resolve the sealed intro");
+        assert_eq!(response.0.pubkey, hex::encode(bob_pubkey));
+        assert_eq!(response.0.port, 4662);
+    }
+
+    /// Holding someone's `ember3:` code yields their secret and so their
+    /// capability, but not a claim to it: the proof is recomputed under the
+    /// registrant's own key.
+    #[tokio::test]
+    async fn a_code_holder_cannot_claim_a_sealed_intro() {
+        let state = test_state();
+        let (_bob, _bob_id, bob_pubkey) = insert_test_identity(&state, 5).await;
+        let (alice, _alice_id, _alice_pubkey) = insert_test_identity(&state, 3).await;
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let epoch_key = client_intro_epoch_key(&bob_pubkey, &[0x5A; 16], epoch);
+        let capability = derive_sealed_intro_presence_capability(&bob_pubkey, &epoch_key, epoch);
+
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&alice, &capability, epoch, 4663, 1, true, Some(hex::encode(epoch_key))),
+            )
+            .await,
+            SEALED_INTRO_REJECTED
+        );
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&alice, &capability, epoch, 4664, 1, true, None),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "a sealed capability is not a valid legacy intro either"
+        );
+        assert!(state.capability_store.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_or_misplaced_intro_keys_are_refused() {
+        let state = test_state();
+        let (bob, _bob_id, bob_pubkey) = insert_test_identity(&state, 5).await;
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let epoch_key = client_intro_epoch_key(&bob_pubkey, &[0x5A; 16], epoch);
+        let capability = derive_sealed_intro_presence_capability(&bob_pubkey, &epoch_key, epoch);
+
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&bob, &capability, epoch, 4662, 8, false, Some(hex::encode(epoch_key))),
+            )
+            .await,
+            SEALED_INTRO_REJECTED,
+            "an intro key on a pairwise registration is refused"
+        );
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&bob, &capability, epoch, 4663, 8, true, Some("zz".repeat(32))),
+            )
+            .await,
+            SEALED_INTRO_REJECTED
+        );
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&bob, &capability, epoch, 4664, 8, true, Some(hex::encode([0u8; 16]))),
+            )
+            .await,
+            SEALED_INTRO_REJECTED
+        );
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&bob, &capability, epoch, 4665, 8, true, Some(hex::encode([0x11u8; 32]))),
+            )
+            .await,
+            SEALED_INTRO_REJECTED,
+            "a key that does not derive the capability is no proof"
+        );
+        assert!(state.capability_store.read().await.is_empty());
+    }
+
+    /// Only a sealed-intro-specific refusal uses `SEALED_INTRO_REJECTED`; the
+    /// generic failures a correct sealed registration can still hit keep
+    /// their own statuses, so the client does not mistake them for "sealed
+    /// intro unsupported" and downgrade.
+    #[tokio::test]
+    async fn generic_rejections_of_a_valid_sealed_intro_keep_their_own_status() {
+        let state = test_state();
+        let bob = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let bob_pubkey = bob.verifying_key().to_bytes();
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let epoch_key = client_intro_epoch_key(&bob_pubkey, &[0x5A; 16], epoch);
+        let capability = derive_sealed_intro_presence_capability(&bob_pubkey, &epoch_key, epoch);
+
+        // Owner not registered, as after a server restart.
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&bob, &capability, epoch, 4662, 8, true, Some(hex::encode(epoch_key))),
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+
+        insert_test_identity(&state, 5).await;
+        let mut stale =
+            intro_register_request(&bob, &capability, epoch, 4663, 8, true, Some(hex::encode(epoch_key)));
+        stale.ts -= 24 * 3600;
+        assert_eq!(register_v4(&state, stale).await, StatusCode::BAD_REQUEST);
+        assert!(state.capability_store.read().await.is_empty());
+    }
+
+    /// Same reclaim guarantee as the legacy intro: a code holder can squat the
+    /// namespace as a pairwise entry, and the proved owner takes it back.
+    #[tokio::test]
+    async fn a_sealed_intro_owner_reclaims_a_namespace_squatted_as_pairwise() {
+        let state = test_state();
+        let (bob, _bob_id, bob_pubkey) = insert_test_identity(&state, 5).await;
+        let (alice, _alice_id, _alice_pubkey) = insert_test_identity(&state, 3).await;
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let epoch_key = client_intro_epoch_key(&bob_pubkey, &[0x5A; 16], epoch);
+        let capability = derive_sealed_intro_presence_capability(&bob_pubkey, &epoch_key, epoch);
+
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&alice, &capability, epoch, 4663, 1, false, None),
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            register_v4(
+                &state,
+                intro_register_request(&bob, &capability, epoch, 4662, 8, true, Some(hex::encode(epoch_key))),
+            )
+            .await,
+            StatusCode::OK
+        );
+        let entry = state
+            .capability_store
+            .read()
+            .await
+            .get(&hex::encode(capability))
+            .cloned()
+            .expect("reclaimed");
+        assert_eq!(entry.pubkey, bob_pubkey);
+        assert!(entry.open_intro);
     }
 
     #[tokio::test]
@@ -5777,6 +7288,7 @@ mod relay_ticket_tests {
                 sig: hex::encode(bob.sign(&register_message).to_bytes()),
                 intro: false,
                 legacy_sig: Some(hex::encode(bob.sign(&legacy_register_message).to_bytes())),
+                intro_key: None,
             }),
         )
         .await;
@@ -5883,6 +7395,7 @@ mod relay_ticket_tests {
                 sig: hex::encode(bob.sign(&register_message).to_bytes()),
                 intro: false,
                 legacy_sig: None,
+                intro_key: None,
             }),
         )
         .await;
@@ -6051,6 +7564,15 @@ mod relay_ticket_tests {
         (initiator_token, responder_token)
     }
 
+    async fn join_from(
+        state: &AppState,
+        ticket_id: &str,
+        token: &str,
+        ip: &str,
+    ) -> Result<RelayRole, StatusCode> {
+        admit_relay_ticket_join(state, ticket_id, token, ip.parse().unwrap()).await
+    }
+
     fn ticket_for_test(responder_id: &str, accepted: bool) -> RelayTicket {
         ticket_with_parties(&"11".repeat(32), responder_id, accepted)
     }
@@ -6133,6 +7655,228 @@ mod relay_ticket_tests {
                 MAX_POLL_READ_NONCES,
             ),
             IdempotentReadAdmission::Idempotent
+        );
+    }
+
+    #[test]
+    fn rate_key_is_the_address_for_ipv4_and_the_slash_64_for_ipv6() {
+        let v4: IpAddr = "203.0.113.9".parse().unwrap();
+        assert_eq!(rate_key(v4), v4, "IPv4 is not grouped, to spare CGNAT neighbours");
+        assert_eq!(
+            rate_key("::ffff:203.0.113.9".parse().unwrap()),
+            v4,
+            "a mapped IPv4 address is the same client as the plain one"
+        );
+        assert_eq!(
+            rate_key("2001:db8:1:2:aaaa:bbbb:cccc:dddd".parse().unwrap()),
+            "2001:db8:1:2::".parse::<IpAddr>().unwrap()
+        );
+        assert_ne!(
+            rate_key("2001:db8:1:2::1".parse().unwrap()),
+            rate_key("2001:db8:1:3::1".parse().unwrap()),
+            "neighbouring /64s stay separate"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_ipv6_slash_64_shares_a_single_general_budget() {
+        let state = test_state();
+        for i in 0..MAX_REQUESTS_PER_MINUTE {
+            let ip: IpAddr = format!("2001:db8:7:7::{:x}", i + 1).parse().unwrap();
+            assert!(check_rate_limit(&state, ip).await);
+        }
+        let rotated: IpAddr = "2001:db8:7:7:ffff:ffff:ffff:ffff".parse().unwrap();
+        assert!(
+            !check_rate_limit(&state, rotated).await,
+            "rotating the interface id must not buy a fresh budget"
+        );
+        assert!(
+            rate_budget_exhausted(&state.rate_limits, rotated, MAX_REQUESTS_PER_MINUTE).await,
+            "the pre-body gate must see the same /64 bucket"
+        );
+        assert!(check_rate_limit(&state, "2001:db8:7:8::1".parse().unwrap()).await);
+        assert_eq!(state.rate_limits.read().await.entries.len(), 2);
+    }
+
+    #[test]
+    fn a_full_rate_bucket_evicts_its_oldest_window_instead_of_refusing() {
+        let mut bucket = RateBucket::default();
+        let t0 = Instant::now();
+        let a: IpAddr = "198.51.100.1".parse().unwrap();
+        let b: IpAddr = "198.51.100.2".parse().unwrap();
+        let c: IpAddr = "198.51.100.3".parse().unwrap();
+        assert!(bucket.charge(a, 5, RATE_WINDOW, t0, 2));
+        assert!(bucket.charge(b, 5, RATE_WINDOW, t0 + Duration::from_secs(1), 2));
+        assert!(
+            bucket.charge(c, 5, RATE_WINDOW, t0 + Duration::from_secs(2), 2),
+            "a newcomer is admitted at capacity"
+        );
+        assert_eq!(bucket.entries.len(), 2);
+        assert!(!bucket.entries.contains_key(&a), "the oldest window went");
+        assert!(bucket.entries.contains_key(&b) && bucket.entries.contains_key(&c));
+        assert_eq!(bucket.by_age.len(), bucket.entries.len());
+    }
+
+    #[test]
+    fn a_rate_window_reset_moves_the_entry_to_the_young_end() {
+        let mut bucket = RateBucket::default();
+        let t0 = Instant::now();
+        let a: IpAddr = "198.51.100.1".parse().unwrap();
+        let b: IpAddr = "198.51.100.2".parse().unwrap();
+        let c: IpAddr = "198.51.100.3".parse().unwrap();
+        assert!(bucket.charge(a, 5, RATE_WINDOW, t0, 2));
+        assert!(bucket.charge(b, 5, RATE_WINDOW, t0 + Duration::from_secs(1), 2));
+        // `a`'s window lapses and restarts, so `b` is now the oldest.
+        let later = t0 + RATE_WINDOW + Duration::from_secs(1);
+        assert!(bucket.charge(a, 5, RATE_WINDOW, later, 2));
+        assert!(bucket.charge(c, 5, RATE_WINDOW, later, 2));
+        assert!(bucket.entries.contains_key(&a));
+        assert!(!bucket.entries.contains_key(&b));
+        assert_eq!(bucket.by_age.len(), bucket.entries.len());
+    }
+
+    #[test]
+    fn rate_bucket_prune_drops_only_lapsed_windows_and_keeps_the_index_in_step() {
+        let mut bucket = RateBucket::default();
+        let t0 = Instant::now();
+        let old: IpAddr = "198.51.100.1".parse().unwrap();
+        let fresh: IpAddr = "198.51.100.2".parse().unwrap();
+        assert!(bucket.charge(old, 5, RATE_WINDOW, t0, MAX_RATE_ENTRIES));
+        assert!(bucket.charge(
+            fresh,
+            5,
+            RATE_WINDOW,
+            t0 + RATE_WINDOW,
+            MAX_RATE_ENTRIES
+        ));
+        bucket.prune(t0 + RATE_WINDOW * 2, RATE_WINDOW * 2);
+        assert!(!bucket.entries.contains_key(&old));
+        assert!(bucket.entries.contains_key(&fresh));
+        assert_eq!(bucket.by_age.len(), 1);
+    }
+
+    #[test]
+    fn a_rate_bucket_still_counts_within_a_window() {
+        let mut bucket = RateBucket::default();
+        let t0 = Instant::now();
+        let ip: IpAddr = "198.51.100.1".parse().unwrap();
+        for _ in 0..3 {
+            assert!(bucket.charge(ip, 3, RATE_WINDOW, t0, MAX_RATE_ENTRIES));
+        }
+        assert!(!bucket.charge(ip, 3, RATE_WINDOW, t0, MAX_RATE_ENTRIES));
+        assert!(bucket.exhausted(ip, 3, RATE_WINDOW, t0));
+        assert!(!bucket.exhausted(ip, 3, RATE_WINDOW, t0 + RATE_WINDOW));
+    }
+
+    #[tokio::test]
+    async fn the_create_budget_is_pooled_per_slash_24_on_top_of_per_address() {
+        let state = test_state();
+        let per_addr = MAX_CHANNEL_CREATES_PER_HOUR;
+        let addresses = MAX_CHANNEL_CREATES_PER_NETWORK_PER_HOUR / per_addr;
+        for host in 1..=addresses {
+            let ip: IpAddr = format!("203.0.113.{host}").parse().unwrap();
+            for _ in 0..per_addr {
+                assert!(check_channel_create_rate_limit(&state, ip).await);
+            }
+            assert!(
+                !check_channel_create_rate_limit(&state, ip).await,
+                "each address still has its own ceiling"
+            );
+        }
+        assert_eq!(
+            state
+                .channel_create_network_rate_limits
+                .read()
+                .await
+                .entries
+                .get(&"203.0.113.0".parse::<IpAddr>().unwrap())
+                .unwrap()
+                .count,
+            MAX_CHANNEL_CREATES_PER_NETWORK_PER_HOUR,
+            "refusals at the per-address tier must not drain the shared pool"
+        );
+        let next: IpAddr = format!("203.0.113.{}", addresses + 1).parse().unwrap();
+        assert!(
+            !check_channel_create_rate_limit(&state, next).await,
+            "a fresh address in an exhausted /24 gets nothing"
+        );
+        assert!(
+            check_channel_create_rate_limit(&state, "203.0.114.1".parse().unwrap()).await,
+            "a neighbouring /24 is unaffected"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_pool_does_not_spend_the_address_allowance() {
+        let mut per_address = RateBucket::default();
+        let mut per_network = RateBucket::default();
+        let t0 = Instant::now();
+        let hosts = MAX_CHANNEL_CREATES_PER_NETWORK_PER_HOUR / MAX_CHANNEL_CREATES_PER_HOUR;
+        for host in 1..=hosts {
+            let ip: IpAddr = format!("203.0.113.{host}").parse().unwrap();
+            for _ in 0..MAX_CHANNEL_CREATES_PER_HOUR {
+                assert!(admit_channel_create(&mut per_address, &mut per_network, ip, t0));
+            }
+        }
+
+        let latecomer: IpAddr = "203.0.113.200".parse().unwrap();
+        for _ in 0..MAX_CHANNEL_CREATES_PER_HOUR * 2 {
+            assert!(
+                !admit_channel_create(&mut per_address, &mut per_network, latecomer, t0),
+                "the pool is exhausted"
+            );
+        }
+        assert!(
+            !per_address.entries.contains_key(&latecomer),
+            "refused retries must not touch the address's own count"
+        );
+
+        let pool_reset = t0 + CHANNEL_CREATE_WINDOW;
+        for _ in 0..MAX_CHANNEL_CREATES_PER_HOUR {
+            assert!(
+                admit_channel_create(&mut per_address, &mut per_network, latecomer, pool_reset),
+                "the full personal allowance survives the pool's recovery"
+            );
+        }
+        assert!(!admit_channel_create(
+            &mut per_address,
+            &mut per_network,
+            latecomer,
+            pool_reset
+        ));
+    }
+
+    #[test]
+    fn an_over_limit_address_does_not_drain_the_pool() {
+        let mut per_address = RateBucket::default();
+        let mut per_network = RateBucket::default();
+        let t0 = Instant::now();
+        let ip: IpAddr = "203.0.113.1".parse().unwrap();
+        for _ in 0..MAX_CHANNEL_CREATES_PER_HOUR {
+            assert!(admit_channel_create(&mut per_address, &mut per_network, ip, t0));
+        }
+        for _ in 0..10 {
+            assert!(!admit_channel_create(&mut per_address, &mut per_network, ip, t0));
+        }
+        assert_eq!(
+            per_network
+                .entries
+                .get(&"203.0.113.0".parse::<IpAddr>().unwrap())
+                .unwrap()
+                .count,
+            MAX_CHANNEL_CREATES_PER_HOUR
+        );
+    }
+
+    #[tokio::test]
+    async fn the_create_budget_is_per_slash_64_for_ipv6() {
+        let state = test_state();
+        for i in 0..MAX_CHANNEL_CREATES_PER_HOUR {
+            let ip: IpAddr = format!("2001:db8:9:9::{:x}", i + 1).parse().unwrap();
+            assert!(check_channel_create_rate_limit(&state, ip).await);
+        }
+        assert!(
+            !check_channel_create_rate_limit(&state, "2001:db8:9:9::beef".parse().unwrap()).await
         );
     }
 
@@ -6239,6 +7983,7 @@ mod relay_ticket_tests {
                         sig: hex::encode(owner.sign(&v4).to_bytes()),
                         intro: false,
                         legacy_sig: Some(hex::encode(owner.sign(&legacy).to_bytes())),
+                        intro_key: None,
                     }),
                 )
                 .await,
@@ -6291,6 +8036,7 @@ mod relay_ticket_tests {
                     sig: hex::encode(owner.sign(&legacy).to_bytes()),
                     intro: false,
                     legacy_sig: None,
+                    intro_key: None,
                 }),
             )
             .await,
@@ -6310,32 +8056,247 @@ mod relay_ticket_tests {
         drop(peer);
     }
 
+    const T: i64 = 1_700_000_000;
+
+    fn admit_one_time(guard: &mut ReplayGuard, key: u8, scope: u64, ts: i64, digest: u128, now: i64) -> ReplayAdmission {
+        guard.admit([key; 32], scope, ts, digest, ReplayMode::OneTime, ReplayNow::at(now))
+    }
+
     #[test]
-    fn replay_cache_fails_closed_without_evicting_fresh_entries() {
-        let now = Instant::now();
-        let mut cache = ReplayCache::default();
+    fn a_one_time_request_is_accepted_once() {
+        let mut guard = ReplayGuard::default();
+        assert_eq!(admit_one_time(&mut guard, 1, 7, T, 1, T), ReplayAdmission::Accepted);
+        assert_eq!(admit_one_time(&mut guard, 1, 7, T, 1, T + 60), ReplayAdmission::Replay);
+        // Same second, different request: accepted once as well.
+        assert_eq!(admit_one_time(&mut guard, 1, 7, T, 2, T), ReplayAdmission::Accepted);
+        assert_eq!(admit_one_time(&mut guard, 1, 7, T, 2, T), ReplayAdmission::Replay);
+        // A newer request supersedes the scope; nothing older gets back in.
+        assert_eq!(admit_one_time(&mut guard, 1, 7, T + 5, 3, T + 5), ReplayAdmission::Accepted);
+        assert_eq!(admit_one_time(&mut guard, 1, 7, T, 4, T + 5), ReplayAdmission::Replay);
+        assert_eq!(admit_one_time(&mut guard, 1, 7, T + 4, 5, T + 5), ReplayAdmission::Replay);
+        // Other scopes and other keys keep their own clocks.
+        assert_eq!(admit_one_time(&mut guard, 1, 8, T, 6, T + 5), ReplayAdmission::Accepted);
+        assert_eq!(admit_one_time(&mut guard, 2, 7, T, 1, T + 5), ReplayAdmission::Accepted);
+        assert_eq!(guard.marks, 3, "one scope's superseded marks are released");
         assert_eq!(
-            admit_replay_key(&mut cache, [1; 32], now, 2),
-            ReplayCacheAdmission::Remembered
+            admit_one_time(&mut guard, 3, 7, T - MAX_TIMESTAMP_SKEW_SECS - 1, 1, T),
+            ReplayAdmission::Stale,
+            "the guard re-checks freshness against its own clock"
         );
+        assert_eq!(replay_status(ReplayAdmission::Replay), Err(StatusCode::CONFLICT));
+        assert_eq!(replay_status(ReplayAdmission::Stale), Err(StatusCode::BAD_REQUEST));
         assert_eq!(
-            admit_replay_key(&mut cache, [2; 32], now, 2),
-            ReplayCacheAdmission::Remembered
-        );
-        assert_eq!(
-            admit_replay_key(&mut cache, [3; 32], now, 2),
-            ReplayCacheAdmission::Full
-        );
-        assert!(cache.entries.contains_key(&[1; 32]));
-        assert!(cache.entries.contains_key(&[2; 32]));
-        assert!(!cache.entries.contains_key(&[3; 32]));
-        assert_eq!(
-            replay_cache_status(ReplayCacheAdmission::Full),
+            replay_status(ReplayAdmission::Full),
             Err(StatusCode::SERVICE_UNAVAILABLE)
         );
+    }
+
+    #[test]
+    fn an_idempotent_scope_allows_only_the_newest_request_again() {
+        let mut guard = ReplayGuard::default();
+        let admit = |guard: &mut ReplayGuard, ts, digest| {
+            guard.admit([1; 32], 9, ts, digest, ReplayMode::IdempotentRepeat, ReplayNow::at(T))
+        };
+        assert_eq!(admit(&mut guard, T, 1), ReplayAdmission::Accepted);
+        assert_eq!(admit(&mut guard, T, 1), ReplayAdmission::Repeat);
+        assert_eq!(admit(&mut guard, T, 2), ReplayAdmission::Accepted);
+        assert_eq!(admit(&mut guard, T, 2), ReplayAdmission::Repeat);
         assert_eq!(
-            replay_cache_status(ReplayCacheAdmission::Replay),
-            Err(StatusCode::CONFLICT)
+            admit(&mut guard, T, 1),
+            ReplayAdmission::Replay,
+            "an earlier state from the same second would roll the newer one back"
+        );
+        assert_eq!(admit(&mut guard, T + 1, 3), ReplayAdmission::Accepted);
+        assert_eq!(admit(&mut guard, T, 2), ReplayAdmission::Replay);
+    }
+
+    /// One key flooding distinct scopes stays within its own mark budget and
+    /// pays for it alone; what it gives up stays refused.
+    #[test]
+    fn a_flooding_key_is_bounded_and_leaves_other_keys_alone() {
+        let mut guard = ReplayGuard::with_limits(100, 200, 8);
+        for scope in 0..1_000u64 {
+            let admission = admit_one_time(&mut guard, 1, scope, T + scope as i64 / 10, scope as u128, T + 100);
+            assert!(
+                matches!(admission, ReplayAdmission::Accepted | ReplayAdmission::Replay),
+                "{admission:?}"
+            );
+        }
+        assert!(guard.keys[&[1; 32]].marks.len() <= 8);
+        assert!(guard.marks <= 8);
+        assert_eq!(
+            admit_one_time(&mut guard, 1, 0, T, 0, T + 100),
+            ReplayAdmission::Replay,
+            "an evicted mark's request is still refused by the raised floor"
+        );
+        for key in 2..50u8 {
+            assert_eq!(admit_one_time(&mut guard, key, 0, T, 0, T + 100), ReplayAdmission::Accepted);
+            assert_eq!(admit_one_time(&mut guard, key, 0, T, 0, T + 100), ReplayAdmission::Replay);
+        }
+    }
+
+    /// When every key is still inside the skew window the guard refuses a new
+    /// key rather than evict one — eviction is only ever of lapsed keys.
+    #[test]
+    fn capacity_never_evicts_a_key_that_can_still_be_replayed() {
+        let mut guard = ReplayGuard::with_limits(2, 100, 8);
+        assert_eq!(admit_one_time(&mut guard, 1, 0, T, 1, T), ReplayAdmission::Accepted);
+        // A future-dated request keeps its key live for longer.
+        assert_eq!(
+            admit_one_time(&mut guard, 2, 0, T + MAX_TIMESTAMP_SKEW_SECS, 1, T),
+            ReplayAdmission::Accepted
+        );
+        assert_eq!(admit_one_time(&mut guard, 3, 0, T, 1, T), ReplayAdmission::Full);
+        assert_eq!(admit_one_time(&mut guard, 1, 0, T, 1, T), ReplayAdmission::Replay);
+
+        let lapsed = T + MAX_TIMESTAMP_SKEW_SECS + 1;
+        assert_eq!(admit_one_time(&mut guard, 3, 0, lapsed, 1, lapsed), ReplayAdmission::Accepted);
+        assert!(!guard.keys.contains_key(&[1; 32]), "key 1 lapsed and was evicted");
+        assert!(guard.keys.contains_key(&[2; 32]), "key 2 is still replayable");
+        assert_eq!(
+            admit_one_time(&mut guard, 1, 0, T, 1, lapsed),
+            ReplayAdmission::Stale,
+            "the evicted key's request can no longer pass freshness"
+        );
+        assert_eq!(
+            admit_one_time(&mut guard, 2, 0, T + MAX_TIMESTAMP_SKEW_SECS, 1, lapsed),
+            ReplayAdmission::Replay
+        );
+        assert_eq!(admit_one_time(&mut guard, 4, 0, lapsed, 1, lapsed), ReplayAdmission::Full);
+    }
+
+    /// Filling the shared pool makes a key recycle its own marks instead of
+    /// taking more, so a pool full of one sender does not refuse everyone.
+    #[test]
+    fn a_full_mark_pool_makes_busy_keys_recycle_their_own_marks() {
+        let mut guard = ReplayGuard::with_limits(10, 4, 4);
+        for scope in 0..4 {
+            assert_eq!(
+                admit_one_time(&mut guard, 1, scope, T + scope as i64, 1, T + 10),
+                ReplayAdmission::Accepted
+            );
+        }
+        assert_eq!(guard.marks, 4);
+        assert_eq!(admit_one_time(&mut guard, 2, 0, T, 1, T + 10), ReplayAdmission::Full);
+        assert_eq!(admit_one_time(&mut guard, 1, 9, T + 10, 1, T + 10), ReplayAdmission::Accepted);
+        assert_eq!(guard.marks, 4);
+        assert_eq!(admit_one_time(&mut guard, 1, 0, T, 1, T + 10), ReplayAdmission::Replay);
+    }
+
+    /// A backward wall-clock step must not re-admit what the guard already
+    /// forgot, and must not make it forget anything more until wall time
+    /// catches up.
+    #[test]
+    fn a_backward_wall_clock_step_does_not_reopen_dropped_replays() {
+        let mut guard = ReplayGuard::with_limits(1, 10, 8);
+        let start = ReplayNow::from_parts(T, 0, T);
+        assert_eq!(guard.admit([1; 32], 0, T, 1, ReplayMode::OneTime, start), ReplayAdmission::Accepted);
+
+        // Time passes normally; key 1 lapses and is evicted for key 2.
+        let lapsed = T + MAX_TIMESTAMP_SKEW_SECS + 1;
+        let later = ReplayNow::from_parts(T, lapsed - T, lapsed);
+        assert_eq!(
+            guard.admit([2; 32], 0, lapsed, 1, ReplayMode::OneTime, later),
+            ReplayAdmission::Accepted
+        );
+        assert!(!guard.keys.contains_key(&[1; 32]));
+
+        // Then the wall clock steps back far enough that key 1's request would
+        // pass the ordinary freshness check again.
+        let stepped_back = ReplayNow::from_parts(T, lapsed - T + 1, T + 100);
+        assert!(fresh_at(T, stepped_back.wall), "by the stepped-back wall clock it would pass");
+        assert_eq!(
+            guard.admit([1; 32], 0, T, 1, ReplayMode::OneTime, stepped_back),
+            ReplayAdmission::Stale,
+            "a request whose protection was dropped stays refused"
+        );
+        assert_eq!(
+            guard.raise_floor([1; 32], T, stepped_back),
+            ReplayAdmission::Stale,
+            "nor can a dropped unregister be replayed"
+        );
+        assert_eq!(
+            guard.admit([3; 32], 0, T + 100, 1, ReplayMode::OneTime, stepped_back),
+            ReplayAdmission::Full,
+            "key 2 is not evicted while the wall clock is behind"
+        );
+        assert!(guard.keys.contains_key(&[2; 32]));
+
+        let first = ReplayNow::current();
+        let second = ReplayNow::current();
+        assert!(second.lapse >= first.lapse);
+    }
+
+    /// A server that booted with its clock fast and was then corrected must
+    /// accept correctly timed requests again rather than until restart.
+    #[test]
+    fn a_fast_clock_corrected_accepts_requests_again() {
+        let fast = T + 3_600;
+        let mut guard = ReplayGuard::with_limits(10, 100, 8);
+        let booted_fast = ReplayNow::from_parts(fast, 0, fast);
+        assert_eq!(
+            guard.admit([1; 32], 0, fast, 1, ReplayMode::OneTime, booted_fast),
+            ReplayAdmission::Accepted
+        );
+        // NTP corrects the wall clock an hour back; monotonic time keeps going.
+        let corrected = ReplayNow::from_parts(fast, 60, T + 60);
+        assert_eq!(
+            guard.admit([2; 32], 0, T + 60, 1, ReplayMode::OneTime, corrected),
+            ReplayAdmission::Accepted,
+            "nothing was dropped, so correctly timed requests pass at once"
+        );
+        assert_eq!(guard.check_floor(&[3; 32], T + 60, corrected), ReplayAdmission::Accepted);
+        assert_eq!(
+            guard.admit([1; 32], 0, fast, 1, ReplayMode::OneTime, corrected),
+            ReplayAdmission::Stale,
+            "fast-era requests are refused as future-dated"
+        );
+
+        // Had the fast era already dropped protection, one-time requests at or
+        // below what it dropped are held back until wall time passes it —
+        // bounded, where previously it lasted until restart — while
+        // registrations and reads are never held back.
+        let mut dropped = ReplayGuard::with_limits(10, 100, 8);
+        assert_eq!(
+            dropped.admit([1; 32], 0, fast, 1, ReplayMode::OneTime, booted_fast),
+            ReplayAdmission::Accepted
+        );
+        let fast_later = ReplayNow::from_parts(fast, 400, fast + 400);
+        dropped.prune(fast_later);
+        assert!(dropped.keys.is_empty());
+        let corrected = ReplayNow::from_parts(fast, 460, T + 460);
+        assert_eq!(
+            dropped.admit([2; 32], 0, T + 460, 1, ReplayMode::OneTime, corrected),
+            ReplayAdmission::Stale
+        );
+        assert_eq!(dropped.check_floor(&[2; 32], T + 460, corrected), ReplayAdmission::Accepted);
+        dropped.prune(corrected);
+        assert_eq!(dropped.dropped_through, fast, "nothing more is dropped while behind");
+        let caught_up = ReplayNow::from_parts(fast, 4_000, fast + 50);
+        assert_eq!(
+            dropped.admit([1; 32], 0, fast, 1, ReplayMode::OneTime, caught_up),
+            ReplayAdmission::Stale,
+            "the dropped fast-era request is still refused once it looks fresh"
+        );
+        assert_eq!(
+            dropped.admit([4; 32], 0, fast + 50, 1, ReplayMode::OneTime, caught_up),
+            ReplayAdmission::Accepted
+        );
+    }
+
+    #[test]
+    fn a_floor_refuses_everything_signed_before_it() {
+        let mut guard = ReplayGuard::default();
+        let at = ReplayNow::at;
+        assert_eq!(guard.check_floor(&[1; 32], T, at(T)), ReplayAdmission::Accepted);
+        assert_eq!(guard.raise_floor([1; 32], T + 10, at(T + 10)), ReplayAdmission::Accepted);
+        assert_eq!(guard.raise_floor([1; 32], T + 10, at(T + 10)), ReplayAdmission::Replay);
+        assert_eq!(guard.check_floor(&[1; 32], T + 10, at(T + 10)), ReplayAdmission::Replay);
+        assert_eq!(guard.check_floor(&[1; 32], T + 11, at(T + 11)), ReplayAdmission::Accepted);
+        assert_eq!(guard.check_floor(&[2; 32], T, at(T + 11)), ReplayAdmission::Accepted);
+        assert_eq!(
+            admit_one_time(&mut guard, 1, 0, T + 5, 1, T + 11),
+            ReplayAdmission::Replay
         );
     }
 
@@ -6519,7 +8480,7 @@ mod relay_ticket_tests {
             vec![format!("{:064x}", 200)],
             "accepted pair slots must not hide live pending offers"
         );
-        assert!(tickets.pending_by_responder.get(&responder_id).is_some());
+        assert!(tickets.pending_by_responder.contains_key(&responder_id));
     }
 
     /// `(now - ts).abs()` wrapped to `i64::MIN` for a crafted `ts`, which
@@ -6540,7 +8501,7 @@ mod relay_ticket_tests {
     #[test]
     fn open_intro_requesters_only_get_their_share_of_a_targets_punch_slots() {
         let target = "tt".repeat(32);
-        let mut punches = HashMap::new();
+        let mut punches = PunchStore::default();
         let entry = |from: &str, via_open_intro: bool| PunchEntry {
             punch_id: "11".repeat(32),
             from_id: from.to_string(),
@@ -6562,7 +8523,8 @@ mod relay_ticket_tests {
         assert!(!open_intro_punch_slots_exhausted(&punches, &target));
         for i in 0..MAX_PUNCH_PER_TARGET_OPEN_INTRO {
             punches.insert(
-                (target.clone(), format!("{i:064x}")),
+                target.clone(),
+                format!("{i:064x}"),
                 entry(&format!("{i:064x}"), true),
             );
         }
@@ -6573,10 +8535,11 @@ mod relay_ticket_tests {
 
         // Pairwise-bound friends never count against that share, and the share is
         // per target rather than global.
-        let mut pairwise_only = HashMap::new();
+        let mut pairwise_only = PunchStore::default();
         for i in 0..MAX_PUNCH_PER_TARGET {
             pairwise_only.insert(
-                (target.clone(), format!("{i:064x}")),
+                target.clone(),
+                format!("{i:064x}"),
                 entry(&format!("{i:064x}"), false),
             );
         }
@@ -6611,57 +8574,112 @@ mod relay_ticket_tests {
         ));
     }
 
+    fn punch_entry(from: &str, punch_id: &str, created_at: Instant, version: RendezvousVersion) -> PunchEntry {
+        PunchEntry {
+            punch_id: punch_id.to_string(),
+            from_id: from.to_string(),
+            from_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            from_port: 1,
+            nat_type: 1,
+            capability: [1; 32],
+            epoch: 1,
+            created_at,
+            leased_until: None,
+            proof_version: version,
+            register_nonce: Some([1; 16]),
+            register_ts: Some(1),
+            register_sig: Some([1; 64]),
+            from_pubkey: Some([1; 32]),
+            via_open_intro: false,
+        }
+    }
+
     #[test]
     fn punch_lease_prefers_unleased_over_leased_head() {
         let now = Instant::now();
-        let mut punches = HashMap::new();
-        punches.insert(
-            ("tt".repeat(32), "aa".repeat(32)),
-            PunchEntry {
-                punch_id: "11".repeat(32),
-                from_id: "aa".repeat(32),
-                from_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-                from_port: 1,
-                nat_type: 1,
-                capability: [1; 32],
-                epoch: 1,
-                created_at: now,
-                leased_until: Some(now + PUNCH_LEASE),
-                proof_version: RendezvousVersion::IpBoundV4,
-                register_nonce: Some([1; 16]),
-                register_ts: Some(1),
-                register_sig: Some([1; 64]),
-                from_pubkey: Some([1; 32]),
-                via_open_intro: false,
-            },
-        );
-        punches.insert(
-            ("tt".repeat(32), "bb".repeat(32)),
-            PunchEntry {
-                punch_id: "22".repeat(32),
-                from_id: "bb".repeat(32),
-                from_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
-                from_port: 2,
-                nat_type: 1,
-                capability: [2; 32],
-                epoch: 1,
-                created_at: now + Duration::from_millis(1),
-                leased_until: None,
-                proof_version: RendezvousVersion::IpBoundV4,
-                register_nonce: Some([2; 16]),
-                register_ts: Some(1),
-                register_sig: Some([2; 64]),
-                from_pubkey: Some([2; 32]),
-                via_open_intro: false,
-            },
-        );
         let target = "tt".repeat(32);
+        let mut punches = PunchStore::default();
+        let mut leased = punch_entry(&"aa".repeat(32), &"11".repeat(32), now, RendezvousVersion::IpBoundV4);
+        leased.leased_until = Some(now + PUNCH_LEASE);
+        punches.insert(target.clone(), "aa".repeat(32), leased);
+        punches.insert(
+            target.clone(),
+            "bb".repeat(32),
+            punch_entry(
+                &"bb".repeat(32),
+                &"22".repeat(32),
+                now + Duration::from_millis(1),
+                RendezvousVersion::IpBoundV4,
+            ),
+        );
         let chosen = punches
-            .iter()
-            .filter(|((candidate, _), entry)| candidate == &target && punch_available(entry, now))
-            .min_by_key(|(_, entry)| entry.created_at)
-            .map(|(_, entry)| entry.punch_id.clone());
+            .lease_next(&target, RendezvousVersion::IpBoundV4, now)
+            .map(|entry| entry.punch_id.clone());
         assert_eq!(chosen.as_deref(), Some(&*"22".repeat(32)));
+        // Both leased now: a re-poll refreshes the oldest rather than 404ing.
+        let again = punches
+            .lease_next(&target, RendezvousVersion::IpBoundV4, now)
+            .map(|entry| entry.punch_id.clone());
+        assert_eq!(again.as_deref(), Some(&*"11".repeat(32)));
+    }
+
+    #[test]
+    fn the_punch_index_serves_only_its_target_and_version() {
+        let now = Instant::now();
+        let mut punches = PunchStore::default();
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        punches.insert(a.clone(), "01".repeat(32), punch_entry("01", &"11".repeat(32), now, RendezvousVersion::LegacyV3));
+        punches.insert(b.clone(), "02".repeat(32), punch_entry("02", &"22".repeat(32), now, RendezvousVersion::IpBoundV4));
+        assert!(
+            punches.lease_next(&a, RendezvousVersion::IpBoundV4, now).is_none(),
+            "a v4 poll never observes a legacy registration"
+        );
+        assert!(punches.lease_next(&a, RendezvousVersion::LegacyV3, now).is_some());
+        assert_eq!(
+            punches
+                .lease_next(&b, RendezvousVersion::IpBoundV4, now)
+                .map(|entry| entry.punch_id.clone()),
+            Some("22".repeat(32))
+        );
+        assert_eq!((punches.len(), punches.target_len(&a), punches.target_len(&b)), (2, 1, 1));
+
+        // Re-registering the same pair replaces it in place.
+        punches.insert(a.clone(), "01".repeat(32), punch_entry("01", &"33".repeat(32), now, RendezvousVersion::LegacyV3));
+        assert_eq!(punches.len(), 2);
+        assert!(!punches.remove_acked(&a, &"11".repeat(32), &[1; 32], 1), "the old punch id is gone");
+        assert!(!punches.remove_acked(&b, &"33".repeat(32), &[1; 32], 1), "acks are per target");
+        assert!(punches.remove_acked(&a, &"33".repeat(32).to_uppercase(), &[1; 32], 1));
+        assert_eq!(punches.len(), 1);
+        assert!(!punches.by_target.contains_key(&a), "an emptied target is dropped");
+    }
+
+    #[test]
+    fn punch_expiry_removes_only_what_expired() {
+        let start = Instant::now();
+        let mut punches = PunchStore::default();
+        let target = "aa".repeat(32);
+        punches.insert(target.clone(), "01".repeat(32), punch_entry("01", "p1", start, RendezvousVersion::IpBoundV4));
+        punches.insert(target.clone(), "02".repeat(32), punch_entry("02", "p2", start, RendezvousVersion::IpBoundV4));
+        // Refreshed later: its first expiry item must not remove the new entry.
+        let refreshed = start + Duration::from_secs(10);
+        punches.insert(target.clone(), "01".repeat(32), punch_entry("01", "p3", refreshed, RendezvousVersion::IpBoundV4));
+        assert_eq!(punches.prune_expired(start + PUNCH_TTL - Duration::from_millis(1)), 0);
+        assert_eq!(punches.prune_expired(start + PUNCH_TTL), 1);
+        assert!(punches.contains(&target, &"01".repeat(32)));
+        assert!(!punches.contains(&target, &"02".repeat(32)));
+        assert_eq!(punches.prune_expired(refreshed + PUNCH_TTL), 1);
+        assert_eq!(punches.len(), 0);
+        assert!(punches.expirations.is_empty());
+        assert!(punches.by_target.is_empty());
+    }
+
+    #[test]
+    fn a_full_store_purge_runs_at_most_once_per_interval() {
+        let throttle = PurgeThrottle::default();
+        let now = Instant::now();
+        assert!(throttle.try_begin(now));
+        assert!(!throttle.try_begin(now + STORE_PURGE_MIN_INTERVAL - Duration::from_millis(1)));
+        assert!(throttle.try_begin(now + STORE_PURGE_MIN_INTERVAL));
     }
 
     #[test]
@@ -6767,9 +8785,16 @@ mod relay_ticket_tests {
             reserve_relay_ticket_join(&state, &ticket_id, &initiator_token, client_ip)
                 .await
                 .unwrap();
-        assert_eq!(state.relay_ip_counts.read().await.get(&client_ip), Some(&1));
+        assert_eq!(
+            state
+                .relay_network_counts
+                .read()
+                .await
+                .get(&client_network(client_ip)),
+            Some(&1)
+        );
         rollback_relay_ticket_reservation(&state, &reservation).await;
-        assert!(state.relay_ip_counts.read().await.is_empty());
+        assert!(state.relay_network_counts.read().await.is_empty());
         assert_eq!(
             state
                 .relay_tickets
@@ -6789,7 +8814,14 @@ mod relay_ticket_tests {
         commit_relay_ticket_reservation(&state, &reservation)
             .await
             .unwrap();
-        assert_eq!(state.relay_ip_counts.read().await.get(&client_ip), Some(&1));
+        assert_eq!(
+            state
+                .relay_network_counts
+                .read()
+                .await
+                .get(&client_network(client_ip)),
+            Some(&1)
+        );
     }
 
     #[tokio::test]
@@ -6855,7 +8887,14 @@ mod relay_ticket_tests {
             reserve_relay_ticket_join(&state, &ticket_id, &initiator_token, client_ip)
                 .await
                 .unwrap();
-        assert_eq!(state.relay_ip_counts.read().await.get(&client_ip), Some(&1));
+        assert_eq!(
+            state
+                .relay_network_counts
+                .read()
+                .await
+                .get(&client_network(client_ip)),
+            Some(&1)
+        );
 
         // The ticket expires while the pre-upgrade reservation is still
         // outstanding. Pruning must retain it so the reservation's rollback
@@ -6872,7 +8911,7 @@ mod relay_ticket_tests {
 
         rollback_relay_ticket_reservation(&state, &reservation).await;
         assert!(
-            state.relay_ip_counts.read().await.is_empty(),
+            state.relay_network_counts.read().await.is_empty(),
             "rollback must release the reserved per-IP count"
         );
 
@@ -6915,8 +8954,16 @@ mod relay_ticket_tests {
             .write()
             .await
             .insert((session.clone(), RelayRole::Responder), second);
-        state.relay_ip_counts.write().await.insert(first, 1);
-        state.relay_ip_counts.write().await.insert(second, 1);
+        state
+            .relay_network_counts
+            .write()
+            .await
+            .insert(client_network(first), 1);
+        state
+            .relay_network_counts
+            .write()
+            .await
+            .insert(client_network(second), 1);
         state.bridged_relays.write().await.insert(
             session.clone(),
             BridgedRelayEntry {
@@ -6927,8 +8974,180 @@ mod relay_ticket_tests {
         cleanup_relay_session_all(&state, &session).await;
         cleanup_relay_session_all(&state, &session).await;
         assert!(state.relay_admissions.read().await.is_empty());
-        assert!(state.relay_ip_counts.read().await.is_empty());
+        assert!(state.relay_network_counts.read().await.is_empty());
         assert!(state.bridged_relays.read().await.is_empty());
+    }
+
+    #[test]
+    fn client_network_groups_ipv4_by_24_and_ipv6_by_64() {
+        let network = |ip: &str| client_network(ip.parse().unwrap());
+        let parsed = |ip: &str| ip.parse::<IpAddr>().unwrap();
+        assert_eq!(network("203.0.113.7"), network("203.0.113.250"));
+        assert_eq!(network("203.0.113.7"), parsed("203.0.113.0"));
+        assert_ne!(network("203.0.113.7"), network("203.0.114.7"));
+        assert_eq!(network("::ffff:203.0.113.9"), network("203.0.113.7"));
+
+        assert_eq!(network("2001:db8:1:2::1"), network("2001:db8:1:2:ffff::1"));
+        assert_eq!(network("2001:db8:1:2::1"), parsed("2001:db8:1:2::"));
+        assert_ne!(network("2001:db8:1:2::1"), network("2001:db8:1:3::1"));
+    }
+
+    #[tokio::test]
+    async fn relay_cap_counts_every_address_in_a_network_together() {
+        let state = test_state();
+        let mut joined = 0usize;
+        for index in 0..=MAX_RELAY_SESSIONS_PER_NETWORK {
+            let ticket_id = format!("{index:064x}");
+            let (initiator_token, _) =
+                insert_ticket(&state, &ticket_id, Instant::now() + Duration::from_secs(30)).await;
+            let address = IpAddr::V6(Ipv6Addr::from(
+                0x2001_0db8_0009_0009_0000_0000_0000_0001_u128 + index as u128,
+            ));
+            match admit_relay_ticket_join(&state, &ticket_id, &initiator_token, address).await {
+                Ok(RelayRole::Initiator) => joined += 1,
+                result => {
+                    assert_eq!(result, Err(StatusCode::TOO_MANY_REQUESTS));
+                    assert_eq!(index, MAX_RELAY_SESSIONS_PER_NETWORK);
+                }
+            }
+        }
+        assert_eq!(joined, MAX_RELAY_SESSIONS_PER_NETWORK);
+
+        let ticket_id = "f0".repeat(32);
+        let (initiator_token, _) =
+            insert_ticket(&state, &ticket_id, Instant::now() + Duration::from_secs(30)).await;
+        assert_eq!(
+            join_from(&state, &ticket_id, &initiator_token, "2001:db8:9:a::1").await,
+            Ok(RelayRole::Initiator),
+            "a neighbouring /64 has its own budget"
+        );
+    }
+
+    #[test]
+    fn network_connection_limiter_caps_each_network() {
+        let limiter = NetworkConnectionLimiter::default();
+        let limit = MAX_HTTP_CONNECTIONS_PER_NETWORK;
+        let mut held: Vec<_> = (0..limit)
+            .map(|host| {
+                limiter
+                    .try_acquire(IpAddr::V4(Ipv4Addr::new(203, 0, 113, host as u8)), limit)
+                    .expect("under the per-network cap")
+            })
+            .collect();
+        let refused = |ip: &str| limiter.try_acquire(ip.parse().unwrap(), limit).is_none();
+        assert!(refused("203.0.113.250"));
+        assert!(refused("::ffff:203.0.113.251"));
+        let neighbour = limiter
+            .try_acquire("203.0.114.1".parse().unwrap(), limit)
+            .expect("another /24 is not affected");
+
+        held.pop();
+        let replacement = limiter
+            .try_acquire("203.0.113.250".parse().unwrap(), limit)
+            .expect("a released slot is reusable");
+
+        drop((held, neighbour, replacement));
+        assert!(limiter.counts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn connection_is_charged_once_to_its_named_client() {
+        let limiter = NetworkConnectionLimiter::default();
+        let client: IpAddr = "2001:db8:7:7::1".parse().unwrap();
+        let connections: Vec<_> = (0..MAX_HTTP_CONNECTIONS_PER_NETWORK)
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
+        for slot in &connections {
+            assert!(admit_client_network(&limiter, slot, "/register", client));
+            // Later requests on the same connection reuse its slot.
+            assert!(admit_client_network(&limiter, slot, "/register", client));
+        }
+        let admit =
+            |slot, path, ip: &str| admit_client_network(&limiter, slot, path, ip.parse().unwrap());
+        let extra = std::sync::Mutex::new(None);
+        assert!(!admit(&extra, "/register", "2001:db8:7:7::2"));
+        assert!(extra.lock().unwrap().is_none());
+        assert!(admit(&extra, "/register", "2001:db8:7:8::1"));
+
+        let trusted = ProxyConfig {
+            mode: ProxyMode::Fly,
+            trusted_hops: vec![TrustedProxyNet::parse("10.0.0.0/8").unwrap()],
+        };
+        assert!(trusted.forwards_client_ip("10.1.2.3".parse().unwrap()));
+        assert!(!trusted.forwards_client_ip("9.9.9.9".parse().unwrap()));
+        let disabled = ProxyConfig {
+            mode: ProxyMode::Disabled,
+            ..trusted
+        };
+        assert!(!disabled.forwards_client_ip("10.1.2.3".parse().unwrap()));
+    }
+
+    #[test]
+    fn health_and_loopback_bypass_the_network_cap() {
+        let limiter = NetworkConnectionLimiter::default();
+        let full: Vec<_> = (0..MAX_HTTP_CONNECTIONS_PER_NETWORK)
+            .map(|host| {
+                let slot = std::sync::Mutex::new(None);
+                let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, host as u8));
+                assert!(admit_client_network(&limiter, &slot, "/register", ip));
+                slot
+            })
+            .collect();
+        let admit = |path, ip: &str| {
+            let slot = std::sync::Mutex::new(None);
+            let admitted = admit_client_network(&limiter, &slot, path, ip.parse().unwrap());
+            (admitted, slot.into_inner().unwrap().is_some())
+        };
+
+        assert_eq!(admit("/register", "203.0.113.200"), (false, false));
+        assert_eq!(admit("/health", "203.0.113.200"), (true, false));
+
+        // A local reverse proxy without TRUST_PROXY makes every client look
+        // like loopback; none of them may be charged to one shared network.
+        for _ in 0..=MAX_HTTP_CONNECTIONS_PER_NETWORK {
+            assert_eq!(admit("/register", "127.0.0.1"), (true, false));
+            assert_eq!(admit("/register", "::1"), (true, false));
+            assert_eq!(admit("/register", "::ffff:127.0.0.1"), (true, false));
+        }
+        drop(full);
+        assert!(limiter.counts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exhausted_budget_is_refused_before_the_body_is_read() {
+        use tower::ServiceExt;
+
+        let state = test_state();
+        let exhausted: SocketAddr = "8.8.8.8:4000".parse().unwrap();
+        for _ in 0..MAX_REQUESTS_PER_MINUTE {
+            assert!(check_rate_limit(&state, exhausted.ip()).await);
+        }
+        let app = build_router(state.clone());
+        let send = |path: &'static str, addr: SocketAddr| {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .extension(ConnectInfo(addr))
+                .body(axum::body::Body::from("not json"))
+                .unwrap();
+            let app = app.clone();
+            async move { app.oneshot(request).await.unwrap().status() }
+        };
+
+        let limited = StatusCode::TOO_MANY_REQUESTS;
+        assert_eq!(send("/register", exhausted).await, limited);
+        assert_eq!(send("/v4/relay-mailbox/offer", exhausted).await, limited);
+        // Other addresses, and routes billed to other buckets, reach the
+        // handler's own body rejection.
+        let fresh: SocketAddr = "1.1.1.1:4000".parse().unwrap();
+        assert_ne!(send("/register", fresh).await, limited);
+        assert_ne!(send("/v4/relay-mailbox/poll", exhausted).await, limited);
+        assert_ne!(send("/v4/punch/register", exhausted).await, limited);
+        // Peeking never charges the bucket.
+        assert_eq!(
+            state.rate_limits.read().await.entries[&exhausted.ip()].count,
+            MAX_REQUESTS_PER_MINUTE
+        );
     }
 
     #[tokio::test]
@@ -7212,9 +9431,8 @@ mod relay_ticket_tests {
     async fn new_rooms_are_capped_per_hour_but_refreshing_one_is_not() {
         let state = test_state();
         let addr: SocketAddr = "9.9.9.9:1000".parse().unwrap();
-        // A distinct timestamp per call: two identical claims inside the same
-        // second sign identical bytes, which the replay cache refuses before
-        // any of this is reached.
+        // A distinct timestamp per call, so each claim is a new request rather
+        // than an idempotent re-send of the previous one.
         let claim = |state: AppState, seed: u8, name: String, ts: i64| async move {
             let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
             let pubkey = key.verifying_key().to_bytes();
@@ -7435,7 +9653,7 @@ mod relay_ticket_tests {
             StatusCode::OK
         );
 
-        let dir = channel_directory_v4(State(state.clone()), ConnectInfo(addr), HeaderMap::new())
+        let dir = channel_directory_v4(State(state.clone()), ConnectInfo(addr), HeaderMap::new(), Query(DirectoryQuery::default()))
             .await
             .expect("directory");
         let channels = dir.0["channels"].as_array().unwrap();
@@ -7479,13 +9697,182 @@ mod relay_ticket_tests {
             "a legacy signature is still accepted"
         );
 
-        let dir = channel_directory_v4(State(state), ConnectInfo(addr), HeaderMap::new())
+        let dir = channel_directory_v4(State(state), ConnectInfo(addr), HeaderMap::new(), Query(DirectoryQuery::default()))
             .await
             .expect("directory");
         assert_eq!(
             dir.0["channels"].as_array().unwrap()[0]["name"], "lobby",
             "casing the legacy signature did not cover must not be published"
         );
+    }
+
+    async fn post_rename(
+        state: &AppState,
+        key: &ed25519_dalek::SigningKey,
+        channel_id: &[u8; 16],
+        name: &str,
+        ts: i64,
+        signed: &[u8],
+    ) -> StatusCode {
+        rename_channel_name_v4(
+            State(state.clone()),
+            ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(ChannelNameRequest {
+                channel_id: hex::encode(channel_id),
+                pubkey: hex::encode(key.verifying_key().to_bytes()),
+                name: name.to_string(),
+                private: false,
+                ts,
+                sig: hex::encode(key.sign(signed).to_bytes()),
+            }),
+        )
+        .await
+    }
+
+    fn rename_msg(key: &ed25519_dalek::SigningKey, name: &str, ts: i64) -> Vec<u8> {
+        let pubkey = key.verifying_key().to_bytes();
+        let display = registry::strip_invisible(name);
+        build_channel_rename_v4_msg(
+            &test_channel_id(&pubkey),
+            &pubkey,
+            &display.to_lowercase(),
+            &display,
+            false,
+            ts,
+        )
+    }
+
+    async fn directory_names(state: &AppState) -> Vec<String> {
+        let dir = channel_directory_v4(
+            State(state.clone()),
+            ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+            HeaderMap::new(),
+            Query(DirectoryQuery::default()),
+        )
+        .await
+        .expect("directory");
+        dir.0["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// End to end over HTTP: only a rename signed as one, by the room's own
+    /// key, moves the room's name; a claim for another name does not.
+    #[tokio::test]
+    async fn channel_rename_needs_its_own_signature_and_the_rooms_key() {
+        let state = test_state();
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
+        let other = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]);
+        let owner_pk = owner.verifying_key().to_bytes();
+        let channel_id = test_channel_id(&owner_pk);
+        let ts = now_unix_secs();
+        let addr: SocketAddr = "8.8.8.8:1000".parse().unwrap();
+
+        let claim =
+            build_channel_name_display_v4_msg(&channel_id, &owner_pk, "lobby", "Lobby", false, ts - 10);
+        assert_eq!(
+            claim_channel_name_v4(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(ChannelNameRequest {
+                    channel_id: hex::encode(channel_id),
+                    pubkey: hex::encode(owner_pk),
+                    name: "Lobby".to_string(),
+                    private: false,
+                    ts: ts - 10,
+                    sig: hex::encode(owner.sign(&claim).to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        // A claim signature on the rename endpoint is not a rename.
+        let claim_for_den =
+            build_channel_name_display_v4_msg(&channel_id, &owner_pk, "den", "Den", false, ts - 9);
+        assert_eq!(
+            post_rename(&state, &owner, &channel_id, "Den", ts - 9, &claim_for_den).await,
+            StatusCode::FORBIDDEN
+        );
+        // Nor does a plain claim for another name rename the room.
+        assert_eq!(
+            claim_channel_name_v4(
+                State(state.clone()),
+                ConnectInfo(addr),
+                HeaderMap::new(),
+                Json(ChannelNameRequest {
+                    channel_id: hex::encode(channel_id),
+                    pubkey: hex::encode(owner_pk),
+                    name: "Den".to_string(),
+                    private: false,
+                    ts: ts - 8,
+                    sig: hex::encode(owner.sign(&build_channel_name_display_v4_msg(
+                        &channel_id, &owner_pk, "den", "Den", false, ts - 8,
+                    ))
+                    .to_bytes()),
+                }),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        // Signed as a rename, but by a key that is not the room's.
+        assert_eq!(
+            post_rename(&state, &other, &channel_id, "Den", ts - 7, &rename_msg(&other, "Den", ts - 7))
+                .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(directory_names(&state).await, vec!["Lobby".to_string()]);
+
+        assert_eq!(
+            post_rename(&state, &owner, &channel_id, "Den", ts - 6, &rename_msg(&owner, "Den", ts - 6))
+                .await,
+            StatusCode::OK
+        );
+        assert_eq!(directory_names(&state).await, vec!["Den".to_string()]);
+    }
+
+    /// A second rename inside the day is 425, distinct from the limiter's 429;
+    /// an older rename cannot be replayed to move the room back; and the
+    /// newest one may be retried after a lost answer.
+    #[tokio::test]
+    async fn channel_rename_is_rationed_and_replay_safe() {
+        let state = test_state();
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[0x63; 32]);
+        let channel_id = test_channel_id(&owner.verifying_key().to_bytes());
+        let ts = now_unix_secs();
+
+        // A room the registry has not seen gets its first name this way.
+        let first = rename_msg(&owner, "Lobby", ts - 10);
+        assert_eq!(
+            post_rename(&state, &owner, &channel_id, "Lobby", ts - 10, &first).await,
+            StatusCode::OK
+        );
+        let second = rename_msg(&owner, "Den", ts - 5);
+        assert_eq!(
+            post_rename(&state, &owner, &channel_id, "Den", ts - 5, &second).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_rename(&state, &owner, &channel_id, "Den", ts - 5, &second).await,
+            StatusCode::OK,
+            "the newest rename may be retried"
+        );
+        assert_ne!(
+            post_rename(&state, &owner, &channel_id, "Lobby", ts - 10, &first).await,
+            StatusCode::OK,
+            "an older one may not be replayed"
+        );
+        let third = rename_msg(&owner, "Attic", ts);
+        assert_eq!(
+            post_rename(&state, &owner, &channel_id, "Attic", ts, &third).await,
+            StatusCode::TOO_EARLY
+        );
+        assert_eq!(directory_names(&state).await, vec!["Den".to_string()]);
     }
 
     /// The two signed forms must not be interchangeable, or the new opcode
@@ -7504,6 +9891,11 @@ mod relay_ticket_tests {
         assert_ne!(
             build_channel_name_display_v4_msg(&channel_id, &pubkey, "ab", "cd", false, ts),
             build_channel_name_display_v4_msg(&channel_id, &pubkey, "abc", "d", false, ts)
+        );
+        assert_ne!(
+            build_channel_name_display_v4_msg(&channel_id, &pubkey, "lobby", "Lobby", false, ts),
+            build_channel_rename_v4_msg(&channel_id, &pubkey, "lobby", "Lobby", false, ts),
+            "a claim is never a rename"
         );
     }
 
@@ -7542,6 +9934,7 @@ mod relay_ticket_tests {
             State(state.clone()),
             ConnectInfo(addr),
             HeaderMap::new(),
+            Query(DirectoryQuery::default()),
         )
         .await
         .expect("directory");
@@ -7592,6 +9985,7 @@ mod relay_ticket_tests {
             State(state.clone()),
             ConnectInfo(addr),
             HeaderMap::new(),
+            Query(DirectoryQuery::default()),
         )
         .await
         .expect("directory");
@@ -7662,6 +10056,550 @@ mod relay_ticket_tests {
             .await,
             StatusCode::CONFLICT,
             "a deleted name must not be reclaimable"
+        );
+    }
+
+    async fn send_register(
+        state: &AppState,
+        key: &ed25519_dalek::SigningKey,
+        port: u16,
+        ts: i64,
+    ) -> StatusCode {
+        let pubkey = key.verifying_key().to_bytes();
+        let id = id_from_pubkey(&pubkey);
+        let id_raw = decode_hex_id(&id).unwrap();
+        let signed = build_register_msg(&id_raw, port, [8, 8, 8, 8], &pubkey, ts);
+        register(
+            State(state.clone()),
+            ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(RegisterRequest {
+                id,
+                port,
+                ip: Some("8.8.8.8".to_string()),
+                pubkey: hex::encode(pubkey),
+                ts,
+                sig: hex::encode(key.sign(&signed).to_bytes()),
+            }),
+        )
+        .await
+    }
+
+    async fn send_unregister(state: &AppState, key: &ed25519_dalek::SigningKey, ts: i64) -> StatusCode {
+        let id = id_from_pubkey(&key.verifying_key().to_bytes());
+        let signed = build_unregister_msg(&decode_hex_id(&id).unwrap(), ts);
+        unregister(
+            State(state.clone()),
+            ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(UnregisterRequest {
+                id,
+                ts,
+                sig: hex::encode(key.sign(&signed).to_bytes()),
+            }),
+        )
+        .await
+    }
+
+    /// A register is a keep-alive: re-sending one is harmless and costs no
+    /// replay state, but nothing signed before an unregister gets back in.
+    #[tokio::test]
+    async fn register_refreshes_freely_but_cannot_undo_an_unregister() {
+        let state = test_state();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let ts = now_unix_secs();
+        assert_eq!(send_register(&state, &key, 4662, ts).await, StatusCode::OK);
+        assert_eq!(
+            send_register(&state, &key, 4662, ts).await,
+            StatusCode::OK,
+            "an identical re-send is a refresh"
+        );
+        assert!(state.replay_guard.read().await.keys.is_empty());
+
+        assert_eq!(send_unregister(&state, &key, ts + 1).await, StatusCode::OK);
+        assert_eq!(
+            send_register(&state, &key, 4662, ts).await,
+            StatusCode::CONFLICT,
+            "a register signed before the unregister must not resurrect presence"
+        );
+        assert!(state.store.read().await.is_empty());
+        assert_eq!(send_register(&state, &key, 4662, ts + 2).await, StatusCode::OK);
+        assert_eq!(
+            send_unregister(&state, &key, ts + 1).await,
+            StatusCode::CONFLICT,
+            "a replayed unregister must not knock the user offline again"
+        );
+        assert_eq!(state.store.read().await.len(), 1);
+    }
+
+    async fn send_capability_register(
+        state: &AppState,
+        owner: &ed25519_dalek::SigningKey,
+        peer_pubkey: [u8; 32],
+        capability: [u8; 32],
+        ip: Ipv4Addr,
+        ts: i64,
+    ) -> StatusCode {
+        let owner_pubkey = owner.verifying_key().to_bytes();
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        let v4 = build_capability_register_v4_msg(
+            &capability,
+            epoch,
+            4662,
+            &encode_signed_ip(IpAddr::V4(ip)),
+            &owner_pubkey,
+            &peer_pubkey,
+            ts,
+        );
+        let legacy = build_capability_register_v3_msg(
+            &capability,
+            epoch,
+            4662,
+            ip.octets(),
+            &owner_pubkey,
+            &peer_pubkey,
+            ts,
+        );
+        capability_register_v4(
+            State(state.clone()),
+            ConnectInfo("8.8.8.8:5000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(CapabilityRegisterRequest {
+                capability: hex::encode(capability),
+                epoch,
+                port: 4662,
+                ip: ip.to_string(),
+                pubkey: hex::encode(owner_pubkey),
+                peer_pubkey: hex::encode(peer_pubkey),
+                ts,
+                sig: hex::encode(owner.sign(&v4).to_bytes()),
+                intro: false,
+                legacy_sig: Some(hex::encode(owner.sign(&legacy).to_bytes())),
+                intro_key: None,
+            }),
+        )
+        .await
+    }
+
+    /// Capability refreshes are the bulk of all signed traffic. They must keep
+    /// no replay state (the v3 proof bundled with v4 used to cost a second
+    /// entry), yet an older registration must not roll a newer address back.
+    #[tokio::test]
+    async fn capability_refreshes_keep_no_replay_state_and_never_roll_back() {
+        let state = test_state();
+        let (_, _, peer_pubkey) = insert_test_identity(&state, 72).await;
+        let (owner, _, _) = insert_test_identity(&state, 73).await;
+        let capability = [0xE1; 32];
+        let ts = now_unix_secs();
+        let first = Ipv4Addr::new(8, 8, 4, 4);
+        let moved = Ipv4Addr::new(9, 9, 9, 9);
+
+        for _ in 0..3 {
+            assert_eq!(
+                send_capability_register(&state, &owner, peer_pubkey, capability, first, ts).await,
+                StatusCode::OK
+            );
+        }
+        assert!(state.replay_guard.read().await.keys.is_empty());
+
+        assert_eq!(
+            send_capability_register(&state, &owner, peer_pubkey, capability, moved, ts + 1).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send_capability_register(&state, &owner, peer_pubkey, capability, first, ts).await,
+            StatusCode::CONFLICT,
+            "replaying the old address must not undo the move"
+        );
+        assert_eq!(
+            send_capability_register(&state, &owner, peer_pubkey, capability, moved, ts).await,
+            StatusCode::OK,
+            "an older request for the current address only keeps it alive"
+        );
+        let capabilities = state.capability_store.read().await;
+        let entry = &capabilities[&hex::encode(capability)];
+        assert_eq!(entry.ip, IpAddr::V4(moved));
+        assert_eq!(entry.v4_proof.map(|(signed_ts, _)| signed_ts), Some(ts + 1));
+        assert_eq!(entry.legacy_proof.map(|(signed_ts, _)| signed_ts), Some(ts + 1));
+    }
+
+    /// Punch registration stays strictly one-time, and a key flooding it has no
+    /// effect on anyone else's.
+    #[tokio::test]
+    async fn a_replayed_punch_registration_is_refused() {
+        let state = test_state();
+        let (from_key, from_id, from_pubkey) = insert_test_identity(&state, 74).await;
+        let (_, target_id, target_pubkey) = insert_test_identity(&state, 75).await;
+        let capability = [0xE2; 32];
+        let epoch = now_unix_secs().div_euclid(15 * 60);
+        state.capability_store.write().await.insert(
+            hex::encode(capability),
+            PairwisePresenceEntry {
+                ip: "8.8.8.8".parse().unwrap(),
+                port: 4662,
+                expires_at: Instant::now() + ENTRY_TTL,
+                peer_pubkey: from_pubkey,
+                open_intro: false,
+                pubkey: target_pubkey,
+                epoch,
+                legacy_proof: None,
+                v4_proof: Some((now_unix_secs(), [0; 64])),
+            },
+        );
+        let ts = now_unix_secs();
+        let nonce = [9u8; 16];
+        let signed = build_punch_register_v3_msg(
+            &decode_hex_id(&from_id).unwrap(),
+            &decode_hex_id(&target_id).unwrap(),
+            &capability,
+            epoch,
+            5000,
+            1,
+            &nonce,
+            ts,
+        );
+        let request = || CapabilityPunchRequest {
+            from_id: from_id.clone(),
+            target_id: target_id.clone(),
+            capability: hex::encode(capability),
+            epoch,
+            port: 5000,
+            ip: None,
+            nat_type: 1,
+            ts,
+            nonce: hex::encode(nonce),
+            sig: hex::encode(from_key.sign(&signed).to_bytes()),
+        };
+        let send = |addr: &'static str| {
+            punch_register_v3(
+                State(state.clone()),
+                ConnectInfo(addr.parse().unwrap()),
+                HeaderMap::new(),
+                Json(request()),
+            )
+        };
+        assert_eq!(send("8.8.8.8:5000").await, StatusCode::OK);
+        assert_eq!(
+            send("1.2.3.4:5000").await,
+            StatusCode::CONFLICT,
+            "a replay from another host must not steer the target's punches"
+        );
+        assert_eq!(state.punch_requests.read().await.len(), 1);
+    }
+
+    async fn directory_page(state: &AppState, cursor: Option<String>) -> Result<serde_json::Value, StatusCode> {
+        channel_directory_v4(
+            State(state.clone()),
+            ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+            HeaderMap::new(),
+            Query(DirectoryQuery {
+                cursor,
+                after: None,
+            }),
+        )
+        .await
+        .map(|json| json.0)
+    }
+
+    #[tokio::test]
+    async fn the_directory_endpoint_pages_with_a_cursor_and_bounds_the_first_page() {
+        let state = test_state();
+        let total = registry::DIRECTORY_PAGE_SIZE + 20;
+        {
+            let mut registry = state.channels_registry.write().await;
+            for i in 0..total {
+                assert!(registry
+                    .claim_channel_name(
+                        &format!("{:032x}", i + 1),
+                        &format!("{:064x}", i + 1),
+                        &format!("room{i}"),
+                        false,
+                    )
+                    .is_ok());
+            }
+        }
+        let first = directory_page(&state, None).await.unwrap();
+        assert_eq!(
+            first["channels"].as_array().unwrap().len(),
+            registry::DIRECTORY_PAGE_SIZE,
+            "a client that sends no cursor gets one bounded page"
+        );
+        let next = first["next_cursor"].as_str().unwrap().to_string();
+        let second = directory_page(&state, Some(next)).await.unwrap();
+        assert_eq!(second["channels"].as_array().unwrap().len(), 20);
+        assert!(second["next_cursor"].is_null());
+
+        let mut seen = HashSet::new();
+        for page in [&first, &second] {
+            for listing in page["channels"].as_array().unwrap() {
+                assert!(seen.insert(listing["channel_id"].as_str().unwrap().to_string()));
+            }
+        }
+        assert_eq!(seen.len(), total);
+
+        for bad in ["nope".to_string(), "1.".to_string(), "9".repeat(200)] {
+            assert_eq!(directory_page(&state, Some(bad)).await, Err(StatusCode::BAD_REQUEST));
+        }
+        assert_eq!(
+            directory_page(&state, Some(String::new())).await.unwrap()["channels"]
+                .as_array()
+                .unwrap()
+                .len(),
+            registry::DIRECTORY_PAGE_SIZE,
+            "an empty cursor is the first page"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_registry_is_flushed_on_schedule_and_at_shutdown() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-shutdown-flush-{}-{}.json",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        let registry = RwLock::new(registry::ChannelRegistry::load(path.clone()));
+        let persister = RegistryPersister::default();
+        let owner = "aa".repeat(32);
+        assert!(registry.write().await.claim_username(&owner, "Ada").is_ok());
+        assert!(!path.exists(), "a claim alone writes nothing");
+        assert!(flush_channels_registry(&registry, &persister).await);
+        assert!(registry::ChannelRegistry::load(path.clone()).holds_username(&owner, "Ada"));
+        assert_eq!(
+            *persister.persisted.borrow(),
+            registry.read().await.durable_generation(),
+            "a write publishes the generation it covered"
+        );
+
+        assert!(registry.write().await.claim_username(&owner, "Lovelace").is_ok());
+        assert!(close_channels_registry(&registry, &persister).await);
+        assert!(
+            registry::ChannelRegistry::load(path.clone()).holds_username(&owner, "Lovelace"),
+            "shutdown writes the pending change"
+        );
+        assert_eq!(
+            registry.write().await.claim_username(&owner, "Byron"),
+            Err(registry::RegistryError::ReadOnly),
+            "nothing is acknowledged after the final snapshot"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A state-creating registry write is on disk before its 200; a refresh
+    /// stays debounced.
+    #[tokio::test]
+    async fn durable_registry_writes_are_persisted_before_they_are_acknowledged() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-durable-ack-{}-{}.json",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        let mut state = test_state();
+        state.channels_registry = Arc::new(RwLock::new(registry::ChannelRegistry::load(path.clone())));
+        let flusher = tokio::spawn(flush_channels_registry_periodically(
+            state.channels_registry.clone(),
+            state.registry_persister.clone(),
+        ));
+        let user = ed25519_dalek::SigningKey::from_bytes(&[0x76; 32]);
+        let user_pk = user.verifying_key().to_bytes();
+        let claim = |ts: i64| {
+            let signed = build_channel_username_v4_msg(&user_pk, "ada", ts);
+            claim_channel_username_v4(
+                State(state.clone()),
+                ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+                HeaderMap::new(),
+                Json(ChannelUsernameRequest {
+                    pubkey: hex::encode(user_pk),
+                    name: "Ada".to_string(),
+                    ts,
+                    sig: hex::encode(user.sign(&signed).to_bytes()),
+                }),
+            )
+        };
+        let ts = now_unix_secs();
+        assert_eq!(claim(ts).await, StatusCode::OK);
+        assert!(
+            registry::ChannelRegistry::load(path.clone()).holds_username(&hex::encode(user_pk), "Ada"),
+            "a first claim is on disk by the time it is acknowledged"
+        );
+
+        let durable = state.channels_registry.read().await.durable_generation();
+        assert_eq!(claim(ts + 1).await, StatusCode::OK);
+        let registry = state.channels_registry.read().await;
+        assert_eq!(registry.durable_generation(), durable, "a refresh is not durable");
+        drop(registry);
+        flusher.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A write answered 503 stays applied in memory, so its retry is a no-op;
+    /// that retry must still wait for the pending write to reach disk.
+    #[tokio::test]
+    async fn a_retry_after_a_503_is_only_acknowledged_once_on_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-durable-retry-{}-{}.json",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        let mut state = test_state();
+        state.channels_registry = Arc::new(RwLock::new(registry::ChannelRegistry::load(path.clone())));
+        let user = ed25519_dalek::SigningKey::from_bytes(&[0x7C; 32]);
+        let user_pk = user.verifying_key().to_bytes();
+        let claim = |ts: i64| {
+            let signed = build_channel_username_v4_msg(&user_pk, "ada", ts);
+            claim_channel_username_v4(
+                State(state.clone()),
+                ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+                HeaderMap::new(),
+                Json(ChannelUsernameRequest {
+                    pubkey: hex::encode(user_pk),
+                    name: "Ada".to_string(),
+                    ts,
+                    sig: hex::encode(user.sign(&signed).to_bytes()),
+                }),
+            )
+        };
+        let ts = now_unix_secs();
+        // No flusher is running, so nothing can reach disk.
+        assert_eq!(claim(ts).await, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            claim(ts + 1).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the retry is a refresh in memory, but the claim is still not on disk"
+        );
+        assert!(!path.exists());
+
+        let flusher = tokio::spawn(flush_channels_registry_periodically(
+            state.channels_registry.clone(),
+            state.registry_persister.clone(),
+        ));
+        assert_eq!(claim(ts + 2).await, StatusCode::OK);
+        assert!(registry::ChannelRegistry::load(path.clone()).holds_username(&hex::encode(user_pk), "Ada"));
+        // With nothing pending, a refresh is answered without waiting.
+        assert_eq!(claim(ts + 3).await, StatusCode::OK);
+        flusher.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Two registrations signed in the same second cannot be ordered, so only
+    /// a byte-for-byte refresh of the live entry is accepted at its timestamp.
+    #[tokio::test]
+    async fn a_same_second_capability_registration_cannot_change_the_address() {
+        let state = test_state();
+        let (_, _, peer_pubkey) = insert_test_identity(&state, 77).await;
+        let (owner, _, _) = insert_test_identity(&state, 78).await;
+        let capability = [0xE3; 32];
+        let ts = now_unix_secs();
+        let live = Ipv4Addr::new(8, 8, 4, 4);
+        assert_eq!(
+            send_capability_register(&state, &owner, peer_pubkey, capability, live, ts).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send_capability_register(&state, &owner, peer_pubkey, capability, Ipv4Addr::new(9, 9, 9, 9), ts)
+                .await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            send_capability_register(&state, &owner, peer_pubkey, capability, live, ts).await,
+            StatusCode::OK,
+            "an identical refresh is still idempotent"
+        );
+        assert_eq!(
+            state.capability_store.read().await[&hex::encode(capability)].ip,
+            IpAddr::V4(live)
+        );
+    }
+
+    async fn send_punch_poll(
+        state: &AppState,
+        key: &ed25519_dalek::SigningKey,
+        target_id: &str,
+        nonce: [u8; 16],
+        ts: i64,
+    ) -> StatusCode {
+        let signed = build_punch_poll_v4_msg(&decode_hex_id(target_id).unwrap(), &nonce, ts);
+        match punch_poll_v4(
+            State(state.clone()),
+            ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(CapabilityPunchPollRequest {
+                target_id: target_id.to_string(),
+                ts,
+                nonce: hex::encode(nonce),
+                sig: hex::encode(key.sign(&signed).to_bytes()),
+            }),
+        )
+        .await
+        {
+            Ok(_) => StatusCode::OK,
+            Err(status) => status,
+        }
+    }
+
+    /// A replayed poll would lease whatever is queued now to whoever holds it.
+    #[tokio::test]
+    async fn a_punch_poll_is_one_time_and_costs_one_mark() {
+        let state = test_state();
+        let (key, id, pubkey) = insert_test_identity(&state, 79).await;
+        let ts = now_unix_secs();
+        assert_eq!(send_punch_poll(&state, &key, &id, [1; 16], ts).await, StatusCode::NOT_FOUND);
+        assert_eq!(
+            send_punch_poll(&state, &key, &id, [1; 16], ts).await,
+            StatusCode::CONFLICT,
+            "the same poll is not served twice"
+        );
+        assert_eq!(
+            send_punch_poll(&state, &key, &id, [2; 16], ts).await,
+            StatusCode::NOT_FOUND,
+            "a second poll in the same second is a new request"
+        );
+        assert_eq!(send_punch_poll(&state, &key, &id, [3; 16], ts + 1).await, StatusCode::NOT_FOUND);
+        assert_eq!(send_punch_poll(&state, &key, &id, [2; 16], ts).await, StatusCode::CONFLICT);
+        assert_eq!(state.replay_guard.read().await.keys[&pubkey].marks.len(), 1);
+    }
+
+    /// Reads keep no marks, but nothing signed before an unregister is served.
+    #[tokio::test]
+    async fn reads_signed_before_an_unregister_are_refused() {
+        let state = test_state();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x7A; 32]);
+        let pubkey = key.verifying_key().to_bytes();
+        let id = id_from_pubkey(&pubkey);
+        let (_, target_id, _) = insert_test_identity(&state, 0x7B).await;
+        let ts = now_unix_secs();
+        assert_eq!(send_register(&state, &key, 4662, ts).await, StatusCode::OK);
+
+        let nonce = [5u8; 16];
+        let signed = build_identity_lookup_v4_msg(
+            &decode_hex_id(&target_id).unwrap(),
+            &decode_hex_id(&id).unwrap(),
+            &pubkey,
+            &nonce,
+            ts,
+        );
+        let lookup = || {
+            identity_lookup_v4(
+                State(state.clone()),
+                ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+                HeaderMap::new(),
+                Json(IdentityLookupRequest {
+                    target_id: target_id.clone(),
+                    requester_id: id.clone(),
+                    requester_pubkey: hex::encode(pubkey),
+                    nonce: hex::encode(nonce),
+                    ts,
+                    sig: hex::encode(key.sign(&signed).to_bytes()),
+                }),
+            )
+        };
+        assert!(lookup().await.is_ok());
+        assert_eq!(send_unregister(&state, &key, ts + 1).await, StatusCode::OK);
+        assert_eq!(send_register(&state, &key, 4662, ts + 2).await, StatusCode::OK);
+        assert_eq!(lookup().await.err(), Some(StatusCode::CONFLICT));
+        assert_eq!(
+            send_punch_poll(&state, &key, &id, [6; 16], ts).await,
+            StatusCode::CONFLICT,
+            "a poll signed before the unregister is refused too"
         );
     }
 }

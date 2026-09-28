@@ -87,7 +87,7 @@
         {/if}
       </div>
       {#if !inProgress}
-        <button type="button" class="notice-x" onclick={dismissNotice} aria-label={m.updater_dismiss_aria()}><IconX size={14} /></button>
+        <button type="button" class="icon-close" onclick={dismissNotice} title={m.updater_dismiss_aria()} aria-label={m.updater_dismiss_aria()}><IconX size={14} /></button>
       {/if}
     </div>
 
@@ -196,36 +196,14 @@
 
   .notice-title {
     flex: 1;
-    font-size: 13.5px;
+    font-size: var(--font-size-md);
     font-weight: 700;
     color: var(--text-primary);
   }
 
-  .notice-x {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 26px;
-    height: 26px;
-    padding: 0;
-    flex-shrink: 0;
-    border: 1px solid transparent;
-    background: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    line-height: 1;
-    border-radius: var(--radius-sm);
-  }
-
-  .notice-x:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-  }
-
   .notice-body {
     margin: 0;
-    font-size: 12.5px;
+    font-size: var(--font-size-md);
     line-height: 1.45;
     color: var(--text-secondary);
   }
@@ -233,7 +211,7 @@
   .notice-progress {
     height: 6px;
     border-radius: var(--radius-pill);
-    background: var(--bg-tertiary, var(--bg-hover));
+    background: var(--bg-tertiary);
     overflow: hidden;
   }
 
@@ -259,7 +237,7 @@
     border: none;
     background: transparent;
     color: var(--accent);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     cursor: pointer;
     padding: 0;
@@ -268,7 +246,7 @@
   .notice-notes {
     max-height: 120px;
     overflow-y: auto;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.5;
     color: var(--text-secondary);
     white-space: pre-wrap;
@@ -285,32 +263,10 @@
     margin-top: 2px;
   }
 
+  /* A notice in the corner, so its buttons run a size down from a dialog's;
+     their colours are the global ghost and primary ones. */
   .notice-actions button {
     padding: 6px 13px;
-    font-size: 12.5px;
-    font-weight: 600;
-    border-radius: var(--radius-md);
-    cursor: pointer;
-  }
-
-  .notice-actions .ghost {
-    background: transparent;
-    color: var(--text-secondary);
-    border: 1px solid var(--border);
-  }
-
-  .notice-actions .ghost:hover {
-    color: var(--text-primary);
-    background: var(--bg-hover);
-  }
-
-  .notice-actions .primary {
-    background: var(--accent);
-    color: var(--on-accent);
-    border: 1px solid var(--accent);
-  }
-
-  .notice-actions .primary:hover {
-    filter: brightness(1.06);
+    font-size: var(--font-size-md);
   }
 </style>

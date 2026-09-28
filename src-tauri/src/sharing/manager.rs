@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -87,6 +87,19 @@ pub struct TransferControl {
     /// mirrored from [`Transfer::priority`] so the multi-source download worker
     /// can bias global connection-slot acquisition without a manager round-trip.
     download_priority: AtomicU8,
+    /// Display name applied by Rename while a download is running. Completion
+    /// and the `.part.met` sidecar both read this so a rename sticks even on
+    /// the callback path, whose tracker is not in the shared registry.
+    pending_rename: std::sync::Mutex<PendingRename>,
+}
+
+/// A rename waiting for completion, and whether completion has already read
+/// the name it moves the file under. One lock for both, so a rename either
+/// lands before that read or is refused — never accepted after it.
+#[derive(Default)]
+struct PendingRename {
+    name: Option<String>,
+    sealed: bool,
 }
 
 impl std::fmt::Debug for TransferControl {
@@ -109,6 +122,7 @@ impl TransferControl {
             preview_priority: AtomicBool::new(false),
             preview_ready: AtomicBool::new(false),
             download_priority: AtomicU8::new(2),
+            pending_rename: std::sync::Mutex::new(PendingRename::default()),
         })
     }
 
@@ -262,6 +276,34 @@ impl TransferControl {
     pub fn download_priority_ordinal(&self) -> u8 {
         self.download_priority.load(Ordering::Acquire)
     }
+
+    /// False once completion has read the name: the file is about to be (or
+    /// has been) moved under it, so a rename now would only relabel the row.
+    #[must_use]
+    pub fn set_pending_rename(&self, name: &str) -> bool {
+        let mut slot = self.pending_rename.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.sealed {
+            return false;
+        }
+        slot.name = Some(name.to_string());
+        true
+    }
+
+    pub fn pending_rename(&self) -> Option<String> {
+        self.pending_rename
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .name
+            .clone()
+    }
+
+    /// The rename completion must apply, read for the last time: later
+    /// renames are refused by [`Self::set_pending_rename`].
+    pub fn seal_pending_rename(&self) -> Option<String> {
+        let mut slot = self.pending_rename.lock().unwrap_or_else(|e| e.into_inner());
+        slot.sealed = true;
+        slot.name.clone()
+    }
 }
 
 pub struct TransferManager {
@@ -274,6 +316,12 @@ pub struct TransferManager {
     controls: HashMap<String, Arc<TransferControl>>,
     /// Per-transfer source details (eMule-style per-source tracking)
     source_details: HashMap<String, Vec<crate::types::SourceInfo>>,
+    /// Bumped by every structural change to `queue` made here. Nothing
+    /// outside this file reorders the queue; code that starts to must call
+    /// [`Self::queue_changed`] too.
+    queue_generation: u64,
+    queue_index: std::sync::Mutex<QueueIndex>,
+    revisions: std::sync::Mutex<TransferRevisions>,
 }
 
 /// Declares the closed set of health explanations a download row can show,
@@ -356,6 +404,240 @@ pub struct SpeedReset {
     pub id: String,
 }
 
+/// What [`TransferManager::resume_many`] changed.
+#[derive(Debug, Default)]
+pub struct BatchResume {
+    /// Queued rows moved into `active`, in queue order; the caller starts them.
+    pub promoted: Vec<Transfer>,
+    /// `active` rows resumed in place from `Paused`/`Insufficient`. They have
+    /// no worker behind them, so the caller restarts them.
+    pub restart_ids: Vec<String>,
+    /// Status after the resume of every requested row found in `active` or
+    /// the queue, in request order.
+    pub statuses: Vec<(String, TransferStatus)>,
+}
+
+/// Removals remembered for [`TransferManager::get_transfers_since`]. A caller
+/// further behind than this gets a full snapshot instead of a delta.
+const MAX_REVISION_TOMBSTONES: usize = 4096;
+
+const FINGERPRINT_SEED: u64 = 0x243F_6A88_85A3_08D3;
+
+#[inline]
+fn mix_word(h: u64, w: u64) -> u64 {
+    (h ^ w).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29)
+}
+
+/// Each step is a bijection in the running state and in the input word, so
+/// two equal-length inputs that differ in a single 8-byte word always hash
+/// differently.
+fn mix_bytes(mut h: u64, bytes: &[u8]) -> u64 {
+    h = mix_word(h, bytes.len() as u64);
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(chunk);
+        h = mix_word(h, u64::from_le_bytes(word));
+    }
+    let rest = chunks.remainder();
+    if !rest.is_empty() {
+        let mut word = [0u8; 8];
+        word[..rest.len()].copy_from_slice(rest);
+        h = mix_word(h, u64::from_le_bytes(word));
+    }
+    h
+}
+
+/// Fingerprint of `value`'s JSON form — the bytes the UI would receive — so a
+/// row reads as changed exactly when its payload would. `buf` is scratch
+/// space reused across calls.
+pub fn serde_fingerprint<T: serde::Serialize + ?Sized>(buf: &mut Vec<u8>, value: &T) -> u64 {
+    buf.clear();
+    let _ = serde_json::to_writer(&mut *buf, value);
+    mix_bytes(FINGERPRINT_SEED, buf)
+}
+
+/// [`serde_fingerprint`] of a whole list, one row at a time so the scratch
+/// buffer only ever holds a single row.
+pub fn serde_fingerprint_rows<'a, T, I>(rows: I) -> u64
+where
+    T: serde::Serialize + 'a,
+    I: IntoIterator<Item = &'a T>,
+{
+    let mut buf = Vec::new();
+    let mut h = FINGERPRINT_SEED;
+    let mut count = 0u64;
+    for row in rows {
+        h = mix_word(h, serde_fingerprint(&mut buf, row));
+        count += 1;
+    }
+    mix_word(h, count)
+}
+
+/// Rows changed since a caller's last [`TransferManager::get_transfers_since`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TransferDelta {
+    /// Identifies this tracker; a caller holding another epoch's revision
+    /// (the backend restarted under it) is answered with a full snapshot.
+    pub epoch: u64,
+    pub revision: u64,
+    /// `transfers` is every row and `removed` is empty; the caller replaces
+    /// its copy instead of merging.
+    pub full: bool,
+    pub transfers: Vec<Transfer>,
+    pub removed: Vec<String>,
+}
+
+struct RowRevision {
+    fingerprint: u64,
+    revision: u64,
+    pass: u64,
+}
+
+/// Change detection by fingerprint rather than by instrumenting writers: the
+/// row collections are public and mutated in place from the network task, so
+/// no set of setters could see every change.
+struct TransferRevisions {
+    epoch: u64,
+    revision: u64,
+    pass: u64,
+    rows: HashMap<String, RowRevision>,
+    tombstones: VecDeque<(u64, String)>,
+    /// Revision of the newest tombstone dropped for space; a delta from any
+    /// earlier revision would miss that removal.
+    floor: u64,
+    buf: Vec<u8>,
+}
+
+impl TransferRevisions {
+    fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // Kept under 2^53 so the UI can hold it in a JS number exactly.
+        let epoch = (nanos ^ (u64::from(std::process::id()) << 32)) & ((1u64 << 53) - 1);
+        Self {
+            epoch: epoch.max(1),
+            revision: 0,
+            pass: 0,
+            rows: HashMap::new(),
+            tombstones: VecDeque::new(),
+            floor: 0,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Fingerprint every row, stamp the changed ones with a new revision, and
+    /// return the rows whose revision is newer than `since` (all of them when
+    /// `since` is `None`).
+    fn sync<'a>(
+        &mut self,
+        rows: impl Iterator<Item = (&'a Transfer, bool)>,
+        since: Option<u64>,
+    ) -> Vec<(&'a Transfer, bool)> {
+        self.pass = self.pass.wrapping_add(1);
+        let pass = self.pass;
+        let next = self.revision + 1;
+        let mut bumped = false;
+        let mut out = Vec::new();
+        for (transfer, preview_ready) in rows {
+            let fingerprint = mix_word(
+                serde_fingerprint(&mut self.buf, transfer),
+                u64::from(preview_ready),
+            );
+            let revision = match self.rows.get_mut(transfer.id.as_str()) {
+                Some(entry) if entry.pass == pass => {
+                    // A duplicate id: `get_all` reports both copies, so the
+                    // snapshot does too, but only the first is tracked.
+                    if since.is_none() {
+                        out.push((transfer, preview_ready));
+                    }
+                    continue;
+                }
+                Some(entry) => {
+                    entry.pass = pass;
+                    if entry.fingerprint != fingerprint {
+                        entry.fingerprint = fingerprint;
+                        entry.revision = next;
+                        bumped = true;
+                    }
+                    entry.revision
+                }
+                None => {
+                    self.rows.insert(
+                        transfer.id.clone(),
+                        RowRevision {
+                            fingerprint,
+                            revision: next,
+                            pass,
+                        },
+                    );
+                    bumped = true;
+                    next
+                }
+            };
+            if since.is_none_or(|since| revision > since) {
+                out.push((transfer, preview_ready));
+            }
+        }
+        let mut removed = Vec::new();
+        self.rows.retain(|id, entry| {
+            if entry.pass == pass {
+                true
+            } else {
+                removed.push(id.clone());
+                false
+            }
+        });
+        if !removed.is_empty() {
+            bumped = true;
+            for id in removed {
+                self.tombstones.push_back((next, id));
+            }
+            while self.tombstones.len() > MAX_REVISION_TOMBSTONES {
+                if let Some((revision, _)) = self.tombstones.pop_front() {
+                    self.floor = self.floor.max(revision);
+                }
+            }
+        }
+        if bumped {
+            self.revision = next;
+        }
+        out
+    }
+
+    fn removed_since(&self, since: u64) -> Vec<String> {
+        let start = self.tombstones.partition_point(|(revision, _)| *revision <= since);
+        self.tombstones
+            .iter()
+            .skip(start)
+            .map(|(_, id)| id.clone())
+            .collect()
+    }
+}
+
+/// `id -> position` for the queue, rebuilt whenever the queue's structure
+/// changed and double-checked on every hit.
+#[derive(Default)]
+struct QueueIndex {
+    generation: u64,
+    len: usize,
+    positions: HashMap<String, usize>,
+}
+
+impl QueueIndex {
+    fn rebuild(&mut self, queue: &VecDeque<Transfer>, generation: u64) {
+        self.positions.clear();
+        for (pos, transfer) in queue.iter().enumerate() {
+            // First occurrence wins, as `iter().find` would.
+            self.positions.entry(transfer.id.clone()).or_insert(pos);
+        }
+        self.generation = generation;
+        self.len = queue.len();
+    }
+}
+
 impl TransferManager {
     pub fn new(max_concurrent: u32) -> Self {
         Self {
@@ -366,7 +648,38 @@ impl TransferManager {
             speed_history: HashMap::new(),
             controls: HashMap::new(),
             source_details: HashMap::new(),
+            queue_generation: 0,
+            queue_index: std::sync::Mutex::new(QueueIndex::default()),
+            revisions: std::sync::Mutex::new(TransferRevisions::new()),
         }
+    }
+
+    pub fn queue_changed(&mut self) {
+        self.queue_generation = self.queue_generation.wrapping_add(1);
+    }
+
+    /// Position of `id` in the queue without scanning it, except to rebuild
+    /// the index after the queue changed shape.
+    fn queue_position(&self, id: &str) -> Option<usize> {
+        let mut index = self.queue_index.lock().unwrap_or_else(|e| e.into_inner());
+        if index.generation != self.queue_generation || index.len != self.queue.len() {
+            index.rebuild(&self.queue, self.queue_generation);
+        }
+        let pos = *index.positions.get(id)?;
+        if self.queue.get(pos).is_some_and(|t| t.id == id) {
+            return Some(pos);
+        }
+        index.rebuild(&self.queue, self.queue_generation);
+        index.positions.get(id).copied()
+    }
+
+    fn queued(&self, id: &str) -> Option<&Transfer> {
+        self.queue_position(id).and_then(|pos| self.queue.get(pos))
+    }
+
+    fn queued_mut(&mut self, id: &str) -> Option<&mut Transfer> {
+        let pos = self.queue_position(id)?;
+        self.queue.get_mut(pos)
     }
 
     pub fn register_control(&mut self, id: &str, control: Arc<TransferControl>) {
@@ -376,8 +689,12 @@ impl TransferManager {
         let ord = self
             .active
             .get(id)
-            .or_else(|| self.queue.iter().find(|t| t.id == id))
+            .or_else(|| self.queued(id))
             .map(|t| Self::priority_ordinal(&t.priority));
+        self.install_control(id, control, ord);
+    }
+
+    fn install_control(&mut self, id: &str, control: Arc<TransferControl>, ord: Option<u8>) {
         if let Some(ord) = ord {
             control.set_download_priority_ordinal(ord);
         }
@@ -389,13 +706,13 @@ impl TransferManager {
     }
 
     fn get_transfer_mut(&mut self, id: &str) -> Option<&mut Transfer> {
-        if let Some(transfer) = self.active.get_mut(id) {
-            Some(transfer)
-        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
-            Some(transfer)
-        } else {
-            self.completed.iter_mut().find(|t| t.id == id)
+        if self.active.contains_key(id) {
+            return self.active.get_mut(id);
         }
+        if let Some(pos) = self.queue_position(id) {
+            return self.queue.get_mut(pos);
+        }
+        self.completed.iter_mut().find(|t| t.id == id)
     }
 
     fn clear_runtime_health(transfer: &mut Transfer) {
@@ -434,8 +751,19 @@ impl TransferManager {
                 if transfer.speed > 0 && idle_secs < (SPEED_IDLE_MS / 1000) as i64 {
                     return (TransferHealth::Healthy, None);
                 }
+                // A granted download slot is still a live transfer. eMule keeps
+                // the file on Downloading and parks Stalled on the source row;
+                // flipping the file red here made the bar flash every few
+                // seconds while blocks were still arriving (progress events
+                // cleared the overlay, then the next health tick put it back).
+                if transfer.active_sources > 0 {
+                    if idle_secs >= ACTIVE_DEGRADED_SECS {
+                        return (TransferHealth::Degraded, Some(TransferHealthCode::Idle));
+                    }
+                    return (TransferHealth::Healthy, None);
+                }
                 if idle_secs >= ACTIVE_STALLED_SECS {
-                    let code = if transfer.active_sources == 0 && transfer.queued_sources > 0 {
+                    let code = if transfer.queued_sources > 0 {
                         TransferHealthCode::QueuedSources
                     } else if transfer.sources == 0 {
                         TransferHealthCode::WaitingSources
@@ -461,7 +789,10 @@ impl TransferManager {
             }
             TransferStatus::Queued => {
                 if transfer.sources == 0 {
-                    return (TransferHealth::Degraded, Some(TransferHealthCode::NoSources));
+                    return (
+                        TransferHealth::Degraded,
+                        Some(TransferHealthCode::NoSources),
+                    );
                 }
                 let age_secs = now.saturating_sub(transfer.started_at);
                 if age_secs >= QUEUED_DEGRADED_SECS {
@@ -484,18 +815,20 @@ impl TransferManager {
     pub(crate) fn active_download_count(&self) -> usize {
         self.active
             .values()
-            .filter(|transfer| {
-                transfer.direction == TransferDirection::Download
-                    && !matches!(
-                        transfer.status,
-                        TransferStatus::Paused
-                            | TransferStatus::Stopped
-                            // Disk-full rows stay visible but must not block the
-                            // concurrent slot budget (T2).
-                            | TransferStatus::Insufficient
-                    )
-            })
+            .filter(|transfer| Self::occupies_download_slot(transfer))
             .count()
+    }
+
+    fn occupies_download_slot(transfer: &Transfer) -> bool {
+        transfer.direction == TransferDirection::Download
+            && !matches!(
+                transfer.status,
+                TransferStatus::Paused
+                    | TransferStatus::Stopped
+                    // Disk-full rows stay visible but must not block the
+                    // concurrent slot budget (T2).
+                    | TransferStatus::Insufficient
+            )
     }
 
     /// Promote queued downloads into free concurrent slots.
@@ -573,7 +906,7 @@ impl TransferManager {
 
     pub fn enqueue(&mut self, mut transfer: Transfer) -> bool {
         let id = transfer.id.clone();
-        if self.active.contains_key(&id) || self.queue.iter().any(|t| t.id == id) {
+        if self.active.contains_key(&id) || self.queue_position(&id).is_some() {
             return false;
         }
         self.completed.retain(|t| t.id != id);
@@ -601,6 +934,7 @@ impl TransferManager {
                 transfer.status = Self::queued_wait_status(&transfer);
             }
             self.queue.push_back(transfer);
+            self.queue_changed();
             false
         }
     }
@@ -646,10 +980,7 @@ impl TransferManager {
         if let Some(transfer) = self.active.get_mut(id) {
             let now = Instant::now();
 
-            let history = self
-                .speed_history
-                .entry(id.to_string())
-                .or_default();
+            let history = self.speed_history.entry(id.to_string()).or_default();
 
             history.push_back((transferred, now));
 
@@ -787,10 +1118,11 @@ impl TransferManager {
         let mut transfer = self.active.remove(id);
         if transfer.is_none() {
             transfer = self
-                .queue
-                .iter()
-                .position(|t| t.id == id)
+                .queue_position(id)
                 .and_then(|idx| self.queue.remove(idx));
+            if transfer.is_some() {
+                self.queue_changed();
+            }
         }
         if let Some(mut transfer) = transfer {
             transfer.status = TransferStatus::Completed;
@@ -846,8 +1178,10 @@ impl TransferManager {
                 // Stopped/queued rows live in `queue`; still move them into
                 // completed so Stop/cancel races don't leave a Failed queue
                 // entry without the normal Failed lifecycle.
-                let pos = self.queue.iter().position(|t| t.id == id)?;
-                self.queue.remove(pos).unwrap()
+                let pos = self.queue_position(id)?;
+                let transfer = self.queue.remove(pos).unwrap();
+                self.queue_changed();
+                transfer
             }
         };
         transfer.status = TransferStatus::Failed;
@@ -880,7 +1214,7 @@ impl TransferManager {
                 Self::clear_failure_context(transfer);
                 Self::clear_runtime_health(transfer);
             }
-        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
+        } else if let Some(transfer) = self.queued_mut(id) {
             transfer.status = status;
             if matches!(
                 transfer.status,
@@ -1006,13 +1340,13 @@ impl TransferManager {
                         | TransferStatus::Failed
                 )
             }) && rows.iter().any(|s| {
-                    s.ip == needle
-                        && matches!(
-                            s.status,
-                            crate::types::SourceStatus::Transferring
-                                | crate::types::SourceStatus::Stalled
-                        )
-                })
+                s.ip == needle
+                    && matches!(
+                        s.status,
+                        crate::types::SourceStatus::Transferring
+                            | crate::types::SourceStatus::Stalled
+                    )
+            })
         })
     }
 
@@ -1118,6 +1452,22 @@ impl TransferManager {
                 transfer.last_seen_complete = Some(chrono::Utc::now().timestamp());
             }
         }
+    }
+
+    /// The origin the stored row for `ip:port` carries, which can be more than
+    /// the caller's own lookup found: a discovery seed or an earlier event may
+    /// have set it, and `update_source_detail` never clears one.
+    pub fn source_detail_origin(
+        &self,
+        transfer_id: &str,
+        ip: &str,
+        port: u16,
+    ) -> Option<crate::types::SourceOrigin> {
+        self.source_details
+            .get(transfer_id)?
+            .iter()
+            .find(|s| s.ip == ip && s.port == port)?
+            .origin
     }
 
     /// Get all source details for a transfer.
@@ -1262,9 +1612,11 @@ impl TransferManager {
     /// and a source restored from `sources.met` may not yet). Without copying
     /// the placeholder's origin onto the live row, the Origin column goes
     /// blank for exactly the sources that are actually working (issue 121).
-    /// Prefer the same user hash, then a placeholder at this IP, then any
-    /// other row at this IP — never a different peer behind the same NAT
-    /// when a hash match exists.
+    ///
+    /// Only rows that can be this peer: the same user hash, or a placeholder
+    /// at this IP whose hash is unknown or matches. Any other row at this IP
+    /// may be a different peer behind the same NAT, and the live row's origin
+    /// is kept from then on, so a neighbour's label would stick.
     pub fn inherited_source_origin(
         &self,
         transfer_id: &str,
@@ -1279,12 +1631,15 @@ impl TransferManager {
                 same_hash.then_some(s.origin).flatten()
             })
             .or_else(|| {
-                rows.iter()
-                    .find_map(|s| (s.ip == ip && s.placeholder).then_some(s.origin).flatten())
-            })
-            .or_else(|| {
-                rows.iter()
-                    .find_map(|s| (s.ip == ip).then_some(s.origin).flatten())
+                rows.iter().find_map(|s| {
+                    let hash_agrees = match s.user_hash.filter(|h| *h != [0u8; 16]) {
+                        None => true,
+                        Some(h) => uh == Some(h),
+                    };
+                    (s.ip == ip && s.placeholder && hash_agrees)
+                        .then_some(s.origin)
+                        .flatten()
+                })
             })
     }
 
@@ -1346,18 +1701,71 @@ impl TransferManager {
 
     pub fn pause(&mut self, id: &str) {
         if let Some(transfer) = self.active.get_mut(id) {
-            transfer.status = TransferStatus::Paused;
-            transfer.speed = 0;
-            transfer.active_sources = 0;
-            transfer.queued_sources = 0;
-            Self::clear_runtime_health(transfer);
-        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
-            transfer.status = TransferStatus::Paused;
-            transfer.speed = 0;
-            transfer.active_sources = 0;
-            transfer.queued_sources = 0;
-            Self::clear_runtime_health(transfer);
+            Self::mark_paused(transfer);
+        } else if let Some(transfer) = self.queued_mut(id) {
+            Self::mark_paused(transfer);
         }
+        self.pause_control_and_sources(id);
+    }
+
+    /// [`Self::pause`] for many ids with one pass over the queue. The queue can
+    /// hold `MAX_PENDING_DOWNLOADS` rows, and pausing them one at a time
+    /// scanned it once per id under the manager's write lock.
+    ///
+    /// Returns the ids of the rows it paused, in request order, deduplicated.
+    pub fn pause_many(&mut self, ids: &[String]) -> Vec<String> {
+        let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let mut paused: HashSet<&str> = HashSet::with_capacity(wanted.len());
+        for &id in &wanted {
+            if let Some(transfer) = self.active.get_mut(id) {
+                Self::mark_paused(transfer);
+                paused.insert(id);
+            }
+        }
+        for transfer in self.queue.iter_mut() {
+            if let Some(&id) = wanted.get(transfer.id.as_str()) {
+                if paused.insert(id) {
+                    Self::mark_paused(transfer);
+                }
+            }
+        }
+        for &id in &wanted {
+            self.pause_control_and_sources(id);
+        }
+        let mut reported: HashSet<&str> = HashSet::with_capacity(paused.len());
+        ids.iter()
+            .filter(|id| paused.contains(id.as_str()) && reported.insert(id.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// [`Self::pause_and_promote`] for many ids: everything is paused first and
+    /// queued downloads are promoted once, into every slot the batch freed.
+    /// Returns the paused ids (as [`Self::pause_many`]) and the promotions.
+    pub fn pause_and_promote_many(&mut self, ids: &[String]) -> (Vec<String>, Vec<Transfer>) {
+        let freed_active_download_slot = ids.iter().any(|id| {
+            self.active
+                .get(id)
+                .is_some_and(Self::occupies_download_slot)
+        });
+        let paused = self.pause_many(ids);
+        let promoted = if freed_active_download_slot {
+            self.promote_next()
+        } else {
+            Vec::new()
+        };
+        (paused, promoted)
+    }
+
+    fn mark_paused(transfer: &mut Transfer) {
+        transfer.status = TransferStatus::Paused;
+        transfer.speed = 0;
+        transfer.active_sources = 0;
+        transfer.queued_sources = 0;
+        Self::clear_runtime_health(transfer);
+    }
+
+    fn pause_control_and_sources(&mut self, id: &str) {
         if let Some(control) = self.controls.get(id) {
             control.pause();
         }
@@ -1408,9 +1816,10 @@ impl TransferManager {
             self.speed_history.remove(id);
             self.source_details.remove(id);
             self.queue.push_front(transfer);
+            self.queue_changed();
             return self.promote_next();
         }
-        if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
+        if let Some(transfer) = self.queued_mut(id) {
             transfer.status = TransferStatus::Stopped;
             transfer.speed = 0;
             transfer.active_sources = 0;
@@ -1446,11 +1855,12 @@ impl TransferManager {
             }
             return Vec::new();
         }
-        if let Some(idx) = self.queue.iter().position(|t| t.id == id) {
+        if let Some(idx) = self.queue_position(id) {
             let Some(mut transfer) = self.queue.remove(idx) else {
                 tracing::error!("Queue index {idx} invalid after position() - skipping");
                 return Vec::new();
             };
+            self.queue_changed();
             transfer.status = Self::queued_wait_status(&transfer);
             Self::clear_runtime_health(&mut transfer);
             if let Some(control) = self.controls.get(id) {
@@ -1474,11 +1884,101 @@ impl TransferManager {
             // ahead of. Only reachable with the concurrency cap full, and
             // invisible in the UI, so it read as the resume being ignored.
             self.queue.insert(idx, transfer);
+            self.queue_changed();
         }
         if let Some(control) = self.controls.get(id) {
             control.resume();
         }
         Vec::new()
+    }
+
+    /// [`Self::resume`] for many ids, in request order, with one pass over the
+    /// queue to find them and at most one more to lift promoted rows out —
+    /// resuming one at a time cost two queue scans per id under the write lock.
+    ///
+    /// With `register_missing_controls`, a row with no control gets a fresh one
+    /// first, as `register_control` would give it.
+    pub fn resume_many(&mut self, ids: &[String], register_missing_controls: bool) -> BatchResume {
+        let mut outcome = BatchResume::default();
+        let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let mut queue_index: HashMap<&str, usize> = HashMap::with_capacity(wanted.len());
+        for (idx, transfer) in self.queue.iter().enumerate() {
+            if let Some(&id) = wanted.get(transfer.id.as_str()) {
+                queue_index.entry(id).or_insert(idx);
+            }
+        }
+        let max_downloads = self.max_concurrent as usize;
+        let mut active_downloads = self.active_download_count();
+        let mut promote_idx: HashSet<usize> = HashSet::new();
+        let mut seen: HashSet<&str> = HashSet::with_capacity(wanted.len());
+        for id in ids.iter().map(String::as_str) {
+            if !seen.insert(id) {
+                continue;
+            }
+            if register_missing_controls && !self.controls.contains_key(id) {
+                let ord = self
+                    .active
+                    .get(id)
+                    .or_else(|| queue_index.get(id).map(|&idx| &self.queue[idx]))
+                    .map(|t| Self::priority_ordinal(&t.priority));
+                self.install_control(id, TransferControl::new(), ord);
+            }
+            if let Some(transfer) = self.active.get(id) {
+                let resumable = matches!(
+                    transfer.status,
+                    TransferStatus::Paused | TransferStatus::Insufficient
+                );
+                let occupied_before = Self::occupies_download_slot(transfer);
+                // In-place for an `active` row: no queue scan, no promotion.
+                self.resume(id);
+                let transfer = &self.active[id];
+                if !occupied_before && Self::occupies_download_slot(transfer) {
+                    active_downloads += 1;
+                }
+                if resumable {
+                    outcome.restart_ids.push(id.to_string());
+                }
+                outcome.statuses.push((id.to_string(), transfer.status.clone()));
+                continue;
+            }
+            if let Some(&idx) = queue_index.get(id) {
+                let transfer = &mut self.queue[idx];
+                transfer.status = Self::queued_wait_status(transfer);
+                Self::clear_runtime_health(transfer);
+                let promote = if transfer.direction == TransferDirection::Upload {
+                    transfer.status = TransferStatus::Active;
+                    true
+                } else if active_downloads < max_downloads {
+                    active_downloads += 1;
+                    true
+                } else {
+                    false
+                };
+                if promote {
+                    promote_idx.insert(idx);
+                }
+                outcome.statuses.push((id.to_string(), transfer.status.clone()));
+            }
+            if let Some(control) = self.controls.get(id) {
+                control.resume();
+            }
+        }
+        if !promote_idx.is_empty() {
+            let remaining = self.queue.len() - promote_idx.len();
+            let queue = std::mem::replace(&mut self.queue, VecDeque::with_capacity(remaining));
+            for (idx, transfer) in queue.into_iter().enumerate() {
+                if promote_idx.contains(&idx) {
+                    outcome.promoted.push(transfer.clone());
+                    self.active.insert(transfer.id.clone(), transfer);
+                } else {
+                    // Unpromoted rows keep their place: queue order is the
+                    // FIFO tie-break `promote_next` relies on.
+                    self.queue.push_back(transfer);
+                }
+            }
+            self.queue_changed();
+        }
+        outcome
     }
 
     pub fn cancel(&mut self, id: &str) -> Vec<Transfer> {
@@ -1487,6 +1987,7 @@ impl TransferManager {
         }
         self.active.remove(id);
         self.queue.retain(|t| t.id != id);
+        self.queue_changed();
         // Also drop any completed/failed copy so a Failed event that raced
         // ahead of cancel can't leave a sticky red "failed" row in memory
         // (and therefore in get_transfers) after the user cancelled.
@@ -1503,6 +2004,7 @@ impl TransferManager {
         }
         let was_active = self.active.remove(id).is_some();
         self.queue.retain(|t| t.id != id);
+        self.queue_changed();
         self.completed.retain(|t| t.id != id);
         self.controls.remove(id);
         self.speed_history.remove(id);
@@ -1517,7 +2019,7 @@ impl TransferManager {
     pub fn set_priority(&mut self, id: &str, priority: &str) {
         if let Some(transfer) = self.active.get_mut(id) {
             transfer.priority = priority.to_string();
-        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
+        } else if let Some(transfer) = self.queued_mut(id) {
             transfer.priority = priority.to_string();
         }
         // Mirror onto the live control so an active download's connection-slot
@@ -1530,17 +2032,34 @@ impl TransferManager {
     pub fn set_category(&mut self, id: &str, category: &str) {
         if let Some(transfer) = self.active.get_mut(id) {
             transfer.category = category.to_string();
-        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
+        } else if let Some(transfer) = self.queued_mut(id) {
             transfer.category = category.to_string();
         } else if let Some(transfer) = self.completed.iter_mut().find(|t| t.id == id) {
             transfer.category = category.to_string();
         }
     }
 
+    /// Change the display name of a download. The `.part` file is named by
+    /// transfer id, so this is metadata only — completion reads the same
+    /// name when it moves the file into Downloads. Finished files stay put:
+    /// renaming those would desync the completed list from the file on disk.
+    /// Failed rows live in `completed` too, but they still have a `.part`
+    /// and can be resumed, so they take the new name.
+    pub fn set_file_name(&mut self, id: &str, name: &str) -> bool {
+        let Some(transfer) = self.get_transfer_mut(id) else {
+            return false;
+        };
+        if transfer.status == TransferStatus::Completed {
+            return false;
+        }
+        transfer.file_name = name.to_string();
+        true
+    }
+
     pub fn set_preview_priority(&mut self, id: &str, enabled: bool) {
         if let Some(transfer) = self.active.get_mut(id) {
             transfer.preview_priority = enabled;
-        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
+        } else if let Some(transfer) = self.queued_mut(id) {
             transfer.preview_priority = enabled;
         }
         if let Some(control) = self.controls.get(id) {
@@ -1707,11 +2226,67 @@ impl TransferManager {
         all
     }
 
+    /// Every row in `get_all` order, with the live preview flag `get_all`
+    /// overlays.
+    fn snapshot_rows(&self) -> impl Iterator<Item = (&Transfer, bool)> {
+        self.active
+            .values()
+            .chain(self.queue.iter())
+            .chain(self.completed.iter())
+            .map(|t| {
+                let preview_ready = self
+                    .controls
+                    .get(&t.id)
+                    .map_or(t.preview_ready, |c| c.is_preview_ready());
+                (t, preview_ready)
+            })
+    }
+
     pub fn get_transfer(&self, id: &str) -> Option<&Transfer> {
         self.active
             .get(id)
-            .or_else(|| self.queue.iter().find(|t| t.id == id))
+            .or_else(|| self.queued(id))
             .or_else(|| self.completed.iter().find(|t| t.id == id))
+    }
+
+    /// Rows changed since `since` of `epoch`, for a poller that keeps its own
+    /// copy. The first call, a stale epoch, or a caller further behind than
+    /// the removal history reaches all get the full snapshot.
+    pub fn get_transfers_since(&self, epoch: Option<u64>, since: u64) -> TransferDelta {
+        let mut revisions = self.revisions.lock().unwrap_or_else(|e| e.into_inner());
+        let delta_possible = epoch == Some(revisions.epoch)
+            && since > 0
+            && since <= revisions.revision
+            && since >= revisions.floor;
+        let changed = revisions.sync(self.snapshot_rows(), delta_possible.then_some(since));
+        // Tombstones evicted during this very sync can raise the floor.
+        let full = !delta_possible || since < revisions.floor;
+        let changed = if full && delta_possible {
+            // Rare: walk again to collect every row. Nothing changed since the
+            // first walk, so the revision does not move.
+            revisions.sync(self.snapshot_rows(), None)
+        } else {
+            changed
+        };
+        let transfers = changed
+            .into_iter()
+            .map(|(t, preview_ready)| {
+                let mut row = t.clone();
+                row.preview_ready = preview_ready;
+                row
+            })
+            .collect();
+        TransferDelta {
+            epoch: revisions.epoch,
+            revision: revisions.revision,
+            full,
+            removed: if full {
+                Vec::new()
+            } else {
+                revisions.removed_since(since)
+            },
+            transfers,
+        }
     }
 
     /// Update the concurrent-download cap and promote any queued downloads
@@ -1745,6 +2320,7 @@ impl TransferManager {
                 tracing::error!("Queue index {idx} invalid during promotion - skipping");
                 break;
             };
+            self.queue_changed();
             transfer.status = Self::queued_wait_status(&transfer);
             let t = transfer.clone();
             self.active.insert(transfer.id.clone(), transfer);
@@ -1757,6 +2333,23 @@ impl TransferManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rename lands before completion reads the name or is refused — never
+    /// accepted after it, where it would relabel a row whose file on disk
+    /// already carries the old name.
+    #[test]
+    fn a_rename_after_completion_read_the_name_is_refused() {
+        let control = TransferControl::new();
+        assert!(control.set_pending_rename("first.mkv"));
+        assert!(control.set_pending_rename("second.mkv"));
+        assert_eq!(control.seal_pending_rename().as_deref(), Some("second.mkv"));
+        assert!(!control.set_pending_rename("too-late.mkv"));
+        assert_eq!(control.pending_rename().as_deref(), Some("second.mkv"));
+
+        let untouched = TransferControl::new();
+        assert_eq!(untouched.seal_pending_rename(), None);
+        assert!(!untouched.set_pending_rename("late.mkv"));
+    }
 
     /// Same contract as the failure codes: the frontend keys a table on these
     /// exact strings, so a duplicate or a stray character costs a translation.
@@ -1790,7 +2383,9 @@ mod tests {
             "the {{reason}} placeholder was left unfilled"
         );
         assert!(
-            TransferHealthCode::RetryingAfter.message().contains("{reason}"),
+            TransferHealthCode::RetryingAfter
+                .message()
+                .contains("{reason}"),
             "the template must keep a slot for the failure, or the UI has nothing to fill"
         );
     }
@@ -1819,18 +2414,51 @@ mod tests {
         assert_eq!(
             stalled(|t| {
                 t.sources = 3;
-                t.active_sources = 1;
+                t.active_sources = 0;
+                t.queued_sources = 0;
             }),
             Some(TransferHealthCode::NoData)
+        );
+        // A live slot is idle, not stalled — the file row must not go red
+        // while a source is still in DS_DOWNLOADING.
+        assert_eq!(
+            stalled(|t| {
+                t.sources = 3;
+                t.active_sources = 1;
+            }),
+            Some(TransferHealthCode::Idle)
         );
 
         let mut active = download("i");
         active.status = TransferStatus::Active;
         active.last_received = Some(active.started_at);
         assert_eq!(
-            TransferManager::compute_health_state(&active, active.started_at + ACTIVE_DEGRADED_SECS)
-                .1,
+            TransferManager::compute_health_state(
+                &active,
+                active.started_at + ACTIVE_DEGRADED_SECS
+            )
+            .1,
             Some(TransferHealthCode::Idle)
+        );
+
+        let mut live_slot = download("live-slot");
+        live_slot.status = TransferStatus::Active;
+        live_slot.last_received = Some(live_slot.started_at);
+        live_slot.sources = 2;
+        live_slot.active_sources = 1;
+        assert_eq!(
+            TransferManager::compute_health_state(
+                &live_slot,
+                live_slot.started_at + ACTIVE_STALLED_SECS,
+            ),
+            (TransferHealth::Degraded, Some(TransferHealthCode::Idle))
+        );
+        assert_eq!(
+            TransferManager::compute_health_state(
+                &live_slot,
+                live_slot.started_at + ACTIVE_DEGRADED_SECS - 1,
+            ),
+            (TransferHealth::Healthy, None)
         );
 
         let mut searching = download("j");
@@ -1854,8 +2482,11 @@ mod tests {
         );
         queued.sources = 4;
         assert_eq!(
-            TransferManager::compute_health_state(&queued, queued.started_at + QUEUED_DEGRADED_SECS)
-                .1,
+            TransferManager::compute_health_state(
+                &queued,
+                queued.started_at + QUEUED_DEGRADED_SECS
+            )
+            .1,
             Some(TransferHealthCode::WaitingSlot)
         );
 
@@ -1957,6 +2588,7 @@ mod tests {
             up_part_count: None,
             up_peer_part_status: None,
             ember_verified: false,
+            friends_only: false,
         }
     }
 
@@ -2081,12 +2713,53 @@ mod tests {
         ours.placeholder = true;
         manager.update_source_detail("a", ours);
 
-        let inherited =
-            manager.inherited_source_origin("a", "198.51.100.10", Some([0x22; 16]));
+        let inherited = manager.inherited_source_origin("a", "198.51.100.10", Some([0x22; 16]));
         assert_eq!(
             inherited,
             Some(SourceOrigin::Ember),
             "a live session must keep its own provenance, not a neighbour's at another IP"
+        );
+    }
+
+    #[test]
+    fn inherited_origin_never_comes_from_a_neighbour_behind_the_same_nat() {
+        use crate::types::SourceOrigin;
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(download("a"));
+
+        // A contacted neighbour at our peer's IP, and a placeholder that was
+        // seeded for someone else's hash.
+        let mut neighbour = src("198.51.100.11", SourceStatus::Queued);
+        neighbour.origin = Some(SourceOrigin::Kad);
+        neighbour.port = 4662;
+        neighbour.user_hash = Some([0x11; 16]);
+        manager.update_source_detail("a", neighbour);
+
+        let mut other_placeholder = src("198.51.100.11", SourceStatus::WaitCallback);
+        other_placeholder.origin = Some(SourceOrigin::Server);
+        other_placeholder.port = 4663;
+        other_placeholder.user_hash = Some([0x33; 16]);
+        other_placeholder.placeholder = true;
+        manager.update_source_detail("a", other_placeholder);
+
+        assert_eq!(
+            manager.inherited_source_origin("a", "198.51.100.11", Some([0x22; 16])),
+            None
+        );
+        assert_eq!(
+            manager.inherited_source_origin("a", "198.51.100.11", None),
+            None,
+            "with no hash of our own, only a hash-less placeholder can be us"
+        );
+
+        let mut ours = src("198.51.100.11", SourceStatus::WaitCallback);
+        ours.origin = Some(SourceOrigin::Ember);
+        ours.port = 4664;
+        ours.placeholder = true;
+        manager.update_source_detail("a", ours);
+        assert_eq!(
+            manager.inherited_source_origin("a", "198.51.100.11", Some([0x22; 16])),
+            Some(SourceOrigin::Ember)
         );
     }
 
@@ -2170,7 +2843,10 @@ mod tests {
     #[test]
     fn completing_a_download_frees_its_slot_for_the_next_queued_one() {
         let mut manager = TransferManager::new(1);
-        assert!(manager.enqueue(sourced("a", 3)), "the first row fits the cap");
+        assert!(
+            manager.enqueue(sourced("a", 3)),
+            "the first row fits the cap"
+        );
         assert!(
             !manager.enqueue(sourced("b", 3)),
             "the second row must wait for the slot"
@@ -2219,7 +2895,10 @@ mod tests {
             promoted.is_empty(),
             "the running download's slot was never freed"
         );
-        assert!(manager.active.contains_key("a"), "the running row is untouched");
+        assert!(
+            manager.active.contains_key("a"),
+            "the running row is untouched"
+        );
         assert_eq!(manager.active.len(), 1);
 
         let promoted = manager
@@ -2270,7 +2949,8 @@ mod tests {
 
         assert_eq!(manager.completed.len(), 1000, "the ring must cap at 1000");
         assert_eq!(
-            manager.completed.first().unwrap().id, "t0005",
+            manager.completed.first().unwrap().id,
+            "t0005",
             "the five oldest rows are the ones that go"
         );
         assert_eq!(manager.completed.last().unwrap().id, "t1004");
@@ -2312,7 +2992,11 @@ mod tests {
             ["c"],
             "the longest-queued row of equal priority goes first"
         );
-        assert_eq!(manager.active.len(), 2, "no slot leaked, none oversubscribed");
+        assert_eq!(
+            manager.active.len(),
+            2,
+            "no slot leaked, none oversubscribed"
+        );
         assert!(!manager.active.contains_key("a"));
         assert!(
             !manager.queue.iter().any(|t| t.id == "c"),
@@ -2502,6 +3186,91 @@ mod tests {
         );
     }
 
+    fn owned(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    fn status_of(manager: &TransferManager, id: &str) -> TransferStatus {
+        manager.get_transfer(id).expect("row present").status.clone()
+    }
+
+    #[test]
+    fn pause_many_pauses_active_and_queued_rows_and_reports_them_once() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(download("a"));
+        manager.enqueue(download("b"));
+        manager.enqueue(download("c"));
+
+        let paused = manager.pause_many(&owned(&["c", "a", "missing", "c"]));
+
+        assert_eq!(paused, ["c", "a"], "request order, found rows only, no repeats");
+        assert_eq!(status_of(&manager, "a"), TransferStatus::Paused);
+        assert_eq!(status_of(&manager, "c"), TransferStatus::Paused);
+        assert_eq!(status_of(&manager, "b"), TransferStatus::Searching, "unrequested rows are untouched");
+        assert_eq!(ids(&Vec::from(manager.queue.clone())), ["b", "c"], "queue order is preserved");
+    }
+
+    /// Promotion runs once after every row is paused, so it fills each freed
+    /// slot and never picks a row the same batch is pausing.
+    #[test]
+    fn pause_and_promote_many_fills_freed_slots_with_unpaused_rows() {
+        let mut manager = TransferManager::new(2);
+        for id in ["a", "b", "c", "d", "e"] {
+            manager.enqueue(download(id));
+        }
+
+        let (paused, promoted) = manager.pause_and_promote_many(&owned(&["a", "b", "c"]));
+
+        assert_eq!(paused, ["a", "b", "c"]);
+        let mut promoted = ids(&promoted);
+        promoted.sort();
+        assert_eq!(promoted, ["d", "e"]);
+        assert_eq!(status_of(&manager, "c"), TransferStatus::Paused);
+        assert!(manager.queue.iter().any(|t| t.id == "c"), "a paused row is not promoted");
+        assert_eq!(manager.active_download_count(), 2);
+    }
+
+    /// Same end state as resuming each id in turn: request order decides who
+    /// gets the free slot, an in-place `active` resume takes a slot too, and
+    /// rows left waiting keep their queue position.
+    #[test]
+    fn resume_many_matches_resuming_each_id_in_turn() {
+        let build = || {
+            let mut manager = TransferManager::new(1);
+            for id in ["a", "b", "c", "d"] {
+                manager.enqueue(download(id));
+            }
+            manager.pause_many(&owned(&["a", "b", "c", "d"]));
+            manager
+        };
+        let request = owned(&["c", "a", "b", "d"]);
+
+        let mut sequential = build();
+        let mut sequential_promoted = Vec::new();
+        for id in &request {
+            sequential_promoted.extend(sequential.resume(id));
+        }
+
+        let mut batched = build();
+        let outcome = batched.resume_many(&request, true);
+
+        assert_eq!(ids(&outcome.promoted), ids(&sequential_promoted));
+        assert_eq!(ids(&outcome.promoted), ["c"]);
+        assert_eq!(outcome.restart_ids, ["a"], "a paused active row needs a restart");
+        for id in ["a", "b", "c", "d"] {
+            assert_eq!(status_of(&batched, id), status_of(&sequential, id), "{id}");
+        }
+        assert_eq!(
+            ids(&Vec::from(batched.queue.clone())),
+            ids(&Vec::from(sequential.queue.clone()))
+        );
+        assert_eq!(
+            outcome.statuses.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["c", "a", "b", "d"]
+        );
+        assert!(batched.get_control("b").is_some(), "a missing control is registered");
+    }
+
     /// A rate measured over a window that has only just opened used to be
     /// divided by the 200 ms between the first two progress events, reporting
     /// several times what actually moved. That is how a single upload slot
@@ -2623,6 +3392,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn set_file_name_updates_active_and_queued_not_completed() {
+        let mut manager = TransferManager::new(1);
+        let mut active = download("a");
+        active.status = TransferStatus::Active;
+        assert!(manager.enqueue(active));
+        let queued = download("b");
+        assert!(!manager.enqueue(queued));
+        let mut finished = download("c");
+        finished.status = TransferStatus::Completed;
+        manager.completed.push(finished);
+        let mut failed = download("d");
+        failed.status = TransferStatus::Failed;
+        manager.completed.push(failed);
+
+        assert!(manager.set_file_name("a", "renamed-a.bin"));
+        assert_eq!(
+            manager.get_transfer("a").unwrap().file_name,
+            "renamed-a.bin"
+        );
+        assert!(manager.set_file_name("b", "renamed-b.bin"));
+        assert_eq!(
+            manager.get_transfer("b").unwrap().file_name,
+            "renamed-b.bin"
+        );
+        assert!(
+            !manager.set_file_name("c", "renamed-c.bin"),
+            "a finished download keeps the name it completed under"
+        );
+        assert_eq!(manager.get_transfer("c").unwrap().file_name, "c.bin");
+        assert!(manager.set_file_name("d", "renamed-d.bin"));
+        assert_eq!(
+            manager.get_transfer("d").unwrap().file_name,
+            "renamed-d.bin"
+        );
+        assert!(!manager.set_file_name("missing", "x.bin"));
+    }
+
     /// A transfer row and the status-bar total are the same bytes measured
     /// twice, and the Uploads tab invites adding the rows up and comparing
     /// them to the total. That only holds if both answer on the same
@@ -2637,9 +3444,8 @@ mod tests {
 
         // Retaining `1 - new` of the previous value each second settles over
         // about `1 / (1 - retained)` seconds.
-        let retained =
-            (SPEED_SMOOTHING_DENOMINATOR - SPEED_SMOOTHING_NEW) as f64
-                / SPEED_SMOOTHING_DENOMINATOR as f64;
+        let retained = (SPEED_SMOOTHING_DENOMINATOR - SPEED_SMOOTHING_NEW) as f64
+            / SPEED_SMOOTHING_DENOMINATOR as f64;
         let settle_ms = 1_000.0 / (1.0 - retained);
         assert!(
             (SPEED_WINDOW_MS as f64) <= settle_ms,
@@ -2652,5 +3458,140 @@ mod tests {
             "the row window ({SPEED_WINDOW_MS} ms) has drifted well ahead of \
              the total's ~{settle_ms:.0} ms settling time"
         );
+    }
+
+    fn delta_ids(delta: &TransferDelta) -> Vec<&str> {
+        let mut ids: Vec<&str> = delta.transfers.iter().map(|t| t.id.as_str()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn the_first_poll_is_a_full_snapshot_and_an_idle_one_is_empty() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(sourced("a", 1));
+        manager.enqueue(sourced("b", 1));
+
+        let first = manager.get_transfers_since(None, 0);
+        assert!(first.full);
+        assert_eq!(delta_ids(&first), ["a", "b"]);
+        assert!(first.revision > 0);
+
+        let idle = manager.get_transfers_since(Some(first.epoch), first.revision);
+        assert!(!idle.full);
+        assert!(idle.transfers.is_empty() && idle.removed.is_empty());
+        assert_eq!(idle.revision, first.revision, "nothing changed, so no bump");
+    }
+
+    #[test]
+    fn a_delta_carries_only_changed_rows_and_removals() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(sourced("a", 1));
+        manager.enqueue(sourced("b", 1));
+        manager.enqueue(sourced("c", 1));
+        let base = manager.get_transfers_since(None, 0);
+
+        // Written straight through the public field, the way the network task
+        // does — the tracker has to see it without a setter.
+        manager.queue.iter_mut().find(|t| t.id == "b").unwrap().sources = 9;
+        manager.cancel("c");
+
+        let delta = manager.get_transfers_since(Some(base.epoch), base.revision);
+        assert!(!delta.full);
+        assert_eq!(delta_ids(&delta), ["b"]);
+        assert_eq!(delta.removed, ["c"]);
+        assert_eq!(delta.revision, base.revision + 1);
+
+        // A caller that already has that revision is up to date; one still at
+        // the base gets the same answer again.
+        let caught_up = manager.get_transfers_since(Some(delta.epoch), delta.revision);
+        assert!(caught_up.transfers.is_empty() && caught_up.removed.is_empty());
+        let behind = manager.get_transfers_since(Some(base.epoch), base.revision);
+        assert_eq!(delta_ids(&behind), ["b"]);
+        assert_eq!(behind.removed, ["c"]);
+    }
+
+    #[test]
+    fn a_live_preview_flag_counts_as_a_change() {
+        let mut manager = TransferManager::new(1);
+        let mut row = sourced("a", 1);
+        row.status = TransferStatus::Active;
+        manager.enqueue(row);
+        let control = TransferControl::new();
+        manager.register_control("a", control.clone());
+        let base = manager.get_transfers_since(None, 0);
+        assert!(!base.transfers[0].preview_ready);
+
+        control.set_preview_ready(true);
+        let delta = manager.get_transfers_since(Some(base.epoch), base.revision);
+        assert_eq!(delta_ids(&delta), ["a"]);
+        assert!(delta.transfers[0].preview_ready);
+    }
+
+    #[test]
+    fn an_unknown_epoch_or_revision_gets_a_full_snapshot() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(sourced("a", 1));
+        let base = manager.get_transfers_since(None, 0);
+
+        let other_epoch = manager.get_transfers_since(Some(base.epoch ^ 1), base.revision);
+        assert!(other_epoch.full);
+        assert_eq!(delta_ids(&other_epoch), ["a"]);
+
+        let ahead = manager.get_transfers_since(Some(base.epoch), base.revision + 5);
+        assert!(ahead.full, "a revision this tracker never issued");
+    }
+
+    #[test]
+    fn a_caller_behind_the_removal_history_gets_a_full_snapshot() {
+        let mut manager = TransferManager::new(MAX_REVISION_TOMBSTONES as u32 + 8);
+        manager.enqueue(sourced("keep", 1));
+        let base = manager.get_transfers_since(None, 0);
+        for i in 0..=MAX_REVISION_TOMBSTONES {
+            let id = format!("gone-{i}");
+            manager.enqueue(sourced(&id, 1));
+            let _ = manager.get_transfers_since(Some(base.epoch), base.revision);
+            manager.cancel(&id);
+            let _ = manager.get_transfers_since(Some(base.epoch), base.revision);
+        }
+
+        let stale = manager.get_transfers_since(Some(base.epoch), base.revision);
+        assert!(stale.full, "removals it would need have been forgotten");
+        assert_eq!(delta_ids(&stale), ["keep"]);
+        assert!(stale.removed.is_empty());
+    }
+
+    #[test]
+    fn a_single_word_edit_always_changes_the_fingerprint() {
+        let mut buf = Vec::new();
+        let mut row = download("a");
+        let before = serde_fingerprint(&mut buf, &row);
+        row.speed = 1;
+        assert_ne!(serde_fingerprint(&mut buf, &row), before);
+        row.speed = 0;
+        assert_eq!(serde_fingerprint(&mut buf, &row), before);
+    }
+
+    #[test]
+    fn queue_lookups_follow_reordering() {
+        let mut manager = TransferManager::new(1);
+        let mut running = sourced("run", 1);
+        running.status = TransferStatus::Active;
+        manager.enqueue(running);
+        for id in ["q1", "q2", "q3"] {
+            manager.enqueue(sourced(id, 1));
+        }
+        assert_eq!(manager.get_transfer("q2").unwrap().id, "q2");
+
+        manager.cancel("q1");
+        assert_eq!(manager.get_transfer("q3").unwrap().id, "q3");
+        manager.stop("run");
+        assert_eq!(manager.get_transfer("run").unwrap().status, TransferStatus::Stopped);
+        manager.set_priority("q3", "high");
+        assert_eq!(manager.get_transfer("q3").unwrap().priority, "high");
+        assert!(manager.get_transfer("q1").is_none());
+        let queued = manager.queue.len();
+        manager.enqueue(sourced("q3", 1));
+        assert_eq!(manager.queue.len(), queued, "still queued, so not enqueued twice");
     }
 }

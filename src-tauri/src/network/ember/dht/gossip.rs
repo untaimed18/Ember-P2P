@@ -31,7 +31,8 @@
 //! own table is starved: a node with nothing has to try everything, since
 //! probing junk costs only bandwidth while failing to join costs the overlay.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use super::EmberNodeId;
@@ -89,7 +90,7 @@ struct Introducer {
     /// Leads skipped since it was last allowed one, driving
     /// [`NOISY_SAMPLE_EVERY`].
     skipped: u32,
-    /// Last time it named a lead, for eviction.
+    /// Last time one of its leads was probed, for eviction.
     seen: Instant,
 }
 
@@ -126,6 +127,11 @@ impl Introducer {
 #[derive(Debug, Clone, Copy)]
 struct PendingLead {
     introducer: EmberNodeId,
+    /// The address the introducer named and the probe went to. The claim is
+    /// that *this* address is the node, so only a frame from it settles the
+    /// lead in the introducer's favour — the same ID speaking from elsewhere
+    /// says nothing about the address it was named at.
+    addr: SocketAddr,
     probed_at: Instant,
 }
 
@@ -138,6 +144,10 @@ pub struct GossipReputation {
     /// caller skips a lead it is already pinging — so one entry per lead is
     /// enough.
     pending: HashMap<EmberNodeId, PendingLead>,
+    /// Every `pending` entry with its probe time, ordered by that time, so the
+    /// oldest is found from the front. A pair whose time `pending` no longer
+    /// holds for that lead is a resolved or re-probed lead, and is skipped.
+    pending_order: VecDeque<(EmberNodeId, Instant)>,
 }
 
 impl GossipReputation {
@@ -190,12 +200,18 @@ impl GossipReputation {
         }
     }
 
-    /// Note that we have just probed `lead` on `introducer`'s word.
+    /// Note that we have just probed `lead` at `addr` on `introducer`'s word.
     ///
     /// Attribution starts at the probe, not at the naming: a lead we never
     /// probed can never answer, so counting it would charge an introducer for
     /// our own budget running out.
-    pub fn note_probe(&mut self, introducer: EmberNodeId, lead: EmberNodeId, now: Instant) {
+    pub fn note_probe(
+        &mut self,
+        introducer: EmberNodeId,
+        lead: EmberNodeId,
+        addr: SocketAddr,
+        now: Instant,
+    ) {
         self.introducers
             .entry(introducer)
             .or_insert_with(|| Introducer::new(now))
@@ -208,36 +224,59 @@ impl GossipReputation {
         // still to come. Dropping the newest also handed a free pass to
         // whoever filled the map — its later leads escaped being charged.
         if self.pending.len() >= MAX_PENDING_LEADS && !self.pending.contains_key(&lead) {
-            if let Some(oldest) = self
-                .pending
-                .iter()
-                .min_by_key(|(_, p)| p.probed_at)
-                .map(|(id, _)| *id)
-            {
-                self.pending.remove(&oldest);
+            while let Some((oldest, at)) = self.pending_order.pop_front() {
+                if self.pending.get(&oldest).is_some_and(|p| p.probed_at == at) {
+                    self.pending.remove(&oldest);
+                    break;
+                }
             }
         }
-        self.pending.insert(
+        let replaced = self.pending.insert(
             lead,
             PendingLead {
                 introducer,
+                addr,
                 probed_at: now,
             },
         );
+        if replaced.is_none_or(|p| p.probed_at != now) {
+            let pos = self.pending_order.partition_point(|(_, at)| *at <= now);
+            self.pending_order.insert(pos, (lead, now));
+        }
+        // Resolved leads leave their pair behind; past twice the cap most of
+        // the queue is such pairs, so dropping them keeps this amortised O(1).
+        if self.pending_order.len() > 2 * MAX_PENDING_LEADS {
+            self.compact_pending_order();
+        }
     }
 
-    /// A lead answered. Credits whoever named it, if anyone still has a claim.
-    pub fn note_answered(&mut self, lead: &EmberNodeId) {
-        let Some(entry) = self.pending.remove(lead) else {
+    fn compact_pending_order(&mut self) {
+        let pending = &self.pending;
+        self.pending_order
+            .retain(|(lead, at)| pending.get(lead).is_some_and(|p| p.probed_at == *at));
+    }
+
+    /// `lead` spoke to us from `from`. Credits whoever named it, if anyone
+    /// still has a claim and `from` is the address the lead was named at.
+    ///
+    /// A frame from any other address leaves the claim pending, so the probe
+    /// still resolves on its own timeout: otherwise an introducer could name
+    /// real, active IDs at addresses that go nowhere and be credited whenever
+    /// those nodes happened to talk to us.
+    pub fn note_answered(&mut self, lead: &EmberNodeId, from: SocketAddr) {
+        let Some(entry) = self.pending.get(lead).copied().filter(|p| p.addr == from) else {
             return;
         };
+        self.pending.remove(lead);
         if let Some(record) = self.introducers.get_mut(&entry.introducer) {
             record.answered = record.answered.saturating_add(1);
             record.decay();
         }
     }
 
-    /// A probed lead never answered.
+    /// A probed lead never answered from the address it was named at. A no-op
+    /// for a lead with no claim pending, so it is safe to call for every
+    /// expired probe.
     pub fn note_silent(&mut self, lead: &EmberNodeId) {
         let Some(entry) = self.pending.remove(lead) else {
             return;
@@ -289,6 +328,7 @@ impl GossipReputation {
                 self.pending.remove(&id);
             }
         }
+        self.compact_pending_order();
     }
 
     #[cfg(test)]
@@ -305,6 +345,11 @@ mod tests {
         EmberNodeId([n; 16])
     }
 
+    /// The address lead `n` is named and probed at.
+    fn addr(n: u8) -> SocketAddr {
+        SocketAddr::from(([198, 51, 100, n], 4000))
+    }
+
     /// Resolve `count` leads from one introducer, `answered` of them by
     /// answering. Every lead is distinct, since the pending map is keyed on it.
     fn resolve_batch(
@@ -316,10 +361,11 @@ mod tests {
     ) {
         let now = Instant::now();
         for i in 0..count {
-            let lead = id(first_lead.wrapping_add(i as u8));
-            rep.note_probe(introducer, lead, now);
+            let n = first_lead.wrapping_add(i as u8);
+            let lead = id(n);
+            rep.note_probe(introducer, lead, addr(n), now);
             if i < answered {
-                rep.note_answered(&lead);
+                rep.note_answered(&lead, addr(n));
             } else {
                 rep.note_silent(&lead);
             }
@@ -451,10 +497,43 @@ mod tests {
     #[test]
     fn a_lead_we_never_probed_is_charged_to_nobody() {
         let mut rep = GossipReputation::new();
-        rep.note_answered(&id(99));
+        rep.note_answered(&id(99), addr(99));
         rep.note_silent(&id(98));
         assert_eq!(rep.rationed_len(), 0);
         assert!(rep.should_probe(&id(1)));
+    }
+
+    /// Naming a real, active node at an address that goes nowhere must not
+    /// earn credit when that node talks to us from where it actually is.
+    #[test]
+    fn an_answer_from_another_address_does_not_credit_the_introducer() {
+        let mut rep = GossipReputation::new();
+        let now = Instant::now();
+        rep.note_probe(id(1), id(50), addr(50), now);
+
+        rep.note_answered(&id(50), addr(51));
+        assert_eq!(rep.introducers[&id(1)].answered, 0);
+        assert_eq!(
+            rep.pending_len(),
+            1,
+            "the claim stays open for the probe's own timeout to settle"
+        );
+
+        rep.note_silent(&id(50));
+        let record = rep.introducers[&id(1)];
+        assert_eq!((record.answered, record.silent), (0, 1));
+    }
+
+    /// The honest case the address check must not break.
+    #[test]
+    fn an_answer_from_the_named_address_credits_the_introducer() {
+        let mut rep = GossipReputation::new();
+        let now = Instant::now();
+        rep.note_probe(id(1), id(50), addr(50), now);
+        rep.note_answered(&id(50), addr(50));
+        let record = rep.introducers[&id(1)];
+        assert_eq!((record.answered, record.silent), (1, 0));
+        assert_eq!(rep.pending_len(), 0);
     }
 
     /// An outcome consumes its claim, so one probe cannot be counted twice.
@@ -462,7 +541,7 @@ mod tests {
     fn an_outcome_is_counted_once() {
         let mut rep = GossipReputation::new();
         let now = Instant::now();
-        rep.note_probe(id(1), id(50), now);
+        rep.note_probe(id(1), id(50), addr(50), now);
         assert_eq!(rep.pending_len(), 1);
         rep.note_silent(&id(50));
         rep.note_silent(&id(50));
@@ -483,7 +562,7 @@ mod tests {
         for i in 0..(MAX_PENDING_LEADS * 2) {
             let mut raw = [0u8; 16];
             raw[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            rep.note_probe(id(1), EmberNodeId(raw), now);
+            rep.note_probe(id(1), EmberNodeId(raw), addr(1), now);
         }
         assert!(rep.pending_len() <= MAX_PENDING_LEADS);
     }
@@ -502,13 +581,13 @@ mod tests {
         for i in 0..MAX_PENDING_LEADS {
             let mut raw = [0u8; 16];
             raw[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            rep.note_probe(id(1), EmberNodeId(raw), start);
+            rep.note_probe(id(1), EmberNodeId(raw), addr(1), start);
         }
         assert_eq!(rep.pending_len(), MAX_PENDING_LEADS);
 
         // The next lead it names is probed a moment later and goes silent.
         let later = start + Duration::from_secs(1);
-        rep.note_probe(id(1), id(99), later);
+        rep.note_probe(id(1), id(99), addr(99), later);
         rep.note_silent(&id(99));
 
         let record = rep.introducers[&id(1)];
@@ -528,12 +607,12 @@ mod tests {
     fn an_unresolved_probe_expires_without_a_verdict() {
         let mut rep = GossipReputation::new();
         let probed = Instant::now();
-        rep.note_probe(id(1), id(50), probed);
+        rep.note_probe(id(1), id(50), addr(50), probed);
         rep.prune(probed + PENDING_TTL + Duration::from_secs(1));
         assert_eq!(rep.pending_len(), 0);
 
         // And the late answer finds no claim to credit.
-        rep.note_answered(&id(50));
+        rep.note_answered(&id(50), addr(50));
         assert!(rep.should_probe(&id(1)));
     }
 
@@ -556,10 +635,98 @@ mod tests {
     fn a_silent_introducers_record_is_forgotten() {
         let mut rep = GossipReputation::new();
         let then = Instant::now();
-        rep.note_probe(id(1), id(50), then);
+        rep.note_probe(id(1), id(50), addr(50), then);
         rep.note_silent(&id(50));
         rep.prune(then + INTRODUCER_TTL + Duration::from_secs(1));
         assert_eq!(rep.rationed_len(), 0);
         assert!(rep.introducers.is_empty());
+    }
+
+    /// A full pending map sheds its oldest probe from a time-ordered queue
+    /// rather than by scanning. Driven through probes, re-probes, answers,
+    /// silences and prunes, the map has to hold exactly what scanning for the
+    /// minimum would have left — and the queue has to stay bounded.
+    #[test]
+    fn a_full_pending_map_sheds_what_a_scan_for_the_oldest_would() {
+        let mut rep = GossipReputation::new();
+        let mut model: HashMap<EmberNodeId, (EmberNodeId, SocketAddr, Instant)> = HashMap::new();
+        let t0 = Instant::now();
+        let mut seed = 0xE703_7ED1_A0B4_28DBu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let lead = |n: u64| {
+            let mut raw = [0u8; 16];
+            raw[..8].copy_from_slice(&n.to_le_bytes());
+            EmberNodeId(raw)
+        };
+        // Distinct probe times, since a scan breaks ties arbitrarily. Mostly
+        // rising, now and then earlier than the last.
+        let mut used = std::collections::HashSet::new();
+        let mut clock_us = 0u64;
+        let mut shed = 0;
+
+        for step in 0..20_000u64 {
+            let r = next();
+            let n = next() % 3_000;
+            let from = addr((n % 200) as u8);
+            match r % 20 {
+                0..=13 => {
+                    clock_us += 1_000;
+                    let mut us = if r.is_multiple_of(7) {
+                        clock_us.saturating_sub((r >> 8) % 2_000_000)
+                    } else {
+                        clock_us
+                    };
+                    while !used.insert(us) {
+                        us += 1;
+                    }
+                    let now = t0 + Duration::from_micros(us);
+                    let introducer = id((r >> 32) as u8 % 5);
+                    rep.note_probe(introducer, lead(n), from, now);
+                    if model.len() >= MAX_PENDING_LEADS && !model.contains_key(&lead(n)) {
+                        let oldest = *model.iter().min_by_key(|(_, p)| p.2).unwrap().0;
+                        model.remove(&oldest);
+                        shed += 1;
+                    }
+                    model.insert(lead(n), (introducer, from, now));
+                }
+                14..=16 => {
+                    let from = if (r >> 16).is_multiple_of(3) {
+                        addr(((n + 1) % 200) as u8)
+                    } else {
+                        from
+                    };
+                    rep.note_answered(&lead(n), from);
+                    if model.get(&lead(n)).is_some_and(|p| p.1 == from) {
+                        model.remove(&lead(n));
+                    }
+                }
+                17..=18 => {
+                    rep.note_silent(&lead(n));
+                    model.remove(&lead(n));
+                }
+                _ => {
+                    if r % 50 == 19 {
+                        let now = t0 + PENDING_TTL + Duration::from_micros(clock_us / 2);
+                        rep.prune(now);
+                        model.retain(|_, p| now.saturating_duration_since(p.2) < PENDING_TTL);
+                    }
+                }
+            }
+
+            assert_eq!(rep.pending.len(), model.len(), "step {step}");
+            if step.is_multiple_of(100) {
+                for (id, p) in &model {
+                    let held = rep.pending.get(id).expect("the same leads pending");
+                    assert_eq!((held.introducer, held.addr, held.probed_at), *p, "step {step}");
+                }
+            }
+            assert!(rep.pending_order.len() <= 2 * MAX_PENDING_LEADS);
+        }
+        assert!(shed > 1_000, "the cap has to bind, and often: {shed}");
     }
 }

@@ -629,14 +629,16 @@ pub async fn download_and_load_ipfilter(
     })?;
 
     let filter_path = data_dir.join("ipfilter.dat");
-    // Use atomic_write so a crash mid-save can't leave a partial
-    // ipfilter.dat that would silently disable filtering on next
-    // start. Mirrors `commands/settings.rs::download_ipfilter` which
-    // already does this.
+    // Atomic, so a crash mid-save can't leave a partial ipfilter.dat that
+    // would silently disable filtering on next start, and gated, so a manual
+    // range edit still queued on the network task can't land the old list
+    // over this one. Mirrors `commands/settings.rs::download_ipfilter`.
     {
         let path = filter_path.clone();
         let payload = extracted.clone();
-        tokio::task::spawn_blocking(move || crate::security::atomic_write(&path, &payload, false))
+        tokio::task::spawn_blocking(move || {
+            crate::network::write_ipfilter_dat_superseding(&path, &payload)
+        })
             .await
             .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
             .map_err(|e| {
@@ -857,11 +859,13 @@ pub async fn update_ipfilter_from_url(
     })?;
 
     let filter_path = data_dir.join("ipfilter.dat");
-    // Atomic write: crash safety as in `download_and_load_ipfilter`.
+    // Atomic and gated, as in `download_and_load_ipfilter`.
     {
         let path = filter_path.clone();
         let payload = filter_bytes.clone();
-        tokio::task::spawn_blocking(move || crate::security::atomic_write(&path, &payload, false))
+        tokio::task::spawn_blocking(move || {
+            crate::network::write_ipfilter_dat_superseding(&path, &payload)
+        })
             .await
             .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
             .map_err(|e| {
@@ -1042,10 +1046,9 @@ async fn import_ipfilter_at_path(
                     "Selected file does not contain any valid IP filter entries — keeping the existing filter",
                 ));
             }
-            // Atomic write: prevents partial-file corruption on crash
-            // mid-decompression-write. Already inside spawn_blocking,
-            // so calling the sync helper directly is fine.
-            crate::security::atomic_write(&dest, &decompressed, false).map_err(|e| {
+            // Atomic and gated, as in `download_and_load_ipfilter`. Already
+            // inside spawn_blocking, so the blocking writer is fine here.
+            crate::network::write_ipfilter_dat_superseding(&dest, &decompressed).map_err(|e| {
                 coded_ctx(
                     "security_failed_to_write_ipfilter",
                     "Failed to write ipfilter.dat",
@@ -1121,7 +1124,7 @@ async fn import_ipfilter_at_path(
                     MAX_IPFILTER_DAT_BYTES / (1024 * 1024),
                 ));
             }
-            crate::security::atomic_write(&dest, &canonical, false).map_err(|e| {
+            crate::network::write_ipfilter_dat_superseding(&dest, &canonical).map_err(|e| {
                 coded_ctx(
                     "security_failed_to_write_ipfilter",
                     "Failed to write ipfilter.dat",

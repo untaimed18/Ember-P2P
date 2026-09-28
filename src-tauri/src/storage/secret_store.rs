@@ -56,11 +56,25 @@ const ENTROPY: &[u8] = b"ember-secret-store-v1";
 /// rewritten, and nothing rewrites it on its own: `is_protected` is true for
 /// these, so the callers' "protect it if it is bare plaintext" path never fires.
 ///
-/// Platform-independent by design. On Windows these magics belong to another
-/// platform's scheme and `unprotect` refuses them outright, so the caller never
-/// reaches a re-wrap.
+/// On Windows these magics belong to another platform's scheme and `unprotect`
+/// refuses them outright, so the caller never reaches a re-wrap.
+///
+/// On Unix an `EMBRSEC4` blob sealed under the machine-id HKDF key — the
+/// fallback `protect` takes when the OS keyring cannot be reached — also asks
+/// for a re-wrap once the keyring answers. That key is derived from values
+/// that are not secret (`/etc/machine-id`, the uid), and nothing else would
+/// ever move such a blob back under the keyring.
 pub fn needs_rewrap(stored: &[u8]) -> bool {
-    stored.len() >= 8 && (&stored[..8] == MAGIC_V2 || &stored[..8] == MAGIC_V3)
+    if stored.len() >= 8 && (&stored[..8] == MAGIC_V2 || &stored[..8] == MAGIC_V3) {
+        return true;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if stored.len() > 8 && &stored[..8] == MAGIC_V4 && stored[8] == KEY_SRC_HKDF {
+            return unix::keyring_reachable();
+        }
+    }
+    false
 }
 
 /// True if `stored` is already in a protected (MAGIC-tagged) form.
@@ -311,6 +325,29 @@ mod unix {
     const HKDF_SALT_V4: &[u8] = b"ember-secret-store-v4";
     const HKDF_INFO_V4: &[u8] = b"ember-secret-store-v4-key";
 
+    /// Whether the keyring would hand `protect` a wrapping key right now:
+    /// either it holds a usable one, or it is reachable and simply has none
+    /// yet. An entry that does not decode counts as unreachable, since
+    /// `protect` falls back past it — otherwise every launch would re-wrap the
+    /// same secrets under the same fallback key and rewrite their files.
+    pub(super) fn keyring_reachable() -> bool {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            match keyring_entry() {
+                Ok(entry) => match entry.get_password() {
+                    Ok(stored) => decode_keyring_key(&stored).map(|mut key| key.zeroize()).is_ok(),
+                    Err(keyring::Error::NoEntry) => true,
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            false
+        }
+    }
+
     fn machine_id() -> anyhow::Result<Vec<u8>> {
         #[cfg(target_os = "linux")]
         {
@@ -528,7 +565,14 @@ mod unix {
     pub fn protect(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
         let (src, mut key) = match keyring_wrapping_key_for_protect() {
             Ok(k) => (KEY_SRC_KEYRING, k),
-            Err(_) => (KEY_SRC_HKDF, hkdf_key_uid(HKDF_SALT_V4, HKDF_INFO_V4)?),
+            Err(e) => {
+                tracing::warn!(
+                    "OS keyring unavailable ({e}); sealing this secret under a key derived \
+                     from the machine id and uid, which are not secret. It is re-sealed under \
+                     the keyring on a later launch once the keyring is reachable."
+                );
+                (KEY_SRC_HKDF, hkdf_key_uid(HKDF_SALT_V4, HKDF_INFO_V4)?)
+            }
         };
         let result = encrypt_with(&key, plaintext);
         key.zeroize();
@@ -569,6 +613,12 @@ mod unix {
             };
             let result = decrypt_with(&key, nonce, ct);
             key.zeroize();
+            if result.is_ok() && src == KEY_SRC_HKDF {
+                tracing::warn!(
+                    "A stored secret is sealed only under the machine-id fallback key, \
+                     not the OS keyring; it will be re-sealed once the keyring is reachable"
+                );
+            }
             return result;
         }
         if stored.len() >= 8 && &stored[..8] == MAGIC_V2 {
@@ -793,7 +843,9 @@ mod tests {
             assert!(super::needs_rewrap(&blob));
             assert!(super::is_protected(&blob));
         }
+        // Source byte 1 is the keyring; an HKDF-sourced V4 is covered below.
         let mut current = b"EMBRSEC4".to_vec();
+        current.push(1);
         current.extend_from_slice(&[0u8; 40]);
         assert!(!super::needs_rewrap(&current), "the current scheme is final");
         let mut dpapi = b"EMBRSEC1".to_vec();
@@ -801,6 +853,23 @@ mod tests {
         assert!(!super::needs_rewrap(&dpapi));
         assert!(!super::needs_rewrap(b"short"));
         assert!(!super::needs_rewrap(b"plaintext with no magic at all"));
+    }
+
+    /// A V4 blob sealed under the machine-id fallback asks to be re-sealed
+    /// exactly when the keyring could take it; DPAPI has no fallback at all.
+    #[test]
+    fn a_fallback_sealed_blob_asks_for_the_keyring_only_when_it_is_reachable() {
+        let mut fallback = b"EMBRSEC4".to_vec();
+        fallback.push(0);
+        fallback.extend_from_slice(&[0u8; 40]);
+        #[cfg(target_os = "windows")]
+        {
+            assert!(!super::needs_rewrap(&fallback));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(super::needs_rewrap(&fallback), super::unix::keyring_reachable());
+        }
     }
 
     #[test]

@@ -1,6 +1,9 @@
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use tracing::{info, warn};
@@ -12,14 +15,34 @@ const MET_HEADER_I64TAGS: u8 = 0x0F;
 
 const FT_FILENAME: u8 = 0x01;
 const FT_FILESIZE: u8 = 0x02;
+/// High 32 bits of a file size, beside a 32-bit `FT_FILESIZE`. Older eMule
+/// builds and some mods write large files this way instead of as one u64.
+const FT_FILESIZE_HI: u8 = 0x3A;
 const FT_AICH_HASH: u8 = 0x27;
+// eMule's ids (`Opcodes.h:363, :381, :388-392`).
 const FT_ATTRANSFERRED: u8 = 0x50;
-const FT_ATTRANSFERREDHI: u8 = 0x51;
-const FT_ATREQUESTED: u8 = 0x52;
-const FT_ATACCEPTED: u8 = 0x53;
-const FT_ULPRIORITY: u8 = 0x18;
+const FT_ATREQUESTED: u8 = 0x51;
+const FT_ATACCEPTED: u8 = 0x52;
+const FT_ATTRANSFERREDHI: u8 = 0x54;
+/// Holds an eMule `PR_*` value, not Ember's byte: see [`priority_to_emule`].
+const FT_ULPRIORITY: u8 = 0x19;
 const FT_KADLASTPUBLISHSRC: u8 = 0x21;
-const FT_LASTSHARED: u8 = 0x24;
+const FT_LASTSHARED: u8 = 0x34;
+// Ids Ember wrote before it matched eMule. It also put transferred-hi,
+// requested and accepted at 0x51-0x53, which are eMule's requested, accepted
+// and category, so those are read the old way only from Ember's own records
+// that carry neither [`FT_EMBER_TAGSET`] nor an id only eMule's layout uses
+// (see `read_record`). The two below collide with nothing eMule writes to
+// known.met and are always accepted.
+/// Held Ember's own priority byte, not a `PR_*` value. Still written beside
+/// `FT_ULPRIORITY` so a build from before 1.7 keeps the priority; eMule's
+/// `CKnownFile` does not read 0x18 (`FT_DLPRIORITY` is a `.part.met` tag) and
+/// carries it through as an unknown tag.
+const LEGACY_EMBER_FT_ULPRIORITY: u8 = 0x18;
+const LEGACY_EMBER_FT_LASTSHARED: u8 = 0x24;
+/// Ember-only tag on every record written with eMule's ids above.
+const FT_EMBER_TAGSET: u8 = 0xED;
+const EMBER_TAGSET_EMULE_IDS: u32 = 1;
 // Older Ember builds accidentally wrote the source-publish timestamp with
 // eMule's `FT_DL_ACTIVE_TIME` id. Read it for migration, but write the real
 // eMule tag above.
@@ -89,6 +112,61 @@ const MAX_KNOWN_PATH_MAPPINGS: usize = 512 * 100_000;
 /// above claims to support. Crossing it is treated as "cannot read", never as
 /// "reset" — see the `oversize` handling in [`KnownFileList::load`].
 const MAX_KNOWN_MET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Version byte plus record count: the size of a `known.met` with no records.
+const KNOWN_MET_HEADER_LEN: u64 = 5;
+
+/// See [`KnownFileList::time_shift_summary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeShift {
+    /// Unmatched files with a record of the same name and size.
+    pub files: usize,
+    /// The most common difference, file time minus record time, in seconds.
+    pub common_delta_secs: i64,
+    /// How many of `files` are off by exactly that much.
+    pub common_count: usize,
+}
+
+/// A string tag from a `.met` file. eMule writes a name that is not plain
+/// ASCII twice: first as UTF-8 behind a byte-order mark, then in the local
+/// code page. Readers keep the first `FT_FILENAME`, as eMule does, and the
+/// mark is not part of the name.
+pub(crate) fn decode_met_string(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Beside `known.met`, the unix time an eMule import landed. While present,
+/// pathless records are not pruned: imported records have no path until the
+/// library scan matches each to its file, and pruning first would throw away
+/// exactly the hashes the import exists to keep.
+pub const PRUNE_HOLD_FILE: &str = "known_prune_hold";
+/// The hold ends once the scan has matched enough, or after this long.
+const PRUNE_HOLD_SECS: i64 = 14 * 24 * 3600;
+
+/// Start a prune hold for the catalog in `data_dir`. See [`PRUNE_HOLD_FILE`].
+pub fn hold_pruning(data_dir: &Path) -> std::io::Result<()> {
+    std::fs::write(
+        data_dir.join(PRUNE_HOLD_FILE),
+        chrono::Utc::now().timestamp().to_string(),
+    )
+}
+
+/// Whether a hold still applies, releasing it once pruning would do nothing
+/// anyway (the scan has caught up) or it has run its course.
+fn prune_hold_active(known_met: &Path, pathless: usize, ceiling: usize) -> bool {
+    let marker = known_met.with_file_name(PRUNE_HOLD_FILE);
+    let Ok(text) = std::fs::read_to_string(&marker) else {
+        return false;
+    };
+    let since = text.trim().parse::<i64>().unwrap_or(0);
+    let expired = chrono::Utc::now().timestamp().saturating_sub(since) > PRUNE_HOLD_SECS;
+    if expired || pathless <= ceiling {
+        let _ = std::fs::remove_file(&marker);
+        return false;
+    }
+    true
+}
 
 fn quarantined_paths() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
     use std::collections::HashSet;
@@ -194,20 +272,122 @@ struct KnownPathEntry {
     modified_at: i64,
 }
 
+/// Copy-on-write map behind [`KnownFileList`], so the periodic save can take
+/// its snapshot on the network event loop in O(1) and do the serialization
+/// and write on the blocking pool.
+///
+/// Values sit behind their own `Arc` as well as the table. A mutation while a
+/// snapshot is alive copies the table of pointers once (no record, path or
+/// hashset is duplicated), then copies only the one value it changes. With a
+/// single-`Arc` table the first counter bump during an in-flight save would
+/// deep-copy the whole catalogue on the loop, which is the cost this avoids.
+struct CowMap<K, V>(Arc<HashMap<K, Arc<V>>>);
+
+impl<K, V> Clone for CowMap<K, V> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+fn unshare<V: Clone>(value: Arc<V>) -> V {
+    Arc::try_unwrap(value).unwrap_or_else(|shared| (*shared).clone())
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> CowMap<K, V> {
+    fn new() -> Self {
+        Self(Arc::new(HashMap::new()))
+    }
+
+    fn table_mut(&mut self) -> &mut HashMap<K, Arc<V>> {
+        Arc::make_mut(&mut self.0)
+    }
+
+    fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.0.get(key).map(|value| &**value)
+    }
+
+    fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.0.contains_key(key)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &V> {
+        self.0.values().map(|value| &**value)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.0.iter().map(|(key, value)| (key, &**value))
+    }
+
+    /// Unshares the table only when `key` is present.
+    fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if !self.0.contains_key(key) {
+            return None;
+        }
+        self.table_mut().get_mut(key).map(Arc::make_mut)
+    }
+
+    fn insert(&mut self, key: K, value: V) -> Option<Arc<V>> {
+        self.table_mut().insert(key, Arc::new(value))
+    }
+
+    fn remove<Q>(&mut self, key: &Q) -> Option<Arc<V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if !self.0.contains_key(key) {
+            return None;
+        }
+        self.table_mut().remove(key)
+    }
+
+    fn into_owned(self) -> impl Iterator<Item = (K, V)> {
+        unshare(self.0)
+            .into_iter()
+            .map(|(key, value)| (key, unshare(value)))
+    }
+
+    #[cfg(test)]
+    fn shares_table_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 #[derive(Clone)]
 pub struct KnownFileList {
-    files: HashMap<[u8; 16], KnownFileRecord>,
-    path_index: HashMap<String, KnownPathEntry>,
+    files: CowMap<[u8; 16], KnownFileRecord>,
+    /// Keyed by `Arc<str>` so unsharing the table after a snapshot copies
+    /// pointers, not every path string.
+    path_index: CowMap<Arc<str>, KnownPathEntry>,
     /// How many `path_index` entries point at each hash.
     ///
     /// Only ever consulted to answer "does another path still reference this
     /// content?", which [`Self::add_or_update`] asks every time a path's hash
     /// changes. Answering it by scanning `path_index` made a library rescan
     /// O(changed x total) — with 100k shared files and 5k modified, half a
-    /// billion comparisons. A count rather than the paths themselves because
-    /// this struct is cloned in full on every periodic save, and duplicating
-    /// 100k path strings to answer a yes/no question is not worth the memory.
-    path_refs: HashMap<[u8; 16], u32>,
+    /// billion comparisons. A count rather than the paths themselves keeps
+    /// the table flat, so unsharing it after a snapshot is one allocation.
+    path_refs: Arc<HashMap<[u8; 16], u32>>,
     dirty: bool,
     dirty_generation: u64,
     authoritative: bool,
@@ -222,9 +402,9 @@ impl KnownFileList {
     /// distinction has to survive into the writer.
     pub fn new() -> Self {
         Self {
-            files: HashMap::new(),
-            path_index: HashMap::new(),
-            path_refs: HashMap::new(),
+            files: CowMap::new(),
+            path_index: CowMap::new(),
+            path_refs: Arc::new(HashMap::new()),
             dirty: false,
             dirty_generation: 0,
             authoritative: false,
@@ -233,9 +413,9 @@ impl KnownFileList {
 
     /// The only way a `path_index` entry is added or replaced, so `path_refs`
     /// cannot drift out of step with it.
-    fn index_path(&mut self, key: String, entry: KnownPathEntry) {
+    fn index_path(&mut self, key: impl Into<Arc<str>>, entry: KnownPathEntry) {
         let hash = entry.hash;
-        if let Some(previous) = self.path_index.insert(key, entry) {
+        if let Some(previous) = self.path_index.insert(key.into(), entry) {
             if previous.hash != hash {
                 self.release_path_ref(&previous.hash);
             } else {
@@ -243,18 +423,28 @@ impl KnownFileList {
                 return;
             }
         }
-        *self.path_refs.entry(hash).or_insert(0) += 1;
+        *Arc::make_mut(&mut self.path_refs).entry(hash).or_insert(0) += 1;
     }
 
     /// Drop one reference to `hash`, forgetting the counter once it reaches
     /// zero so the map stays the size of the content actually indexed.
     fn release_path_ref(&mut self, hash: &[u8; 16]) {
-        if let Some(count) = self.path_refs.get_mut(hash) {
+        if !self.path_refs.contains_key(hash) {
+            return;
+        }
+        let refs = Arc::make_mut(&mut self.path_refs);
+        if let Some(count) = refs.get_mut(hash) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                self.path_refs.remove(hash);
+                refs.remove(hash);
             }
         }
+    }
+
+    /// An O(1) copy for a background save: every later mutation of `self`
+    /// copies what it touches instead of writing through to the snapshot.
+    pub fn snapshot(&self) -> Self {
+        self.clone()
     }
 
     /// Merge records from a freshly loaded catalog.
@@ -279,9 +469,8 @@ impl KnownFileList {
     /// So: cumulative fields take the larger value, and fields that are either
     /// known or absent take whichever side actually has one.
     pub fn absorb_missing_from(&mut self, other: Self) {
-        for (hash, record) in other.files {
-            if let std::collections::hash_map::Entry::Occupied(mut e) = self.files.entry(hash) {
-                let live = e.get_mut();
+        for (hash, record) in other.files.into_owned() {
+            if let Some(live) = self.files.get_mut(&hash) {
                 // A share-scan that ran before disk load can insert a
                 // rediscovered row with `friends_only = false`. In-memory
                 // winning this would drop a persisted restriction.
@@ -346,14 +535,26 @@ impl KnownFileList {
         }
         // Path index entries for hashes we already had stay as-is; disk-only
         // path mappings for absorbed hashes are already inserted above.
-        for (path_key, entry) in other.path_index {
-            if self.files.contains_key(&entry.hash) && !self.path_index.contains_key(&path_key) {
+        for (path_key, entry) in other.path_index.into_owned() {
+            if self.files.contains_key(&entry.hash) && !self.path_index.contains_key(&*path_key) {
                 self.index_path(path_key, entry);
             }
         }
         // Absorbing a catalog that was actually read off disk is what makes
         // this list safe to write back.
         self.authoritative |= other.authoritative;
+    }
+
+    /// Parse a `known.met` already read into memory, touching no file.
+    ///
+    /// For another client's catalog (an eMule import): the interrupted-replace
+    /// recovery and the corrupt-file quarantine in [`Self::load_checked`] would
+    /// otherwise write into that client's folder.
+    pub fn from_bytes(data: &[u8]) -> anyhow::Result<Self> {
+        let mut list = Self::new();
+        list.parse_known_met(data, false)?;
+        list.authoritative = true;
+        Ok(list)
     }
 
     /// Strict loader used by security-policy and share-intent startup. Missing
@@ -411,7 +612,7 @@ impl KnownFileList {
         // Set before parsing, not after: a partial parse clears it, and that
         // verdict has to survive rather than being overwritten here.
         list.authoritative = true;
-        list.parse_known_met(&data)?;
+        list.parse_known_met(&data, true)?;
         list.load_path_index(&path.with_file_name("known_paths.dat"));
         Ok(list)
     }
@@ -498,7 +699,9 @@ impl KnownFileList {
         }
     }
 
-    fn parse_known_met(&mut self, data: &[u8]) -> anyhow::Result<()> {
+    /// `own_catalog` is true for Ember's own known.met, whose older records
+    /// carry Ember's pre-1.7 tag ids (see [`FT_EMBER_TAGSET`]).
+    fn parse_known_met(&mut self, data: &[u8], own_catalog: bool) -> anyhow::Result<()> {
         if data.len() < 5 {
             anyhow::bail!("known.met is truncated");
         }
@@ -536,7 +739,7 @@ impl KnownFileList {
         // strictly better: the app runs with what could be read, and the file
         // on disk is untouched until the user repairs it.
         for record_index in 0..count {
-            let record = match Self::read_record(&mut cursor, version) {
+            let record = match Self::read_record(&mut cursor, version, own_catalog) {
                 Ok(record) => record,
                 Err(e) => {
                     warn!(
@@ -598,7 +801,11 @@ impl KnownFileList {
         Ok(())
     }
 
-    fn read_record(cursor: &mut Cursor<&[u8]>, _version: u8) -> anyhow::Result<KnownFileRecord> {
+    fn read_record(
+        cursor: &mut Cursor<&[u8]>,
+        _version: u8,
+        own_catalog: bool,
+    ) -> anyhow::Result<KnownFileRecord> {
         let modified_at = cursor.read_u32::<LittleEndian>()? as i64;
 
         let mut file_hash = [0u8; 16];
@@ -653,6 +860,17 @@ impl KnownFileList {
             media: None,
             media_scanned: false,
         };
+        // 0x51-0x53 mean different things in eMule's records and in Ember's
+        // pre-1.7 ones, so they are resolved once the whole record (and
+        // whether it carries `FT_EMBER_TAGSET`) has been read.
+        let mut tag_51 = None;
+        let mut tag_52 = None;
+        let mut tag_53 = None;
+        let mut transferred_hi = None;
+        let mut emule_priority = None;
+        let mut legacy_priority = None;
+        let mut emule_last_shared = false;
+        let mut emule_ids = !own_catalog;
 
         for _ in 0..tag_count {
             let tag_type = cursor.read_u8()?;
@@ -688,9 +906,9 @@ impl KnownFileList {
                         }
                         cursor.set_position(new_pos);
                     }
-                    let s = String::from_utf8_lossy(&sbuf).to_string();
+                    let s = decode_met_string(&sbuf);
                     match name_id {
-                        FT_FILENAME => record.file_name = s,
+                        FT_FILENAME if record.file_name.is_empty() => record.file_name = s,
                         FT_AICH_HASH => record.aich_hash = normalize_aich_hash(&s),
                         FT_EMBER_FILE_HASH => record.ember_file_hash = s,
                         FT_EMBER_MEDIA_CODEC => {
@@ -711,23 +929,33 @@ impl KnownFileList {
                 TAG_UINT32 => {
                     let v = cursor.read_u32::<LittleEndian>()?;
                     match name_id {
-                        FT_FILESIZE => record.file_size = v as u64,
+                        // Either half may come first, so neither clears the other.
+                        FT_FILESIZE => {
+                            record.file_size = (record.file_size & 0xFFFF_FFFF_0000_0000) | v as u64;
+                        }
+                        FT_FILESIZE_HI => {
+                            record.file_size =
+                                (record.file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32);
+                        }
                         FT_ATTRANSFERRED => {
                             record.all_time_transferred =
                                 (record.all_time_transferred & 0xFFFF_FFFF_0000_0000) | v as u64;
                         }
-                        FT_ATTRANSFERREDHI => {
-                            record.all_time_transferred = (record.all_time_transferred
-                                & 0x0000_0000_FFFF_FFFF)
-                                | ((v as u64) << 32);
-                        }
-                        FT_ATREQUESTED => record.all_time_requested = v,
-                        FT_ATACCEPTED => record.all_time_accepted = v,
-                        FT_ULPRIORITY => record.upload_priority = v as u8,
+                        FT_ATTRANSFERREDHI => transferred_hi = Some(v),
+                        0x51 => tag_51 = Some(v),
+                        0x52 => tag_52 = Some(v),
+                        0x53 => tag_53 = Some(v),
+                        FT_ULPRIORITY => emule_priority = Some(v),
+                        LEGACY_EMBER_FT_ULPRIORITY => legacy_priority = Some(v),
+                        FT_EMBER_TAGSET => emule_ids |= v >= EMBER_TAGSET_EMULE_IDS,
                         FT_KADLASTPUBLISHSRC | FT_KADLASTPUBLISHSRC_LEGACY_EMBER => {
                             record.last_publish_src = v;
                         }
-                        FT_LASTSHARED => record.last_shared = v,
+                        FT_LASTSHARED => {
+                            record.last_shared = v;
+                            emule_last_shared = true;
+                        }
+                        LEGACY_EMBER_FT_LASTSHARED => record.last_shared = v,
                         FT_EMBER_UNSHARED => record.is_shared = v == 0,
                         FT_EMBER_FRIENDS_ONLY => record.friends_only = v != 0,
                         FT_EMBER_SOURCES => record.complete_sources = v,
@@ -743,11 +971,19 @@ impl KnownFileList {
                         _ => {}
                     }
                 }
+                // Writers that pick the smallest integer type (aMule, mods)
+                // store a small file's size in these.
                 0x08 => {
-                    cursor.read_u16::<LittleEndian>()?;
+                    let v = cursor.read_u16::<LittleEndian>()?;
+                    if name_id == FT_FILESIZE {
+                        record.file_size = v as u64;
+                    }
                 }
                 0x09 => {
-                    cursor.read_u8()?;
+                    let v = cursor.read_u8()?;
+                    if name_id == FT_FILESIZE {
+                        record.file_size = v as u64;
+                    }
                 }
                 0x0B => {
                     let v = cursor.read_u64::<LittleEndian>()?;
@@ -800,9 +1036,9 @@ impl KnownFileList {
                     let len = (t - 0x11 + 1) as usize;
                     let mut sbuf = vec![0u8; len];
                     cursor.read_exact(&mut sbuf)?;
-                    let s = String::from_utf8_lossy(&sbuf).to_string();
+                    let s = decode_met_string(&sbuf);
                     match name_id {
-                        FT_FILENAME => record.file_name = s,
+                        FT_FILENAME if record.file_name.is_empty() => record.file_name = s,
                         FT_AICH_HASH => record.aich_hash = normalize_aich_hash(&s),
                         FT_EMBER_FILE_HASH => record.ember_file_hash = s,
                         _ => {}
@@ -818,6 +1054,29 @@ impl KnownFileList {
             }
         }
 
+        // Ember before 1.7 never wrote these ids, and eMule always writes
+        // `FT_LASTSHARED`, so a catalog copied over from eMule by hand reads
+        // as eMule's even without our marker.
+        emule_ids |= emule_priority.is_some() || transferred_hi.is_some() || emule_last_shared;
+        let (requested, accepted, hi) = if emule_ids {
+            (tag_51, tag_52, transferred_hi)
+        } else {
+            // Ember's pre-1.7 layout: 0x51 transferred-hi, 0x52 requested,
+            // 0x53 accepted.
+            (tag_52, tag_53, tag_51.or(transferred_hi))
+        };
+        record.all_time_requested = requested.unwrap_or(0);
+        record.all_time_accepted = accepted.unwrap_or(0);
+        if let Some(hi) = hi {
+            record.all_time_transferred =
+                (record.all_time_transferred & 0x0000_0000_FFFF_FFFF) | (u64::from(hi) << 32);
+        }
+        if let Some(pr) = emule_priority {
+            record.upload_priority = priority_from_emule(pr);
+        } else if let Some(p) = legacy_priority {
+            record.upload_priority = p as u8;
+        }
+
         Ok(record)
     }
 
@@ -828,7 +1087,7 @@ impl KnownFileList {
         size: u64,
         mtime: i64,
     ) -> Option<&KnownFileRecord> {
-        if let Some(entry) = self.path_index.get(&normalize_path_key(path)) {
+        if let Some(entry) = self.path_index.get(normalize_path_key(path).as_str()) {
             if let Some(record) = self.files.get(&entry.hash) {
                 if entry.size == size && entry.modified_at == mtime {
                     return Some(record);
@@ -868,16 +1127,83 @@ impl KnownFileList {
         size: u64,
         mtime: i64,
     ) -> Option<&KnownFileRecord> {
-        let mut matches = self
+        // An exact time wins. Failing that, a time off by FAT's 2-second
+        // rounding, or by exactly an hour, is still the same file when only one
+        // record is that close: the hour is the daylight-saving shift FAT and
+        // older NTFS tooling apply to stored times (eMule corrects the same
+        // with `AdjustNTFSDaylightFileTime`). Without it an archive carried
+        // over from eMule on such a drive was re-hashed in full, which on a
+        // multi-terabyte library is days of disk time.
+        const FAT_SLACK_SECS: i64 = 2;
+        const DST_SHIFT_SECS: i64 = 3600;
+        let (mut exact, mut exact_count) = (None, 0usize);
+        let (mut near, mut near_count) = (None, 0usize);
+        for record in self
             .files
             .values()
-            .filter(|r| r.file_name == name && r.file_size == size && r.modified_at == mtime);
-        let first = matches.next()?;
-        if matches.next().is_some() {
+            .filter(|r| r.file_name == name && r.file_size == size)
+        {
+            let delta = (record.modified_at - mtime).abs();
+            if delta == 0 {
+                exact = Some(record);
+                exact_count += 1;
+            } else if delta <= FAT_SLACK_SECS || (delta - DST_SHIFT_SECS).abs() <= FAT_SLACK_SECS {
+                near = Some(record);
+                near_count += 1;
+            }
+        }
+        let (found, count) = if exact_count > 0 {
+            (exact, exact_count)
+        } else {
+            (near, near_count)
+        };
+        if count > 1 {
             warn!("known.met: ambiguous match for {name} ({size} bytes, mtime {mtime}); rehashing");
             return None;
         }
-        Some(first)
+        found
+    }
+
+    /// Of files this catalog did not match, how many it holds a record for
+    /// under the same name and size but another modification time, and the
+    /// difference most of them share. A library off by one amount throughout
+    /// is a clock or time-zone shift on the drive, not new files. For the
+    /// startup log, which is all a user can send.
+    pub fn time_shift_summary<'a>(
+        &self,
+        unmatched: impl IntoIterator<Item = (&'a str, u64, i64)>,
+    ) -> Option<TimeShift> {
+        use std::collections::HashMap;
+        // Nearest difference found so far for each unmatched (size, name).
+        let mut wanted: HashMap<u64, HashMap<&'a str, (i64, Option<i64>)>> = HashMap::new();
+        for (name, size, mtime) in unmatched {
+            wanted.entry(size).or_default().insert(name, (mtime, None));
+        }
+        for record in self.files.values() {
+            let Some(slot) = wanted
+                .get_mut(&record.file_size)
+                .and_then(|by_name| by_name.get_mut(record.file_name.as_str()))
+            else {
+                continue;
+            };
+            let delta = slot.0 - record.modified_at;
+            if slot.1.is_none_or(|best| delta.abs() < best.abs()) {
+                slot.1 = Some(delta);
+            }
+        }
+        let mut tally: HashMap<i64, usize> = HashMap::new();
+        for (_, delta) in wanted.values().flat_map(HashMap::values) {
+            if let Some(delta) = delta {
+                *tally.entry(*delta).or_default() += 1;
+            }
+        }
+        let files = tally.values().sum();
+        let (common_delta_secs, common_count) = tally.into_iter().max_by_key(|(_, count)| *count)?;
+        Some(TimeShift {
+            files,
+            common_delta_secs,
+            common_count,
+        })
     }
 
     pub fn find_by_hash(&self, hash: &[u8; 16]) -> Option<&KnownFileRecord> {
@@ -990,7 +1316,10 @@ impl KnownFileList {
         discovered_aich: &str,
         discovered_ember: &str,
     ) -> bool {
-        if let Some(entry) = self.path_index.get(&normalize_path_key(discovered_path)) {
+        if let Some(entry) = self
+            .path_index
+            .get(normalize_path_key(discovered_path).as_str())
+        {
             return entry.hash != *hash
                 || entry.size != discovered_size
                 || entry.modified_at != discovered_mtime
@@ -1028,7 +1357,7 @@ impl KnownFileList {
             // different path casing updates the same entry instead of
             // accumulating a stale duplicate.
             let new_key = normalize_path_key(&new_path);
-            if let Some(old_entry) = self.path_index.get(&new_key) {
+            if let Some(old_entry) = self.path_index.get(new_key.as_str()) {
                 let old_hash = old_entry.hash;
                 if old_hash != hash {
                     // `new_key` is itself one of `old_hash`'s references, so
@@ -1211,13 +1540,16 @@ impl KnownFileList {
     /// cached hashes for files the library no longer contains — at worst a
     /// re-hash if one reappears, against an index that otherwise grows until it
     /// can no longer be read.
-    fn prune_unreferenced(&mut self) {
+    fn prune_unreferenced(&mut self, known_met: &Path) {
         let mut pathless: Vec<([u8; 16], i64)> = self
             .files
             .iter()
             .filter(|(hash, _)| !self.path_refs.contains_key(*hash))
             .map(|(hash, record)| (*hash, record.modified_at))
             .collect();
+        if prune_hold_active(known_met, pathless.len(), Self::MAX_UNREFERENCED_RECORDS) {
+            return;
+        }
         if pathless.len() <= Self::MAX_UNREFERENCED_RECORDS {
             return;
         }
@@ -1235,6 +1567,11 @@ impl KnownFileList {
     }
 
     pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
+        // The share-intent migration reads known.met off-thread at startup. A
+        // replace-fallback save leaves no known.met for a moment, and a probe
+        // landing then records a previously seen catalog as lost, persisting
+        // fail-closed sharing across every future launch.
+        crate::storage::share_intent::wait_until_initialized();
         // Refuse to write a catalog that was never read off disk over one that
         // exists. The network task starts from `new()` and absorbs known.met
         // from a deferred background load, so quitting (or completing a
@@ -1255,10 +1592,21 @@ impl KnownFileList {
             );
             return Ok(());
         }
+        // Nothing in this type removes every record — pathless ones are kept
+        // for exactly the re-hash they save — so an empty list here is a
+        // catalog that failed to arrive, not one the user emptied. Writing it
+        // is how a shutdown mid-reindex once left "Saved 0 known files" over a
+        // library's worth of hashes.
+        if self.files.is_empty()
+            && std::fs::metadata(path).is_ok_and(|meta| meta.len() > KNOWN_MET_HEADER_LEN)
+        {
+            warn!("Skipping known.met save: refusing to replace a populated catalog with an empty one");
+            return Ok(());
+        }
         // Bounded here rather than on every mutation: this is the one place the
         // whole catalog is already being walked, and the only place its size
         // has a consequence.
-        self.prune_unreferenced();
+        self.prune_unreferenced(path);
 
         // Partitioned before the header is written, because the header commits
         // a record count and there is no way to skip a record after it.
@@ -1299,7 +1647,11 @@ impl KnownFileList {
         })?;
         buf.write_u32::<LittleEndian>(encodable.len() as u32)?;
 
+        // Encoded size of each record no library path refers to, the ones
+        // that can go if the catalog outgrows what `load_checked` reads back.
+        let mut pathless_sizes: Vec<([u8; 16], i64, u64)> = Vec::new();
         for record in encodable {
+            let record_start = buf.len();
             buf.write_u32::<LittleEndian>(
                 (record.modified_at.max(0) as u64).min(u32::MAX as u64) as u32
             )?;
@@ -1318,6 +1670,8 @@ impl KnownFileList {
                 write_string_tag(&mut tags, FT_FILENAME, &record.file_name)?;
                 tag_count += 1;
             }
+            write_u32_tag(&mut tags, FT_EMBER_TAGSET, EMBER_TAGSET_EMULE_IDS)?;
+            tag_count += 1;
             if record.file_size > u32::MAX as u64 {
                 write_u64_tag(&mut tags, FT_FILESIZE, record.file_size)?;
             } else {
@@ -1356,10 +1710,12 @@ impl KnownFileList {
                 write_u32_tag(&mut tags, FT_ATACCEPTED, record.all_time_accepted)?;
                 tag_count += 1;
             }
-            if record.upload_priority > 0 {
-                write_u32_tag(&mut tags, FT_ULPRIORITY, record.upload_priority as u32)?;
-                tag_count += 1;
-            }
+            // Always written, as eMule does, so a record without it can only
+            // be an older one.
+            write_u32_tag(&mut tags, FT_ULPRIORITY, priority_to_emule(record.upload_priority))?;
+            tag_count += 1;
+            write_u32_tag(&mut tags, LEGACY_EMBER_FT_ULPRIORITY, u32::from(record.upload_priority))?;
+            tag_count += 1;
             if record.last_publish_src > 0 {
                 write_u32_tag(&mut tags, FT_KADLASTPUBLISHSRC, record.last_publish_src)?;
                 tag_count += 1;
@@ -1426,6 +1782,47 @@ impl KnownFileList {
 
             buf.write_u32::<LittleEndian>(tag_count)?;
             buf.write_all(&tags)?;
+            if !self.path_refs.contains_key(&record.file_hash) {
+                pathless_sizes.push((
+                    record.file_hash,
+                    record.modified_at,
+                    (buf.len() - record_start) as u64,
+                ));
+            }
+        }
+
+        // A catalog over the read ceiling would load as "cannot read" at the
+        // next launch, which turns sharing off. That is how a prune hold after
+        // a large import would end, so the ceiling wins over the hold: the
+        // oldest pathless records go until it fits, and if records with live
+        // paths alone are too many, the readable catalog on disk is kept.
+        if buf.len() as u64 > MAX_KNOWN_MET_BYTES {
+            let mut excess = buf.len() as u64 - MAX_KNOWN_MET_BYTES;
+            pathless_sizes.sort_unstable_by_key(|(_, modified_at, _)| *modified_at);
+            let mut shed = Vec::new();
+            for (hash, _, size) in pathless_sizes {
+                if excess == 0 {
+                    break;
+                }
+                shed.push(hash);
+                excess = excess.saturating_sub(size);
+            }
+            if excess > 0 {
+                anyhow::bail!(
+                    "known.met would be {} bytes, over the {MAX_KNOWN_MET_BYTES} it can be read back \
+                     at; keeping the catalog already on disk",
+                    buf.len()
+                );
+            }
+            for hash in &shed {
+                self.files.remove(hash);
+            }
+            warn!(
+                "Dropped the {} oldest known.met record(s) whose files are not in the library, \
+                 to keep the catalog readable",
+                shed.len()
+            );
+            return self.save(path);
         }
 
         crate::security::atomic_write(path, &buf, true)?;
@@ -1488,13 +1885,19 @@ impl KnownFileList {
     ///
     /// Returns the number of records whose AICH root was cleared.
     pub fn clear_stale_multipart_aich(&mut self) -> usize {
-        let mut cleared = 0usize;
-        for record in self.files.values_mut() {
-            if record.file_size > crate::network::ed2k::hash::PARTSIZE
-                && !record.aich_hash.is_empty()
-            {
+        let stale: Vec<[u8; 16]> = self
+            .files
+            .iter()
+            .filter(|(_, record)| {
+                record.file_size > crate::network::ed2k::hash::PARTSIZE
+                    && !record.aich_hash.is_empty()
+            })
+            .map(|(hash, _)| *hash)
+            .collect();
+        let cleared = stale.len();
+        for hash in &stale {
+            if let Some(record) = self.files.get_mut(hash) {
                 record.aich_hash.clear();
-                cleared += 1;
             }
         }
         if cleared > 0 {
@@ -1688,11 +2091,11 @@ impl KnownFileList {
         buf.write_u8(3)?;
         buf.write_u64::<LittleEndian>(known_mtime_ns)?;
         buf.write_u32::<LittleEndian>(self.path_index.len() as u32)?;
-        for (norm_key, entry) in &self.path_index {
+        for (norm_key, entry) in self.path_index.iter() {
             // Persist the original-case physical path and its own metadata,
             // not the content record's canonical path/mtime.
             let file_path = if entry.path.is_empty() {
-                norm_key.as_str()
+                &**norm_key
             } else {
                 entry.path.as_str()
             };
@@ -1869,11 +2272,39 @@ fn aich_base32_to_hex(value: &str) -> Option<String> {
     }
 }
 
+/// Ember's stored priority byte to eMule's `PR_*` value for `FT_ULPRIORITY`
+/// (`PartFile.h:36-41`: low 0, normal 1, high 2, very high 3, very low 4,
+/// auto 5). "release" is eMule's very high.
+fn priority_to_emule(priority: u8) -> u32 {
+    match priority {
+        0 => 4,
+        1 => 0,
+        3 => 2,
+        4 => 3,
+        5 => 5,
+        _ => 1,
+    }
+}
+
+/// Inverse of [`priority_to_emule`]; anything eMule would itself coerce to
+/// normal reads as normal.
+fn priority_from_emule(pr: u32) -> u8 {
+    match pr {
+        4 => 0,
+        0 => 1,
+        2 => 3,
+        3 => 4,
+        5 => 5,
+        _ => 2,
+    }
+}
+
 /// Encode a UI priority label into the byte stored as
-/// `KnownFileRecord::upload_priority` (and shipped as the `FT_ULPRIORITY`
-/// known-file tag). Order matches eMule's priority enum: 0=verylow, 1=low,
-/// 2=normal, 3=high, 4=release, 5=auto. Unknown labels fall back to `normal`
-/// so a malformed UI value never silently promotes a file to the highest tier.
+/// `KnownFileRecord::upload_priority`: 0=verylow, 1=low, 2=normal, 3=high,
+/// 4=release, 5=auto. This is Ember's own order, not eMule's; the known.met
+/// tag carries the eMule value (see [`priority_to_emule`]). Unknown labels
+/// fall back to `normal` so a malformed UI value never silently promotes a
+/// file to the highest tier.
 pub fn priority_str_to_u8(priority: &str) -> u8 {
     match priority {
         "verylow" => 0,
@@ -1949,6 +2380,283 @@ mod tests {
         }
     }
 
+    fn pathless(hash: u8, modified_at: i64) -> KnownFileRecord {
+        let mut record = sample_record();
+        record.file_hash = [hash; 16];
+        record.file_path = String::new();
+        record.modified_at = modified_at;
+        record
+    }
+
+    /// What the startup log says when a launch re-hashes: files the catalog
+    /// knows by name and size, and the time difference most of them share.
+    #[test]
+    fn a_library_shifted_in_time_is_reported_as_such() {
+        let mut kf = KnownFileList::new();
+        for (n, name) in ["a.mkv", "b.mkv", "c.mkv"].iter().enumerate() {
+            let mut record = pathless(n as u8 + 1, 1_700_000_000);
+            record.file_name = name.to_string();
+            kf.files.insert(record.file_hash, record);
+        }
+        let size = 1024 * 1024;
+        let unmatched = [
+            ("a.mkv", size, 1_700_007_200),
+            ("b.mkv", size, 1_700_007_200),
+            ("c.mkv", size, 1_700_000_005),
+            ("new.mkv", size, 1_700_000_000),
+            ("a.mkv", size + 1, 1_700_000_000),
+        ];
+        let shift = kf.time_shift_summary(unmatched.iter().map(|&(n, s, t)| (n, s, t))).unwrap();
+        assert_eq!(shift.files, 3, "a new name or another size is not the same file");
+        assert_eq!((shift.common_delta_secs, shift.common_count), (7200, 2));
+        assert_eq!(kf.time_shift_summary(std::iter::empty()), None);
+    }
+
+    /// A file carried over from eMule on a FAT drive, or across a DST change,
+    /// reports a time 2 s or an hour off what eMule stored. That is still the
+    /// file, unless two records are equally close.
+    #[test]
+    fn a_near_modified_time_still_finds_the_record() {
+        fn find(kf: &KnownFileList, mtime: i64) -> Option<[u8; 16]> {
+            kf.find_by_name_and_meta("movie.mkv", 1024 * 1024, mtime)
+                .map(|r| r.file_hash)
+        }
+        let mut kf = KnownFileList::new();
+        kf.files.insert([1; 16], pathless(1, 1_700_000_000));
+        for delta in [0, 1, -2, 3600, -3600, 3601] {
+            assert!(find(&kf, 1_700_000_000 + delta).is_some(), "delta {delta}");
+        }
+        for delta in [3, 60, 7200] {
+            assert!(find(&kf, 1_700_000_000 + delta).is_none(), "delta {delta}");
+        }
+
+        // An exact match wins over a near one.
+        kf.files.insert([2; 16], pathless(2, 1_700_000_002));
+        assert_eq!(find(&kf, 1_700_000_002), Some([2; 16]));
+        // Two near matches and no exact one: ambiguous, so re-hash.
+        assert!(find(&kf, 1_700_000_001).is_none());
+    }
+
+    #[test]
+    fn a_split_file_size_reads_whole_in_either_tag_order() {
+        let mut buf = vec![MET_HEADER];
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        for hi_first in [true, false] {
+            buf.extend_from_slice(&1_700_000_000u32.to_le_bytes());
+            buf.extend_from_slice(&[if hi_first { 0x31 } else { 0x32 }; 16]);
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&2u32.to_le_bytes());
+            let lo = |buf: &mut Vec<u8>| {
+                buf.extend_from_slice(&[TAG_UINT32 | 0x80, FT_FILESIZE]);
+                buf.extend_from_slice(&0x0000_1000u32.to_le_bytes());
+            };
+            let hi = |buf: &mut Vec<u8>| {
+                buf.extend_from_slice(&[TAG_UINT32 | 0x80, FT_FILESIZE_HI]);
+                buf.extend_from_slice(&3u32.to_le_bytes());
+            };
+            if hi_first {
+                hi(&mut buf);
+                lo(&mut buf);
+            } else {
+                lo(&mut buf);
+                hi(&mut buf);
+            }
+        }
+        let mut kf = KnownFileList::new();
+        kf.parse_known_met(&buf, false).unwrap();
+        for hash in [[0x31; 16], [0x32; 16]] {
+            assert_eq!(kf.files.get(&hash).unwrap().file_size, (3u64 << 32) | 0x1000);
+        }
+    }
+
+    /// One record with the given `(id, value)` uint32 tags.
+    fn met_with_u32_tags(tags: &[(u8, u32)]) -> Vec<u8> {
+        let mut buf = vec![MET_HEADER];
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&1_700_000_000u32.to_le_bytes());
+        buf.extend_from_slice(&[0x44; 16]);
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&(tags.len() as u32 + 1).to_le_bytes());
+        buf.extend_from_slice(&[TAG_UINT32 | 0x80, FT_FILESIZE]);
+        buf.extend_from_slice(&1000u32.to_le_bytes());
+        for (id, value) in tags {
+            buf.extend_from_slice(&[TAG_UINT32 | 0x80, *id]);
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        buf
+    }
+
+    /// eMule's statistics and upload priority, as its `WriteToFile` lays
+    /// them out (`Opcodes.h:363, :381, :388-392`; `PR_HIGH` = 2).
+    #[test]
+    fn an_emule_catalog_reads_with_emule_tag_ids() {
+        let buf = met_with_u32_tags(&[
+            (0x50, 7),
+            (0x51, 57),
+            (0x52, 12),
+            (0x53, 3),
+            (0x54, 2),
+            (0x19, 2),
+            (0x34, 1_690_000_000),
+        ]);
+        let kf = KnownFileList::from_bytes(&buf).unwrap();
+        let r = kf.files.get(&[0x44; 16]).unwrap();
+        assert_eq!(r.all_time_requested, 57);
+        assert_eq!(r.all_time_accepted, 12, "0x53 is eMule's category, not accepted");
+        assert_eq!(r.all_time_transferred, (2u64 << 32) | 7);
+        assert_eq!(priority_u8_to_str(r.upload_priority), "high");
+        assert_eq!(r.last_shared, 1_690_000_000);
+    }
+
+    /// Ember's own records from before the ids were corrected keep their
+    /// meaning, and are rewritten in eMule's layout.
+    #[test]
+    fn an_older_ember_record_keeps_its_statistics_and_is_rewritten_as_emule() {
+        let buf = met_with_u32_tags(&[
+            (0x50, 7),
+            (0x51, 2),
+            (0x52, 57),
+            (0x53, 12),
+            (0x18, 3),
+            (0x24, 1_690_000_000),
+        ]);
+        let mut own = KnownFileList::new();
+        own.parse_known_met(&buf, true).unwrap();
+        let r = own.files.get(&[0x44; 16]).unwrap().clone();
+        assert_eq!(r.all_time_transferred, (2u64 << 32) | 7);
+        assert_eq!(r.all_time_requested, 57);
+        assert_eq!(r.all_time_accepted, 12);
+        assert_eq!(priority_u8_to_str(r.upload_priority), "high");
+        assert_eq!(r.last_shared, 1_690_000_000);
+
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-tagset-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        own.save(&path).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        for list in [
+            KnownFileList::from_bytes(&written).unwrap(),
+            {
+                let mut again = KnownFileList::new();
+                again.parse_known_met(&written, true).unwrap();
+                again
+            },
+        ] {
+            let back = list.files.get(&[0x44; 16]).unwrap();
+            assert_eq!(back.all_time_transferred, r.all_time_transferred);
+            assert_eq!(back.all_time_requested, 57);
+            assert_eq!(back.all_time_accepted, 12);
+            assert_eq!(back.upload_priority, r.upload_priority);
+            assert_eq!(back.last_shared, r.last_shared);
+        }
+    }
+
+    /// eMule's own known.met copied into Ember's data folder has no
+    /// `FT_EMBER_TAGSET`, but its eMule-only ids give its layout away.
+    #[test]
+    fn a_hand_copied_emule_catalog_reads_with_emule_tag_ids() {
+        let buf = met_with_u32_tags(&[
+            (0x50, 7),
+            (0x51, 57),
+            (0x52, 12),
+            (0x19, 2),
+            (0x34, 1_690_000_000),
+        ]);
+        let mut own = KnownFileList::new();
+        own.parse_known_met(&buf, true).unwrap();
+        let r = own.files.get(&[0x44; 16]).unwrap();
+        assert_eq!(r.all_time_transferred, 7, "0x51 is not transferred-hi here");
+        assert_eq!(r.all_time_requested, 57);
+        assert_eq!(r.all_time_accepted, 12);
+        assert_eq!(priority_u8_to_str(r.upload_priority), "high");
+    }
+
+    /// Ember's own priority byte rides along under its pre-1.7 id, so a
+    /// downgraded build still finds it; the eMule value stays authoritative.
+    #[test]
+    fn the_legacy_priority_tag_is_written_beside_emules() {
+        let mut own = KnownFileList::new();
+        own.parse_known_met(&met_with_u32_tags(&[(0x18, 4)]), true).unwrap();
+        assert_eq!(
+            priority_u8_to_str(own.files.get(&[0x44; 16]).unwrap().upload_priority),
+            "release"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-legacy-prio-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        own.save(&path).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let tag = |id: u8, value: u32| {
+            let mut t = vec![TAG_UINT32, 1, 0, id];
+            t.extend_from_slice(&value.to_le_bytes());
+            t
+        };
+        assert!(written.windows(8).any(|w| w == tag(0x18, 4).as_slice()), "legacy byte");
+        assert!(written.windows(8).any(|w| w == tag(0x19, 3).as_slice()), "PR_VERYHIGH");
+        let back = KnownFileList::from_bytes(&written).unwrap();
+        assert_eq!(
+            priority_u8_to_str(back.files.get(&[0x44; 16]).unwrap().upload_priority),
+            "release"
+        );
+    }
+
+    #[test]
+    fn every_priority_label_survives_the_emule_encoding() {
+        for label in ["verylow", "low", "normal", "high", "release", "auto"] {
+            let byte = priority_str_to_u8(label);
+            assert_eq!(priority_u8_to_str(priority_from_emule(priority_to_emule(byte))), label);
+        }
+    }
+
+    #[test]
+    fn an_empty_catalog_never_replaces_a_populated_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-empty-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        let mut full = KnownFileList::new();
+        full.mark_authoritative_for_tests();
+        full.add_or_update(sample_record());
+        full.save(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let mut empty = KnownFileList::new();
+        empty.mark_authoritative_for_tests();
+        empty.save(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_import_prune_hold_keeps_pathless_records_until_released() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-hold-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        hold_pruning(&dir).unwrap();
+        assert!(prune_hold_active(&path, 10, 5), "held while the scan has not caught up");
+        assert!(!prune_hold_active(&path, 5, 5), "released once pruning would do nothing");
+        assert!(!dir.join(PRUNE_HOLD_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `path_refs` is only ever read to answer "does another path still point
     /// at this content?", which used to be a full scan of `path_index`. Pins
     /// the count against the shape of `path_index` itself across the mutations
@@ -1971,7 +2679,7 @@ mod tests {
                 );
             }
             // No counter outlives the last path that justified it.
-            for (hash, count) in &kf.path_refs {
+            for (hash, count) in kf.path_refs.iter() {
                 assert_ne!(*count, 0, "a zeroed counter was left behind");
                 assert_eq!(*count, scan(kf, hash));
             }
@@ -2016,6 +2724,94 @@ mod tests {
         assert_eq!(kf.path_refs.get(&[0x42; 16]).copied(), None);
         assert!(!kf.files.contains_key(&[0x42; 16]));
         agrees(&kf);
+    }
+
+    /// The periodic known.met save snapshots the catalogue on the network
+    /// event loop and writes it on the blocking pool, so the snapshot has to
+    /// be O(1) and later mutations must never write through to it.
+    #[test]
+    fn known_files_snapshot_is_unaffected_by_later_mutation() {
+        fn record(byte: u8, path: &str) -> KnownFileRecord {
+            let mut record = sample_record();
+            record.file_hash = [byte; 16];
+            record.file_path = path.to_string();
+            record.all_time_transferred = 10;
+            record
+        }
+        let (bumped, renamed, untouched, added) = ([1u8; 16], [2u8; 16], [3u8; 16], [4u8; 16]);
+        let mut kf = KnownFileList::new();
+        kf.add_or_update(record(1, "C:/Library/bumped.bin"));
+        kf.add_or_update(record(2, "C:/Library/renamed.bin"));
+        kf.add_or_update(record(3, "C:/Library/untouched.bin"));
+        kf.mark_authoritative_for_tests();
+
+        let mut snapshot = kf.snapshot();
+        assert!(snapshot.files.shares_table_with(&kf.files));
+        assert!(snapshot.path_index.shares_table_with(&kf.path_index));
+        assert!(Arc::ptr_eq(&snapshot.path_refs, &kf.path_refs));
+        let generation = snapshot.dirty_generation();
+
+        assert!(kf.add_all_time_transferred(&bumped, 5));
+        kf.find_by_hash_mut(&renamed).unwrap().file_name = "changed.bin".into();
+        kf.add_or_update(record(4, "C:/Library/added.bin"));
+        // Moving a path to other content releases the old hash's reference
+        // and drops its record.
+        kf.add_or_update(record(5, "C:/Library/untouched.bin"));
+
+        assert_eq!(snapshot.find_by_hash(&bumped).unwrap().all_time_transferred, 10);
+        assert_eq!(snapshot.find_by_hash(&renamed).unwrap().file_name, "movie.mkv");
+        assert!(snapshot.find_by_hash(&untouched).is_some());
+        assert!(snapshot.find_by_hash(&added).is_none());
+        assert_eq!(snapshot.file_count(), 3);
+        assert_eq!(snapshot.path_refs.get(&untouched).copied(), Some(1));
+        assert_eq!(snapshot.dirty_generation(), generation);
+        let (size, mtime) = (1024 * 1024, 1_700_000_000);
+        assert!(snapshot
+            .find_by_path_and_meta("C:/Library/added.bin", size, mtime)
+            .is_none());
+        assert!(kf
+            .find_by_path_and_meta("C:/Library/added.bin", size, mtime)
+            .is_some());
+
+        assert_eq!(kf.find_by_hash(&bumped).unwrap().all_time_transferred, 15);
+        assert!(kf.find_by_hash(&untouched).is_none());
+        // Unsharing copied the table of pointers, not the records: one the
+        // live list never touched is still the snapshot's allocation.
+        let mut kept = KnownFileList::new();
+        kept.add_or_update(record(6, "C:/Library/kept.bin"));
+        kept.add_or_update(record(7, "C:/Library/other.bin"));
+        let before = kept.snapshot();
+        assert!(kept.add_all_time_transferred(&[7; 16], 1));
+        assert!(!before.files.shares_table_with(&kept.files));
+        assert!(Arc::ptr_eq(
+            before.files.0.get(&[6; 16]).unwrap(),
+            kept.files.0.get(&[6; 16]).unwrap()
+        ));
+
+        // Mutation flows neither way: the snapshot's own save-time edits
+        // (pruning, the dirty flag) stay off the live list.
+        snapshot.find_by_hash_mut(&bumped).unwrap().all_time_transferred = 99;
+        assert_eq!(kf.find_by_hash(&bumped).unwrap().all_time_transferred, 15);
+
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-snapshot-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        let snapshot = kf.snapshot();
+        kf.add_or_update(record(8, "C:/Library/late.bin"));
+        let mut writer = snapshot;
+        writer.save(&path).unwrap();
+        let reloaded = KnownFileList::load_checked(&path).unwrap();
+        assert!(reloaded.find_by_hash(&added).is_some());
+        assert!(
+            reloaded.find_by_hash(&[8; 16]).is_none(),
+            "a record added after the snapshot must not reach its save"
+        );
+        assert_eq!(reloaded.find_by_hash(&bumped).unwrap().all_time_transferred, 15);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -1,7 +1,16 @@
 <script lang="ts">
   import { getStatistics, type TransferStats } from '$lib/api/statistics';
   import { getReputationStats, type ReputationStatsInfo } from '$lib/api/reputation';
-  import { formatBytes, formatSpeed as formatRate, formatDurationSecs as formatDuration } from '$lib/utils';
+  import {
+    formatBytes,
+    formatCalendarDate,
+    formatDateTime,
+    formatNumber,
+    formatSpeed as formatRate,
+    formatDurationSecs as formatDuration,
+    formatElapsed,
+    withTimeout,
+  } from '$lib/utils';
   import { onMount } from 'svelte';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
@@ -10,7 +19,14 @@
   let loading = $state(true);
   let error: string | null = $state(null);
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
-  let refreshBusy = false;
+  /** Sequence number of the call holding the in-flight gate, 0 when idle. A
+   *  forced refresh takes the gate over, so the poll it overlapped must not
+   *  release it when it lands first. */
+  let busySeq = 0;
+  let requestSeq = 0;
+  /** Newest call whose results were applied. An older call landing later is
+   *  discarded rather than rolling the dashboard back. */
+  let appliedSeq = 0;
   let tickCounter = $state(0);
   let unmounted = false;
   // Monotonic session elapsed from the backend at last successful poll,
@@ -34,10 +50,9 @@
     // in-flight gate so it never silently no-ops while a 2s poll happens to be
     // mid-flight. Watchdog timers are local to each call so a forced retry
     // running concurrently with a poll can't clobber the other's timer id.
-    if (refreshBusy && !opts.force) return;
-    refreshBusy = true;
-    let statsTimer: ReturnType<typeof setTimeout> | undefined;
-    let repTimer: ReturnType<typeof setTimeout> | undefined;
+    if (busySeq !== 0 && !opts.force) return;
+    const seq = ++requestSeq;
+    busySeq = seq;
     try {
       // Fire both fetches concurrently — they hit different backend
       // paths (stats reads a cached snapshot; reputation reads the
@@ -47,27 +62,18 @@
       // allSettled so a stats timeout can't discard an already-resolved
       // reputation result (and vice versa) — they're independent fetches.
       const [statsResult, repResult] = await Promise.allSettled([
-        Promise.race([
-          getStatistics(),
-          new Promise<TransferStats>((_, reject) => {
-            statsTimer = setTimeout(() => reject(new Error('timeout')), 4000);
-          }),
-        ]),
+        withTimeout(getStatistics(), 'get_statistics', 4000),
         // Reputation rides the same watchdog as stats. Unlike
         // getStatistics() (a direct cached-snapshot read), this round-trips
         // through the network task's command channel, whose reply timeout
-        // is 10s. Because both fetches share the `refreshBusy` gate, a
+        // is 10s. Because both fetches share the in-flight gate, a
         // briefly-busy network loop would otherwise stall the entire
         // dashboard refresh for up to 10s even though the transfer stats
         // themselves resolved instantly. Bound it independently.
-        Promise.race([
-          getReputationStats(),
-          new Promise<ReputationStatsInfo>((_, reject) => {
-            repTimer = setTimeout(() => reject(new Error('timeout')), 4000);
-          }),
-        ]),
+        withTimeout(getReputationStats(), 'get_reputation_stats', 4000),
       ]);
-      if (unmounted) return;
+      if (unmounted || seq < appliedSeq) return;
+      appliedSeq = seq;
       if (repResult.status === 'fulfilled') {
         repStats = repResult.value;
         repUnavailable = false;
@@ -89,15 +95,11 @@
         error = translateError(statsResult.reason, m.error_operation_failed());
       }
     } catch (e) {
-      if (unmounted) return;
+      if (unmounted || seq < appliedSeq) return;
       if (!stats) error = translateError(e, m.error_operation_failed());
     } finally {
-      // Clear the race watchdogs so the loser timers don't linger until they
-      // fire (otherwise each poll leaves an orphan timeout pending).
-      if (statsTimer) clearTimeout(statsTimer);
-      if (repTimer) clearTimeout(repTimer);
       if (!unmounted) loading = false;
-      refreshBusy = false;
+      if (busySeq === seq) busySeq = 0;
     }
   }
 
@@ -200,27 +202,20 @@
   // Returns an em-dash if we don't have a reset timestamp yet (fresh
   // install before the first session ends).
   function formatSinceDate(ts: number): string {
-    if (!ts) return '\u2014';
-    return new Date(ts * 1000).toLocaleDateString(undefined, {
+    return formatCalendarDate(ts, {
       year: 'numeric',
       month: 'short',
       day: 'numeric',
     });
   }
 
-  function formatSessionTime(secs: number): string {
-    if (secs <= 0) return '0s';
-    const h = Math.floor(secs / 3600);
-    const min = Math.floor((secs % 3600) / 60);
-    const s = secs % 60;
-    if (h > 0) return `${h}h ${String(min).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
-    if (min > 0) return `${min}m ${String(s).padStart(2, '0')}s`;
-    return `${s}s`;
-  }
 </script>
 
 <div class="page-header">
-  <h2>{m.stats_title()}</h2>
+  <div>
+    <h2>{m.stats_title()}</h2>
+    <p class="page-subtitle">{m.stats_page_subtitle()}</p>
+  </div>
   <div class="header-actions">
     <button class="ghost" onclick={() => loadStats({ force: true })} disabled={loading}>{m.common_refresh()}</button>
   </div>
@@ -244,7 +239,7 @@
 
     <!-- Hero cards -->
     <div class="hero-row">
-      <div class="hero-card">
+      <div class="stat-card hero-card">
         <div class="hero-icon down-icon" aria-hidden="true">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
             <line x1="10" y1="3" x2="10" y2="15"/>
@@ -252,11 +247,11 @@
           </svg>
         </div>
         <div class="hero-body">
-          <span class="hero-value">{formatRate(stats.session_down_rate)}</span>
-          <span class="hero-label">{m.stats_download_rate()}</span>
+          <span class="value">{formatRate(stats.session_down_rate)}</span>
+          <span class="label">{m.stats_download_rate()}</span>
         </div>
       </div>
-      <div class="hero-card">
+      <div class="stat-card hero-card">
         <div class="hero-icon up-icon" aria-hidden="true">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
             <line x1="10" y1="17" x2="10" y2="5"/>
@@ -264,11 +259,11 @@
           </svg>
         </div>
         <div class="hero-body">
-          <span class="hero-value">{formatRate(stats.session_up_rate)}</span>
-          <span class="hero-label">{m.stats_upload_rate()}</span>
+          <span class="value">{formatRate(stats.session_up_rate)}</span>
+          <span class="label">{m.stats_upload_rate()}</span>
         </div>
       </div>
-      <div class="hero-card">
+      <div class="stat-card hero-card">
         <div class="hero-icon time-icon" aria-hidden="true">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="10" cy="11" r="6.5"/>
@@ -278,11 +273,11 @@
           </svg>
         </div>
         <div class="hero-body">
-          <span class="hero-value">{formatSessionTime(sessionTime)}</span>
-          <span class="hero-label">{m.stats_session_time()}</span>
+          <span class="value">{formatElapsed(sessionTime)}</span>
+          <span class="label">{m.stats_session_time()}</span>
         </div>
       </div>
-      <div class="hero-card">
+      <div class="stat-card hero-card">
         <div class="hero-icon ratio-icon" aria-hidden="true">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
             <line x1="6" y1="3.5" x2="6" y2="15"/>
@@ -292,8 +287,8 @@
           </svg>
         </div>
         <div class="hero-body">
-          <span class="hero-value" class:ratio-good={sessionRatio !== null && sessionRatio >= 1} class:ratio-low={sessionRatio !== null && sessionRatio < 1}>{sessionRatioLabel}</span>
-          <span class="hero-label">{m.stats_session_upload_ratio()}</span>
+          <span class="value" class:ratio-good={sessionRatio !== null && sessionRatio >= 1} class:ratio-low={sessionRatio !== null && sessionRatio < 1}>{sessionRatioLabel}</span>
+          <span class="label">{m.stats_session_upload_ratio()}</span>
         </div>
       </div>
     </div>
@@ -317,7 +312,7 @@
             <span class="big-sub">{m.stats_transferred()}</span>
           </div>
           <div class="big-stat">
-            <span class="big-value">{stats.session_completed_down.toLocaleString()}</span>
+            <span class="big-value">{formatNumber(stats.session_completed_down)}</span>
             <span class="big-sub">{m.stats_completed()}</span>
           </div>
         </div>
@@ -340,7 +335,7 @@
             <span class="big-sub">{m.stats_transferred()}</span>
           </div>
           <div class="big-stat">
-            <span class="big-value">{stats.session_completed_up.toLocaleString()}</span>
+            <span class="big-value">{formatNumber(stats.session_completed_up)}</span>
             <span class="big-sub">{m.stats_completed()}</span>
           </div>
         </div>
@@ -359,7 +354,7 @@
         {#if stats.stat_last_reset}
           <span
             class="head-aside"
-            title={m.stats_cumulative_started_on({ when: new Date(stats.stat_last_reset * 1000).toLocaleString() })}
+            title={m.stats_cumulative_started_on({ when: formatDateTime(stats.stat_last_reset) })}
           >{m.stats_since({ date: formatSinceDate(stats.stat_last_reset) })}</span>
         {/if}
       </div>
@@ -379,11 +374,11 @@
         <div class="cum-item">
           <span class="cum-label">{m.stats_completed_downloads()}</span>
           <!-- cum_ excludes current session (DB snapshot at startup), so addition is intentional -->
-          <span class="cum-value">{(stats.cum_completed_down + stats.session_completed_down).toLocaleString()}</span>
+          <span class="cum-value">{formatNumber(stats.cum_completed_down + stats.session_completed_down)}</span>
         </div>
         <div class="cum-item">
           <span class="cum-label">{m.stats_completed_uploads()}</span>
-          <span class="cum-value">{(stats.cum_completed_up + stats.session_completed_up).toLocaleString()}</span>
+          <span class="cum-value">{formatNumber(stats.cum_completed_up + stats.session_completed_up)}</span>
         </div>
         <div class="cum-item">
           <span class="cum-label">{m.stats_upload_download_ratio()}</span>
@@ -460,18 +455,18 @@
         <div class="reputation-row">
           <div class="rep-stat">
             <span class="rep-label" title={m.stats_tracked_peers_hint()}>{m.stats_tracked_peers()}</span>
-            <span class="rep-value">{repStats.tracked_peers.toLocaleString()}</span>
+            <span class="rep-value">{formatNumber(repStats.tracked_peers)}</span>
           </div>
           <div class="rep-stat">
             <span class="rep-label" title={m.stats_banned_peers_hint()}>{m.stats_banned_peers()}</span>
             <span class="rep-value" class:rep-danger={repStats.banned_peers > 0}>
-              {repStats.banned_peers.toLocaleString()}
+              {formatNumber(repStats.banned_peers)}
             </span>
           </div>
           <div class="rep-stat">
             <span class="rep-label" title={m.stats_banned_ips_hint()}>{m.stats_banned_ips()}</span>
             <span class="rep-value" class:rep-danger={repStats.banned_ips > 0}>
-              {repStats.banned_ips.toLocaleString()}
+              {formatNumber(repStats.banned_ips)}
             </span>
           </div>
         </div>
@@ -497,7 +492,7 @@
 
 <style>
   .page-content {
-    padding: 20px;
+    padding: var(--page-padding);
     display: flex;
     flex-direction: column;
     gap: 16px;
@@ -509,21 +504,15 @@
     grid-template-columns: repeat(4, 1fr);
     gap: 12px;
   }
-  @media (max-width: 900px) {
+  @media (max-width: 980px) {
     .hero-row { grid-template-columns: repeat(2, 1fr); }
   }
+  /* The shared `.stat-card`, with an icon beside the number. */
   .hero-card {
     display: flex;
     align-items: center;
     gap: 14px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    padding: 16px 18px;
-    box-shadow: var(--shadow-sm);
-    transition: box-shadow var(--transition-normal);
   }
-  .hero-card:hover { box-shadow: var(--shadow-md); }
   .hero-icon {
     width: 42px;
     height: 42px;
@@ -538,21 +527,16 @@
     height: 22px;
   }
   .down-icon  { background: color-mix(in srgb, var(--accent)  14%, transparent); color: var(--accent); }
-  .up-icon    { background: color-mix(in srgb, var(--success) 14%, transparent); color: var(--success); }
-  .time-icon  { background: color-mix(in srgb, var(--warning) 14%, transparent); color: var(--warning); }
+  .up-icon    { background: color-mix(in srgb, var(--warning) 14%, transparent); color: var(--warning); }
+  .time-icon  { background: color-mix(in srgb, var(--success) 14%, transparent); color: var(--success); }
   .ratio-icon { background: color-mix(in srgb, var(--stat-ratio) 14%, transparent); color: var(--stat-ratio); }
   .hero-body { display: flex; flex-direction: column; min-width: 0; }
-  .hero-value {
-    font-size: 1.25rem;
-    font-weight: 700;
-    color: var(--text-primary);
-    font-variant-numeric: tabular-nums;
+  .hero-card .value {
+    margin-top: 0;
     white-space: nowrap;
   }
-  .hero-label {
-    font-size: 0.75rem;
-    color: var(--text-muted);
-    margin-top: 1px;
+  .hero-card .label {
+    margin-top: 2px;
   }
 
   /* ---- Section cards ---- */
@@ -572,7 +556,7 @@
     border-bottom: 1px solid var(--border);
   }
   .card-head h3 {
-    font-size: 0.95rem;
+    font-size: var(--font-size-base);
     font-weight: 600;
     color: var(--text-primary);
     margin: 0;
@@ -589,7 +573,7 @@
   }
   .head-aside {
     margin-left: auto;
-    font-size: 0.8rem;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
   }
@@ -600,7 +584,7 @@
     grid-template-columns: 1fr 1fr;
     gap: 12px;
   }
-  @media (max-width: 700px) {
+  @media (max-width: 760px) {
     .section-row { grid-template-columns: 1fr; }
   }
 
@@ -612,13 +596,13 @@
   }
   .big-stat { display: flex; flex-direction: column; align-items: center; }
   .big-value {
-    font-size: 1.5rem;
+    font-size: var(--font-size-2xl);
     font-weight: 700;
     color: var(--text-primary);
     font-variant-numeric: tabular-nums;
   }
   .big-sub {
-    font-size: 0.75rem;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     margin-top: 2px;
     text-transform: uppercase;
@@ -626,7 +610,7 @@
   }
 
   .down-color { color: var(--accent); }
-  .up-color   { color: var(--success); }
+  .up-color   { color: var(--warning); }
 
   /* ---- Cumulative grid ---- */
   .cum-grid {
@@ -634,19 +618,19 @@
     grid-template-columns: repeat(3, 1fr);
     gap: 18px 24px;
   }
-  @media (max-width: 800px) {
+  @media (max-width: 760px) {
     .cum-grid { grid-template-columns: repeat(2, 1fr); }
   }
   .cum-item { display: flex; flex-direction: column; }
   .cum-label {
-    font-size: 0.75rem;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.04em;
     margin-bottom: 4px;
   }
   .cum-value {
-    font-size: 1.1rem;
+    font-size: var(--font-size-lg);
     font-weight: 600;
     color: var(--text-primary);
     font-variant-numeric: tabular-nums;
@@ -668,12 +652,12 @@
     gap: 10px;
   }
   .oh-label {
-    font-size: 0.82rem;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     white-space: nowrap;
   }
   .oh-value {
-    font-size: 0.82rem;
+    font-size: var(--font-size-sm);
     color: var(--text-primary);
     font-variant-numeric: tabular-nums;
     text-align: right;
@@ -704,7 +688,7 @@
   .oh-empty {
     text-align: center;
     color: var(--text-muted);
-    font-size: 0.82rem;
+    font-size: var(--font-size-sm);
     padding: 8px 0;
   }
 
@@ -735,13 +719,13 @@
     gap: 4px;
   }
   .rep-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
   }
   .rep-value {
-    font-size: 18px;
+    font-size: var(--font-size-xl);
     font-weight: 600;
     color: var(--text-primary);
     font-variant-numeric: tabular-nums;
@@ -752,7 +736,7 @@
   .rep-unavailable {
     margin: 0;
     padding: 4px 2px 2px;
-    font-size: 0.85rem;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
 </style>

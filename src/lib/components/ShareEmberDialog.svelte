@@ -196,7 +196,7 @@
           class="share-copy"
           class:copied
           onclick={() => void copyLink()}
-          disabled={!websiteUrl}
+          disabled={!websiteUrl && !loadError}
           aria-live="polite"
         >
           <span class="share-copy-icon" aria-hidden="true">
@@ -262,7 +262,7 @@
       {/if}
 
       <div class="share-actions">
-        <button type="button" class="share-close" onclick={close}>{m.common_close()}</button>
+        <button type="button" class="primary share-close" onclick={close}>{m.common_close()}</button>
       </div>
     </div>
   </div>
@@ -314,7 +314,7 @@
   }
 
   .share-brand h2 {
-    font-size: 16px;
+    font-size: var(--font-size-lg);
     font-weight: 700;
     color: var(--text-primary);
     margin: 0 0 4px;
@@ -323,7 +323,7 @@
 
   .share-lede {
     margin: 0;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     line-height: 1.45;
     color: var(--text-secondary);
   }
@@ -339,10 +339,10 @@
   .share-url {
     flex: 1;
     min-width: 0;
-    font-family: var(--font-mono, ui-monospace, monospace);
-    font-size: 12px;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
-    background: var(--bg-tertiary, var(--bg-primary));
+    background: var(--bg-tertiary);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     padding: 8px 10px;
@@ -358,7 +358,7 @@
     align-items: center;
     gap: 6px;
     padding: 8px 12px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     font-family: inherit;
     border-radius: var(--radius-md);
@@ -397,15 +397,14 @@
   }
 
   .share-copy:focus-visible,
-  .share-target:focus-visible,
-  .share-close:focus-visible {
+  .share-target:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
 
   .share-on {
     margin: 0 0 8px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     letter-spacing: 0.04em;
     text-transform: uppercase;
@@ -427,7 +426,7 @@
     border-radius: var(--radius-md);
     background: transparent;
     color: var(--text-primary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-family: inherit;
     text-align: left;
     cursor: pointer;
@@ -470,7 +469,7 @@
 
   .share-error {
     color: var(--danger);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     margin: 12px 0 0;
   }
 
@@ -478,22 +477,5 @@
     display: flex;
     justify-content: flex-end;
     margin-top: 16px;
-  }
-
-  .share-close {
-    padding: 8px 18px;
-    font-size: 13px;
-    font-weight: 600;
-    font-family: inherit;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border);
-    background: var(--accent);
-    color: var(--on-accent);
-    cursor: pointer;
-    transition: opacity var(--transition-normal), filter var(--transition-normal);
-  }
-
-  .share-close:hover {
-    filter: brightness(1.06);
   }
 </style>

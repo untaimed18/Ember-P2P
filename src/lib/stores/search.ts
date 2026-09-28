@@ -10,6 +10,8 @@ import {
   SEARCH_STORAGE_KEY,
   buildPersistPayload,
   parsePersistedSearch,
+  trimPersistPayload,
+  type PersistedSearch,
 } from '$lib/searchPersistence';
 import { appSettings } from './settings';
 import { dev } from '$app/environment';
@@ -58,22 +60,47 @@ export type SearchTab = {
  * and a tab can hold thousands of rows, so serialising on each update would
  * cost far more than the one write that actually matters.
  */
+/**
+ * Whether anything has changed since the last write that landed.
+ *
+ * `visibilitychange`→hidden fires on every app switch, and building the payload
+ * is not cheap — the row shed behind `forPersist` is several O(n log n) passes
+ * over up to `PERSIST_MAX_TABS` tabs of up to `MAX_TAB_RESULTS` rows, all of it
+ * synchronous on the thread that draws the window. Alt-tabbing away from a page
+ * whose results have not moved since the last write now costs nothing.
+ *
+ * Every write to what gets persisted goes through `searchTabs` or
+ * `activeSearchTabId`, so subscribing to both covers the whole surface. Cleared
+ * only once `setItem` has actually succeeded: a write refused at every limit in
+ * `PERSIST_RETRY_LIMITS` has to stay pending, or the quota that refused it would
+ * cost the user the rest of the session's results as well.
+ */
+let persistDirty = true;
+
 function persistSearch() {
   if (typeof sessionStorage === 'undefined') return;
+  if (!persistDirty) return;
   const tabs = get(searchTabs);
   if (tabs.length === 0) {
     try {
       sessionStorage.removeItem(SEARCH_STORAGE_KEY);
+      persistDirty = false;
     } catch {
       /* nothing to lose */
     }
     return;
   }
   const activeId = get(activeSearchTabId);
+  // Built once at the largest limit and then trimmed down, rather than rebuilt
+  // from the live tabs per limit — see `trimPersistPayload`.
+  let payload: PersistedSearch | null = null;
   for (const limit of PERSIST_RETRY_LIMITS) {
+    payload = payload === null
+      ? buildPersistPayload(tabs, activeId, limit)
+      : trimPersistPayload(payload, limit);
     try {
-      const payload = buildPersistPayload(tabs, activeId, limit);
       sessionStorage.setItem(SEARCH_STORAGE_KEY, JSON.stringify(payload));
+      persistDirty = false;
       return;
     } catch {
       // Quota, or a value that would not serialise. Try a smaller payload.
@@ -109,10 +136,33 @@ if (typeof window !== 'undefined') {
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') persistSearch();
   });
+  // See `persistDirty`. Both fire once on subscribe, which leaves the first
+  // persist after a restore to write the restored payload straight back — one
+  // wasted write, and the safe direction to be wrong in.
+  searchTabs.subscribe(() => {
+    persistDirty = true;
+  });
+  activeSearchTabId.subscribe(() => {
+    persistDirty = true;
+  });
 }
 /** Bumped when learned spam data is wiped so the search page can drop
  *  tooltip caches that would otherwise outlive empty `spam_reasons`. */
 export const spamFilterEpoch = writable(0);
+
+/**
+ * Bumped whenever a row is rewritten in place by something other than the
+ * result stream — a spam mark, its undo, or a re-score.
+ *
+ * The search page reads a throttled snapshot of the active tab's results so a
+ * streaming search cannot drive its whole-list passes at flush rate. That
+ * throttle keys off the row *count*, which a spam mark does not change, so
+ * hiding the row the user just marked could sit behind up to a full throttle
+ * interval. These edits are user-initiated and arrive one at a time, so they
+ * are exactly the case the throttle is not for: the page syncs immediately
+ * when this changes.
+ */
+export const searchRowPatchEpoch = writable(0);
 
 let initialized = false;
 let unlisteners: UnlistenFn[] = [];
@@ -219,8 +269,38 @@ function takesIncomingSpamSignals(existingIsSpam: boolean, existingRating: numbe
 }
 
 /** Per-hash user spam overrides. Honored by mergeResult so stream merges
- * cannot undo an explicit Mark spam / Mark not spam. Cleared on store cleanup. */
+ * cannot undo an explicit Mark spam / Mark not spam. Cleared on store cleanup,
+ * and bounded by `SPAM_OVERRIDE_MAX` in between. */
 const spamUserOverrides = new Map<string, { isSpam: boolean; spamRating: number; reasons?: string[] }>();
+type SpamOverride = NonNullable<ReturnType<typeof spamUserOverrides.get>>;
+
+/**
+ * Ceiling on the override table, the same bound and the same treatment
+ * `SPAM_CACHE_MAX` gives the search page's tooltip cache — and for the same
+ * reason, that nothing else prunes it. This was emptied only by
+ * `notifySpamFilterReset` and store teardown, so a long session spent marking
+ * spam grew it for as long as the window stayed open.
+ *
+ * Set far above any plausible number of marks in flight at once, which is what
+ * makes eviction safe here: `handleMarkSpam` reverts a failed IPC through the
+ * entry this holds, so dropping one a request is still waiting on would lose the
+ * revert. Reaching that would take 500 marks issued before the first came back.
+ */
+const SPAM_OVERRIDE_MAX = 500;
+
+function setSpamOverride(hash: string, override: SpamOverride): void {
+  // Deleted before it is set, so a re-mark moves the hash to the back of the
+  // insertion order the eviction below reads: what gets dropped is then the mark
+  // the user touched longest ago rather than whichever they happened to make
+  // first, and never the one just written.
+  spamUserOverrides.delete(hash);
+  spamUserOverrides.set(hash, override);
+  while (spamUserOverrides.size > SPAM_OVERRIDE_MAX) {
+    const oldest = spamUserOverrides.keys().next().value;
+    if (oldest === undefined) break;
+    spamUserOverrides.delete(oldest);
+  }
+}
 
 /** Ranking ceiling for peer-reported counts, matching MAX_PLAUSIBLE_SOURCES in
  * merge.rs (pinned by `scripts/fixtures/merge-contract.json`). ed2k carries this
@@ -232,6 +312,12 @@ const MAX_PLAUSIBLE_SOURCES = 65535;
  * is 64, and the network task seeds at most 49); addresses beyond that were kept
  * and shipped over IPC only to be dropped on arrival. */
 const MAX_SOURCE_ADDRS = 64;
+
+/** Whether a row carries anything that explains a spam verdict — the prose list
+ *  or the coded one, since `spamReasonTexts` renders from either. */
+function hasSpamExplanation(row: SearchResult): boolean {
+  return !!(row.spam_reasons?.length || row.spam_reason_details?.length);
+}
 
 function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResult {
   const mergedAddresses = Array.from(new Set([...(existing.source_addresses || []), ...(incoming.source_addresses || [])])).slice(0, MAX_SOURCE_ADDRS);
@@ -289,13 +375,34 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
     !!incoming.is_spam,
     incoming.spam_rating ?? 0,
   );
+  // An empty list from the winning side is normally adopted as-is, which is the
+  // point: if the verdict came from that row, so does its explanation, and
+  // "flagged, no reasons given" is a truthful one. Falling back to the other
+  // side's list whenever this one is empty is the mix-and-match the rule above
+  // exists to prevent.
+  //
+  // The exception is a *flagged* row that neither list explains, which is the
+  // one outcome a user cannot read at all: the badge says spam, the tooltip is
+  // blank, and `spam_rating` — merged with max, so it can come from the side that
+  // was overruled — shows a score nothing on screen justifies. A verdict from
+  // `existing.is_spam` with `existing.spam_reasons` absent, which is what a
+  // channel that classifies without reporting signal detail sends, landed there
+  // every time. So a flagged row keeps whichever side actually has an
+  // explanation; only an unflagged row, or one both sides leave unexplained,
+  // ends up with nothing.
+  //
+  // A deliberate divergence from `merge_into`, alongside the availability,
+  // filename and address-cap ones the module header lists, and deliberately not
+  // in `merge-contract.json` for the same reason they are not: Rust merges rows
+  // for the wire, where an unexplained flag costs nothing, while this copy is the
+  // one feeding the tooltip the badge promises.
+  const preferredSignals = takeIncomingSignals ? incoming : existing;
+  const otherSignals = takeIncomingSignals ? existing : incoming;
   const spamSignals = override?.reasons
     ? { spam_reasons: override.reasons, spam_reason_details: undefined }
-    : takeIncomingSignals && (incoming.spam_reasons?.length ?? 0) > 0
-      ? incoming
-      : existing.spam_reasons?.length
-        ? existing
-        : incoming;
+    : is_spam && !hasSpamExplanation(preferredSignals) && hasSpamExplanation(otherSignals)
+      ? otherSignals
+      : preferredSignals;
   return {
     ...existing,
     ...incoming,
@@ -440,22 +547,68 @@ export function appendSearchResults(requestId: number, incoming: SearchResult[])
 }
 
 /**
+ * Where a hash sits in a tab, via the tab's own key index when it is usable.
+ *
+ * `resultKey` *is* the hash for any row that has one, so an index hit is the
+ * row and an index miss is authoritative — the same lookup `mergeIntoTab`
+ * makes, and the reason the index exists. The size check is its validity test
+ * (one entry per row is the invariant); the identity check behind it costs one
+ * comparison and keeps a stale index from patching the wrong row, which a
+ * scan cannot do.
+ */
+function resultIndexOfHash(tab: SearchTab, fileHash: string): number {
+  const index = tab.resultIndex;
+  if (index && index.size === tab.results.length) {
+    const at = index.get(fileHash);
+    if (at === undefined) return -1;
+    if (tab.results[at]?.file.hash === fileHash) return at;
+  }
+  return tab.results.findIndex((r) => r.file.hash === fileHash);
+}
+
+/** The fields a spam verdict owns. Restored together, because a score without
+ *  the reasons that produced it explains nothing. */
+function spamFieldsOf(r: SearchResult) {
+  return {
+    is_spam: r.is_spam,
+    spam_rating: r.spam_rating,
+    spam_reasons: r.spam_reasons,
+    spam_reason_details: r.spam_reason_details,
+  };
+}
+
+/**
  * Patch `is_spam` / `spam_rating` for a file hash across all tabs.
  * Only reallocates tabs/results that actually contain a match.
  * Records a user override so later stream merges cannot undo the choice.
+ *
+ * Returns the undo for the whole call — the rows *and* the override entry.
+ * A failed `mark_spam` used to be reverted by patching the previous values
+ * back through this same function, which restored the row but left
+ * `spamUserOverrides` holding those values as though the user had chosen
+ * them. `mergeResult` honours an override ahead of every later scoring pass,
+ * so an IPC failure on a first-ever mark pinned the file to "not spam" for
+ * the rest of the session: the backend could never flag it again, and nothing
+ * short of resetting the learned data cleared it.
  */
 export function patchSpamFlagByHash(
   fileHash: string,
   isSpam: boolean,
   spamRating: number,
   reasons?: string[],
-) {
-  if (!fileHash) return;
-  spamUserOverrides.set(fileHash, { isSpam, spamRating, reasons });
+): () => void {
+  if (!fileHash) return () => {};
+  const hadOverride = spamUserOverrides.has(fileHash);
+  const previousOverride = spamUserOverrides.get(fileHash);
+  setSpamOverride(fileHash, { isSpam, spamRating, reasons });
+  // Keyed by tab id rather than by row position: the undo runs after an IPC
+  // round-trip, by which time a streaming merge may have grown the tab.
+  const undoRows: { tabId: string; fields: ReturnType<typeof spamFieldsOf> }[] = [];
+  let patched = false;
   searchTabs.update((tabs) => {
     let anyChanged = false;
     const next = tabs.map((tab) => {
-      const idx = tab.results.findIndex((r) => r.file.hash === fileHash);
+      const idx = resultIndexOfHash(tab, fileHash);
       if (idx === -1) return tab;
       const current = tab.results[idx];
       if (
@@ -466,6 +619,7 @@ export function patchSpamFlagByHash(
         return tab;
       }
       anyChanged = true;
+      undoRows.push({ tabId: tab.id, fields: spamFieldsOf(current) });
       const results = tab.results.slice();
       results[idx] = {
         ...current,
@@ -479,8 +633,38 @@ export function patchSpamFlagByHash(
       };
       return { ...tab, results };
     });
+    patched = anyChanged;
     return anyChanged ? next : tabs;
   });
+  // After the tabs are committed, not inside the updater: the page reads both
+  // stores in one effect, and bumping this while `searchTabs` is mid-update
+  // would publish the signal ahead of the rows it is signalling.
+  if (patched) searchRowPatchEpoch.update((n) => n + 1);
+  return () => {
+    if (hadOverride) setSpamOverride(fileHash, previousOverride!);
+    else spamUserOverrides.delete(fileHash);
+    if (undoRows.length === 0) return;
+    let restored = false;
+    searchTabs.update((tabs) => {
+      let anyChanged = false;
+      const next = tabs.map((tab) => {
+        const undo = undoRows.find((u) => u.tabId === tab.id);
+        if (!undo) return tab;
+        const idx = resultIndexOfHash(tab, fileHash);
+        if (idx === -1) return tab;
+        anyChanged = true;
+        const results = tab.results.slice();
+        // Only the verdict goes back. Anything else the row picked up while
+        // the IPC was in flight — a re-sight's source count, a second
+        // origin — belongs to the merge, not to the mark being undone.
+        results[idx] = { ...tab.results[idx], ...undo.fields };
+        return { ...tab, results };
+      });
+      restored = anyChanged;
+      return anyChanged ? next : tabs;
+    });
+    if (restored) searchRowPatchEpoch.update((n) => n + 1);
+  };
 }
 
 function sameReasons(a: string[] | undefined, b: string[] | undefined): boolean {
@@ -494,6 +678,34 @@ function sameReasons(a: string[] | undefined, b: string[] | undefined): boolean 
  *  because a search tab is far heavier: each one holds its own result array,
  *  up to `MAX_TAB_RESULTS` rows. */
 const MAX_SEARCH_TABS = 20;
+
+/**
+ * Rows a finished tab keeps once the user has moved off it.
+ *
+ * `MAX_TAB_RESULTS` bounds one tab; nothing bounded the set, so twenty finished
+ * broad searches could sit on 300k rows no one was looking at. The tab being
+ * viewed and the one still streaming keep their full cap.
+ */
+const IDLE_TAB_RESULTS = 3_000;
+
+function trimIdleTab(tab: SearchTab, activeId: string | null): SearchTab {
+  if (tab.id === activeId || tab.isSearching || tab.results.length <= IDLE_TAB_RESULTS) return tab;
+  const results = tab.results.slice();
+  shedWeakestRows(results, IDLE_TAB_RESULTS);
+  const resultIndex = new Map<string, number>();
+  for (let i = 0; i < results.length; i++) resultIndex.set(resultKey(results[i]), i);
+  return { ...tab, results, resultIndex };
+}
+
+function trimIdleTabs(tabs: SearchTab[], activeId: string | null): SearchTab[] {
+  let changed = false;
+  const next = tabs.map((tab) => {
+    const trimmed = trimIdleTab(tab, activeId);
+    if (trimmed !== tab) changed = true;
+    return trimmed;
+  });
+  return changed ? next : tabs;
+}
 
 /**
  * Cancel a search, retrying briefly when the network task is busy.
@@ -562,7 +774,7 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
       pendingByRequest.delete(rid);
       void cancelSearchWithRetry(rid);
     }
-    return next;
+    return trimIdleTabs(next, id);
   });
   activeSearchTabId.set(id);
   return { tabId: id, requestId, stoppedOthers };
@@ -570,6 +782,11 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
 
 export function setActiveSearchTab(tabId: string | null) {
   activeSearchTabId.set(tabId);
+  // Checked before writing: an object store notifies on every `set`, even of
+  // the same array, and the search page re-derives its whole list from it.
+  const tabs = get(searchTabs);
+  const trimmed = trimIdleTabs(tabs, tabId);
+  if (trimmed !== tabs) searchTabs.set(trimmed);
 }
 
 export async function closeSearchTab(tabId: string): Promise<void> {
@@ -687,6 +904,75 @@ function spamSettingsKey(
   return `${s.spam_filter_enabled ? '1' : '0'}:${s.spam_filter_profile}`;
 }
 
+/**
+ * Fold a re-scored batch back into the tab it came from.
+ *
+ * Only the verdict is adopted, so a row keeps everything the merge gave it.
+ * `resultIndex` survives for the same reason: `resultKey` is derived from the
+ * hash / id / path / name+size, none of which a re-score touches, and the map
+ * is rebuilt in place order — so positions and keys are exactly what they
+ * were and the next streamed batch can use the index instead of rebuilding it.
+ */
+function applyRescoredRows(tabId: string, scored: SearchResult[]) {
+  if (scored.length === 0) return;
+  // A chunked re-score outlives the tab it started on — closed, cleared, or
+  // torn down with the page — so a chunk landing on nothing must not tell the
+  // search page its rows changed and cost it a whole-list filter and sort.
+  let applied = false;
+  searchTabs.update((current) => {
+    const i = current.findIndex((t) => t.id === tabId);
+    if (i === -1) return current;
+    // Keyed by `resultKey`, not `file.hash`. Hashless rows are a supported
+    // case — `resultKey` has dedicated `nohash-id:` / `nohash-path:` /
+    // `nohash:` branches for pending library entries and path-only local
+    // hits — and every one of them keys to `''`, so a hash-keyed map kept
+    // only the last and every other hashless row in the tab then adopted
+    // that one row's spam verdict.
+    const byKey = new Map(scored.map((r) => [resultKey(r), r]));
+    const results = current[i].results.map((r) => {
+      const n = byKey.get(resultKey(r));
+      if (!n) return r;
+      const override = r.file.hash ? spamUserOverrides.get(r.file.hash) : undefined;
+      return {
+        ...r,
+        spam_rating: override?.spamRating ?? n.spam_rating,
+        is_spam: override?.isSpam ?? n.is_spam,
+        spam_reasons: override?.reasons ?? n.spam_reasons,
+        spam_reason_details: override?.reasons ? undefined : n.spam_reason_details,
+      };
+    });
+    const next = [...current];
+    next[i] = { ...current[i], results };
+    applied = true;
+    return next;
+  });
+  if (applied) searchRowPatchEpoch.update((n) => n + 1);
+}
+
+/**
+ * Rows per `rescore_search_results` call.
+ *
+ * The backend caps one call at 15,000 and chunks its own scoring so it cannot
+ * sit on the spam lock; this is the other half of that, because the payload
+ * crosses IPC and both `JSON.stringify` on the way out and the parse on the
+ * way back run on the thread that draws the window. A whole tab is up to
+ * `MAX_TAB_RESULTS` rows of several hundred bytes each — megabytes in one
+ * blocking call. Split, the same rows cost the same total work in slices the
+ * frame budget can absorb, and the tab updates as each lands instead of all
+ * at the end.
+ *
+ * Safe to split because this pass looks at one row at a time: the command
+ * deliberately scores without batch statistics, so a chunk boundary cannot
+ * change a verdict.
+ */
+const RESCORE_IPC_CHUNK = 1_000;
+
+async function rescoreRowsIntoTab(tabId: string, query: string, rows: SearchResult[]) {
+  for (let i = 0; i < rows.length; i += RESCORE_IPC_CHUNK) {
+    applyRescoredRows(tabId, await rescoreSearchResults(rows.slice(i, i + RESCORE_IPC_CHUNK), query));
+  }
+}
+
 /** Re-score every open tab after spam settings change (SF8). Honors per-hash
  *  user mark/unmark overrides so an explicit classification is not overwritten. */
 async function rescoreOpenTabs() {
@@ -702,38 +988,83 @@ async function rescoreOpenTabs() {
   );
   for (const tab of ordered) {
     if (tab.results.length === 0) continue;
-    const tabId = tab.id;
     try {
-      const scored = await rescoreSearchResults(tab.results, tab.query);
-      searchTabs.update((current) => {
-        const i = current.findIndex((t) => t.id === tabId);
-        if (i === -1) return current;
-        // Keyed by `resultKey`, not `file.hash`. Hashless rows are a supported
-        // case — `resultKey` has dedicated `nohash-id:` / `nohash-path:` /
-        // `nohash:` branches for pending library entries and path-only local
-        // hits — and every one of them keys to `''`, so a hash-keyed map kept
-        // only the last and every other hashless row in the tab then adopted
-        // that one row's spam verdict.
-        const byKey = new Map(scored.map((r) => [resultKey(r), r]));
-        const results = current[i].results.map((r) => {
-          const n = byKey.get(resultKey(r));
-          if (!n) return r;
-          const override = r.file.hash ? spamUserOverrides.get(r.file.hash) : undefined;
-          return {
-            ...r,
-            spam_rating: override?.spamRating ?? n.spam_rating,
-            is_spam: override?.isSpam ?? n.is_spam,
-            spam_reasons: override?.reasons ?? n.spam_reasons,
-            spam_reason_details: override?.reasons ? undefined : n.spam_reason_details,
-          };
-        });
-        const next = [...current];
-        next[i] = { ...current[i], results, resultIndex: undefined };
-        return next;
-      });
+      await rescoreRowsIntoTab(tab.id, tab.query, tab.results);
     } catch (e) {
       console.error('Failed to rescore search results:', e);
     }
+  }
+}
+
+/**
+ * Re-score the tab a spam mark was made in, which is what marking one row is
+ * for: the backend learns the filename, the name with the query words removed,
+ * the size and the source IPs, and every one of those is a rule about *other*
+ * rows. Without this the user marks the obvious fake and its nine siblings sit
+ * there unflagged until the next search.
+ *
+ * eMule does exactly this — `CSearchList::MarkFileAsSpam` learns, then
+ * `RecalculateSpamRatings(nSearchID, bExpectHigher, bExpectLower, ...)` re-rates
+ * that one search — including the part that keeps it affordable: a mark can
+ * only push scores up, so rows already flagged cannot change and are skipped;
+ * an unmark can only pull them down, so rows already clean are skipped. Only
+ * the rows whose verdict can actually move are sent.
+ *
+ * Coalesced, because eMule marks a whole selection and re-rates once
+ * (`CSearchListCtrl::OnCommand`, MP_MARKASSPAM) while our context menu marks
+ * one row per click. A burst of marks in both directions leaves nothing safely
+ * skippable, so that case re-scores the lot.
+ */
+const SPAM_MARK_RESCORE_DEBOUNCE_MS = 400;
+let spamMarkRescoreTimer: ReturnType<typeof setTimeout> | null = null;
+let spamMarkRescorePending: { tabId: string; expectHigher: boolean; expectLower: boolean } | null = null;
+
+export function rescoreTabAfterSpamMark(tabId: string, marked: 'spam' | 'not-spam') {
+  if (!tabId) return;
+  const expectHigher = marked === 'spam';
+  if (spamMarkRescorePending && spamMarkRescorePending.tabId === tabId) {
+    spamMarkRescorePending.expectHigher ||= expectHigher;
+    spamMarkRescorePending.expectLower ||= !expectHigher;
+  } else {
+    // A mark in another tab supersedes rather than queues: the pending one was
+    // for a list the user has moved on from, and the new tab is the one they
+    // are looking at.
+    spamMarkRescorePending = { tabId, expectHigher, expectLower: !expectHigher };
+  }
+  if (spamMarkRescoreTimer !== null) clearTimeout(spamMarkRescoreTimer);
+  spamMarkRescoreTimer = setTimeout(() => {
+    spamMarkRescoreTimer = null;
+    const pending = spamMarkRescorePending;
+    spamMarkRescorePending = null;
+    if (pending) void runSpamMarkRescore(pending);
+  }, SPAM_MARK_RESCORE_DEBOUNCE_MS);
+}
+
+async function runSpamMarkRescore(pending: {
+  tabId: string;
+  expectHigher: boolean;
+  expectLower: boolean;
+}) {
+  const tab = get(searchTabs).find((t) => t.id === pending.tabId);
+  if (!tab || tab.results.length === 0) return;
+  const { expectHigher, expectLower } = pending;
+  // Marks in both directions coalesced into this pass, so nothing is safely
+  // skippable and the whole list is re-scored. Running the filter below on both
+  // expectations at once excluded *every* row instead — a flagged row fails the
+  // first test, an unflagged row fails the second — so the re-rating this
+  // function exists for silently did nothing whenever a mark was followed by a
+  // correcting unmark.
+  const candidates =
+    expectHigher && expectLower
+      ? tab.results
+      : tab.results.filter(
+          (r) => !(r.is_spam && expectHigher) && !(!r.is_spam && expectLower),
+        );
+  if (candidates.length === 0) return;
+  try {
+    await rescoreRowsIntoTab(tab.id, tab.query, candidates);
+  } catch (e) {
+    console.error('Failed to rescore search results after a spam mark:', e);
   }
 }
 
@@ -788,12 +1119,11 @@ export async function initSearchStore() {
       if (pendingByRequest.has(requestId)) {
         flushSearchResults();
       }
+      const activeId = get(activeSearchTabId);
       searchTabs.update((tabs) =>
-        updateTabByRequestId(tabs, requestId, (t) => ({
-          ...t,
-          isSearching: false,
-          progress: null,
-        })),
+        updateTabByRequestId(tabs, requestId, (t) =>
+          trimIdleTab({ ...t, isSearching: false, progress: null }, activeId),
+        ),
       );
     }));
     registered.push(await listen<{ request_id: number; nodes_contacted: number; results_so_far: number; phase: string }>(
@@ -856,6 +1186,11 @@ export function cleanupSearchStore() {
   flushTimeout = null;
   flushScheduled = false;
   pendingByRequest.clear();
+  // The tab it was going to re-score is about to be dropped, and the overrides
+  // it honours are cleared below.
+  if (spamMarkRescoreTimer !== null) clearTimeout(spamMarkRescoreTimer);
+  spamMarkRescoreTimer = null;
+  spamMarkRescorePending = null;
   spamUserOverrides.clear();
   spamFilterEpoch.update((n) => n + 1);
   searchTabs.set([]);

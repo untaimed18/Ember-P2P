@@ -129,6 +129,12 @@ pub const PRESENCE_MESH_FRESH_SECS: i64 = PRESENCE_BEAT_SECS * 3 + 15;
 /// Beacons carried in one digest frame. See
 /// `a_full_presence_digest_fits_one_unfragmented_datagram`.
 pub const PRESENCE_BEACON_BATCH_MAX: usize = 10;
+/// Beacons carried in one digest frame that also carries key proofs.
+///
+/// One fewer than [`PRESENCE_BEACON_BATCH_MAX`]: the proof trailer does not fit
+/// beside a full batch inside one unfragmented datagram. Decoding still admits
+/// the larger count, which is what builds without proofs send.
+pub const PRESENCE_BEACON_PROVEN_BATCH_MAX: usize = PRESENCE_BEACON_BATCH_MAX - 1;
 
 /// Smallest gap between two *flooded* announcements from one member.
 ///
@@ -155,13 +161,32 @@ pub const MODERATION_REPUBLISH_SECS: i64 = 6 * 60 * 60;
 /// does not free it after a year of silence.
 pub const USERNAME_REFRESH_SECS: i64 = 24 * 60 * 60;
 /// Cap on rooms whose XOR-neighbors we register at rendezvous per heartbeat.
+///
+/// A wire budget, not a comfort setting. Each selected room registers
+/// [`CHANNEL_NEIGHBOR_COUNT`] capabilities as one HTTP POST apiece, on top of
+/// the intro and one per friend, and the server admits 60 requests a minute
+/// from an address. Four rooms is already 32 of those in a burst; raising it
+/// is how a user with a normal friend list starts being rate-limited off
+/// presence entirely.
 pub const CHANNEL_RENDEZVOUS_MAX_CHANNELS: usize = 4;
+/// How many heartbeats a registration outlives, and so how far the room
+/// selection may rotate without letting an entry lapse.
+///
+/// The server expires presence after 300s and we heartbeat every 120s, so an
+/// entry written on this beat is still live on the next one and gone before
+/// the one after. Rotating the non-focused slots across two beats therefore
+/// keeps twice as many rooms reachable for the same number of POSTs — which
+/// is the only way to widen coverage, since the cap above is fixed by a limit
+/// on the other end. The walk spans the *rotating* slots times this depth, so
+/// a room on screen narrows it rather than stretching each revisit past expiry.
+pub const CHANNEL_RENDEZVOUS_ROTATION_DEPTH: usize = 2;
 /// Deterministic gossip degree: XOR-closest members to self.
 pub const CHANNEL_NEIGHBOR_COUNT: usize = 8;
 /// Default hop budget for a gossip flood.
 pub const CHANNEL_MSG_TTL_DEFAULT: u8 = 8;
-/// In-session cap on distinct gossip ids remembered for flood dedup.
-pub const CHANNEL_GOSSIP_SEEN_CAP: usize = 4096;
+/// In-session cap on flood-dedup keys. Each admitted frame spends two — its id
+/// and its body key ([`admit_gossip`]) — so this is twice the frame window.
+pub const CHANNEL_GOSSIP_SEEN_CAP: usize = 8192;
 /// `CHANNEL_MSG` frames we will relay for the mesh per second.
 pub const CHANNEL_GOSSIP_OUT_PER_SEC: usize = 16;
 /// `CHANNEL_MSG` frames this user may originate per second.
@@ -277,6 +302,76 @@ const _: () = assert!(
 pub const CHANNEL_HISTORY_SYNC_PER_MIN: usize = 2;
 /// How often we ask one neighbor for missed history.
 pub const CHANNEL_HISTORY_SYNC_SECS: u64 = 5 * 60;
+/// How soon a neighbor that is still feeding us backlog may be asked again.
+///
+/// A catch-up reply carries at most [`CHANNEL_HISTORY_SYNC_MAX`] lines, so a
+/// gap wider than that takes several rounds to walk. Waiting out
+/// [`CHANNEL_HISTORY_SYNC_SECS`] between rounds meant a room that had been
+/// quiet for a day filled in half an hour at best, which reads as a room where
+/// nobody ever spoke. Only applied while the watermark is actually advancing —
+/// a neighbor with nothing to add falls back to the idle interval — and kept
+/// above the responder's own [`CHANNEL_HISTORY_SYNC_PER_MIN`] window so the
+/// faster walk still fits inside the budget it admits.
+pub const CHANNEL_HISTORY_WALK_SECS: u64 = 31;
+// The walk is the fastest we ever ask one neighbor, and a responder admits
+// `CHANNEL_HISTORY_SYNC_PER_MIN` per minute for one room. Asking faster than
+// its share of that window would spend the allowance on refusals and stall the
+// very backlog the walk exists to drain.
+const _: () = assert!(
+    CHANNEL_HISTORY_WALK_SECS * (CHANNEL_HISTORY_SYNC_PER_MIN as u64) > 60,
+    "the walk interval must stay inside the budget a responder admits"
+);
+
+/// Whether a newly stored line arrived the way a catch-up reply sends it.
+///
+/// Replies go out as TTL-1 unicasts that nobody floods on, while a live line
+/// reaches us with most of [`CHANNEL_MSG_TTL_DEFAULT`] left. Only these may
+/// put a room on [`CHANNEL_HISTORY_WALK_SECS`]: ordinary chat moves the
+/// room's watermark too, and counting it had every busy room asking all its
+/// neighbors ten times as often for backlog that did not exist.
+pub fn gossip_is_catch_up_shaped(ttl: u8) -> bool {
+    ttl <= 1
+}
+
+/// Whether a neighbor is mid-walk: catch-up lines have landed in the room
+/// since we asked them. `mark` is the room's catch-up count at that ask.
+pub fn history_sync_walking(mark: Option<i64>, ingested: i64) -> bool {
+    mark.is_some_and(|mark| ingested > mark)
+}
+/// Catch-up requests one tick may attempt, sent or not.
+///
+/// Counted per attempt rather than per success, so a tick whose neighbors are
+/// all unreachable still stops after this many instead of walking every
+/// room's roster.
+pub const CHANNEL_HISTORY_SYNC_ATTEMPTS_PER_TICK: usize = 4;
+/// First retry after a catch-up request found no path to its neighbor.
+pub const CHANNEL_HISTORY_SYNC_RETRY_BASE_SECS: u64 = 5;
+/// How long to wait before asking a neighbor again after `failures` attempts
+/// in a row found no way to reach them.
+///
+/// Doubles per failure and stops at [`CHANNEL_HISTORY_SYNC_SECS`], so a
+/// neighbor that is simply offline costs no more than an idle one does. Zero
+/// failures has no backoff of its own; the caller's ordinary gate applies.
+pub fn history_sync_retry_secs(failures: u32) -> u64 {
+    if failures == 0 {
+        return 0;
+    }
+    let shift = (failures - 1).min(16);
+    CHANNEL_HISTORY_SYNC_RETRY_BASE_SECS
+        .saturating_mul(1u64 << shift)
+        .min(CHANNEL_HISTORY_SYNC_SECS)
+}
+/// How soon opening a room may re-ask for its history ahead of that gate.
+///
+/// Focusing a room drops its catch-up stamps so the next tick asks straight
+/// away rather than waiting out the five minutes while the transcript looks
+/// empty. Dropping them on *every* focus change would be self-defeating:
+/// `maybe_sync_channel_history` runs on the one-second tick, so clicking
+/// between two rooms would re-ask the same neighbors every switch, and a
+/// responder admits only [`CHANNEL_HISTORY_SYNC_PER_MIN`] requests a minute
+/// for one room — the redundant asks would spend that allowance and get a
+/// later, genuine catch-up refused. Stamps younger than this stay.
+pub const CHANNEL_HISTORY_FOCUS_RESYNC_SECS: u64 = 60;
 /// How a catch-up reply is ordered, which decides whether a gap can close.
 ///
 /// A requester's watermark is the newest timestamp it holds, so a reply served
@@ -319,6 +414,132 @@ pub const HANDOFF_FETCH_SECS: i64 = 5 * 60;
 /// short, and short enough that a lapsed one stops being a life sentence.
 /// Re-offering to the *same* member stays allowed at any age.
 pub const HANDOFF_PENDING_TTL_SECS: i64 = 60 * 60;
+
+/// Whether an ownership offer is still inside [`HANDOFF_PENDING_TTL_SECS`].
+///
+/// The offer's version is its own wall-clock second, so it doubles as its
+/// age. A negative age means the clock moved backwards, and counts as lapsed
+/// so it cannot wedge the room either.
+pub fn handoff_offer_live(version: u64, now: i64) -> bool {
+    let offered_at = i64::try_from(version).unwrap_or(i64::MAX);
+    (0..HANDOFF_PENDING_TTL_SECS).contains(&now.saturating_sub(offered_at))
+}
+
+/// [`handoff_offer_live`] as the nominee applies it, on a clock that is not
+/// the owner's.
+///
+/// The version was stamped by the owner, so a nominee running a little slow
+/// sees a fresh offer dated in its future — which the owner-side rule rightly
+/// treats as lapsed, and which would refuse an honest offer here. The same
+/// skew the gossip envelope is allowed is allowed here; the window closes that
+/// much earlier on the nominee's side as a result, never later.
+pub fn handoff_offer_live_at_target(version: u64, now: i64) -> bool {
+    handoff_offer_live(version, now.saturating_add(CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS))
+}
+
+/// Most rooms whose live ownership offer a node keeps in mind at once. Only an
+/// owner can sign an offer, so an honest room has one at a time and this is
+/// far above what a device's joined rooms will ever need.
+pub const HANDOFF_OFFERS_SEEN_CAP: usize = 64;
+
+/// The live ownership offer this node last saw in each room: whom it names,
+/// and at which version.
+///
+/// What a member relaying a ready checks it against. A ready is signed by the
+/// member it names, not by the room, so anyone holding the content key can mint
+/// one naming themselves; only one from the member the owner's signed offer
+/// named, for that offer, is worth carrying across the room.
+#[derive(Debug, Default)]
+pub struct HandoffOffersSeen {
+    offers: HashMap<[u8; 16], ([u8; 32], u64)>,
+}
+
+impl HandoffOffersSeen {
+    /// Remember a verified, live offer. A later version replaces an earlier
+    /// one; lapsed offers are dropped first, and at the cap the oldest goes.
+    pub fn note(&mut self, channel_id: [u8; 16], target: [u8; 32], version: u64, now: i64) {
+        self.offers
+            .retain(|_, (_, held)| handoff_offer_live_at_target(*held, now));
+        if let Some((_, held)) = self.offers.get(&channel_id) {
+            if *held > version {
+                return;
+            }
+        } else if self.offers.len() >= HANDOFF_OFFERS_SEEN_CAP {
+            if let Some(oldest) = self
+                .offers
+                .iter()
+                .min_by_key(|(_, (_, held))| *held)
+                .map(|(id, _)| *id)
+            {
+                self.offers.remove(&oldest);
+            }
+        }
+        self.offers.insert(channel_id, (target, version));
+    }
+
+    /// Whether the offer seen in `channel_id` named `member` at `version`.
+    pub fn names(&self, channel_id: &[u8; 16], member: &[u8; 32], version: u64) -> bool {
+        self.offers
+            .get(channel_id)
+            .is_some_and(|(target, held)| target == member && *held == version)
+    }
+}
+
+/// Whether a verified ready may be passed on to the rest of the room, before
+/// the sender's rate budget is spent on it.
+///
+/// From a member who is not banned, for an offer still live and known to this
+/// node as naming that member. Anything else is at best useless to the room
+/// and at worst a flood: the owner acts only on its own pending offer, so no
+/// other ready can move the room, and every copy relayed costs each member a
+/// signature check. The key that sealed it is not asked about: the owner's
+/// signed offer already names the sender, and a nominee still on the epoch
+/// before a ban's rotation is exactly who has to be able to answer.
+pub fn handoff_ready_may_relay(
+    sender_banned: bool,
+    offer_known: bool,
+    version: u64,
+    now: i64,
+) -> bool {
+    !sender_banned && offer_known && handoff_offer_live_at_target(version, now)
+}
+
+/// Least gap between two publishes of a committed handoff record.
+pub const HANDOFF_REPUBLISH_SECS: i64 = 60;
+/// How long after a handoff is committed (or re-driven) its record keeps
+/// being published before the owner is told it did not land. Ten attempts at
+/// [`HANDOFF_REPUBLISH_SECS`].
+pub const HANDOFF_REPUBLISH_WINDOW_SECS: i64 = 10 * 60;
+
+/// What the owner should do about a handoff it has committed to but has not
+/// seen stored anywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandoffRepublish {
+    Publish,
+    Wait,
+    /// Out of attempts, or the offer it answers has lapsed. The commitment
+    /// stands — the record may yet be found stored — but nothing more is sent
+    /// until the owner re-drives it.
+    GiveUp,
+}
+
+pub fn handoff_republish_due(
+    version: u64,
+    committed_at: i64,
+    last_attempt: i64,
+    now: i64,
+) -> HandoffRepublish {
+    if !handoff_offer_live(version, now)
+        || now.saturating_sub(committed_at) >= HANDOFF_REPUBLISH_WINDOW_SECS
+        || committed_at > now
+    {
+        return HandoffRepublish::GiveUp;
+    }
+    if last_attempt > 0 && now.saturating_sub(last_attempt) < HANDOFF_REPUBLISH_SECS {
+        return HandoffRepublish::Wait;
+    }
+    HandoffRepublish::Publish
+}
 // --- Ember Transfer -------------------------------------------------------
 //
 // One member hands a file to one other member. Nothing is broadcast: the
@@ -331,8 +552,13 @@ pub const HANDOFF_PENDING_TTL_SECS: i64 = 60 * 60;
 // the file identified by its BLAKE3 root, so a later QUIC or multi-source
 // implementation can carry the same offers without a new handshake.
 
-/// Largest file one member may offer another.
-pub const XFER_MAX_BYTES: u64 = 100 * 1024 * 1024;
+/// Largest file one member may offer another. The same ceiling as a chat
+/// attachment, whose stream carries it when both ends can reach each other.
+///
+/// Builds before 1.7.0 capped this at 100 MB and decode a larger offer as
+/// malformed, dropping it without an answer, so such an offer to them simply
+/// expires. The UI says as much when one does.
+pub const XFER_MAX_BYTES: u64 = super::attach::ATTACH_MAX_BYTES;
 /// Payload bytes per block. Chosen so a data frame plus its plaintext header,
 /// authenticator, gossip envelope, and a relay wrapper still fit one
 /// unfragmented datagram. `xfer_block_frame_fits_one_unfragmented_datagram`
@@ -710,9 +936,56 @@ pub fn derive_channel_presence_capability(
 /// public content key can mint a chat line, so treating every author as a
 /// mesh neighbor is how a public room gets eclipsed. Private rooms fold a
 /// secret into the content key, so a chat line is already evidence of
-/// membership. Chat display can still show the author either way.
-pub fn chat_author_joins_gossip_roster(private: bool) -> bool {
-    private
+/// membership — but only under the key the room seals with *now*, and only
+/// when the seal is the author's own. A retired epoch is still held by whoever
+/// a rotation evicted, so a line under one is evidence of nothing but having
+/// once been here.
+///
+/// The seal is the author's for a live line: relays pass the original body on
+/// with only its TTL lowered. It is not for a catch-up re-serve, which the
+/// responder seals afresh under *its* current key around a line it may have
+/// stored while it was the one lagging — so a line the evicted member wrote
+/// under the old epoch would reach us looking current. Those go out at TTL 1
+/// ([`gossip_is_catch_up_shaped`]), and a TTL-1 frame is never taken as
+/// evidence, which costs only a live line on its final hop that presence will
+/// vouch for anyway. Chat display can still show the author either way.
+pub fn chat_author_joins_gossip_roster(private: bool, opened: OpenedUnder, ttl: u8) -> bool {
+    private && opened == OpenedUnder::Current && !gossip_is_catch_up_shaped(ttl)
+}
+
+/// Which of a room's content keys opened a frame.
+///
+/// [`OpenedUnder::Retired`] is every key but the head of the list: an older
+/// epoch, or the original invite secret once a room has rotated. Those stay
+/// readable so in-flight traffic and lagging members are not lost, but they
+/// are also exactly what an evicted member still holds, so a frame opened
+/// under one is read-only — it may be displayed, and may refresh a member the
+/// roster already has, but it must not admit anyone or change anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenedUnder {
+    Current,
+    Retired,
+}
+
+/// Try `keys` in order and report which one `open` succeeded under.
+///
+/// `keys` is newest-first, as `channel_content_keys` builds it, so the head is
+/// the key this device seals new traffic with and is the only one that counts
+/// as current.
+pub fn open_with_content_keys<T>(
+    keys: &[[u8; 32]],
+    mut open: impl FnMut(&[u8; 32]) -> Option<T>,
+) -> Option<(T, OpenedUnder)> {
+    keys.iter().enumerate().find_map(|(index, key)| {
+        open(key).map(|value| {
+            let opened = if index == 0 {
+                OpenedUnder::Current
+            } else {
+                OpenedUnder::Retired
+            };
+            (value, opened)
+        })
+    })
 }
 
 /// Presence timestamps more than this far ahead of wall clock are dropped.
@@ -1004,7 +1277,18 @@ impl ChannelInvite {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
             match key {
                 "pk" => pubkey = hex_32(value),
-                "name" => name = percent_decode(value)?,
+                // Bounded before decoding, not after. The name is the one
+                // variable-length field in an invite, `percent_decode` sizes its
+                // buffer from the input, and this runs on a string the user
+                // pasted or an `ember-channel:` deep link handed us — so without
+                // a cap the parse allocates whatever arrived, before the pubkey
+                // below has established the invite is even real. Three times
+                // `CHANNEL_NAME_MAX` leaves room for a fully percent-encoded name
+                // (`%XX` per byte) and refuses anything that could not be one.
+                "name" if value.len() <= super::dht::publish::CHANNEL_NAME_MAX * 3 => {
+                    name = percent_decode(value)?
+                }
+                "name" => return None,
                 "k" => join_secret = hex_32(value),
                 // Unparseable is the same as absent: an invite is user-pasted,
                 // so a mangled epoch must not throw the whole thing away when
@@ -1153,6 +1437,39 @@ const XFER_BLOCK_DATA_SEALED_VERSION: u8 = 21;
 /// a batch of one — so the periodic digest can carry a slice of the roster in a
 /// single frame rather than a datagram per member.
 const PRESENCE_BEACON_PLAIN_VERSION: u8 = 22;
+/// A member is (or has stopped) composing a line. Ephemeral: sent one hop to
+/// members we hold a live session with, never relayed, stored, or re-served.
+///
+/// A new number rather than a flag on anything older because v1.6.x routes
+/// by this byte alone and drops a number it does not know without scoring
+/// the hop — every one of its decoders checks the byte first and the chat
+/// fallthrough ends in a `debug!`. See
+/// `a_typing_frame_falls_through_the_v1_6_7_dispatch_untouched`.
+const TYPING_PLAIN_VERSION: u8 = 23;
+// 24 was the stream frame with its ports and address in the clear, sealed only
+// by the gossip envelope — the room's content key, which every member a frame
+// is forwarded through holds. It never shipped in a release; retired rather
+// than reused so a pre-release build's frame is dropped, not misread.
+/// A transfer's QUIC port, encrypted to the other end alone. The sender sends
+/// one right after its offer, and a recipient that accepts answers with its own
+/// so the sender can punch toward it. A new number for the reason typing has
+/// one: v1.6.x drops it without scoring the hop, keeps using the block
+/// protocol, and never dials.
+const XFER_STREAM_SEALED_VERSION: u8 = 25;
+/// An offer encrypted to the recipient alone. See [`encode_xfer_offer_sealed`]
+/// for why 1.7.0 reads it and does not yet send it. v1.6.x drops the number
+/// like the two above, which is why senders keep the plain offer for now.
+const XFER_OFFER_SEALED_VERSION: u8 = 26;
+/// A friend request from one member to another, for a recipient the friend
+/// rendezvous cannot find: a current build publishes presence only to its
+/// friends and to holders of its v3 friend code, and a room shows members
+/// neither. Flooded, because the sender cannot tell which members reach the
+/// recipient, and addressed by a tag only the two of them can compute, so the
+/// members carrying it learn who is asking but not whom. A new number for the
+/// reason typing has one: v1.6.x drops it without scoring the hop, and never
+/// relays it.
+const ROOM_FRIEND_REQUEST_PLAIN_VERSION: u8 = 27;
+const TYPING_SIG_DOMAIN: &[u8] = b"ember-channel-typing-author-v1\0";
 const PRESENCE_BEACON_SIG_DOMAIN: &[u8] = b"ember-channel-presence-beacon-v1\0";
 const MOD_ACTION_BAN: u8 = 1;
 const MOD_ACTION_UNBAN: u8 = 0;
@@ -1267,6 +1584,215 @@ pub fn decode_channel_chat_plain(
     Some((pk, text, sig))
 }
 
+/// Opens the reply trailer: U+E0001 LANGUAGE TAG.
+///
+/// Deprecated since Unicode 5.1 and never part of an emoji tag sequence, so no
+/// text a person types — including a subdivision flag, whose tags run
+/// U+E0020..U+E007F — can end in this by accident.
+const REPLY_TRAILER_LEAD: char = '\u{E0001}';
+/// U+E0072 TAG LATIN SMALL LETTER R. Names the one trailer there is, and leaves
+/// the other tag letters free for a later signed field to use the same way.
+const REPLY_TRAILER_KIND: char = '\u{E0072}';
+/// Tag characters mirror printable ASCII at this offset: U+E0030 is tag `0`.
+const TAG_BASE: u32 = 0xE0000;
+/// Lead, kind, and the parent's 16-byte id as 32 lowercase hex digits.
+pub const REPLY_TRAILER_CHARS: usize = 2 + 32;
+/// Every tag character is four bytes of UTF-8, and the byte count is what the
+/// 4096-byte message cap measures — so a reply leaves this much less room.
+pub const REPLY_TRAILER_BYTES: usize = REPLY_TRAILER_CHARS * 4;
+
+/// The chat text a reply is signed and sent as: `body` followed, when this is a
+/// reply, by the parent's id written in Unicode tag characters.
+///
+/// Why the reference rides inside the text rather than beside it. The chat
+/// frame is `version || sender || signature || text`, with the text running to
+/// the end of the frame and the signature covering all of it
+/// ([`chat_sig_preimage`]); the edit frame is built the same way. There is no
+/// spare field, no flags byte, and no room after the text — anything appended
+/// *is* text to every build that exists. That leaves three ways to carry a
+/// signed reference, and this is the only one that keeps both properties asked
+/// of it:
+///
+/// * a new frame version would be signed, but every v1.6 build drops frames it
+///   does not know ([`decode_channel_chat_plain`] refuses any other version
+///   byte), so a reply would simply never appear for them;
+/// * a separate annotation frame beside an ordinary line would keep the line
+///   readable, but a relay could drop the annotation on its own, catch-up would
+///   have to carry a second kind of row, and every reply would spend two frames
+///   of its author's rate allowance;
+/// * inside the signed text, the reference is covered by the same signature as
+///   the words, cannot be stripped or retargeted without breaking it, and is
+///   re-served byte-for-byte by every member, old or new, who stores the line.
+///
+/// Tag characters make the third one invisible to builds that know nothing of
+/// it. They are default-ignorable code points — rendered as nothing, not as a
+/// missing-glyph box — with neutral bidi class, and none of them is removed by
+/// [`crate::security::sanitize_chat_text`] on either side of the wire, which
+/// matters because a line whose text changes under sanitising loses its
+/// signature on receipt. A v1.6 build therefore verifies the line, stores it,
+/// re-serves it, and draws exactly the body. What it cannot help is that the
+/// invisible characters come along if someone copies the line out of it.
+pub fn with_reply_trailer(body: &str, parent: Option<&[u8; 16]>) -> String {
+    let Some(parent) = parent else {
+        return body.to_string();
+    };
+    let mut out = String::with_capacity(body.len() + REPLY_TRAILER_BYTES);
+    out.push_str(body);
+    out.push(REPLY_TRAILER_LEAD);
+    out.push(REPLY_TRAILER_KIND);
+    for digit in hex::encode(parent).bytes() {
+        out.push(tag_char(digit));
+    }
+    out
+}
+
+fn tag_char(ascii: u8) -> char {
+    char::from_u32(TAG_BASE + u32::from(ascii)).unwrap_or(REPLY_TRAILER_LEAD)
+}
+
+/// `text` without its reply trailer, and the parent it named.
+///
+/// Strict on purpose: exactly one trailer, at the very end, in lowercase hex,
+/// after a non-empty body. That is the form [`with_reply_trailer`] writes, so a
+/// parsed reference always re-encodes to the bytes it came from, and anything
+/// looser — upper-case digits, a trailer mid-text, a bare trailer with nothing
+/// to reply with — is left as the ordinary (invisible) text it would be to an
+/// older build.
+pub fn split_reply_trailer(text: &str) -> (&str, Option<[u8; 16]>) {
+    let mut tail = text.char_indices().rev().take(REPLY_TRAILER_CHARS);
+    let mut digits = [0u8; 32];
+    for slot in digits.iter_mut().rev() {
+        let Some((_, c)) = tail.next() else {
+            return (text, None);
+        };
+        let ascii = (c as u32).wrapping_sub(TAG_BASE);
+        match u8::try_from(ascii) {
+            Ok(b @ (b'0'..=b'9' | b'a'..=b'f')) => *slot = b,
+            _ => return (text, None),
+        }
+    }
+    let (Some((_, kind)), Some((start, lead))) = (tail.next(), tail.next()) else {
+        return (text, None);
+    };
+    if kind != REPLY_TRAILER_KIND || lead != REPLY_TRAILER_LEAD || start == 0 {
+        return (text, None);
+    }
+    let mut parent = [0u8; 16];
+    if hex::decode_to_slice(digits, &mut parent).is_err() {
+        return (text, None);
+    }
+    (&text[..start], Some(parent))
+}
+
+/// What a member sees of a stored or received line: the body, trailer removed.
+pub fn chat_display_text(text: &str) -> &str {
+    split_reply_trailer(text).0
+}
+
+/// Drop every reply trailer from the end of text the local user typed.
+///
+/// A line copied out of a build that shows the trailer as nothing carries it
+/// along invisibly, and pasting that back in would otherwise send a reply to
+/// whatever the copied line was answering — or, with a reply of our own on top,
+/// two trailers of which receivers would honour only the outer one.
+pub fn strip_reply_trailers(text: &str) -> &str {
+    let mut body = text;
+    loop {
+        match split_reply_trailer(body) {
+            (rest, Some(_)) => body = rest,
+            (rest, None) => return rest,
+        }
+    }
+}
+
+/// The parent a stored line replies to, as the database keeps it.
+///
+/// `None` for a line that names itself: a signed self-reference is harmless but
+/// means nothing, and storing it would give the transcript a quote that points
+/// at its own bubble. `own_msg_id` is the stored hex id, which for a handoff
+/// copy is not hex at all — that case can never equal a real parent id.
+pub fn chat_reply_parent_hex(text: &str, own_msg_id: &str) -> Option<String> {
+    let parent = hex::encode(split_reply_trailer(text).1?);
+    (!parent.eq_ignore_ascii_case(own_msg_id)).then_some(parent)
+}
+
+const CHAT_MSG_ID_DOMAIN: &[u8] = b"ember-channel-chat-msg-id-v1\0";
+const CHAT_MSG_ID_NONCE_LEN: usize = 6;
+
+fn chat_msg_id_from_nonce(
+    channel_id: &[u8; 16],
+    author: &[u8; 32],
+    timestamp: i64,
+    nonce: &[u8; CHAT_MSG_ID_NONCE_LEN],
+) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CHAT_MSG_ID_DOMAIN);
+    hasher.update(channel_id);
+    hasher.update(author);
+    hasher.update(&timestamp.to_le_bytes());
+    hasher.update(nonce);
+    let tag = hasher.finalize();
+    let mut id = [0u8; 16];
+    id[..CHAT_MSG_ID_NONCE_LEN].copy_from_slice(nonce);
+    id[CHAT_MSG_ID_NONCE_LEN..].copy_from_slice(&tag.as_bytes()[..16 - CHAT_MSG_ID_NONCE_LEN]);
+    id
+}
+
+/// A fresh chat `msg_id` that proves who wrote the line and when.
+///
+/// `nonce(6) || BLAKE3(domain, room, author, timestamp, nonce)[..10]`. Still
+/// opaque to every older peer, which only ever compares ids, but it lets a
+/// member who never held the line check an *edit* of it: the edit frame names
+/// its signer, target and original timestamp, and nothing else ties the target
+/// to anyone. Without the binding an edit arriving ahead of (or instead of) its
+/// line had to be taken on trust, which is how one member could claim another's
+/// id and have the genuine line dropped as a duplicate.
+///
+/// `timestamp` must be the one the line is signed and sealed with.
+pub fn new_chat_msg_id(channel_id: &[u8; 16], author: &[u8; 32], timestamp: i64) -> [u8; 16] {
+    let mut nonce = [0u8; CHAT_MSG_ID_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    chat_msg_id_from_nonce(channel_id, author, timestamp, &nonce)
+}
+
+/// Whether `msg_id` was minted by [`new_chat_msg_id`] for this author and time.
+///
+/// False for every id a build before the binding minted: those are uniformly
+/// random, and match with probability 2^-80.
+pub fn chat_msg_id_binds(
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    author: &[u8; 32],
+    timestamp: i64,
+) -> bool {
+    let mut nonce = [0u8; CHAT_MSG_ID_NONCE_LEN];
+    nonce.copy_from_slice(&msg_id[..CHAT_MSG_ID_NONCE_LEN]);
+    chat_msg_id_from_nonce(channel_id, author, timestamp, &nonce) == *msg_id
+}
+
+/// [`chat_msg_id_binds`] over the hex the database stores. Anything that does
+/// not decode — a handoff copy's synthetic id, say — binds to nobody.
+pub fn chat_msg_id_binds_hex(
+    channel_id_hex: &str,
+    msg_id_hex: &str,
+    author_hex: &str,
+    timestamp: i64,
+) -> bool {
+    fn decode<const N: usize>(s: &str) -> Option<[u8; N]> {
+        hex::decode(s).ok()?.try_into().ok()
+    }
+    match (
+        decode::<16>(channel_id_hex),
+        decode::<16>(msg_id_hex),
+        decode::<32>(author_hex),
+    ) {
+        (Some(channel_id), Some(msg_id), Some(author)) => {
+            chat_msg_id_binds(&channel_id, &msg_id, &author, timestamp)
+        }
+        _ => false,
+    }
+}
+
 /// A member's own signed assertion that they were in a room at an instant.
 ///
 /// The unit of the live presence layer, and deliberately the same shape of
@@ -1292,10 +1818,25 @@ pub struct PresenceBeacon {
     /// that one nobody has to be trusted about.
     pub departed: bool,
     pub signature: [u8; 64],
+    /// The author's proof that they hold the content key they sealed their
+    /// own beacon under. See [`PresenceBeacon::proves_key`].
+    ///
+    /// Carried verbatim by relays, like the signature. It is the only part of a
+    /// beacon that says anything about the room's key: the signed epoch is a
+    /// number the author picks, and the frame's own seal belongs to whoever
+    /// assembled the digest — a member who may have picked the beacon up while
+    /// still on an epoch its author was later evicted from.
+    pub key_proof: Option<[u8; PRESENCE_BEACON_PROOF_LEN]>,
 }
 
 /// `flags(1) || pubkey(32) || timestamp(8) || signature(64)`.
 pub const PRESENCE_BEACON_ENTRY_LEN: usize = 1 + 32 + 8 + 64;
+/// Bytes of key proof per beacon, in a trailer after the entries.
+///
+/// Short because it only has to resist online guessing — checking one needs
+/// the key it proves — and a full digest has to stay one datagram.
+pub const PRESENCE_BEACON_PROOF_LEN: usize = 8;
+const PRESENCE_BEACON_PROOF_DOMAIN: &[u8] = b"ember-channel-presence-key-proof-v1\0";
 /// `flags` bit 0: this is a leave rather than an announcement.
 const PRESENCE_BEACON_FLAG_DEPARTED: u8 = 0x01;
 
@@ -1348,10 +1889,66 @@ pub fn sign_presence_beacon(
             signing_key,
             &presence_beacon_preimage(channel_id, key_epoch, member, timestamp, departed),
         ),
+        key_proof: None,
     }
 }
 
+fn presence_beacon_key_proof(
+    content_key: &[u8; 32],
+    channel_id: &[u8; 16],
+    member: &[u8; 32],
+    timestamp: i64,
+    departed: bool,
+) -> [u8; PRESENCE_BEACON_PROOF_LEN] {
+    let mut input = Vec::with_capacity(PRESENCE_BEACON_PROOF_DOMAIN.len() + 16 + 32 + 8 + 1);
+    input.extend_from_slice(PRESENCE_BEACON_PROOF_DOMAIN);
+    input.extend_from_slice(channel_id);
+    input.extend_from_slice(member);
+    input.extend_from_slice(&timestamp.to_le_bytes());
+    input.push(u8::from(departed));
+    let full = blake3::keyed_hash(content_key, &input);
+    let mut out = [0u8; PRESENCE_BEACON_PROOF_LEN];
+    out.copy_from_slice(&full.as_bytes()[..PRESENCE_BEACON_PROOF_LEN]);
+    out
+}
+
 impl PresenceBeacon {
+    /// Attach the author's proof of `content_key`. Only ever called on our own
+    /// beacon, with the key we seal new traffic under.
+    pub fn with_key_proof(mut self, channel_id: &[u8; 16], content_key: &[u8; 32]) -> Self {
+        self.key_proof = Some(presence_beacon_key_proof(
+            content_key,
+            channel_id,
+            &self.member,
+            self.timestamp,
+            self.departed,
+        ));
+        self
+    }
+
+    /// Whether this beacon's author held `content_key` when they minted it.
+    ///
+    /// Bound to the member, timestamp and departure bit, so a proof cannot be
+    /// lifted onto another beacon. It is not inside the signature — builds
+    /// that predate it still verify beacons that carry one — which costs
+    /// nothing: anyone able to mint a valid proof holds the key already, and
+    /// could as easily have handed it to whoever they meant to vouch for.
+    pub fn proves_key(&self, channel_id: &[u8; 16], content_key: &[u8; 32]) -> bool {
+        self.key_proof.is_some_and(|proof| {
+            let expected = presence_beacon_key_proof(
+                content_key,
+                channel_id,
+                &self.member,
+                self.timestamp,
+                self.departed,
+            );
+            proof
+                .iter()
+                .zip(expected.iter())
+                .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+                == 0
+        })
+    }
     /// The roster `last_seen` this beacon supports, or nothing if its clock is
     /// unusable. Clamped by [`clamp_presence_timestamp`] so a member running
     /// slightly fast cannot sort ahead of honest peers, and one running wildly
@@ -1362,9 +1959,24 @@ impl PresenceBeacon {
 }
 
 /// Pack beacons for the wire. A join announcement is a batch of one.
+///
+/// Key proofs ride in a trailer of one fixed-size slot per entry, zeroed for a
+/// beacon that has none, after entries laid out exactly as before. Builds that
+/// predate the trailer only check the frame is *at least* as long as its
+/// entries, so they read the batch and ignore it.
 pub fn encode_channel_presence_beacons(beacons: &[PresenceBeacon]) -> Vec<u8> {
-    let count = beacons.len().min(PRESENCE_BEACON_BATCH_MAX);
-    let mut out = Vec::with_capacity(2 + count * PRESENCE_BEACON_ENTRY_LEN);
+    let proven = beacons
+        .iter()
+        .take(PRESENCE_BEACON_PROVEN_BATCH_MAX)
+        .any(|b| b.key_proof.is_some());
+    let cap = if proven {
+        PRESENCE_BEACON_PROVEN_BATCH_MAX
+    } else {
+        PRESENCE_BEACON_BATCH_MAX
+    };
+    let count = beacons.len().min(cap);
+    let trailer = if proven { count * PRESENCE_BEACON_PROOF_LEN } else { 0 };
+    let mut out = Vec::with_capacity(2 + count * PRESENCE_BEACON_ENTRY_LEN + trailer);
     out.push(PRESENCE_BEACON_PLAIN_VERSION);
     out.push(count as u8);
     for beacon in beacons.iter().take(count) {
@@ -1376,6 +1988,11 @@ pub fn encode_channel_presence_beacons(beacons: &[PresenceBeacon]) -> Vec<u8> {
         out.extend_from_slice(&beacon.member);
         out.extend_from_slice(&beacon.timestamp.to_le_bytes());
         out.extend_from_slice(&beacon.signature);
+    }
+    if proven {
+        for beacon in beacons.iter().take(count) {
+            out.extend_from_slice(&beacon.key_proof.unwrap_or([0u8; PRESENCE_BEACON_PROOF_LEN]));
+        }
     }
     out
 }
@@ -1411,6 +2028,8 @@ pub fn decode_channel_presence_beacons(
     if count > PRESENCE_BEACON_BATCH_MAX || bytes.len() < 2 + count * PRESENCE_BEACON_ENTRY_LEN {
         return Some(Vec::new());
     }
+    let proofs_at = 2 + count * PRESENCE_BEACON_ENTRY_LEN;
+    let has_proofs = bytes.len() == proofs_at + count * PRESENCE_BEACON_PROOF_LEN && count > 0;
     let mut out = Vec::with_capacity(count);
     for index in 0..count {
         let at = 2 + index * PRESENCE_BEACON_ENTRY_LEN;
@@ -1422,11 +2041,20 @@ pub fn decode_channel_presence_beacons(
         let timestamp = i64::from_le_bytes(stamp);
         let mut signature = [0u8; 64];
         signature.copy_from_slice(&bytes[at + 41..at + PRESENCE_BEACON_ENTRY_LEN]);
+        let key_proof = if has_proofs {
+            let slot = proofs_at + index * PRESENCE_BEACON_PROOF_LEN;
+            let mut proof = [0u8; PRESENCE_BEACON_PROOF_LEN];
+            proof.copy_from_slice(&bytes[slot..slot + PRESENCE_BEACON_PROOF_LEN]);
+            (proof != [0u8; PRESENCE_BEACON_PROOF_LEN]).then_some(proof)
+        } else {
+            None
+        };
         let beacon = PresenceBeacon {
             member,
             timestamp,
             departed,
             signature,
+            key_proof,
         };
         if beacon.last_seen_at(now).is_none() {
             continue;
@@ -1517,8 +2145,18 @@ pub fn beacon_superseded(held: Option<&PresenceBeacon>, incoming: &PresenceBeaco
 /// duplicates are the normal case rather than an anomaly. Keeping the newest is
 /// what makes the layer converge instead of flapping between whichever copy
 /// happened to be processed last.
+///
+/// A copy of the same beacon that has lost its key proof — re-packed by a
+/// build that predates the trailer — does not displace one that still has it.
 pub fn keep_latest_beacon(latest: &mut HashMap<[u8; 32], PresenceBeacon>, beacon: PresenceBeacon) {
-    if !beacon_superseded(latest.get(&beacon.member), &beacon) {
+    let held = latest.get(&beacon.member);
+    let loses_proof = held.is_some_and(|prev| {
+        prev.timestamp == beacon.timestamp
+            && prev.departed == beacon.departed
+            && prev.key_proof.is_some()
+            && beacon.key_proof.is_none()
+    });
+    if !loses_proof && !beacon_superseded(held, &beacon) {
         latest.insert(beacon.member, beacon);
     }
 }
@@ -1732,10 +2370,32 @@ pub struct ChannelChatEdit {
 /// another frame version. An unrecognised value is stored and re-served rather
 /// than dropped, so a room running a newer build does not lose its reactions
 /// every time they pass through this one — this build simply does not draw them.
+///
+/// Codes are an index into a curated emoji table the UI owns
+/// (`src/lib/channelReactions.ts`), never a code point: one byte on the wire, no
+/// glyph a receiver cannot draw, and a tally that every build computes the same
+/// way. A code is permanent once shipped. v1.6.x draws 1–3 and counts every
+/// other value nowhere, so reusing a number for a different emoji would show
+/// on those builds as the old mark — append, never renumber.
 pub const REACTION_NONE: u8 = 0;
 pub const REACTION_UP: u8 = 1;
 pub const REACTION_DOWN: u8 = 2;
 pub const REACTION_HEART: u8 = 3;
+/// Highest code this build lets a member send and counts in a tally. 4–20 are
+/// the curated set after the original three (😂 😮 😢 😡 🎉 🙏 🔥 👀 ✅ ❌ 💯 🤔
+/// 👏 🚀 ⭐ 😊 👋, in that order). Anything above is a later build's and is kept
+/// and re-served like any other value, just not counted.
+pub const REACTION_CURATED_MAX: u8 = 20;
+
+// The three codes v1.6.x draws. Moving any of them would make those builds
+// show a member's new reaction as a different mark than the one they picked.
+const _: () = assert!(REACTION_UP == 1 && REACTION_DOWN == 2 && REACTION_HEART == 3);
+
+/// Whether this build draws `reaction`. [`REACTION_NONE`] is a withdrawal, not
+/// a reaction, so it is not one of them.
+pub fn reaction_is_curated(reaction: u8) -> bool {
+    (REACTION_UP..=REACTION_CURATED_MAX).contains(&reaction)
+}
 
 /// Reactions one frame may carry. 121 bytes each, so a full batch is under 4 KiB
 /// and stays inside the budget a chat line already occupies.
@@ -1864,6 +2524,348 @@ pub fn decode_channel_reactions(
         });
     }
     Some(out)
+}
+
+/// How often a composing member's client refreshes its typing signal, and the
+/// window both ends meter typing frames over.
+pub const CHANNEL_TYPING_REFRESH_SECS: u64 = 4;
+/// Typing frames one device may originate into one room per refresh window:
+/// a refresh, a stop, and a fresh start after a message is sent.
+pub const CHANNEL_TYPING_SEND_PER_WINDOW: usize = 3;
+/// Typing frames accepted from one member of one room per refresh window.
+/// Above what an honest sender is allowed, so the sender's own ceiling is the
+/// one that bites and this only ever refuses a client that ignores it.
+pub const CHANNEL_TYPING_RECV_PER_WINDOW: usize = 4;
+const _: () = assert!(
+    CHANNEL_TYPING_RECV_PER_WINDOW > CHANNEL_TYPING_SEND_PER_WINDOW,
+    "a receiver must admit everything an honest sender is allowed to send"
+);
+/// A typing frame older than this is dropped. The indicator it would raise
+/// lasts about six seconds, so anything older describes a moment already over,
+/// and a replay of a captured frame buys at most this much false "typing".
+pub const CHANNEL_TYPING_MAX_AGE_SECS: i64 = 10;
+/// A typing frame dated further ahead than this is dropped. Symmetric with the
+/// age bound: a clock that far off would otherwise hold an indicator open.
+pub const CHANNEL_TYPING_MAX_FUTURE_SECS: i64 = 10;
+/// Present members above which this device stops sending typing signals.
+///
+/// Sending is one datagram per reachable member, so its cost grows with the
+/// room while its value shrinks: in a room this size "several people are
+/// typing" is the most the line could say. Receiving is unaffected — a member
+/// of a smaller view of the room still shows what reaches it.
+pub const CHANNEL_TYPING_MAX_ROOM: usize = 50;
+/// Hop budget written on a typing envelope. One, so even a path that decrements
+/// and forwards (a moderator action's, say) gets `None` from
+/// [`ChannelGossip::decremented_ttl`] and stops here.
+pub const CHANNEL_TYPING_TTL: u8 = 1;
+/// `version || member(32) || state(1) || sig(64)`.
+const TYPING_FRAME_LEN: usize = 1 + 32 + 1 + 64;
+
+/// What a typing signal's signature covers.
+///
+/// The room, envelope id and envelope time are inside for the same reasons as
+/// chat's: the content key proves only that a frame came from somebody in the
+/// room, so without them any member could relabel a captured signal as another
+/// member's, move it into another room, or re-date it past the staleness check.
+fn typing_sig_preimage(
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+    member: &[u8; 32],
+    typing: bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(TYPING_SIG_DOMAIN.len() + 16 + 16 + 8 + 32 + 1);
+    out.extend_from_slice(TYPING_SIG_DOMAIN);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(msg_id);
+    out.extend_from_slice(&timestamp.to_le_bytes());
+    out.extend_from_slice(member);
+    out.push(u8::from(typing));
+    out
+}
+
+pub fn encode_channel_typing(
+    signing_key: &SigningKey,
+    member: &[u8; 32],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+    typing: bool,
+) -> Vec<u8> {
+    let sig = crypto::sign(
+        signing_key,
+        &typing_sig_preimage(channel_id, msg_id, timestamp, member, typing),
+    );
+    let mut out = Vec::with_capacity(TYPING_FRAME_LEN);
+    out.push(TYPING_PLAIN_VERSION);
+    out.extend_from_slice(member);
+    out.push(u8::from(typing));
+    out.extend_from_slice(&sig);
+    out
+}
+
+/// The member a typing signal names and whether they are composing, or nothing
+/// if it is malformed or not signed by that member for this envelope.
+pub fn decode_channel_typing(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+) -> Option<([u8; 32], bool)> {
+    if bytes.len() != TYPING_FRAME_LEN || bytes[0] != TYPING_PLAIN_VERSION {
+        return None;
+    }
+    let typing = match bytes[33] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let member: [u8; 32] = bytes[1..33].try_into().ok()?;
+    let sig: [u8; 64] = bytes[34..].try_into().ok()?;
+    let author = crypto::verifying_key_from_bytes(&member)?;
+    if !crypto::verify(
+        &author,
+        &typing_sig_preimage(channel_id, msg_id, timestamp, &member, typing),
+        &sig,
+    ) {
+        return None;
+    }
+    Some((member, typing))
+}
+
+const ROOM_FRIEND_REQUEST_DOMAIN: &[u8] = b"ember-channel-friend-request-v1\0";
+/// `version || sender(32) || recipient tag(16) || sig(64)`.
+const ROOM_FRIEND_REQUEST_LEN: usize = 1 + 32 + 16 + 64;
+/// Oldest room friend request acted on or passed on. Past the sender's own
+/// ten-minute origin retry, and short enough that a member replaying one it
+/// carried has only this window to do it in — inside which the recipient
+/// remembers a refusal (`Database::add_room_friend_request`), so a declined
+/// request cannot be put back in front of them.
+pub const ROOM_FRIEND_REQUEST_MAX_AGE_SECS: i64 = 15 * 60;
+
+/// The tag that tells `recipient` a room friend request is theirs.
+///
+/// Pairwise, so the sender and the recipient derive the same value and nobody
+/// else can, and bound to the envelope's id so no two requests carry the same
+/// tag: the members relaying them cannot tell whether two are to one person.
+pub fn room_friend_request_tag(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+) -> Option<[u8; 16]> {
+    let mut purpose = Vec::with_capacity(12 + 16 + 16);
+    purpose.extend_from_slice(b"ch-friend-v1");
+    purpose.extend_from_slice(channel_id);
+    purpose.extend_from_slice(msg_id);
+    let key =
+        crypto::derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, 0)?;
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&key[..16]);
+    Some(tag)
+}
+
+/// Whether a room friend request from `sender` carrying `tag` is addressed to
+/// the holder of `our_ed25519_seed`.
+pub fn room_friend_request_is_for(
+    our_ed25519_seed: &[u8; 32],
+    sender: &[u8; 32],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    tag: &[u8; 16],
+) -> bool {
+    let Some(expected) = room_friend_request_tag(our_ed25519_seed, sender, channel_id, msg_id)
+    else {
+        return false;
+    };
+    expected.iter().zip(tag.iter()).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
+}
+
+fn room_friend_request_preimage(
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+    sender: &[u8; 32],
+    tag: &[u8; 16],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ROOM_FRIEND_REQUEST_DOMAIN.len() + 16 + 16 + 8 + 32 + 16);
+    out.extend_from_slice(ROOM_FRIEND_REQUEST_DOMAIN);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(msg_id);
+    out.extend_from_slice(&timestamp.to_le_bytes());
+    out.extend_from_slice(sender);
+    out.extend_from_slice(tag);
+    out
+}
+
+/// Signed by the sender's user key, so every member it passes through can
+/// hold it to the sender's ban and rate like chat, and cannot pin it on
+/// anyone else.
+pub fn encode_room_friend_request(
+    signing_key: &SigningKey,
+    sender: &[u8; 32],
+    tag: &[u8; 16],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+) -> Vec<u8> {
+    let sig = crypto::sign(
+        signing_key,
+        &room_friend_request_preimage(channel_id, msg_id, timestamp, sender, tag),
+    );
+    let mut out = Vec::with_capacity(ROOM_FRIEND_REQUEST_LEN);
+    out.push(ROOM_FRIEND_REQUEST_PLAIN_VERSION);
+    out.extend_from_slice(sender);
+    out.extend_from_slice(tag);
+    out.extend_from_slice(&sig);
+    out
+}
+
+/// The sender and recipient tag of a room friend request, or nothing if it is
+/// malformed or not signed by the member it names for this envelope.
+pub fn decode_room_friend_request(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+) -> Option<([u8; 32], [u8; 16])> {
+    if bytes.len() != ROOM_FRIEND_REQUEST_LEN || bytes[0] != ROOM_FRIEND_REQUEST_PLAIN_VERSION {
+        return None;
+    }
+    let sender: [u8; 32] = bytes[1..33].try_into().ok()?;
+    let tag: [u8; 16] = bytes[33..49].try_into().ok()?;
+    let sig: [u8; 64] = bytes[49..].try_into().ok()?;
+    let author = crypto::verifying_key_from_bytes(&sender)?;
+    if !crypto::verify(
+        &author,
+        &room_friend_request_preimage(channel_id, msg_id, timestamp, &sender, &tag),
+        &sig,
+    ) {
+        return None;
+    }
+    Some((sender, tag))
+}
+
+/// Whether a room friend request's envelope time is recent enough to act on.
+pub fn room_friend_request_fresh(timestamp: i64, now: i64) -> bool {
+    timestamp >= now.saturating_sub(ROOM_FRIEND_REQUEST_MAX_AGE_SECS)
+        && timestamp <= now.saturating_add(CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS)
+}
+
+/// Whether a typing envelope's time is close enough to now to mean anything.
+///
+/// Far tighter than [`gossip_timestamp_ok`], which has to let catch-up replay
+/// lines from days ago. A typing signal is only ever live.
+pub fn typing_timestamp_fresh(timestamp: i64, now: i64) -> bool {
+    timestamp >= now.saturating_sub(CHANNEL_TYPING_MAX_AGE_SECS)
+        && timestamp <= now.saturating_add(CHANNEL_TYPING_MAX_FUTURE_SECS)
+}
+
+/// Admit one outbound typing frame for `channel_id`, or refuse it.
+///
+/// The frontend already paces itself; this is the ceiling that holds whatever
+/// it does, since each admitted frame is a datagram to every reachable member.
+pub fn typing_send_allow(
+    sent: &mut HashMap<[u8; 16], VecDeque<Instant>>,
+    channel_id: [u8; 16],
+    now: Instant,
+) -> bool {
+    rate_window_allow(
+        sent.entry(channel_id).or_default(),
+        now,
+        Duration::from_secs(CHANNEL_TYPING_REFRESH_SECS),
+        CHANNEL_TYPING_SEND_PER_WINDOW,
+    )
+}
+
+/// Admit one inbound typing frame from `author` in `channel_id`, or refuse it.
+///
+/// Its own map rather than the chat budget's: sharing it would let a member's
+/// typing spend the allowance their next line needs. Same refuse-when-full rule
+/// as [`author_gossip_allow`], for the same reason.
+pub fn typing_recv_allow(
+    seen: &mut HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>>,
+    channel_id: [u8; 16],
+    author: &[u8; 32],
+    now: Instant,
+) -> bool {
+    let key = (channel_id, *author);
+    if seen.len() >= CHANNEL_GOSSIP_AUTHOR_CAP && !seen.contains_key(&key) {
+        return false;
+    }
+    rate_window_allow(
+        seen.entry(key).or_default(),
+        now,
+        Duration::from_secs(CHANNEL_TYPING_REFRESH_SECS),
+        CHANNEL_TYPING_RECV_PER_WINDOW,
+    )
+}
+
+/// Why an authenticated typing frame was not shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypingRefusal {
+    /// Our own signal, echoed back by a peer.
+    Own,
+    Stale,
+    /// The author is banned, or not on the roster at all. A signal introduces
+    /// nobody: a member who has not yet announced themselves has nothing to
+    /// be shown typing in.
+    NotAMember,
+    RateLimited,
+}
+
+/// Decide whether a verified typing frame from `member` is shown.
+///
+/// `roster_status` is `Database::channel_member_status`'s answer: `Some(false)`
+/// on the roster and unbanned, `Some(true)` banned, `None` unknown. The rate
+/// check runs last and only for a frame that passed everything else, so a
+/// refused frame is not charged to the member it names.
+pub fn admit_channel_typing(
+    member: &[u8; 32],
+    local: &[u8; 32],
+    roster_status: Option<bool>,
+    timestamp: i64,
+    now: i64,
+    rate_ok: impl FnOnce() -> bool,
+) -> Result<(), TypingRefusal> {
+    if member == local {
+        return Err(TypingRefusal::Own);
+    }
+    if !typing_timestamp_fresh(timestamp, now) {
+        return Err(TypingRefusal::Stale);
+    }
+    if roster_status != Some(false) {
+        return Err(TypingRefusal::NotAMember);
+    }
+    if !rate_ok() {
+        return Err(TypingRefusal::RateLimited);
+    }
+    Ok(())
+}
+
+/// The members a typing signal goes to: every present member but us that
+/// `reachable` says we hold a live session with. `None` when the room is over
+/// [`CHANNEL_TYPING_MAX_ROOM`], which is the caller's cue to send nothing.
+///
+/// Live sessions only, and deliberately so. The overlay and the rendezvous
+/// tunnel both exist to make a line arrive eventually, which a typing signal
+/// has no use for, and the tunnel's outbox is bounded: filling it with typing
+/// would refuse the chat line queued behind it.
+pub fn typing_recipients(
+    local: &[u8; 32],
+    present: &[[u8; 32]],
+    mut reachable: impl FnMut(&[u8; 32]) -> bool,
+) -> Option<Vec<[u8; 32]>> {
+    if present.len() > CHANNEL_TYPING_MAX_ROOM {
+        return None;
+    }
+    Some(
+        present
+            .iter()
+            .filter(|pk| *pk != local && reachable(pk))
+            .copied()
+            .collect(),
+    )
 }
 
 fn mod_action_preimage(
@@ -2214,6 +3216,8 @@ pub fn xfer_frame_peek(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16])> {
             | XFER_BLOCK_DATA_SEALED_VERSION
             | XFER_CANCEL_PLAIN_VERSION
             | XFER_DONE_PLAIN_VERSION
+            | XFER_STREAM_SEALED_VERSION
+            | XFER_OFFER_SEALED_VERSION
     ) {
         return None;
     }
@@ -2299,7 +3303,64 @@ pub fn encode_xfer_offer(key: &[u8; 32], offer: &XferOffer) -> Vec<u8> {
 
 pub fn decode_xfer_offer(bytes: &[u8]) -> Option<XferOffer> {
     let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_OFFER_PLAIN_VERSION)?;
-    let rest = bytes.get(XFER_HEADER_LEN..)?;
+    parse_xfer_offer_body(sender, target, xfer_id, bytes.get(XFER_HEADER_LEN..)?)
+}
+
+/// `hdr || nonce(12) || sealed(size(8) || root(32) || name) || tag(16)`.
+///
+/// The plain offer's body, encrypted to the recipient alone, so a member the
+/// offer is forwarded through learns neither the file's name nor its size.
+/// 1.7.0 reads these and still sends the plain offer, because v1.6.x reads only
+/// that one and a sender cannot tell which build a relayed member runs; once
+/// the members who cannot read this have updated, senders can switch.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "not sent until senders switch; see docs/post-1.7.0.md")
+)]
+pub fn encode_xfer_offer_sealed(key: &[u8; 32], offer: &XferOffer) -> Vec<u8> {
+    let name = truncate_utf8_owned(&offer.name, XFER_NAME_MAX);
+    let mut out = Vec::with_capacity(
+        XFER_HEADER_LEN + XFER_SEAL_NONCE_LEN + 8 + 32 + name.len() + XFER_MAC_LEN,
+    );
+    put_xfer_header(
+        &mut out,
+        XFER_OFFER_SEALED_VERSION,
+        &offer.sender,
+        &offer.target,
+        &offer.xfer_id,
+    );
+    let mut nonce = [0u8; XFER_SEAL_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    out.extend_from_slice(&nonce);
+    let body = out.len();
+    out.extend_from_slice(&offer.size.to_le_bytes());
+    out.extend_from_slice(&offer.root);
+    out.extend_from_slice(name.as_bytes());
+    xfer_seal_xor(key, XFER_OFFER_SEAL_DOMAIN, &offer.xfer_id, &nonce, &mut out[body..]);
+    append_xfer_tag(key, &mut out);
+    out
+}
+
+/// Open a sealed offer. Call only on a frame [`xfer_verify`] has already
+/// accepted — decrypting first would be decrypting whatever a stranger sent.
+pub fn decode_xfer_offer_sealed(key: &[u8; 32], bytes: &[u8]) -> Option<XferOffer> {
+    let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_OFFER_SEALED_VERSION)?;
+    let sealed = bytes.get(XFER_HEADER_LEN..)?;
+    if sealed.len() < XFER_SEAL_NONCE_LEN {
+        return None;
+    }
+    let (nonce, body) = sealed.split_at(XFER_SEAL_NONCE_LEN);
+    let mut rest = body.to_vec();
+    xfer_seal_xor(key, XFER_OFFER_SEAL_DOMAIN, &xfer_id, nonce, &mut rest);
+    parse_xfer_offer_body(sender, target, xfer_id, &rest)
+}
+
+fn parse_xfer_offer_body(
+    sender: [u8; 32],
+    target: [u8; 32],
+    xfer_id: [u8; 16],
+    rest: &[u8],
+) -> Option<XferOffer> {
     if rest.len() < 8 + 32 {
         return None;
     }
@@ -2510,6 +3571,168 @@ pub fn decode_xfer_done(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16])> 
         return None;
     }
     Some(parsed)
+}
+
+/// Which end of a transfer a stream frame comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XferStreamRole {
+    /// The sender: fetch this transfer from my QUIC endpoint at the port given.
+    Serve,
+    /// The recipient: I am dialling you, and the port given is mine, for your
+    /// punch toward it.
+    Fetch,
+}
+
+impl XferStreamRole {
+    fn code(self) -> u8 {
+        match self {
+            Self::Serve => 1,
+            Self::Fetch => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Serve),
+            2 => Some(Self::Fetch),
+            _ => None,
+        }
+    }
+}
+
+/// A decoded stream frame's ports, and the address they are on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XferStreamPorts {
+    pub quic: u16,
+    /// The sender's upload listener, for a recipient whose QUIC dial cannot
+    /// get through. `None` when the frame did not carry one.
+    pub tcp: Option<u16>,
+    /// The frame sender's public IPv4 as STUN reports it, when the two ends
+    /// hold no direct session — the ordinary case in a room, where most
+    /// members are reached through the relay. On a Serve frame it is where the
+    /// recipient dials; on a Fetch frame, where the sender punches back. A
+    /// claim, but one the pairwise tag binds to the frame's sender, and every
+    /// connection made to it demands that sender's key, so a wrong one fails
+    /// rather than reaching anyone else's service.
+    pub public_ip: Option<std::net::Ipv4Addr>,
+}
+
+const XFER_SEAL_NONCE_LEN: usize = 12;
+const XFER_STREAM_SEAL_DOMAIN: &[u8] = b"ember-channel-xfer-stream-v1\0";
+const XFER_OFFER_SEAL_DOMAIN: &[u8] = b"ember-channel-xfer-offer-v1\0";
+
+/// XOR a sealed control frame's body with a keystream only the two ends can
+/// produce, separated per frame kind by `domain`.
+///
+/// Both ends hold the same pairwise key and each can send frames for one
+/// transfer, so unlike a block — whose offset already picks a stream only one
+/// plaintext ever uses — these take a random nonce from the wire. Without it
+/// the sender's stream frame and the recipient's would share a keystream, and
+/// anyone holding both would learn the XOR of their ports and addresses.
+fn xfer_seal_xor(key: &[u8; 32], domain: &[u8], xfer_id: &[u8; 16], nonce: &[u8], data: &mut [u8]) {
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(domain);
+    hasher.update(xfer_id);
+    hasher.update(nonce);
+    let mut reader = hasher.finalize_xof();
+    let mut pad = [0u8; 64];
+    for chunk in data.chunks_mut(pad.len()) {
+        let pad = &mut pad[..chunk.len()];
+        reader.fill(pad);
+        for (byte, p) in chunk.iter_mut().zip(pad.iter()) {
+            *byte ^= *p;
+        }
+    }
+}
+
+/// `hdr || nonce(12) || sealed(role(1) || quic_port(2 LE) || [tcp_port(2 LE)
+/// || [ipv4(4)]]) || tag(16)`. A frame carrying an address but no TCP port
+/// writes the port as zero.
+///
+/// Sealed because the frame may be forwarded through other members, and every
+/// one of them can open the gossip envelope: what they would read is where each
+/// end can be reached — its public address, when the two share no session.
+/// Encrypt then MAC, as for blocks, so the tag covers the ciphertext and still
+/// binds sender, target and transfer.
+pub fn encode_xfer_stream(
+    key: &[u8; 32],
+    sender: &[u8; 32],
+    target: &[u8; 32],
+    xfer_id: &[u8; 16],
+    role: XferStreamRole,
+    ports: XferStreamPorts,
+) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(XFER_HEADER_LEN + XFER_SEAL_NONCE_LEN + 9 + XFER_MAC_LEN);
+    put_xfer_header(&mut out, XFER_STREAM_SEALED_VERSION, sender, target, xfer_id);
+    let mut nonce = [0u8; XFER_SEAL_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    out.extend_from_slice(&nonce);
+    let body = out.len();
+    out.push(role.code());
+    out.extend_from_slice(&ports.quic.to_le_bytes());
+    let tcp = ports.tcp.filter(|p| *p != 0);
+    let public_ip = ports.public_ip.filter(|ip| !ip.is_unspecified());
+    if tcp.is_some() || public_ip.is_some() {
+        out.extend_from_slice(&tcp.unwrap_or(0).to_le_bytes());
+    }
+    if let Some(ip) = public_ip {
+        out.extend_from_slice(&ip.octets());
+    }
+    xfer_seal_xor(key, XFER_STREAM_SEAL_DOMAIN, xfer_id, &nonce, &mut out[body..]);
+    append_xfer_tag(key, &mut out);
+    out
+}
+
+/// Open a stream frame. Call only on a frame [`xfer_verify`] has already
+/// accepted — decrypting first would be decrypting whatever a stranger sent.
+///
+/// Bytes past the ports are ignored, so a later build can append candidate
+/// addresses without taking another frame number.
+pub fn decode_xfer_stream(
+    key: &[u8; 32],
+    bytes: &[u8],
+) -> Option<([u8; 32], [u8; 32], [u8; 16], XferStreamRole, XferStreamPorts)> {
+    let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_STREAM_SEALED_VERSION)?;
+    let sealed = bytes.get(XFER_HEADER_LEN..)?;
+    if sealed.len() < XFER_SEAL_NONCE_LEN + 3 {
+        return None;
+    }
+    let (nonce, body) = sealed.split_at(XFER_SEAL_NONCE_LEN);
+    let mut rest = body.to_vec();
+    xfer_seal_xor(key, XFER_STREAM_SEAL_DOMAIN, &xfer_id, nonce, &mut rest);
+    let role = XferStreamRole::from_code(rest[0])?;
+    let quic = u16::from_le_bytes([rest[1], rest[2]]);
+    if quic == 0 {
+        return None;
+    }
+    let tcp = rest
+        .get(3..5)
+        .map(|p| u16::from_le_bytes([p[0], p[1]]))
+        .filter(|p| *p != 0);
+    let public_ip = rest
+        .get(5..9)
+        .map(|b| std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]))
+        .filter(|ip| !ip.is_unspecified());
+    Some((sender, target, xfer_id, role, XferStreamPorts { quic, tcp, public_ip }))
+}
+
+/// Capability behind a transfer's QUIC stream request.
+///
+/// Pairwise like [`derive_xfer_key`], under its own purpose so the stream tag
+/// and the frame authenticator never share a key.
+pub fn derive_xfer_stream_capability(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    channel_id: &[u8; 16],
+    xfer_id: &[u8; 16],
+) -> Option<[u8; 32]> {
+    // Pairwise purpose is capped at 64 bytes; this is 49.
+    let mut purpose = Vec::with_capacity(17 + 16 + 16);
+    purpose.extend_from_slice(b"ch-xfer-stream-v1");
+    purpose.extend_from_slice(channel_id);
+    purpose.extend_from_slice(xfer_id);
+    crypto::derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, 0)
 }
 
 /// Total blocks a file of `size` bytes is cut into.
@@ -2950,6 +4173,63 @@ pub fn remember_gossip_id(
     true
 }
 
+const GOSSIP_BODY_KEY_DOMAIN: &[u8] = b"ember-channel-gossip-body-v1\0";
+
+/// Dedup key for one exact sealed frame, as opposed to its id.
+///
+/// Kept in the same seen-set as ids; the domain keeps the two from colliding.
+pub fn gossip_body_key(gossip: &ChannelGossip) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(GOSSIP_BODY_KEY_DOMAIN);
+    hasher.update(&gossip.channel_id);
+    hasher.update(&gossip.msg_id);
+    hasher.update(&gossip.timestamp.to_le_bytes());
+    hasher.update(&gossip.sender_counter.to_le_bytes());
+    hasher.update(&gossip.ciphertext);
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    key
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GossipAdmission {
+    /// First frame under this id.
+    Fresh,
+    /// The id was seen, but with a different body. A chat line's id is chosen
+    /// by whoever sends first, so a member can sign their own line under
+    /// somebody else's id and race it out; were the id alone the dedup key, the
+    /// genuine line would be dropped here before storage could tell the two
+    /// apart. Callers must treat these as chat-only and must not relay one
+    /// they already hold, or the originator's own echo floods again.
+    Variant,
+    /// This exact frame was seen.
+    Duplicate,
+}
+
+/// Flood dedup on id first, exact body second.
+///
+/// A fresh id also records its body key, so a byte-identical replay is a
+/// [`GossipAdmission::Duplicate`] rather than a variant. [`forget_gossip_id`]
+/// on the id alone still re-admits a retransmit: a fresh id never consults
+/// the body key.
+pub fn admit_gossip(
+    seen: &mut HashMap<[u8; 16], Instant>,
+    order: &mut VecDeque<[u8; 16]>,
+    cap: usize,
+    msg_id: [u8; 16],
+    body_key: [u8; 16],
+    now: Instant,
+) -> GossipAdmission {
+    if remember_gossip_id(seen, order, cap, msg_id, now) {
+        let _ = remember_gossip_id(seen, order, cap, body_key, now);
+        GossipAdmission::Fresh
+    } else if remember_gossip_id(seen, order, cap, body_key, now) {
+        GossipAdmission::Variant
+    } else {
+        GossipAdmission::Duplicate
+    }
+}
+
 /// Undo a [`remember_gossip_id`] for a message refused on grounds that may not
 /// hold next time — a rate limit rather than a validity failure.
 ///
@@ -3196,6 +4476,75 @@ mod tests {
     }
 
     #[test]
+    fn a_different_body_under_a_seen_channel_id_is_admitted_once_as_a_variant() {
+        let key = [7u8; 32];
+        let id = new_chat_msg_id(&CHAT_CHANNEL, &[0xA1u8; 32], CHAT_TS);
+        let squat = ChannelGossip::sealed(CHAT_CHANNEL, id, &key, 1, b"mallory", 4, CHAT_TS);
+        let genuine = ChannelGossip::sealed(CHAT_CHANNEL, id, &key, 1, b"alice", 4, CHAT_TS);
+        let mut seen: HashMap<[u8; 16], Instant> = HashMap::new();
+        let mut order: VecDeque<[u8; 16]> = VecDeque::new();
+        let now = Instant::now();
+        let admit = |g: &ChannelGossip,
+                     seen: &mut HashMap<[u8; 16], Instant>,
+                     order: &mut VecDeque<[u8; 16]>| {
+            admit_gossip(seen, order, 64, g.msg_id, gossip_body_key(g), now)
+        };
+
+        assert_eq!(admit(&squat, &mut seen, &mut order), GossipAdmission::Fresh);
+        // A relayed copy differs only in its hop count, which is outside the key.
+        let relayed = squat.decremented_ttl().unwrap();
+        assert_eq!(admit(&relayed, &mut seen, &mut order), GossipAdmission::Duplicate);
+        assert_eq!(
+            admit(&genuine, &mut seen, &mut order),
+            GossipAdmission::Variant,
+            "the genuine line must reach storage even when a squatter's frame came first"
+        );
+        assert_eq!(admit(&genuine, &mut seen, &mut order), GossipAdmission::Duplicate);
+
+        // Forgetting the id alone still re-admits a retransmit of the original.
+        forget_gossip_id(&mut seen, &mut order, &id);
+        assert_eq!(admit(&squat, &mut seen, &mut order), GossipAdmission::Fresh);
+    }
+
+    #[test]
+    fn a_chat_msg_id_binds_only_its_author_room_and_timestamp() {
+        let alice = [0xA1u8; 32];
+        let mallory = [0x3Cu8; 32];
+        let id = new_chat_msg_id(&CHAT_CHANNEL, &alice, CHAT_TS);
+        assert!(chat_msg_id_binds(&CHAT_CHANNEL, &id, &alice, CHAT_TS));
+        assert!(
+            !chat_msg_id_binds(&CHAT_CHANNEL, &id, &mallory, CHAT_TS),
+            "an edit signed by someone else must not be able to claim the line"
+        );
+        assert!(!chat_msg_id_binds(&[9u8; 16], &id, &alice, CHAT_TS));
+        assert!(
+            !chat_msg_id_binds(&CHAT_CHANNEL, &id, &alice, CHAT_TS + 60),
+            "a re-dated original would reopen the edit window"
+        );
+        // Ids minted before the binding are random and bind to nobody.
+        assert!(!chat_msg_id_binds(&CHAT_CHANNEL, &CHAT_MSG_ID, &alice, CHAT_TS));
+
+        assert!(chat_msg_id_binds_hex(
+            &hex::encode(CHAT_CHANNEL),
+            &hex::encode(id),
+            &hex::encode(alice).to_ascii_uppercase(),
+            CHAT_TS,
+        ));
+        assert!(!chat_msg_id_binds_hex(
+            &hex::encode(CHAT_CHANNEL),
+            "handoff-x-1",
+            &hex::encode(alice),
+            CHAT_TS,
+        ));
+
+        // Same author, same second: still distinct lines.
+        let ids: HashSet<[u8; 16]> = (0..256)
+            .map(|_| new_chat_msg_id(&CHAT_CHANNEL, &alice, CHAT_TS))
+            .collect();
+        assert_eq!(ids.len(), 256);
+    }
+
+    #[test]
     fn an_edit_round_trips_and_is_bound_to_its_author_room_and_target() {
         let alice = SigningKey::generate(&mut rand::rngs::OsRng);
         let bob = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -3241,6 +4590,162 @@ mod tests {
                 "byte {byte} is inside the signed preimage and must not be malleable"
             );
         }
+    }
+
+    const PARENT: [u8; 16] = [
+        0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71, 0x82, 0x93, 0xa4, 0xb5, 0xc6, 0xd7, 0xe8,
+        0xf9,
+    ];
+
+    #[test]
+    fn a_reply_trailer_round_trips_and_a_plain_line_is_untouched() {
+        assert_eq!(with_reply_trailer("hello", None), "hello");
+        assert_eq!(split_reply_trailer("hello"), ("hello", None));
+
+        let wire = with_reply_trailer("hello\nworld", Some(&PARENT));
+        assert_eq!(wire.chars().count(), "hello\nworld".chars().count() + REPLY_TRAILER_CHARS);
+        assert_eq!(wire.len(), "hello\nworld".len() + REPLY_TRAILER_BYTES);
+        assert_eq!(split_reply_trailer(&wire), ("hello\nworld", Some(PARENT)));
+        assert_eq!(chat_display_text(&wire), "hello\nworld");
+        // Every character added is a default-ignorable tag character, which is
+        // what makes the trailer draw as nothing on a build that ignores it.
+        assert!(wire[..].strip_prefix("hello\nworld").unwrap().chars().all(|c| {
+            ('\u{E0000}'..='\u{E0FFF}').contains(&c)
+        }));
+
+        assert_eq!(
+            chat_reply_parent_hex(&wire, &hex::encode(CHAT_MSG_ID)),
+            Some(hex::encode(PARENT))
+        );
+        assert_eq!(
+            chat_reply_parent_hex(&wire, &hex::encode(PARENT).to_ascii_uppercase()),
+            None,
+            "a line naming itself as its parent is not a reply"
+        );
+        assert_eq!(chat_reply_parent_hex("hello", "00"), None);
+    }
+
+    #[test]
+    fn only_the_exact_trailer_form_is_read_as_a_reply() {
+        let wire = with_reply_trailer("hi", Some(&PARENT));
+
+        // Nothing to reply with: left alone, as the invisible text it is.
+        let bare = with_reply_trailer("", Some(&PARENT));
+        assert_eq!(split_reply_trailer(&bare), (bare.as_str(), None));
+
+        // Upper-case tag digits would not re-encode to the same bytes.
+        let upper: String = wire
+            .chars()
+            .map(|c| match c as u32 {
+                x @ 0xE0061..=0xE0066 => char::from_u32(x - 0x20).unwrap(),
+                _ => c,
+            })
+            .collect();
+        assert_ne!(upper, wire);
+        assert_eq!(split_reply_trailer(&upper).1, None);
+
+        // One digit short, a trailer mid-text, and a flag's tag sequence.
+        let mut short = wire.clone();
+        short.pop();
+        assert_eq!(split_reply_trailer(&short).1, None);
+        let buried = format!("{wire} and more");
+        assert_eq!(split_reply_trailer(&buried).1, None);
+        let flag = "go \u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}";
+        assert_eq!(split_reply_trailer(flag), (flag, None));
+        let flag_reply = with_reply_trailer(flag, Some(&PARENT));
+        assert_eq!(split_reply_trailer(&flag_reply), (flag, Some(PARENT)));
+
+        // Pasted trailers go, however many; the body before them stays.
+        let doubled = with_reply_trailer(&wire, Some(&[7u8; 16]));
+        assert_eq!(split_reply_trailer(&doubled), (wire.as_str(), Some([7u8; 16])));
+        assert_eq!(strip_reply_trailers(&doubled), "hi");
+        assert_eq!(strip_reply_trailers("plain"), "plain");
+    }
+
+    /// The compatibility claim, checked against the decoder a v1.6 build runs.
+    ///
+    /// `decode_channel_chat_plain` and `sanitize_chat_text` are byte-for-byte
+    /// what v1.6.0 through v1.6.7 shipped, so this is the old receive path, not a
+    /// model of it: the line verifies, sanitising leaves it unchanged (so the
+    /// signature is kept and the line is re-served), it fits the 4096-byte cap
+    /// the old receiver checks, and the text it hands on is the body plus
+    /// characters that draw as nothing.
+    #[test]
+    fn a_reply_verifies_and_survives_the_v1_6_receive_path_unchanged() {
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let body = "x".repeat(4096 - REPLY_TRAILER_BYTES);
+        let wire = with_reply_trailer(&body, Some(&PARENT));
+        assert_eq!(wire.len(), 4096, "the longest reply a sender allows fits the old cap");
+
+        let frame = chat_frame(&alice, &wire);
+        let (pk, text, _sig) =
+            decode_channel_chat_plain(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS)
+                .expect("an old build must accept a reply as an ordinary signed line");
+        assert_eq!(pk, alice.verifying_key().to_bytes());
+        assert_eq!(text, wire);
+        let cleaned = crate::security::sanitize_chat_text(&text);
+        assert_eq!(cleaned, text, "sanitising must not touch the trailer, or the signature is dropped");
+        assert!(!cleaned.is_empty() && cleaned.len() <= 4096);
+        assert_eq!(split_reply_trailer(&text), (body.as_str(), Some(PARENT)));
+    }
+
+    #[test]
+    fn the_authors_signature_covers_the_reply_reference() {
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let wire = with_reply_trailer("agreed", Some(&PARENT));
+        let frame = chat_frame(&alice, &wire);
+        assert!(decode_channel_chat_plain(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_some());
+
+        // Retargeted at another line, and stripped back to a plain line, by a
+        // relay that holds the room key but not the author's signing key.
+        let sig: [u8; 64] = frame[33..97].try_into().unwrap();
+        let pk = alice.verifying_key().to_bytes();
+        let retargeted = encode_channel_chat_plain_presigned(
+            &pk,
+            &sig,
+            &with_reply_trailer("agreed", Some(&[0xEEu8; 16])),
+        );
+        let stripped = encode_channel_chat_plain_presigned(&pk, &sig, "agreed");
+        for forged in [retargeted, stripped] {
+            assert!(
+                decode_channel_chat_plain(&forged, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none(),
+                "the parent a line answers is part of what its author signed"
+            );
+        }
+        // Any single byte of the trailer.
+        for at in (frame.len() - REPLY_TRAILER_BYTES)..frame.len() {
+            let mut tampered = frame.clone();
+            tampered[at] ^= 0x01;
+            assert!(
+                decode_channel_chat_plain(&tampered, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS)
+                    .is_none(),
+                "trailer byte {at} must not be malleable"
+            );
+        }
+    }
+
+    #[test]
+    fn an_edit_of_a_reply_carries_the_same_signed_reference() {
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let revised = with_reply_trailer("agreed, mostly", Some(&PARENT));
+        let frame = edit_frame(&alice, &revised, CHAT_TS + 30);
+        let edit = decode_channel_chat_edit(&frame, &CHAT_CHANNEL).unwrap();
+        assert_eq!(split_reply_trailer(&edit.text), ("agreed, mostly", Some(PARENT)));
+        assert_eq!(crate::security::sanitize_chat_text(&edit.text), edit.text);
+
+        let pk = alice.verifying_key().to_bytes();
+        let stripped = encode_channel_chat_edit_presigned(
+            &pk,
+            &CHAT_MSG_ID,
+            CHAT_TS,
+            CHAT_TS + 30,
+            &edit.signature,
+            "agreed, mostly",
+        );
+        assert!(
+            decode_channel_chat_edit(&stripped, &CHAT_CHANNEL).is_none(),
+            "an edit's reference is signed too, so a relay cannot detach the quote"
+        );
     }
 
     #[test]
@@ -3313,6 +4818,54 @@ mod tests {
         let frame = encode_channel_reactions(std::slice::from_ref(&future));
         let decoded = decode_channel_reactions(&frame, &CHAT_CHANNEL).unwrap();
         assert_eq!(decoded, vec![future]);
+    }
+
+    #[test]
+    fn every_curated_reaction_round_trips_in_the_frame_v1_6_parses() {
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let entries: Vec<ChannelReaction> = (REACTION_UP..=REACTION_CURATED_MAX)
+            .map(|code| {
+                let mut target = CHAT_MSG_ID;
+                target[0] = code;
+                reaction_entry(&alice, target, code, CHAT_TS + i64::from(code))
+            })
+            .collect();
+        assert!(entries.len() <= CHANNEL_REACTION_MAX_PER_FRAME);
+        let frame = encode_channel_reactions(&entries);
+        // The layout v1.6.x decodes: same version byte, same 121-byte entry,
+        // the code a single byte in the same place. A richer set that needed a
+        // wider field would have been a new frame those builds drop whole.
+        assert_eq!(frame[0], 20);
+        assert_eq!(REACTION_ENTRY_LEN, 121);
+        assert_eq!(frame.len(), 2 + entries.len() * 121);
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(frame[2 + i * REACTION_ENTRY_LEN + 48], entry.reaction);
+        }
+        let decoded = decode_channel_reactions(&frame, &CHAT_CHANNEL).unwrap();
+        assert_eq!(decoded, entries);
+    }
+
+    #[test]
+    fn a_curated_code_is_bound_by_the_signature() {
+        // Relabelling 🎉 as 👍 in transit must not survive: the code is what
+        // old builds count, so a hop rewriting it would put words in a
+        // member's mouth on exactly the builds that cannot see the original.
+        let alice = SigningKey::generate(&mut rand::rngs::OsRng);
+        let entry = reaction_entry(&alice, CHAT_MSG_ID, 8, CHAT_TS + 1);
+        let mut frame = encode_channel_reactions(std::slice::from_ref(&entry));
+        frame[2 + 48] = REACTION_UP;
+        assert_eq!(decode_channel_reactions(&frame, &CHAT_CHANNEL), Some(Vec::new()));
+    }
+
+    #[test]
+    fn the_curated_range_starts_after_none_and_stops_at_the_last_shipped_code() {
+        assert!(!reaction_is_curated(REACTION_NONE));
+        for code in [REACTION_UP, REACTION_DOWN, REACTION_HEART] {
+            assert!(reaction_is_curated(code), "{code} must keep its v1.6 meaning");
+        }
+        assert!(reaction_is_curated(REACTION_CURATED_MAX));
+        assert!(!reaction_is_curated(REACTION_CURATED_MAX + 1));
+        assert!(!reaction_is_curated(u8::MAX));
     }
 
     #[test]
@@ -3510,14 +5063,93 @@ mod tests {
     }
 
     #[test]
+    fn a_line_under_a_retired_key_is_read_but_admits_nobody() {
+        let channel_id = [0x42u8; 16];
+        let current = content_key(&[0x01u8; 32]);
+        let retired = content_key(&[0x02u8; 32]);
+        let legacy = content_key(&[0x03u8; 32]);
+        let keys = [current, retired, legacy];
+        let open = |sealed_with: &[u8; 32]| {
+            let gossip = ChannelGossip::new_plaintext(channel_id, sealed_with, 1, b"hi", 1);
+            open_with_content_keys(&keys, |candidate| gossip.decrypt(candidate))
+        };
+
+        let (plain, opened) = open(&current).expect("current key opens");
+        assert_eq!(plain, b"hi");
+        assert_eq!(opened, OpenedUnder::Current);
+        for old in [retired, legacy] {
+            let (plain, opened) = open(&old).expect(
+                "a retired key still reads, or in-flight traffic is lost across a rotation",
+            );
+            assert_eq!(plain, b"hi");
+            assert_eq!(opened, OpenedUnder::Retired);
+            assert!(
+                !chat_author_joins_gossip_roster(true, opened, CHANNEL_MSG_TTL_DEFAULT),
+                "an evicted member holds every retired key; a line under one \
+                 must not put a fresh identity on the roster"
+            );
+        }
+        assert!(
+            !chat_author_joins_gossip_roster(true, OpenedUnder::Current, 1),
+            "a catch-up re-serve is sealed by the responder, not the author, so \
+             its current-key seal says nothing about who wrote the line"
+        );
+        assert!(open(&content_key(&[0x04u8; 32])).is_none());
+        assert!(open_with_content_keys::<()>(&[], |_| Some(())).is_none());
+    }
+
+    #[test]
+    fn a_nominee_tolerates_owner_clock_skew_but_not_a_stale_offer() {
+        let now = 1_800_000_000i64;
+        assert!(handoff_offer_live_at_target(now as u64, now));
+        assert!(
+            handoff_offer_live_at_target((now + 60) as u64, now),
+            "an owner a minute fast still gets an answer"
+        );
+        assert!(!handoff_offer_live_at_target(
+            (now + CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS + 1) as u64,
+            now
+        ));
+        assert!(!handoff_offer_live_at_target(
+            (now - HANDOFF_PENDING_TTL_SECS) as u64,
+            now
+        ));
+        assert!(
+            !handoff_offer_live_at_target(
+                (now - HANDOFF_PENDING_TTL_SECS + CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS) as u64,
+                now
+            ),
+            "the nominee's window closes early by the skew, never late"
+        );
+        assert!(!handoff_offer_live_at_target(u64::MAX, now));
+        assert!(!handoff_offer_live_at_target(1, now));
+    }
+
+    #[test]
+    fn unreachable_catch_up_neighbors_back_off_to_the_idle_interval() {
+        assert_eq!(history_sync_retry_secs(0), 0);
+        assert_eq!(history_sync_retry_secs(1), CHANNEL_HISTORY_SYNC_RETRY_BASE_SECS);
+        assert_eq!(history_sync_retry_secs(2), CHANNEL_HISTORY_SYNC_RETRY_BASE_SECS * 2);
+        assert_eq!(history_sync_retry_secs(3), CHANNEL_HISTORY_SYNC_RETRY_BASE_SECS * 4);
+        let mut last = 0;
+        for failures in 1..64 {
+            let wait = history_sync_retry_secs(failures);
+            assert!(wait >= last, "backoff never shrinks while failures grow");
+            assert!(wait <= CHANNEL_HISTORY_SYNC_SECS);
+            last = wait;
+        }
+        assert_eq!(history_sync_retry_secs(u32::MAX), CHANNEL_HISTORY_SYNC_SECS);
+    }
+
+    #[test]
     fn a_public_chat_line_does_not_insert_a_stranger_into_the_neighbor_set() {
         assert!(
-            !chat_author_joins_gossip_roster(false),
+            !chat_author_joins_gossip_roster(false, OpenedUnder::Current, CHANNEL_MSG_TTL_DEFAULT),
             "public rooms take neighbors from presence, not from chat authors"
         );
         assert!(
-            chat_author_joins_gossip_roster(true),
-            "a private chat line is already evidence of membership"
+            chat_author_joins_gossip_roster(true, OpenedUnder::Current, CHANNEL_MSG_TTL_DEFAULT),
+            "a live private chat line is already evidence of membership"
         );
 
         let self_pk = [1u8; 32];
@@ -4568,6 +6200,137 @@ mod tests {
     }
 
     #[test]
+    fn a_handoff_offer_is_live_only_inside_its_window() {
+        let offered = 1_700_000_000u64;
+        let at = offered as i64;
+        assert!(handoff_offer_live(offered, at));
+        assert!(handoff_offer_live(offered, at + HANDOFF_PENDING_TTL_SECS - 1));
+        assert!(!handoff_offer_live(offered, at + HANDOFF_PENDING_TTL_SECS));
+        // A clock that ran backwards must not keep an offer open forever.
+        assert!(!handoff_offer_live(offered, at - 1));
+        assert!(!handoff_offer_live(u64::MAX, at));
+    }
+
+    /// A ready is carried across the room only for the offer the owner signed,
+    /// from the member it named, while it lives — under whichever key.
+    #[test]
+    fn only_a_ready_answering_a_known_live_offer_is_relayed() {
+        let room = [0x31u8; 16];
+        let (nominee, other) = ([0xA1u8; 32], [0xB2u8; 32]);
+        let offered = 1_700_000_000u64;
+        let now = offered as i64 + 10;
+        let mut seen = HandoffOffersSeen::default();
+        assert!(!seen.names(&room, &nominee, offered), "nothing seen yet");
+        seen.note(room, nominee, offered, now);
+        assert!(seen.names(&room, &nominee, offered));
+        assert!(!seen.names(&room, &other, offered), "a ready naming itself");
+        assert!(!seen.names(&room, &nominee, offered + 1), "for an offer never made");
+        assert!(!seen.names(&[0x32; 16], &nominee, offered), "in another room");
+
+        // A later offer replaces it; an older one arriving late does not.
+        seen.note(room, other, offered + 5, now);
+        seen.note(room, nominee, offered, now);
+        assert!(seen.names(&room, &other, offered + 5));
+        assert!(!seen.names(&room, &nominee, offered));
+
+        assert!(handoff_ready_may_relay(false, true, offered, now));
+        assert!(!handoff_ready_may_relay(true, true, offered, now), "banned sender");
+        assert!(!handoff_ready_may_relay(false, false, offered, now), "unknown offer");
+        assert!(
+            !handoff_ready_may_relay(false, true, offered, now + HANDOFF_PENDING_TTL_SECS),
+            "lapsed offer"
+        );
+    }
+
+    #[test]
+    fn remembered_handoff_offers_are_bounded_and_forget_lapsed_ones() {
+        let offered = 1_700_000_000u64;
+        let now = offered as i64;
+        let mut seen = HandoffOffersSeen::default();
+        for i in 0..HANDOFF_OFFERS_SEEN_CAP + 8 {
+            let mut room = [0u8; 16];
+            room[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            seen.note(room, [1; 32], offered + i as u64, now);
+        }
+        assert_eq!(seen.offers.len(), HANDOFF_OFFERS_SEEN_CAP);
+        assert!(!seen.names(&[0u8; 16], &[1; 32], offered), "the oldest made way");
+        seen.note([0xEE; 16], [2; 32], offered, now + HANDOFF_PENDING_TTL_SECS * 2);
+        assert_eq!(seen.offers.len(), 1, "lapsed offers are dropped");
+    }
+
+    /// Only the member a room friend request was made out to recognises it,
+    /// and no two requests carry a tag the relaying members could match up.
+    #[test]
+    fn a_room_friend_request_is_recognised_only_by_its_recipient() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let bob = SigningKey::generate(&mut OsRng);
+        let carol = SigningKey::generate(&mut OsRng);
+        let alice_pk = alice.verifying_key().to_bytes();
+        let bob_pk = bob.verifying_key().to_bytes();
+        let room = [0x44u8; 16];
+        let (msg, other_msg) = ([1u8; 16], [2u8; 16]);
+        let tag = room_friend_request_tag(&alice.to_bytes(), &bob_pk, &room, &msg).unwrap();
+
+        assert!(room_friend_request_is_for(&bob.to_bytes(), &alice_pk, &room, &msg, &tag));
+        assert!(!room_friend_request_is_for(&carol.to_bytes(), &alice_pk, &room, &msg, &tag));
+        assert!(!room_friend_request_is_for(&alice.to_bytes(), &alice_pk, &room, &msg, &tag));
+        assert!(!room_friend_request_is_for(&bob.to_bytes(), &alice_pk, &[0x45; 16], &msg, &tag));
+        assert_ne!(
+            room_friend_request_tag(&alice.to_bytes(), &bob_pk, &room, &other_msg).unwrap(),
+            tag,
+            "a second request to the same member carries a different tag"
+        );
+    }
+
+    #[test]
+    fn a_room_friend_request_is_signed_by_its_sender_for_its_envelope() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let alice_pk = alice.verifying_key().to_bytes();
+        let tag = [9u8; 16];
+        let (room, msg) = (CHAT_CHANNEL, CHAT_MSG_ID);
+        let frame = encode_room_friend_request(&alice, &alice_pk, &tag, &room, &msg, CHAT_TS);
+        let decode = |bytes: &[u8], channel: &[u8; 16], msg: &[u8; 16], ts: i64| {
+            decode_room_friend_request(bytes, channel, msg, ts)
+        };
+        assert_eq!(decode(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS), Some((alice_pk, tag)));
+        assert!(decode(&frame, &[0u8; 16], &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode(&frame, &CHAT_CHANNEL, &[0u8; 16], CHAT_TS).is_none());
+        assert!(decode(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS + 1).is_none());
+
+        let mut impostor = frame.clone();
+        let stranger = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        impostor[1..33].copy_from_slice(&stranger);
+        assert!(decode(&impostor, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        let mut retargeted = frame.clone();
+        retargeted[33] ^= 1;
+        assert!(decode(&retargeted, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+
+        // No other decoder in the dispatch reads it as its own.
+        assert!(xfer_frame_peek(&frame).is_none());
+        assert!(decode_channel_typing(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_channel_chat_plain(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_channel_handoff_ready(&frame, &CHAT_CHANNEL).is_none());
+
+        let now = CHAT_TS;
+        assert!(room_friend_request_fresh(now, now));
+        assert!(room_friend_request_fresh(now - ROOM_FRIEND_REQUEST_MAX_AGE_SECS, now));
+        assert!(!room_friend_request_fresh(now - ROOM_FRIEND_REQUEST_MAX_AGE_SECS - 1, now));
+        assert!(!room_friend_request_fresh(now + CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS + 1, now));
+    }
+
+    #[test]
+    fn only_catch_up_shaped_lines_put_a_room_on_the_walk_interval() {
+        assert!(gossip_is_catch_up_shaped(1));
+        assert!(gossip_is_catch_up_shaped(0));
+        assert!(!gossip_is_catch_up_shaped(CHANNEL_MSG_TTL_DEFAULT));
+        assert!(!gossip_is_catch_up_shaped(2));
+
+        assert!(!history_sync_walking(None, 10), "no ask recorded means no walk");
+        assert!(!history_sync_walking(Some(4), 4), "nothing landed since the ask");
+        assert!(history_sync_walking(Some(4), 5));
+    }
+
+    #[test]
     fn handoff_ready_requires_the_nominees_user_key() {
         let nominee = SigningKey::generate(&mut OsRng);
         let nominee_pk = nominee.verifying_key().to_bytes();
@@ -4690,6 +6453,130 @@ mod tests {
             root: *blake3::hash(b"hello").as_bytes(),
             name: "note.txt".into(),
         }
+    }
+
+    fn quic_only(quic: u16) -> XferStreamPorts {
+        XferStreamPorts { quic, tcp: None, public_ip: None }
+    }
+
+    #[test]
+    fn xfer_stream_frame_round_trips_and_is_routed_as_a_transfer() {
+        let (s, t, id) = ([1u8; 32], [2u8; 32], [3u8; 16]);
+        let both = XferStreamPorts { quic: 4662, tcp: Some(4661), public_ip: None };
+        let addressed = XferStreamPorts {
+            quic: 4662,
+            tcp: Some(4661),
+            public_ip: Some(std::net::Ipv4Addr::new(203, 0, 113, 7)),
+        };
+        let address_only = XferStreamPorts {
+            quic: 4662,
+            tcp: None,
+            public_ip: Some(std::net::Ipv4Addr::new(203, 0, 113, 8)),
+        };
+        for role in [XferStreamRole::Serve, XferStreamRole::Fetch] {
+            for ports in [quic_only(4662), both, addressed, address_only] {
+                let frame = encode_xfer_stream(&K, &s, &t, &id, role, ports);
+                assert_eq!(xfer_frame_peek(&frame), Some((s, t, id)));
+                assert_eq!(decode_xfer_stream(&K, &opened(&frame)), Some((s, t, id, role, ports)));
+            }
+        }
+        // Fields past the address are a later build's business, not a refusal.
+        let mut body =
+            opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, addressed));
+        body.extend_from_slice(&[0xEE; 12]);
+        assert_eq!(
+            decode_xfer_stream(&K, &body),
+            Some((s, t, id, XferStreamRole::Serve, addressed))
+        );
+        // A zero TCP port is no port, on either side of the wire.
+        let zero_tcp = XferStreamPorts { quic: 9, tcp: Some(0), public_ip: None };
+        let body = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, zero_tcp));
+        assert_eq!(decode_xfer_stream(&K, &body).map(|f| f.4), Some(quic_only(9)));
+    }
+
+    #[test]
+    fn xfer_stream_frame_refuses_a_zero_port_an_unknown_role_or_a_short_body() {
+        let (s, t, id) = ([1u8; 32], [2u8; 32], [3u8; 16]);
+        let zero = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, quic_only(0)));
+        assert!(decode_xfer_stream(&K, &zero).is_none());
+        // The role sits under the keystream; flipping Fetch (2) to 3 there.
+        let mut role =
+            opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, quic_only(80)));
+        role[XFER_HEADER_LEN + XFER_SEAL_NONCE_LEN] ^= 2 ^ 3;
+        assert!(decode_xfer_stream(&K, &role).is_none());
+        let full = opened(&encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Fetch, quic_only(80)));
+        assert!(decode_xfer_stream(&K, &full[..full.len() - 1]).is_none());
+        // Nor is any other transfer frame read as one.
+        let reply = opened(&encode_xfer_reply(&K, &s, &t, &id, XferReply::Accept));
+        assert!(decode_xfer_stream(&K, &reply).is_none());
+    }
+
+    /// A member the frame is forwarded through can open the gossip envelope,
+    /// and must find neither the ports nor the address under it — nor tell two
+    /// frames with the same content apart as the same.
+    #[test]
+    fn xfer_stream_frame_hides_its_ports_and_address() {
+        let (s, t, id) = ([1u8; 32], [2u8; 32], [3u8; 16]);
+        let ports = XferStreamPorts {
+            quic: 0xBEEF,
+            tcp: Some(0xCAFE),
+            public_ip: Some(std::net::Ipv4Addr::new(198, 51, 100, 77)),
+        };
+        let a = encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, ports);
+        let b = encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, ports);
+        assert_ne!(a, b, "a fresh nonce each time");
+        let clear = [1, 0xEF, 0xBE, 0xFE, 0xCA, 198, 51, 100, 77];
+        for frame in [&a, &b] {
+            let body = &frame[XFER_HEADER_LEN..frame.len() - XFER_MAC_LEN];
+            assert!(!body.windows(4).any(|w| w == [198, 51, 100, 77]));
+            assert_ne!(&body[XFER_SEAL_NONCE_LEN..], &clear[..]);
+        }
+        // Someone without the pairwise key reads nothing sensible either.
+        let other = [0x99u8; 32];
+        assert_ne!(decode_xfer_stream(&other, &opened(&a)).map(|f| f.4), Some(ports));
+    }
+
+    #[test]
+    fn the_stream_capability_is_pairwise_and_not_the_frame_key() {
+        let a = ChannelIdentity::generate();
+        let b = ChannelIdentity::generate();
+        let (room, xfer) = ([0x41u8; 16], [0x42u8; 16]);
+        let a_seed = a.signing_key.to_bytes();
+        let b_seed = b.signing_key.to_bytes();
+        let from_a = derive_xfer_stream_capability(&a_seed, &b.pubkey, &room, &xfer).unwrap();
+        let from_b = derive_xfer_stream_capability(&b_seed, &a.pubkey, &room, &xfer).unwrap();
+        assert_eq!(from_a, from_b);
+        assert_ne!(from_a, derive_xfer_key(&a_seed, &b.pubkey, &room, &xfer).unwrap());
+        assert_ne!(
+            from_a,
+            derive_xfer_stream_capability(&a_seed, &b.pubkey, &room, &[0x43u8; 16]).unwrap()
+        );
+    }
+
+    /// A sealed offer reads back as the same offer, passes the same bounds,
+    /// hides the name and size from anyone without the pairwise key, and is
+    /// never mistaken for a plain one or the reverse.
+    #[test]
+    fn a_sealed_offer_round_trips_and_hides_its_name_and_size() {
+        let offer = XferOffer { name: "holiday-photos.zip".into(), size: 123_456_789, ..sample_offer() };
+        let frame = encode_xfer_offer_sealed(&K, &offer);
+        assert_eq!(xfer_frame_peek(&frame), Some((offer.sender, offer.target, offer.xfer_id)));
+        assert_eq!(decode_xfer_offer_sealed(&K, &opened(&frame)), Some(offer.clone()));
+        assert_ne!(frame, encode_xfer_offer_sealed(&K, &offer), "a fresh nonce each time");
+
+        let body = &frame[XFER_HEADER_LEN..frame.len() - XFER_MAC_LEN];
+        assert!(!body.windows(offer.name.len()).any(|w| w == offer.name.as_bytes()));
+        assert!(!body.windows(8).any(|w| w == offer.size.to_le_bytes()));
+        assert!(!body.windows(32).any(|w| w == offer.root));
+
+        assert!(decode_xfer_offer_sealed(&[0x99u8; 32], &opened(&frame)).is_none_or(|o| o != offer));
+        assert!(decode_xfer_offer(&opened(&frame)).is_none());
+        assert!(decode_xfer_offer_sealed(&K, &opened(&encode_xfer_offer(&K, &offer))).is_none());
+
+        let too_big = XferOffer { size: XFER_MAX_BYTES + 1, ..sample_offer() };
+        assert!(decode_xfer_offer_sealed(&K, &opened(&encode_xfer_offer_sealed(&K, &too_big))).is_none());
+        let empty = XferOffer { name: String::new(), ..sample_offer() };
+        assert!(decode_xfer_offer_sealed(&K, &opened(&encode_xfer_offer_sealed(&K, &empty))).is_none());
     }
 
     #[test]
@@ -4957,15 +6844,164 @@ mod tests {
     #[test]
     fn a_full_presence_digest_fits_one_unfragmented_datagram() {
         let budget = crate::network::ember::dht::messages::MAX_UNFRAGMENTED_PAYLOAD;
-        let framed = 2
-            + PRESENCE_BEACON_BATCH_MAX * PRESENCE_BEACON_ENTRY_LEN
-            + GOSSIP_HEADER_LEN
-            + GOSSIP_ENVELOPE_OVERHEAD
-            + CHANNEL_RELAY_ENVELOPE_HEADER;
+        let around = GOSSIP_HEADER_LEN + GOSSIP_ENVELOPE_OVERHEAD + CHANNEL_RELAY_ENVELOPE_HEADER;
+        let framed = 2 + PRESENCE_BEACON_BATCH_MAX * PRESENCE_BEACON_ENTRY_LEN + around;
         assert!(
             framed <= budget,
             "a full digest is {framed} bytes, over the {budget}-byte unfragmented budget — \
              lower PRESENCE_BEACON_BATCH_MAX rather than letting digests fragment"
+        );
+        let proven = 2
+            + PRESENCE_BEACON_PROVEN_BATCH_MAX
+                * (PRESENCE_BEACON_ENTRY_LEN + PRESENCE_BEACON_PROOF_LEN)
+            + around;
+        assert!(
+            proven <= budget,
+            "a full digest with key proofs is {proven} bytes, over the {budget}-byte budget — \
+             lower PRESENCE_BEACON_PROVEN_BATCH_MAX"
+        );
+
+        let room = [0x11u8; 16];
+        let key = content_key(&[0x33u8; 32]);
+        let many: Vec<PresenceBeacon> = (0..PRESENCE_BEACON_BATCH_MAX as u8)
+            .map(|seed| test_beacon(seed + 1, &room, 0, 1_700_000_000).1.with_key_proof(&room, &key))
+            .collect();
+        assert_eq!(
+            encode_channel_presence_beacons(&many).len(),
+            proven - around,
+            "the encoder must hold a proven digest to the smaller batch"
+        );
+    }
+
+    /// The eviction bypass this closes: a member who picked up an evicted
+    /// member's fresh identity while still on the old epoch later relays it
+    /// inside a digest sealed under the new one. The frame's seal is theirs;
+    /// only the proof speaks for the author.
+    #[test]
+    fn only_the_authors_own_proof_of_the_current_key_vouches_for_a_beacon() {
+        let room = [0x11u8; 16];
+        let now = 1_700_000_000;
+        let retired = content_key(&[0x01u8; 32]);
+        let current = content_key(&[0x02u8; 32]);
+
+        let (_, evicted) = test_beacon(7, &room, 3, now);
+        let evicted = evicted.with_key_proof(&room, &retired);
+        let (_, honest) = test_beacon(8, &room, 4, now);
+        let honest = honest.with_key_proof(&room, &current);
+        let (_, legacy) = test_beacon(9, &room, 4, now);
+
+        let frame = encode_channel_presence_beacons(&[honest, evicted, legacy]);
+        let got = decode_channel_presence_beacons(&frame, &room, 4, now).expect("a beacon frame");
+        assert_eq!(got, vec![honest, evicted, legacy], "proofs survive the round trip");
+        assert!(got[0].proves_key(&room, &current));
+        assert!(
+            !got[1].proves_key(&room, &current),
+            "a proof under a retired key is no proof of the current one"
+        );
+        assert!(!got[2].proves_key(&room, &current), "no proof proves nothing");
+
+        let lifted = PresenceBeacon {
+            member: evicted.member,
+            timestamp: evicted.timestamp,
+            departed: evicted.departed,
+            signature: evicted.signature,
+            key_proof: honest.key_proof,
+        };
+        assert!(
+            !lifted.proves_key(&room, &current),
+            "a proof is bound to its own beacon and cannot be moved onto another"
+        );
+        let redated = PresenceBeacon {
+            timestamp: now - 1,
+            ..honest
+        };
+        assert!(!redated.proves_key(&room, &current));
+        assert!(!honest.proves_key(&[0x22u8; 16], &current));
+    }
+
+    /// A build that predates the trailer must still read a proven digest, and
+    /// this build must still read theirs.
+    #[test]
+    fn the_key_proof_trailer_is_invisible_to_older_builds() {
+        let room = [0x11u8; 16];
+        let now = 1_700_000_000;
+        let key = content_key(&[0x02u8; 32]);
+        let (_, a) = test_beacon(1, &room, 0, now);
+        let (_, b) = test_beacon(2, &room, 0, now);
+        let proven = encode_channel_presence_beacons(&[a.with_key_proof(&room, &key), b]);
+        let legacy = encode_channel_presence_beacons(&[a, b]);
+        assert_eq!(
+            &proven[..legacy.len()],
+            legacy.as_slice(),
+            "the entries are laid out exactly as before; only a trailer follows"
+        );
+        let got = decode_channel_presence_beacons(&legacy, &room, 0, now).expect("a beacon frame");
+        assert_eq!(got, vec![a, b]);
+        assert!(got.iter().all(|beacon| beacon.key_proof.is_none()));
+
+        let mut odd = proven.clone();
+        odd.push(0);
+        let got = decode_channel_presence_beacons(&odd, &room, 0, now).expect("a beacon frame");
+        assert_eq!(got.len(), 2, "a trailer of the wrong size is ignored, not fatal");
+        assert!(got.iter().all(|beacon| beacon.key_proof.is_none()));
+    }
+
+    #[test]
+    fn a_relayed_copy_without_its_proof_does_not_displace_the_proven_one() {
+        let room = [0x11u8; 16];
+        let key = content_key(&[0x02u8; 32]);
+        let (pk, plain) = test_beacon(1, &room, 0, 1_700_000_000);
+        let proven = plain.with_key_proof(&room, &key);
+        let mut latest = HashMap::new();
+        keep_latest_beacon(&mut latest, proven);
+        keep_latest_beacon(&mut latest, plain);
+        assert_eq!(latest.get(&pk), Some(&proven));
+        let (_, newer) = test_beacon(1, &room, 0, 1_700_000_001);
+        keep_latest_beacon(&mut latest, newer);
+        assert_eq!(latest.get(&pk), Some(&newer), "a newer beacon still wins");
+    }
+
+    #[test]
+    fn a_committed_handoff_is_republished_on_a_bounded_schedule() {
+        let offered = 1_800_000_000i64;
+        let committed = offered + 30;
+        let version = offered as u64;
+        assert_eq!(
+            handoff_republish_due(version, committed, 0, committed),
+            HandoffRepublish::Publish
+        );
+        assert_eq!(
+            handoff_republish_due(version, committed, committed, committed + 10),
+            HandoffRepublish::Wait
+        );
+        assert_eq!(
+            handoff_republish_due(
+                version,
+                committed,
+                committed,
+                committed + HANDOFF_REPUBLISH_SECS
+            ),
+            HandoffRepublish::Publish
+        );
+        assert_eq!(
+            handoff_republish_due(
+                version,
+                committed,
+                0,
+                committed + HANDOFF_REPUBLISH_WINDOW_SECS
+            ),
+            HandoffRepublish::GiveUp,
+            "attempts are bounded by the window"
+        );
+        assert_eq!(
+            handoff_republish_due(version, offered + HANDOFF_PENDING_TTL_SECS - 1, 0, offered + HANDOFF_PENDING_TTL_SECS),
+            HandoffRepublish::GiveUp,
+            "a re-driven commit still stops when the offer it answers lapses"
+        );
+        assert_eq!(
+            handoff_republish_due(version, committed + 100, 0, committed),
+            HandoffRepublish::GiveUp,
+            "a clock that moved backwards cannot keep a commit publishing forever"
         );
     }
 
@@ -5131,6 +7167,7 @@ mod tests {
             timestamp: now,
             departed: false,
             signature: [0xBBu8; 64],
+            key_proof: None,
         };
         let frame = encode_channel_presence_beacons(&[first, junk, second]);
         let got = decode_channel_presence_beacons(&frame, &room, 0, now).expect("a beacon frame");
@@ -5285,6 +7322,376 @@ mod tests {
                 "the room on screen is the one worth walking more often"
             );
         }
+    }
+
+    fn typing_frame(sk: &SigningKey, typing: bool) -> Vec<u8> {
+        let pk = sk.verifying_key().to_bytes();
+        encode_channel_typing(sk, &pk, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS, typing)
+    }
+
+    #[test]
+    fn a_typing_frame_round_trips_and_names_only_the_member_who_signed_it() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let alice_pk = alice.verifying_key().to_bytes();
+        for typing in [true, false] {
+            let frame = typing_frame(&alice, typing);
+            assert_eq!(frame.len(), TYPING_FRAME_LEN);
+            assert_eq!(
+                decode_channel_typing(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS),
+                Some((alice_pk, typing))
+            );
+        }
+
+        let frame = typing_frame(&alice, true);
+        // Moved into another room, onto another envelope, or re-dated.
+        assert!(decode_channel_typing(&frame, &[9u8; 16], &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_channel_typing(&frame, &CHAT_CHANNEL, &[9u8; 16], CHAT_TS).is_none());
+        assert!(decode_channel_typing(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS + 1).is_none());
+        // Relabelled as somebody else's, by a member who holds the room key but
+        // not that member's signing key.
+        let bob = SigningKey::generate(&mut OsRng);
+        let mut relabelled = frame.clone();
+        relabelled[1..33].copy_from_slice(&bob.verifying_key().to_bytes());
+        assert!(decode_channel_typing(&relabelled, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        let forged = encode_channel_typing(&bob, &alice_pk, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS, true);
+        assert!(decode_channel_typing(&forged, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        // "Stopped" turned into "typing", and a state byte that is neither.
+        let mut flipped = typing_frame(&alice, false);
+        flipped[33] = 1;
+        assert!(decode_channel_typing(&flipped, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        let mut odd = frame.clone();
+        odd[33] = 2;
+        assert!(decode_channel_typing(&odd, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        // Truncated or padded.
+        assert!(decode_channel_typing(&frame[..frame.len() - 1], &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        let mut padded = frame.clone();
+        padded.push(0);
+        assert!(decode_channel_typing(&padded, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+    }
+
+    #[test]
+    fn a_typing_frame_survives_the_room_envelope() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let key = [5u8; 32];
+        let plain = typing_frame(&alice, true);
+        let sealed = ChannelGossip::sealed(
+            CHAT_CHANNEL,
+            CHAT_MSG_ID,
+            &key,
+            CHAT_TS as u64,
+            &plain,
+            CHANNEL_TYPING_TTL,
+            CHAT_TS,
+        );
+        let wire = sealed.encode();
+        let back = ChannelGossip::decode(&wire).expect("the ordinary envelope");
+        assert_eq!(back.decrypt(&key).as_deref(), Some(plain.as_slice()));
+        assert!(back.decrypt(&[6u8; 32]).is_none(), "only room members can read it");
+        assert_eq!(
+            decode_channel_typing(&plain, &back.channel_id, &back.msg_id, back.timestamp),
+            Some((alice.verifying_key().to_bytes(), true))
+        );
+    }
+
+    #[test]
+    fn typing_is_only_believed_for_a_few_seconds_either_side_of_now() {
+        let now = 1_700_000_000;
+        assert!(typing_timestamp_fresh(now, now));
+        assert!(typing_timestamp_fresh(now - CHANNEL_TYPING_MAX_AGE_SECS, now));
+        assert!(!typing_timestamp_fresh(now - CHANNEL_TYPING_MAX_AGE_SECS - 1, now));
+        assert!(typing_timestamp_fresh(now + CHANNEL_TYPING_MAX_FUTURE_SECS, now));
+        assert!(!typing_timestamp_fresh(now + CHANNEL_TYPING_MAX_FUTURE_SECS + 1, now));
+        // Old enough that `gossip_timestamp_ok` would still take it for catch-up.
+        assert!(gossip_timestamp_ok(now - 3600, now));
+        assert!(!typing_timestamp_fresh(now - 3600, now));
+        assert!(!typing_timestamp_fresh(i64::MIN, now));
+        assert!(!typing_timestamp_fresh(i64::MAX, now));
+    }
+
+    #[test]
+    fn a_typing_signal_is_shown_only_for_a_fresh_unbanned_member_under_budget() {
+        let local = [1u8; 32];
+        let ada = [2u8; 32];
+        let now = 1_700_000_000;
+        let charged = std::cell::Cell::new(0);
+        let rate = |ok: bool| {
+            let charged = &charged;
+            move || {
+                charged.set(charged.get() + 1);
+                ok
+            }
+        };
+
+        assert_eq!(admit_channel_typing(&ada, &local, Some(false), now, now, rate(true)), Ok(()));
+        assert_eq!(charged.get(), 1);
+        assert_eq!(
+            admit_channel_typing(&ada, &local, Some(false), now, now, rate(false)),
+            Err(TypingRefusal::RateLimited)
+        );
+        assert_eq!(charged.get(), 2);
+
+        // Refused before the budget is touched, so none of these is charged to
+        // the member they name.
+        charged.set(0);
+        assert_eq!(
+            admit_channel_typing(&local, &local, Some(false), now, now, rate(true)),
+            Err(TypingRefusal::Own)
+        );
+        assert_eq!(
+            admit_channel_typing(&ada, &local, Some(false), now - 60, now, rate(true)),
+            Err(TypingRefusal::Stale)
+        );
+        assert_eq!(
+            admit_channel_typing(&ada, &local, Some(false), now + 60, now, rate(true)),
+            Err(TypingRefusal::Stale)
+        );
+        assert_eq!(
+            admit_channel_typing(&ada, &local, Some(true), now, now, rate(true)),
+            Err(TypingRefusal::NotAMember),
+            "a banned member is not shown typing"
+        );
+        assert_eq!(
+            admit_channel_typing(&ada, &local, None, now, now, rate(true)),
+            Err(TypingRefusal::NotAMember),
+            "a signal introduces nobody"
+        );
+        assert_eq!(charged.get(), 0);
+    }
+
+    #[test]
+    fn typing_is_rate_limited_per_member_per_room_on_its_own_budget() {
+        let room = [1u8; 16];
+        let ada = [2u8; 32];
+        let bo = [3u8; 32];
+        let t0 = Instant::now();
+        let mut seen = HashMap::new();
+        for _ in 0..CHANNEL_TYPING_RECV_PER_WINDOW {
+            assert!(typing_recv_allow(&mut seen, room, &ada, t0));
+        }
+        assert!(!typing_recv_allow(&mut seen, room, &ada, t0));
+        // Somebody else, or the same member elsewhere, is not held back.
+        assert!(typing_recv_allow(&mut seen, room, &bo, t0));
+        assert!(typing_recv_allow(&mut seen, [9u8; 16], &ada, t0));
+        // Once the window has rolled past, Ada is admitted again.
+        let later = t0 + Duration::from_millis(CHANNEL_TYPING_REFRESH_SECS * 1000 + 1);
+        assert!(typing_recv_allow(&mut seen, room, &ada, later));
+
+        // Apart from chat: typing at the full allowance leaves the author's
+        // chat budget untouched.
+        let mut chat = HashMap::new();
+        for _ in 0..CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC {
+            assert!(author_gossip_allow(&mut chat, room, &ada, t0));
+        }
+
+        // A full map refuses a newcomer rather than growing.
+        let mut full: HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>> = HashMap::new();
+        for i in 0..CHANNEL_GOSSIP_AUTHOR_CAP {
+            let mut author = [0u8; 32];
+            author[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert!(typing_recv_allow(&mut full, room, &author, t0));
+        }
+        assert!(!typing_recv_allow(&mut full, room, &[0xFFu8; 32], t0));
+        prune_rate_windows(&mut full, later + Duration::from_secs(60), Duration::from_secs(60));
+        assert!(full.is_empty());
+        assert!(typing_recv_allow(&mut full, room, &[0xFFu8; 32], later));
+    }
+
+    #[test]
+    fn this_device_sends_at_most_a_few_typing_frames_per_room_per_window() {
+        let room = [1u8; 16];
+        let t0 = Instant::now();
+        let mut sent = HashMap::new();
+        for _ in 0..CHANNEL_TYPING_SEND_PER_WINDOW {
+            assert!(typing_send_allow(&mut sent, room, t0));
+        }
+        assert!(!typing_send_allow(&mut sent, room, t0 + Duration::from_secs(1)));
+        assert!(typing_send_allow(&mut sent, [2u8; 16], t0), "per room");
+        let later = t0 + Duration::from_millis(CHANNEL_TYPING_REFRESH_SECS * 1000 + 1);
+        assert!(typing_send_allow(&mut sent, room, later));
+    }
+
+    #[test]
+    fn typing_goes_one_hop_to_reachable_members_and_not_at_all_in_a_large_room() {
+        let local = [0u8; 32];
+        let member = |i: u8| [i; 32];
+        let present: Vec<[u8; 32]> = (0..=5).map(member).collect();
+        // Us excluded, and only members with a live session.
+        assert_eq!(
+            typing_recipients(&local, &present, |pk| pk[0] % 2 == 1),
+            Some(vec![member(1), member(3), member(5)])
+        );
+        assert_eq!(typing_recipients(&local, &present, |_| false), Some(Vec::new()));
+
+        let at_limit: Vec<[u8; 32]> = (0..CHANNEL_TYPING_MAX_ROOM as u8).map(member).collect();
+        assert_eq!(
+            typing_recipients(&local, &at_limit, |_| true).map(|r| r.len()),
+            Some(CHANNEL_TYPING_MAX_ROOM - 1)
+        );
+        let over: Vec<[u8; 32]> = (0..=CHANNEL_TYPING_MAX_ROOM as u8).map(member).collect();
+        assert_eq!(typing_recipients(&local, &over, |_| true), None);
+
+        // Nobody passes it on: the hop budget written on it is already spent.
+        let sealed = ChannelGossip::sealed(
+            CHAT_CHANNEL,
+            CHAT_MSG_ID,
+            &[5u8; 32],
+            1,
+            b"x",
+            CHANNEL_TYPING_TTL,
+            CHAT_TS,
+        );
+        assert!(sealed.decremented_ttl().is_none());
+    }
+
+    /// Typing never reaches anything that stores or re-serves.
+    ///
+    /// Catch-up serves what the database holds — chat lines, edits folded into
+    /// them, and reactions — and those enter only through the decoders below,
+    /// every one of which refuses a typing frame. The typing branch itself
+    /// writes nothing (`apply_channel_typing`), so there is nothing for a
+    /// catch-up to find.
+    #[test]
+    fn a_typing_frame_is_refused_by_every_decoder_that_stores_or_acts() {
+        let alice = SigningKey::generate(&mut OsRng);
+        for typing in [true, false] {
+            let plain = typing_frame(&alice, typing);
+            assert!(decode_channel_chat_plain(&plain, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+            assert!(decode_channel_chat_edit(&plain, &CHAT_CHANNEL).is_none());
+            assert!(decode_channel_reactions(&plain, &CHAT_CHANNEL).is_none());
+            assert!(decode_channel_mod_action(&plain, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+            assert!(decode_channel_sync_request(&plain, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+            assert!(decode_channel_presence_beacons(&plain, &CHAT_CHANNEL, 0, CHAT_TS).is_none());
+            assert!(decode_channel_handoff_offer(&plain, &CHAT_CHANNEL, &[7u8; 32]).is_none());
+            assert!(decode_channel_handoff_ready(&plain, &CHAT_CHANNEL).is_none());
+            assert!(xfer_frame_peek(&plain).is_none());
+        }
+        // And the other way round: no stored kind reads as typing.
+        let chat = chat_frame(&alice, "hello");
+        assert!(decode_channel_typing(&chat, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        let reactions =
+            encode_channel_reactions(&[reaction_entry(&alice, CHAT_MSG_ID, REACTION_UP, CHAT_TS)]);
+        assert!(decode_channel_typing(&reactions, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+    }
+
+    /// Where a decrypted plaintext goes in v1.6.7's `handle_inbound_channel_gossip`
+    /// (`git show v1.6.7:src-tauri/src/network/mod.rs`, the function at line
+    /// 18659).
+    ///
+    /// Copied from that build rather than read from this one, whose constants
+    /// are free to move. Every v1.6.7 decoder opens with `bytes[0] != ITS_VERSION`
+    /// (`git show v1.6.7:src-tauri/src/network/ember/channel.rs`), so the first
+    /// byte and the order below are the whole of its routing; the length checks
+    /// after it can only refuse more. A plaintext no branch claims reaches the
+    /// chat decoder's `else`, which is `debug!(..); return;` — no reputation
+    /// event, no relay, no write, and the hop was already admitted by
+    /// `channel_gossip_inbound_ok`, which v1.6.7 documents and implements as
+    /// unscored.
+    #[derive(Debug, PartialEq, Eq)]
+    enum V167Branch {
+        Transfer,
+        Presence,
+        HandoffOffer,
+        HandoffReady,
+        SyncRequest,
+        ModAction,
+        Edit,
+        Reactions,
+        Chat,
+        DroppedWithDebugLog,
+    }
+
+    fn v1_6_7_branch(plain: &[u8]) -> V167Branch {
+        // XFER_OFFER, _REPLY, _BLOCK_REQUEST, _BLOCK_DATA_SEALED, _CANCEL, _DONE.
+        const V167_XFER: [u8; 6] = [9, 10, 11, 21, 13, 14];
+        let Some(&first) = plain.first() else {
+            return V167Branch::DroppedWithDebugLog;
+        };
+        match first {
+            b if V167_XFER.contains(&b) => V167Branch::Transfer,
+            22 => V167Branch::Presence,
+            6 => V167Branch::HandoffOffer,
+            17 => V167Branch::HandoffReady,
+            18 => V167Branch::SyncRequest,
+            16 => V167Branch::ModAction,
+            19 => V167Branch::Edit,
+            20 => V167Branch::Reactions,
+            15 => V167Branch::Chat,
+            _ => V167Branch::DroppedWithDebugLog,
+        }
+    }
+
+    #[test]
+    fn a_typing_frame_falls_through_the_v1_6_7_dispatch_untouched() {
+        let alice = SigningKey::generate(&mut OsRng);
+        // The model routes what this build sends the way v1.6.7 did.
+        assert_eq!(v1_6_7_branch(&chat_frame(&alice, "hi")), V167Branch::Chat);
+        assert_eq!(v1_6_7_branch(&edit_frame(&alice, "hi", CHAT_TS + 1)), V167Branch::Edit);
+        assert_eq!(
+            v1_6_7_branch(&encode_channel_reactions(&[reaction_entry(
+                &alice,
+                CHAT_MSG_ID,
+                REACTION_UP,
+                CHAT_TS
+            )])),
+            V167Branch::Reactions
+        );
+        for typing in [true, false] {
+            assert_eq!(
+                v1_6_7_branch(&typing_frame(&alice, typing)),
+                V167Branch::DroppedWithDebugLog
+            );
+        }
+        // The number is not one v1.6.7 ever used or retired, so no old peer
+        // reads it as something else.
+        const V167_ASSIGNED_OR_RETIRED: [u8; 22] =
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
+        assert!(!V167_ASSIGNED_OR_RETIRED.contains(&TYPING_PLAIN_VERSION));
+        // The transfer's QUIC port frame rides the same fall-through: v1.6.7
+        // never learns the port, so it never dials and keeps to the block
+        // protocol.
+        assert!(!V167_ASSIGNED_OR_RETIRED.contains(&XFER_STREAM_SEALED_VERSION));
+        assert!(!V167_ASSIGNED_OR_RETIRED.contains(&XFER_OFFER_SEALED_VERSION));
+        // A room friend request too: v1.6.7 neither reads nor relays it.
+        assert!(!V167_ASSIGNED_OR_RETIRED.contains(&ROOM_FRIEND_REQUEST_PLAIN_VERSION));
+        assert_eq!(
+            v1_6_7_branch(&encode_room_friend_request(
+                &alice,
+                &alice.verifying_key().to_bytes(),
+                &[4u8; 16],
+                &CHAT_CHANNEL,
+                &CHAT_MSG_ID,
+                CHAT_TS,
+            )),
+            V167Branch::DroppedWithDebugLog
+        );
+        assert_eq!(
+            v1_6_7_branch(&encode_xfer_offer_sealed(&[0x5Au8; 32], &sample_offer())),
+            V167Branch::DroppedWithDebugLog
+        );
+        let stream = encode_xfer_stream(
+            &[0x5Au8; 32],
+            &[1u8; 32],
+            &[2u8; 32],
+            &[3u8; 16],
+            XferStreamRole::Serve,
+            XferStreamPorts { quic: 4662, tcp: Some(4661), public_ip: None },
+        );
+        assert_eq!(v1_6_7_branch(&stream), V167Branch::DroppedWithDebugLog);
+        // It reaches that dispatch at all only through the envelope v1.6.7 also
+        // speaks: outer version 1, the same header, and a hop budget it would
+        // not forward on even if it knew the frame.
+        let wire = ChannelGossip::sealed(
+            CHAT_CHANNEL,
+            CHAT_MSG_ID,
+            &[5u8; 32],
+            1,
+            &typing_frame(&alice, true),
+            CHANNEL_TYPING_TTL,
+            CHAT_TS,
+        )
+        .encode();
+        assert_eq!(wire[0], 1);
+        assert_eq!(wire[33], CHANNEL_TYPING_TTL);
     }
 
     fn directed_reach(neighbors: &[Vec<usize>], origin: usize, ttl: u8) -> HashSet<usize> {

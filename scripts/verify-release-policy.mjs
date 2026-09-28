@@ -281,7 +281,29 @@ function workflowFiles(root) {
 }
 
 /** Every job the release workflow must still have, in dependency order. */
-const REQUIRED_JOBS = ["verify", "build", "build-linux", "sign-publish"];
+const REQUIRED_JOBS = [
+  "verify",
+  "build",
+  "build-windows",
+  "build-linux",
+  "sign-publish",
+];
+
+/**
+ * What `sign-publish` must never do: anything that runs the dependency tree's
+ * code, or compiles, while the signing key is in the job's environment. The
+ * lockfile-pinned Tauri CLI, installed with install scripts off, is the one
+ * package it executes.
+ */
+const SIGNING_JOB_FORBIDDEN = [
+  [/tauri-apps\/tauri-action/, "run tauri-action, which builds with the key present"],
+  [/\btauri\s+build\b/, "build the app"],
+  [/\bcargo\s/, "run cargo"],
+  [/rust-toolchain|rust-cache/, "set up a Rust toolchain"],
+  [/\bnpm\s+(?:install|i|add)\b/, "npm install packages"],
+  [/\bnpm\s+ci\b(?![^\n]*--ignore-scripts)/, "run npm ci without --ignore-scripts"],
+  [/\bnpm\s+run\b/, "run package.json scripts"],
+];
 
 /**
  * The release workflow's jobs, each mapped to its own body.
@@ -398,8 +420,31 @@ export function verifyWorkflow({ root = scriptRoot } = {}) {
       `sign-publish must depend on every build job; it is missing ${undeclared.join(", ")}`,
     );
   }
-  if (!/releaseDraft:\s*true\b/.test(signJob)) {
+  if (
+    !/\bgh\s+release\s+create\b[^\n]*--draft\b/.test(signJob) ||
+    /--draft=false\b/.test(signJob)
+  ) {
     errors.push("release must remain a draft");
+  }
+  for (const [pattern, what] of SIGNING_JOB_FORBIDDEN) {
+    if (pattern.test(signJob)) {
+      errors.push(`sign-publish holds the signing key, so it must not ${what}`);
+    }
+  }
+
+  // The key-free half of the same guarantee: the Windows installers are built
+  // where no key exists, so the bundler must not be asked for signatures.
+  const windowsJob = jobs.get("build-windows") ?? "";
+  if (!/--bundles\s+nsis,msi\b/.test(windowsJob)) {
+    errors.push("build-windows must build both the NSIS and MSI installers");
+  }
+  if (!/"createUpdaterArtifacts"\s*:\s*false/.test(windowsJob)) {
+    errors.push(
+      "build-windows holds no signing key, so it must disable createUpdaterArtifacts",
+    );
+  }
+  if (!signJob.includes("scripts/compose-update-manifest.mjs")) {
+    errors.push("sign-publish must compose the Windows updater targets into latest.json");
   }
 
   // A Linux release is three things that have to stay together: both formats

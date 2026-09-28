@@ -2,7 +2,7 @@
   import type { FileInfo } from '$lib/types';
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
-  import { formatSize, formatDateWithYear as formatDate } from '$lib/utils';
+  import { formatSize, formatNumber, formatDateTime, formatDateWithYear as formatDate } from '$lib/utils';
   import { onMount, onDestroy, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
 
@@ -38,7 +38,7 @@
     { key: 'priority',    label: () => m.library_col_priority(),    width: 72,  minWidth: 60,  sortField: 'priority' },
     { key: 'transferred', label: () => m.library_col_transferred(), width: 90,  minWidth: 60,  sortField: 'bytes_transferred' },
     { key: 'sources',     label: () => m.library_col_peers(),       width: 118, minWidth: 84,  sortField: 'complete_sources' },
-    { key: 'shared',      label: () => m.library_col_shared(),      width: 132, minWidth: 96 },
+    { key: 'shared',      label: () => m.library_col_published(),   width: 132, minWidth: 96 },
     { key: 'hash',        label: () => m.library_col_file_id(),     width: 120, minWidth: 80,  sortField: 'hash' },
     { key: 'requests',    label: () => m.library_col_requests(),    width: 70,  minWidth: 50,  sortField: 'requests' },
     { key: 'accepted',    label: () => m.library_col_accepted(),    width: 70,  minWidth: 50,  sortField: 'accepted' },
@@ -47,6 +47,8 @@
   ];
 
   const DEFAULT_HIDDEN = new Set(['hash', 'requests', 'accepted', 'folder']);
+  /** Columns whose cells are right-aligned numbers; their headers align with them. */
+  const NUMERIC_COLUMNS = new Set(['size', 'requests', 'accepted', 'transferred', 'sources']);
   const FIXED_KEY = 'name';
   const STORAGE_WIDTHS = 'library-col-widths';
   const STORAGE_HIDDEN = 'library-col-hidden';
@@ -555,6 +557,7 @@
             class:drag-enabled={canDrag(col.key)}
             class:drop-before={isDropBefore(col.key)}
             class:drop-after={isDropAfter(col.key)}
+            class:num={NUMERIC_COLUMNS.has(col.key)}
             tabindex={col.sortField ? 0 : undefined}
             role="columnheader"
             draggable={canDrag(col.key)}
@@ -630,9 +633,9 @@
               {:else if col.key === 'size'}
                 <td class="cell-num">{formatSize(file.size)}</td>
               {:else if col.key === 'type'}
-                <td class="cell-type">{fileType(file.extension)}</td>
+                <td class="cell-type" title={fileType(file.extension)}>{fileType(file.extension)}</td>
               {:else if col.key === 'priority'}
-                <td class="cell-prio prio-{file.priority}">{priorityLabel(file.priority)}</td>
+                <td class="cell-prio prio-{file.priority}" title={priorityLabel(file.priority)}>{priorityLabel(file.priority)}</td>
               {:else if col.key === 'hash'}
                 <td class="cell-hash" title={file.hash || m.library_hashing()}>
                   {#if file.hash}
@@ -642,38 +645,38 @@
                   {/if}
                 </td>
               {:else if col.key === 'requests'}
-                <td class="cell-num">{file.requests}{file.alltime_requests ? ` (${file.alltime_requests})` : ''}</td>
+                <td class="cell-num">{formatNumber(file.requests)}{file.alltime_requests ? ` (${formatNumber(file.alltime_requests)})` : ''}</td>
               {:else if col.key === 'accepted'}
-                <td class="cell-num">{file.accepted}{file.alltime_accepted ? ` (${file.alltime_accepted})` : ''}</td>
+                <td class="cell-num">{formatNumber(file.accepted)}{file.alltime_accepted ? ` (${formatNumber(file.alltime_accepted)})` : ''}</td>
               {:else if col.key === 'transferred'}
                 <td class="cell-num">{formatTransferred(file.bytes_transferred, file.alltime_transferred)}</td>
               {:else if col.key === 'folder'}
                 <td class="cell-folder" title={file.folder}>{file.folder.split(/[\\/]/).filter(Boolean).pop() || file.folder}</td>
               {:else if col.key === 'modified'}
-                <td class="cell-date" title={file.modified_at ? new Date(file.modified_at * 1000).toLocaleString() : ''}>{formatDate(file.modified_at)}</td>
+                <td class="cell-date" title={file.modified_at ? formatDateTime(file.modified_at) : ''}>{formatDate(file.modified_at)}</td>
               {:else if col.key === 'sources'}
-                <td class="cell-num">{file.complete_sources || '\u2014'}</td>
+                <td class="cell-num">{file.complete_sources ? formatNumber(file.complete_sources) : '\u2014'}</td>
               {:else if col.key === 'shared'}
+                <!-- Every row in the Library is a file peers can download, so
+                     a "yes" tick on all of them said nothing. What varies is
+                     where the file has actually reached. -->
                 <td class="cell-shared">
                   {#if !file.hash}
                     <span class="hashing-label">{m.common_pending()}</span>
-                  {:else if file.shared}
-                    <span class="shared-icon shared-yes" title={m.library_shared()}>&#x2713;</span>
-                    {#if file.friends_only || file.shared_kad || file.shared_ed2k || file.shared_ember || file.aich_hash}
-                      <span class="shared-badges">
-                        {#if file.friends_only}<span class="shared-badge friends" title={m.library_friends_only_badge_title()}>{m.library_friends_only_badge()}</span>{/if}
-                        {#if file.shared_kad}<span class="shared-badge kad" title={m.library_published_kad()}>KAD</span>{/if}
-                        {#if file.shared_ed2k}<span class="shared-badge ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
-                        {#if file.shared_ember}<span class="shared-badge ember" title={m.library_published_ember()}>Ember</span>{/if}
-                        {#if file.aich_hash}<span class="shared-badge aich" title={m.library_aich_available()}>AICH</span>{/if}
-                      </span>
-                    {/if}
+                  {:else if file.friends_only || file.shared_kad || file.shared_ed2k || file.shared_ember}
+                    <span class="shared-badges">
+                      {#if file.friends_only}<span class="shared-badge friends" title={m.library_friends_only_badge_title()}>{m.library_friends_only_badge()}</span>{/if}
+                      {#if file.shared_kad}<span class="shared-badge kad" title={m.library_published_kad()}>KAD</span>{/if}
+                      {#if file.shared_ed2k}<span class="shared-badge ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
+                      {#if file.shared_ember}<span class="shared-badge ember" title={m.library_published_ember()}>Ember</span>{/if}
+                      {#if file.aich_hash}<span class="shared-badge aich" title={m.library_aich_available()}>AICH</span>{/if}
+                    </span>
                   {:else}
-                    <span class="shared-icon shared-no" title={m.library_not_shared()}>&#x2715;</span>
+                    <span class="not-published" title={m.library_not_published_yet()}>&#x2014;</span>
+                    <!-- Repair data, not a place the file has reached, so it
+                         rides along without counting as published. -->
                     {#if file.aich_hash}
-                      <span class="shared-badges">
-                        <span class="shared-badge aich" title={m.library_aich_available()}>AICH</span>
-                      </span>
+                      <span class="shared-badges"><span class="shared-badge aich" title={m.library_aich_available()}>AICH</span></span>
                     {/if}
                   {/if}
                 </td>
@@ -740,7 +743,7 @@
   .lib-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     table-layout: fixed;
   }
   .lib-table th {
@@ -749,8 +752,8 @@
     text-align: left;
     white-space: nowrap;
     font-weight: 600;
-    font-size: 11px;
-    background: var(--bg-surface);
+    font-size: var(--font-size-xs);
+    background: var(--table-head-bg);
     border-bottom: 1px solid var(--border);
     user-select: none;
     box-sizing: border-box;
@@ -759,6 +762,9 @@
   }
   .lib-table th.sortable {
     cursor: pointer;
+  }
+  .lib-table th.num {
+    text-align: right;
   }
   .lib-table th.sortable:hover {
     color: var(--text-primary);
@@ -813,7 +819,7 @@
     width: 1px;
     transform: translateX(-50%);
     background: transparent;
-    transition: background 0.1s;
+    transition: background var(--transition-fast);
   }
   .lib-table th:hover .col-resize-handle::after,
   .lib-table th.resizing .col-resize-handle::after,
@@ -830,7 +836,7 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
+    border-bottom: 1px solid var(--table-row-divider);
     box-sizing: border-box;
     /* Rows are virtualized: <tr> nodes are reused as you scroll and their
        zebra (row-alt) parity flips on the reused node. A background-color
@@ -841,10 +847,10 @@
   .lib-table tbody tr {
     cursor: pointer;
     box-sizing: border-box;
-    transition: background-color 0.12s ease;
+    transition: background-color var(--transition-fast) ease;
   }
   .lib-table tbody tr.row-alt td {
-    background: color-mix(in srgb, var(--bg-secondary) 90%, var(--bg-primary));
+    background: var(--table-row-alt);
   }
   .lib-table tbody tr:hover td {
     background: var(--bg-hover);
@@ -854,7 +860,7 @@
     outline-offset: -2px;
   }
   .lib-table tbody tr.selected td {
-    background: var(--accent-fill);
+    background: var(--table-row-selected);
     color: var(--text-primary);
     border-bottom-color: color-mix(in srgb, var(--accent) 30%, var(--border));
   }
@@ -880,7 +886,7 @@
   }
   .cell-hash {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
   }
@@ -889,7 +895,7 @@
   }
   .cell-date {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
   .cell-shared {
     text-align: center;
@@ -898,29 +904,11 @@
 
   .hashing-label {
     color: var(--warning);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-style: italic;
   }
-  .shared-icon {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 18px;
-    height: 18px;
-    border-radius: var(--radius-pill);
-    font-size: 10px;
-    font-weight: 700;
-    padding: 0 6px;
-    vertical-align: middle;
-  }
-  .shared-yes {
-    background: color-mix(in srgb, var(--success) 20%, transparent);
-    color: var(--success);
-  }
-  .shared-no {
-    background: color-mix(in srgb, var(--text-muted) 16%, transparent);
+  .not-published {
     color: var(--text-muted);
-    font-size: 9px;
   }
   .shared-badges {
     display: inline-flex;
@@ -981,7 +969,7 @@
 
   .prio-verylow { color: var(--priority-verylow); }
   .prio-low { color: var(--priority-low); }
-  .prio-normal { color: var(--text-primary); }
+  .prio-normal { color: var(--text-secondary); }
   .prio-high { color: var(--warning); }
   .prio-release { color: var(--danger); font-weight: 600; }
   .prio-auto { color: var(--priority-auto); }

@@ -258,6 +258,73 @@ pub const EMBER_EXT_DHT_CONTACT_REQ: u8 = 0x05;
 /// guarantee gossip over the DHT wire gets.
 pub const EMBER_EXT_DHT_CONTACTS: u8 = 0x06;
 
+/// [`OP_EMBER_EXT`] sub-type: the sender is refusing a friend request the
+/// recipient sent them, so the requester stops waiting on an answer that is
+/// never coming.
+///
+/// The mirror image of [`EMBER_EXT_FRIEND_RETRACT`]: that one is the *sender*
+/// taking their request back, this one is the *recipient* turning it down.
+/// Carries no body for the same reason — the only thing it has to say is who
+/// refused, and that is the authenticated session identity.
+///
+/// Acting on it may only ever delete a one-sided `friends` row we have not had
+/// accepted, never a friendship. A peer cannot use this to unfriend anybody:
+/// once a friendship is mutual their own row is the one that would have to go,
+/// and they can already do that by removing us.
+///
+/// Older builds log and ignore an unknown sub-type, so declining a request
+/// from a peer that predates this costs nothing beyond them not learning of
+/// it — which is exactly the behaviour before it existed.
+pub const EMBER_EXT_FRIEND_DECLINE: u8 = 0x07;
+
+/// [`OP_EMBER_EXT`] sub-type: the sender is offering the recipient a file in
+/// chat. Body is
+/// [`crate::network::ember::attach::encode_attach_offer`].
+///
+/// Signalling only — no file bytes ride the friend session. It names a transfer
+/// id, a size, the BLAKE3 root the content is committed to, and the port of the
+/// sender's QUIC endpoint; the recipient dials that for the data if it wants
+/// the file. Envelope rather than an opcode because `0xFF` was the last free
+/// code in the `OP_EMULEPROT` space, and a peer that predates these three
+/// sub-types ignores them — which reads to the sender as an offer nobody ever
+/// answered, and lapses on its own.
+pub const EMBER_EXT_ATTACH_OFFER: u8 = 0x08;
+
+/// [`OP_EMBER_EXT`] sub-type: the recipient's answer to
+/// [`EMBER_EXT_ATTACH_OFFER`]. Body is
+/// [`crate::network::ember::attach::encode_attach_reply`].
+///
+/// An accept is what tells the sender to keep the grant alive and expect a
+/// stream; every other answer retires it. Nothing is transferred on the
+/// strength of an offer alone.
+pub const EMBER_EXT_ATTACH_REPLY: u8 = 0x09;
+
+/// [`OP_EMBER_EXT`] sub-type: either side is giving up on an attachment. Body
+/// is [`crate::network::ember::attach::encode_attach_cancel`].
+///
+/// Sent by a recipient that no longer wants the file and by a sender that can
+/// no longer read it, so the other end stops waiting rather than sitting on a
+/// transfer until it lapses.
+pub const EMBER_EXT_ATTACH_CANCEL: u8 = 0x0A;
+
+/// [`OP_EMBER_EXT`] sub-type: which entries of the browse answer that follows
+/// on the same session are friends-only. Body is
+/// `crate::network::browse::encode_browse_scope`.
+///
+/// Its own frame rather than a field of [`OP_EMBER_BROWSE_RES`] because the v1
+/// browse body has no room left: the Ember digest trailer is only accepted
+/// when it ends the payload exactly, so appending anything would strip every
+/// digest for peers already in the field. A peer that predates this sub-type
+/// ignores it and treats the listing as unrestricted, as it always did.
+pub const EMBER_EXT_BROWSE_SCOPE: u8 = 0x0B;
+
+/// [`OP_EMBER_EXT`] sub-type: how many distinct files the sender would list
+/// to this friend if the browse answer that follows had no size cap. Body is
+/// [`crate::network::browse::encode_browse_summary`]. A separate frame for the
+/// same reason as [`EMBER_EXT_BROWSE_SCOPE`]; a peer that predates it ignores
+/// it and simply cannot tell the listing was cut short.
+pub const EMBER_EXT_BROWSE_SUMMARY: u8 = 0x0C;
+
 /// Wrap `body` in an [`OP_EMBER_EXT`] payload under `ext_type`.
 pub fn build_ember_ext(ext_type: u8, body: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(1 + body.len());
@@ -562,6 +629,12 @@ pub struct PeerCapabilities {
     pub version_major: u8,
     pub emule_version_min: u8,
     pub version_update: u8,
+    /// eMule's `m_byEmuleVersion`: `0x99` once a Hello carries
+    /// `CT_EMULE_VERSION` (`BaseClient.cpp:539`), otherwise the version byte
+    /// of the peer's EmuleInfo (`:743`), 0 when neither arrived. Only this
+    /// byte, never the Hello's minor version, decides eMule's old-client
+    /// score halving (`UploadClient.cpp:228`).
+    pub emule_version_byte: u8,
     pub mod_version: String,
     pub peer_name: String,
     /// eMule's `m_bEmuleProtocol` / `ExtProtocolAvailable()`
@@ -584,26 +657,6 @@ pub struct PeerCapabilities {
     /// Ed25519 public key for Ember auth, from the same private handshake as
     /// `ember_hash`. The `ET_EMBER_PUBKEY` EmuleInfo harvest was removed too.
     pub ember_pubkey: Option<[u8; 32]>,
-}
-
-/// Build Hello with buddy info tags.
-pub fn build_hello_with_buddy(
-    user_hash: &[u8; 16],
-    client_id: u32,
-    tcp_port: u16,
-    udp_port: u16,
-    nickname: &str,
-    buddy: Option<BuddyInfo>,
-) -> Vec<u8> {
-    build_hello_inner(
-        user_hash,
-        client_id,
-        tcp_port,
-        nickname,
-        true,
-        buddy,
-        &HelloOptions::default_for_udp_port(udp_port),
-    )
 }
 
 pub fn build_hello_with_buddy_opts(
@@ -687,17 +740,11 @@ const MO2_SUPPORT_LARGE_FILES: u32 = 4;
 /// `ET_FEATURES` (0x27) layout. eMule defines exactly two fields
 /// (`BaseClient.cpp:847-853`, whose own comment is the authority here):
 /// bits 0-1 are the SecureIdent level — a value, not a flag, hence no shift —
-/// and **bit 7** is preview. Everything between is "0 - reserved".
-///
-/// Bits 3-5 are Ember's, not eMule's. eMule touches `ET_FEATURES` in exactly
-/// two places — the write at `:723-725` and the read above — and neither knows
-/// about a crypt layer here; it carries those in `CT_EMULE_MISCOPTIONS2`
-/// instead. eMule masks the bits it wants and ignores the rest, so occupying
-/// reserved space costs nothing today, but it is an extension sitting inside a
-/// standard tag rather than a namespaced one, and it is recorded as such.
+/// and **bit 7** is preview. Everything between is "0 - reserved", and we
+/// leave it so: the crypt layer is advertised in `CT_EMULE_MISCOPTIONS2`, as
+/// eMule does, not in this tag.
 const ET_FEATURES_SEC_IDENT_LEVEL: u8 = 3;
 const ET_FEATURES_PREVIEW: u32 = 7;
-const ET_FEATURES_SUPPORTS_CRYPT_LAYER: u32 = 3;
 
 /// Whether a SecureIdent keypair is actually usable this session.
 ///
@@ -734,7 +781,6 @@ fn secident_level() -> u8 {
         0
     }
 }
-const ET_FEATURES_REQUESTS_CRYPT_LAYER: u32 = 4;
 
 /// Compute CT_EMULE_MISCOPTIONS1 matching eMule BaseClient.cpp SendHelloTypePacket.
 ///
@@ -845,11 +891,13 @@ fn build_hello_inner(
     // byte: any non-zero value is treated as a third-party / spoofing
     // client and triggers a silent queue-ban (the peer accepts the
     // connection, answers OP_REQFILENAMEANSWER, then closes the socket
-    // before sending OP_FILESTATUS). We claim eMule 0.50.1 (the last
-    // known-good vanilla build) so anti-leecher version-range heuristics
-    // accept us. Ember-specific identity is exchanged later via
-    // `OP_EMBER_HELLO`, which vanilla peers ignore.
-    let emule_version: u32 = (50u32 << 10) | (1u32 << 7);
+    // before sending OP_FILESTATUS). We claim eMule 0.50a, the last official
+    // build and the one whose Kad v9 and capability set this Hello matches,
+    // so anti-leecher version-range heuristics accept us. The update field is
+    // the letter's offset from 'a' (`Emule.cpp:316`), so it is 0; 1 read as a
+    // "0.50b" that never shipped. Ember-specific identity is exchanged later
+    // via `OP_EMBER_HELLO`, which vanilla peers ignore.
+    let emule_version: u32 = 50u32 << 10;
     write_ed2k_tag(&mut buf, 0xFB, &Ed2kTagValue::Uint32(emule_version));
 
     buf.write_u32::<LittleEndian>(options.server_ip).unwrap();
@@ -918,6 +966,29 @@ pub(super) fn write_ed2k_tag(buf: &mut Vec<u8>, name_id: u8, value: &Ed2kTagValu
     }
 }
 
+/// Whether we, having dialed, should send `OP_EMULEINFO` after reading the
+/// peer's HelloAnswer.
+///
+/// eMule never does as the dialer. Only its listener sends MuleInfo, and only
+/// to an eMule-hash peer whose Hello lacked `CT_EMULE_VERSION`
+/// (`ListenSocket.cpp:272-273`); a Hello with that tag already carries every
+/// capability. We ask that same legacy kind of peer, and Ember 1.6.x: its
+/// listener waits for our MuleInfo on an obfuscated connection and discards
+/// every packet it reads before one arrives, file request included.
+pub fn dialer_needs_mule_info(peer_user_hash: &[u8; 16], hello_caps: &PeerCapabilities) -> bool {
+    let emule_hash = peer_user_hash[5] == 14 && peer_user_hash[14] == 111;
+    emule_hash && (hello_caps.emule_version_byte != 0x99 || is_ember_1_6_hello(hello_caps))
+}
+
+/// Ember before 1.7 claimed eMule "0.50b" in `CT_EMULE_VERSION` (update 1),
+/// a build eMule never shipped; 1.7 claims 0.50a like the real client.
+fn is_ember_1_6_hello(caps: &PeerCapabilities) -> bool {
+    caps.compatible_client == 0
+        && caps.version_major == 0
+        && caps.emule_version_min == 50
+        && caps.version_update == 1
+}
+
 /// Build an EmuleInfo packet payload matching eMule `BaseClient.cpp`
 /// `SendMuleInfoPacket` byte-for-byte: version(1) + EMULE_PROTOCOL(1) +
 /// tag_count(4) + 7 ET_ tags. **No** `ET_COMPATIBLECLIENT`, **no**
@@ -929,10 +1000,12 @@ pub(super) fn write_ed2k_tag(buf: &mut Vec<u8>, name_id: u8, value: &Ed2kTagValu
 /// API stability but are intentionally ignored here — Ember identity is
 /// exchanged in a separate `OP_EMBER_HELLO` opcode that vanilla peers
 /// silently ignore. Callers that need Ember peer identification should
-/// also send `build_ember_hello(...)` after their EmuleInfoAnswer.
+/// also send `build_ember_hello(...)` after their EmuleInfoAnswer. The
+/// obfuscation flag is ignored for the same byte-for-byte reason: the Hello's
+/// `CT_EMULE_MISCOPTIONS2` already states it.
 pub fn build_emule_info(
     udp_port: u16,
-    obfuscation_enabled: bool,
+    _obfuscation_enabled: bool,
     _ember_hash: Option<&[u8; 16]>,
     _ed25519_pubkey: Option<&[u8; 32]>,
 ) -> Vec<u8> {
@@ -983,27 +1056,29 @@ pub fn build_emule_info(
     write_ed2k_tag(&mut buf, 0x22, &Ed2kTagValue::Uint32(4));
     // ET_UDPPORT (0x21) = udp_port
     write_ed2k_tag(&mut buf, 0x21, &Ed2kTagValue::Uint32(udp_port as u32));
-    // ET_SOURCEEXCHANGE (0x23) = 4 — must match MISCOPTIONS1 SX version
-    write_ed2k_tag(&mut buf, 0x23, &Ed2kTagValue::Uint32(4));
+    // ET_SOURCEEXCHANGE (0x23) = 3, eMule's literal (`BaseClient.cpp:715`)
+    // even though its MISCOPTIONS1 says 4. Source exchange runs on the
+    // MISCOPTIONS2 SX2 bit, so the value only has to match what eMule sends.
+    write_ed2k_tag(&mut buf, 0x23, &Ed2kTagValue::Uint32(3));
     // ET_COMMENTS (0x24) = 1
     write_ed2k_tag(&mut buf, 0x24, &Ed2kTagValue::Uint32(1));
     // ET_EXTENDEDREQUEST (0x25) = 2
     write_ed2k_tag(&mut buf, 0x25, &Ed2kTagValue::Uint32(2));
-    // ET_FEATURES (0x27). Named like the MISCOPTIONS shifts above and for the
-    // same reason: bit 7 (preview) and bit 5 (RequiresCryptLayer) are left
-    // clear, and the labels for those two once slid onto the neighbouring
-    // fields when the zero terms were removed.
+    // ET_FEATURES (0x27): the SecureIdent level, as eMule writes it (`:722`).
     //
-    // Preview stays clear deliberately rather than by omission. eMule sets it
-    // only when `CanSeeShares() != vsfaNobody` (`BaseClient.cpp:723`), tying
-    // the offer to whether shares are browsable at all — and Ember's browse
-    // responder is currently unreachable from stock eMule, which asks with
-    // `OP_ASKSHAREDDIRS` (0x5D) rather than `OP_ASKSHAREDFILES`. Advertising
-    // preview before that is answered would promise a capability the peer
-    // cannot reach.
-    let features: u32 = secident_level() as u32
-        | ((obfuscation_enabled as u32) << ET_FEATURES_SUPPORTS_CRYPT_LAYER)
-        | ((obfuscation_enabled as u32) << ET_FEATURES_REQUESTS_CRYPT_LAYER);
+    // Preview stays clear deliberately rather than by omission, but not for the
+    // reason this comment used to give. It said Ember's browse responder was
+    // unreachable from stock eMule, which asks with `OP_ASKSHAREDDIRS` (0x5D);
+    // that opcode is answered now, so browsability is no longer the blocker and
+    // `share_browsing_allowed()` would be the flag to gate on — eMule sets the
+    // bit when `CanSeeShares() != vsfaNobody` (`BaseClient.cpp:723`).
+    //
+    // What is still missing is the protocol itself: there is no
+    // `OP_REQUESTPREVIEW` handler anywhere in this crate, so a peer that read
+    // the bit and asked would get silence. Claiming a capability and then not
+    // answering it is worse than not claiming it, which is the whole argument
+    // behind the SecIdent level above. Set this only alongside a responder.
+    let features: u32 = secident_level() as u32;
     write_ed2k_tag(&mut buf, 0x27, &Ed2kTagValue::Uint32(features));
 
     buf
@@ -1276,7 +1351,14 @@ pub struct EmberFileOffer {
     /// 32-byte trailer after the v1 name so pre-1.5.5 parsers (which stop at
     /// the declared name length) ignore it.
     pub ember_file_hash: Option<[u8; 32]>,
+    /// The sender restricts this file to friends, so the recipient must not
+    /// advertise or serve its copy on the open network. Carried in a flags
+    /// byte after the digest slot; absent means unrestricted.
+    pub friends_only: bool,
 }
+
+/// [`EmberFileOffer`] flags bit: the offered file is friends-only.
+const EMBER_OFFER_FLAG_FRIENDS_ONLY: u8 = 0x01;
 
 /// Build an [`OP_EMBER_FILE_OFFER`] payload. Rides the friend session's Noise
 /// encryption, so like the XFER messages it carries no signature of its own.
@@ -1299,7 +1381,12 @@ pub fn build_ember_file_offer(offer: &EmberFileOffer) -> Vec<u8> {
     buf.extend_from_slice(&offer.file_size.to_le_bytes());
     buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
     buf.extend_from_slice(name);
-    if let Some(digest) = offer.ember_file_hash {
+    if offer.friends_only {
+        // The flags byte sits after a fixed digest slot; zeros read as
+        // "no digest" to every parser that knows the slot.
+        buf.extend_from_slice(&offer.ember_file_hash.unwrap_or([0u8; 32]));
+        buf.push(EMBER_OFFER_FLAG_FRIENDS_ONLY);
+    } else if let Some(digest) = offer.ember_file_hash {
         buf.extend_from_slice(&digest);
     }
     buf
@@ -1334,11 +1421,15 @@ pub fn parse_ember_file_offer(payload: &[u8]) -> Option<EmberFileOffer> {
     } else {
         None
     };
+    let friends_only = payload
+        .get(end + 32)
+        .is_some_and(|flags| flags & EMBER_OFFER_FLAG_FRIENDS_ONLY != 0);
     Some(EmberFileOffer {
         file_hash,
         file_size,
         file_name,
         ember_file_hash,
+        friends_only,
     })
 }
 
@@ -1390,7 +1481,7 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
     // extended protocol whatever its tags turn out to say.
     caps.ext_protocol = true;
     let mut cursor = Cursor::new(payload);
-    let _version = cursor.read_u8().unwrap_or(0);
+    caps.emule_version_byte = cursor.read_u8().unwrap_or(0);
     let protocol_or_tag_count_byte = cursor.read_u8().unwrap_or(0);
 
     let tag_count = if protocol_or_tag_count_byte == 0x01 {
@@ -1777,6 +1868,7 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
                 caps.version_major = ((int_val >> 17) & 0x7F) as u8;
                 caps.emule_version_min = ((int_val >> 10) & 0x7F) as u8;
                 caps.version_update = ((int_val >> 7) & 0x07) as u8;
+                caps.emule_version_byte = 0x99;
             }
             _ => {}
         }
@@ -2297,6 +2389,11 @@ pub fn merge_caps(base: &mut PeerCapabilities, update: PeerCapabilities) {
     }
     if update.version_update != 0 {
         base.version_update = update.version_update;
+    }
+    // Last writer wins, as in eMule: an EmuleInfo after the Hello
+    // overwrites the Hello's 0x99.
+    if update.emule_version_byte != 0 {
+        base.emule_version_byte = update.emule_version_byte;
     }
     if !update.mod_version.is_empty() {
         base.mod_version = update.mod_version;
@@ -3084,14 +3181,51 @@ mod tests {
     /// capability — no parse error, no wire-format mismatch, just peers that
     /// stop offering us comments or obfuscation. Only a golden value catches it.
     /// Cross-check against `emulesource/BaseClient.cpp:980-1024`.
+    /// Serialises every test that reads or writes the `SECIDENT_AVAILABLE`
+    /// process-global, and puts it back even if the test panics.
+    ///
+    /// The suite runs in parallel threads against one global, so a test that
+    /// overrides it could be observed mid-flight by any other test that builds
+    /// a Hello or EmuleInfo — and restoring at the end of a test body does not
+    /// run when an assertion fails, which would leak the override into whatever
+    /// happened to run next. Both problems are the guard's job, not the
+    /// individual test's.
+    static SECIDENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct SecIdentOverride {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: bool,
+    }
+
+    impl SecIdentOverride {
+        /// Take the lock without disturbing the value, for readers.
+        fn hold() -> Self {
+            let guard = SECIDENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = SECIDENT_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed);
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+
+        fn set(available: bool) -> Self {
+            let held = Self::hold();
+            set_secident_available(available);
+            held
+        }
+    }
+
+    impl Drop for SecIdentOverride {
+        fn drop(&mut self) {
+            set_secident_available(self.previous);
+        }
+    }
+
     #[test]
     fn misc_options_match_emule_hello_layout() {
         // SecIdent is `CryptoAvailable() ? 3 : 0` (`BaseClient.cpp:966`), and
-        // the golden values below are the with-a-key form. The flag is a
-        // process-global and the suite runs in parallel, so this restores
-        // whatever it found rather than assuming a starting state.
-        let restore = SECIDENT_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed);
-        set_secident_available(true);
+        // the golden values below are the with-a-key form.
+        let _secident = SecIdentOverride::set(true);
 
         // AICH 1<<29 | Unicode 1<<28 | UDPv4 4<<24 | Comp 1<<20 | SecIdent 3<<16
         // | SourceExch 4<<12 | ExtReq 2<<8 | AcceptComment 1<<4 | MultiPacket 1<<1
@@ -3109,7 +3243,6 @@ mod tests {
             "only the SecIdent field may change when no keypair is available"
         );
 
-        set_secident_available(restore);
         assert_eq!(
             build_misc_options1(),
             misc_options1_with(!share_browsing_allowed())
@@ -3170,6 +3303,19 @@ mod tests {
         );
     }
 
+    /// The decline is the other body-less sub-type, and it travels the same
+    /// courier as the retraction — so a dispatcher that told the two apart by
+    /// anything other than the sub-type byte would act on the wrong one.
+    #[test]
+    fn ember_ext_friend_decline_is_body_less_and_distinct_from_retract() {
+        let payload = build_ember_ext(EMBER_EXT_FRIEND_DECLINE, &[]);
+        assert_eq!(
+            parse_ember_ext(&payload),
+            Some((EMBER_EXT_FRIEND_DECLINE, &[][..]))
+        );
+        assert_ne!(EMBER_EXT_FRIEND_DECLINE, EMBER_EXT_FRIEND_RETRACT);
+    }
+
     #[test]
     fn ember_ext_frame_carries_the_sub_type() {
         let frame = build_ember_ext_frame(EMBER_EXT_CHAT_TYPING, b"env");
@@ -3192,6 +3338,12 @@ mod tests {
             EMBER_EXT_CHAT_READ,
             EMBER_EXT_DHT_CONTACT_REQ,
             EMBER_EXT_DHT_CONTACTS,
+            EMBER_EXT_FRIEND_DECLINE,
+            EMBER_EXT_ATTACH_OFFER,
+            EMBER_EXT_ATTACH_REPLY,
+            EMBER_EXT_ATTACH_CANCEL,
+            EMBER_EXT_BROWSE_SCOPE,
+            EMBER_EXT_BROWSE_SUMMARY,
         ];
         let mut seen = std::collections::HashSet::new();
         for sub_type in sub_types {
@@ -3383,6 +3535,9 @@ mod tests {
 
     #[test]
     fn parse_emule_info_roundtrip_preserves_flags() {
+        // Reads the SecIdent global through `build_emule_info`; hold it steady
+        // against the test that overrides it.
+        let _secident = SecIdentOverride::hold();
         let caps = parse_emule_info(&build_emule_info(4672, true, None, None));
 
         assert_eq!(caps.udp_port, 4672);
@@ -3525,6 +3680,7 @@ mod tests {
             file_size: 4_294_967_296, // deliberately over u32 to prove 64-bit sizing
             file_name: "holiday video.mkv".to_string(),
             ember_file_hash: None,
+            friends_only: false,
         };
         let payload = build_ember_file_offer(&offer);
         assert_eq!(parse_ember_file_offer(&payload), Some(offer));
@@ -3537,6 +3693,7 @@ mod tests {
             file_size: 12,
             file_name: "clip.mp4".to_string(),
             ember_file_hash: Some([0xABu8; 32]),
+            friends_only: false,
         };
         let payload = build_ember_file_offer(&offer);
         assert_eq!(parse_ember_file_offer(&payload), Some(offer));
@@ -3545,6 +3702,49 @@ mod tests {
         let parsed = parse_ember_file_offer(without).expect("legacy body still parses");
         assert_eq!(parsed.file_name, "clip.mp4");
         assert_eq!(parsed.ember_file_hash, None);
+    }
+
+    #[test]
+    fn ember_file_offer_friends_only_flag_round_trips_with_and_without_digest() {
+        for digest in [None, Some([0xCDu8; 32])] {
+            let offer = EmberFileOffer {
+                file_hash: [0x66u8; 16],
+                file_size: 99,
+                file_name: "private.flac".to_string(),
+                ember_file_hash: digest,
+                friends_only: true,
+            };
+            let payload = build_ember_file_offer(&offer);
+            assert_eq!(parse_ember_file_offer(&payload), Some(offer));
+        }
+    }
+
+    /// A parser that predates the flags byte reads the same hash, name and
+    /// digest; one that knows it reads a flagless offer as unrestricted.
+    #[test]
+    fn ember_file_offer_flag_is_invisible_to_older_parsers() {
+        let restricted = EmberFileOffer {
+            file_hash: [0x77u8; 16],
+            file_size: 5,
+            file_name: "x.bin".to_string(),
+            ember_file_hash: None,
+            friends_only: true,
+        };
+        let payload = build_ember_file_offer(&restricted);
+        // What a pre-flag build sees: everything up to the digest slot.
+        let pre_flag = &payload[..payload.len() - 1];
+        let parsed = parse_ember_file_offer(pre_flag).expect("pre-flag body parses");
+        assert_eq!(parsed.file_hash, restricted.file_hash);
+        assert_eq!(parsed.ember_file_hash, None);
+        assert!(!parsed.friends_only);
+
+        let public = EmberFileOffer {
+            friends_only: false,
+            ..restricted
+        };
+        let public_payload = build_ember_file_offer(&public);
+        assert_eq!(public_payload.len(), EMBER_FILE_OFFER_MIN_LEN + "x.bin".len());
+        assert!(!parse_ember_file_offer(&public_payload).unwrap().friends_only);
     }
 
     #[test]
@@ -3568,6 +3768,7 @@ mod tests {
             file_size: 10,
             file_name: "a.bin".to_string(),
             ember_file_hash: None,
+            friends_only: false,
         };
         let good = build_ember_file_offer(&offer);
 
@@ -3601,6 +3802,7 @@ mod tests {
             // 3 bytes per char, so the cap lands mid-character if unguarded.
             file_name: "日".repeat(400),
             ember_file_hash: None,
+            friends_only: false,
         };
         let payload = build_ember_file_offer(&offer);
         let parsed = parse_ember_file_offer(&payload).expect("truncated name still parses");
@@ -3629,6 +3831,29 @@ mod tests {
             assert!(!taken.contains(&op), "op 0x{op:02X} collides");
         }
         assert_ne!(OP_EMBER_XFER_REQ, OP_EMBER_XFER_ACK);
+    }
+
+    #[test]
+    fn a_dialer_sends_mule_info_only_to_legacy_peers_and_ember_1_6() {
+        let mut emule_hash = [0u8; 16];
+        emule_hash[5] = 14;
+        emule_hash[14] = 111;
+        let hello = |update: u8| PeerCapabilities {
+            emule_version_byte: 0x99,
+            emule_version_min: 50,
+            version_update: update,
+            ..Default::default()
+        };
+        assert!(!dialer_needs_mule_info(&emule_hash, &hello(0)), "eMule 0.50a, Ember 1.7");
+        assert!(dialer_needs_mule_info(&emule_hash, &hello(1)), "Ember 1.6.x");
+        assert!(
+            dialer_needs_mule_info(&emule_hash, &PeerCapabilities::default()),
+            "a Hello without CT_EMULE_VERSION"
+        );
+        assert!(
+            !dialer_needs_mule_info(&[0u8; 16], &PeerCapabilities::default()),
+            "not an eMule user hash"
+        );
     }
 
     /// Anti-leecher contract: the public Hello our `build_hello_with_buddy_opts`
@@ -3666,6 +3891,7 @@ mod tests {
     /// us look like a third-party client to anti-leecher mods.
     #[test]
     fn emule_info_has_exactly_seven_tags() {
+        let _secident = SecIdentOverride::hold();
         let payload = build_emule_info(4672, true, None, None);
         // Layout: version(1) + protocol(1) + tag_count(u32) + tags
         assert_eq!(
@@ -3751,6 +3977,7 @@ mod tests {
     /// cannot read it.
     #[test]
     fn ext_protocol_is_claimed_only_where_emule_claims_it() {
+        let _secident = SecIdentOverride::hold();
         let user_hash = [0x11u8; 16];
         let hello = build_hello_with_buddy_opts(
             &user_hash,

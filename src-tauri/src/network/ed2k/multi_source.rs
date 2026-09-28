@@ -21,13 +21,15 @@ use crate::types::Ed2kDownloadLimits;
 use super::chunk_selection::ChunkSelector;
 use super::comments::CommentManager;
 use super::credits::CreditManager;
+use super::peer_sessions;
 use super::part_tracker::PartTracker;
 use super::sources::SourceManager;
 use super::tcp_obfuscation::{self, Rc4Reader, Rc4Writer};
 use super::transfer::CompressedPartAccumulator;
 use super::transfer::{
-    expire_outstanding_ranges, is_filtered_source_ip, push_outstanding_batch,
-    refresh_outstanding_range, take_completed_outstanding_range, DownloadEvent, OutstandingRange,
+    desynced_io_error, expire_outstanding_ranges, is_filtered_source_ip, is_packet_stream_desynced,
+    packet_stream_desynced_error, push_outstanding_batch, refresh_outstanding_range,
+    take_completed_outstanding_range, DownloadEvent, OutstandingRange, PacketStreamDesynced,
 };
 
 /// Shared registry of active download trackers so the shutdown path can
@@ -144,6 +146,198 @@ pub(super) fn corrupt_part_indices_on_disk(
     }
 
     Ok(corrupt)
+}
+
+/// Parts of a `.part` that cannot be read back, or that read back wrong.
+///
+/// Unlike [`corrupt_part_indices_on_disk`], a read error costs only the part
+/// it falls in rather than the whole diagnosis: re-downloading that part
+/// rewrites its sectors, which is what lets a drive remap a bad one. Parts are
+/// only compared when a full hashset is known. `Err` only when the file cannot
+/// be opened or sized at all.
+pub(super) fn unreadable_or_corrupt_parts_on_disk(
+    path: &std::path::Path,
+    file_size: u64,
+    expected_part_hashes: &[[u8; 16]],
+) -> anyhow::Result<Vec<usize>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let part_count = file_size.div_ceil(super::hash::PARTSIZE) as usize;
+    let mut file = std::fs::File::open(path)?;
+    if file.metadata()?.len() != file_size {
+        return Ok((0..part_count).collect());
+    }
+    let hashes = (expected_part_hashes.len() >= part_count).then_some(expected_part_hashes);
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut bad = Vec::new();
+    for part_idx in 0..part_count {
+        let start = part_idx as u64 * super::hash::PARTSIZE;
+        let mut remaining = (file_size - start).min(super::hash::PARTSIZE);
+        let mut hasher = Md4::new();
+        let mut readable = file.seek(SeekFrom::Start(start)).is_ok();
+        while readable && remaining > 0 {
+            let want = (remaining as usize).min(buf.len());
+            match file.read(&mut buf[..want]) {
+                Ok(0) => readable = false,
+                Ok(n) => {
+                    hasher.update(&buf[..n]);
+                    remaining -= n as u64;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => readable = false,
+            }
+        }
+        let wrong = readable
+            && hashes.is_some_and(|h| <[u8; 16]>::from(hasher.finalize()) != h[part_idx]);
+        if !readable || wrong {
+            bad.push(part_idx);
+        }
+    }
+    Ok(bad)
+}
+
+/// Inconclusive final verifications in a row before the `.part` is re-read
+/// part by part, tolerating read errors, instead of verified again.
+pub(super) const FINAL_VERIFY_INCONCLUSIVE_LIMIT: u32 = 3;
+/// Wait before re-verifying after the first inconclusive attempt; doubles for
+/// each further one below [`FINAL_VERIFY_INCONCLUSIVE_LIMIT`].
+pub(super) const FINAL_VERIFY_RETRY_BASE_SECS: u64 = 30;
+
+/// Consecutive inconclusive final verifications per transfer id. Kept here
+/// rather than on the worker because each attempt ends the worker and
+/// re-queues the download.
+fn final_verify_inconclusive_runs() -> &'static std::sync::Mutex<HashMap<String, u32>> {
+    static RUNS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u32>>> =
+        std::sync::OnceLock::new();
+    RUNS.get_or_init(Default::default)
+}
+
+pub(super) fn prior_inconclusive_final_verifies(transfer_id: &str) -> u32 {
+    final_verify_inconclusive_runs()
+        .lock()
+        .map(|runs| runs.get(transfer_id).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+fn note_inconclusive_final_verify(transfer_id: &str) -> u32 {
+    let Ok(mut runs) = final_verify_inconclusive_runs().lock() else {
+        return FINAL_VERIFY_INCONCLUSIVE_LIMIT;
+    };
+    let n = runs.entry(transfer_id.to_string()).or_insert(0);
+    *n = n.saturating_add(1);
+    *n
+}
+
+pub(super) fn clear_inconclusive_final_verifies(transfer_id: &str) {
+    if let Ok(mut runs) = final_verify_inconclusive_runs().lock() {
+        runs.remove(transfer_id);
+    }
+}
+
+/// How long to wait before a final verification that follows `prior`
+/// inconclusive ones. None before the first, and none once the part-by-part
+/// fallback has run: that re-opened parts, so this attempt follows a download.
+pub(super) fn final_verify_retry_delay(prior: u32) -> std::time::Duration {
+    if prior == 0 || prior >= FINAL_VERIFY_INCONCLUSIVE_LIMIT {
+        return std::time::Duration::ZERO;
+    }
+    std::time::Duration::from_secs(FINAL_VERIFY_RETRY_BASE_SECS << (prior - 1))
+}
+
+/// What a failed final whole-file check does to the gap list.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FinalVerifyRecovery {
+    /// These parts are wrong on disk; re-open them for download.
+    Reopen(Vec<usize>),
+    /// Nothing shows the bytes are wrong. Keep every part and verify again
+    /// on the next attempt.
+    Reverify,
+    /// Even a part-by-part re-read cannot find what to re-download. Retrying
+    /// cannot help; the user has to look at the drive.
+    Unreadable,
+}
+
+/// Recovery once the part-by-part fallback has run: re-open what it found,
+/// or give up if it found nothing (or could not open the file).
+pub(super) fn tolerant_final_verify_recovery(diagnosis: Option<Vec<usize>>) -> FinalVerifyRecovery {
+    match diagnosis {
+        Some(parts) if !parts.is_empty() => FinalVerifyRecovery::Reopen(parts),
+        _ => FinalVerifyRecovery::Unreadable,
+    }
+}
+
+/// Count `recovery` against this transfer's run of inconclusive verifications
+/// and escalate once the run reaches [`FINAL_VERIFY_INCONCLUSIVE_LIMIT`].
+///
+/// A digest that was actually computed ends the run. The count survives the
+/// fallback's own re-open, so a part that still cannot be read after being
+/// downloaded again goes straight back to the fallback, and a `.part` that
+/// reads fine part by part but never as a whole ends as `Unreadable` rather
+/// than cycling.
+pub(super) async fn settle_final_verify_recovery(
+    transfer_id: &str,
+    recovery: FinalVerifyRecovery,
+    part_path: PathBuf,
+    file_size: u64,
+    expected_part_hashes: Vec<[u8; 16]>,
+) -> FinalVerifyRecovery {
+    if recovery != FinalVerifyRecovery::Reverify {
+        clear_inconclusive_final_verifies(transfer_id);
+        return recovery;
+    }
+    if note_inconclusive_final_verify(transfer_id) < FINAL_VERIFY_INCONCLUSIVE_LIMIT {
+        return FinalVerifyRecovery::Reverify;
+    }
+    let diagnosis = tokio::task::spawn_blocking(move || {
+        unreadable_or_corrupt_parts_on_disk(&part_path, file_size, &expected_part_hashes)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok);
+    let settled = tolerant_final_verify_recovery(diagnosis);
+    if settled == FinalVerifyRecovery::Unreadable {
+        clear_inconclusive_final_verifies(transfer_id);
+    }
+    settled
+}
+
+/// Decide the recovery after the whole-file ed2k digest mismatched.
+///
+/// `diagnosis` is [`corrupt_part_indices_on_disk`]'s answer, `None` when that
+/// re-read failed. An empty diagnosis only re-opens everything when the
+/// hashset it was checked against does not reproduce the file hash: when it
+/// does, parts that all match imply a file that matches, so the mismatch came
+/// from the read, not the data.
+pub(super) fn final_verify_recovery(
+    diagnosis: Option<Vec<usize>>,
+    hashset_reproduces_file_hash: bool,
+    part_count: usize,
+) -> FinalVerifyRecovery {
+    match diagnosis {
+        None => FinalVerifyRecovery::Reverify,
+        Some(parts) if !parts.is_empty() => FinalVerifyRecovery::Reopen(parts),
+        Some(_) if hashset_reproduces_file_hash => FinalVerifyRecovery::Reverify,
+        Some(_) => FinalVerifyRecovery::Reopen((0..part_count).collect()),
+    }
+}
+
+/// Re-read the `.part` part by part after a whole-file digest mismatch and
+/// decide what to re-open. See [`final_verify_recovery`].
+pub(super) async fn diagnose_final_hash_mismatch(
+    part_path: PathBuf,
+    file_hash: [u8; 16],
+    file_size: u64,
+    expected_part_hashes: Vec<[u8; 16]>,
+) -> FinalVerifyRecovery {
+    let part_count = file_size.div_ceil(super::hash::PARTSIZE) as usize;
+    let hashset_ok =
+        super::transfer::verify_hashset(&file_hash, &expected_part_hashes, file_size);
+    let diagnosis = tokio::task::spawn_blocking(move || {
+        corrupt_part_indices_on_disk(&part_path, file_size, &expected_part_hashes)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok);
+    final_verify_recovery(diagnosis, hashset_ok, part_count)
 }
 
 /// Record that peer `(ip, port)` dropped the TCP connection immediately
@@ -716,10 +910,130 @@ const OUTBOUND_DIAL_MIN_INTERVAL: std::time::Duration = std::time::Duration::fro
 static OUTBOUND_DIAL_GATE: std::sync::OnceLock<tokio::sync::Mutex<std::time::Instant>> =
     std::sync::OnceLock::new();
 
-/// Block until this task may open a new outbound connection, spacing dials by
-/// `OUTBOUND_DIAL_MIN_INTERVAL`. The gate lock is never held across the sleep
-/// — each caller reserves its slot, releases the lock, then waits.
-async fn throttle_outbound_dial() {
+/// eMule's `MaxConperFive`, the "New Connections / 5s" setting: how many new
+/// client connections, in either direction, one five-second window may count
+/// before we stop opening more (`CListenSocket::TooManySockets`, with the
+/// window reset every five seconds by `CListenSocket::Process`,
+/// `UploadQueue.cpp:1085`). `0` turns the limit off.
+///
+/// Only our own dials wait on it. eMule's accept path passes `bIgnoreInterval`
+/// (`ListenSocket.cpp:2524`) and merely counts the connection: one that has
+/// reached us has already crossed the router, so refusing it protects nothing
+/// and turns away a peer that wanted our files. eMule also shrinks the budget
+/// during connection spikes (`GetMaxConperFiveModifier`); that only ever makes
+/// it stricter, and is not reproduced here.
+static NEW_CONNS_PER_FIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(20);
+const NEW_CONN_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+/// When the current window opened, and how many connections it has counted.
+static NEW_CONN_WINDOW_STATE: std::sync::Mutex<Option<(std::time::Instant, usize)>> =
+    std::sync::Mutex::new(None);
+
+/// Apply the "New Connections / 5s" setting. Safe to call at start and on
+/// every settings change.
+pub fn set_new_connections_per_five(budget: usize) {
+    NEW_CONNS_PER_FIVE.store(budget, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count a connection the upload listener accepted toward the window.
+pub fn note_inbound_connection() {
+    let mut window = NEW_CONN_WINDOW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+    let budget = NEW_CONNS_PER_FIVE.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = admit_new_connection(&mut window, budget, std::time::Instant::now(), false);
+}
+
+/// Count a new connection in the window, or, for an outbound one that finds
+/// the window full, say how long until it reopens. Inbound connections are
+/// always counted and never refused.
+fn admit_new_connection(
+    window: &mut Option<(std::time::Instant, usize)>,
+    budget: usize,
+    now: std::time::Instant,
+    outbound: bool,
+) -> Option<std::time::Duration> {
+    let (started, count) = match *window {
+        Some((started, count)) if now.saturating_duration_since(started) < NEW_CONN_WINDOW => {
+            (started, count)
+        }
+        _ => (now, 0),
+    };
+    if outbound && budget > 0 && count >= budget {
+        *window = Some((started, count));
+        return Some(NEW_CONN_WINDOW.saturating_sub(now.saturating_duration_since(started)));
+    }
+    *window = Some((started, count + 1));
+    None
+}
+
+/// How long until the "New Connections / 5s" window has room for a dial,
+/// without taking a place in it. `None` when there is room now.
+fn new_connection_window_wait(
+    window: &Option<(std::time::Instant, usize)>,
+    budget: usize,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
+    match *window {
+        Some((started, count))
+            if budget > 0
+                && count >= budget
+                && now.saturating_duration_since(started) < NEW_CONN_WINDOW =>
+        {
+            Some(NEW_CONN_WINDOW.saturating_sub(now.saturating_duration_since(started)))
+        }
+        _ => None,
+    }
+}
+
+fn outbound_dial_window_wait() -> Option<std::time::Duration> {
+    let window = NEW_CONN_WINDOW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+    let budget = NEW_CONNS_PER_FIVE.load(std::sync::atomic::Ordering::Relaxed);
+    new_connection_window_wait(&window, budget, std::time::Instant::now())
+}
+
+/// Take this dial's place in the window, or say how long until it reopens.
+fn try_admit_outbound_dial() -> Option<std::time::Duration> {
+    let mut window = NEW_CONN_WINDOW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+    let budget = NEW_CONNS_PER_FIVE.load(std::sync::atomic::Ordering::Relaxed);
+    admit_new_connection(&mut window, budget, std::time::Instant::now(), true)
+}
+
+/// A slot in the shared connection budget for a download dial, taken only
+/// once the "New Connections / 5s" window has room for it.
+///
+/// The window is waited out without a slot. Accepts count toward it too, so a
+/// busy sharer can keep it full for a while, and a dial parked on a slot in
+/// the meantime is one requester the listener turns away — enough of them, and
+/// after [`MAX_LISTENER_FLOOR_WAIT`] they reach into the listener's reserve as
+/// well. eMule never holds a socket while its window is full: the download
+/// simply does not connect that tick (`TooManySockets`).
+///
+/// Gives up without a slot once the download is cancelled or paused: a busy
+/// window can stay full for a long time, and the caller checks the control
+/// straight after.
+async fn acquire_dial_slot(control: &TransferControl) -> Option<GlobalConnPermit> {
+    loop {
+        if control.is_cancelled() || control.is_paused() {
+            return None;
+        }
+        let priority_ord = control.download_priority_ordinal();
+        if let Some(wait) = outbound_dial_window_wait() {
+            tokio::time::sleep(wait.max(std::time::Duration::from_millis(1))).await;
+            continue;
+        }
+        let permit = acquire_global_dl_conn(priority_ord).await;
+        match try_admit_outbound_dial() {
+            None => return permit,
+            // Another dial took the last place while this one waited for a slot.
+            Some(wait) => {
+                drop(permit);
+                tokio::time::sleep(wait.max(std::time::Duration::from_millis(1))).await;
+            }
+        }
+    }
+}
+
+/// Space our own dials by `OUTBOUND_DIAL_MIN_INTERVAL`. The lock is not held
+/// across the sleep: each caller reserves its place, releases it, then waits.
+async fn space_outbound_dial() {
     let gate = OUTBOUND_DIAL_GATE.get_or_init(|| {
         tokio::sync::Mutex::new(std::time::Instant::now() - OUTBOUND_DIAL_MIN_INTERVAL)
     });
@@ -805,6 +1119,68 @@ struct LivePeerGuard {
 impl Drop for LivePeerGuard {
     fn drop(&mut self) {
         release_live_peer(&self.transfer_id, &self.id);
+    }
+}
+
+/// A source connection past its handshake. Owns both halves so that, however
+/// the download session ends, a peer still waiting on requests it sent us
+/// over this socket gets the connection passed to the upload server instead
+/// of closed (see [`peer_sessions::HeldRequests`]).
+struct PeerConnection {
+    reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    held: Arc<peer_sessions::HeldRequests>,
+    peer_addr: SocketAddr,
+    peer_user_hash: [u8; 16],
+    hello_caps: super::messages::PeerCapabilities,
+    session: Option<peer_sessions::PeerSession>,
+}
+
+impl PeerConnection {
+    fn new(
+        reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        peer_addr: SocketAddr,
+        peer_user_hash: [u8; 16],
+        hello_caps: super::messages::PeerCapabilities,
+        session: Option<peer_sessions::PeerSession>,
+    ) -> Self {
+        let held = Arc::new(peer_sessions::HeldRequests::default());
+        Self {
+            reader: Box::new(peer_sessions::HoldingReader::new(reader, held.clone())),
+            writer: Box::new(peer_sessions::FrameTrackingWriter::new(
+                writer,
+                held.clone(),
+            )),
+            held,
+            peer_addr,
+            peer_user_hash,
+            hello_caps,
+            session,
+        }
+    }
+}
+
+impl Drop for PeerConnection {
+    fn drop(&mut self) {
+        if !self.held.ready_for_handover() {
+            return;
+        }
+        self.held.release();
+        let handover = peer_sessions::DownloadHandover {
+            peer_addr: self.peer_addr,
+            reader: std::mem::replace(&mut self.reader, Box::new(tokio::io::empty())),
+            writer: std::mem::replace(&mut self.writer, Box::new(tokio::io::sink())),
+            peer_user_hash: self.peer_user_hash,
+            hello_caps: std::mem::take(&mut self.hello_caps),
+            session: self.session.take(),
+        };
+        if peer_sessions::hand_over(handover) {
+            debug!(
+                "Passing connection to {} to the upload server: the peer asked us for files on it",
+                self.peer_addr
+            );
+        }
     }
 }
 
@@ -949,6 +1325,29 @@ fn no_source_can_ever_arrive(
     has_established_rx: bool,
 ) -> bool {
     sources_empty && !has_source_rx && !has_established_rx
+}
+
+/// Smallest OP_SENDINGPART accepted for a range we never asked for (D18). A
+/// peer shipping 1-byte chunks unprompted is broken or abusive (work
+/// amplification against the syscall/allocator path).
+const MIN_UNSOLICITED_BLOCK_BYTES: u64 = 16;
+
+/// True for an undersized block that neither ends the file nor lies inside a
+/// range we requested. The floor cannot apply to requested ranges: the gap
+/// planner asks for whatever gaps remain, and an interrupted compressed block
+/// can leave a tail of any length, which the uploader answers with an
+/// uncompressed packet of exactly that size.
+fn is_unsolicited_undersized_block(
+    start: u64,
+    end: u64,
+    file_size: u64,
+    requested: impl IntoIterator<Item = (u64, u64)>,
+) -> bool {
+    end.saturating_sub(start) < MIN_UNSOLICITED_BLOCK_BYTES
+        && end != file_size
+        && !requested
+            .into_iter()
+            .any(|(req_start, req_end)| start >= req_start && end <= req_end)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1317,7 +1716,10 @@ impl Drop for WriteReservation {
         }
         let to_release = std::mem::take(&mut self.reserved);
         if let Some(tx) = &self.drop_tx {
-            if tx.send(DropReleaseOp::WriteRanges(to_release.clone())).is_ok() {
+            if tx
+                .send(DropReleaseOp::WriteRanges(to_release.clone()))
+                .is_ok()
+            {
                 return;
             }
         }
@@ -1357,13 +1759,8 @@ async fn write_gap_subranges_ms(
     drop_tx: Option<&DropReleaseTx>,
 ) -> GapWriteOutcome {
     let end = start.saturating_add(data.len() as u64);
-    let mut reservation = WriteReservation::acquire_with_release(
-        tracker,
-        start,
-        end,
-        drop_tx.cloned(),
-    )
-    .await;
+    let mut reservation =
+        WriteReservation::acquire_with_release(tracker, start, end, drop_tx.cloned()).await;
     let mut written_subranges = Vec::with_capacity(reservation.ranges().len());
     let mut write_ok = true;
     let mut disk_full = None;
@@ -1586,44 +1983,34 @@ enum InSessionRequeueResult {
     Disconnected(String),
 }
 
-/// Try to re-acquire an upload slot from the peer on the SAME TCP
-/// connection that just signalled `OP_OUTOFPARTREQS`. Sends a fresh
-/// `OP_STARTUPLOADREQ` (the eMule "I want this file" packet) and waits
-/// up to `timeout_secs` for the peer to either:
+/// Wait on the SAME TCP connection that just signalled `OP_OUTOFPARTREQS`
+/// for the peer to hand us the next slot. Waits up to `timeout_secs` for
+/// the peer to either:
 ///   * promote us with `OP_ACCEPTUPLOADREQ` → `Promoted`
 ///   * reject us with `OP_QUEUEFULL` → `Timeout`
 ///   * stay silent past the deadline → `Timeout`
 ///   * close the TCP socket → `Disconnected`
 ///
-/// Saves a Hello/SecIdent/obfuscation reconnect (1–3 s) on every
-/// peer-rotation cycle. eMule's per-session upload cap (SESSIONMAXTRANS,
-/// ~9.30 MiB) means well-behaved peers fire `OP_OUTOFPARTREQS` after
-/// every ~1 part of upload to us — without re-queue we'd pay the full
-/// reconnect tax for each subsequent part from the same peer.
+/// Nothing is sent. The uploader re-queues us itself when it rotates us
+/// out (`SendOutOfPartReqsAndAddToWaitingQueue`, UploadClient.cpp:487-500,
+/// and our own uploader after `OP_OUTOFPARTREQS`), and eMule's downloader
+/// only moves to `DS_ONQUEUE` (ListenSocket.cpp:583-589). A fresh
+/// `OP_STARTUPLOADREQ` here reaches `AddRequestCount` (UploadQueue.cpp:528)
+/// and, inside `MIN_REQUESTTIME` of our previous ask, is a strike toward
+/// eMule's `BADCLIENTBAN` "Aggressive behaviour" ban.
 ///
-/// Wire-protocol-compatible: `OP_STARTUPLOADREQ` mid-session is the
-/// same packet the initial handshake uses, and our own upload code
-/// (`upload.rs:2613`) already handles duplicate `OP_STARTUPLOADREQ`
-/// from a peer whose previous session was just rotated out.
-async fn try_in_session_requeue<R, W>(
-    writer: &mut W,
+/// An idle eMule socket times out after `CONNECTION_TIMEOUT` (40 s), so a
+/// disconnect here is the normal outcome and we stay on its queue; the
+/// uploader dials us (or we reask) when our turn comes.
+async fn try_in_session_requeue<R>(
     reader: &mut R,
-    file_hash: &[u8; 16],
     timeout_secs: u64,
     control: &TransferControl,
 ) -> InSessionRequeueResult
 where
     R: AsyncReadExt + Unpin + ?Sized,
-    W: AsyncWriteExt + Unpin + ?Sized,
 {
     use super::messages::*;
-
-    let upload_req = build_file_request(file_hash);
-    if let Err(e) =
-        write_packet_async_ms(writer, OP_EDONKEYHEADER, OP_STARTUPLOADREQ, &upload_req).await
-    {
-        return InSessionRequeueResult::Disconnected(format!("send OP_STARTUPLOADREQ: {e:#}"));
-    }
 
     let queue_start = std::time::Instant::now();
     loop {
@@ -1801,9 +2188,13 @@ impl MultiSourceDownload {
                     transfer_id: self.transfer_id.clone(),
                 })
                 .await;
+            let zero_name = self
+                .control
+                .seal_pending_rename()
+                .unwrap_or_else(|| self.file_name.clone());
             let zero_final = super::transfer::finalize_zero_ed2k_file(
                 &self.transfer_id,
-                &self.file_name,
+                &zero_name,
                 self.file_hash,
                 &self.download_dir,
             )
@@ -1846,24 +2237,8 @@ impl MultiSourceDownload {
         );
 
         let allowed_roots = vec![self.download_dir.to_string_lossy().into_owned()];
-        let temp_dir = {
-            let root = self.download_dir.clone();
-            let allowed = allowed_roots.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::security::filesystem::prepare_approved_subdir(&root, "Temp", &allowed)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("temp dir task failed: {e}"))??
-        };
-        let _completed_dir = {
-            let root = self.download_dir.clone();
-            let allowed = allowed_roots.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::security::filesystem::prepare_approved_subdir(&root, "Downloads", &allowed)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("downloads dir task failed: {e}"))??
-        };
+        let (temp_dir, _completed_dir) =
+            super::transfer::prepare_download_dirs(&self.download_dir).await?;
 
         let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
         let file_size = self.file_size;
@@ -1876,6 +2251,7 @@ impl MultiSourceDownload {
         .map_err(|e| anyhow::anyhow!("part tracker load task failed: {e}"))?;
         pt.set_file_hash(self.file_hash);
         pt.set_file_name(&self.file_name);
+        super::transfer::apply_control_rename(&self.control, &mut pt);
         let tracker = Arc::new(RwLock::new(pt));
 
         if let Some(ref registry) = self.tracker_registry {
@@ -1902,6 +2278,7 @@ impl MultiSourceDownload {
                     *t = PartTracker::new_empty(self.file_size, &part_path);
                     t.set_file_hash(self.file_hash);
                     t.set_file_name(&self.file_name);
+                    super::transfer::apply_control_rename(&self.control, &mut t);
                     t.snapshot_for_save()
                 };
                 spawn_save_snapshot(snap).await;
@@ -1942,7 +2319,10 @@ impl MultiSourceDownload {
                 Ok(())
             })
             .await
-            .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+            .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))?
+            .map_err(|e| {
+                super::transfer::download_folder_error("creating the part file", &self.download_dir, e)
+            })?;
         }
 
         let _ = event_tx
@@ -1958,13 +2338,11 @@ impl MultiSourceDownload {
         // correct on resume (when the first part is already verified on disk)
         // before any new block arrives. The progress aggregator keeps it fresh
         // as parts verify during the download.
-        self.control.set_preview_ready(
-            self.expected_aich_master.is_none()
-                && tracker
-                    .read()
-                    .await
-                    .is_preview_ready(&self.file_name, self.file_size),
-        );
+        self.control.set_preview_ready(self.expected_aich_master.is_none() && {
+            let t = tracker.read().await;
+            let name = super::transfer::completed_download_name(t.file_name(), &self.file_name);
+            t.is_preview_ready(&name, self.file_size)
+        });
 
         // Shared rarest-first chunk selector for dynamic part assignment
         let part_count = {
@@ -2220,6 +2598,7 @@ impl MultiSourceDownload {
             let mut last_total: u32 = agg_total.load(Ordering::Relaxed);
             let mut pending_progress = false;
             let mut last_emitted_bytes: u64 = 0;
+            let mut last_emitted_wire: u64 = 0;
             let mut interval = tokio::time::interval(EMIT_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Skip the immediate first tick so we don't emit before any
@@ -2248,9 +2627,13 @@ impl MultiSourceDownload {
                                 // Refresh preview-readiness while we hold the
                                 // lock: cheap, and this is the cadence at which
                                 // the first part finishes + verifies mid-download.
+                                // By the tracker's name, which a rename updates.
+                                let name = super::transfer::completed_download_name(
+                                    t.file_name(),
+                                    &agg_file_name,
+                                );
                                 agg_control.set_preview_ready(
-                                    !agg_requires_final_aich
-                                        && t.is_preview_ready(&agg_file_name, file_size),
+                                    !agg_requires_final_aich && t.is_preview_ready(&name, file_size),
                                 );
                                 (t.progress_bytes().min(file_size), t.transferred())
                             };
@@ -2259,7 +2642,14 @@ impl MultiSourceDownload {
                             // negative correction that landed at the same
                             // total). Saves a UI round-trip when sources
                             // are flapping but bytes are static.
-                            if pending_progress && capped != last_emitted_bytes {
+                            //
+                            // Wire bytes count too: overlapping / duplicate
+                            // blocks do not move `progress_bytes`, and skipping
+                            // those left `last_received` stale so a live
+                            // download flashed Stalled every health tick.
+                            if pending_progress
+                                && (capped != last_emitted_bytes || wire_total != last_emitted_wire)
+                            {
                                 let _ = event_tx_clone
                                     .send(DownloadEvent::Progress {
                                         transfer_id: transfer_id.clone(),
@@ -2269,6 +2659,7 @@ impl MultiSourceDownload {
                                     })
                                     .await;
                                 last_emitted_bytes = capped;
+                                last_emitted_wire = wire_total;
                             }
                             pending_progress = false;
 
@@ -2293,12 +2684,13 @@ impl MultiSourceDownload {
             // last source closes.
             let (capped, wire_total) = {
                 let t = agg_tracker.read().await;
+                let name = super::transfer::completed_download_name(t.file_name(), &agg_file_name);
                 agg_control.set_preview_ready(
-                    !agg_requires_final_aich && t.is_preview_ready(&agg_file_name, file_size),
+                    !agg_requires_final_aich && t.is_preview_ready(&name, file_size),
                 );
                 (t.progress_bytes().min(file_size), t.transferred())
             };
-            if capped != last_emitted_bytes {
+            if capped != last_emitted_bytes || wire_total != last_emitted_wire {
                 let _ = event_tx_clone
                     .send(DownloadEvent::Progress {
                         transfer_id: transfer_id.clone(),
@@ -2372,7 +2764,9 @@ impl MultiSourceDownload {
             Some(self.control.discarding_flag()),
         )
         .await
-        .map_err(|e| anyhow::anyhow!("open part file: {e}"))?;
+        .map_err(|e| {
+            super::transfer::download_folder_error("opening the part file", &self.download_dir, e)
+        })?;
 
         // Spawn per-source download tasks
         let mut handles = Vec::new();
@@ -3740,22 +4134,27 @@ impl MultiSourceDownload {
                             }
                         }
                         if super::transfer::should_emit_source_failed(&err_str) {
-                            warn!("Adopted callback source {} ({}) failed: {e:#}", src_idx, fail_ip);
-                            let _ = fail_etx.send(DownloadEvent::SourceDetail {
-                                transfer_id: fail_tid,
-                                ip: fail_ip,
-                                port: fail_port,
-                                status: "failed".to_string(),
-                                queue_rank: None,
-                                speed: 0,
-                                transferred: 0,
-                                client_software: String::new(),
-                                peer_name: String::new(),
-                                failure_kind: Some(super::transfer::classify_error(&err_str)),
-                                available_parts: None,
-                                total_parts: None,
-                                country_code: None,
-                            }).await;
+                            warn!(
+                                "Adopted callback source {} ({}) failed: {e:#}",
+                                src_idx, fail_ip
+                            );
+                            let _ = fail_etx
+                                .send(DownloadEvent::SourceDetail {
+                                    transfer_id: fail_tid,
+                                    ip: fail_ip,
+                                    port: fail_port,
+                                    status: "failed".to_string(),
+                                    queue_rank: None,
+                                    speed: 0,
+                                    transferred: 0,
+                                    client_software: String::new(),
+                                    peer_name: String::new(),
+                                    failure_kind: Some(super::transfer::classify_error(&err_str)),
+                                    available_parts: None,
+                                    total_parts: None,
+                                    country_code: None,
+                                })
+                                .await;
                         }
                     }
                 });
@@ -3813,14 +4212,34 @@ impl MultiSourceDownload {
             // 29 min cooldown and a peer that simply refused a TCP
             // connection gets the hello-fail cooldown (`MIN_REQUESTTIME`).
             let now = std::time::Instant::now();
+            // Our last `OP_STARTUPLOADREQ` may predate this download's own
+            // history (a pause, a restart, another transfer path), so the
+            // process-wide record gates dials alongside `source_dial_history`.
+            let file_hash = self.file_hash;
+            let reask_wait = |s: &DownloadSource| -> std::time::Duration {
+                s.peer_ip
+                    .parse::<Ipv4Addr>()
+                    .ok()
+                    .and_then(|ip| {
+                        peer_sessions::upload_request_wait(
+                            s.peer_user_hash,
+                            ip,
+                            &[s.peer_port],
+                            &file_hash,
+                        )
+                    })
+                    .unwrap_or_default()
+            };
             let eligible: Vec<bool> = all_sources
                 .iter()
-                .map(
-                    |s| match source_dial_history.get(&(s.peer_ip.clone(), s.peer_port)) {
+                .map(|s| {
+                    let cooled = match source_dial_history.get(&(s.peer_ip.clone(), s.peer_port))
+                    {
                         Some((t, kind)) => now.duration_since(*t) >= cooldown_for(*kind),
                         None => true,
-                    },
-                )
+                    };
+                    cooled && reask_wait(s).is_zero()
+                })
                 .collect();
 
             let mut retry_assignments: Vec<Vec<usize>> = vec![Vec::new(); all_sources.len()];
@@ -3924,7 +4343,8 @@ impl MultiSourceDownload {
                             .checked_sub(now.duration_since(*t))
                             .unwrap_or_default(),
                         None => std::time::Duration::ZERO,
-                    };
+                    }
+                    .max(reask_wait(source));
                     next_eligible = Some(match next_eligible {
                         Some(cur) => cur.min(remaining),
                         None => remaining,
@@ -4259,21 +4679,23 @@ impl MultiSourceDownload {
                                 src_idx, r_src_ip, SOURCE_RETRY_COOLDOWN_SECS,
                             );
                         } else {
-                            let _ = rfail_etx.send(DownloadEvent::SourceDetail {
-                                transfer_id: rfail_tid,
-                                ip: rfail_ip,
-                                port: rfail_port,
-                                status: "failed".to_string(),
-                                queue_rank: None,
-                                speed: 0,
-                                transferred: 0,
-                                client_software: String::new(),
-                                peer_name: String::new(),
-                                failure_kind: Some(super::transfer::classify_error(&err_str)),
-                                available_parts: None,
-                                total_parts: None,
-                                country_code: None,
-                            }).await;
+                            let _ = rfail_etx
+                                .send(DownloadEvent::SourceDetail {
+                                    transfer_id: rfail_tid,
+                                    ip: rfail_ip,
+                                    port: rfail_port,
+                                    status: "failed".to_string(),
+                                    queue_rank: None,
+                                    speed: 0,
+                                    transferred: 0,
+                                    client_software: String::new(),
+                                    peer_name: String::new(),
+                                    failure_kind: Some(super::transfer::classify_error(&err_str)),
+                                    available_parts: None,
+                                    total_parts: None,
+                                    country_code: None,
+                                })
+                                .await;
                             warn!("Retry source {} failed: {e:#}", src_idx);
                         }
                     }
@@ -4351,6 +4773,24 @@ impl MultiSourceDownload {
         };
 
         if all_done {
+            let retry_delay =
+                final_verify_retry_delay(prior_inconclusive_final_verifies(&self.transfer_id));
+            if !retry_delay.is_zero() {
+                info!(
+                    "Waiting {}s before re-verifying {} after an unreadable attempt",
+                    retry_delay.as_secs(),
+                    self.file_name
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(retry_delay) => {}
+                    _ = self.control.wait_cancelled() => {
+                        if let Some(ref registry) = self.tracker_registry {
+                            unregister_own_tracker(registry, &self.transfer_id, &tracker);
+                        }
+                        anyhow::bail!("cancelled by user");
+                    }
+                }
+            }
             let _ = event_tx
                 .send(DownloadEvent::Verifying {
                     transfer_id: self.transfer_id.clone(),
@@ -4385,6 +4825,7 @@ impl MultiSourceDownload {
             let expected_aich = self.expected_aich_master;
             let ember_expected = self.ember_file_hash;
             let mut ember_pin_failed = false;
+            let mut could_not_verify = false;
             // `handle.abort()` cannot interrupt `spawn_blocking`, so a Stop or
             // Pause during "Verifying" would otherwise leave a thread reading a
             // multi-GB file for minutes. `TransferControl` does not expose its
@@ -4460,16 +4901,18 @@ impl MultiSourceDownload {
                             self.file_name
                         );
                     } else {
+                        could_not_verify = true;
                         warn!(
-                            "Multi-source download hash verification failed for {}: {e}",
+                            "Could not read {} for final verification: {e} — keeping progress",
                             self.file_name
                         );
                     }
                     None
                 }
                 Err(e) => {
+                    could_not_verify = true;
                     warn!(
-                        "Hash verification task failed for {}: {e} — treating as failed",
+                        "Hash verification task failed for {}: {e} — keeping progress",
                         self.file_name
                     );
                     None
@@ -4489,6 +4932,7 @@ impl MultiSourceDownload {
             }
 
             if ember_pin_failed {
+                clear_inconclusive_final_verifies(&self.transfer_id);
                 let _ = event_tx
                     .send(DownloadEvent::Failed {
                         transfer_id: self.transfer_id.clone(),
@@ -4499,6 +4943,7 @@ impl MultiSourceDownload {
             } else if let Some((verified_identity, actual_aich, verified_part_hashes)) =
                 verified_result
             {
+                clear_inconclusive_final_verifies(&self.transfer_id);
                 if let Some(expected_aich) = self.expected_aich_master {
                     let computed = actual_aich.ok_or_else(|| {
                         anyhow::anyhow!("AICH verification did not produce a root")
@@ -4515,11 +4960,12 @@ impl MultiSourceDownload {
                 // Mark every part verified (covers < PARTSIZE single-part
                 // files that never set per-part flags, and acts as a
                 // belt-and-braces reset for multi-part files).
-                {
+                let safe_name = {
                     let mut t = tracker.write().await;
                     t.mark_file_hash_verified();
-                }
-                let safe_name = crate::security::sanitize_filename(&self.file_name);
+                    super::transfer::seal_control_rename(&self.control, &mut t);
+                    super::transfer::completed_download_name(t.file_name(), &self.file_name)
+                };
                 let final_path = self.download_dir.join("Downloads").join(&safe_name);
                 let pp = part_path.clone();
                 let fp = final_path.clone();
@@ -4570,64 +5016,108 @@ impl MultiSourceDownload {
                     .await;
             } else {
                 let expected_part_hashes = part_hashes.read().await.clone();
-                let diagnose_path = part_path.clone();
-                let diagnose_size = self.file_size;
-                let corrupt_parts = tokio::task::spawn_blocking(move || {
-                    corrupt_part_indices_on_disk(
-                        &diagnose_path,
-                        diagnose_size,
-                        &expected_part_hashes,
+                let recovery = if could_not_verify {
+                    FinalVerifyRecovery::Reverify
+                } else {
+                    diagnose_final_hash_mismatch(
+                        part_path.clone(),
+                        self.file_hash,
+                        self.file_size,
+                        expected_part_hashes.clone(),
                     )
-                })
-                .await
-                .ok()
-                .and_then(Result::ok);
-
-                let (corrected_bytes, corrected_wire, snap) = {
-                    let mut t = tracker.write().await;
-                    let mut parts_to_reopen = corrupt_parts.unwrap_or_default();
-                    if parts_to_reopen.is_empty() {
-                        parts_to_reopen = (0..t.part_count).collect();
-                    }
-                    for &i in &parts_to_reopen {
-                        if i < t.part_count {
-                            t.mark_incomplete(i);
-                        }
-                    }
-                    warn!(
-                        "Final hash failed for {} — re-opened {}/{} part(s) for retry",
-                        self.file_name,
-                        parts_to_reopen.len(),
-                        t.part_count
-                    );
-                    (t.completed_bytes(), t.transferred(), t.snapshot_for_save())
+                    .await
                 };
-                // Awaited save here: this is a terminal failure path and
-                // we want the .part.met on disk to reflect the reset
-                // before signaling the failure (so a quick restart picks
-                // up the corrected gap list).
-                super::part_tracker::save_snapshot_async(snap).await;
-                let _ = event_tx
-                    .send(DownloadEvent::Progress {
-                        transfer_id: self.transfer_id.clone(),
-                        downloaded: corrected_bytes.min(self.file_size),
-                        // The re-open dropped Completed back by the failed
-                        // part(s); Transferred keeps every byte those parts cost,
-                        // which is the point of having both numbers.
-                        transferred: Some(corrected_wire),
-                        total: self.file_size,
-                    })
-                    .await;
-                let _ = event_tx
-                    .send(DownloadEvent::Failed {
-                        transfer_id: self.transfer_id.clone(),
-                        error: "Final hash verification failed — .part preserved for retry"
-                            .to_string(),
-                        // Transient: parts were reopened and .part.met saved;
-                        // the network loop re-queues Searching so recovery continues.
-                        failure_kind: super::transfer::SourceFailureKind::Transient,
-                    })
-                    .await;
+                let inconclusive = recovery == FinalVerifyRecovery::Reverify;
+                let recovery = settle_final_verify_recovery(
+                    &self.transfer_id,
+                    recovery,
+                    part_path.clone(),
+                    self.file_size,
+                    expected_part_hashes,
+                )
+                .await;
+                match recovery {
+                    FinalVerifyRecovery::Reopen(parts_to_reopen) => {
+                        let (corrected_bytes, corrected_wire, snap) = {
+                            let mut t = tracker.write().await;
+                            for &i in &parts_to_reopen {
+                                if i < t.part_count {
+                                    t.mark_incomplete(i);
+                                }
+                            }
+                            warn!(
+                                "Final hash failed for {} — re-opened {}/{} part(s) for retry",
+                                self.file_name,
+                                parts_to_reopen.len(),
+                                t.part_count
+                            );
+                            (t.completed_bytes(), t.transferred(), t.snapshot_for_save())
+                        };
+                        // Awaited save here: this is a terminal failure path and
+                        // we want the .part.met on disk to reflect the reset
+                        // before signaling the failure (so a quick restart picks
+                        // up the corrected gap list).
+                        super::part_tracker::save_snapshot_async(snap).await;
+                        let _ = event_tx
+                            .send(DownloadEvent::Progress {
+                                transfer_id: self.transfer_id.clone(),
+                                downloaded: corrected_bytes.min(self.file_size),
+                                // The re-open dropped Completed back by the failed
+                                // part(s); Transferred keeps every byte those parts
+                                // cost, which is the point of having both numbers.
+                                transferred: Some(corrected_wire),
+                                total: self.file_size,
+                            })
+                            .await;
+                        // A re-open after read errors is still our drive's
+                        // fault, not a source's, and must read that way.
+                        let error = if inconclusive {
+                            super::transfer::FINAL_VERIFY_INCONCLUSIVE_MSG
+                        } else {
+                            "Final hash verification failed — .part preserved for retry"
+                        };
+                        let _ = event_tx
+                            .send(DownloadEvent::Failed {
+                                transfer_id: self.transfer_id.clone(),
+                                error: error.to_string(),
+                                // Transient: parts were reopened and .part.met saved;
+                                // the network loop re-queues Searching so recovery
+                                // continues.
+                                failure_kind: super::transfer::SourceFailureKind::Transient,
+                            })
+                            .await;
+                    }
+                    FinalVerifyRecovery::Unreadable => {
+                        warn!(
+                            "{} still cannot be read after {FINAL_VERIFY_INCONCLUSIVE_LIMIT} \
+                             verification attempts and a part-by-part re-read — giving up",
+                            self.file_name
+                        );
+                        let _ = event_tx
+                            .send(DownloadEvent::Failed {
+                                transfer_id: self.transfer_id.clone(),
+                                error: super::transfer::LOCAL_READ_FAILED_MSG.to_string(),
+                                failure_kind: super::transfer::SourceFailureKind::Transient,
+                            })
+                            .await;
+                    }
+                    FinalVerifyRecovery::Reverify => {
+                        warn!(
+                            "Final verification of {} was inconclusive — gap list kept, will re-verify",
+                            self.file_name
+                        );
+                        // Transient re-queues the download with its gap list
+                        // intact, so the next attempt re-runs this verification
+                        // rather than downloading anything again.
+                        let _ = event_tx
+                            .send(DownloadEvent::Failed {
+                                transfer_id: self.transfer_id.clone(),
+                                error: super::transfer::FINAL_VERIFY_INCONCLUSIVE_MSG.to_string(),
+                                failure_kind: super::transfer::SourceFailureKind::Transient,
+                            })
+                            .await;
+                    }
+                }
             }
         } else {
             let remaining = {
@@ -4909,9 +5399,17 @@ async fn download_parts_from_source(
     // a Path B detach) to release the machine-wide connection slot. Stays
     // `None` for adopted inbound streams, which open no outbound connection.
     let mut _global_conn_permit: Option<GlobalConnPermit> = None;
+    let mut peer_session: Option<peer_sessions::PeerSession> = None;
 
     if let Some(es) = pre_established {
         emit_source!("connecting", None, 0u64);
+        if let std::net::IpAddr::V4(v4) = addr.ip() {
+            peer_session = Some(peer_sessions::register(
+                Some(es.peer_user_hash),
+                v4,
+                es.peer_caps.tcp_port,
+            ));
+        }
         // Pre-established (KAD/server callback) path: the upload-side
         // listener already did TCP + (maybe obfuscation) + Hello +
         // (maybe EmuleInfo) for this peer, so we adopt the supplied
@@ -4944,6 +5442,9 @@ async fn download_parts_from_source(
                     es.peer_user_hash,
                     0,
                     es.peer_caps.is_high_id(),
+                    // `on_kad_callback_conn` registered this peer with the
+                    // route's origin before handing the stream over.
+                    None,
                 );
             }
         }
@@ -5021,13 +5522,57 @@ async fn download_parts_from_source(
             debug!("Source {} ({}) skip dial: port 0", _src_idx, addr,);
             return Ok(());
         }
+        let std::net::IpAddr::V4(dial_v4) = addr.ip() else {
+            return Ok(());
+        };
+        // Every dial ends in `OP_STARTUPLOADREQ`, and one inside eMule's
+        // `MIN_REQUESTTIME` of the last is a strike toward a ban however we
+        // got here: a restarted or resumed download, another retry path, or a
+        // re-found source. The peer keeps our queue slot meanwhile.
+        if let Some(wait) = peer_sessions::upload_request_wait(
+            source.peer_user_hash,
+            dial_v4,
+            &[addr.port()],
+            file_hash,
+        ) {
+            debug!(
+                "Source {} ({}) skip dial: asked for this file too recently ({}s to go)",
+                _src_idx,
+                addr,
+                wait.as_secs(),
+            );
+            return Ok(());
+        }
+        // eMule gives each peer one socket. Dialing while another session
+        // with it is open, from another download or its own connection to our
+        // upload side, makes it close that one.
+        if peer_sessions::is_busy(source.peer_user_hash, dial_v4, addr.port()) {
+            debug!(
+                "Source {} ({}) skip dial: a connection with this peer is already open",
+                _src_idx, addr,
+            );
+            return Ok(());
+        }
         emit_source!("connecting", None, 0u64);
-        // Global connection cap + dial pacing apply to outbound dials only.
-        // Reserve the machine-wide slot first (waits here if we're already at
-        // eMule's `maxconnections`), then pace the actual TCP connect so a
-        // burst of source starts can't storm the network.
-        _global_conn_permit = acquire_global_dl_conn(control.download_priority_ordinal()).await;
-        throttle_outbound_dial().await;
+        // Global connection cap + dial pacing apply to outbound dials only:
+        // a machine-wide slot (eMule's `maxconnections`) once the "New
+        // Connections / 5s" window has room, then spacing so a burst of source
+        // starts can't storm the network.
+        _global_conn_permit = acquire_dial_slot(&control).await;
+        check_control(&control).await?;
+        space_outbound_dial().await;
+        // Reserved only now: holding it through the slot wait would turn away
+        // our own upload side's push-grant to this peer meanwhile.
+        let Some(session) = peer_sessions::try_reserve(source.peer_user_hash, dial_v4, addr.port())
+        else {
+            debug!(
+                "Source {} ({}) skip dial: the peer connected to us while we waited to dial",
+                _src_idx, addr,
+            );
+            emit_source!("duplicate", None, 0u64);
+            return Ok(());
+        };
+        peer_session = Some(session);
 
         // Build the Hello payload once; it's identical across attempts.
         // (Include buddy tags if we have a buddy.)
@@ -5048,7 +5593,8 @@ async fn download_parts_from_source(
             supports_crypt_layer: obfuscation_enabled,
             requests_crypt_layer: obfuscation_enabled,
             requires_crypt_layer: false,
-            supports_direct_udp_callback: crate::network::kad::firewall::advertised_direct_udp_callback(),
+            supports_direct_udp_callback:
+                crate::network::kad::firewall::advertised_direct_udp_callback(),
             supports_captcha: false,
             server_ip,
             server_port,
@@ -5057,7 +5603,7 @@ async fn download_parts_from_source(
         let hello_payload = build_hello_with_buddy_opts(
             user_hash,
             our_client_id,
-            tcp_port,
+            peer_sessions::advertised_tcp_port_or(tcp_port),
             nickname,
             buddy,
             &hello_options,
@@ -5319,19 +5865,25 @@ async fn download_parts_from_source(
         peer_supports_aich = hello_caps.supports_aich;
         peer_ember_hash = hello_caps.ember_hash;
 
-        let emule_payload =
-            build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
-        write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
-
-        match read_packet_timeout_ms(&mut *reader)
-            .await
-            .context("stage:emule_info_wait")
-        {
-            Ok((proto, opcode, payload)) => {
+        let mule_info_reply = if dialer_needs_mule_info(&peer_user_hash, &hello_caps) {
+            let emule_payload =
+                build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
+            write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload)
+                .await?;
+            Some(
+                read_packet_timeout_ms(&mut *reader)
+                    .await
+                    .context("stage:emule_info_wait"),
+            )
+        } else {
+            None
+        };
+        match mule_info_reply {
+            None => {}
+            Some(Ok((proto, opcode, payload))) => {
                 if proto == OP_EMULEPROT && (opcode == OP_EMULEINFOANSWER || opcode == OP_EMULEINFO)
                 {
                     merge_caps(&mut hello_caps, parse_emule_info(&payload));
-                    let peer_udp = hello_caps.udp_port;
                     peer_supports_multipacket = hello_caps.supports_multi_packet;
                     peer_supports_ext_multipacket = hello_caps.ext_multi_packet;
                     peer_supports_file_ident = hello_caps.supports_file_ident;
@@ -5345,30 +5897,6 @@ async fn download_parts_from_source(
                     src_client_software = client_software_from_caps(&hello_caps);
                     if !hello_caps.peer_name.is_empty() {
                         src_peer_name = hello_caps.peer_name.clone();
-                    }
-                    // Always remember the peer's user hash once we've learned
-                    // it from the handshake — eMule keeps client identity in its
-                    // `clientlist` so it can obfuscate future connections to the
-                    // same peer (and reuse the hash cross-file via
-                    // `get_user_hash_by_addr`). Previously this was gated on the
-                    // peer advertising a UDP port, which silently dropped hashes
-                    // for peers that didn't, leaving us unable to obfuscate them
-                    // later.
-                    if peer_user_hash != [0u8; 16] {
-                        if let Some(sm) = &source_mgr {
-                            let mut sm = sm.write().await;
-                            if let std::net::IpAddr::V4(v4) = addr.ip() {
-                                sm.register_observed_peer_ports(
-                                    *file_hash,
-                                    v4,
-                                    addr.port(),
-                                    hello_caps.tcp_port,
-                                    peer_udp,
-                                    peer_user_hash,
-                                    hello_caps.is_high_id(),
-                                );
-                            }
-                        }
                     }
                     if opcode == OP_EMULEINFO {
                         let emule_answer = build_emule_info(
@@ -5403,11 +5931,46 @@ async fn download_parts_from_source(
                     deferred_packet = Some((proto, opcode, payload));
                 }
             }
-            Err(e) => {
+            Some(Err(e)) if is_packet_stream_desynced(&e) => return Err(e),
+            Some(Err(e)) => {
                 debug!("EmuleInfo exchange failed for source {}: {e}", _src_idx);
             }
         }
+        // Remember the peer's user hash and ports once the handshake has
+        // told us them. eMule keeps client identity in its `clientlist` so it
+        // can obfuscate later connections to the same peer, and we reuse the
+        // hash across files via `get_user_hash_by_addr`.
+        if peer_user_hash != [0u8; 16] {
+            if let (Some(sm), std::net::IpAddr::V4(v4)) = (&source_mgr, addr.ip()) {
+                sm.write().await.register_observed_peer_ports(
+                    *file_hash,
+                    v4,
+                    addr.port(),
+                    hello_caps.tcp_port,
+                    hello_caps.udp_port,
+                    peer_user_hash,
+                    hello_caps.is_high_id(),
+                );
+            }
+        }
     }
+
+    if let Some(session) = &peer_session {
+        session.identify(peer_user_hash);
+        if hello_caps.is_ember {
+            session.mark_ember();
+        }
+    }
+    let mut peer_conn = PeerConnection::new(
+        reader,
+        writer,
+        addr,
+        peer_user_hash,
+        hello_caps.clone(),
+        peer_session,
+    );
+    let reader = &mut peer_conn.reader;
+    let writer = &mut peer_conn.writer;
 
     // Now that the handshake has converged (dialed or adopted) we know the
     // peer's authoritative user hash. Claim it as the live identity for this
@@ -5543,15 +6106,19 @@ async fn download_parts_from_source(
             // for Ember-to-Ember downloads.
             pkt
         } else {
-            match tokio::time::timeout(
+            match read_packet_within_ms(
+                &mut *reader,
                 std::time::Duration::from_millis(read_timeout_ms),
-                read_packet_async_ms(&mut *reader),
+                std::time::Duration::from_secs(HANDSHAKE_READ_TIMEOUT_SECS),
             )
             .await
             {
-                Ok(Ok(pkt)) => {
+                Ok(Some(pkt)) => {
                     read_timeout_ms = 3000;
                     pkt
+                }
+                Err(e) if e.get_ref().is_some_and(|i| i.is::<PacketStreamDesynced>()) => {
+                    return Err(anyhow::Error::from(e).context("stage:emule_info_wait"));
                 }
                 _ => break,
             }
@@ -5570,16 +6137,13 @@ async fn download_parts_from_source(
                 // this, `respond_to_secident_challenge` silently drops the
                 // OP_SIGNATURE (sig len = 0) when `record.public_key` is
                 // empty, the peer never gets our signature, and the
-                // handshake never completes.
-                let missing_peer_key = if state >= 2 {
-                    if let Some(cm) = &credit_mgr {
-                        let cm = cm.read().await;
-                        !cm.has_public_key(&peer_user_hash)
-                    } else {
-                        true
-                    }
+                // handshake never completes. A state-1 challenge needs their
+                // key just the same (BaseClient.cpp:1851-1852).
+                let missing_peer_key = if let Some(cm) = &credit_mgr {
+                    let cm = cm.read().await;
+                    !cm.has_public_key(&peer_user_hash)
                 } else {
-                    false
+                    true
                 };
                 if missing_peer_key {
                     pending_peer_challenge = Some((challenge, state));
@@ -5811,6 +6375,9 @@ async fn download_parts_from_source(
             (OP_EMULEPROT, OP_EMBER_HELLO) | (OP_EMULEPROT, OP_EMBER_HELLOANSWER) => {
                 if let Some(ident) = parse_ember_hello(&payload) {
                     hello_caps.is_ember = true;
+                    if let Some(session) = &peer_conn.session {
+                        session.mark_ember();
+                    }
                     // Identity lock: refuse to swap pubkey/hash after
                     // PoP verification (see upload.rs/transfer.rs for
                     // the same fix; the risk is credit accounting on
@@ -5884,7 +6451,7 @@ async fn download_parts_from_source(
                                 info!("Ember binding: source {} at {} pubkey BLAKE3-binds to advertised hash", _src_idx, addr);
                                 if peer_user_hash != [0u8; 16] {
                                     if let Some(cm) = &credit_mgr {
-                                        cm.write().await.set_ember_hash(peer_user_hash, *peer_eh);
+                                        cm.write().await.note_bound_ember_hash(peer_user_hash, *peer_eh);
                                     }
                                 }
                             } else {
@@ -6189,7 +6756,9 @@ async fn download_parts_from_source(
         if !single_part {
             mp.push(OP_SETREQFILEID);
         }
-        if sx_allowed {
+        // eMule asks only peers that support SX2 or SX1 v2+
+        // (DownloadClient.cpp:228-229).
+        if sx_allowed && (peer_supports_source_ex2 || peer_source_exchange_ver > 1) {
             if peer_supports_source_ex2 {
                 mp.push(OP_REQUESTSOURCES2);
                 mp.push(SOURCEEXCHANGE2_VERSION);
@@ -6243,7 +6812,9 @@ async fn download_parts_from_source(
     // file-status-wait loop below. Sending after FileStatus leaves the answer
     // to land in the bounded hashset-wait loop, which has no arm for it — the
     // peer is then never identified as Ember (no EPX, no friend detection).
-    if !sent_ember_hello {
+    // Only to peers that speak the eMule extended protocol: anything else has
+    // no handler for an `OP_EMULEPROT` packet, and every Ember peer does.
+    if !sent_ember_hello && hello_caps.ext_protocol {
         let payload = build_ember_hello(&ember_hash, &our_nickname, Some(&ed25519_public_key));
         if write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload)
             .await
@@ -6397,15 +6968,11 @@ async fn download_parts_from_source(
             let state = _payload[0];
             let challenge =
                 u32::from_le_bytes([_payload[1], _payload[2], _payload[3], _payload[4]]);
-            let missing_peer_key = if state >= 2 {
-                if let Some(cm) = &credit_mgr {
-                    let cm = cm.read().await;
-                    !cm.has_public_key(&peer_user_hash)
-                } else {
-                    true
-                }
+            let missing_peer_key = if let Some(cm) = &credit_mgr {
+                let cm = cm.read().await;
+                !cm.has_public_key(&peer_user_hash)
             } else {
-                false
+                true
             };
             if missing_peer_key {
                 pending_peer_challenge = Some((challenge, state));
@@ -6528,10 +7095,7 @@ async fn download_parts_from_source(
                         pubkey: hello_caps.ember_pubkey,
                         nickname: nick,
                         peer_ip: addr.ip().to_string(),
-                        peer_port: super::advertised_listen_port(
-                            hello_caps.tcp_port,
-                            addr.port(),
-                        ),
+                        peer_port: super::advertised_listen_port(hello_caps.tcp_port, addr.port()),
                         verified,
                     })
                     .await;
@@ -6547,6 +7111,9 @@ async fn download_parts_from_source(
         if proto == OP_EMULEPROT && (opcode == OP_EMBER_HELLO || opcode == OP_EMBER_HELLOANSWER) {
             if let Some(ident) = parse_ember_hello(&_payload) {
                 hello_caps.is_ember = true;
+                if let Some(session) = &peer_conn.session {
+                    session.mark_ember();
+                }
                 let identity_changed = ember_auth_verified
                     && ((ident.ed25519_pubkey.is_some()
                         && hello_caps.ember_pubkey.is_some()
@@ -6608,7 +7175,7 @@ async fn download_parts_from_source(
                             info!("Ember binding: source {} at {} pubkey BLAKE3-binds (file-status-wait)", _src_idx, addr);
                             if peer_user_hash != [0u8; 16] {
                                 if let Some(cm) = &credit_mgr {
-                                    cm.write().await.set_ember_hash(peer_user_hash, *peer_eh);
+                                    cm.write().await.note_bound_ember_hash(peer_user_hash, *peer_eh);
                                 }
                             }
                             if hello_caps.is_ember && !mesh_discovered_emitted {
@@ -7311,6 +7878,7 @@ async fn download_parts_from_source(
                     Ok((proto, opcode, _)) => {
                         debug!("Source {} waiting for hashset, got proto=0x{proto:02X} op=0x{opcode:02X} — skipping", _src_idx);
                     }
+                    Err(e) if is_packet_stream_desynced(&e) => return Err(e),
                     Err(_) => {
                         debug!(
                             "No hashset answer from source {} (peer may not support it)",
@@ -7334,7 +7902,9 @@ async fn download_parts_from_source(
     } else {
         true
     };
-    if sx_allowed {
+    // eMule asks only peers that support SX2 or SX1 v2+
+    // (DownloadClient.cpp:228-229).
+    if sx_allowed && (peer_supports_source_ex2 || peer_source_exchange_ver > 1) {
         let sx_write_ok = if peer_supports_source_ex2 {
             let mut sx2_req = Vec::with_capacity(19);
             sx2_req.push(SOURCEEXCHANGE2_VERSION);
@@ -7400,19 +7970,50 @@ async fn download_parts_from_source(
         // `got_any_data` gate in the receive loop).
         emit_source!("stalled", None, 0u64);
     } else {
-        // Request upload slot
-        let upload_req = build_file_request(file_hash);
-        write_packet_async_ms(
-            &mut *writer,
-            OP_EDONKEYHEADER,
-            OP_STARTUPLOADREQ,
-            &upload_req,
-        )
-        .await?;
-        file_req_overhead.record_upload((6 + upload_req.len()) as u64);
+        // Every port the peer is known by, so the record matches however we
+        // reach it next time: dialed, its Hello, or its source row.
+        let ask_ports = [addr.port(), source.peer_port, hello_caps.tcp_port];
+        let ask_wait = match addr.ip() {
+            std::net::IpAddr::V4(v4) => peer_sessions::upload_request_wait(
+                Some(peer_user_hash),
+                v4,
+                &ask_ports,
+                file_hash,
+            ),
+            _ => None,
+        };
+        if let Some(wait) = ask_wait {
+            // We are already on its queue from that ask; another would only
+            // count toward eMule's `BADCLIENTBAN`. Wait for the grant instead.
+            debug!(
+                "Source {} ({}) not re-sending StartUploadReq ({}s left of MIN_REQUESTTIME)",
+                _src_idx,
+                addr,
+                wait.as_secs(),
+            );
+        } else {
+            let upload_req = build_file_request(file_hash);
+            write_packet_async_ms(
+                &mut *writer,
+                OP_EDONKEYHEADER,
+                OP_STARTUPLOADREQ,
+                &upload_req,
+            )
+            .await?;
+            file_req_overhead.record_upload((6 + upload_req.len()) as u64);
+            if let std::net::IpAddr::V4(v4) = addr.ip() {
+                peer_sessions::note_upload_request(
+                    Some(peer_user_hash),
+                    v4,
+                    &ask_ports,
+                    *file_hash,
+                );
+            }
+        }
 
         queued_count.fetch_add(1, Ordering::Relaxed);
         queued_guard.armed = true;
+        peer_conn.held.set_awaiting_grant(true);
 
         // Wait for the uploader to grant a slot. Don't re-request; eMule
         // uploaders push OP_ACCEPTUPLOADREQ when a slot opens.
@@ -7479,18 +8080,17 @@ async fn download_parts_from_source(
             // tick expiry with no packet is NORMAL while queued (it is NOT the
             // timeout — that is the `elapsed > queue_wait_secs` check above).
             let poll_secs = queue_wait_secs.saturating_sub(elapsed).clamp(1, 5);
-            let result = tokio::time::timeout(
+            let result = read_packet_within_ms(
+                &mut *reader,
                 std::time::Duration::from_secs(poll_secs),
-                read_packet_async_ms(&mut *reader),
+                std::time::Duration::from_secs(HANDSHAKE_READ_TIMEOUT_SECS),
             )
             .await;
             let (proto, opcode, payload) = match result {
-                Ok(Ok(p)) => p,
-                Ok(Err(e)) => {
+                Ok(Some(p)) => p,
+                Ok(None) => continue,
+                Err(e) => {
                     anyhow::bail!("stage:queue_detached connection lost while queued: {e}");
-                }
-                Err(_) => {
-                    continue;
                 }
             };
             if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
@@ -7499,6 +8099,7 @@ async fn download_parts_from_source(
                 queued_count.fetch_sub(1, Ordering::Relaxed);
                 active_count.fetch_add(1, Ordering::Relaxed);
                 _active_guard.armed = true;
+                peer_conn.held.set_awaiting_grant(false);
                 info!(
                     "Source {} ({}) accepted upload request — entering transfer (obfuscated={})",
                     _src_idx, addr, connection_is_obfuscated
@@ -7513,6 +8114,8 @@ async fn download_parts_from_source(
             if proto == OP_EMULEPROT && opcode == OP_QUEUEFULL && payload.is_empty() {
                 file_req_overhead.record_download(6u64);
                 emit_source!("queue_full", None, 0u64);
+                // Not queued after all, so no grant will come on this socket.
+                peer_conn.held.set_awaiting_grant(false);
                 anyhow::bail!("peer queue is full");
             }
             if proto == OP_EDONKEYHEADER && opcode == OP_OUTOFPARTREQS {
@@ -7587,6 +8190,15 @@ async fn download_parts_from_source(
     let mut measured_speed: u64 = 0;
     let mut speed_start = std::time::Instant::now();
     let mut speed_bytes: u64 = 0;
+    // Has this peer ever sent us a byte on this connection? Status display only.
+    // The per-part `got_any_data` below resets at every part boundary, and
+    // driving the source row off that made it flash Stalled for two seconds at
+    // the start of each new part even though the peer had been sending all
+    // along. Deliberately separate from the per-part flag rather than replacing
+    // it: the part-local answer is what the read-timeout and re-assert policy
+    // must key off, because "this peer has sent nothing *for the part we just
+    // asked for*" is the condition those branches were written to recover from.
+    let mut conn_got_any_data = false;
 
     // Build dynamic part queue: start with pre-assigned parts, add more dynamically
     let mut part_queue: Vec<usize> = parts.to_vec();
@@ -7611,6 +8223,9 @@ async fn download_parts_from_source(
         Mismatch,
         AichNarrowed,
         Unverified,
+        /// The part changed or was verified by another source while this one
+        /// hashed it, so this source's verdict describes bytes that are gone.
+        Superseded,
     }
 
     // Cross-part request pipelining.
@@ -7642,6 +8257,12 @@ async fn download_parts_from_source(
     // Taken once, outside the receive loop: the wire-byte counter is incremented
     // on every packet and must not cost a tracker lock each time.
     let wire_bytes_counter = tracker.read().await.transferred_counter();
+    // Set when we abandon a read that may have consumed part of a packet,
+    // which leaves the stream unparseable for the rest of the connection.
+    // The part in hand is still verified (that only touches disk), but the
+    // AICH repair has to be skipped because it writes a request and reads
+    // the answer, and no further part may be requested on this connection.
+    let mut stream_maybe_desynced = false;
 
     // Outer "session" loop wraps the per-part loop so we can re-enter
     // it after the peer rotates us out via `OP_OUTOFPARTREQS` (their
@@ -7653,6 +8274,21 @@ async fn download_parts_from_source(
     'session_loop: loop {
         while queue_idx < part_queue.len() {
             check_control(&control).await?;
+            if stream_maybe_desynced {
+                if tracker.read().await.all_complete() {
+                    break;
+                }
+                let _ = write_packet_async_ms(
+                    &mut *writer,
+                    OP_EDONKEYHEADER,
+                    OP_CANCELTRANSFER,
+                    &[],
+                )
+                .await;
+                return Err(anyhow::Error::from(packet_stream_desynced_error()).context(
+                    "stage:data_wait connection unusable after an abandoned read; reconnecting for the reopened parts",
+                ));
+            }
             let part_idx = part_queue[queue_idx];
             queue_idx += 1;
             if peer_out_of_parts {
@@ -7802,13 +8438,7 @@ async fn download_parts_from_source(
                         .collect();
                     let needs_large_offsets =
                         all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
-                    (
-                        all_blocks,
-                        batches,
-                        0,
-                        needs_large_offsets,
-                        Vec::new(),
-                    )
+                    (all_blocks, batches, 0, needs_large_offsets, Vec::new())
                 };
 
             // Checked for both paths, not just the freshly computed one.
@@ -7945,7 +8575,6 @@ async fn download_parts_from_source(
             let mut consecutive_bad_blocks: u32 = 0;
             const MAX_CONSECUTIVE_BAD_BLOCKS: u32 = 5;
             let mut data_loop_start = std::time::Instant::now();
-            let mut got_any_data = false;
             // Trickle-source rotation: timestamp since which this source has been
             // continuously below `TRICKLE_SLOW_FLOOR_BPS`. Cleared whenever it
             // recovers. See the rotation check at the top of the receive loop.
@@ -7965,6 +8594,15 @@ async fn download_parts_from_source(
             // configured queue-wait budget, before finally disconnecting.
             let mut no_data_reasserts: u32 = 0;
             const MAX_NO_DATA_REASSERTS: u32 = 5;
+            // Per-part, and it has to stay that way: it selects the read
+            // timeout, decides re-assert versus disconnect, and classifies a
+            // FIN as "peer dropped on this part". A fresh `OP_REQUESTPARTS` at
+            // a part boundary can be dropped or race the uploader's own slot
+            // rotation exactly as the first one can, so the part that has just
+            // been asked for is the thing those branches need to know about.
+            // `conn_got_any_data` carries the connection-wide answer for the
+            // status badge.
+            let mut got_any_data = false;
             let mut last_epx_resend = std::time::Instant::now();
             // Use the generation we sent at handshake time as the resend
             // baseline so any rebuild that happened during file-status / queue
@@ -8005,11 +8643,6 @@ async fn download_parts_from_source(
             let mut bytes_received_this_part: u64 = 0;
             let mut chunks_received_this_part: u32 = 0;
             let mut bytes_received_for_other_parts: u64 = 0;
-            // Set when we abandon a read that may have consumed part of a
-            // packet, which leaves the stream unparseable. Nothing below reads
-            // from it again, but the AICH repair still *writes* to it and then
-            // waits for an answer, so that request has to be skipped.
-            let mut stream_maybe_desynced = false;
             let receive_loop_started = std::time::Instant::now();
             // DIAG: snapshot the gap state for this part at entry so we can
             // tell whether is_part_complete tripping mid-loop is "the only
@@ -8159,144 +8792,155 @@ async fn download_parts_from_source(
                 // indicator had already flipped red at the 60s
                 // ACTIVE_STALLED threshold.
                 let mut hard_deadline = tokio::time::Instant::now() + read_timeout;
-                let read_result: Result<anyhow::Result<(u8, u8, Vec<u8>)>, ()> =
-                    if let Some(packet) = auth_deferred.pop_front() {
-                        Ok(Ok(packet))
-                    } else {
-                        let mut read_fut = std::pin::pin!(read_packet_async_ms(&mut *reader));
-                        let mut stall_check =
-                            tokio::time::interval(std::time::Duration::from_secs(2));
-                        stall_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                        // Consume the immediate first tick so the first real
-                        // stall-check fires 2s after we start waiting, not
-                        // instantly (which would spam an emit on every
-                        // packet).
-                        stall_check.tick().await;
+                let packet_started = AtomicBool::new(false);
+                let read_result: Result<anyhow::Result<(u8, u8, Vec<u8>)>, ()> = if let Some(
+                    packet,
+                ) =
+                    auth_deferred.pop_front()
+                {
+                    Ok(Ok(packet))
+                } else {
+                    let mut read_fut = std::pin::pin!(read_packet_marking_start_ms(
+                        &mut *reader,
+                        &packet_started
+                    ));
+                    let mut stall_check = tokio::time::interval(std::time::Duration::from_secs(2));
+                    stall_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    // Consume the immediate first tick so the first real
+                    // stall-check fires 2s after we start waiting, not
+                    // instantly (which would spam an emit on every
+                    // packet).
+                    stall_check.tick().await;
 
-                        loop {
-                            tokio::select! {
-                                biased;
-                                // User Stop/Cancel (or a network disconnect) landed
-                                // while we're actively downloading from this source.
-                                // Mirror eMule's CPartFile::PauseFile, which sends
-                                // OP_CANCELTRANSFER to every DS_DOWNLOADING peer so the
-                                // uploader frees our slot immediately rather than
-                                // waiting to notice the dropped TCP socket. Best-effort
-                                // + time-boxed so a wedged socket can't delay the stop,
-                                // then bail (the outer task `select!` grace window lets
-                                // this finish before it would force-drop the future).
-                                // Fires on Pause too: eMule's PauseFile notifies every
-                                // DS_DOWNLOADING source, so a paused active transfer
-                                // also frees the uploader's slot (the transfer's source
-                                // knowledge is kept by `PauseDownload` for fast resume).
-                                _ = control.wait_cancel_or_pause() => {
-                                    let _ = tokio::time::timeout(
-                                        std::time::Duration::from_millis(400),
-                                        write_packet_async_ms(
-                                            &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
-                                        ),
-                                    ).await;
-                                    anyhow::bail!("cancelled by user");
+                    loop {
+                        tokio::select! {
+                            biased;
+                            // User Stop/Cancel (or a network disconnect) landed
+                            // while we're actively downloading from this source.
+                            // Mirror eMule's CPartFile::PauseFile, which sends
+                            // OP_CANCELTRANSFER to every DS_DOWNLOADING peer so the
+                            // uploader frees our slot immediately rather than
+                            // waiting to notice the dropped TCP socket. Best-effort
+                            // + time-boxed so a wedged socket can't delay the stop,
+                            // then bail (the outer task `select!` grace window lets
+                            // this finish before it would force-drop the future).
+                            // Fires on Pause too: eMule's PauseFile notifies every
+                            // DS_DOWNLOADING source, so a paused active transfer
+                            // also frees the uploader's slot (the transfer's source
+                            // knowledge is kept by `PauseDownload` for fast resume).
+                            _ = control.wait_cancel_or_pause() => {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_millis(400),
+                                    write_packet_async_ms(
+                                        &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
+                                    ),
+                                ).await;
+                                anyhow::bail!("cancelled by user");
+                            }
+                            // `read_packet_async_ms` returns `Result<_, io::Error>`;
+                            // hoist into `anyhow::Error` here so the outer
+                            // match arms stay aligned with the error-kind
+                            // classification that the rest of the receive
+                            // loop uses.
+                            res = &mut read_fut => break Ok(res.map_err(anyhow::Error::from)),
+                            _ = tokio::time::sleep_until(hard_deadline) => break Err(()),
+                            _ = stall_check.tick() => {
+                                // Another source may have closed the
+                                // last gap while we were blocked here.
+                                // See the receive-loop comment above.
+                                {
+                                    let t = tracker.read().await;
+                                    if t.all_complete() {
+                                        break Err(());
+                                    }
                                 }
-                                // `read_packet_async_ms` returns `Result<_, io::Error>`;
-                                // hoist into `anyhow::Error` here so the outer
-                                // match arms stay aligned with the error-kind
-                                // classification that the rest of the receive
-                                // loop uses.
-                                res = &mut read_fut => break Ok(res.map_err(anyhow::Error::from)),
-                                _ = tokio::time::sleep_until(hard_deadline) => break Err(()),
-                                _ = stall_check.tick() => {
-                                    // Another source may have closed the
-                                    // last gap while we were blocked here.
-                                    // See the receive-loop comment above.
+                                // Emit a fresh `transferring` update
+                                // with recalculated speed (which will
+                                // trend toward 0 as the byte window
+                                // ages out). The same logic that runs
+                                // after packet processing below — just
+                                // triggered on a timer so the UI gets
+                                // updates during silence.
+                                let elapsed = speed_start.elapsed();
+                                if elapsed.as_millis() >= 2000 {
+                                    measured_speed =
+                                        (speed_bytes as u128 * 1000
+                                            / elapsed.as_millis().max(1))
+                                            as u64;
+                                    speed_bytes = 0;
+                                    speed_start = std::time::Instant::now();
+                                    emit_source!(
+                                        if conn_got_any_data {
+                                            "transferring"
+                                        } else {
+                                            "stalled"
+                                        },
+                                        None,
+                                        measured_speed
+                                    );
+                                }
+                                let expired = expire_outstanding_ranges(&mut outstanding_ranges);
+                                if let Some(pending) = pipelined_next.as_mut() {
+                                    let _ = expire_outstanding_ranges(
+                                        &mut pending.outstanding_ranges,
+                                    );
+                                }
+                                if expired > 0 {
+                                    let mut sent_any = false;
+                                    while sent_idx < batches.len()
+                                        && outstanding_ranges.len() < max_outstanding_blocks
                                     {
-                                        let t = tracker.read().await;
-                                        if t.all_complete() {
-                                            break Err(());
-                                        }
-                                    }
-                                    // Emit a fresh `transferring` update
-                                    // with recalculated speed (which will
-                                    // trend toward 0 as the byte window
-                                    // ages out). The same logic that runs
-                                    // after packet processing below — just
-                                    // triggered on a timer so the UI gets
-                                    // updates during silence.
-                                    let elapsed = speed_start.elapsed();
-                                    if elapsed.as_millis() >= 2000 {
-                                        measured_speed =
-                                            (speed_bytes as u128 * 1000
-                                                / elapsed.as_millis().max(1))
-                                                as u64;
-                                        speed_bytes = 0;
-                                        speed_start = std::time::Instant::now();
-                                        emit_source!(
-                                            if got_any_data { "transferring" } else { "stalled" },
-                                            None,
-                                            measured_speed
-                                        );
-                                    }
-                                    let expired = expire_outstanding_ranges(&mut outstanding_ranges);
-                                    if let Some(pending) = pipelined_next.as_mut() {
-                                        let _ = expire_outstanding_ranges(
-                                            &mut pending.outstanding_ranges,
-                                        );
-                                    }
-                                    if expired > 0 {
-                                        let mut sent_any = false;
-                                        while sent_idx < batches.len()
-                                            && outstanding_ranges.len() < max_outstanding_blocks
-                                        {
-                                            let batch =
-                                                drop_filled_blocks(&tracker, &batches[sent_idx])
-                                                    .await;
-                                            sent_idx += 1;
-                                            if batch.is_empty() {
-                                                continue;
-                                            }
-                                            if write_part_request_batch(
-                                                &mut *writer,
-                                                file_hash,
-                                                &batch,
-                                                needs_i64,
-                                            )
-                                            .await
-                                            .is_err()
-                                            {
-                                                anyhow::bail!(
-                                                    "connection lost while refilling expired request"
-                                                );
-                                            }
-                                            push_outstanding_batch(
-                                                &mut outstanding_ranges,
-                                                &batch,
-                                            );
-                                            sent_any = true;
-                                        }
-                                        // Keyed on a request actually going out,
-                                        // not on `sent_idx` moving: skipping a
-                                        // batch whose bytes another worker
-                                        // already landed advances the index
-                                        // without extending the deadline, so a
-                                        // worker whose whole tail went stale
-                                        // still falls through to the exit below.
-                                        if sent_any {
-                                            hard_deadline =
-                                                tokio::time::Instant::now() + read_timeout;
-                                            ip_guard
-                                                .publish_in_flight(&outstanding_ranges)
+                                        let batch =
+                                            drop_filled_blocks(&tracker, &batches[sent_idx])
                                                 .await;
-                                        } else if outstanding_ranges.is_empty()
-                                            && sent_idx >= batches.len()
-                                        {
-                                            break Err(());
+                                        sent_idx += 1;
+                                        if batch.is_empty() {
+                                            continue;
                                         }
+                                        if write_part_request_batch(
+                                            &mut *writer,
+                                            file_hash,
+                                            &batch,
+                                            needs_i64,
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            anyhow::bail!(
+                                                "connection lost while refilling expired request"
+                                            );
+                                        }
+                                        push_outstanding_batch(
+                                            &mut outstanding_ranges,
+                                            &batch,
+                                        );
+                                        sent_any = true;
                                     }
-                                    continue;
+                                    // Keyed on a request actually going out,
+                                    // not on `sent_idx` moving: skipping a
+                                    // batch whose bytes another worker
+                                    // already landed advances the index
+                                    // without extending the deadline, so a
+                                    // worker whose whole tail went stale
+                                    // still falls through to the exit below.
+                                    if sent_any {
+                                        hard_deadline =
+                                            tokio::time::Instant::now() + read_timeout;
+                                        ip_guard
+                                            .publish_in_flight(&outstanding_ranges)
+                                            .await;
+                                    } else if outstanding_ranges.is_empty()
+                                        && sent_idx >= batches.len()
+                                        && !packet_started.load(Ordering::Relaxed)
+                                    {
+                                        break Err(());
+                                    }
                                 }
+                                continue;
                             }
                         }
-                    };
+                    }
+                };
 
                 let (proto, opcode, payload) = match read_result {
                     Ok(Ok(pkt)) => {
@@ -8369,6 +9013,21 @@ async fn download_parts_from_source(
                     }
                     Err(()) => {
                         let file_complete = tracker.read().await.all_complete();
+                        let mid_packet = packet_started.load(Ordering::Relaxed);
+                        if mid_packet && !file_complete {
+                            let _ = write_packet_async_ms(
+                                &mut *writer,
+                                OP_EDONKEYHEADER,
+                                OP_CANCELTRANSFER,
+                                &[],
+                            )
+                            .await;
+                            return Err(anyhow::Error::from(packet_stream_desynced_error())
+                                .context(format!(
+                                    "stage:data_wait download timeout: stalled mid-packet for {}s",
+                                    read_timeout.as_secs()
+                                )));
+                        }
                         match read_timeout_action(
                             file_complete,
                             outstanding_ranges.is_empty(),
@@ -8380,10 +9039,9 @@ async fn download_parts_from_source(
                             !all_blocks.is_empty(),
                         ) {
                             ReadTimeoutAction::FileComplete => {
-                                // The read we just abandoned may have taken a
-                                // partial packet with it, so the stream can no
-                                // longer be framed.
-                                stream_maybe_desynced = true;
+                                // If the read we just abandoned had begun a
+                                // packet, the stream can no longer be framed.
+                                stream_maybe_desynced |= mid_packet;
                                 exit_reason = "all_complete";
                                 break;
                             }
@@ -8516,15 +9174,27 @@ async fn download_parts_from_source(
                             }
                             continue;
                         }
-                        // D18: refuse absurdly small chunks. eMule-family peers
-                        // never ship OP_SENDINGPART below a few KiB; a peer
-                        // sending 1-byte chunks is either broken or abusive
-                        // (work amplification vs our syscall/allocator path).
-                        // 16 bytes keeps the floor trivially low for any legit
-                        // truncated-tail block.
-                        const MIN_BLOCK_BYTES: u64 = 16;
                         let piece_len = end - start;
-                        if piece_len < MIN_BLOCK_BYTES && end != file_size {
+                        let requested_ranges = outstanding_ranges
+                            .iter()
+                            .map(|r| (r.start, r.end))
+                            .chain(batches.iter().take(sent_idx).flatten().copied())
+                            .chain(pipelined_next.iter().flat_map(|pending| {
+                                pending
+                                    .outstanding_ranges
+                                    .iter()
+                                    .map(|r| (r.start, r.end))
+                                    .chain(
+                                        pending
+                                            .batches
+                                            .iter()
+                                            .take(pending.sent_idx)
+                                            .flatten()
+                                            .copied(),
+                                    )
+                            }));
+                        if is_unsolicited_undersized_block(start, end, file_size, requested_ranges)
+                        {
                             consecutive_bad_blocks += 1;
                             tracing::debug!(
                             "source {_src_idx} sent undersized block ({piece_len} bytes); treating as abusive"
@@ -8560,7 +9230,8 @@ async fn download_parts_from_source(
                         // Lock-free: this fires on every packet, and the tracker's
                         // write lock serialises every reader including the network
                         // event loop.
-                        wire_bytes_counter.fetch_add(piece_len, std::sync::atomic::Ordering::Relaxed);
+                        wire_bytes_counter
+                            .fetch_add(piece_len, std::sync::atomic::Ordering::Relaxed);
 
                         // D21: never overwrite bytes we already have. With several
                         // sources in flight (and cross-part pipelining), source B
@@ -8590,17 +9261,16 @@ async fn download_parts_from_source(
                         // us overwrite its bytes and claim duplicate credit) —
                         // see `WriteReservation` for why the guard can no
                         // longer span the write itself.
-                        let gap_write =
-                            write_gap_subranges_ms(
-                                &tracker,
-                                &output,
-                                start,
-                                data,
-                                _src_idx,
-                                "",
-                                drop_tx.as_ref(),
-                            )
-                                .await;
+                        let gap_write = write_gap_subranges_ms(
+                            &tracker,
+                            &output,
+                            start,
+                            data,
+                            _src_idx,
+                            "",
+                            drop_tx.as_ref(),
+                        )
+                        .await;
                         if let Some(ref e) = gap_write.disk_full {
                             anyhow::bail!("stage:insufficient_disk disk write failed: {e}");
                         }
@@ -8659,6 +9329,7 @@ async fn download_parts_from_source(
                                 _src_idx, addr, part_idx, piece_len
                             );
                             got_any_data = true;
+                            conn_got_any_data = true;
                             // First real byte: now it's genuinely transferring.
                             // Flip the status immediately (the periodic speed emit
                             // below only fires every 2s, too laggy for the badge).
@@ -8725,8 +9396,10 @@ async fn download_parts_from_source(
                         // the counter "includes compressed packets" — and it counts
                         // every packet, whereas Ember reaches the write only once
                         // enough has inflated to be worth one.
-                        wire_bytes_counter
-                            .fetch_add(compressed.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        wire_bytes_counter.fetch_add(
+                            compressed.len() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
 
                         let requested_end = outstanding_ranges
                             .iter()
@@ -8740,13 +9413,11 @@ async fn download_parts_from_source(
                                 })
                             })
                             .or_else(|| {
-                                batches
-                                    .iter()
-                                    .take(sent_idx)
-                                    .flatten()
-                                    .find_map(|(requested_start, requested_end)| {
+                                batches.iter().take(sent_idx).flatten().find_map(
+                                    |(requested_start, requested_end)| {
                                         (*requested_start == start).then_some(*requested_end)
-                                    })
+                                    },
+                                )
                             })
                             .or_else(|| {
                                 (resumed
@@ -8789,10 +9460,7 @@ async fn download_parts_from_source(
                         else {
                             refresh_outstanding_range(&mut outstanding_ranges, start);
                             if let Some(pending) = pipelined_next.as_mut() {
-                                refresh_outstanding_range(
-                                    &mut pending.outstanding_ranges,
-                                    start,
-                                );
+                                refresh_outstanding_range(&mut pending.outstanding_ranges, start);
                             }
                             continue;
                         };
@@ -8905,6 +9573,7 @@ async fn download_parts_from_source(
                         if !got_any_data {
                             info!("Source {} ({}) first compressed data received for part {} ({} bytes)", _src_idx, addr, part_idx, piece_len);
                             got_any_data = true;
+                            conn_got_any_data = true;
                         }
                         // Contribution, not wire bytes — see the uncompressed
                         // path above.
@@ -9683,7 +10352,7 @@ async fn download_parts_from_source(
                     speed_bytes = 0;
                     speed_start = std::time::Instant::now();
                     emit_source!(
-                        if got_any_data {
+                        if conn_got_any_data {
                             "transferring"
                         } else {
                             "stalled"
@@ -9701,9 +10370,11 @@ async fn download_parts_from_source(
                     // for the duration of the fsync.
                     let snap = {
                         let t = tracker.read().await;
-                        t.snapshot_for_save()
+                        t.periodic_snapshot_for_save(PERIODIC_SAVE_INTERVAL)
                     };
-                    super::part_tracker::save_snapshot_async(snap).await;
+                    if let Some(snap) = snap {
+                        super::part_tracker::save_snapshot_async(snap).await;
+                    }
                     last_periodic_save = std::time::Instant::now();
                 }
             }
@@ -9793,6 +10464,7 @@ async fn download_parts_from_source(
             }
 
             // Verify part hash before marking complete
+            let mut hashed_generation: u64 = 0;
             let part_hash_outcome = {
                 // Copied out under a short read, so the guard drops here.
                 //
@@ -9813,6 +10485,7 @@ async fn download_parts_from_source(
                     let t = tracker.read().await;
                     let (ps, pe) = t.part_range(part_idx);
                     let part_len = (pe - ps) as usize;
+                    hashed_generation = t.part_content_generation(part_idx);
                     drop(t);
 
                     // Read + MD4 in one writer-thread round-trip: the hash
@@ -9825,15 +10498,19 @@ async fn download_parts_from_source(
                         .map_err(|e| anyhow::anyhow!("part hash read at {ps}: {e}"))?;
 
                     if actual_hash != expected_hash {
-                        let aich_hs = super::aich::AICHRecoveryHashSet::build_from_data(&part_data);
+                        let part_data = std::sync::Arc::new(part_data);
+                        let (aich_root, aich_leaves) =
+                            super::aich::part_aich_summary_blocking(part_data.clone())
+                                .await
+                                .unwrap_or(([0u8; 20], 0));
                         warn!(
                         "Multi-source part {} hash mismatch from source {}! expected={} got={}, part_aich_root={}, {} AICH leaves",
                         part_idx,
                         _src_idx,
                         hex::encode(expected_hash),
                         hex::encode(actual_hash),
-                        hex::encode(aich_hs.root_hash),
-                        aich_hs.leaf_count(),
+                        hex::encode(aich_root),
+                        aich_leaves,
                     );
 
                         let mut recovery_bytes: Option<Vec<u8>> =
@@ -9911,48 +10588,60 @@ async fn download_parts_from_source(
                             }
 
                             let mut narrowed = false;
-                            if let Some(ref rec) = recovery_bytes {
+                            let mut superseded = false;
+                            if let Some(rec) = recovery_bytes.take() {
                                 if let Some(corrupt) =
-                                    super::aich::corrupt_blocks_from_aich_recovery(
+                                    super::aich::corrupt_blocks_from_aich_recovery_blocking(
                                         master_hash,
                                         rec,
                                         part_idx,
-                                        &part_data,
+                                        part_data.clone(),
                                         part_len,
                                         file_size,
                                     )
+                                    .await
                                 {
                                     if !corrupt.is_empty() {
                                         let mut invalidated = 0u64;
                                         let snap = {
                                             let mut t = tracker.write().await;
-                                            for &bi in &corrupt {
-                                                let rel =
-                                                    bi as u64 * super::aich::AICH_BLOCK_SIZE as u64;
-                                                let gs = ps + rel;
-                                                let ge = (gs + super::aich::AICH_BLOCK_SIZE as u64)
-                                                    .min(ps + part_len as u64);
-                                                t.invalidate_range(gs, ge);
-                                                invalidated += ge - gs;
+                                            if t.part_verdict_superseded(part_idx, hashed_generation) {
+                                                superseded = true;
+                                                None
+                                            } else {
+                                                for &bi in &corrupt {
+                                                    let rel = bi as u64
+                                                        * super::aich::AICH_BLOCK_SIZE as u64;
+                                                    let gs = ps + rel;
+                                                    let ge = (gs
+                                                        + super::aich::AICH_BLOCK_SIZE as u64)
+                                                        .min(ps + part_len as u64);
+                                                    t.invalidate_range(gs, ge);
+                                                    invalidated += ge - gs;
+                                                }
+                                                Some(t.snapshot_for_save())
                                             }
-                                            t.snapshot_for_save()
                                         };
-                                        save_snapshot_now(snap, "AICH narrowed").await;
-                                        let _ = progress_tx
-                                            .send((_src_idx, -(invalidated as i64)))
-                                            .await;
-                                        info!(
-                                        "AICH narrowed part {} to {} bad 180KiB block(s), ~{} bytes to re-fetch",
-                                        part_idx,
-                                        corrupt.len(),
-                                        invalidated
-                                    );
-                                        narrowed = true;
+                                        if let Some(snap) = snap {
+                                            save_snapshot_now(snap, "AICH narrowed").await;
+                                            let _ = progress_tx
+                                                .send((_src_idx, -(invalidated as i64)))
+                                                .await;
+                                            info!(
+                                            "AICH narrowed part {} to {} bad 180KiB block(s), ~{} bytes to re-fetch",
+                                            part_idx,
+                                            corrupt.len(),
+                                            invalidated
+                                        );
+                                            narrowed = true;
+                                        }
                                     }
                                 }
                             }
 
-                            if narrowed {
+                            if superseded {
+                                PartHashOutcome::Superseded
+                            } else if narrowed {
                                 PartHashOutcome::AichNarrowed
                             } else {
                                 if let std::net::IpAddr::V4(v4) = addr.ip() {
@@ -10047,7 +10736,8 @@ async fn download_parts_from_source(
                     let committed = {
                         let mut t = tracker.write().await;
                         let (ps, pe) = t.part_range(part_idx);
-                        let reopened = t.gap_list().iter().any(|&(gs, ge)| gs < pe && ge > ps);
+                        let reopened = t.gap_list().iter().any(|&(gs, ge)| gs < pe && ge > ps)
+                            || t.part_content_generation(part_idx) != hashed_generation;
                         if reopened {
                             ip_guard.release_locked(part_idx, &mut t);
                             None
@@ -10104,6 +10794,7 @@ async fn download_parts_from_source(
                                 // anything.
                                 cm.note_client_identity(
                                     peer_user_hash,
+                                    Some(addr.ip()),
                                     &src_peer_name,
                                     &src_client_software,
                                 );
@@ -10140,16 +10831,31 @@ async fn download_parts_from_source(
                             .await;
                     }
                 }
+                PartHashOutcome::Superseded => {
+                    {
+                        let mut t = tracker.write().await;
+                        ip_guard.release_locked(part_idx, &mut t);
+                    }
+                    per_part_credit.remove(&part_idx);
+                    info!(
+                        "Multi-source part {part_idx}: another source changed or verified it \
+                         while source {_src_idx} was hashing; discarding this source's verdict"
+                    );
+                    continue;
+                }
                 PartHashOutcome::Mismatch => {
-                    let (ps, pe, snap) = {
+                    let (ps, pe, snap, superseded) = {
                         let mut t = tracker.write().await;
                         let (ps, pe) = t.part_range(part_idx);
                         // D15: the inner verification block has already sent a
                         // progress correction for this part (using part_len);
                         // don't double-subtract here.
-                        t.mark_incomplete(part_idx);
+                        let superseded = t.part_verdict_superseded(part_idx, hashed_generation);
+                        if !superseded {
+                            t.mark_incomplete(part_idx);
+                        }
                         ip_guard.release_locked(part_idx, &mut t);
-                        (ps, pe, t.snapshot_for_save())
+                        (ps, pe, t.snapshot_for_save(), superseded)
                     };
                     spawn_save_snapshot(snap).await;
                     // D12: drop the per-part credit bucket for THIS part —
@@ -10159,7 +10865,12 @@ async fn download_parts_from_source(
                     // independently).
                     per_part_credit.remove(&part_idx);
                     let _ = progress_tx.try_send((_src_idx, 0i64));
-                    if let Some(ref etx) = event_tx {
+                    if superseded {
+                        info!(
+                            "Multi-source part {part_idx}: another source changed or verified it \
+                             while source {_src_idx} was hashing; not blaming this source"
+                        );
+                    } else if let Some(ref etx) = event_tx {
                         let _ = etx
                             .send(DownloadEvent::PartCorrupted {
                                 file_hash: *file_hash,
@@ -10318,7 +11029,7 @@ async fn download_parts_from_source(
         // OP_OUTOFPARTREQS). For any other exit reason the queue is
         // genuinely exhausted (no more parts this peer can serve) and
         // re-queueing would just stall.
-        if !peer_out_of_parts {
+        if !peer_out_of_parts || stream_maybe_desynced {
             break 'session_loop;
         }
         // Verify there's still work for this peer to do before we burn
@@ -10365,18 +11076,14 @@ async fn download_parts_from_source(
         // last measured rate here put a live-looking speed on a row the lines
         // above went out of their way to stop presenting as active.
         emit_source!("queued", None, 0u64);
+        peer_conn.held.set_awaiting_grant(true);
 
-        let requeue_outcome = try_in_session_requeue(
-            &mut *writer,
-            &mut *reader,
-            file_hash,
-            requeue_timeout_secs,
-            &control,
-        )
-        .await;
+        let requeue_outcome =
+            try_in_session_requeue(&mut *reader, requeue_timeout_secs, &control).await;
 
         match requeue_outcome {
             InSessionRequeueResult::Promoted => {
+                peer_conn.held.set_awaiting_grant(false);
                 // Peer gave us a fresh slot on the same TCP connection.
                 // Reset per-session state and re-enter the per-part
                 // loop.  pipelined_next / per_part_credit stay because
@@ -10477,15 +11184,20 @@ async fn download_parts_from_source(
                     queued_guard.armed = false;
                     queued_count.fetch_sub(1, Ordering::Relaxed);
                 }
-                // Bail with an error so the spawn handler logs and emits
-                // a SourceDetail "failed" event.
-                anyhow::bail!("in-session re-queue lost connection: {reason}");
+                // The uploader still holds us on its queue (it re-queued us
+                // when it sent OP_OUTOFPARTREQS), so this is a queue state,
+                // not a source failure.
+                anyhow::bail!(
+                    "stage:queue_detached connection lost while queued after OutOfPartReqs: {reason}"
+                );
             }
         }
     } // end 'session_loop
 
-    // Signal the uploader that we're done
-    write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_END_OF_DOWNLOAD, &[])
+    // Signal the uploader that we're done. eMule counts a payload without the
+    // file hash as a failed file request (ListenSocket.cpp OP_END_OF_DOWNLOAD
+    // -> CheckFailedFileIdReqs).
+    write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_END_OF_DOWNLOAD, file_hash)
         .await
         .ok();
 
@@ -10836,9 +11548,8 @@ async fn compute_part_blocks_ms(
     if !busy.is_empty() {
         // Stable partition, so blocks keep their ascending order within each
         // group and a part is still filled front-to-back.
-        all_blocks.sort_by_key(|&(bs, be)| {
-            u8::from(busy.iter().any(|&(rs, re)| rs < be && re > bs))
-        });
+        all_blocks
+            .sort_by_key(|&(bs, be)| u8::from(busy.iter().any(|&(rs, re)| rs < be && re > bs)));
     }
     (all_blocks, part_start, part_end)
 }
@@ -10900,8 +11611,21 @@ fn outstanding_blocks_for_speed_ms(
     // already says so. So this branch now only adds the sub-eMule tiers that
     // exist to keep a trickle slot inside its uploader's send timeout, and then
     // falls through to the shared ladder.
-    let mut blocks = if remaining_parts <= 4 && speed > 0 && speed < 4 * 1024 {
-        if speed < 1200 {
+    //
+    // The cold start is deliberately *not* optimistic on a small file. This
+    // budget is computed once per part (see the call site) and never revised
+    // inside the receive loop, so on a file of four parts or fewer the guess
+    // made at `speed == 0` is the depth for effectively the whole transfer —
+    // there is no second part to re-measure on. Handing a trickle uploader six
+    // blocks, or even the clamped three, is 540 KiB outstanding, which at
+    // 4 KB/s is over two minutes of data and puts us back past the send timeout
+    // that the sub-eMule tiers exist to keep us inside. Two blocks is 360 KiB,
+    // inside that timeout even on the slowest slot, and costs a fast peer only a
+    // slightly shorter sliding window — the window refills as blocks land, so a
+    // smaller one means more round trips, not a stalled pipe. A file with more
+    // parts keeps the optimistic default, because its next part corrects it.
+    let mut blocks = if remaining_parts <= 4 && speed < 4 * 1024 {
+        if speed > 0 && speed < 1200 {
             1
         } else {
             2
@@ -11062,19 +11786,24 @@ async fn wait_for_aich_recovery_answer_ms<R: AsyncReadExt + Unpin + ?Sized>(
             // on the wire but may inflate to 10 MiB — roughly 640 MiB resident per
             // connection, multiplied across source slots, on a path the sender
             // reaches by failing a part's MD4. Both limits leave the stream on a
-            // packet boundary, so refusing to buffer more is safe either way.
+            // packet boundary, so giving up on the answer is safe either way.
+            //
+            // The packet just read is buffered before giving up, never
+            // dropped: it is usually a requested data block, and losing it
+            // leaves that range outstanding for the rest of the session. That
+            // overshoots the byte cap by at most one packet.
             const MAX_DEFERRED_PACKETS: usize = 64;
             const MAX_DEFERRED_BYTES: usize = 4 * 1024 * 1024;
+            deferred_packets.push_back((proto, opcode, payload));
             let deferred_bytes: usize = deferred_packets
                 .iter()
                 .map(|(_, _, buffered)| buffered.len())
                 .sum();
             if deferred_packets.len() >= MAX_DEFERRED_PACKETS
-                || deferred_bytes.saturating_add(payload.len()) > MAX_DEFERRED_BYTES
+                || deferred_bytes >= MAX_DEFERRED_BYTES
             {
                 return AichAnswerOutcome::NotAvailable;
             }
-            deferred_packets.push_back((proto, opcode, payload));
         }
     };
 
@@ -11093,30 +11822,74 @@ async fn wait_for_aich_recovery_answer_ms<R: AsyncReadExt + Unpin + ?Sized>(
 /// [`HANDSHAKE_READ_TIMEOUT_SECS`] of silence. All call sites are pre-transfer
 /// (hello / emule-info / file-status / hashset); the in-transfer no-data check
 /// uses the longer `DOWNLOADTIMEOUT_SECS` separately.
+///
+/// A timeout while no packet has begun is a plain `TimedOut` and leaves the
+/// stream on a packet boundary; a stall part-way through a packet is reported
+/// as [`PacketStreamDesynced`] (see [`read_packet_within_ms`]).
 async fn read_packet_timeout_ms<R: AsyncReadExt + Unpin + ?Sized>(
     reader: &mut R,
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(HANDSHAKE_READ_TIMEOUT_SECS),
-        read_packet_async_ms(reader),
-    )
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
+    let bound = std::time::Duration::from_secs(HANDSHAKE_READ_TIMEOUT_SECS);
+    read_packet_within_ms(reader, bound, bound)
+        .await?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))
+}
+
+/// Wait up to `start_within` for a packet to begin, then up to `finish_within`
+/// for the rest of it.
+///
+/// Only the protocol byte races the idle deadline: a one-byte read consumes
+/// that byte or nothing, so `Ok(None)` leaves the stream on a packet boundary.
+/// Once a packet has begun, abandoning it would strand the reader mid-frame,
+/// so that expiry is an error carrying [`PacketStreamDesynced`].
+async fn read_packet_within_ms<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
+    start_within: std::time::Duration,
+    finish_within: std::time::Duration,
+) -> std::io::Result<Option<(u8, u8, Vec<u8>)>> {
+    let protocol = match tokio::time::timeout(start_within, reader.read_u8()).await {
+        Ok(result) => result?,
+        Err(_) => return Ok(None),
+    };
+    match tokio::time::timeout(finish_within, read_packet_body_ms(reader, protocol)).await {
+        Ok(result) => result.map(Some),
+        Err(_) => Err(packet_stream_desynced_error()),
+    }
 }
 
 async fn read_packet_async_ms<R: AsyncReadExt + Unpin + ?Sized>(
     reader: &mut R,
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
-    const OP_PACKEDPROT: u8 = 0xD4;
     let protocol = reader.read_u8().await?;
-    let length = reader.read_u32_le().await? as usize;
+    read_packet_body_ms(reader, protocol).await
+}
+
+/// [`read_packet_async_ms`] that sets `started` once the first byte is
+/// consumed, so a caller dropping the future can tell whether the stream is
+/// still framed.
+async fn read_packet_marking_start_ms<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
+    started: &AtomicBool,
+) -> std::io::Result<(u8, u8, Vec<u8>)> {
+    let protocol = reader.read_u8().await?;
+    started.store(true, Ordering::Relaxed);
+    read_packet_body_ms(reader, protocol).await
+}
+
+/// The rest of a packet once its protocol byte has been read.
+async fn read_packet_body_ms<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
+    protocol: u8,
+) -> std::io::Result<(u8, u8, Vec<u8>)> {
+    const OP_PACKEDPROT: u8 = 0xD4;
+    let length = reader.read_u32_le().await.map_err(desynced_io_error)? as usize;
     if length == 0 || length > MAX_WIRE_PACKET_LEN {
-        return Err(std::io::Error::new(
+        return Err(desynced_io_error(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid packet length",
-        ));
+        )));
     }
-    let opcode = reader.read_u8().await?;
+    let opcode = reader.read_u8().await.map_err(desynced_io_error)?;
     let payload_len = length - 1;
     // Grow the buffer on the heap with bytes that actually arrive rather than
     // trusting the declared length up front. A peer that announces a large
@@ -11134,7 +11907,10 @@ async fn read_packet_async_ms<R: AsyncReadExt + Unpin + ?Sized>(
         let want = remaining.min(READ_STEP);
         let start = payload.len();
         payload.resize(start + want, 0);
-        reader.read_exact(&mut payload[start..start + want]).await?;
+        reader
+            .read_exact(&mut payload[start..start + want])
+            .await
+            .map_err(desynced_io_error)?;
         remaining -= want;
     }
     if protocol == OP_PACKEDPROT {
@@ -11217,7 +11993,7 @@ pub async fn perform_outbound_hello(
     let hello_payload = build_hello_with_buddy_opts(
         user_hash,
         our_client_id,
-        tcp_port,
+        peer_sessions::advertised_tcp_port_or(tcp_port),
         nickname,
         None,
         &hello_options,
@@ -11362,7 +12138,10 @@ mod tests {
             .publish_in_flight_requests(0, held.clone());
 
         let (blocks, _, _) = compute_part_blocks_ms(&tracker, 0, 1).await;
-        assert!(blocks.len() > held.len(), "part 0 has more blocks than this");
+        assert!(
+            blocks.len() > held.len(),
+            "part 0 has more blocks than this"
+        );
         for (i, held_range) in held.iter().enumerate() {
             assert_ne!(
                 blocks[i], *held_range,
@@ -11401,7 +12180,10 @@ mod tests {
             "nothing is on disk yet, so every block is still worth asking for"
         );
 
-        tracker.write().await.fill_range(EMBLOCKSIZE, EMBLOCKSIZE * 2);
+        tracker
+            .write()
+            .await
+            .fill_range(EMBLOCKSIZE, EMBLOCKSIZE * 2);
         assert_eq!(
             drop_filled_blocks(&tracker, &batch).await,
             vec![batch[0], batch[2]],
@@ -11870,18 +12652,33 @@ mod tests {
     }
 
     /// ...but small-file / endgame cases (remaining_parts <= 4) must stay
-    /// conservative — the inner clamp at the bottom of the function
-    /// caps to 3 blocks when remaining_parts <= 2, and to 6 when
-    /// <= 4, so the unknown-speed branch shouldn't leak the larger
-    /// `blocks = 6` default in there and start over-requesting the tail
-    /// of a small file.
+    /// conservative. The budget is chosen once per part and never revised, so on
+    /// a file this small the unknown-speed guess is the depth for the whole
+    /// transfer — if it leaks the optimistic default in here, a trickle uploader
+    /// is handed minutes of outstanding data and drops us on its send timeout.
+    ///
+    /// Asserted with a gap large enough that the trailing gap clamp is not what
+    /// produces the answer. That clamp is why the previous version of this test
+    /// passed while the branch it names was in fact leaking: it asked for
+    /// `(0, 2, 1024)`, and 1024 bytes of gap floors any budget to a single block
+    /// no matter what the ladder said.
     #[test]
     fn outstanding_requests_cold_start_respects_small_file_clamp() {
-        let blocks = outstanding_blocks_for_speed_ms(0, 2, 1024);
-        assert_eq!(
-            blocks, 1,
-            "endgame with tiny gap should keep a single block pending, got {blocks}",
+        for &remaining_parts in &[1usize, 2, 3, 4] {
+            let blocks = outstanding_blocks_for_speed_ms(0, remaining_parts, u64::from(u32::MAX));
+            assert!(
+                blocks <= 2,
+                "cold start on a {remaining_parts}-part file must stay inside a \
+                 trickle uploader's send timeout, got {blocks}",
+            );
+        }
+        // A file with more parts still gets the optimistic default, because its
+        // next part re-measures and corrects it.
+        assert!(
+            outstanding_blocks_for_speed_ms(0, 100, u64::from(u32::MAX)) > MAX_BLOCKS_PER_REQUEST,
         );
+        // The gap clamp still has the final say when there is almost nothing left.
+        assert_eq!(outstanding_blocks_for_speed_ms(0, 2, 1024), 1);
     }
 
     /// Going faster must never shrink the pipeline. The endgame branch used to
@@ -12234,5 +13031,573 @@ mod browse_response_tests {
         let parsed = parse_browse_response(&legacy);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].3, None);
+    }
+}
+
+#[cfg(test)]
+mod new_connection_window_tests {
+    use super::*;
+
+    #[test]
+    fn outbound_dials_wait_once_the_window_is_full() {
+        let mut window = None;
+        let t0 = std::time::Instant::now();
+        for _ in 0..3 {
+            assert_eq!(admit_new_connection(&mut window, 3, t0, true), None);
+        }
+        let wait = admit_new_connection(&mut window, 3, t0 + std::time::Duration::from_secs(2), true);
+        assert_eq!(wait, Some(std::time::Duration::from_secs(3)));
+        // A new window opens after five seconds.
+        assert_eq!(admit_new_connection(&mut window, 3, t0 + NEW_CONN_WINDOW, true), None);
+    }
+
+    /// eMule counts accepts but never refuses them for rate: the peer has
+    /// already crossed the router. Refusing them is what could keep peers
+    /// from joining the upload queue under load.
+    #[test]
+    fn inbound_connections_are_counted_but_never_refused() {
+        let mut window = None;
+        let t0 = std::time::Instant::now();
+        for _ in 0..10 {
+            assert_eq!(admit_new_connection(&mut window, 3, t0, false), None);
+        }
+        // They still fill the window our own dials wait on.
+        assert!(admit_new_connection(&mut window, 3, t0, true).is_some());
+    }
+
+    #[test]
+    fn a_zero_budget_turns_the_limit_off() {
+        let mut window = None;
+        let t0 = std::time::Instant::now();
+        for _ in 0..100 {
+            assert_eq!(admit_new_connection(&mut window, 0, t0, true), None);
+        }
+    }
+
+    /// A dial checks for room before it takes a connection slot, and the
+    /// check must not use up the room it is asking about.
+    #[test]
+    fn looking_at_the_window_takes_no_place_in_it() {
+        let mut window = None;
+        let t0 = std::time::Instant::now();
+        assert_eq!(new_connection_window_wait(&window, 2, t0), None);
+        assert_eq!(admit_new_connection(&mut window, 2, t0, false), None);
+        assert_eq!(new_connection_window_wait(&window, 2, t0), None);
+        assert_eq!(window.map(|(_, count)| count), Some(1), "peeking counted nothing");
+        assert_eq!(admit_new_connection(&mut window, 2, t0, false), None);
+        let wait = new_connection_window_wait(&window, 2, t0 + std::time::Duration::from_secs(1));
+        assert_eq!(wait, Some(std::time::Duration::from_secs(4)));
+        assert_eq!(new_connection_window_wait(&window, 2, t0 + NEW_CONN_WINDOW), None);
+        assert_eq!(new_connection_window_wait(&window, 0, t0), None, "no limit, no wait");
+    }
+}
+
+#[cfg(test)]
+mod final_verify_recovery_tests {
+    use super::*;
+    use crate::network::ed2k::hash::{ed2k_hash_bytes, PARTSIZE};
+
+    #[test]
+    fn a_failed_re_read_keeps_every_part() {
+        assert_eq!(final_verify_recovery(None, true, 5), FinalVerifyRecovery::Reverify);
+        assert_eq!(final_verify_recovery(None, false, 5), FinalVerifyRecovery::Reverify);
+    }
+
+    #[test]
+    fn diagnosed_parts_are_the_only_ones_reopened() {
+        assert_eq!(
+            final_verify_recovery(Some(vec![1, 3]), true, 5),
+            FinalVerifyRecovery::Reopen(vec![1, 3])
+        );
+    }
+
+    #[test]
+    fn no_bad_part_against_a_trusted_hashset_is_not_a_mismatch() {
+        assert_eq!(final_verify_recovery(Some(Vec::new()), true, 5), FinalVerifyRecovery::Reverify);
+    }
+
+    #[test]
+    fn no_bad_part_against_an_untrusted_hashset_reopens_everything() {
+        assert_eq!(
+            final_verify_recovery(Some(Vec::new()), false, 3),
+            FinalVerifyRecovery::Reopen(vec![0, 1, 2])
+        );
+    }
+
+    struct TwoPartFile {
+        dir: std::path::PathBuf,
+        path: std::path::PathBuf,
+        file_hash: [u8; 16],
+        part_hashes: Vec<[u8; 16]>,
+        size: u64,
+    }
+
+    impl TwoPartFile {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "ember-final-verify-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("f.part");
+            let data: Vec<u8> = (0..PARTSIZE as usize + 500).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&path, &data).unwrap();
+            let mut file_hash = [0u8; 16];
+            file_hash.copy_from_slice(&hex::decode(ed2k_hash_bytes(&data)).unwrap());
+            let split = PARTSIZE as usize;
+            let part_hashes = vec![
+                Md4::digest(&data[..split]).into(),
+                Md4::digest(&data[split..]).into(),
+            ];
+            Self { dir, path, file_hash, part_hashes, size: data.len() as u64 }
+        }
+    }
+
+    impl Drop for TwoPartFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn intact_parts_under_a_verified_hashset_are_reverified_not_reopened() {
+        let f = TwoPartFile::new("intact");
+        let got = diagnose_final_hash_mismatch(
+            f.path.clone(),
+            f.file_hash,
+            f.size,
+            f.part_hashes.clone(),
+        )
+        .await;
+        assert_eq!(got, FinalVerifyRecovery::Reverify);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_part_is_the_only_one_reopened() {
+        let f = TwoPartFile::new("corrupt");
+        let mut bytes = std::fs::read(&f.path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&f.path, &bytes).unwrap();
+        let got = diagnose_final_hash_mismatch(
+            f.path.clone(),
+            f.file_hash,
+            f.size,
+            f.part_hashes.clone(),
+        )
+        .await;
+        assert_eq!(got, FinalVerifyRecovery::Reopen(vec![1]));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_part_file_keeps_progress() {
+        let f = TwoPartFile::new("missing");
+        let missing = f.dir.join("gone.part");
+        let got =
+            diagnose_final_hash_mismatch(missing, f.file_hash, f.size, f.part_hashes.clone())
+                .await;
+        assert_eq!(got, FinalVerifyRecovery::Reverify);
+    }
+
+    #[test]
+    fn re_verification_waits_grow_and_stop_at_the_fallback() {
+        let secs = |prior| final_verify_retry_delay(prior).as_secs();
+        assert_eq!(secs(0), 0, "the first attempt never waits");
+        assert_eq!(secs(1), FINAL_VERIFY_RETRY_BASE_SECS);
+        assert_eq!(secs(2), FINAL_VERIFY_RETRY_BASE_SECS * 2);
+        assert_eq!(
+            secs(FINAL_VERIFY_INCONCLUSIVE_LIMIT),
+            0,
+            "past the limit the fallback re-opened parts; this attempt follows a download"
+        );
+    }
+
+    #[test]
+    fn the_fallback_reopens_what_it_found_or_gives_up() {
+        assert_eq!(
+            tolerant_final_verify_recovery(Some(vec![2])),
+            FinalVerifyRecovery::Reopen(vec![2])
+        );
+        assert_eq!(tolerant_final_verify_recovery(Some(Vec::new())), FinalVerifyRecovery::Unreadable);
+        assert_eq!(tolerant_final_verify_recovery(None), FinalVerifyRecovery::Unreadable);
+    }
+
+    #[test]
+    fn the_tolerant_re_read_names_only_bad_parts() {
+        let f = TwoPartFile::new("tolerant");
+        assert_eq!(
+            unreadable_or_corrupt_parts_on_disk(&f.path, f.size, &f.part_hashes).unwrap(),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            unreadable_or_corrupt_parts_on_disk(&f.path, f.size, &[]).unwrap(),
+            Vec::<usize>::new(),
+            "readable parts with nothing to compare against are kept"
+        );
+        let mut bytes = std::fs::read(&f.path).unwrap();
+        bytes[0] ^= 0xFF;
+        std::fs::write(&f.path, &bytes).unwrap();
+        assert_eq!(
+            unreadable_or_corrupt_parts_on_disk(&f.path, f.size, &f.part_hashes).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            unreadable_or_corrupt_parts_on_disk(&f.path, f.size + 1, &f.part_hashes).unwrap(),
+            vec![0, 1],
+            "a size that disagrees re-opens everything"
+        );
+        assert!(unreadable_or_corrupt_parts_on_disk(&f.dir.join("gone"), f.size, &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn inconclusive_runs_escalate_then_give_up_on_a_file_that_reads_fine() {
+        let f = TwoPartFile::new("escalate");
+        let id = "final-verify-escalation-test";
+        clear_inconclusive_final_verifies(id);
+        for run in 1..FINAL_VERIFY_INCONCLUSIVE_LIMIT {
+            let got = settle_final_verify_recovery(
+                id,
+                FinalVerifyRecovery::Reverify,
+                f.path.clone(),
+                f.size,
+                f.part_hashes.clone(),
+            )
+            .await;
+            assert_eq!(got, FinalVerifyRecovery::Reverify);
+            assert_eq!(prior_inconclusive_final_verifies(id), run);
+        }
+        let got = settle_final_verify_recovery(
+            id,
+            FinalVerifyRecovery::Reverify,
+            f.path.clone(),
+            f.size,
+            f.part_hashes.clone(),
+        )
+        .await;
+        assert_eq!(got, FinalVerifyRecovery::Unreadable, "nothing to re-download");
+        assert_eq!(prior_inconclusive_final_verifies(id), 0, "a later resume starts afresh");
+    }
+
+    #[tokio::test]
+    async fn the_fallback_reopens_bad_parts_and_keeps_counting() {
+        let f = TwoPartFile::new("fallback");
+        let mut bytes = std::fs::read(&f.path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&f.path, &bytes).unwrap();
+        let id = "final-verify-fallback-test";
+        clear_inconclusive_final_verifies(id);
+        let mut got = FinalVerifyRecovery::Reverify;
+        for _ in 0..FINAL_VERIFY_INCONCLUSIVE_LIMIT {
+            got = settle_final_verify_recovery(
+                id,
+                FinalVerifyRecovery::Reverify,
+                f.path.clone(),
+                f.size,
+                f.part_hashes.clone(),
+            )
+            .await;
+        }
+        assert_eq!(got, FinalVerifyRecovery::Reopen(vec![1]));
+        assert_eq!(prior_inconclusive_final_verifies(id), FINAL_VERIFY_INCONCLUSIVE_LIMIT);
+
+        // A digest that was actually computed ends the run.
+        let got = settle_final_verify_recovery(
+            id,
+            FinalVerifyRecovery::Reopen(vec![0]),
+            f.path.clone(),
+            f.size,
+            f.part_hashes.clone(),
+        )
+        .await;
+        assert_eq!(got, FinalVerifyRecovery::Reopen(vec![0]));
+        assert_eq!(prior_inconclusive_final_verifies(id), 0);
+    }
+
+    #[tokio::test]
+    async fn without_a_hashset_every_part_is_reopened() {
+        let f = TwoPartFile::new("nohashset");
+        let got = diagnose_final_hash_mismatch(f.path.clone(), f.file_hash, f.size, Vec::new())
+            .await;
+        assert_eq!(got, FinalVerifyRecovery::Reopen(vec![0, 1]));
+    }
+}
+
+#[cfg(test)]
+mod undersized_block_tests {
+    use super::super::hash::PARTSIZE;
+    use super::*;
+
+    const FILE_SIZE: u64 = 3 * PARTSIZE;
+
+    #[test]
+    fn a_tiny_block_inside_a_requested_range_is_accepted() {
+        // The gap planner re-requests the 5-byte tail an interrupted packed
+        // block left behind; the uploader answers with exactly those bytes.
+        let requested = [(1_000, 1_005)];
+        assert!(!is_unsolicited_undersized_block(
+            1_000, 1_005, FILE_SIZE, requested
+        ));
+    }
+
+    #[test]
+    fn a_tiny_slice_of_a_larger_request_is_accepted() {
+        let requested = [(0, 180 * 1024)];
+        assert!(!is_unsolicited_undersized_block(
+            10_240, 10_241, FILE_SIZE, requested
+        ));
+    }
+
+    #[test]
+    fn a_tiny_block_nobody_asked_for_is_rejected() {
+        let requested = [(0, 180 * 1024)];
+        assert!(is_unsolicited_undersized_block(
+            PARTSIZE,
+            PARTSIZE + 1,
+            FILE_SIZE,
+            requested
+        ));
+        assert!(is_unsolicited_undersized_block(
+            500,
+            501,
+            FILE_SIZE,
+            std::iter::empty()
+        ));
+    }
+
+    #[test]
+    fn a_tiny_block_straddling_a_request_edge_is_rejected() {
+        let requested = [(1_000, 1_005)];
+        assert!(is_unsolicited_undersized_block(
+            1_003, 1_008, FILE_SIZE, requested
+        ));
+    }
+
+    #[test]
+    fn the_file_tail_and_full_size_blocks_are_never_rejected() {
+        assert!(!is_unsolicited_undersized_block(
+            FILE_SIZE - 3,
+            FILE_SIZE,
+            FILE_SIZE,
+            std::iter::empty()
+        ));
+        assert!(!is_unsolicited_undersized_block(
+            0,
+            MIN_UNSOLICITED_BLOCK_BYTES,
+            FILE_SIZE,
+            std::iter::empty()
+        ));
+    }
+}
+
+#[cfg(test)]
+mod packet_framing_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn frame(protocol: u8, opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![protocol];
+        out.extend_from_slice(&(1 + payload.len() as u32).to_le_bytes());
+        out.push(opcode);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[tokio::test]
+    async fn aich_wait_keeps_the_packet_that_fills_the_deferred_buffer() {
+        let mut stream = Vec::new();
+        for i in 0..70u8 {
+            stream.extend(frame(0xE3, 0x46, &[i; 8]));
+        }
+        let mut reader = std::io::Cursor::new(stream);
+        let mut deferred = std::collections::VecDeque::new();
+        let outcome =
+            wait_for_aich_recovery_answer_ms(&mut reader, &[0; 16], 0, [0; 20], &mut deferred)
+                .await;
+        assert!(matches!(outcome, AichAnswerOutcome::NotAvailable));
+        assert_eq!(deferred.len(), 64);
+        assert_eq!(deferred.back().map(|p| p.2.clone()), Some(vec![63u8; 8]));
+        let next = read_packet_async_ms(&mut reader).await.unwrap();
+        assert_eq!(next.2, vec![64u8; 8], "nothing was read and discarded");
+    }
+
+    #[tokio::test]
+    async fn aich_wait_keeps_the_packet_that_crosses_the_byte_cap() {
+        let big = vec![0x5A; 1_500_000];
+        let mut stream = Vec::new();
+        for _ in 0..4 {
+            stream.extend(frame(0xE3, 0x46, &big));
+        }
+        let mut reader = std::io::Cursor::new(stream);
+        let mut deferred = std::collections::VecDeque::new();
+        let outcome =
+            wait_for_aich_recovery_answer_ms(&mut reader, &[0; 16], 0, [0; 20], &mut deferred)
+                .await;
+        assert!(matches!(outcome, AichAnswerOutcome::NotAvailable));
+        assert_eq!(deferred.len(), 3, "the third block is buffered, not dropped");
+        let next = read_packet_async_ms(&mut reader).await.unwrap();
+        assert_eq!(next.2.len(), big.len());
+    }
+
+    #[tokio::test]
+    async fn a_packet_split_across_the_idle_tick_is_read_whole() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        let payload = vec![0xAB; 600];
+        let first = frame(0xE3, 0x46, &payload);
+        let second = frame(0xC5, 0x60, &[1, 2]);
+        let writer = tokio::spawn(async move {
+            peer.write_all(&first[..8]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            peer.write_all(&first[8..]).await.unwrap();
+            peer.write_all(&second).await.unwrap();
+            peer
+        });
+
+        let got = read_packet_within_ms(
+            &mut reader,
+            Duration::from_millis(40),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, Some((0xE3, 0x46, payload)));
+        let next = read_packet_within_ms(
+            &mut reader,
+            Duration::from_millis(40),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next, Some((0xC5, 0x60, vec![1, 2])));
+        drop(writer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_idle_tick_consumes_nothing() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        let idle = read_packet_within_ms(
+            &mut reader,
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(idle, None);
+
+        peer.write_all(&frame(0xE3, 0x54, &[7; 12])).await.unwrap();
+        let got = read_packet_within_ms(
+            &mut reader,
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, Some((0xE3, 0x54, vec![7; 12])));
+    }
+
+    #[tokio::test]
+    async fn a_stall_mid_packet_is_reported_as_desync() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        peer.write_all(&frame(0xE3, 0x46, &[0; 64])[..10]).await.unwrap();
+        let err = read_packet_within_ms(
+            &mut reader,
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        let err = anyhow::Error::from(err).context("stage:hashset_wait");
+        assert!(is_packet_stream_desynced(&err));
+        drop(peer);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_length_after_the_header_is_a_desync() {
+        let (mut peer, mut reader) = tokio::io::duplex(64);
+        peer.write_all(&[0xE3, 0, 0, 0, 0, 0x46]).await.unwrap();
+        let err = read_packet_within_ms(&mut reader, Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(is_packet_stream_desynced(
+            &anyhow::Error::from(err).context("stage:emule_info_wait")
+        ));
+
+        let (mut peer, mut reader) = tokio::io::duplex(64);
+        peer.write_all(&[0xE3, 0xFF, 0xFF, 0xFF, 0x7F]).await.unwrap();
+        let err = read_packet_async_ms(&mut reader).await.unwrap_err();
+        assert!(is_packet_stream_desynced(&anyhow::Error::from(err)));
+    }
+
+    #[tokio::test]
+    async fn eof_mid_packet_is_a_desync_that_keeps_its_kind() {
+        let (mut peer, mut reader) = tokio::io::duplex(64);
+        peer.write_all(&frame(0xE3, 0x46, &[0; 32])[..9]).await.unwrap();
+        drop(peer);
+        let err = read_packet_async_ms(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        let err = anyhow::Error::from(err);
+        assert!(is_packet_stream_desynced(&err));
+        assert!(is_connection_reset(&err));
+    }
+
+    #[tokio::test]
+    async fn eof_on_a_packet_boundary_is_not_a_desync() {
+        let (peer, mut reader) = tokio::io::duplex(64);
+        drop(peer);
+        let err = read_packet_async_ms(&mut reader).await.unwrap_err();
+        assert!(!is_packet_stream_desynced(&anyhow::Error::from(err)));
+    }
+
+    #[tokio::test]
+    async fn a_bad_packed_payload_leaves_the_stream_framed() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        peer.write_all(&frame(0xD4, 0x40, &[0xDE, 0xAD, 0xBE, 0xEF]))
+            .await
+            .unwrap();
+        peer.write_all(&frame(0xE3, 0x54, &[9])).await.unwrap();
+        let err = read_packet_async_ms(&mut reader).await.unwrap_err();
+        assert!(!is_packet_stream_desynced(&anyhow::Error::from(err)));
+        assert_eq!(
+            read_packet_async_ms(&mut reader).await.unwrap(),
+            (0xE3, 0x54, vec![9])
+        );
+    }
+
+    #[test]
+    fn only_the_desync_marker_classifies_as_desync() {
+        let idle = std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out");
+        assert!(!is_packet_stream_desynced(
+            &anyhow::Error::from(idle).context("stage:emule_info_wait")
+        ));
+        assert!(is_packet_stream_desynced(&anyhow::Error::from(
+            packet_stream_desynced_error()
+        )));
+    }
+
+    #[tokio::test]
+    async fn marking_read_flags_a_packet_only_once_it_has_begun() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        let started = AtomicBool::new(false);
+        {
+            let read = read_packet_marking_start_ms(&mut reader, &started);
+            assert!(tokio::time::timeout(Duration::from_millis(20), read)
+                .await
+                .is_err());
+        }
+        assert!(!started.load(Ordering::Relaxed));
+
+        peer.write_all(&frame(0xE3, 0x46, &[0; 32])[..3]).await.unwrap();
+        {
+            let read = read_packet_marking_start_ms(&mut reader, &started);
+            assert!(tokio::time::timeout(Duration::from_millis(50), read)
+                .await
+                .is_err());
+        }
+        assert!(started.load(Ordering::Relaxed));
     }
 }

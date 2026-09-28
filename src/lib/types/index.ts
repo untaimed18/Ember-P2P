@@ -147,6 +147,9 @@ export interface Transfer {
   expected_aich?: string;
   /** Optional Ember content BLAKE3 (64 hex) from `eh=` / browse / offer. */
   ember_file_hash?: string;
+  /** Downloads only: taken from a friend who restricts the file, so it is
+   *  never advertised on the open network and completes friends-only. */
+  friends_only?: boolean;
   /** Downloads only: absolute path of the finished file on disk. Completion
    *  moves the `.part` to `Downloads/<name>`, but the backend deduplicates
    *  against an existing file by appending ` (n)` to the stem — so rebuilding
@@ -166,12 +169,6 @@ export interface Transfer {
    *  had at request time — eMule's `m_abyUpPartStatus`. Shaded dark beneath the
    *  green served-this-session fill. */
   up_peer_part_status?: string;
-  /** Downloads only: true once this completion re-checked the file's Ember
-   *  content BLAKE3 hash on disk and it matched. Only ever set by a
-   *  completion that actually ran the check — never inferred from
-   *  `expected_aich`-style presence, since the crash-recovery re-verify
-   *  path skips it. */
-  ember_verified: boolean;
 }
 
 export interface SourceInfo {
@@ -395,9 +392,10 @@ export interface EmberDiagnostics {
    *  and have not been yet. Persistently high means replication is falling
    *  behind its per-cycle budget. */
   ember_dht_republish_backlog: number;
-  /** Seconds since any Ember DHT frame arrived, or 0 if none ever has. Separates
-   *  "still joining" from "joined and quiet" from "stuck". */
-  ember_dht_seconds_since_inbound: number;
+  /** Seconds since any Ember DHT frame arrived, or null if none ever has (0 is
+   *  a frame this second). Separates "still joining" from "joined and quiet"
+   *  from "stuck". */
+  ember_dht_seconds_since_inbound: number | null;
   ember_dht_pings_sent: number;
   ember_dht_pings_received: number;
   ember_dht_pongs_received: number;
@@ -415,9 +413,14 @@ export interface EmberDiagnostics {
   ember_dht_stored_for_others_records: number;
   ember_dht_stores_received: number;
   ember_dht_find_values_received: number;
+  /** Single-record publish operations plus `STORE_BATCH` frames awaiting an
+   *  ack. A gauge of work in flight, not a record count: one batch carries
+   *  many records. */
   ember_dht_active_publishes: number;
   /** Maintenance loop (slice 6) counters. */
   ember_dht_refreshes: number;
+  /** Every automatic "does it answer" PING, not only the maintenance pass:
+   *  gossip-lead probes and full-bucket incumbent probes land here too. */
   ember_dht_liveness_pings_sent: number;
   ember_dht_contacts_evicted: number;
   /** Contacts moved to a replacement cache because the diversity limits tightened. */
@@ -469,9 +472,11 @@ export interface EmberDiagnostics {
   /** Slice 15: LowID/firewalled but still publishing Ember DHT sources. */
   ember_dht_firewalled_publishing: boolean;
   /** Firewalled with no HighID buddy — Ember source STORE is skipped. */
-  ember_dht_waiting_buddy?: boolean;
+  ember_dht_waiting_buddy: boolean;
   /** Slice 15: Ember on but no external IPv4 available for source records. */
   ember_dht_udp_unreachable: boolean;
+  /** Whether the three reachability flags above have been evaluated since diagnostics were last reset. */
+  ember_dht_reachability_known: boolean;
   /** PROXY_STORE requests sent (firewalled publisher → HighID buddies). */
   ember_dht_buddy_publishes: number;
   /** PROXY_STORE requests accepted and fanned out as a buddy. */
@@ -586,6 +591,8 @@ export interface EmberDiagnostics {
   ember_dht_store_reject_proximity?: number;
   /** Verified inbound keyword records whose key no word in their own signed name hashes to. */
   ember_dht_keyword_key_off_name?: number;
+  /** Inbound records of a type this build does not know that were stored (not replicated onward). */
+  ember_dht_unknown_record_types?: number;
   /** Peers that have told us which wire versions they can decode. */
   ember_dht_version_advertisers?: number;
   /** Frames refused by the aggregate per-address STORE ceiling. */
@@ -901,8 +908,9 @@ export interface AppSettings {
   /** eMule `maxconnections`. One machine-wide budget shared by the upload
    *  listener and the outbound download sources. */
   max_connections: number;
-  /** eMule `MaxConnectionsPerFiveSeconds`. Caps how fast the upload listener
-   *  opens new sockets; 0 disables the gate. */
+  /** eMule `MaxConnectionsPerFiveSeconds`. Caps how fast we open new
+   *  connections; accepted ones count toward it but are never refused by it.
+   *  0 disables the gate. */
   max_connections_per_five_secs: number;
   add_downloads_paused: boolean;
   remove_finished_downloads: boolean;
@@ -954,6 +962,9 @@ export interface AppSettings {
   /** Who may offer you a file in a channel. Gates the prompt only — accepting
    *  is always a separate, explicit choice. */
   channel_file_offers: 'everyone' | 'friends' | 'nobody';
+  /** Files a friend sends in chat at or under this many MB download without
+   *  asking; larger ones wait for an accept. 0 always asks. At most 2048. */
+  chat_attachment_auto_accept_mb: number;
   /** Maximum number of friends allowed (1–500) */
   max_friends: number;
   /**
@@ -1014,6 +1025,10 @@ export interface AppSettings {
   /** Friend chat messages and incoming file offers. */
   notify_friend_message: boolean;
   notify_friend_request: boolean;
+  /** Someone viewed our shared files (an ed2k client's "View Files", or a
+   *  friend over Ember). Only answered browses notify; refusals go to the
+   *  server log alone. */
+  notify_shares_browsed: boolean;
   /** Messages in joined rooms. The one category that defaults **off** — a room
    *  can carry hundreds of messages an hour. Muted rooms and ignored members
    *  are excluded regardless. */

@@ -6,9 +6,11 @@
   import { listen } from '@tauri-apps/api/event';
   import { networkStats, serverStatus } from '$lib/stores/network';
   import { getSharedFileCount } from '$lib/api/sharing';
-  import { formatBytes, formatSpeed } from '$lib/utils';
+  import { formatBytes, formatNumber, formatSpeed } from '$lib/utils';
   import { addToast } from '$lib/stores/toast';
-  import { EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
+  import { emberJoinTimedOut } from '$lib/stores/emberJoin';
+  import { isUploadCounterPhase } from '$lib/sharedFileStats';
+  import { plural } from '$lib/plural';
   import * as m from '$lib/paraglide/messages';
 
   // Count / total size of files the user is actively sharing (the `shared`
@@ -18,78 +20,6 @@
   let sharedBytes = $state(0);
   let sharedRefreshGen = 0;
   let sharedRefreshFailedToast = false;
-  let emberJoinTimedOut = $state(false);
-  let emberJoinSince: number | null = null;
-  let emberJoinTimer: ReturnType<typeof setTimeout> | null = null;
-
-  // How long verified contacts must hold above zero before the join counts as
-  // real. Without a dwell this was level-triggered: every ~3s poll that caught
-  // `verified > 0` cleared `emberJoinSince`, so a join oscillating around zero
-  // — cold start, partition recovery, eviction churn — restarted the grace
-  // period on each such poll and the timeout never fired. The user was never
-  // told the overlay had failed to join.
-  const EMBER_JOIN_DWELL_MS = 10_000;
-  let emberJoinedSince: number | null = null;
-  /** Plain mirror of `emberJoinTimedOut`, read by `recomputeEmberJoin` so the
-   *  `$effect` below does not subscribe to the very `$state` it writes. The
-   *  two are always set and cleared together. */
-  let emberJoinExpired = false;
-
-  function clearEmberJoinTimer() {
-    if (emberJoinTimer) {
-      clearTimeout(emberJoinTimer);
-      emberJoinTimer = null;
-    }
-  }
-
-  function recomputeEmberJoin(stats: typeof $networkStats) {
-    const enabled = !!stats.ember_native_enabled;
-    const verified = stats.ember_dht_verified_contacts ?? 0;
-    const now = Date.now();
-
-    if (!enabled) {
-      clearEmberJoinTimer();
-      emberJoinSince = null;
-      emberJoinedSince = null;
-      emberJoinExpired = false;
-      emberJoinTimedOut = false;
-      return;
-    }
-
-    if (verified > 0) {
-      if (emberJoinedSince === null) emberJoinedSince = now;
-      // Stop the timer straight away so a join in progress cannot flash the
-      // warning, but hold `emberJoinSince` until the dwell elapses. If
-      // contacts drop back before then, the branch below re-arms for the
-      // *remaining* budget rather than a fresh full one.
-      clearEmberJoinTimer();
-      if (now - emberJoinedSince >= EMBER_JOIN_DWELL_MS) {
-        emberJoinSince = null;
-        emberJoinExpired = false;
-        emberJoinTimedOut = false;
-      }
-      return;
-    }
-
-    emberJoinedSince = null;
-    if (emberJoinSince === null) {
-      emberJoinSince = now;
-      emberJoinExpired = false;
-      emberJoinTimedOut = false;
-    }
-    if (!emberJoinExpired && emberJoinTimer === null) {
-      const remaining = Math.max(0, EMBER_JOIN_TIMEOUT_MS - (now - emberJoinSince));
-      emberJoinTimer = setTimeout(() => {
-        emberJoinExpired = true;
-        emberJoinTimedOut = true;
-        emberJoinTimer = null;
-      }, remaining);
-    }
-  }
-
-  $effect(() => {
-    recomputeEmberJoin($networkStats);
-  });
 
   function openPage(href: string) {
     if (get(page).url.pathname === href) return;
@@ -98,19 +28,33 @@
 
   function sharedTitle(count: number, bytes: number): string {
     const size = formatBytes(bytes);
-    return count === 1
-      ? m.statusbar_shared_title_one({ size })
-      : m.statusbar_shared_title_other({ count: count.toLocaleString(), size });
+    const n = formatNumber(count);
+    return plural(count, {
+      one: () => m.statusbar_shared_title_one({ size }),
+      few: () => m.statusbar_shared_title_few({ count: n, size }),
+      other: () => m.statusbar_shared_title_other({ count: n, size }),
+    });
   }
 
   onMount(() => {
     let active = true;
+    // `getSharedFileCount` walks the whole library, so a burst of events costs
+    // at most the call in flight plus one more after it, and nothing while
+    // the window is hidden — the `visibilitychange` handler catches up.
+    let sharedRefreshInFlight = false;
+    let sharedRefreshDirty = false;
 
     async function refreshSharedCount() {
+      if (!active) return;
+      if (sharedRefreshInFlight || document.visibilityState !== 'visible') {
+        sharedRefreshDirty = true;
+        return;
+      }
+      sharedRefreshInFlight = true;
+      sharedRefreshDirty = false;
       const gen = ++sharedRefreshGen;
       try {
         const stats = await getSharedFileCount();
-        // Ignore stale responses from overlapping shared-files-changed bursts.
         if (active && gen === sharedRefreshGen) {
           sharedCount = stats.count;
           sharedBytes = stats.total_bytes;
@@ -121,15 +65,26 @@
           sharedRefreshFailedToast = true;
           addToast('warning', m.statusbar_shared_refresh_failed());
         }
+      } finally {
+        sharedRefreshInFlight = false;
+        if (sharedRefreshDirty) void refreshSharedCount();
       }
     }
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && sharedRefreshDirty) {
+        void refreshSharedCount();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
     void refreshSharedCount();
 
     // The library indexer emits this whenever files are shared, unshared,
     // added, removed, or finish hashing, so the bottom-bar count stays in
-    // sync without polling.
-    const unlistenPromise = listen('shared-files-changed', () => {
+    // sync without polling. Upload counters never change the count or size.
+    const unlistenPromise = listen('shared-files-changed', (event) => {
+      if (isUploadCounterPhase(event.payload)) return;
       void refreshSharedCount();
     }).catch((e) => {
       console.warn('StatusBar: shared-files-changed listen failed', e);
@@ -142,10 +97,7 @@
 
     return () => {
       active = false;
-      if (emberJoinTimer) {
-        clearTimeout(emberJoinTimer);
-        emberJoinTimer = null;
-      }
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       void unlistenPromise
         .then((unlisten) => unlisten())
         .catch((e) => console.error('Failed to unlisten shared-files-changed:', e));
@@ -160,21 +112,29 @@
     return stats.ember_peers > 0 ? 'active' : 'idle';
   }
 
-  function emberDhtStatus(stats: typeof $networkStats): 'connected' | 'connecting' | 'disconnected' {
+  // A join that timed out is the Ember page's amber "No peers found", not a
+  // red disconnect: the overlay is running and still looking.
+  function emberDhtStatus(
+    stats: typeof $networkStats,
+    timedOut: boolean,
+  ): 'connected' | 'connecting' | 'no_peers' | 'disconnected' {
     if (!stats.ember_native_enabled) return 'disconnected';
     if ((stats.ember_dht_verified_contacts ?? 0) > 0) return 'connected';
-    return emberJoinTimedOut ? 'disconnected' : 'connecting';
+    return timedOut ? 'no_peers' : 'connecting';
   }
 
-  function emberDhtTitle(stats: typeof $networkStats): string {
-    const status = emberDhtStatus(stats);
+  function emberDhtTitle(stats: typeof $networkStats, timedOut: boolean): string {
+    const status = emberDhtStatus(stats, timedOut);
     let base: string;
     if (status === 'connected') {
       const peers = stats.ember_dht_verified_contacts ?? 0;
-      base = peers === 1
-        ? m.statusbar_ember_dht_title_peers_one({ status: statusLabel(status) })
-        : m.statusbar_ember_dht_title_peers_other({ status: statusLabel(status), count: peers });
-    } else if (stats.ember_native_enabled && emberJoinTimedOut) {
+      const label = statusLabel(status);
+      base = plural(peers, {
+        one: () => m.statusbar_ember_dht_title_peers_one({ status: label }),
+        few: () => m.statusbar_ember_dht_title_peers_few({ status: label, count: peers }),
+        other: () => m.statusbar_ember_dht_title_peers_other({ status: label, count: peers }),
+      });
+    } else if (status === 'no_peers') {
       base = m.statusbar_ember_dht_title_no_peers();
     } else {
       base = m.statusbar_ember_dht_title({ status: statusLabel(status) });
@@ -194,6 +154,7 @@
       case 'connected': return m.network_status_connected();
       case 'connecting': return m.network_status_connecting();
       case 'disconnected': return m.network_status_disconnected();
+      case 'no_peers': return m.ember_status_no_peers();
       default: return m.network_status_unknown();
     }
   }
@@ -208,10 +169,16 @@
     if (status === 'idle') return m.statusbar_epx_title_idle();
     const p = stats.ember_peers;
     const s = stats.epx_sources_received;
-    if (p === 1 && s === 1) return m.statusbar_epx_title_active_one_one();
-    if (p === 1) return m.statusbar_epx_title_active_one_other({ sources: s });
-    if (s === 1) return m.statusbar_epx_title_active_other_one({ peers: p });
-    return m.statusbar_epx_title_active_other_other({ peers: p, sources: s });
+    return plural(p, {
+      one: () => plural(s, {
+        one: m.statusbar_epx_title_active_one_one,
+        other: () => m.statusbar_epx_title_active_one_other({ sources: s }),
+      }),
+      other: () => plural(s, {
+        one: () => m.statusbar_epx_title_active_other_one({ peers: p }),
+        other: () => m.statusbar_epx_title_active_other_other({ peers: p, sources: s }),
+      }),
+    });
   }
 </script>
 
@@ -232,11 +199,11 @@
       <button
         type="button"
         class="status-label"
-        title={emberDhtTitle($networkStats)}
+        title={emberDhtTitle($networkStats, $emberJoinTimedOut)}
         onclick={() => openPage('/ember')}
       >
         {m.statusbar_ember_dht_label()}
-        <span class="dot {emberDhtStatus($networkStats)}" aria-label={statusLabel(emberDhtStatus($networkStats))}></span>
+        <span class="dot {emberDhtStatus($networkStats, $emberJoinTimedOut)}" aria-label={statusLabel(emberDhtStatus($networkStats, $emberJoinTimedOut))}></span>
       </button>
       <button
         type="button"
@@ -264,12 +231,12 @@
       onclick={() => openPage('/library')}
     >
       <span class="shared-label">{m.statusbar_shared_label()}</span>
-      <span class="shared-count">{sharedCount.toLocaleString()}</span>
+      <span class="shared-count">{formatNumber(sharedCount)}</span>
       <span class="shared-size">({formatBytes(sharedBytes)})</span>
     </button>
   </div>
 
-  <div class="status-right" aria-label={m.statusbar_speeds_aria()}>
+  <div class="status-right" role="group" aria-label={m.statusbar_speeds_aria()}>
     <!--
       Status bar rates/totals are file-transfer payload only (BandwidthLimiter).
       Protocol overhead (server, KAD, source exchange, EPX, Ember DHT, reasks)
@@ -286,7 +253,7 @@
       <span class="sr-only">{m.statusbar_download_sr()}</span>
       {formatSpeed($networkStats.download_speed)}
     </span>
-    <span class="status-item muted status-totals" title={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })} aria-label={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })}>
+    <span class="status-item muted status-totals" role="img" title={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })} aria-label={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })}>
       <span aria-hidden="true">↑</span> {formatBytes($networkStats.total_uploaded)} / <span aria-hidden="true">↓</span> {formatBytes($networkStats.total_downloaded)}
     </span>
   </div>
@@ -302,7 +269,7 @@
     justify-content: space-between;
     gap: 12px;
     padding: 0 16px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     flex-shrink: 0;
     overflow: hidden;
   }
@@ -381,6 +348,11 @@
     background: var(--status-connecting);
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-connecting) 18%, transparent);
     animation: status-pulse 1.5s ease-in-out infinite;
+  }
+
+  .dot.no_peers {
+    background: transparent;
+    box-shadow: inset 0 0 0 2px var(--warning), 0 0 0 2px color-mix(in srgb, var(--warning) 18%, transparent);
   }
 
   .dot.disconnected {

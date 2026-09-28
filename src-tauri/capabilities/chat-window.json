@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "chat-window",
+  "description": "The popped-out chat window. It needs events (every chat update arrives as one, and it reports what it shows to the main window) and to follow the theme; it does not get `process:allow-restart`. Opening, closing and focusing windows go through Ember's own commands, so no window-management permission is granted here.",
+  "windows": ["chat"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-theme"
+  ]
+}

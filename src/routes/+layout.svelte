@@ -8,17 +8,19 @@
   import CloseAppDialog from '$lib/components/CloseAppDialog.svelte';
   import DeepLinkHandler from '$lib/components/DeepLinkHandler.svelte';
   import ChatDock from '$lib/components/ChatDock.svelte';
+  import ErrorBoundary from '$lib/components/ErrorBoundary.svelte';
   import UpdateNotice from '$lib/components/UpdateNotice.svelte';
 
   import { initNetworkStore, cleanupNetworkStore, startStatsPoll } from '$lib/stores/network';
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
-  import { retainChatTabs } from '$lib/stores/chatTabs';
+  import { chatDockOpen, closeDock, retainChatTabs } from '$lib/stores/chatTabs';
   import { initChannelsStore, cleanupChannelsStore } from '$lib/stores/channels';
   import { loadAppSettings, clearAppSettings, setAppSettings } from '$lib/stores/settings';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { applyDocumentLang, translateError } from '$lib/i18n';
+  import { plural } from '$lib/plural';
   import * as m from '$lib/paraglide/messages';
   import {
     getSettings,
@@ -38,12 +40,20 @@
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { confirmDroppedFolders, dismissDroppedFolders } from '$lib/api/sharing';
   import { takePendingDownloadOverflowNotice } from '$lib/api/transfers';
+  import { getEmuleImportReport } from '$lib/api/emuleImport';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { fly } from 'svelte/transition';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { inertBackground, trapTabKey } from '$lib/a11y';
+  import ChatWindowShell from '$lib/components/ChatWindowShell.svelte';
+  import { initChatPopoutMain } from '$lib/chatPopout';
+  import { isChatWindow } from '$lib/windowRole';
+
+  /** This document is the popped-out chat window, which draws the chat and
+   *  nothing else of the shell. Fixed for the life of the document. */
+  const chatWindow = isChatWindow();
 
   // Sync `<html lang>` to the active Paraglide locale on every
   // mount. Paraglide's strategy chain (localStorage →
@@ -87,13 +97,16 @@
       return m.library_drop_many_confirm({ count: folders.length, summary });
     }
     if (dropPrompt.reason === 'broad') {
-      return folders.length === 1
-        ? m.library_drop_broad_confirm_one({ folder: folders[0] })
-        : m.library_drop_broad_confirm_other({ count: folders.length, summary });
+      return plural(folders.length, {
+        one: () => m.library_drop_broad_confirm_one({ folder: folders[0] }),
+        other: () => m.library_drop_broad_confirm_other({ count: folders.length, summary }),
+      });
     }
-    return folders.length === 1
-      ? m.library_drop_parent_confirm_one({ folder: folders[0] })
-      : m.library_drop_parent_confirm_other({ count: folders.length, summary });
+    return plural(folders.length, {
+      one: () => m.library_drop_parent_confirm_one({ folder: folders[0] }),
+      few: () => m.library_drop_parent_confirm_few({ count: folders.length, summary }),
+      other: () => m.library_drop_parent_confirm_other({ count: folders.length, summary }),
+    });
   });
   let policyResetReason = $state<string | null>(null);
   let policyResetPending = $state(false);
@@ -252,6 +265,8 @@
   // backend's (delayed) corrupt-config/db emit, so the
   // "active before the user can act" intent is preserved.
   onMount(() => {
+    // The chat window's shell starts what it needs itself.
+    if (chatWindow) return;
     initTheme();
     const splashStartedAt = performance.now();
     // The splash exists to mask the first paint, not to delay it. Once
@@ -276,6 +291,13 @@
     let unlistenFoldersFailed: UnlistenFn | null = null;
     let unlistenDropPending: UnlistenFn | null = null;
     let unlistenDropRejected: UnlistenFn | null = null;
+    let unlistenDownloadFolder: UnlistenFn | null = null;
+    let stopChatPopout: (() => void) | null = null;
+
+    void initChatPopoutMain().then((stop) => {
+      if (mounted) stopChatPopout = stop;
+      else stop();
+    });
 
     // Last-resort floor for promise rejections nothing else caught. Every
     // `invoke()` rejects whenever its Rust command returns `Err`, so a call
@@ -331,6 +353,17 @@
       .then((fn) => { if (mounted) unlistenDbCorrupt = fn; else fn(); })
       .catch((e) => console.error('Failed to register db-corrupt listener:', e));
 
+    // An eMule import staged before this launch was applied during startup.
+    // Marked seen as it is read, so the notice shows once; the full report
+    // stays in Settings → Import.
+    getEmuleImportReport(true)
+      .then((report) => {
+        if (!mounted || !report || report.seen) return;
+        if (report.items.every((item) => item.ok)) toastSuccess(m.emule_import_toast_done());
+        else toastWarning(m.emule_import_toast_problems());
+      })
+      .catch((e) => console.error('Failed to read the eMule import report:', e));
+
     // The upgrade turned the Ember overlay on for a profile that had it off.
     // There is no stored difference between "off because that was the default"
     // and "off because the user chose it", so say so rather than assume.
@@ -373,7 +406,10 @@
       const count = event.payload?.count ?? 0;
       if (count <= 0) return;
       toastSuccess(
-        count === 1 ? m.library_folders_shared_one() : m.library_folders_shared_other({ count }),
+        plural(count, {
+          one: m.library_folders_shared_one,
+          other: () => m.library_folders_shared_other({ count }),
+        }),
       );
     })
       .then((fn) => { if (mounted) unlistenFoldersAdded = fn; else fn(); })
@@ -386,13 +422,23 @@
       const count = event.payload?.count ?? 0;
       if (count <= 0) return;
       toastWarning(
-        count === 1
-          ? m.library_folders_share_failed_one()
-          : m.library_folders_share_failed_other({ count }),
+        plural(count, {
+          one: m.library_folders_share_failed_one,
+          other: () => m.library_folders_share_failed_other({ count }),
+        }),
       );
     })
       .then((fn) => { if (mounted) unlistenFoldersFailed = fn; else fn(); })
       .catch((e) => console.error('Failed to register shared-folders-add-failed listener:', e));
+
+    // Downloads re-queue on their own once the folder is fixed, so without this
+    // the only sign of a folder Ember cannot write is rows that never start.
+    listen('download-folder-unavailable', () => {
+      if (!mounted) return;
+      toastWarning(m.layout_download_folder_unavailable());
+    })
+      .then((fn) => { if (mounted) unlistenDownloadFolder = fn; else fn(); })
+      .catch((e) => console.error('Failed to register download-folder-unavailable listener:', e));
 
     listen<{ token?: number; folders?: string[]; reason?: string }>(
       'shared-folder-drop-pending',
@@ -466,9 +512,11 @@
               const migrated = await takePendingDownloadOverflowNotice();
               if (migrated > 0) {
                 toastWarning(
-                  migrated === 1
-                    ? m.layout_download_overflow_notice_one()
-                    : m.layout_download_overflow_notice_other({ count: migrated }),
+                  plural(migrated, {
+                    one: m.layout_download_overflow_notice_one,
+                    few: () => m.layout_download_overflow_notice_few({ count: migrated }),
+                    other: () => m.layout_download_overflow_notice_other({ count: migrated }),
+                  }),
                 );
               }
             }
@@ -613,10 +661,17 @@
       if (unlistenFoldersFailed) unlistenFoldersFailed();
       if (unlistenDropPending) unlistenDropPending();
       if (unlistenDropRejected) unlistenDropRejected();
+      if (unlistenDownloadFolder) unlistenDownloadFolder();
+      stopChatPopout?.();
     };
   });
 </script>
 
+{#if chatWindow}
+<ErrorBoundary variant="window" title={m.chat_dock_render_error()}>
+  <ChatWindowShell />
+</ErrorBoundary>
+{:else}
 <a href="#main-content" class="skip-to-content">{m.layout_skip_to_content()}</a>
 {#if splashVisible}
   <SplashScreen exiting={splashExiting} />
@@ -661,7 +716,9 @@
         -->
         {#key $page.url.pathname}
           <div class="route-view" in:fly={{ y: 8, duration: 160 }}>
-            {@render children()}
+            <ErrorBoundary title={m.layout_render_error_title()} body={m.layout_render_error_body()}>
+              {@render children()}
+            </ErrorBoundary>
           </div>
         {/key}
       {/if}
@@ -682,7 +739,14 @@
     keyed off the `chatTabs` store, so opening a chat from any page
     just calls `chatTabs.openChat(hash, name)`.
   -->
-  <ChatDock />
+  <ErrorBoundary
+    variant="panel"
+    title={m.chat_dock_render_error()}
+    onclose={closeDock}
+    active={$chatDockOpen}
+  >
+    <ChatDock />
+  </ErrorBoundary>
 </div>
 
 <!-- Outside `.app-shell` so `CloseAppDialog`'s inert walk, which inerts the
@@ -705,14 +769,32 @@
       ? m.library_drop_many_confirm_title()
       : m.library_drop_parent_confirm_title()}
   message={dropPromptMessage}
+  confirmLabel={dropPrompt.reason === 'files'
+    ? m.library_drop_share_files()
+    : dropPrompt.reason === 'broad'
+      ? m.library_drop_share_anyway()
+      : m.library_drop_share_folders_confirm()}
+  altLabel={dropPrompt.reason === 'files'
+    ? plural(dropPrompt.folders.length, {
+        one: m.library_drop_share_folder,
+        other: m.library_drop_share_folders,
+      })
+    : undefined}
   danger={dropPrompt.reason === 'broad'}
   isolateMessage
   onconfirm={() => {
     const token = dropPrompt.token;
-    void confirmDroppedFolders(token).catch((e) =>
+    const onlyDroppedFiles = dropPrompt.reason === 'files';
+    void confirmDroppedFolders(token, onlyDroppedFiles).catch((e) =>
       toastError(translateError(e, m.error_operation_failed())),
     );
   }}
+  onalt={dropPrompt.reason === 'files' ? () => {
+    const token = dropPrompt.token;
+    void confirmDroppedFolders(token, false).catch((e) =>
+      toastError(translateError(e, m.error_operation_failed())),
+    );
+  } : undefined}
   oncancel={() => { void dismissDroppedFolders(dropPrompt.token).catch(() => {}); }}
   ondismiss={() => { void dismissDroppedFolders(dropPrompt.token).catch(() => {}); }}
 />
@@ -751,6 +833,7 @@
     </div>
   </div>
 {/if}
+{/if}
 
 <style>
   .skip-to-content {
@@ -763,7 +846,7 @@
     color: var(--on-accent);
     text-decoration: none;
     font-weight: 600;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     border-radius: 0 0 var(--radius-md) 0;
   }
 

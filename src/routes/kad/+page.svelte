@@ -19,8 +19,9 @@
   import { onMount, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
   import { translateError, degradedReasonText } from '$lib/i18n';
+  import { kadNodesLoadedText } from '$lib/commandReplies';
   import { inertBackground } from '$lib/a11y';
-  import { copyToClipboard } from '$lib/utils';
+  import { copyToClipboard, formatDateTime, formatNumber } from '$lib/utils';
   import IconX from '$lib/components/IconX.svelte';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
 
@@ -80,7 +81,10 @@
 
   // K25: debounce Connect/Disconnect so a user who double-clicks the
   // button doesn't queue two conflicting commands.
-  let connectPending = $state(false);
+  // Which way the in-flight click is going: the status alone can't say,
+  // since both a fresh connect and a Cancel spend time in 'connecting'.
+  let pendingAction: 'connect' | 'disconnect' | null = $state(null);
+  let connectPending = $derived(pendingAction !== null);
 
   onMount(() => {
     mounted = true;
@@ -217,12 +221,13 @@
     // flight. Without this an eager user who double-clicks flips the
     // state twice and can end up with the backend in an unexpected mode.
     if (connectPending) return;
-    connectPending = true;
     kadError = null;
     try {
       if ($networkStats.status === 'connected' || $networkStats.status === 'connecting') {
+        pendingAction = 'disconnect';
         await kadDisconnect();
       } else {
+        pendingAction = 'connect';
         loading = true;
         await kadConnect();
       }
@@ -230,7 +235,7 @@
       kadError = toErrMsg(e, m.kad_connection_failed());
       loading = false;
     } finally {
-      connectPending = false;
+      pendingAction = null;
     }
   }
 
@@ -269,8 +274,8 @@
           toastError(m.kad_bootstrap_port_range());
           return;
         }
-        const result = await kadBootstrapIp(host, portNum);
-        toastSuccess(result || m.kad_bootstrap_from_host({ host, port: portNum }));
+        await kadBootstrapIp(host, portNum);
+        toastSuccess(m.kad_bootstrap_from_host({ host, port: portNum }));
       } else if (bootstrapMode === 'url') {
         const url = bootstrapUrl.trim();
         if (!url) { toastError(m.kad_bootstrap_url_required()); return; }
@@ -278,9 +283,9 @@
           toastError(m.kad_bootstrap_url_must_be_https());
           return;
         }
-        const result = await kadBootstrapUrl(url);
-        toastSuccess(result || m.kad_bootstrap_loaded_url());
+        toastSuccess(kadNodesLoadedText(await kadBootstrapUrl(url)));
       } else {
+        if (contacts.length === 0) return;
         await kadBootstrapClients();
         toastSuccess(m.kad_bootstrap_from_known());
       }
@@ -375,12 +380,8 @@
   }
 
   function getConnectButtonLabel(): string {
-    if (connectPending && $networkStats.status !== 'connected' && $networkStats.status !== 'connecting') {
-      return m.kad_connecting();
-    }
-    if (connectPending && $networkStats.status === 'connected') {
-      return m.kad_disconnecting();
-    }
+    if (pendingAction === 'connect') return m.kad_connecting();
+    if (pendingAction === 'disconnect') return m.kad_disconnecting();
     if ($networkStats.status === 'connected') return m.servers_disconnect();
     if ($networkStats.status === 'connecting') return m.common_cancel();
     return m.servers_connect();
@@ -660,6 +661,7 @@
   let visibleSearchColumns = $derived(
     SEARCH_COLUMNS.filter((c) => c.key === SEARCH_FIXED_COL || !searchColHidden[c.key]),
   );
+  const NUMERIC_SEARCH_COLUMNS = new Set(['load', 'packets_sent', 'responses']);
 
   let searchTableWidth = $derived(
     visibleSearchColumns.reduce((sum, c) => sum + searchColWidth(c.key), 0) + SEARCH_ACTIONS_WIDTH,
@@ -883,7 +885,7 @@
       aria-busy={connectPending}
     >
       {#if connectPending}
-        <span class="spinner-inline" aria-hidden="true"></span>
+        <span class="spinner xs current" aria-hidden="true"></span>
       {/if}
       {getConnectButtonLabel()}
     </button>
@@ -891,7 +893,7 @@
 </div>
 
 {#if kadError}
-  <div class="error-banner">
+  <div class="error-banner" role="alert">
     <span>{kadError}</span>
     <button class="ghost" onclick={() => { kadError = null; networkError.set(null); }}>{m.common_dismiss()}</button>
   </div>
@@ -912,9 +914,9 @@
         <span class="toolbar-label">
           {m.kad_contacts_label()}
           {#if contactFilter.trim() || contactTypeFilter !== 'all'}
-            ({m.kad_contacts_count_filtered({ filtered: filteredContacts.length.toLocaleString(), total: contacts.length.toLocaleString() })})
+            ({m.kad_contacts_count_filtered({ filtered: formatNumber(filteredContacts.length), total: formatNumber(contacts.length) })})
           {:else}
-            ({contacts.length.toLocaleString()})
+            ({formatNumber(contacts.length)})
           {/if}
         </span>
         <input
@@ -958,8 +960,8 @@
         {#if $networkStats.status !== 'connected' && $networkStats.status !== 'connecting'}
           <div class="empty-state compact">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path><line x1="8" y1="12" x2="16" y2="12"></line><line x1="2" y1="2" x2="22" y2="22"></line></svg>
-            <p>{m.kad_not_connected()}</p>
-            <p class="sub">{m.kad_press_connect()}</p>
+            <p class="empty-title">{m.kad_not_connected()}</p>
+            <p class="empty-sub">{m.kad_press_connect()}</p>
             <!-- Same pending chrome as the header button. `handleConnect`
                  already drops re-clicks, but a button that stays enabled and
                  unchanged makes a slow connect look like a dead control. -->
@@ -970,7 +972,7 @@
               aria-busy={connectPending}
             >
               {#if connectPending}
-                <span class="spinner-inline" aria-hidden="true"></span>
+                <span class="spinner xs current" aria-hidden="true"></span>
               {/if}
               {getConnectButtonLabel()}
             </button>
@@ -983,19 +985,20 @@
         {:else if contacts.length === 0}
           <div class="empty-state compact">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
-            <p>{m.kad_empty_no_contacts()}</p>
-            <p class="sub">{m.kad_empty_no_contacts_sub()}</p>
+            <p class="empty-title">{m.kad_empty_no_contacts()}</p>
+            <p class="empty-sub">{m.kad_empty_no_contacts_sub()}</p>
+            <!-- No "Known Contacts" here: it re-pings the routing table,
+                 which is exactly what is empty. -->
             <div class="empty-actions">
-              <button class="empty-action" onclick={() => openBootstrap('clients')}>{m.kad_bootstrap_from_clients()}</button>
-              <button class="empty-action ghost" onclick={() => openBootstrap('url')}>{m.kad_from_url()}</button>
+              <button class="empty-action" onclick={() => openBootstrap('url')}>{m.kad_from_url()}</button>
               <button class="empty-action ghost" onclick={() => openBootstrap('ip')}>{m.kad_by_ip()}</button>
             </div>
           </div>
         {:else if filteredContacts.length === 0}
           <div class="empty-state compact">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line><line x1="11" y1="8" x2="11" y2="14"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
-            <p>{m.kad_empty_no_matches()}</p>
-            <p class="sub">{m.kad_empty_no_matches_sub()}</p>
+            <p class="empty-title">{m.kad_empty_no_matches()}</p>
+            <p class="empty-sub">{m.kad_empty_no_matches_sub()}</p>
             <button class="empty-action ghost" onclick={() => { contactFilterInput = ''; contactFilter = ''; contactTypeFilter = 'all'; }}>{m.common_clear_filters()}</button>
           </div>
         {:else}
@@ -1103,14 +1106,14 @@
         <div class="stat-group stat-group-grid">
           <div class="stat-tile">
             <span class="stat-label">{m.kad_stat_contacts()}</span>
-            <span class="stat-value stat-numeric">{contacts.length.toLocaleString()}</span>
+            <span class="stat-value stat-numeric">{formatNumber(contacts.length)}</span>
           </div>
           <div class="stat-tile">
             <span class="stat-label" title={m.kad_stat_kad_users_title()}>{m.kad_stat_kad_users()}</span>
             <span class="stat-value stat-numeric">
               {$networkStats.status === 'disconnected' || $networkStats.kad_users_estimate == null
                 ? '—'
-                : $networkStats.kad_users_estimate.toLocaleString()}
+                : formatNumber($networkStats.kad_users_estimate)}
             </span>
           </div>
         </div>
@@ -1133,7 +1136,7 @@
             title={rechecking ? m.kad_firewall_in_progress() : m.kad_firewall_recheck_title()}
           >
             {#if rechecking}
-              <span class="spinner-inline" aria-hidden="true"></span> {m.kad_rechecking()}
+              <span class="spinner xs current" aria-hidden="true"></span> {m.kad_rechecking()}
             {:else}
               {m.kad_recheck_firewall()}
             {/if}
@@ -1197,7 +1200,7 @@
       <div class="modal-content bootstrap-modal">
         <div class="modal-header">
           <h3 id="kad-bootstrap-title">{m.kad_bootstrap_modal_title()}</h3>
-          <button type="button" class="modal-close" aria-label={m.common_close()} disabled={bootstrapPending} onclick={closeBootstrap}><IconX size={16} /></button>
+          <button type="button" class="icon-close" aria-label={m.common_close()} disabled={bootstrapPending} onclick={closeBootstrap}><IconX size={16} /></button>
         </div>
         <div class="modal-body">
           <!--
@@ -1288,10 +1291,11 @@
             onclick={handleBootstrap}
             disabled={bootstrapPending
               || (bootstrapMode === 'ip' && !bootstrapIpHost.trim())
-              || (bootstrapMode === 'url' && !bootstrapUrl.trim())}
+              || (bootstrapMode === 'url' && !bootstrapUrl.trim())
+              || (bootstrapMode === 'clients' && contacts.length === 0)}
           >
             {#if bootstrapPending}
-              <span class="spinner-inline" aria-hidden="true"></span> {m.kad_working()}
+              <span class="spinner xs current" aria-hidden="true"></span> {m.kad_working()}
             {:else}
               {m.kad_bootstrap_action()}
             {/if}
@@ -1315,8 +1319,8 @@
       {#if $networkStats.status !== 'connected' && $networkStats.status !== 'connecting'}
         <div class="empty-state compact">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path><line x1="8" y1="12" x2="16" y2="12"></line><line x1="2" y1="2" x2="22" y2="22"></line></svg>
-          <p>{m.kad_not_connected()}</p>
-          <p class="sub">{m.kad_searches_empty_disconnected_sub()}</p>
+          <p class="empty-title">{m.kad_not_connected()}</p>
+          <p class="empty-sub">{m.kad_searches_empty_disconnected_sub()}</p>
           <button
             class="empty-action"
             onclick={handleConnect}
@@ -1324,7 +1328,7 @@
             aria-busy={connectPending}
           >
             {#if connectPending}
-              <span class="spinner-inline" aria-hidden="true"></span>
+              <span class="spinner xs current" aria-hidden="true"></span>
             {/if}
             {getConnectButtonLabel()}
           </button>
@@ -1332,8 +1336,8 @@
       {:else if searches.length === 0}
         <div class="empty-state compact">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
-          <p>{m.kad_searches_empty_title()}</p>
-          <p class="sub">{m.kad_searches_empty_sub()}</p>
+          <p class="empty-title">{m.kad_searches_empty_title()}</p>
+          <p class="empty-sub">{m.kad_searches_empty_sub()}</p>
         </div>
       {:else}
         <table
@@ -1357,6 +1361,7 @@
               {#each visibleSearchColumns as column (column.key)}
                 <th
                   class="sortable"
+                  class:num={NUMERIC_SEARCH_COLUMNS.has(column.key)}
                   class:resizing={searchResizeKey === column.key}
                   tabindex="0"
                   role="columnheader"
@@ -1398,18 +1403,18 @@
                     <td>{kadSearchNameLabel(search.name) || '—'}</td>
                   {:else if column.key === 'status'}
                     <td>
-                      <span class="badge {search.status}">
+                      <span class="badge {search.status === 'stopping' ? 'tone-warning' : search.status}">
                         {search.status === 'active' ? m.kad_search_status_active() : m.kad_search_status_stopping()}
                       </span>
                     </td>
                   {:else if column.key === 'load'}
-                    <td>{search.load} ({search.load_response}/{search.load_total})</td>
+                    <td class="num">{search.load} ({search.load_response}/{search.load_total})</td>
                   {:else if column.key === 'packets_sent'}
-                    <td>{search.packets_sent} / {search.request_answer}</td>
+                    <td class="num">{search.packets_sent} / {search.request_answer}</td>
                   {:else if column.key === 'responses'}
-                    <td>{search.responses}</td>
+                    <td class="num">{search.responses}</td>
                   {:else if column.key === 'started_at'}
-                    <td title={new Date(search.started_at * 1000).toLocaleString()}>{formatSearchAge(search.started_at)}</td>
+                    <td title={formatDateTime(search.started_at)}>{formatSearchAge(search.started_at)}</td>
                   {/if}
                 {/each}
                 <td>
@@ -1463,21 +1468,13 @@
   }
 
   .error-banner,
-  .warning-banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 8px 20px;
-    font-size: 13px;
-  }
 
   .kad-layout {
     flex: 1;
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    padding: 12px;
+    padding: var(--workspace-padding);
     gap: 12px;
     background: var(--bg-primary);
   }
@@ -1521,7 +1518,7 @@
 
   .toolbar-label {
     padding: 9px 14px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-secondary);
     white-space: nowrap;
@@ -1533,7 +1530,7 @@
     max-width: 280px;
     margin: 4px 6px 4px 0;
     padding: 5px 12px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     background: var(--bg-secondary);
     color: var(--text-primary);
     border: 1px solid var(--border);
@@ -1550,7 +1547,7 @@
   .filter-select {
     margin: 4px 6px 4px 0;
     padding: 5px 24px 5px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     background-color: var(--bg-secondary);
     color: var(--text-primary);
     border: 1px solid var(--border);
@@ -1568,19 +1565,6 @@
     justify-content: center;
     margin-top: 10px;
   }
-
-  .spinner-inline {
-    display: inline-block;
-    width: 10px;
-    height: 10px;
-    border: 2px solid var(--text-muted);
-    border-top-color: transparent;
-    border-radius: 50%;
-    animation: spinner-rotate 0.9s linear infinite;
-    vertical-align: -1px;
-    margin-right: 4px;
-  }
-  @keyframes spinner-rotate { to { transform: rotate(360deg); } }
 
   /* --- Modal --- */
   .modal-overlay {
@@ -1610,27 +1594,7 @@
     padding: 14px 20px;
     border-bottom: 1px solid var(--border);
   }
-  .modal-header h3 { margin: 0; font-size: 15px; font-weight: 600; }
-  .modal-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    flex-shrink: 0;
-    cursor: pointer;
-    border: 1px solid transparent;
-    background: none;
-    color: var(--text-secondary);
-    border-radius: var(--radius-sm);
-    line-height: 1;
-  }
-  .modal-close:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-  }
+  .modal-header h3 { margin: 0; font-size: var(--font-size-lg); font-weight: 600; }
   .modal-body { padding: 16px 20px; overflow-y: auto; flex: 1; }
   .modal-footer {
     display: flex;
@@ -1646,7 +1610,7 @@
     margin-bottom: 12px;
   }
   .form-label {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-secondary);
     width: 80px;
@@ -1655,7 +1619,7 @@
   .form-input {
     flex: 1;
     padding: 7px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     background: var(--bg-input);
@@ -1682,7 +1646,7 @@
     border: none;
     border-bottom: 2px solid transparent;
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
   }
   .bootstrap-tabs button:hover {
@@ -1693,7 +1657,7 @@
     border-bottom-color: var(--accent);
   }
   .bootstrap-hint {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     margin: 0 0 12px 0;
     line-height: 1.5;
@@ -1708,26 +1672,6 @@
     width: 110px;
   }
 
-  .pager {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    margin-left: auto;
-    padding-right: 8px;
-  }
-
-  .pager-btn {
-    padding: 1px 6px;
-    font-size: 10px;
-    min-width: 0;
-    line-height: 1;
-  }
-
-  .pager-info {
-    font-size: 10px;
-    color: var(--text-muted);
-  }
-
   .panel-content {
     flex: 1;
     min-height: 0;
@@ -1738,7 +1682,7 @@
   }
 
   .panel-title {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -1769,14 +1713,8 @@
     container-type: inline-size;
   }
 
-  .stat-group {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 2px 12px;
-    padding: 6px 0;
-    border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
-  }
-
+  /* Tiles, groups and their collapse come from app.css, shared with the
+     `NetworkStatusTiles` block this panel ends in. */
   .stat-group:first-of-type {
     padding-top: 0;
   }
@@ -1800,79 +1738,24 @@
     align-items: center;
     justify-content: center;
     gap: 6px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 7px 10px;
     white-space: nowrap;
-  }
-
-  .stat-group-grid {
-    grid-template-columns: repeat(4, 1fr);
-    gap: 2px 8px;
-  }
-
-  .stat-tile {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    padding: 6px 0;
-    min-width: 0;
   }
 
   .tile-wide {
     grid-column: span 1;
   }
 
-  /* At narrow panel widths, collapse the 4-up numeric group to 2-up
-     and the 2-up groups stay 2-up (labels are short enough). Below
-     ~220px everything stacks single column. */
-  @container (max-width: 330px) {
-    .stat-group-grid {
-      grid-template-columns: repeat(2, 1fr);
-    }
-  }
-
-  @container (max-width: 220px) {
-    .stat-group,
-    .stat-group-grid {
-      grid-template-columns: 1fr;
-    }
-  }
-
-  .stat-label {
-    color: var(--text-muted);
-    font-weight: 500;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .stat-value {
-    color: var(--text-primary);
-    font-weight: 600;
-    font-size: 13px;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
   /* Numeric readouts get the larger "stat card" treatment so peer
      counts read at a glance. Tabular numerals keep digits aligned
-     across rows. */
-  .stat-numeric {
-    font-size: 18px;
+     across rows. Qualified so it outranks the shared `.stat-tile .stat-value`
+     whatever order the stylesheets load in. */
+  .stat-tile .stat-numeric {
+    font-size: var(--font-size-xl);
     font-weight: 700;
     font-variant-numeric: tabular-nums;
     letter-spacing: -0.3px;
-  }
-
-  /* Badges inside tiles shouldn't stretch — they sit at their natural
-     width so the tile column stays flexible. */
-  .stat-tile .badge {
-    align-self: flex-start;
   }
 
   .kad-lower {
@@ -1893,7 +1776,7 @@
     align-items: center;
     gap: 8px;
     padding: 9px 14px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-secondary);
     background: var(--bg-surface);
@@ -1907,29 +1790,16 @@
     opacity: 0.6;
   }
 
-  .empty-action {
-    margin-top: 10px;
-    font-size: 12px;
-    padding: 5px 16px;
-  }
-
-  .page-subtitle {
-    margin: 4px 0 0;
-    font-size: 13px;
-    line-height: 1.5;
-    color: var(--text-muted);
-    max-width: 70ch;
-  }
 
   .compact-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
 
   .compact-table th {
     padding: 5px 8px;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     position: sticky;
     top: 0;
     z-index: 1;
@@ -1939,7 +1809,7 @@
 
   .compact-table td {
     padding: 3px 8px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     line-height: 1.2;
   }
 
@@ -1949,7 +1819,7 @@
 
   .compact-table tbody tr.row-alt td,
   .compact-table tbody tr:nth-child(even):not(.virtual-row):not(.spacer-row) td {
-    background: color-mix(in srgb, var(--bg-secondary) 88%, var(--bg-primary));
+    background: var(--table-row-alt);
   }
 
   /*
@@ -1983,6 +1853,11 @@
     white-space: nowrap;
   }
 
+  .searches-table .num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
   .col-resize-handle {
     position: absolute;
     top: 0;
@@ -2005,7 +1880,7 @@
     width: 1px;
     transform: translateX(-50%);
     background: transparent;
-    transition: background 0.12s ease;
+    transition: background var(--transition-fast) ease;
   }
 
   .searches-table th:hover .col-resize-handle::after,
@@ -2029,13 +1904,13 @@
    */
   .contact-id {
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
   }
 
   .distance {
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-secondary);
   }
 
@@ -2062,7 +1937,7 @@
     align-items: center;
     justify-content: center;
     opacity: 0;
-    transition: opacity 0.1s, color 0.1s, background 0.1s;
+    transition: opacity var(--transition-fast), color var(--transition-fast), background var(--transition-fast);
     color: var(--text-secondary);
     line-height: 1;
     background: none;
@@ -2086,7 +1961,7 @@
   }
 
   .contact-type {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 500;
     display: inline-flex;
     align-items: center;
@@ -2136,27 +2011,6 @@
 
   .unverified {
     opacity: 0.6;
-  }
-
-  .empty-state.compact {
-    padding: 34px 16px;
-  }
-
-  .empty-state.compact p {
-    font-size: 13px;
-  }
-
-  .sub {
-    font-size: 12px;
-    color: var(--text-muted);
-  }
-
-  /* Local badge variants. Follow the same tinted-chip recipe as the
-     global badges in app.css so the KAD page matches in both themes. */
-  .badge.stopping {
-    background: color-mix(in srgb, var(--warning) 15%, transparent);
-    border-color: color-mix(in srgb, var(--warning) 30%, transparent);
-    color: var(--badge-warning-text);
   }
 
   /* Per-row Cancel: compact danger chip that fits the 26px row and

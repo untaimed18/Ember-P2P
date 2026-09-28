@@ -201,6 +201,17 @@ impl AppConfig {
                         );
                         config_changed = true;
                     }
+                    if !s.preview_player.is_empty()
+                        && !crate::network::ed2k::preview::player_path_is_local(
+                            std::path::Path::new(&s.preview_player),
+                        )
+                    {
+                        tracing::warn!(
+                            "Cleared a configured media player that is not on a local drive"
+                        );
+                        s.preview_player.clear();
+                        config_changed = true;
+                    }
                     match crate::commands::settings::validate_settings(&s) {
                         Ok(()) => s,
                         Err(e) => {
@@ -323,6 +334,12 @@ impl AppConfig {
     ) -> anyhow::Result<(String, std::path::PathBuf, std::path::PathBuf)> {
         let data = serde_json::to_string_pretty(settings)?;
         Ok((data, self.config_path.clone(), self.config_path.clone()))
+    }
+
+    /// Where `config.json` lives, for writers that run before the config is
+    /// shared behind its lock (the startup apply of an eMule import).
+    pub fn config_path(&self) -> &std::path::Path {
+        &self.config_path
     }
 
     /// Blocking file write -- call this OUTSIDE of the RwLock.

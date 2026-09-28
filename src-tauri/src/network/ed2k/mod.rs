@@ -13,6 +13,7 @@ pub mod hash;
 pub mod messages;
 pub mod multi_source;
 pub mod part_tracker;
+pub mod peer_sessions;
 pub mod preview;
 pub mod secure_stream;
 pub mod server;

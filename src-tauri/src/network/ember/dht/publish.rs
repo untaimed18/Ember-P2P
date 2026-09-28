@@ -85,17 +85,30 @@ pub const CHANNEL_NAME_MAX: usize = 64;
 pub const CHANNEL_WELCOME_MAX: usize = 256;
 pub const CHANNEL_BAN_LIST_MAX: usize = 12;
 pub const CHANNEL_MOD_LIST_MAX: usize = 6;
+/// Most messages an owner may pin in one room.
+///
+/// Not covered by the compile-time budget below, unlike every other maximum
+/// here: see [`ModerationTail::pinned_msg_ids`] for why pins take whatever
+/// room the rest of the snapshot leaves rather than a reserved share of it.
+pub const CHANNEL_PIN_MAX: usize = 3;
+/// Wire width of one pinned message's id — the gossip `msg_id`.
+const CHANNEL_PIN_ID_LEN: usize = 16;
 
-/// Largest [`ModerationTail::encode`] output: `owner_pubkey(32) +
+/// Largest [`ModerationTail::encode`] output with no pins: `owner_pubkey(32) +
 /// key_epoch(8) + successor_nominee(32) + claim_after_days(2) +
-/// invites_owner_only(1) + slow_mode_secs(2)`.
+/// invites_owner_only(1) + slow_mode_secs(2) + room_name(1 + 64) +
+/// announce_only(1) + pin_count(1)`.
 ///
 /// Every field the encoder can write has to be counted here. This budget is
 /// what [`moderation_snapshot_fits`] reserves, so a field left out of the sum
 /// lets a snapshot sitting on the boundary pass the check and then publish a
 /// record the network refuses — losing the whole governance snapshot, not just
-/// the new field.
-const MODERATION_TAIL_MAX_LEN: usize = 32 + 8 + 32 + 2 + 1 + 2;
+/// the new field. The pin entries themselves are the one deliberate exception:
+/// they are fitted into what is left per record ([`moderation_pin_capacity`])
+/// and dropped before anything else is, so they can never be what pushes a
+/// snapshot over.
+const MODERATION_TAIL_MAX_LEN: usize =
+    32 + 8 + 32 + 2 + 1 + 2 + 1 + CHANNEL_NAME_MAX + 1 + 1;
 
 /// Fixed cost of a moderation `extra` blob: the three length prefixes plus a
 /// fully-populated tail.
@@ -117,6 +130,11 @@ const MODERATION_EXTRA_FIXED_LEN: usize = 2 + 2 + 2 + MODERATION_TAIL_MAX_LEN;
 /// This pins them together. Anything that widens the welcome, lengthens the
 /// tail or grows either list now fails to compile instead of silently
 /// un-publishing rooms.
+///
+/// With the announce flag and the pin count counted, the worst case is 1164 of
+/// 1165 bytes: one byte of slack. Even a single 16-byte pin cannot be reserved
+/// without shrinking a limit rooms already publish at, which is why pin
+/// entries are fitted per record instead.
 const _: () = assert!(
     RECORD_HEADER_LEN
         + CHANNEL_NAME_MAX
@@ -449,7 +467,12 @@ pub(super) fn record_matches_constraints(
     if constraints.min_size.is_some_and(|min| file_size < min) {
         return false;
     }
-    if constraints.max_size.is_some_and(|max| file_size > max) {
+    // Zero is "no limit" on every search path this overlay borrows from, so a
+    // sender that forwards it unfiltered is asking for everything, not nothing.
+    if constraints
+        .max_size
+        .is_some_and(|max| max > 0 && file_size > max)
+    {
         return false;
     }
     if constraints.file_type.is_some() || constraints.file_extension.is_some() {
@@ -495,6 +518,15 @@ pub(super) fn file_hash_from_record_data(data: &[u8]) -> Option<[u8; 16]> {
     let mut hash = [0u8; 16];
     hash.copy_from_slice(&data[17..33]);
     Some(hash)
+}
+
+/// The Ember BLAKE3 a packed record body names, read at its fixed offset — all
+/// zero when it names none. `None` when the body is too short to hold one.
+///
+/// Unverified, like [`file_hash_from_record_data`], and for the same callers:
+/// ones that bucket records by what they claim and parse nothing else.
+pub(super) fn ember_digest_from_record_data(data: &[u8]) -> Option<[u8; 32]> {
+    data.get(33..65)?.try_into().ok()
 }
 
 /// DHT key under which a file's source records live: `BLAKE3(file_hash)[..16]`.
@@ -779,6 +811,31 @@ pub struct ChannelModeration {
     pub tail: ModerationTail,
     pub timestamp: i64,
     pub publisher_key: [u8; 32],
+    /// Breaks ties between two snapshots stamped the same second. See
+    /// [`moderation_supersedes`].
+    pub signature: [u8; 64],
+}
+
+/// Whether a snapshot stamped `(timestamp, signature)` replaces the one held
+/// at `(held_timestamp, held_signature)`.
+///
+/// Newer wins. Two different snapshots in one second — which an owner on a
+/// build before stamps were made strictly increasing can still produce — are
+/// ordered by signature, so every member and storer settles on the same one
+/// rather than on whichever reached it last. The same snapshot again is not a
+/// replacement but is harmless to apply, and a held one whose signature was
+/// never recorded is treated as the old rule treated every tie.
+pub fn moderation_supersedes(
+    timestamp: i64,
+    signature: &[u8; 64],
+    held_timestamp: i64,
+    held_signature: Option<&[u8; 64]>,
+) -> bool {
+    match timestamp.cmp(&held_timestamp) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => held_signature.is_none_or(|held| signature >= held),
+    }
 }
 
 /// Owner-signed successor mapping. `file_hash` is the **old** channel_id.
@@ -794,6 +851,51 @@ pub struct ChannelHandoff {
 
 pub fn pack_channel_file_size(kind: u8, flags: u8) -> u64 {
     u64::from(kind) | (u64::from(flags) << 8)
+}
+
+/// Languages an owner can mark as a room's default, as language codes.
+///
+/// A code's wire id is its position plus one, which is why this list is
+/// append-only: reordering or removing an entry would relabel every room that
+/// already carries a later one. Zero means no default language. A byte this
+/// build has no entry for comes from a later build's longer list and reads as
+/// no language. Mirrored by `CHANNEL_LANGUAGES` in
+/// `src/lib/channelLanguages.ts`, which owns names and flags.
+pub const CHANNEL_LANGUAGES: &[&str] = &[
+    "en", "es", "fr", "de", "pt", "it", "ru", "zh", "ja", "ko", "ar", "hi", "tr", "pl", "nl", "sv",
+    "uk", "vi", "id", "th", "fa", "he", "el", "cs", "ro", "hu", "da", "fi", "no", "bn", "ms",
+    "fil", "bg", "hr", "sr", "sk", "ca",
+];
+const _: () = assert!(CHANNEL_LANGUAGES.len() < u8::MAX as usize);
+
+/// The registry entry for `code`, or `None` if rooms cannot carry it.
+pub fn channel_language(code: &str) -> Option<&'static str> {
+    CHANNEL_LANGUAGES.iter().copied().find(|c| *c == code)
+}
+
+fn channel_language_wire_id(code: &str) -> u8 {
+    CHANNEL_LANGUAGES
+        .iter()
+        .position(|c| *c == code)
+        .map_or(0, |i| (i + 1) as u8)
+}
+
+/// The language a channel record's `file_size` carries in its third byte.
+///
+/// That byte, like the five above it, was always written as zero and never
+/// read: every build masks `file_size` down to the kind and flag bytes, and
+/// the size filter that reads the whole value only runs for file searches. So
+/// an index or moderation record can carry the language without a byte of
+/// its trailer, and every storer that accepted the record before still does.
+/// The signature covers it like the rest of the header.
+pub fn channel_language_from_file_size(file_size: u64) -> Option<&'static str> {
+    let id = ((file_size >> 16) & 0xff) as usize;
+    id.checked_sub(1).and_then(|i| CHANNEL_LANGUAGES.get(i).copied())
+}
+
+fn pack_channel_file_size_with_language(kind: u8, flags: u8, language: Option<&str>) -> u64 {
+    pack_channel_file_size(kind, flags)
+        | (u64::from(language.map_or(0, channel_language_wire_id)) << 16)
 }
 
 pub fn channel_kind_from_data(data: &[u8]) -> Option<u8> {
@@ -894,6 +996,7 @@ impl SignedRecord {
             None,
             media,
             signing_key,
+            chrono::Utc::now().timestamp(),
         )
     }
 
@@ -921,12 +1024,15 @@ impl SignedRecord {
         )
     }
 
-    /// Public/private index listing, signed by the **channel** key.
+    /// Public/private index listing, signed by the **channel** key. The
+    /// language rides in `file_size` (see [`channel_language_from_file_size`]),
+    /// so Discover can show it before anyone joins.
     pub fn channel_index(
         name: &str,
         channel_id: [u8; 16],
         channel_pubkey: [u8; 32],
         private: bool,
+        language: Option<&str>,
         signing_key: &SigningKey,
     ) -> Self {
         let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
@@ -936,7 +1042,7 @@ impl SignedRecord {
             channel::index_key_for_channel(&channel_id),
             channel_id,
             channel_pubkey,
-            pack_channel_file_size(CHANNEL_KIND_INDEX, flags),
+            pack_channel_file_size_with_language(CHANNEL_KIND_INDEX, flags, language),
             name,
             None,
             Some(Vec::new()),
@@ -1029,9 +1135,43 @@ impl SignedRecord {
         private: bool,
         signing_key: &SigningKey,
     ) -> Option<Self> {
+        Self::channel_moderation_at(
+            topic,
+            welcome,
+            banned_pubkeys,
+            moderator_pubkeys,
+            tail,
+            channel_id,
+            channel_pubkey,
+            private,
+            signing_key,
+            chrono::Utc::now().timestamp(),
+        )
+    }
+
+    /// [`Self::channel_moderation`] stamped `timestamp` rather than now.
+    ///
+    /// Snapshots are whole replacements ordered by this stamp alone, and it is
+    /// whole seconds, so an owner signing two in one second — an edit racing the
+    /// republish — would publish two different snapshots every storer and
+    /// member ranks as equal. Owners stamp from
+    /// `Database::stamp_owner_snapshot`, which never repeats.
+    pub fn channel_moderation_at(
+        topic: &str,
+        welcome: &str,
+        banned_pubkeys: &[[u8; 32]],
+        moderator_pubkeys: &[[u8; 32]],
+        tail: &ModerationTail,
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        private: bool,
+        signing_key: &SigningKey,
+        timestamp: i64,
+    ) -> Option<Self> {
         let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
+        let tail = fit_moderation_pins(topic, welcome, banned_pubkeys, moderator_pubkeys, tail);
         let topic = truncate_utf8(topic, CHANNEL_NAME_MAX);
-        let extra = encode_moderation_extra(welcome, banned_pubkeys, moderator_pubkeys, tail);
+        let extra = encode_moderation_extra(welcome, banned_pubkeys, moderator_pubkeys, &tail);
         // `None` rather than an oversized record: this is a full snapshot of a
         // room's governance, so publishing one the network refuses does not
         // leave the previous state standing — it lets the last good copy expire
@@ -1043,16 +1183,18 @@ impl SignedRecord {
         {
             return None;
         }
-        Some(Self::build(
+        Some(Self::build_with_media(
             RECORD_TYPE_CHANNEL,
             channel::moderation_key(&channel_id),
             channel_id,
             channel_pubkey,
-            pack_channel_file_size(CHANNEL_KIND_MODERATION, flags),
+            pack_channel_file_size_with_language(CHANNEL_KIND_MODERATION, flags, tail.language),
             topic,
             None,
             Some(extra),
+            None,
             signing_key,
+            timestamp,
         ))
     }
 
@@ -1285,6 +1427,7 @@ impl SignedRecord {
             channel_extra,
             None,
             signing_key,
+            chrono::Utc::now().timestamp(),
         )
     }
 
@@ -1300,9 +1443,9 @@ impl SignedRecord {
         channel_extra: Option<Vec<u8>>,
         media: Option<&crate::types::MediaMetadata>,
         signing_key: &SigningKey,
+        timestamp: i64,
     ) -> Self {
         let publisher_key = signing_key.verifying_key().to_bytes();
-        let timestamp = chrono::Utc::now().timestamp();
         let contact_bytes = source_contact_encoded_len(source_contact.as_ref());
         // Encoded before the name is clamped, because its length is part of what
         // the name has to fit around.
@@ -1408,11 +1551,9 @@ impl SignedRecord {
 
     /// Verify this record's signature against the embedded publisher key.
     ///
-    /// The live paths never need this: `from_wire` and `from_value_blob`
-    /// both verify before handing back a record, so anything parsed is
-    /// already checked. Kept as the standalone predicate those tests
-    /// assert through.
-    #[allow(dead_code)]
+    /// [`Self::from_wire`] is [`Self::parse_unverified`] followed by exactly
+    /// this, so a caller that parses unverified, runs cheaper checks, and then
+    /// asks this has admitted precisely what `from_wire` would have.
     pub fn verify(&self) -> bool {
         if let Some(pk) = crypto::verifying_key_from_bytes(&self.publisher_key) {
             crypto::verify(&pk, &self.data, &self.signature)
@@ -1486,8 +1627,9 @@ impl SignedRecord {
         if meta.kind != CHANNEL_KIND_MODERATION {
             return None;
         }
-        let (welcome, banned_pubkeys, moderator_pubkeys, tail) =
+        let (welcome, banned_pubkeys, moderator_pubkeys, mut tail) =
             decode_moderation_extra(&meta.extra)?;
+        tail.language = channel_language_from_file_size(rec.file_size);
         Some(ChannelModeration {
             topic: rec.file_name,
             welcome,
@@ -1496,6 +1638,7 @@ impl SignedRecord {
             tail,
             timestamp: rec.timestamp,
             publisher_key: rec.publisher_key,
+            signature: rec.signature,
         })
     }
 
@@ -1569,11 +1712,7 @@ impl SignedRecord {
     /// Parse a signed record from raw data + signature.
     pub fn from_wire(data: &[u8], signature: [u8; 64]) -> Option<Self> {
         let parsed = Self::parse_unverified(data, signature)?;
-        let pk = crypto::verifying_key_from_bytes(&parsed.publisher_key)?;
-        if !crypto::verify(&pk, data, &signature) {
-            return None;
-        }
-        Some(parsed)
+        parsed.verify().then_some(parsed)
     }
 
     /// Parse a record body's structure **without checking its signature**.
@@ -1581,10 +1720,13 @@ impl SignedRecord {
     /// Everything returned is derived from `data` alone, so it says nothing
     /// about who wrote it: a caller that does not verify must not act on the
     /// identity fields. It exists for callers that verify separately — and
-    /// would otherwise pay twice. `DhtStore::restore` is the one that matters:
-    /// it runs synchronously at startup against a 20,000-record ceiling sized
-    /// on one Ed25519 check each, so a second one per record is a real launch
-    /// cost rather than a micro-optimisation.
+    /// would otherwise pay twice. `DhtStore::restore` is one: it runs
+    /// synchronously at startup against a 20,000-record ceiling sized on one
+    /// Ed25519 check each, so a second one per record is a real launch cost
+    /// rather than a micro-optimisation. The inbound STORE and `PROXY_STORE`
+    /// paths are the other: they refuse on these fields first and call
+    /// [`Self::verify`] only for a record that survives, so junk costs no
+    /// signature check at all.
     pub fn parse_unverified(data: &[u8], signature: [u8; 64]) -> Option<Self> {
         // Minimum: type(1) + kw_hash(16) + file_hash(16) + ember_hash(32) +
         //          size(8) + pub_key(32) + timestamp(8) + name_len(2) = 115
@@ -1694,7 +1836,7 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 /// if the whole of it is present. Any prefix is valid, so a reader accepts
 /// every version of the record ever published and a writer never has to
 /// coordinate with one; a *partial* field is malformed, not old.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModerationTail {
     /// The owner's own user identity. Lets any member refuse a moderator's ban
     /// aimed at the owner — nothing else on the wire identifies them.
@@ -1737,6 +1879,64 @@ pub struct ModerationTail {
     /// them the whole record. This way the wire is byte-identical for every
     /// room that never turns it on.
     pub slow_mode_secs: Option<u16>,
+    /// The room's name, carried only once its owner has renamed it.
+    ///
+    /// A member learns the name once, from the invite or listing they joined
+    /// through, and nothing else ever corrects it; this is how a rename reaches
+    /// them. Absent for a room that was never renamed, for the same reason as
+    /// [`Self::slow_mode_secs`]: builds from before 1.6.0 refuse tail bytes
+    /// they cannot place, and this field forces the one before it onto the
+    /// wire. Those builds lose a renamed room's snapshot until they update,
+    /// and nothing changes for any other room. Encoded as a length byte and
+    /// at most [`CHANNEL_NAME_MAX`] bytes of UTF-8; a length of zero means no
+    /// name is carried, which is how a later field is written without one.
+    pub room_name: Option<String>,
+    /// Only the owner and the moderators named in this snapshot may post.
+    ///
+    /// A guardrail like [`Self::slow_mode_secs`], enforced by each sender
+    /// declining to publish: receivers keep storing whatever arrives. Deciding
+    /// on receipt would need to know when the policy took effect and who was a
+    /// moderator at the time a line was written, and this record carries
+    /// neither — only the state as of its own signing. Members learn a change
+    /// minutes apart, so a receiver judging by what it holds now would drop an
+    /// honest line one member accepted, or an ex-moderator's announcement
+    /// replayed to a newcomer, and the room would split over what was said.
+    ///
+    /// Written only when on, or as an explicit `false` when pins follow it, so
+    /// a room that never uses it publishes the tail it did before. Absent reads
+    /// as off, as for slow mode.
+    ///
+    /// Older builds, like for [`Self::room_name`]: 1.6.x stops reading after
+    /// slow mode, so its members keep the rest of the snapshot but neither see
+    /// the pins nor decline to post — and since nothing filters on receipt,
+    /// what they post is shown to everyone. Builds before 1.6.0 refuse tail
+    /// bytes they cannot place and lose the room's snapshot until they update.
+    pub announce_only: Option<bool>,
+    /// Gossip ids of the messages the owner has pinned, oldest pin first.
+    ///
+    /// Encoded as a count byte and that many 16-byte ids. The count and the
+    /// field before it are in the compile-time budget; the entries are not,
+    /// because the worst-case snapshot leaves one spare byte and reserving
+    /// even one pin would mean shrinking the welcome or a list below what
+    /// rooms already publish. Instead a record carries as many of the newest
+    /// pins as fit beside everything else ([`moderation_pin_capacity`]) and
+    /// sheds the oldest first, so a new ban always wins over an old pin. A room
+    /// short of the maximum on every other front — nearly all of them — has
+    /// room for [`CHANNEL_PIN_MAX`].
+    ///
+    /// Empty means none, and nothing is written, as for slow mode.
+    pub pinned_msg_ids: Vec<[u8; CHANNEL_PIN_ID_LEN]>,
+    /// The language the owner expects the room to be held in, shown beside
+    /// its name. Advisory: nothing is filtered on it.
+    ///
+    /// Not part of the encoded tail: [`SignedRecord::channel_moderation`]
+    /// writes it into the record's `file_size` (see
+    /// [`channel_language_from_file_size`]) and
+    /// [`SignedRecord::parse_channel_moderation`] reads it back, so it costs
+    /// the tail's byte budget nothing and every build that reads a snapshot
+    /// today keeps reading it. The public index record carries it the same
+    /// way, which is what lets Discover show it before anyone joins.
+    pub language: Option<&'static str>,
 }
 
 impl ModerationTail {
@@ -1763,10 +1963,43 @@ impl ModerationTail {
             return;
         };
         out.push(u8::from(owner_only));
-        let Some(slow) = self.slow_mode_secs else {
+        let pins = self.pins_to_encode();
+        let announce = self.announce_only == Some(true);
+        let later = announce || !pins.is_empty();
+        // A later field needs the one before it written to be located, so a
+        // room with a name, an announce flag or pins and no slow mode writes an
+        // explicit zero, which reads as "off" exactly as absence does.
+        let Some(slow) = self
+            .slow_mode_secs
+            .or_else(|| (self.room_name.is_some() || later).then_some(0))
+        else {
             return;
         };
         out.extend_from_slice(&slow.to_le_bytes());
+        let name = truncate_utf8(self.room_name.as_deref().unwrap_or(""), CHANNEL_NAME_MAX);
+        if name.is_empty() && !later {
+            return;
+        }
+        // Zero-length when there is no name: "no name carried".
+        out.push(name.len() as u8);
+        out.extend_from_slice(name.as_bytes());
+        if !later {
+            return;
+        }
+        out.push(u8::from(announce));
+        if pins.is_empty() {
+            return;
+        }
+        out.push(pins.len() as u8);
+        for id in pins {
+            out.extend_from_slice(id);
+        }
+    }
+
+    /// The newest [`CHANNEL_PIN_MAX`] pins, which is all a record ever carries.
+    fn pins_to_encode(&self) -> &[[u8; CHANNEL_PIN_ID_LEN]] {
+        let ids = &self.pinned_msg_ids;
+        &ids[ids.len().saturating_sub(CHANNEL_PIN_MAX)..]
     }
 
     fn decode(mut rest: &[u8]) -> Option<Self> {
@@ -1819,6 +2052,51 @@ impl ModerationTail {
             return None;
         }
         tail.slow_mode_secs = Some(u16::from_le_bytes(rest[..2].try_into().ok()?));
+        rest = &rest[2..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        // A zero length is "no name carried": how a writer with a later field
+        // to place skips this one without inventing a rename.
+        let name_len = usize::from(rest[0]);
+        if rest.len() < 1 + name_len {
+            return None;
+        }
+        // A name this build would not have written — longer than it allows,
+        // say from a later build that raised the limit — is read as absent
+        // rather than as a malformed record. The bytes are all there, so the
+        // fields after it still decode, and refusing would cost members the
+        // whole snapshot (bans, epoch, nominee) over one display string.
+        if name_len > 0 && name_len <= CHANNEL_NAME_MAX {
+            tail.room_name = std::str::from_utf8(&rest[1..1 + name_len]).ok().map(str::to_string);
+        }
+        rest = &rest[1 + name_len..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        tail.announce_only = Some(rest[0] != 0);
+        rest = &rest[1..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        // The count is not checked against `CHANNEL_PIN_MAX`: a later build
+        // allowed more would otherwise cost this one the whole snapshot. Only
+        // the newest this build shows are kept.
+        let pin_count = usize::from(rest[0]);
+        let pins_end = 1 + pin_count * CHANNEL_PIN_ID_LEN;
+        if rest.len() < pins_end {
+            return None;
+        }
+        for chunk in rest[1..pins_end].chunks_exact(CHANNEL_PIN_ID_LEN) {
+            let mut id = [0u8; CHANNEL_PIN_ID_LEN];
+            id.copy_from_slice(chunk);
+            // A repeat is one pin, where it was first placed.
+            if !tail.pinned_msg_ids.contains(&id) {
+                tail.pinned_msg_ids.push(id);
+            }
+        }
+        let excess = tail.pinned_msg_ids.len().saturating_sub(CHANNEL_PIN_MAX);
+        tail.pinned_msg_ids.drain(..excess);
         // Anything past the last field this build knows is a newer one's
         // addition, and is ignored rather than refused. A moderation record is
         // a whole governance snapshot, so rejecting it over an unreadable
@@ -1861,15 +2139,173 @@ mod moderation_budget_tests {
             claim_after_days: Some(30),
             invites_owner_only: Some(true),
             slow_mode_secs: Some(300),
+            room_name: Some("n".repeat(CHANNEL_NAME_MAX)),
+            announce_only: Some(true),
+            pinned_msg_ids: vec![[0x31; 16], [0x32; 16], [0x33; 16]],
+            language: None,
         }
     }
 
-    /// The constant the compile-time budget assert is written against.
+    /// The constant the compile-time budget assert is written against, which
+    /// counts every field but the pin entries; those cost 16 bytes each on top.
     #[test]
     fn a_full_tail_encodes_to_the_length_the_budget_assumes() {
         let mut out = Vec::new();
         tail().encode(&mut out);
-        assert_eq!(out.len(), MODERATION_TAIL_MAX_LEN);
+        assert_eq!(out.len(), MODERATION_TAIL_MAX_LEN + CHANNEL_PIN_MAX * CHANNEL_PIN_ID_LEN);
+
+        // One pin keeps the count byte the budget reserves.
+        let one_pin = ModerationTail {
+            pinned_msg_ids: vec![[0x31; 16]],
+            ..tail()
+        };
+        let mut out = Vec::new();
+        one_pin.encode(&mut out);
+        assert_eq!(out.len(), MODERATION_TAIL_MAX_LEN + CHANNEL_PIN_ID_LEN);
+
+        // No pins: the count byte is not written, so the budget over-reserves
+        // by exactly that one byte.
+        let no_pins = ModerationTail {
+            pinned_msg_ids: Vec::new(),
+            ..tail()
+        };
+        let mut out = Vec::new();
+        no_pins.encode(&mut out);
+        assert_eq!(out.len(), MODERATION_TAIL_MAX_LEN - 1);
+    }
+
+    /// The language rides in `file_size`, not the tail: every trailer byte is
+    /// unchanged by it, and a reader that only looks at the kind and flag
+    /// bytes — every released build — sees the record it always did.
+    #[test]
+    fn the_language_rides_in_file_size_and_leaves_the_trailer_alone() {
+        let ident = crate::network::ember::channel::ChannelIdentity::generate();
+        let plain = SignedRecord::channel_moderation(
+            "t", "w", &[], &[], &tail(), ident.channel_id, ident.pubkey, false, &ident.signing_key,
+        )
+        .expect("fits");
+        let tagged = SignedRecord::channel_moderation(
+            "t",
+            "w",
+            &[],
+            &[],
+            &ModerationTail {
+                language: Some("ja"),
+                ..tail()
+            },
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+        )
+        .expect("fits");
+        assert_eq!(plain.data.len(), tagged.data.len(), "no trailer byte is spent on it");
+        let (plain_meta, tagged_meta) = (plain.channel.unwrap(), tagged.channel.unwrap());
+        assert_eq!(plain_meta.extra, tagged_meta.extra);
+        assert_eq!(plain_meta.kind, tagged_meta.kind);
+        assert_eq!(plain_meta.flags, tagged_meta.flags);
+        assert_eq!(channel_kind_from_data(&tagged.data), Some(CHANNEL_KIND_MODERATION));
+        assert_eq!(channel_flags_from_data(&tagged.data), Some(0));
+
+        let parsed = SignedRecord::parse_channel_moderation(&[tagged.data.clone(), tagged.signature.to_vec()].concat(), &ident.channel_id)
+            .expect("parses");
+        assert_eq!(parsed.tail.language, Some("ja"));
+        let parsed = SignedRecord::parse_channel_moderation(&[plain.data.clone(), plain.signature.to_vec()].concat(), &ident.channel_id)
+            .expect("parses");
+        assert_eq!(parsed.tail.language, None);
+
+        let index = SignedRecord::channel_index(
+            "Lobby", ident.channel_id, ident.pubkey, false, Some("de"), &ident.signing_key,
+        );
+        assert!(index.channel_store_ok());
+        assert_eq!(channel_language_from_file_size(index.file_size), Some("de"));
+        assert_eq!(index.channel.as_ref().unwrap().kind, CHANNEL_KIND_INDEX);
+        let reread = SignedRecord::from_value_blob(&[index.data.clone(), index.signature.to_vec()].concat()).expect("reparses");
+        assert_eq!(channel_language_from_file_size(reread.file_size), Some("de"));
+    }
+
+    #[test]
+    fn language_wire_ids_are_stable_and_unknown_ones_read_as_none() {
+        let with = |id: u64| pack_channel_file_size(CHANNEL_KIND_INDEX, 0) | (id << 16);
+        assert_eq!(channel_language_from_file_size(with(0)), None);
+        assert_eq!(channel_language_from_file_size(with(1)), Some("en"));
+        assert_eq!(channel_language_from_file_size(with(255)), None);
+        assert_eq!(channel_language_from_file_size(pack_channel_file_size(CHANNEL_KIND_INDEX, 1)), None);
+        for code in CHANNEL_LANGUAGES {
+            let packed = pack_channel_file_size_with_language(CHANNEL_KIND_INDEX, 1, Some(code));
+            assert_eq!(channel_language_from_file_size(packed), Some(*code));
+            assert_eq!(packed & 0xffff, pack_channel_file_size(CHANNEL_KIND_INDEX, 1));
+        }
+        assert_eq!(channel_language_wire_id("xx"), 0);
+    }
+
+    /// The slack the budget comment claims, so the next field added knows what
+    /// it has to work with.
+    #[test]
+    fn the_worst_case_snapshot_leaves_one_byte() {
+        let worst = RECORD_HEADER_LEN
+            + CHANNEL_NAME_MAX
+            + CHANNEL_TRAILER_MIN_LEN
+            + MODERATION_EXTRA_FIXED_LEN
+            + CHANNEL_WELCOME_MAX
+            + 32 * (CHANNEL_BAN_LIST_MAX + CHANNEL_MOD_LIST_MAX);
+        assert_eq!(messages::MAX_STORE_RECORD_BYTES, 1165);
+        assert_eq!(worst, 1164);
+    }
+
+    /// A room at every other maximum has no room left for a pin, so its pins
+    /// are shed — oldest first — and the record still publishes whole.
+    #[test]
+    fn pins_give_way_to_the_rest_of_a_full_snapshot() {
+        let topic = "t".repeat(CHANNEL_NAME_MAX);
+        let welcome = "w".repeat(CHANNEL_WELCOME_MAX);
+        let bans = vec![[0xAA; 32]; CHANNEL_BAN_LIST_MAX];
+        let mods = vec![[0xBB; 32]; CHANNEL_MOD_LIST_MAX];
+        assert_eq!(moderation_pin_capacity(&topic, &welcome, &bans, &mods, &tail()), 0);
+        let fitted = fit_moderation_pins(&topic, &welcome, &bans, &mods, &tail());
+        assert!(fitted.pinned_msg_ids.is_empty());
+        assert_eq!(fitted.announce_only, Some(true), "only pins are shed");
+
+        // Two bans short of the cap frees 64 bytes: three pins' worth at 48.
+        let fewer = &bans[..CHANNEL_BAN_LIST_MAX - 2];
+        assert_eq!(moderation_pin_capacity(&topic, &welcome, fewer, &mods, &tail()), 3);
+        // One short frees 32 plus the byte of slack: two pins, not three.
+        let one_fewer = &bans[..CHANNEL_BAN_LIST_MAX - 1];
+        assert_eq!(moderation_pin_capacity(&topic, &welcome, one_fewer, &mods, &tail()), 2);
+        let fitted = fit_moderation_pins(&topic, &welcome, one_fewer, &mods, &tail());
+        assert_eq!(
+            fitted.pinned_msg_ids,
+            vec![[0x32; 16], [0x33; 16]],
+            "the newest pins survive"
+        );
+        // A welcome 20 bytes short of full leaves 21: exactly one pin.
+        let shorter = "w".repeat(CHANNEL_WELCOME_MAX - 20);
+        assert_eq!(moderation_pin_capacity(&topic, &shorter, &bans, &mods, &tail()), 1);
+
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let record = SignedRecord::channel_moderation(
+            &topic, &shorter, &bans, &mods, &tail(), [0x33; 16], [0x44; 32], false, &sk,
+        )
+        .expect("shedding pins keeps the record publishable");
+        assert!(record.data.len() <= messages::MAX_STORE_RECORD_BYTES);
+        let meta = record.channel.as_ref().expect("channel meta");
+        let (_, _, _, decoded) = decode_moderation_extra(&meta.extra).expect("decodes");
+        assert_eq!(decoded.pinned_msg_ids, vec![[0x33; 16]]);
+    }
+
+    /// An ordinary room — a topic, a short welcome, a ban or two — carries
+    /// every pin the owner is allowed.
+    #[test]
+    fn a_typical_room_carries_every_pin() {
+        let bans = vec![[0xAA; 32]; 2];
+        assert_eq!(
+            moderation_pin_capacity("Lobby", "Be kind.", &bans, &[], &tail()),
+            CHANNEL_PIN_MAX
+        );
+        assert_eq!(
+            fit_moderation_pins("Lobby", "Be kind.", &bans, &[], &tail()),
+            tail()
+        );
     }
 
     /// Everything the advertised maxima allow, at once, has to fit — that is
@@ -1997,10 +2433,83 @@ pub fn moderation_snapshot_fits(
     {
         return false;
     }
+    // Pins are shed before this is measured, the same way the record is built,
+    // so a pin is never the reason a ban or a welcome edit is refused.
+    let tail = fit_moderation_pins(topic, welcome, banned_pubkeys, moderator_pubkeys, tail);
+    moderation_record_len(topic, welcome, banned_pubkeys, moderator_pubkeys, &tail)
+        <= messages::MAX_STORE_RECORD_BYTES
+}
+
+fn moderation_record_len(
+    topic: &str,
+    welcome: &str,
+    banned_pubkeys: &[[u8; 32]],
+    moderator_pubkeys: &[[u8; 32]],
+    tail: &ModerationTail,
+) -> usize {
     let topic_len = truncate_utf8(topic, CHANNEL_NAME_MAX).len();
     let extra = encode_moderation_extra(welcome, banned_pubkeys, moderator_pubkeys, tail);
     RECORD_HEADER_LEN + topic_len + CHANNEL_TRAILER_MIN_LEN + extra.len()
-        <= messages::MAX_STORE_RECORD_BYTES
+}
+
+/// How many pins a moderation record for this snapshot has room for, up to
+/// [`CHANNEL_PIN_MAX`], whatever `tail` itself holds.
+///
+/// Pins are the one part of the snapshot without a reserved share of the
+/// record (see [`ModerationTail::pinned_msg_ids`]), so an owner pinning a
+/// message needs to hear "no room" up front rather than find the pin shed.
+pub fn moderation_pin_capacity(
+    topic: &str,
+    welcome: &str,
+    banned_pubkeys: &[[u8; 32]],
+    moderator_pubkeys: &[[u8; 32]],
+    tail: &ModerationTail,
+) -> usize {
+    let mut probe = tail.clone();
+    for count in (1..=CHANNEL_PIN_MAX).rev() {
+        // Distinct ids so the probe measures exactly what `count` real pins
+        // would cost; their values do not matter.
+        probe.pinned_msg_ids = (0..count as u8).map(|i| [i; CHANNEL_PIN_ID_LEN]).collect();
+        if moderation_record_len(topic, welcome, banned_pubkeys, moderator_pubkeys, &probe)
+            <= messages::MAX_STORE_RECORD_BYTES
+        {
+            return count;
+        }
+    }
+    0
+}
+
+/// `tail` as a record for this snapshot will carry it: the newest pins that
+/// fit, the oldest shed first. What the owner stores locally after a commit,
+/// so their pin bar shows what members will see.
+pub fn fit_moderation_pins(
+    topic: &str,
+    welcome: &str,
+    banned_pubkeys: &[[u8; 32]],
+    moderator_pubkeys: &[[u8; 32]],
+    tail: &ModerationTail,
+) -> ModerationTail {
+    let mut fitted = tail.clone();
+    let pins = tail.pins_to_encode();
+    if pins.is_empty() {
+        fitted.pinned_msg_ids.clear();
+        return fitted;
+    }
+    let keep = moderation_pin_capacity(topic, welcome, banned_pubkeys, moderator_pubkeys, tail)
+        .min(pins.len());
+    // Debug, not warn: this runs for every build of the record — each commit
+    // measures it more than once, and the owner loop republishes every room
+    // on a timer — so a room at capacity would log this on every pass. An
+    // owner's pin edit is refused up front instead (`moderation_pin_capacity`).
+    if keep < pins.len() {
+        tracing::debug!(
+            "Ember: channel moderation snapshot sheds {} of {} pin(s) to fit one record",
+            pins.len() - keep,
+            pins.len()
+        );
+    }
+    fitted.pinned_msg_ids = pins[pins.len() - keep..].to_vec();
+    fitted
 }
 
 fn encode_moderation_extra(
@@ -2222,8 +2731,15 @@ impl PublishManager {
         }
     }
 
-    /// Store on the closest verified contacts currently in `routing`.
-    /// Channel presence, moderation, and handoff still use this snapshot.
+    /// Store on the closest contacts currently in `routing`: verified ones
+    /// first, with unverified leads filling any slots they leave empty (see
+    /// `RoutingTable::find_closest_prefer_verified`). Channel presence,
+    /// moderation, and handoff still use this snapshot.
+    ///
+    /// Leads stay in deliberately. On a young network they are most of the
+    /// table, and one that never answers costs a handshake and a target that
+    /// times out rather than a lost publish: nothing here parks a record for
+    /// failing, and the callers that care retry when it stored on nobody.
     pub fn start_publish(
         &mut self,
         record: SignedRecord,
@@ -2314,6 +2830,46 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+
+    /// A maximum size of zero is how every search path here spells "no limit",
+    /// and a sender that forwards it unfiltered must not have every record under
+    /// the key refused.
+    #[test]
+    fn a_zero_max_size_constraint_is_no_limit() {
+        let sk = SigningKey::from_bytes(&[0x5C; 32]);
+        let record = SignedRecord::keyword(
+            "holiday",
+            [0x11; 16],
+            [0u8; 32],
+            700_000,
+            "holiday.mkv",
+            &sk,
+        );
+        let zero = super::super::messages::ValueConstraints {
+            max_size: Some(0),
+            ..Default::default()
+        };
+        assert!(record_matches_constraints(&record.data, &zero));
+
+        let zero_with_type = super::super::messages::ValueConstraints {
+            max_size: Some(0),
+            file_type: Some("Video".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            record_matches_constraints(&record.data, &zero_with_type),
+            "the other constraints still apply on their own"
+        );
+
+        let real_ceiling = super::super::messages::ValueConstraints {
+            max_size: Some(1_000),
+            ..Default::default()
+        };
+        assert!(
+            !record_matches_constraints(&record.data, &real_ceiling),
+            "a non-zero ceiling is still enforced"
+        );
+    }
 
     /// A keyword record's media block has to survive the wire, and — the property
     /// that lets it exist at all — a build that has never heard of it has to
@@ -2772,6 +3328,7 @@ mod tests {
             ident.channel_id,
             ident.pubkey,
             false,
+            None,
             &ident.signing_key,
         );
         assert_eq!(record.record_type, RECORD_TYPE_CHANNEL);
@@ -2800,6 +3357,7 @@ mod tests {
             ident.channel_id,
             ident.pubkey,
             false,
+            None,
             &ident.signing_key,
         );
         record.keyword_hash = channel::index_key(index_other_shard(&ident.channel_id));
@@ -2958,6 +3516,50 @@ mod tests {
         assert_eq!(member_info.noise_pub, noise_pub);
     }
 
+    /// A snapshot carries the stamp it was built at and the signature that
+    /// orders it against another from the same second.
+    #[test]
+    fn a_stamped_moderation_snapshot_parses_back_with_its_stamp_and_signature() {
+        let ident = channel::ChannelIdentity::generate();
+        let at = chrono::Utc::now().timestamp() + 3;
+        let record = SignedRecord::channel_moderation_at(
+            "rules",
+            "",
+            &[],
+            &[],
+            &ModerationTail::default(),
+            ident.channel_id,
+            ident.pubkey,
+            false,
+            &ident.signing_key,
+            at,
+        )
+        .expect("the fixture fits one record");
+        assert_eq!(record.timestamp, at);
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        let parsed = SignedRecord::parse_channel_moderation(&blob, &ident.channel_id).unwrap();
+        assert_eq!(parsed.timestamp, at);
+        assert_eq!(parsed.signature, record.signature);
+    }
+
+    #[test]
+    fn moderation_snapshots_order_by_stamp_then_signature() {
+        let (low, high) = ([0x10u8; 64], [0x20u8; 64]);
+        assert!(moderation_supersedes(11, &low, 10, Some(&high)), "newer wins");
+        assert!(!moderation_supersedes(9, &high, 10, Some(&low)), "older never does");
+        assert!(moderation_supersedes(10, &high, 10, Some(&low)));
+        assert!(!moderation_supersedes(10, &low, 10, Some(&high)));
+        assert!(
+            moderation_supersedes(10, &low, 10, Some(&low)),
+            "the same snapshot again is harmless to apply"
+        );
+        assert!(
+            moderation_supersedes(10, &low, 10, None),
+            "a held snapshot with no recorded signature ties the old way"
+        );
+    }
+
     #[test]
     fn channel_moderation_round_trip() {
         let ident = channel::ChannelIdentity::generate();
@@ -3082,6 +3684,10 @@ mod tests {
             claim_after_days: Some(14),
             invites_owner_only: Some(true),
             slow_mode_secs: Some(30),
+            room_name: None,
+            announce_only: None,
+            pinned_msg_ids: Vec::new(),
+            language: None,
         };
 
         let round_trip = |tail: &ModerationTail| -> ModerationTail {
@@ -3094,22 +3700,22 @@ mod tests {
         assert_eq!(round_trip(&full), full);
         let no_slow = ModerationTail {
             slow_mode_secs: None,
-            ..full
+            ..full.clone()
         };
         assert_eq!(round_trip(&no_slow), no_slow);
         let no_invites = ModerationTail {
             invites_owner_only: None,
-            ..no_slow
+            ..no_slow.clone()
         };
         assert_eq!(round_trip(&no_invites), no_invites);
         let no_days = ModerationTail {
             claim_after_days: None,
-            ..no_invites
+            ..no_invites.clone()
         };
         assert_eq!(round_trip(&no_days), no_days);
         let owner_and_epoch = ModerationTail {
             successor_nominee: None,
-            ..no_days
+            ..no_days.clone()
         };
         assert_eq!(round_trip(&owner_and_epoch), owner_and_epoch);
         let owner_only = ModerationTail {
@@ -3131,8 +3737,74 @@ mod tests {
             claim_after_days: Some(7),
             invites_owner_only: None,
             slow_mode_secs: Some(10),
+            room_name: None,
+            announce_only: Some(true),
+            pinned_msg_ids: vec![[0x44u8; 16]],
+            language: None,
         };
         assert_eq!(round_trip(&orphan), ModerationTail::default());
+
+        // A renamed room with slow mode off writes an explicit zero so the
+        // name can be located after it; zero reads back as "off".
+        let renamed = ModerationTail {
+            slow_mode_secs: None,
+            room_name: Some("Renamed Room".to_string()),
+            ..full.clone()
+        };
+        assert_eq!(
+            round_trip(&renamed),
+            ModerationTail {
+                slow_mode_secs: Some(0),
+                ..renamed.clone()
+            }
+        );
+        // A room never renamed publishes exactly what it did before the field.
+        assert_eq!(
+            encode_moderation_extra("hi", &[], &[], &no_slow),
+            encode_moderation_extra(
+                "hi",
+                &[],
+                &[],
+                &ModerationTail { room_name: None, ..no_slow.clone() }
+            )
+        );
+        // A name cut short is malformed, not an older record.
+        let with_name = encode_moderation_extra("hi", &[], &[], &renamed);
+        assert!(decode_moderation_extra(&with_name[..with_name.len() - 1]).is_none());
+        // A zero-length name is a writer skipping the field, not a rename.
+        let mut skipped = encode_moderation_extra("hi", &[], &[], &no_slow);
+        skipped.extend_from_slice(&0u16.to_le_bytes());
+        skipped.push(0);
+        let (_, _, _, decoded) = decode_moderation_extra(&skipped).expect("decodes");
+        assert_eq!(decoded.room_name, None);
+        // And the byte past it is the announce flag, which leaves the name be.
+        let mut newer = with_name.clone();
+        newer.push(1);
+        let (_, _, _, decoded) = decode_moderation_extra(&newer).expect("decodes");
+        assert_eq!(decoded.room_name.as_deref(), Some("Renamed Room"));
+        assert_eq!(decoded.announce_only, Some(true));
+        // A name longer than this build writes — a later build's, say — is
+        // skipped whole, and what follows it still decodes.
+        let long_name = [b'n'; CHANNEL_NAME_MAX + 1];
+        let mut longer = skipped.clone();
+        longer.pop();
+        longer.push(long_name.len() as u8);
+        longer.extend_from_slice(&long_name);
+        let complete_len = longer.len();
+        longer.push(1);
+        longer.push(1);
+        longer.extend_from_slice(&[0x5Au8; 16]);
+        let (_, _, _, decoded) =
+            decode_moderation_extra(&longer).expect("an over-long name costs only the name");
+        assert_eq!(decoded.room_name, None);
+        assert_eq!(decoded.announce_only, Some(true));
+        assert_eq!(decoded.pinned_msg_ids, vec![[0x5Au8; 16]]);
+        assert_eq!(decoded.owner_pubkey, no_slow.owner_pubkey);
+        let (_, _, _, decoded) =
+            decode_moderation_extra(&longer[..complete_len]).expect("and may end the tail");
+        assert_eq!(decoded.room_name, None);
+        // Only bytes that are not there make it malformed.
+        assert!(decode_moderation_extra(&longer[..complete_len - 1]).is_none());
 
         // Every partial field is malformed, not old. The lengths a writer can
         // legitimately stop at are the running totals of the field widths.
@@ -3153,12 +3825,247 @@ mod tests {
         }
 
         // A field this build has never heard of is skipped, not treated as a
-        // reason to throw away the owner key and both lists with it.
-        let mut from_the_future = base.clone();
+        // reason to throw away the owner key and both lists with it. It comes
+        // after every field this build knows, the pins included.
+        let everything = ModerationTail {
+            room_name: Some("Lobby".to_string()),
+            announce_only: Some(true),
+            pinned_msg_ids: vec![[0x0Au8; 16], [0x0Bu8; 16]],
+            ..full.clone()
+        };
+        let mut from_the_future = encode_moderation_extra("hi", &[], &[], &everything);
         from_the_future.extend_from_slice(&[0xEE; 6]);
         let (_, _, _, decoded) = decode_moderation_extra(&from_the_future)
             .expect("a longer tail from a newer build still decodes");
+        assert_eq!(decoded, everything);
+    }
+
+    /// The announce flag and the pins, with and without the fields before them
+    /// that they force onto the wire.
+    #[test]
+    fn announce_only_and_pins_round_trip_behind_every_combination_of_their_predecessors() {
+        let base = ModerationTail {
+            owner_pubkey: Some([0x11u8; 32]),
+            key_epoch: Some(3),
+            successor_nominee: Some([0u8; 32]),
+            claim_after_days: Some(0),
+            invites_owner_only: Some(false),
+            ..Default::default()
+        };
+        let round_trip = |tail: &ModerationTail| -> ModerationTail {
+            let extra = encode_moderation_extra("hi", &[[0x01u8; 32]], &[[0x02u8; 32]], tail);
+            decode_moderation_extra(&extra).expect("decodes").3
+        };
+        let pins = vec![[0xA1u8; 16], [0xA2u8; 16], [0xA3u8; 16]];
+        for slow in [None, Some(30)] {
+            for name in [None, Some("Renamed".to_string())] {
+                for announce in [None, Some(true)] {
+                    for pinned in [Vec::new(), pins.clone()] {
+                        let tail = ModerationTail {
+                            slow_mode_secs: slow,
+                            room_name: name.clone(),
+                            announce_only: announce,
+                            pinned_msg_ids: pinned.clone(),
+                            ..base.clone()
+                        };
+                        let later = announce.is_some() || !pinned.is_empty();
+                        // What a reader sees for each forced predecessor: zero
+                        // slow mode, no name, and an explicit "not announce-only".
+                        let expected = ModerationTail {
+                            slow_mode_secs: slow.or((name.is_some() || later).then_some(0)),
+                            announce_only: if later { Some(announce.is_some()) } else { None },
+                            ..tail.clone()
+                        };
+                        assert_eq!(round_trip(&tail), expected, "{tail:?}");
+                    }
+                }
+            }
+        }
+
+        // Off is not written, so a room that never used either field is
+        // byte-identical to what it published before they existed.
+        let off = ModerationTail {
+            announce_only: Some(false),
+            ..base.clone()
+        };
+        assert_eq!(
+            encode_moderation_extra("hi", &[], &[], &off),
+            encode_moderation_extra("hi", &[], &[], &base)
+        );
+
+        // Past the cap, only the newest pins travel; repeats are one pin.
+        let many = ModerationTail {
+            pinned_msg_ids: vec![[1u8; 16], [2u8; 16], [3u8; 16], [4u8; 16]],
+            ..base.clone()
+        };
+        assert_eq!(
+            round_trip(&many).pinned_msg_ids,
+            vec![[2u8; 16], [3u8; 16], [4u8; 16]]
+        );
+        let mut repeated = encode_moderation_extra("hi", &[], &[], &base);
+        repeated.extend_from_slice(&0u16.to_le_bytes());
+        repeated.push(0);
+        repeated.push(1);
+        repeated.push(2);
+        repeated.extend_from_slice(&[7u8; 16]);
+        repeated.extend_from_slice(&[7u8; 16]);
+        let decoded = decode_moderation_extra(&repeated).expect("decodes").3;
+        assert_eq!(decoded.pinned_msg_ids, vec![[7u8; 16]]);
+        assert_eq!(decoded.announce_only, Some(true));
+        // A later build allowed more pins than this one: still readable, and
+        // the newest are what this build keeps.
+        let mut wider = encode_moderation_extra("hi", &[], &[], &base);
+        wider.extend_from_slice(&0u16.to_le_bytes());
+        wider.push(0);
+        wider.push(0);
+        wider.push(5);
+        for i in 1..=5u8 {
+            wider.extend_from_slice(&[i; 16]);
+        }
+        let decoded = decode_moderation_extra(&wider).expect("decodes").3;
+        assert_eq!(decoded.pinned_msg_ids, vec![[3u8; 16], [4u8; 16], [5u8; 16]]);
+    }
+
+    /// Every length a writer can stop at, now that the tail runs on past the
+    /// room name, and a partial field everywhere else.
+    #[test]
+    fn the_tail_with_pins_decodes_at_every_field_boundary_and_nowhere_else() {
+        let full = ModerationTail {
+            owner_pubkey: Some([0x11u8; 32]),
+            key_epoch: Some(9),
+            successor_nominee: Some([0x22u8; 32]),
+            claim_after_days: Some(14),
+            invites_owner_only: Some(true),
+            slow_mode_secs: Some(30),
+            room_name: Some("Lobby".to_string()),
+            announce_only: Some(true),
+            pinned_msg_ids: vec![[0xA1u8; 16], [0xA2u8; 16]],
+            language: None,
+        };
+        const TO_SLOW: usize = 32 + 8 + 32 + 2 + 1 + 2;
+        const TO_NAME: usize = TO_SLOW + 1 + 5;
+        const TO_ANNOUNCE: usize = TO_NAME + 1;
+        const FULL_TAIL: usize = TO_ANNOUNCE + 1 + 2 * 16;
+        let base = encode_moderation_extra("hi", &[], &[], &full);
+        let prefix_len = base.len() - FULL_TAIL;
+        let legitimate = [0, 32, 40, 72, 74, 75, TO_SLOW, TO_NAME, TO_ANNOUNCE, FULL_TAIL];
+        for tail_len in 0..=FULL_TAIL {
+            let mut truncated = base.clone();
+            truncated.truncate(prefix_len + tail_len);
+            let decoded = decode_moderation_extra(&truncated);
+            if legitimate.contains(&tail_len) {
+                assert!(decoded.is_some(), "a {tail_len}-byte tail is a valid prefix");
+            } else {
+                assert!(decoded.is_none(), "a {tail_len}-byte tail is malformed");
+            }
+        }
+        let (_, _, _, decoded) = decode_moderation_extra(&base).expect("decodes");
         assert_eq!(decoded, full);
+        // Stopping after the flag reads as "announce-only, nothing pinned".
+        let mut flag_only = base.clone();
+        flag_only.truncate(prefix_len + TO_ANNOUNCE);
+        let decoded = decode_moderation_extra(&flag_only).expect("decodes").3;
+        assert_eq!(decoded.announce_only, Some(true));
+        assert!(decoded.pinned_msg_ids.is_empty());
+    }
+
+    /// The decoder released builds run (v1.6.0 through v1.6.7), verbatim but
+    /// for returning the fields it knew as a tuple. It stops after slow mode.
+    #[allow(clippy::type_complexity)]
+    fn v1_6_decode(
+        mut rest: &[u8],
+    ) -> Option<(
+        Option<[u8; 32]>,
+        Option<u64>,
+        Option<[u8; 32]>,
+        Option<u16>,
+        Option<bool>,
+        Option<u16>,
+    )> {
+        let mut tail = (None, None, None, None, None, None);
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() < 32 {
+            return None;
+        }
+        tail.0 = Some(<[u8; 32]>::try_from(&rest[..32]).ok()?);
+        rest = &rest[32..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() < 8 {
+            return None;
+        }
+        tail.1 = Some(u64::from_le_bytes(rest[..8].try_into().ok()?));
+        rest = &rest[8..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() < 32 {
+            return None;
+        }
+        tail.2 = Some(<[u8; 32]>::try_from(&rest[..32]).ok()?);
+        rest = &rest[32..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() < 2 {
+            return None;
+        }
+        tail.3 = Some(u16::from_le_bytes(rest[..2].try_into().ok()?));
+        rest = &rest[2..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        tail.4 = Some(rest[0] != 0);
+        rest = &rest[1..];
+        if rest.is_empty() {
+            return Some(tail);
+        }
+        if rest.len() < 2 {
+            return None;
+        }
+        tail.5 = Some(u16::from_le_bytes(rest[..2].try_into().ok()?));
+        Some(tail)
+    }
+
+    /// A released 1.6 build reads an announce-only room with pins as the room
+    /// it already understood: every field it knows, intact, and the rest
+    /// ignored. That holds with or without slow mode and a name, since both
+    /// are forced onto the wire as "off" / "none" when a later field needs them.
+    #[test]
+    fn a_released_decoder_reads_the_fields_it_knows_from_a_tail_with_pins() {
+        for slow in [None, Some(60)] {
+            for name in [None, Some("Lobby".to_string())] {
+                let tail = ModerationTail {
+                    owner_pubkey: Some([0x11u8; 32]),
+                    key_epoch: Some(5),
+                    successor_nominee: Some([0x22u8; 32]),
+                    claim_after_days: Some(30),
+                    invites_owner_only: Some(true),
+                    slow_mode_secs: slow,
+                    room_name: name,
+                    announce_only: Some(true),
+                    pinned_msg_ids: vec![[0xA1u8; 16], [0xA2u8; 16], [0xA3u8; 16]],
+                    language: None,
+                };
+                let mut out = Vec::new();
+                tail.encode(&mut out);
+                let old = v1_6_decode(&out).expect("a 1.6 build still accepts the snapshot");
+                assert_eq!(
+                    old,
+                    (
+                        Some([0x11u8; 32]),
+                        Some(5),
+                        Some([0x22u8; 32]),
+                        Some(30),
+                        Some(true),
+                        Some(slow.unwrap_or(0)),
+                    )
+                );
+            }
+        }
     }
 
     #[test]
@@ -3169,6 +4076,7 @@ mod tests {
             ident.channel_id,
             ident.pubkey,
             false,
+            None,
             &ident.signing_key,
         );
         let truncated = &record.data[..record.data.len() - 1];

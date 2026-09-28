@@ -62,6 +62,15 @@ pub struct EmberSessionHandle {
     /// connection gets one, including authenticated duplicate connections
     /// that do not win the canonical outbound-routing slot.
     secure_registration: Option<Arc<SecureSessionRegistration>>,
+    /// The session runs through a relay (the rendezvous server's WebSocket
+    /// hop, or an Ember peer relay), so there is no direct address for the
+    /// friend behind it. Chat attachments need one: their bytes go over a
+    /// direct QUIC connection, never through the session.
+    relayed: bool,
+    /// Where the friend is connected from, when directly. Tells a chat
+    /// attachment which of our QUIC ports to name: a friend on our own network
+    /// cannot reach the public one the NAT maps.
+    peer_addr: Option<std::net::SocketAddr>,
 }
 
 static NEXT_EMBER_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -139,7 +148,28 @@ impl EmberSessionHandle {
             shutdown,
             peer_ember_pubkey,
             secure_registration: None,
+            relayed: false,
+            peer_addr: None,
         }
+    }
+
+    pub fn via_relay(mut self, relayed: bool) -> Self {
+        self.relayed = relayed;
+        self
+    }
+
+    pub fn is_relayed(&self) -> bool {
+        self.relayed
+    }
+
+    /// `None` for a relayed session, which has no direct address.
+    pub fn with_peer_addr(mut self, peer_addr: Option<std::net::SocketAddr>) -> Self {
+        self.peer_addr = peer_addr;
+        self
+    }
+
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.peer_addr
     }
 
     pub fn new_secure(
@@ -243,6 +273,25 @@ fn friend_privileges_allowed(secure_v2_authenticated: bool, live_friend_member: 
     secure_v2_authenticated && live_friend_member
 }
 
+/// Whether an `OP_EMBER_HELLO`/`HELLOANSWER` tries to replace the Ember
+/// identity already bound to this session. The first claimed hash and pubkey
+/// stick for the life of the socket, authenticated or not; later HELLOs may
+/// only repeat them (or fill in a pubkey that was never given).
+fn ember_hello_identity_changed(
+    bound_hash: Option<[u8; 16]>,
+    bound_pubkey: Option<[u8; 32]>,
+    claimed_hash: [u8; 16],
+    claimed_pubkey: Option<[u8; 32]>,
+) -> bool {
+    let hash_changed =
+        claimed_hash != [0u8; 16] && bound_hash.is_some_and(|bound| bound != claimed_hash);
+    let pubkey_changed = matches!(
+        (bound_pubkey, claimed_pubkey),
+        (Some(bound), Some(claimed)) if bound != claimed
+    );
+    hash_changed || pubkey_changed
+}
+
 /// True when this peer may receive friend-slot upload priority / verified
 /// Ember scoring on **this** TCP session.
 ///
@@ -276,6 +325,49 @@ async fn live_secure_friend_member(
 /// Passing this rather than a precomputed boolean keeps the mutual-friend
 /// lookup lazy: it happens only when the resolved file is actually restricted,
 /// so ordinary public serving takes no extra lock.
+/// Turn an `OP_EMBER_EXT` attachment frame into the event the network loop acts
+/// on, or `None` if it does not decode.
+///
+/// Shared by the two readers that carry friend sessions — the dedicated
+/// outbound one in `friend_connect` and the inbound secure-v2 upload socket
+/// here — so the two cannot disagree about what an attachment frame means. Both
+/// call it only after their own friend-privilege gate.
+pub(crate) fn attach_event_from_ext(
+    ember_hash: [u8; 16],
+    payload: &[u8],
+    peer_addr: Option<std::net::SocketAddr>,
+) -> Option<UploadEventKind> {
+    use crate::network::ember::attach;
+    let (sub_type, body) = super::messages::parse_ember_ext(payload)?;
+    let kind = match sub_type {
+        super::messages::EMBER_EXT_ATTACH_OFFER => UploadEventKind::EmberAttachOffer {
+            ember_hash,
+            offer: attach::decode_attach_offer(body)?,
+            peer_addr,
+        },
+        super::messages::EMBER_EXT_ATTACH_REPLY => {
+            let (xfer_id, reply, quic_port) = attach::decode_attach_reply(body)?;
+            UploadEventKind::EmberAttachReply {
+                ember_hash,
+                xfer_id,
+                reply,
+                quic_port,
+                peer_addr,
+            }
+        }
+        super::messages::EMBER_EXT_ATTACH_CANCEL => {
+            let (xfer_id, reason) = attach::decode_attach_cancel(body)?;
+            UploadEventKind::EmberAttachCancel {
+                ember_hash,
+                xfer_id,
+                reason,
+            }
+        }
+        _ => return None,
+    };
+    Some(kind)
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PeerFileAccess {
     /// Peer Ember hash, once proven. `None` until `OP_EMBER_HELLO` lands, and
@@ -283,6 +375,41 @@ pub(crate) struct PeerFileAccess {
     pub ember_hash: Option<[u8; 16]>,
     /// Whether this session completed the Noise IK secure friend handshake.
     pub secure_v2_authenticated: bool,
+}
+
+/// Log that a shared file could not be opened for upload: once per folder, the
+/// first time the approval check refuses it.
+///
+/// The peer is only ever told the file is not available, so an unapproved
+/// shared folder looked healthy — hashed, published and searchable — while
+/// every upload from it failed, and nothing said so anywhere. Once per folder
+/// per session, because a popular folder is asked for many times a minute.
+fn note_upload_refusal(path: &std::path::Path, allowed_roots: &[String], error: &std::io::Error) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let path_text = path.to_string_lossy();
+    if error.kind() != std::io::ErrorKind::PermissionDenied {
+        tracing::debug!("Could not open {path_text} for upload: {error}");
+        return;
+    }
+    let root = allowed_roots
+        .iter()
+        .find(|root| !root.is_empty() && crate::security::path_within_dir(&path_text, root))
+        .cloned()
+        .unwrap_or_else(|| path_text.to_string());
+    let first = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(root.clone());
+    if first {
+        tracing::warn!(
+            "Refusing uploads from {root}: {error}. Re-approve it in the Library if you \
+             reconnected its drive."
+        );
+    } else {
+        tracing::debug!("Refusing upload of {path_text}: {error}");
+    }
 }
 
 /// True when this peer may reach **private** content on this session: friends
@@ -449,8 +576,24 @@ enum ConnInit {
         reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
         secure_peer: Option<super::secure_stream::SecurePeerIdentity>,
+        relayed: bool,
+        /// A duplicate handle on the TCP socket underneath, when there is one,
+        /// so a file stream can widen the send buffer the listener capped for
+        /// eD2K. Dropped as soon as the stream has said what it is: while it
+        /// is held, closing the stream's own halves does not close the socket.
+        socket: Option<socket2::Socket>,
     },
 }
+
+/// Kernel send buffer for a chat attachment or room transfer served from the
+/// upload listener, in place of the 256 KiB it caps eD2K sockets to.
+///
+/// The eD2K cap keeps the upload counter close to what the peer has received.
+/// A file stream needs no such thing — the recipient says when it has every
+/// byte — and at 256 KiB its throughput stops at the buffer over the round
+/// trip: 2.5 MB/s at 100 ms. This covers 40 MB/s there. Linux holds any request
+/// to `net.core.wmem_max`, so there it helps only as far as that allows.
+const FILE_STREAM_SEND_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// Request handed from the network task to the upload listener for a
 /// pre-established stream (Ember QUIC hole-punch, peer relay, or
@@ -471,6 +614,9 @@ pub struct InboundStreamRequest {
     /// `None` — every other punch, relay, and broker stream — keeps the
     /// historical inbound behaviour.
     pub serve_friend_ember_hash: Option<[u8; 16]>,
+    /// The stream runs through a relay rather than straight to the peer, so
+    /// `peer_addr` is not an address the peer can be dialled at.
+    pub relayed: bool,
 }
 
 /// A fully handshaked outbound connection produced by `connect_and_serve`, handed
@@ -504,6 +650,10 @@ struct OutboundServeState {
     /// the serve loop may treat it as authenticated and grant friend-slot
     /// upload priority.
     secure_peer: Option<super::secure_stream::SecurePeerIdentity>,
+    /// The connection is one our download side opened and has finished with
+    /// (see [`super::peer_sessions::DownloadHandover`]). It already carried
+    /// our `OP_EMBER_HELLO`, so the serve loop does not send another.
+    handed_over: bool,
 }
 
 /// Request from the network task asking the upload listener to dial `peer_addr`
@@ -777,6 +927,55 @@ fn friends_only_from_sources(
     index_friends_only.unwrap_or(false)
 }
 
+/// Whether a live download of `hash_hex` came from a friend who restricts it.
+fn download_restricted_by_friend(mgr: &TransferManager, hash_hex: &str) -> bool {
+    mgr.active
+        .values()
+        .chain(mgr.queue.iter())
+        .any(|t| {
+            t.friends_only
+                && t.direction == TransferDirection::Download
+                && t.file_hash.eq_ignore_ascii_case(hash_hex)
+        })
+}
+
+#[cfg(test)]
+mod friend_restricted_download_tests {
+    use super::*;
+
+    fn download(id: &str, hash_hex: &str, friends_only: bool) -> crate::types::Transfer {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "file_name": "f.bin",
+            "file_hash": hash_hex,
+            "peer_id": "",
+            "peer_name": "",
+            "direction": "download",
+            "status": "active",
+            "progress": 0.0,
+            "speed": 0,
+            "total_size": 10,
+            "transferred": 0,
+            "started_at": 0,
+            "friends_only": friends_only,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_a_flagged_live_download_restricts_its_hash() {
+        let restricted = hex::encode([0x5A; 16]);
+        let public = hex::encode([0x5B; 16]);
+        let mut mgr = TransferManager::new(4);
+        mgr.enqueue(download("a", &restricted, true));
+        mgr.enqueue(download("b", &public, false));
+        assert!(download_restricted_by_friend(&mgr, &restricted));
+        assert!(download_restricted_by_friend(&mgr, &restricted.to_ascii_uppercase()));
+        assert!(!download_restricted_by_friend(&mgr, &public));
+        assert!(!download_restricted_by_friend(&mgr, &hex::encode([0x5C; 16])));
+    }
+}
+
 /// Shared buddy info for including in Hello tags (updated by network task)
 pub type SharedBuddyInfo = Arc<RwLock<Option<BuddyInfo>>>;
 
@@ -825,6 +1024,16 @@ pub struct KadCallbackParts {
     /// for the same file was the friend connect-back it was waiting on (a
     /// genuine server/KAD LowID callback can arrive for the same download).
     pub friend_ember_hash: Option<[u8; 16]>,
+    /// The network that found this peer, when the route that brought the
+    /// connection knows it: the pending KAD or Ember callback it answered, or a
+    /// friend connect-back. `None` for server-LowID callbacks and push-grants,
+    /// whose peers already have a source row that records it.
+    ///
+    /// Carried because a buddy-callback peer has no such row. It is known only
+    /// by the pending callback and a drawer placeholder, which is removed as
+    /// the connection is adopted, so without this the live row had nothing to
+    /// inherit a label from and showed a dash.
+    pub origin: Option<crate::types::SourceOrigin>,
 }
 
 /// Path B (eMule queued-source model) inbound reconnect index.
@@ -924,6 +1133,9 @@ pub struct PendingKadCallbackEntry {
     /// `TAG_SOURCEPORT` from the KAD publish (used for disambiguation).
     pub expected_tcp_port: u16,
     pub registered_at: i64,
+    /// Which network's answer this callback was requested for, handed on to
+    /// the adopted connection as [`KadCallbackParts::origin`].
+    pub origin: Option<crate::types::SourceOrigin>,
 }
 
 /// Pending inbound KAD callbacks. Type 3/5 sources are keyed by user hash;
@@ -1041,7 +1253,8 @@ const UPLOAD_SLOW_WRITE_THRESHOLD: std::time::Duration = std::time::Duration::fr
 
 /// Max concurrent outbound HighID push-grant dials (AddUpNextClient).
 const MAX_PUSH_GRANT_DIALS: usize = 3;
-/// Backoff after a failed HighID push dial before retrying the same peer.
+/// Backoff after a HighID push dial that did not end in a grant before
+/// retrying the same peer.
 const PUSH_GRANT_BACKOFF_SECS: u64 = 30;
 
 /// Maximum concurrent TCP connections from a single IP address
@@ -1090,6 +1303,43 @@ pub(crate) const MAX_UPLOAD_QUEUE_SIZE: usize = 5000;
 /// Below that it says nothing at all, because silence is what times the peer's
 /// UDP ask out and sends it back to TCP where it can re-enter the queue.
 pub(crate) const QUEUE_FULL_HEADROOM: usize = 50;
+
+/// What the once-a-minute "Upload queue" log line reports, so a queue that
+/// stays small can be explained from an ordinary log: the peer-level lines
+/// behind these counts are debug-only.
+static QUEUE_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static QUEUE_REFUSED_AT_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QUEUE_DROPPED_UNSHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QUEUE_REASK_NOT_FOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Upload queue figures since the last call. `waiting` is a gauge taken by
+/// the 30-second queue maintenance; the rest are counts, reset as they are read.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct QueueHealth {
+    pub waiting: usize,
+    /// Inbound connections turned away because the shared connection budget
+    /// (`max_connections`) was full.
+    pub refused_at_limit: u64,
+    /// Waiters removed because the file they wanted is not in the shared index.
+    pub dropped_unshared: u64,
+    /// UDP re-asks answered "file not found", which makes the asker give up.
+    pub reask_not_found: u64,
+}
+
+pub fn take_queue_health() -> QueueHealth {
+    use std::sync::atomic::Ordering;
+    QueueHealth {
+        waiting: QUEUE_WAITING.load(Ordering::Relaxed),
+        refused_at_limit: QUEUE_REFUSED_AT_LIMIT.swap(0, Ordering::Relaxed),
+        dropped_unshared: QUEUE_DROPPED_UNSHARED.swap(0, Ordering::Relaxed),
+        reask_not_found: QUEUE_REASK_NOT_FOUND.swap(0, Ordering::Relaxed),
+    }
+}
+
+pub(crate) fn note_reask_file_not_found() {
+    QUEUE_REASK_NOT_FOUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// eMule SESSIONMAXTRANS: max bytes uploaded per session before rotating slots (opcodes.h:97).
 const SESSIONMAXTRANS: u64 = PARTSIZE + 20 * 1024;
 /// eMule SESSIONMAXTIME: max duration of a single upload session (1 hour).
@@ -1428,6 +1678,72 @@ fn keep_queue_row_after_slot_grant(
         || entry
             .current_addr
             .is_some_and(|bound| bound.ip() != grant_ip)
+}
+
+/// Drop every row of a banned user hash that no other live client holds.
+/// The ban is on the hash itself, so a peer replaying someone's hash cannot
+/// use this to evict anyone who is not banned already.
+fn remove_banned_hash_queue_rows(
+    queue: &mut Vec<QueueEntry>,
+    user_hash: [u8; 16],
+    peer_addr: SocketAddr,
+    session_tcp_port: u16,
+) {
+    let identity = QueueIdentity::UserHash(user_hash);
+    queue.retain(|e| {
+        e.identity != identity
+            || !queue_row_owned_by_session(e.current_addr, e.tcp_port, peer_addr, session_tcp_port)
+    });
+}
+
+/// Drop the waiting-list row of a peer the session refused outright for what
+/// it is (AntiLeech) or where it connects from (IP ban). Keeping it would
+/// leave the peer holding rank, and a HighID row would be redialled by
+/// `try_add_up_next_client` only to be refused again.
+///
+/// The refusal is about this session, but the row is keyed on the cleartext
+/// `OP_HELLO` user hash. An unbound row therefore goes only when this session
+/// could also have inherited its seniority ([`session_may_inherit_seniority`]):
+/// otherwise a replayed hash plus a leech mod string would evict the real
+/// waiter. Rows bound to a different client are left alone as well.
+fn remove_refused_queue_row(
+    queue: &mut Vec<QueueEntry>,
+    identity: &QueueIdentity,
+    peer_addr: SocketAddr,
+    session_tcp_port: u16,
+    session_ember_pubkey: Option<[u8; 32]>,
+    session_ember_verified: bool,
+) {
+    queue.retain(|e| {
+        if e.identity != *identity {
+            return true;
+        }
+        let owned = if e.current_addr.is_some() {
+            queue_row_owned_by_session(e.current_addr, e.tcp_port, peer_addr, session_tcp_port)
+        } else {
+            session_may_inherit_seniority(e, peer_addr, session_ember_pubkey, session_ember_verified)
+        };
+        !owned
+    });
+}
+
+/// Whether a disconnected waiter may be dialed for a HighID push-grant now.
+fn push_grant_dialable(
+    e: &QueueEntry,
+    in_flight: &HashSet<QueueIdentity>,
+    backoff: &HashMap<QueueIdentity, std::time::Instant>,
+    is_banned: impl Fn(&[u8; 16], &SocketAddr) -> bool,
+) -> bool {
+    let Some(ip) = e.last_ip else {
+        return false;
+    };
+    e.current_addr.is_none()
+        && e.is_high_id
+        && e.tcp_port != 0
+        && e.file_hash != [0u8; 16]
+        && !in_flight.contains(&e.identity)
+        && !backoff.contains_key(&e.identity)
+        && !is_banned(&e.user_hash, &SocketAddr::new(ip, e.tcp_port))
 }
 
 /// Shared handle to the upload queue so non-upload subsystems (e.g. the UDP
@@ -1781,7 +2097,7 @@ fn queue_entry_from_hello(
         join_time,
         last_request: std::time::Instant::now(),
         add_next_connect: false,
-        emule_version: hello_caps.emule_version_min,
+        emule_version: hello_caps.emule_version_byte,
         is_friend_slot,
         ember_pubkey: hello_caps.ember_pubkey,
         ember_verified,
@@ -1980,6 +2296,17 @@ pub enum UploadEventKind {
         inc_requests: u32,
         inc_accepted: u32,
     },
+    /// An ed2k client asked for our shared-file list ("View Files"), either
+    /// flat or as the directory list stock eMule sends. `allowed` is whether
+    /// we answered it or sent the denial (`allow_shared_files_browse`). Sent
+    /// once per list request, not per folder the peer then opens.
+    SharesBrowsed {
+        peer_addr: std::net::SocketAddr,
+        /// The nickname the client announced in its hello; may be empty.
+        peer_name: String,
+        client_software: String,
+        allowed: bool,
+    },
     /// Sources discovered via Ember Peer Exchange from an incoming Ember peer.
     EmberSources {
         entries: Vec<([u8; 16], Vec<(std::net::Ipv4Addr, u16, u16, u8)>)>,
@@ -2020,6 +2347,12 @@ pub enum UploadEventKind {
     EmberFriendRetract {
         ember_hash: [u8; 16],
     },
+    /// The peer is refusing a friend request we sent them. Only ever clears a
+    /// one-sided `friends` row we have not had accepted — never a friendship —
+    /// so an accept that beat it to the punch makes this a no-op.
+    EmberFriendDecline {
+        ember_hash: [u8; 16],
+    },
     /// An Ember friend was seen on an incoming connection (EmuleInfo exchange completed).
     FriendSeen {
         ember_hash: [u8; 16],
@@ -2054,6 +2387,20 @@ pub enum UploadEventKind {
         ember_hash: [u8; 16],
         session_id: u64,
         entries: Vec<(String, u64, String, Option<String>, Option<String>)>,
+    },
+    /// A friend's `EMBER_EXT_BROWSE_SCOPE`: the friends-only hashes of the
+    /// browse answer that follows on `session_id`. `body` is still encoded.
+    EmberBrowseScope {
+        ember_hash: [u8; 16],
+        session_id: u64,
+        body: Vec<u8>,
+    },
+    /// A friend's `EMBER_EXT_BROWSE_SUMMARY` for the browse answer that
+    /// follows on `session_id`. `body` is still encoded.
+    EmberBrowseSummary {
+        ember_hash: [u8; 16],
+        session_id: u64,
+        body: Vec<u8>,
     },
     /// An on-demand browse dial established a new friend session. The network
     /// loop binds the opaque session ID to the queued request before sending
@@ -2131,6 +2478,36 @@ pub enum UploadEventKind {
         offer: super::messages::EmberFileOffer,
         /// The friend session this arrived on, for the offer ack.
         reply_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    },
+    /// A friend is offering us a file in chat (`EMBER_EXT_ATTACH_OFFER`).
+    ///
+    /// Signalling only. Whether to take it is the network loop's decision —
+    /// under the user's auto-accept ceiling it is fetched without asking, above
+    /// it the user is asked — and the bytes come over QUIC, never this session.
+    EmberAttachOffer {
+        ember_hash: [u8; 16],
+        offer: crate::network::ember::attach::AttachOffer,
+        /// Where the friend session is connected. The recipient dials the
+        /// sender's QUIC endpoint at this IP and the port the offer named, so a
+        /// friend can steer the dial's port but not which host it goes to.
+        /// `None` for a relayed session, which has no direct address to dial.
+        peer_addr: Option<std::net::SocketAddr>,
+    },
+    /// A friend answered an attachment we offered them.
+    EmberAttachReply {
+        ember_hash: [u8; 16],
+        xfer_id: [u8; 16],
+        reply: crate::network::ember::attach::AttachReply,
+        /// The recipient's public QUIC port, on an accept that sent one. With
+        /// `peer_addr` it is what the sender punches toward.
+        quic_port: Option<u16>,
+        peer_addr: Option<std::net::SocketAddr>,
+    },
+    /// A friend gave up on an attachment in either direction.
+    EmberAttachCancel {
+        ember_hash: [u8; 16],
+        xfer_id: [u8; 16],
+        reason: crate::network::ember::attach::AttachCancel,
     },
     /// A friend answered a file offer we sent them.
     EmberFileOfferAck {
@@ -2238,12 +2615,6 @@ struct UploadHandler {
     advertise_udp_port: Arc<std::sync::atomic::AtomicU16>,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
     max_concurrent_uploads: Arc<std::sync::atomic::AtomicUsize>,
-    /// `AppSettings::max_connections_per_five_secs`, live-updated. See
-    /// [`UploadHandler::accept_budget_allows`].
-    max_conn_per_five: Arc<std::sync::atomic::AtomicUsize>,
-    /// Rolling accept-rate window: when it started, and how many connections
-    /// have been accepted inside it.
-    accept_window: parking_lot::Mutex<(std::time::Instant, usize)>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     upload_queue: Arc<tokio::sync::Mutex<Vec<QueueEntry>>>,
     ip_connection_counts:
@@ -2359,7 +2730,7 @@ struct UploadHandler {
     slot_holders: Arc<parking_lot::Mutex<HashSet<QueueIdentity>>>,
     /// Identities currently being dialed for HighID AddUpNextClient push-grants.
     push_grant_in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<QueueIdentity>>>,
-    /// Per-identity backoff after a failed HighID push dial.
+    /// Per-identity backoff after a HighID push dial that did not grant.
     push_grant_backoff: Arc<tokio::sync::Mutex<HashMap<QueueIdentity, std::time::Instant>>>,
     /// Count of concurrent outbound HighID push-grant dials.
     push_grant_dials: Arc<std::sync::atomic::AtomicUsize>,
@@ -2381,6 +2752,9 @@ struct UploadHandler {
     sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
     /// Ember Peer Exchange (`OP_EMBER_SOURCEEXCHANGE`) wire bytes.
     epx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
+    /// Grants for chat attachments and room transfers, for a secure stream
+    /// that asks for one instead of opening an eD2K session.
+    file_stream_serve: Option<crate::network::ember::relay::FileStreamServe>,
 }
 
 const MAX_AICH_CACHE_ENTRIES: usize = 50;
@@ -2389,6 +2763,124 @@ const MAX_PART_HASH_CACHE_ENTRIES: usize = 50;
 /// Minimum spacing between full shared-file listings served to one connection.
 /// A human clicking "View Files" asks once; anything faster is a loop.
 const MIN_BROWSE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Directory listings one connection may be served before the stream is treated
+/// as a loop.
+///
+/// `OP_ASKSHAREDFILESDIR` is deliberately not charged to `MIN_BROWSE_INTERVAL`:
+/// one browse legitimately sends one of these per shared directory, back to
+/// back, so spacing them a minute apart would break the feature. That left it
+/// with no bound at all, and it is an independent match arm — a peer can send it
+/// in a tight loop having never sent the `OP_ASKSHAREDDIRS` that supposedly
+/// throttles it. Each answer walks the index under its read lock (the same lock
+/// every scoring and admission path takes) and spends real upload tokens from the
+/// shared bucket that feeds part sends. A per-session ceiling keeps the honest
+/// burst free while stopping the loop. The directory list itself is capped at
+/// the same figure (see [`DirBrowseListing::build`]) and the count restarts
+/// with each answered `OP_ASKSHAREDDIRS`, so an honest browse never reaches it.
+const MAX_DIR_BROWSE_ANSWERS_PER_SESSION: u32 = 256;
+
+/// `(hash_hex, name, size, extension)`, the shape [`encode_shared_files_answer`] takes.
+type BrowseEntry = (String, String, u64, String);
+
+/// One directory browse: the list a peer was sent and the files behind each
+/// entry, grouped once when the list is built.
+///
+/// eMule follows `OP_ASKSHAREDDIRSANS` with one `OP_ASKSHAREDFILESDIR` per
+/// entry, back to back. Regrouping the index for each of those made a browse
+/// cost folders × files under the index read lock; kept for the burst, each
+/// answer is a lookup.
+///
+/// Keyed by the label exactly as this peer was sent it. A peer without
+/// Unicode support was sent the folded form and echoes it back, so it matches
+/// directly; a Unicode peer's exact request cannot land on a different folder
+/// whose name merely folds onto the same ASCII.
+struct DirBrowseListing {
+    /// In the order they were advertised.
+    labels: Vec<String>,
+    groups: HashMap<String, Vec<BrowseEntry>>,
+    built: std::time::Instant,
+}
+
+impl DirBrowseListing {
+    /// How long a listing answers requests before it is rebuilt from the live
+    /// index. It only has to outlast the burst that follows the list; bounded
+    /// so a folder unshared since stops being browsable on a long-lived
+    /// connection.
+    const TTL: std::time::Duration = MIN_BROWSE_INTERVAL;
+
+    /// Groups `files` by the label this peer will see, advertising at most
+    /// `max_dirs` directories.
+    ///
+    /// eMule asks for every entry it is sent, so a list longer than
+    /// [`MAX_DIR_BROWSE_ANSWERS_PER_SESSION`] would turn an honest browse into
+    /// the loop that allowance exists to catch. Folders past the cap are merged
+    /// into [`super::messages::OP_OTHER_SHARED_FILES`] rather than dropped, so
+    /// their files stay reachable.
+    fn build(
+        files: Vec<(String, BrowseEntry)>,
+        peer_supports_unicode: bool,
+        max_dirs: usize,
+    ) -> Self {
+        let mut labels: Vec<String> = Vec::new();
+        let mut groups: HashMap<String, Vec<BrowseEntry>> = HashMap::new();
+        for (folder, entry) in files {
+            let label = UploadHandler::browse_label_for_peer(
+                &UploadHandler::browse_dir_label(&folder),
+                peer_supports_unicode,
+            );
+            match groups.entry(label) {
+                std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(entry),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    labels.push(e.key().clone());
+                    e.insert(vec![entry]);
+                }
+            }
+        }
+        if labels.len() > max_dirs {
+            let other = super::messages::OP_OTHER_SHARED_FILES.to_string();
+            let mut overflow = Vec::new();
+            for label in labels.drain(max_dirs.saturating_sub(1)..) {
+                if let Some(mut entries) = groups.remove(&label) {
+                    overflow.append(&mut entries);
+                }
+            }
+            if !groups.contains_key(&other) {
+                labels.push(other.clone());
+            }
+            groups.entry(other).or_default().extend(overflow);
+        }
+        Self {
+            labels,
+            groups,
+            built: std::time::Instant::now(),
+        }
+    }
+
+    fn is_fresh(&self) -> bool {
+        self.built.elapsed() < Self::TTL
+    }
+
+    /// `OP_ASKSHAREDDIRSANS`: `<count 4>(<string>)[count]`.
+    ///
+    /// Only directories that actually have something browsable in them.
+    /// eMule sends every shared directory including empty ones and says so in
+    /// a TODO; there is no reason to copy a listing entry that resolves to
+    /// nothing.
+    fn encode_dirs(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(4 + self.labels.len() * 24);
+        buf.extend_from_slice(&(self.labels.len() as u32).to_le_bytes());
+        for label in &self.labels {
+            super::messages::write_ed2k_string(&mut buf, label);
+        }
+        buf
+    }
+
+    /// The files behind one advertised label; empty for a name we never sent.
+    fn files_in(&self, requested: &str) -> &[BrowseEntry] {
+        self.groups.get(requested).map_or(&[], Vec::as_slice)
+    }
+}
 
 /// Uncached whole-file hash computations one connection may trigger per window.
 const MAX_UNCACHED_HASH_JOBS: u32 = 4;
@@ -2785,7 +3277,14 @@ struct AbuseTracker {
 struct AbuseEntry {
     request_count: u32,
     window_start: std::time::Instant,
-    file_not_found_count: u32,
+    /// Distinct hashes this address asked for that we would not serve, in the
+    /// current window. Distinct rather than a count because the honest way to
+    /// produce a miss is to keep reasking one file we stopped sharing (or
+    /// several clients behind one CGNAT address doing so); a hash prober
+    /// needs many different hashes. Every unservable hash counts the same —
+    /// unknown, unshared or friends-only — so the ban cannot become an oracle
+    /// for which hashes we hold privately.
+    fnf_hashes: Vec<[u8; 16]>,
     /// Independent window for hash-probe (file-not-found) counting so
     /// occasional missing-file asks over hours do not accumulate forever
     /// while `record_request` keeps `window_start` fresh.
@@ -2885,7 +3384,7 @@ impl AbuseTracker {
         let entry = self.entries.entry(ip).or_insert_with(|| AbuseEntry {
             request_count: 0,
             window_start: now,
-            file_not_found_count: 0,
+            fnf_hashes: Vec::new(),
             fnf_window_start: now,
             banned_until: None,
         });
@@ -2915,15 +3414,16 @@ impl AbuseTracker {
         false
     }
 
-    /// Record a "file not found" response to this IP. Returns true if should ban.
-    fn record_file_not_found(&mut self, ip: std::net::IpAddr) -> bool {
+    /// Record a "file not found" response for `file_hash` to this IP. Returns
+    /// true if should ban.
+    fn record_file_not_found(&mut self, ip: std::net::IpAddr, file_hash: [u8; 16]) -> bool {
         let ip = Self::normalize_ip(&ip);
         let now = std::time::Instant::now();
         self.maybe_cleanup(now);
         let entry = self.entries.entry(ip).or_insert_with(|| AbuseEntry {
             request_count: 0,
             window_start: now,
-            file_not_found_count: 0,
+            fnf_hashes: Vec::new(),
             fnf_window_start: now,
             banned_until: None,
         });
@@ -2935,17 +3435,20 @@ impl AbuseTracker {
         // Window FNF the same way as request-rate so rare missing-file
         // asks over a long session cannot trip the probe ban.
         if now.duration_since(entry.fnf_window_start).as_secs() > ABUSE_WINDOW_SECS {
-            entry.file_not_found_count = 0;
+            entry.fnf_hashes.clear();
             entry.fnf_window_start = now;
         }
 
-        entry.file_not_found_count += 1;
+        if entry.fnf_hashes.contains(&file_hash) {
+            return false;
+        }
+        entry.fnf_hashes.push(file_hash);
 
-        if entry.file_not_found_count > MAX_FILE_NOT_FOUND {
+        if entry.fnf_hashes.len() > MAX_FILE_NOT_FOUND as usize {
             entry.banned_until = Some(now + std::time::Duration::from_secs(BAN_DURATION_SECS));
             tracing::warn!(
-                "Auto-banned {ip}: {} file-not-found requests (hash probing)",
-                entry.file_not_found_count
+                "Auto-banned {ip}: {} distinct unservable file requests (hash probing)",
+                entry.fnf_hashes.len()
             );
             return true;
         }
@@ -3264,6 +3767,7 @@ fn encode_shared_files_answer(
     files: &[(String, String, u64, String)],
     client_id: u32,
     tcp_port: u16,
+    peer_supports_large_files: bool,
 ) -> Vec<u8> {
     // Independent of the caller's `MAX_BROWSE_ANSWER_FILES` entry-count cap
     // (which alone still allows a multi-MB payload for a large library),
@@ -3289,6 +3793,17 @@ fn encode_shared_files_answer(
     for (hash_hex, name, size, extension) in files {
         if entries.len() >= MAX_ANSWER_BYTES {
             break;
+        }
+        // eMule omits a large file from the listing entirely for a peer that
+        // cannot represent one — `(!pFile->IsLargeFile() || client->
+        // SupportsLargeFiles())` (`ListenSocket.cpp:723`). Listing it anyway
+        // would hand that peer `FT_FILESIZE` alone, and the low 32 bits of a
+        // >4 GiB size read as a plausible small file: it would show a wrong
+        // size and request ranges that do not exist. Omitting is the only
+        // honest answer, since the tag that carries the rest is one the peer
+        // has told us it does not understand.
+        if !peer_supports_large_files && *size > OLD_MAX_EMULE_FILE_SIZE {
+            continue;
         }
         let hash_bytes = match hex::decode(hash_hex) {
             Ok(b) if b.len() >= 16 => b,
@@ -3327,13 +3842,60 @@ fn encode_shared_files_answer(
     payload
 }
 
-/// Compute the rank of a queued peer reached over UDP (OP_REASKFILEPING).
+/// Whether `entry` is a waiter at `ip`, connected or not.
 ///
-/// Matches on either a known `user_hash` or the UDP source IP — we don't
-/// have the user hash from UDP alone, so IP+file is the normal fallback.
-/// If multiple candidate entries match (e.g., two peers NATted behind the
-/// same address) we pick the earliest join time so the rank we report is
-/// stable and non-inflationary.
+/// `last_ip` is what makes a disconnected waiter findable: every queued socket
+/// is released after [`QUEUED_SOCKET_IDLE_SECS`], which clears `current_addr`,
+/// and a waiter identified by user hash has nothing else that names an address.
+fn queue_entry_is_at_ip(entry: &QueueEntry, ip: IpAddr) -> bool {
+    let canonical = |ip: IpAddr| match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    let ip = canonical(ip);
+    matches!(&entry.identity, QueueIdentity::Ip(own) if canonical(*own) == ip)
+        || entry.current_addr.is_some_and(|a| canonical(a.ip()) == ip)
+        || entry.last_ip.is_some_and(|last| canonical(last) == ip)
+}
+
+/// The waiting-list row a UDP `OP_REASKFILEPING` from `from_ip:from_udp_port`
+/// about `file_hash` belongs to.
+///
+/// eMule's `CUploadQueue::GetWaitingClientByIP_UDP(ip, port, true)`: an exact
+/// address-and-port match wins, and a port that differs is ignored when only
+/// one waiter is at that address, since a NAT may have remapped it. Several
+/// waiters behind one address need the port to tell them apart, and a
+/// datagram whose address matches no waiter matches nothing — the UDP port
+/// alone is not an identity, and eMule's default one is shared by thousands of
+/// clients. Among exact matches the earliest join wins, so the rank reported
+/// is stable when several peers share an address and port.
+fn find_udp_reasker(
+    queue: &[QueueEntry],
+    from_ip: IpAddr,
+    from_udp_port: u16,
+    file_hash: &[u8; 16],
+) -> Option<usize> {
+    let mut exact: Option<usize> = None;
+    let mut only_at_ip: Option<usize> = None;
+    let mut at_ip = 0usize;
+    for (i, entry) in queue.iter().enumerate() {
+        if entry.file_hash != *file_hash || !queue_entry_is_at_ip(entry, from_ip) {
+            continue;
+        }
+        at_ip += 1;
+        only_at_ip = Some(i);
+        if entry.udp_port != 0
+            && entry.udp_port == from_udp_port
+            && exact.is_none_or(|best| entry.join_time < queue[best].join_time)
+        {
+            exact = Some(i);
+        }
+    }
+    exact.or(if at_ip == 1 { only_at_ip } else { None })
+}
+
+/// Compute the rank of a queued peer reached over UDP (OP_REASKFILEPING),
+/// matched by [`find_udp_reasker`], and refresh its purge clock.
 ///
 /// Returns `Some(rank)` where rank is 1-based (matching TCP `OP_QUEUERANKING`
 /// semantics) or `None` if no matching entry exists (caller should treat as
@@ -3361,52 +3923,13 @@ pub(crate) async fn udp_queue_rank_for_peer(
     let idx = local_index.read().await;
     let mut queue = upload_queue.lock().await;
 
-    // A UDP re-ask is the peer holding its place, so it has to refresh the
-    // purge clock exactly as the TCP path does — eMule stamps
-    // `SetLastUpRequest` here too (`ClientUDPSocket.cpp:255`). Folded into the
-    // match scan rather than run as a second pass, but note the two conditions
-    // differ: the refresh is deliberately not gated on the UDP port.
-    let now = std::time::Instant::now();
-    let mut best: Option<usize> = None;
-    let mut best_join: Option<std::time::Instant> = None;
-    for i in 0..queue.len() {
-        let entry = &mut queue[i];
-        if entry.file_hash != *file_hash {
-            continue;
-        }
-        let ip_matches = matches!(&entry.identity, QueueIdentity::Ip(ip) if *ip == from_ip)
-            || entry
-                .current_addr
-                .map(|a| a.ip() == from_ip)
-                .unwrap_or(false);
-        if ip_matches {
-            entry.last_request = now;
-        }
-        if entry.udp_port != 0 && entry.udp_port != from_udp_port {
-            continue;
-        }
-        let matches = ip_matches
-            // Port-only fallback for entries with no known address yet.
-            // Requires a real (non-zero) stored UDP port so multiple
-            // queued peers that both still have `udp_port == 0` can't
-            // spuriously match each other via `0 == 0`, and so this
-            // branch never substitutes for the IP checks above by
-            // coincidence when the port happens to still be unset.
-            || (entry.current_addr.is_none()
-                && entry.udp_port != 0
-                && entry.udp_port == from_udp_port);
-        if matches {
-            // Earliest join wins, so the reported rank is stable and
-            // non-inflationary when several peers NAT to one address.
-            let join = entry.join_time;
-            if best_join.is_none_or(|bj| join < bj) {
-                best = Some(i);
-                best_join = Some(join);
-            }
-        }
-    }
+    // A UDP re-ask is the peer holding its place, so it refreshes the purge
+    // clock exactly as the TCP path does — eMule stamps `SetLastUpRequest` on
+    // the matched sender here too (`ClientUDPSocket.cpp:255`).
+    let best = find_udp_reasker(&queue, from_ip, from_udp_port, file_hash)?;
+    queue[best].last_request = std::time::Instant::now();
 
-    let target = &queue[best?];
+    let target = &queue[best];
     let my_score = score_queue_entry(
         &cm,
         &idx,
@@ -3444,7 +3967,6 @@ pub async fn start_upload_server(
     bandwidth_limiter: Arc<BandwidthLimiter>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     max_concurrent_uploads: Arc<std::sync::atomic::AtomicUsize>,
-    max_conn_per_five: Arc<std::sync::atomic::AtomicUsize>,
     source_manager: Arc<RwLock<SourceManager>>,
     comment_manager: Arc<RwLock<CommentManager>>,
     credit_manager: Arc<RwLock<CreditManager>>,
@@ -3512,6 +4034,9 @@ pub async fn start_upload_server(
     // they're served here rather than through `kad_callback_tx`. Drained in
     // the same accept `select!`.
     mut inbound_stream_rx: tokio::sync::mpsc::Receiver<InboundStreamRequest>,
+    // Chat attachments and room transfers, served here to a peer that could
+    // not reach our QUIC port. See `crate::network::ember::attach_tcp`.
+    file_stream_serve: Option<crate::network::ember::relay::FileStreamServe>,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     // SO_REUSEADDR so the NATMAP-style TCP mapping hold can bind the same
@@ -3558,8 +4083,6 @@ pub async fn start_upload_server(
         advertise_udp_port,
         active_count,
         max_concurrent_uploads,
-        max_conn_per_five,
-        accept_window: parking_lot::Mutex::new((std::time::Instant::now(), 0)),
         upload_event_tx,
         upload_queue,
         ip_connection_counts: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -3611,6 +4134,7 @@ pub async fn start_upload_server(
         halted_for_shutdown,
         sx_overhead,
         epx_overhead,
+        file_stream_serve,
     });
 
     let mut slot_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -3624,6 +4148,8 @@ pub async fn start_upload_server(
     let mut connect_serve_closed = false;
     // Same latch pattern for the punch/relay inbound-stream channel below.
     let mut inbound_stream_closed = false;
+    let mut download_handover_rx = super::peer_sessions::accept_download_handovers();
+    let mut download_handover_closed = false;
 
     loop {
         tokio::select! {
@@ -3767,21 +4293,6 @@ pub async fn start_upload_server(
                             continue;
                         }
 
-                        // Accept-rate gate, ahead of the capacity check because
-                        // it is about how fast we open sockets rather than how
-                        // many we hold. The configured server is exempt: its
-                        // HighID port-test must never lose to a burst from
-                        // ordinary peers, which is the same carve-out eMule
-                        // makes for `serverconnect->IsConnecting()`
-                        // (`ListenSocket.cpp:2013`).
-                        if !is_server_port_test_ip && !server.accept_budget_allows() {
-                            debug!(
-                                "Rejecting connection from {peer_addr}: accept rate budget spent for this window"
-                            );
-                            drop(stream);
-                            continue;
-                        }
-
                         // Take one unit of the machine-wide budget, which the
                         // download side draws on too. The port-test headroom
                         // is the one thing allowed above the configured
@@ -3794,6 +4305,7 @@ pub async fn start_upload_server(
                         let Some(conn_permit) =
                             super::multi_source::try_acquire_listener_conn(headroom)
                         else {
+                            QUEUE_REFUSED_AT_LIMIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             debug!("Rejecting connection from {peer_addr}: global connection limit reached");
                             drop(stream);
                             continue;
@@ -3823,6 +4335,11 @@ pub async fn start_upload_server(
                             server.ip_connection_counts.clone(),
                             peer_addr.ip(),
                         );
+                        // Counted toward "New Connections / 5s" but never
+                        // refused by it: the peer has already crossed the
+                        // router, so turning it away protects nothing. See
+                        // `multi_source::NEW_CONNS_PER_FIVE`.
+                        super::multi_source::note_inbound_connection();
                         let _ = stream.set_nodelay(true);
                         // Cap the kernel TCP send buffer so our sender-side
                         // `uploaded` counter (which advances when bytes are
@@ -4110,7 +4627,12 @@ pub async fn start_upload_server(
                         .catch_unwind()
                         .await,
                         None => std::panic::AssertUnwindSafe(
-                            server.handle_inbound_stream(peer_addr, req.reader, req.writer),
+                            server.handle_inbound_stream(
+                                peer_addr,
+                                req.reader,
+                                req.writer,
+                                req.relayed,
+                            ),
                         )
                         .catch_unwind()
                         .await,
@@ -4133,11 +4655,142 @@ pub async fn start_upload_server(
                     }
                 });
             }
+            // A download connection whose peer asked us for files on it. The
+            // download side is done with the socket; serve those requests
+            // instead of letting it close under a peer still waiting.
+            maybe_handover = download_handover_rx.recv(), if !download_handover_closed => {
+                let Some(handover) = maybe_handover else {
+                    download_handover_closed = true;
+                    continue;
+                };
+                if server.halted_for_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                let peer_addr = handover.peer_addr;
+                let peer_ip = peer_addr.ip();
+                let banned = match (peer_ip, server.banned_ips.read()) {
+                    (std::net::IpAddr::V4(v4), Ok(banned)) => banned.contains(&v4),
+                    (_, Err(_poisoned)) => true,
+                    _ => false,
+                };
+                if banned || server.abuse_tracker.lock().await.is_banned(&peer_ip) {
+                    debug!("Not serving handed-over connection to banned {peer_addr}");
+                    continue;
+                }
+                // One slot of headroom: the download side gives its own back
+                // only after handing this over.
+                let Some(conn_permit) = super::multi_source::try_acquire_listener_conn(1) else {
+                    debug!(
+                        "Dropping handed-over connection to {peer_addr}: global connection limit reached"
+                    );
+                    continue;
+                };
+                {
+                    let mut counts = server.ip_connection_counts.lock();
+                    let count = counts.entry(peer_ip).or_insert(0);
+                    if *count >= MAX_CONNECTIONS_PER_IP {
+                        debug!(
+                            "Dropping handed-over connection to {peer_addr}: per-IP limit reached"
+                        );
+                        drop(counts);
+                        drop(conn_permit);
+                        continue;
+                    }
+                    *count += 1;
+                }
+                let admission_guard = ConnectionAdmissionGuard::new(
+                    conn_permit,
+                    server.ip_connection_counts.clone(),
+                    peer_ip,
+                );
+                let server = server.clone();
+                tokio::spawn(async move {
+                    let _admission_guard = admission_guard;
+                    let result = std::panic::AssertUnwindSafe(server.serve_handed_over(handover))
+                        .catch_unwind()
+                        .await;
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => debug!("Handed-over session with {peer_addr} ended: {e}"),
+                        Err(_panic) => {
+                            error!("Handed-over session handler panicked for {peer_addr}");
+                        }
+                    }
+                });
+            }
         }
     }
 }
 
 impl UploadHandler {
+    /// A secure stream that asked for a chat attachment or a room transfer
+    /// instead of an eD2K session: the fallback for a recipient that could not
+    /// reach our QUIC port. `first` is the stream type it opened with.
+    ///
+    /// Never over a relay. A relay operator forwards sessions as a favour to
+    /// friends, and a file would turn that into carrying gigabytes for them.
+    async fn serve_file_stream(
+        &self,
+        first: u8,
+        mut reader: Box<dyn AsyncRead + Unpin + Send>,
+        mut writer: Box<dyn AsyncWrite + Unpin + Send>,
+        peer: super::secure_stream::SecurePeerIdentity,
+        relayed: bool,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        use crate::network::ember::{attach, attach_tcp, relay};
+        if relayed {
+            debug!("Refusing a file stream over a relayed session");
+            return Ok(());
+        }
+        let Some(serve) = self.file_stream_serve.clone() else {
+            return Ok(());
+        };
+        let mut header = [0u8; 7];
+        header[0] = first;
+        if !matches!(
+            tokio::time::timeout_at(deadline, reader.read_exact(&mut header[1..])).await,
+            Ok(Ok(_))
+        ) {
+            return Ok(());
+        }
+        if first == attach::ATTACH_STREAM_MSG_TYPE {
+            let Some((served, progress)) = relay::serve_chat_attachment_stream(
+                &serve.chat,
+                &self.friend_hashes,
+                peer.ember_hash,
+                peer.ed25519_public_key,
+                &mut reader,
+                &mut writer,
+                &header,
+                &self.bandwidth_limiter,
+            )
+            .await
+            else {
+                return Ok(());
+            };
+            let delivered =
+                served.is_ok() && attach_tcp::tcp_stream_delivered(&mut reader, &mut writer).await;
+            progress.finish(&serve.chat.db, &serve.chat.app_handle, delivered);
+        } else {
+            let served = relay::serve_room_transfer_stream(
+                &serve.room,
+                peer.ed25519_public_key,
+                &mut reader,
+                &mut writer,
+                &header,
+                &self.bandwidth_limiter,
+            )
+            .await;
+            // Completion reaches the event loop as the recipient's done frame;
+            // this only holds the connection until the last bytes are read.
+            if served.is_ok() {
+                let _ = attach_tcp::tcp_stream_delivered(&mut reader, &mut writer).await;
+            }
+        }
+        Ok(())
+    }
+
     fn advertised_tcp_port(&self) -> u16 {
         let p = self
             .advertise_tcp_port
@@ -4202,22 +4855,32 @@ impl UploadHandler {
         friends_only_from_sources(snapshot_hit, snapshot_ready, index_friends_only)
     }
 
-    /// True when `file_hash` is restricted to mutual friends and this peer is
-    /// not one — so queueing them could only ever end in a refusal.
-    ///
-    /// [`Self::resolve_upload_file`] is still the authority on whether bytes
-    /// go out; this exists purely so a peer who cannot be served does not sit
-    /// in the waiting list occupying a slot another peer could use.
-    async fn friends_only_and_barred(&self, file_hash: &[u8; 16], peer: PeerFileAccess) -> bool {
-        if !self.hash_is_friends_only(file_hash).await {
-            return false;
+    /// Our in-progress copy of `file_hash`, when there is one, came from a
+    /// friend who restricts it. Only the partial path may consult this: a
+    /// complete copy in the library carries the user's own scope.
+    async fn partial_restricted_by_friend(&self, file_hash: &[u8; 16]) -> bool {
+        let mgr = self.transfer_manager.read().await;
+        download_restricted_by_friend(&mgr, &hex::encode(file_hash))
+    }
+
+    /// Charge a file request we answered with `OP_FILEREQANSNOFIL` to the
+    /// hash-probe counter (see `AbuseTracker::record_file_not_found`).
+    /// Nothing is charged while the friends-only catalog is still loading:
+    /// every indexed file is refused to strangers alike until it lands, so
+    /// those misses say nothing about the asker.
+    async fn note_unservable_file_request(&self, peer_ip: std::net::IpAddr, file_hash: [u8; 16]) {
+        if !friends_only_snapshot_ready(&self.friends_only_hashes) {
+            return;
         }
-        !mutual_friend_access(
-            &self.mutual_friend_hashes,
-            peer.ember_hash,
-            peer.secure_v2_authenticated,
-        )
-        .await
+        let banned = self
+            .abuse_tracker
+            .lock()
+            .await
+            .record_file_not_found(peer_ip, file_hash);
+        if banned {
+            self.emit_auto_ban(peer_ip, "excessive file-not-found requests (hash probing)")
+                .await;
+        }
     }
 
     /// Resolve a requested hash to a servable file.
@@ -4313,7 +4976,7 @@ impl UploadHandler {
                 // join error.
                 let path_for_check = path.clone();
                 let allowed_for_open = allowed.clone();
-                let (verified_path, opened) = tokio::task::spawn_blocking(move || {
+                let opened = tokio::task::spawn_blocking(move || {
                     crate::security::filesystem::open_existing_approved(
                         &path_for_check,
                         &allowed_for_open,
@@ -4321,8 +4984,14 @@ impl UploadHandler {
                     )
                 })
                 .await
-                .ok()
-                .and_then(Result::ok)?;
+                .ok()?;
+                let (verified_path, opened) = match opened {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        note_upload_refusal(&path, &allowed, &error);
+                        return None;
+                    }
+                };
                 return Some(ResolvedUploadFile {
                     name: file.name,
                     path: verified_path,
@@ -4338,7 +5007,8 @@ impl UploadHandler {
         // Unshared index rows `break` into this `.part` branch, and hashes
         // that exist only in known.met never enter the index branch at all.
         // Either way, friends-only content must not leave for a stranger.
-        if self.hash_is_friends_only(file_hash).await
+        if (self.hash_is_friends_only(file_hash).await
+            || self.partial_restricted_by_friend(file_hash).await)
             && !mutual_friend_access(
                 &self.mutual_friend_hashes,
                 peer.ember_hash,
@@ -4433,18 +5103,33 @@ impl UploadHandler {
         if public_share {
             return true;
         }
-        let mgr = self.transfer_manager.read().await;
-        mgr.active
-            .values()
-            .chain(mgr.queue.iter())
-            .any(|t| {
-                t.direction == TransferDirection::Download
-                    && t.file_hash == hash_hex
-                    && !matches!(
-                        t.status,
-                        TransferStatus::Completed | TransferStatus::Failed
-                    )
-            })
+        let live_download = {
+            let mgr = self.transfer_manager.read().await;
+            mgr.active
+                .values()
+                .chain(mgr.queue.iter())
+                .find(|t| {
+                    t.direction == TransferDirection::Download
+                        && t.file_hash == hash_hex
+                        && !matches!(
+                            t.status,
+                            TransferStatus::Completed | TransferStatus::Failed
+                        )
+                })
+                .map(|t| t.friends_only)
+        };
+        match live_download {
+            Some(true) => {
+                mutual_friend_access(
+                    &self.mutual_friend_hashes,
+                    peer.ember_hash,
+                    peer.secure_v2_authenticated,
+                )
+                .await
+            }
+            Some(false) => true,
+            None => false,
+        }
     }
 
     /// Build the `OP_ASKSHAREDFILESANSWER` payload: `<count 4>(<HASH
@@ -4459,7 +5144,11 @@ impl UploadHandler {
     /// identity (not the server's magic compression IDs): this answer goes
     /// straight to the peer that already has our real address, so there's
     /// nothing to obscure.
-    async fn build_shared_files_answer(&self, client_id: u32) -> Vec<u8> {
+    async fn build_shared_files_answer(
+        &self,
+        client_id: u32,
+        peer_supports_large_files: bool,
+    ) -> Vec<u8> {
         // Real libraries rarely exceed a few hundred thousand files; this
         // bounds the worst case (huge or pathological index) so a single
         // browse request can't force us to build and hold an unbounded
@@ -4496,7 +5185,12 @@ impl UploadHandler {
                 .collect()
         };
 
-        encode_shared_files_answer(&files, client_id, self.advertised_tcp_port())
+        encode_shared_files_answer(
+            &files,
+            client_id,
+            self.advertised_tcp_port(),
+            peer_supports_large_files,
+        )
     }
 
     /// The browsable set, with the folder each file sits in.
@@ -4552,46 +5246,57 @@ impl UploadHandler {
             .unwrap_or_else(|| super::messages::OP_OTHER_SHARED_FILES.to_string())
     }
 
-    /// `OP_ASKSHAREDDIRSANS`: `<count 4>(<string>)[count]`.
-    async fn build_shared_dirs_answer(&self) -> Vec<u8> {
-        let mut labels: Vec<String> = Vec::new();
-        for (folder, _) in self.browsable_files_by_folder().await {
-            let label = Self::browse_dir_label(&folder);
-            if !labels.contains(&label) {
-                labels.push(label);
-            }
+    /// The directory label to send a peer that never claimed Unicode support.
+    ///
+    /// eMule picks the encoding per peer: `GetUnicodeSupport()` feeds
+    /// `CFileDataIO::WriteString`, which writes raw UTF-8 only for a Unicode
+    /// peer and the local ANSI codepage otherwise (`SafeFile.cpp:170-192`).
+    /// Ember writes UTF-8 unconditionally, and copying eMule properly would mean
+    /// picking a codepage for a peer whose locale we do not know — guess wrong
+    /// and the name is corrupted for a peer that would otherwise have read it.
+    ///
+    /// ASCII sidesteps the question entirely, because it is a subset of every
+    /// ANSI codepage: a folded label decodes to the same characters whatever the
+    /// peer assumes it is reading. So a non-ASCII folder name is degraded rather
+    /// than turned into mojibake, and only for a peer that told us it cannot
+    /// read anything else. eMule's own ANSI conversion substitutes for an
+    /// unmappable character in the same way.
+    fn browse_label_for_peer(label: &str, peer_supports_unicode: bool) -> String {
+        if peer_supports_unicode || label.is_ascii() {
+            return label.to_string();
         }
-        // Only directories that actually have something browsable in them.
-        // eMule sends every shared directory including empty ones and says so
-        // in a TODO; there is no reason to copy a listing entry that resolves
-        // to nothing.
-        let mut buf = Vec::with_capacity(4 + labels.len() * 24);
-        buf.extend_from_slice(&(labels.len() as u32).to_le_bytes());
-        for label in &labels {
-            super::messages::write_ed2k_string(&mut buf, label);
-        }
-        buf
+        label
+            .chars()
+            .map(|c| if c.is_ascii() { c } else { '_' })
+            .collect()
+    }
+
+    async fn build_dir_browse_listing(&self, peer_supports_unicode: bool) -> DirBrowseListing {
+        DirBrowseListing::build(
+            self.browsable_files_by_folder().await,
+            peer_supports_unicode,
+            MAX_DIR_BROWSE_ANSWERS_PER_SESSION as usize,
+        )
     }
 
     /// `OP_ASKSHAREDFILESDIRANS`: the requested directory echoed back, then the
     /// same body as the flat answer.
-    async fn build_shared_files_dir_answer(&self, requested: &str, client_id: u32) -> Vec<u8> {
-        let files: Vec<(String, String, u64, String)> = self
-            .browsable_files_by_folder()
-            .await
-            .into_iter()
-            .filter(|(folder, _)| Self::browse_dir_label(folder) == requested)
-            .map(|(_, entry)| entry)
-            .collect();
-
+    fn build_shared_files_dir_answer(
+        &self,
+        requested: &str,
+        files: &[BrowseEntry],
+        client_id: u32,
+        peer_supports_large_files: bool,
+    ) -> Vec<u8> {
         let mut buf = Vec::new();
         // Echoed verbatim, as eMule does with `strOrgReqDir` — the asker keys
         // its pending request on the exact string it sent.
         super::messages::write_ed2k_string(&mut buf, requested);
         buf.extend_from_slice(&encode_shared_files_answer(
-            &files,
+            files,
             client_id,
             self.advertised_tcp_port(),
+            peer_supports_large_files,
         ));
         buf
     }
@@ -4623,6 +5328,7 @@ impl UploadHandler {
         // 1. Distinct, named file hashes currently in the queue.
         let hashes: Vec<[u8; 16]> = {
             let queue = self.upload_queue.lock().await;
+            QUEUE_WAITING.store(queue.len(), std::sync::atomic::Ordering::Relaxed);
             if queue.is_empty() {
                 return;
             }
@@ -4682,8 +5388,10 @@ impl UploadHandler {
             let mut queue = self.upload_queue.lock().await;
             let before = queue.len();
             queue.retain(|e| !unserveable.contains(&e.file_hash));
+            QUEUE_WAITING.store(queue.len(), std::sync::atomic::Ordering::Relaxed);
             before - queue.len()
         };
+        QUEUE_DROPPED_UNSHARED.fetch_add(removed as u64, std::sync::atomic::Ordering::Relaxed);
         if removed > 0 {
             debug!(
                 "Upload queue: purged {removed} waiting peer(s) for {} file(s) no longer shared or downloading (eMule file-gone queue purge)",
@@ -4734,38 +5442,6 @@ impl UploadHandler {
     /// per-slot rate is compared against the target: if existing slots are
     /// already starved (median < target * 0.5), we avoid opening more even
     /// if the formula would allow it.
-    /// eMule's `MaxConperFive` gate: at most N newly accepted connections in
-    /// any five-second window (`CListenSocket::TooManySockets`,
-    /// `ListenSocket.cpp:2182`, default `MAXCONPER5SEC` = 20).
-    ///
-    /// This bounds the rate at which we open sockets, not how many we hold —
-    /// the point is to stay friendly to NAT tables and to routers that choke on
-    /// connection bursts, which is why eMule ships it as a user-visible
-    /// preference. Returns false when the budget for the current window is
-    /// spent; the caller drops the connection and the peer retries, which is
-    /// the same outcome as eMule's `StopListening`.
-    ///
-    /// `0` disables the gate, for a user who would rather not have one.
-    fn accept_budget_allows(&self) -> bool {
-        const WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
-        let budget = self
-            .max_conn_per_five
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if budget == 0 {
-            return true;
-        }
-        let now = std::time::Instant::now();
-        let mut window = self.accept_window.lock();
-        if now.duration_since(window.0) >= WINDOW {
-            *window = (now, 0);
-        }
-        if window.1 >= budget {
-            return false;
-        }
-        window.1 += 1;
-        true
-    }
-
     fn compute_dynamic_slot_count(&self) -> usize {
         let active = self.active_count.load(std::sync::atomic::Ordering::Relaxed);
         let max_configured = self
@@ -4892,6 +5568,29 @@ impl UploadHandler {
     /// IPv4-only, so a pure-IPv6 peer (which can't be ban-set keyed) is
     /// dropped here; the abuse tracker's own per-connection enforcement
     /// still applies in that case.
+    /// Tell the network loop an ed2k client asked for our shared-file list.
+    ///
+    /// Best effort: the peer's answer has already gone out, and a full event
+    /// channel must not hold it up, so the notice is dropped rather than
+    /// awaited.
+    fn note_shares_browsed(
+        &self,
+        peer_addr: std::net::SocketAddr,
+        peer_name: &str,
+        client_software: &str,
+        allowed: bool,
+    ) {
+        let _ = self.upload_event_tx.try_send(UploadEvent {
+            transfer_id: String::new(),
+            kind: UploadEventKind::SharesBrowsed {
+                peer_addr,
+                peer_name: peer_name.to_string(),
+                client_software: client_software.to_string(),
+                allowed,
+            },
+        });
+    }
+
     /// Charge one packet-level abuse event to `ip` and ban it if that crossed
     /// the window limit.
     ///
@@ -4993,6 +5692,7 @@ impl UploadHandler {
         peer_addr: SocketAddr,
         reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        relayed: bool,
     ) -> anyhow::Result<()> {
         self.run_session(
             peer_addr,
@@ -5000,6 +5700,8 @@ impl UploadHandler {
                 reader,
                 writer,
                 secure_peer: None,
+                relayed,
+                socket: None,
             },
             Some(
                 tokio::time::Instant::now()
@@ -5057,19 +5759,16 @@ impl UploadHandler {
                     e.ember_pubkey.as_ref(),
                     e.ember_verified,
                 );
-                if e.current_addr.is_some() {
-                    if score > best_connected_score {
+                if let Some(bound) = e.current_addr {
+                    if !self.peer_is_banned(&e.user_hash, &bound) && score > best_connected_score
+                    {
                         best_connected_score = score;
                     }
                     continue;
                 }
-                if !e.is_high_id || e.tcp_port == 0 || e.last_ip.is_none() {
-                    continue;
-                }
-                if e.file_hash == [0u8; 16] {
-                    continue;
-                }
-                if in_flight.contains(&e.identity) || backoff.contains_key(&e.identity) {
+                if !push_grant_dialable(e, &in_flight, &backoff, |hash, addr| {
+                    self.peer_is_banned(hash, addr)
+                }) {
                     continue;
                 }
                 let better = match &best_dial {
@@ -5198,15 +5897,21 @@ impl UploadHandler {
             // NAT rebind of the peer that just got the slot.
             let mut queue = self.upload_queue.lock().await;
             queue.retain(|e| keep_queue_row_after_slot_grant(&identity, peer_addr.ip(), e));
-        } else if let Err(e) = result {
-            // Pre-grant failure: leave the queue entry (seniority intact) and backoff.
-            debug!("AddUpNextClient dial to {peer_addr} failed before grant: {e}");
+        } else {
+            // No grant, whether the dial failed or the session ended softly.
+            // Back off either way: the row is still the top scorer, so without
+            // this the 1 s slot tick redials it and starves everyone below.
+            // The row keeps its seniority; sessions that refuse the peer
+            // outright (ban / AntiLeech) have already removed it.
+            match result {
+                Err(e) => debug!("AddUpNextClient dial to {peer_addr} failed before grant: {e}"),
+                Ok(()) => debug!("AddUpNextClient dial to {peer_addr} ended without a grant"),
+            }
             self.push_grant_backoff.lock().await.insert(
                 identity,
                 std::time::Instant::now() + std::time::Duration::from_secs(PUSH_GRANT_BACKOFF_SECS),
             );
         }
-        // Soft Ok(()) before grant (ban / AntiLeech / etc.) keeps seniority.
     }
 
     /// Dial `peer_addr` and serve it as an upload peer — the LowID callback
@@ -5231,6 +5936,20 @@ impl UploadHandler {
         let push_grant_file_hash = req.push_grant_file_hash;
         let push_grant_accepted = req.push_grant_accepted;
         let peer_hash = req.user_hash.filter(|h| *h != [0u8; 16]);
+        // eMule would reuse a socket it already has with this peer; we cannot,
+        // and a second one makes the peer close the first.
+        let _peer_session = match peer_addr.ip() {
+            std::net::IpAddr::V4(v4) => Some(
+                super::peer_sessions::try_reserve(peer_hash, v4, peer_addr.port()).ok_or_else(
+                    || {
+                        anyhow::anyhow!(
+                            "connect_and_serve {peer_addr}: a connection with this peer is already open"
+                        )
+                    },
+                )?,
+            ),
+            std::net::IpAddr::V6(_) => None,
+        };
         let obf_enabled = self
             .obfuscation_enabled
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -5397,23 +6116,33 @@ impl UploadHandler {
                     (puh, PeerCapabilities::default())
                 });
 
-            // Outbound EmuleInfo: send ours, then read the peer's answer. A
+            // Outbound EmuleInfo, only for the legacy peers eMule itself would
+            // send it to: send ours, then read the peer's answer. A
             // non-EmuleInfo packet here (peer jumped straight to a file request)
             // is captured as `first_packet` and replayed by the serve loop.
-            let emule_payload = build_emule_info(
-                self.advertised_udp_port(),
-                obf_enabled,
-                Some(&self.ember_hash),
-                None,
-            );
-            write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
             let mut first_packet: Option<(u8, u8, Vec<u8>)> = None;
-            if let Ok(Ok((eproto, eopcode, epayload))) = tokio::time::timeout(
-                std::time::Duration::from_secs(OUTBOUND_SERVE_HANDSHAKE_SECS),
-                read_packet_async_inner(&mut reader),
-            )
-            .await
-            {
+            let emule_info_reply = if dialer_needs_mule_info(&peer_user_hash, &hello_caps) {
+                let emule_payload = build_emule_info(
+                    self.advertised_udp_port(),
+                    obf_enabled,
+                    Some(&self.ember_hash),
+                    None,
+                );
+                write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload)
+                    .await?;
+                read_packet_if_started(
+                    &mut reader,
+                    std::time::Duration::from_secs(OUTBOUND_SERVE_HANDSHAKE_SECS),
+                    std::time::Duration::from_secs(OUTBOUND_SERVE_HANDSHAKE_SECS),
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("connect_and_serve {peer_addr}: read EmuleInfo: {e}")
+                })?
+            } else {
+                None
+            };
+            if let Some((eproto, eopcode, epayload)) = emule_info_reply {
                 if eproto == OP_EMULEPROT
                     && (eopcode == OP_EMULEINFOANSWER || eopcode == OP_EMULEINFO)
                 {
@@ -5455,10 +6184,43 @@ impl UploadHandler {
                 push_grant_file_hash,
                 push_grant_accepted,
                 secure_peer,
+                handed_over: false,
             };
             self.run_session(peer_addr, ConnInit::OutboundServe(Box::new(state)), None)
                 .await
         }
+    }
+
+    /// Serve a peer on a connection our download side opened to it and has
+    /// finished with, answering the requests it sent over it meanwhile (they
+    /// replay first from the reader). The peer is not dialed or greeted
+    /// again: from its side this is the same session carrying on.
+    async fn serve_handed_over(
+        &self,
+        handover: super::peer_sessions::DownloadHandover,
+    ) -> anyhow::Result<()> {
+        let super::peer_sessions::DownloadHandover {
+            peer_addr,
+            reader,
+            writer,
+            peer_user_hash,
+            hello_caps,
+            session: _session,
+        } = handover;
+        let state = OutboundServeState {
+            reader: StreamReader::Boxed(reader),
+            writer: StreamWriter::Boxed(writer),
+            hello_data: Vec::new(),
+            peer_user_hash,
+            hello_caps,
+            first_packet: None,
+            push_grant_file_hash: None,
+            push_grant_accepted: None,
+            secure_peer: None,
+            handed_over: true,
+        };
+        self.run_session(peer_addr, ConnInit::OutboundServe(Box::new(state)), None)
+            .await
     }
 
     /// Serve a friend over a transport we did not dial — the responder half of a
@@ -5537,6 +6299,8 @@ impl UploadHandler {
         // of continuing into the upload serve loop.
         let inbound_stream = matches!(init, ConnInit::InboundStream { .. });
         let skip_diversions = outbound || inbound_stream;
+        let relayed = matches!(init, ConnInit::InboundStream { relayed: true, .. });
+        let attach_addr = (!relayed).then_some(peer_addr);
 
         // Check if already banned (fast path), but don't count yet --
         // buddy/KAD callback connections are legitimate and shouldn't
@@ -5549,11 +6313,7 @@ impl UploadHandler {
         }
 
         // Produce the post-Hello session state via whichever path initiated this
-        // connection. `obf_ember_hash` / `obf_emule_caps` are only set by the
-        // inbound obfuscated branch; outbound leaves them `None` (its EmuleInfo
-        // caps are already merged into `hello_caps` by `connect_and_serve`).
-        let mut obf_ember_hash: Option<[u8; 16]> = None;
-        let mut obf_emule_caps: Option<PeerCapabilities> = None;
+        // connection.
         // A packet handed over by the outbound handshake to replay as the serve
         // loop's first packet (see `OutboundServeState::first_packet`). Always
         // `None` for inbound.
@@ -5561,6 +6321,7 @@ impl UploadHandler {
         let mut push_grant_file_hash: Option<[u8; 16]> = None;
         let mut push_grant_accepted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
         let mut secure_v2_peer: Option<super::secure_stream::SecurePeerIdentity> = None;
+        let mut handed_over = false;
         let (mut reader, mut writer, hello_data, peer_user_hash, mut hello_caps) = match init {
             ConnInit::OutboundServe(state) => {
                 let OutboundServeState {
@@ -5573,8 +6334,10 @@ impl UploadHandler {
                     push_grant_file_hash: pg,
                     push_grant_accepted: pga,
                     secure_peer,
+                    handed_over: ho,
                 } = *state;
                 secure_v2_peer = secure_peer;
+                handed_over = ho;
                 outbound_first_packet = first_packet;
                 push_grant_file_hash = pg;
                 push_grant_accepted = pga;
@@ -5584,13 +6347,54 @@ impl UploadHandler {
                 reader: mut boxed_reader,
                 writer: boxed_writer,
                 secure_peer: preauthenticated_peer,
+                relayed,
+                socket,
             } => {
                 let (mut rd, mut wr, first_inner_byte) = if let Some(peer) = preauthenticated_peer {
                     secure_v2_peer = Some(peer);
+                    let deadline = preauth_deadline.unwrap_or_else(|| {
+                        tokio::time::Instant::now()
+                            + std::time::Duration::from_secs(INBOUND_PREAUTH_DEADLINE_SECS)
+                    });
+                    let first = match tokio::time::timeout_at(deadline, boxed_reader.read_u8()).await {
+                        Ok(Ok(byte)) => byte,
+                        Ok(Err(e)) if is_connection_closed(&e) => {
+                            info!("Secure connection from {peer_addr} closed immediately");
+                            return Ok(());
+                        }
+                        Ok(Err(e)) => {
+                            info!("Secure connection read failed from {peer_addr}: {e}");
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            info!("Timeout waiting for the first packet from secure peer {peer_addr}");
+                            return Ok(());
+                        }
+                    };
+                    // eD2K framing opens with a protocol marker, so a file
+                    // stream's type byte cannot be mistaken for a session.
+                    if first == crate::network::ember::attach::ATTACH_STREAM_MSG_TYPE
+                        || first == crate::network::ember::attach::ROOM_XFER_STREAM_MSG_TYPE
+                    {
+                        if let Some(socket) = socket {
+                            let _ = socket.set_send_buffer_size(FILE_STREAM_SEND_BUFFER_BYTES);
+                        }
+                        return self
+                            .serve_file_stream(
+                                first,
+                                boxed_reader,
+                                boxed_writer,
+                                peer,
+                                relayed,
+                                deadline,
+                            )
+                            .await;
+                    }
+                    drop(socket);
                     (
                         StreamReader::Boxed(boxed_reader),
                         StreamWriter::Boxed(boxed_writer),
-                        None,
+                        Some(first),
                     )
                 } else {
                     let first = match tokio::time::timeout_at(
@@ -5764,6 +6568,10 @@ impl UploadHandler {
                         Ok(true)
                     );
                 if is_ember_preamble {
+                    // Taken before the halves vanish into the secure layer.
+                    let socket = socket2::SockRef::from(raw_reader.get_ref().as_ref())
+                        .try_clone()
+                        .ok();
                     let secure = tokio::time::timeout_at(
                         preauth_deadline.expect("inbound TCP has a pre-auth deadline"),
                         super::secure_stream::accept_after_first(
@@ -5783,6 +6591,8 @@ impl UploadHandler {
                             reader: secure.reader,
                             writer: secure.writer,
                             secure_peer: Some(secure.peer),
+                            relayed: false,
+                            socket,
                         },
                         preauth_deadline,
                     ))
@@ -5935,36 +6745,14 @@ impl UploadHandler {
                                     return Ok(());
                                 }
 
-                                // Consume peer's EmuleInfo/SecIdent packets
-                                let mut obf_peer_ember_hash: Option<[u8; 16]> = None;
-                                let mut obf_peer_caps: Option<PeerCapabilities> = None;
-                                for _ in 0..5 {
-                                    match tokio::time::timeout(
-                                        std::time::Duration::from_secs(5),
-                                        read_packet_async_inner(&mut obf_reader),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok((p, o, ref data))) => {
-                                            if p == OP_EMULEPROT
-                                                && (o == OP_EMULEINFOANSWER || o == OP_EMULEINFO)
-                                            {
-                                                let ic = parse_emule_info(data);
-                                                if ic.ember_hash.is_some() {
-                                                    obf_peer_ember_hash = ic.ember_hash;
-                                                }
-                                                obf_peer_caps = Some(ic);
-                                                break;
-                                            }
-                                        }
-                                        _ => break,
-                                    }
-                                }
-
+                                // The peer's next packet is read by the shared
+                                // EmuleInfo step below, which keeps anything
+                                // else as the serve loop's first packet. A
+                                // modern eMule sends OP_SECIDENTSTATE and its
+                                // file request here, never OP_EMULEINFO
+                                // (ListenSocket.cpp:212-229, :272-273).
                                 let obf_writer =
                                     tokio::io::BufWriter::new(Rc4Writer::new(raw_writer, send_key));
-                                obf_ember_hash = obf_peer_ember_hash;
-                                obf_emule_caps = obf_peer_caps;
                                 (
                                     StreamReader::Obfuscated(obf_reader),
                                     StreamWriter::Obfuscated(obf_writer),
@@ -6128,13 +6916,21 @@ impl UploadHandler {
                     }
                 };
 
-                let (_, mut hello_caps) = parse_hello_packet(&hello_data)
+                let (_, hello_caps) = parse_hello_packet(&hello_data)
                     .unwrap_or_else(|_| ([0u8; 16], PeerCapabilities::default()));
-                if let Some(obf_caps) = obf_emule_caps.take() {
-                    merge_caps(&mut hello_caps, obf_caps);
-                }
                 (reader, writer, hello_data, peer_user_hash, hello_caps)
             }
+        };
+        // A connection the peer opened occupies its one eMule socket to us,
+        // so our download side must not dial it until this ends. Outbound
+        // serves hold their own reservation.
+        let peer_session = match (outbound, attach_addr.map(|a| a.ip())) {
+            (false, Some(std::net::IpAddr::V4(v4))) => Some(super::peer_sessions::register(
+                Some(peer_user_hash),
+                v4,
+                hello_caps.tcp_port,
+            )),
+            _ => None,
         };
 
         let secure_v2_authenticated = secure_v2_peer.is_some();
@@ -6143,6 +6939,9 @@ impl UploadHandler {
             // Hello/EmuleInfo fields remain byte-compatible metadata and may
             // not replace the authenticated Ember identity.
             hello_caps.is_ember = true;
+            if let Some(session) = &peer_session {
+                session.mark_ember();
+            }
             hello_caps.ember_hash = Some(peer.ember_hash);
             hello_caps.ember_pubkey = Some(peer.ed25519_public_key);
         }
@@ -6184,29 +6983,24 @@ impl UploadHandler {
         let mut ul_client_software = client_software_from_caps(&hello_caps);
         let ul_country_code = crate::geoip::lookup_country(&self.geoip, peer_addr.ip());
 
-        // Remember who this is for the Known eD2K Peers ledger, which is
-        // built from credit records alone and so has no session to ask later.
-        // `hello_caps.peer_name` rather than `ul_peer_name`: the latter falls
-        // back to the peer's address for display, and an `IP:port` is not a
-        // nickname worth persisting.
         if peer_user_hash != [0u8; 16] {
-            self.credit_manager.write().await.note_client_identity(
-                peer_user_hash,
-                &hello_caps.peer_name,
-                &ul_client_software,
-            );
-        }
-
-        if peer_user_hash != [0u8; 16] {
-            if let Ok(set) = self.banned_hashes.read() {
-                if set.contains(&peer_user_hash) {
-                    info!(
-                        "Rejecting upload session from banned user {} ({})",
-                        crate::security::short_hash(&peer_user_hash),
-                        peer_addr
-                    );
-                    return Ok(());
-                }
+            let banned = self
+                .banned_hashes
+                .read()
+                .is_ok_and(|set| set.contains(&peer_user_hash));
+            if banned {
+                info!(
+                    "Rejecting upload session from banned user {} ({})",
+                    crate::security::short_hash(&peer_user_hash),
+                    peer_addr
+                );
+                remove_banned_hash_queue_rows(
+                    &mut *self.upload_queue.lock().await,
+                    peer_user_hash,
+                    peer_addr,
+                    hello_caps.tcp_port,
+                );
+                return Ok(());
             }
         }
 
@@ -6332,6 +7126,7 @@ impl UploadHandler {
                             emule_info_done: true,
                             peer_caps: hello_caps.clone(),
                             friend_ember_hash: Some(peer.ember_hash),
+                            origin: Some(crate::types::SourceOrigin::Ember),
                         })
                         .await;
                     return Ok(());
@@ -6380,7 +7175,7 @@ impl UploadHandler {
                     lookup_keys.push(PendingKadCallbackKey::SourceIp(peer_v4));
                 }
 
-                let mut matched: Option<[u8; 16]> = None;
+                let mut matched: Option<([u8; 16], Option<crate::types::SourceOrigin>)> = None;
                 'outer: for key in lookup_keys {
                     let Some(entries) = cbs.get_mut(&key) else {
                         continue;
@@ -6424,7 +7219,7 @@ impl UploadHandler {
                         if entries.is_empty() {
                             cbs.remove(&key);
                         }
-                        matched = Some(entry.file_hash);
+                        matched = Some((entry.file_hash, entry.origin));
                         break 'outer;
                     }
                 }
@@ -6458,7 +7253,7 @@ impl UploadHandler {
                 }
                 matched
             };
-            if let Some(file_hash) = callback_file {
+            if let Some((file_hash, callback_origin)) = callback_file {
                 info!(
                     "Recognized KAD callback connection from {peer_addr} for file {}",
                     hex::encode(file_hash)
@@ -6490,6 +7285,7 @@ impl UploadHandler {
                     emule_info_done: emule_done,
                     peer_caps: hello_caps.clone(),
                     friend_ember_hash: None,
+                    origin: callback_origin,
                 };
                 let _ = self.kad_callback_tx.send(parts).await;
                 return Ok(());
@@ -6558,6 +7354,7 @@ impl UploadHandler {
                         emule_info_done: emule_done,
                         peer_caps: hello_caps.clone(),
                         friend_ember_hash: None,
+                        origin: None,
                     };
                     let _ = self.kad_callback_tx.send(parts).await;
                     return Ok(());
@@ -6629,6 +7426,7 @@ impl UploadHandler {
                     emule_info_done: emule_done,
                     peer_caps: hello_caps.clone(),
                     friend_ember_hash: None,
+                    origin: None,
                 };
                 let _ = self.kad_callback_tx.send(parts).await;
                 return Ok(());
@@ -6681,7 +7479,7 @@ impl UploadHandler {
         // so we don't read again — `deferred_packet` stays `None` and the main
         // loop reads the peer's first real packet fresh.
         let mut deferred_packet: Option<(u8, u8, Vec<u8>)> = outbound_first_packet.take();
-        let mut peer_ember_hash: Option<[u8; 16]> = hello_caps.ember_hash.or(obf_ember_hash);
+        let mut peer_ember_hash: Option<[u8; 16]> = hello_caps.ember_hash;
         let mut peer_secure_ident_level = peer_secure_ident_level;
         if !outbound {
             let (proto2, opcode2, payload2) = read_packet_timeout(&mut reader).await?;
@@ -6698,15 +7496,6 @@ impl UploadHandler {
                 ul_client_software = client_software_from_caps(&hello_caps);
                 if !hello_caps.peer_name.is_empty() {
                     ul_peer_name = hello_caps.peer_name.clone();
-                }
-                // OP_EMULEINFO is where the version details arrive, so the
-                // software string is only now complete — re-record it.
-                if peer_user_hash != [0u8; 16] {
-                    self.credit_manager.write().await.note_client_identity(
-                        peer_user_hash,
-                        &hello_caps.peer_name,
-                        &ul_client_software,
-                    );
                 }
                 let emule_payload = build_emule_info(
                     self.advertised_udp_port(),
@@ -6747,8 +7536,10 @@ impl UploadHandler {
         // their `ember_hash`. See `super::ember_auth` for the full
         // state diagram and tests.
         let mut ember_auth_state = super::ember_auth::EmberAuthState::default();
-        let mut ul_sent_ember_hello = secure_v2_authenticated;
-        if !secure_v2_authenticated {
+        let mut ul_sent_ember_hello = secure_v2_authenticated || handed_over;
+        // Only to peers that speak the eMule extended protocol; see the
+        // matching gate on the download side.
+        if !ul_sent_ember_hello && hello_caps.ext_protocol {
             // Preserve the existing generic eMule byte stream exactly:
             // legacy Ember Hello remains an ignorable extension packet.
             // Its auth challenge/response opcodes are parsed and dropped
@@ -6790,7 +7581,31 @@ impl UploadHandler {
             // returning, and a TCP reply here would be read as
             // `OP_MULTIPACKETANSWER` and cost us the source — see the
             // `OP_QUEUEFULL` note in `messages.rs`.
+            remove_refused_queue_row(
+                &mut *self.upload_queue.lock().await,
+                &QueueIdentity::from_peer(peer_user_hash, peer_addr),
+                peer_addr,
+                hello_caps.tcp_port,
+                hello_caps.ember_pubkey,
+                ember_auth_state.is_verified(),
+            );
             return Ok(());
+        }
+
+        // Remember who this is for the Known eD2K Peers ledger, which is
+        // built from credit records alone and so has no session to ask later.
+        // Only now, past the ban, rate-limit and anti-leech gates: every new
+        // user hash costs a credit record, and a Hello alone is unauthenticated.
+        // `hello_caps.peer_name` rather than `ul_peer_name`: the latter falls
+        // back to the peer's address for display, and an `IP:port` is not a
+        // nickname worth persisting.
+        if peer_user_hash != [0u8; 16] {
+            self.credit_manager.write().await.note_client_identity(
+                peer_user_hash,
+                Some(peer_addr.ip()),
+                &hello_caps.peer_name,
+                &ul_client_software,
+            );
         }
 
         // Proactively challenge the peer's identity — fire this AFTER the
@@ -6904,10 +7719,15 @@ impl UploadHandler {
         // `is_ember_friend`-gated arm below (CHAT_MSG, BROWSE_REQ,
         // BROWSE_RES, KEEPALIVE) and the `owns_ember_slot`
         // reservation permanently dead for these sessions too.
-        let mut is_friend = if let Some(eh) = peer_ember_hash {
-            self.friend_hashes.read().await.contains(&eh)
-        } else {
-            false
+        //
+        // Membership is only ever consulted on secure v2 sessions. On any
+        // other socket the ember hash is an unauthenticated claim, and every
+        // reaction to "that hash is a friend" (the reciprocal request, a
+        // different packet sequence, even the lock round-trip) would let an
+        // anonymous peer test candidate hashes against our friend list.
+        let mut is_friend = match peer_ember_hash {
+            Some(eh) if secure_v2_authenticated => self.friend_hashes.read().await.contains(&eh),
+            _ => false,
         };
 
         // FriendSeen is deliberately NOT emitted here. The dispatcher
@@ -6970,7 +7790,9 @@ impl UploadHandler {
                 // revocation, even when another connection already owns the
                 // canonical outbound-routing slot.  Chat/browse authorization
                 // on this socket does not require owns_ember_slot.
-                let handle = EmberSessionHandle::new_secure(outbound_tx.clone(), pk, eh);
+                let handle = EmberSessionHandle::new_secure(outbound_tx.clone(), pk, eh)
+                    .via_relay(relayed)
+                    .with_peer_addr(attach_addr);
                 ember_shutdown_rx = Some(handle.subscribe_shutdown());
                 ember_session_handle = Some(handle.clone());
 
@@ -7088,6 +7910,11 @@ impl UploadHandler {
         let mut hash_answers_served: u32 = 0;
         // When this connection last received a full shared-file listing.
         let mut last_browse: Option<std::time::Instant> = None;
+        // Per-directory listings served on this connection; see
+        // `MAX_DIR_BROWSE_ANSWERS_PER_SESSION` for why these are counted rather
+        // than spaced.
+        let mut dir_browse_answers_served: u32 = 0;
+        let mut dir_browse: Option<DirBrowseListing> = None;
         // eMule `m_abyUpPartStatus`: the parts the downloader told us it
         // already has, captured from the `OP_REQUESTFILENAME` extended-info
         // block and shaded dark on the parts bar. Keyed by file hash so a
@@ -7281,10 +8108,14 @@ impl UploadHandler {
             PathBuf,
             super::part_tracker::PartTracker,
             std::time::Instant,
-            // `part_tracker::verification_epoch()` when this was parsed. The
-            // time-based refresh below is only safe in the "newly verified"
-            // direction; losing a verified bit has to invalidate immediately.
+            // `part_tracker::verification_epoch()` when this was parsed or
+            // last had pending invalidations applied. The time-based refresh
+            // below is only safe in the "newly verified" direction; losing a
+            // verified bit has to take effect immediately.
             u64,
+            // `.part.met` fingerprint at parse time; an unchanged sidecar is
+            // not re-parsed on the timed refresh.
+            Option<(std::time::SystemTime, u64)>,
         )> = None;
         let mut cached_is_video_ext: Option<(PathBuf, bool)> = None;
         // Keep the disk-backed cache short-lived so a just-verified part can
@@ -7354,30 +8185,27 @@ impl UploadHandler {
         // underlying cause.
         let session_result: anyhow::Result<()> = async {
         loop {
-            if let Some(eh) = peer_ember_hash {
+            // Secure v2 only, for the same reason as the `is_friend` seed:
+            // promoting (and answering with `OP_EMBER_FRIEND_REQ`) on a
+            // plain socket tells whoever claimed the hash that it is listed.
+            if let (true, Some(eh)) = (secure_v2_authenticated, peer_ember_hash) {
                 let live_member = self.friend_hashes.read().await.contains(&eh);
                 if is_friend && !live_member {
-                    is_friend = false;
-                    is_ember_friend = false;
-                    if secure_v2_authenticated {
-                        // Membership is the live authorization source.  Do not
-                        // let a session-local flag or queued priority snapshot
-                        // survive friend removal.
-                        info!("Friend {} removed; closing secure v2 stream", hex::encode(eh));
-                        break;
-                    }
+                    // Membership is the live authorization source.  Do not
+                    // let a session-local flag or queued priority snapshot
+                    // survive friend removal.
+                    info!("Friend {} removed; closing secure v2 stream", hex::encode(eh));
+                    break;
                 }
                 if !is_friend && live_member {
                     // Add Friend from the uploads pane (or Friends page) can
                     // land while this downloader's socket is still open.
                     // Promote membership, then ship `OP_EMBER_FRIEND_REQ` on
                     // this live connection — FindFriendAndConnect cannot
-                    // carry the request when the peer is firewalled, and
-                    // classic Ember file sockets are not in `ember_sessions`
-                    // until they are already friends.
+                    // carry the request when the peer is firewalled.
                     is_friend = true;
                     is_ember_friend = hello_caps.is_ember;
-                    if secure_v2_authenticated && !owns_ember_slot {
+                    if !owns_ember_slot {
                         if let Some(handle) = ember_session_handle.as_ref().cloned() {
                             let mut sessions = self.ember_sessions.write().await;
                             match sessions.get(&eh) {
@@ -7484,6 +8312,14 @@ impl UploadHandler {
                             .await;
                     }
                 }
+                remove_refused_queue_row(
+                    &mut *self.upload_queue.lock().await,
+                    &queue_identity,
+                    peer_addr,
+                    hello_caps.tcp_port,
+                    hello_caps.ember_pubkey,
+                    ember_auth_state.is_verified(),
+                );
                 break;
             }
 
@@ -7625,10 +8461,24 @@ impl UploadHandler {
                     }
                     r = tokio::time::timeout(timeout_dur, pkt_rx.recv()) => r,
                     Some(outbound_data) = outbound_rx.recv() => {
-                        if writer.write_all(&outbound_data).await.is_ok() {
-                            let _ = writer.flush().await;
+                        let wrote = tokio::time::timeout(WRITE_PACKET_TIMEOUT, async {
+                            writer.write_all(&outbound_data).await?;
+                            writer.flush().await
+                        })
+                        .await;
+                        match wrote {
+                            Ok(Ok(())) => continue,
+                            Ok(Err(e)) => {
+                                info!("Ending session with {peer_addr}: outbound write failed: {e}");
+                            }
+                            Err(_) => {
+                                info!(
+                                    "Ending session with {peer_addr}: outbound write stalled > {}s",
+                                    WRITE_PACKET_TIMEOUT.as_secs()
+                                );
+                            }
                         }
-                        continue;
+                        break;
                     }
                 };
 
@@ -7784,6 +8634,7 @@ impl UploadHandler {
                                         // Slot already reserved atomically above.
                                         queued_identity = None;
                                         uploaded = 0;
+                                        uploaded_wire = 0;
                                         served_bytes_per_part.clear();
                                         sent_blocks.clear();
                                         queue_wait_at_grant = queue_join_time.elapsed().as_secs();
@@ -7842,8 +8693,12 @@ impl UploadHandler {
                                 }
                             }
 
-                            // Re-send OP_QUEUERANKING if rank changed, rate-limited to once per 5 min
-                            if last_rank_resend.elapsed().as_secs() >= 300 {
+                            // Re-send OP_QUEUERANKING if rank changed, rate-limited to
+                            // once per 5 min — to Ember peers only. eMule sends a rank
+                            // only in reply to a request, and its downloader counts
+                            // three it did not ask for as a "QR flood" strike, the
+                            // second strike a ban (DownloadClient.cpp:1993-2012).
+                            if hello_caps.is_ember && last_rank_resend.elapsed().as_secs() >= 300 {
                                 last_rank_resend = std::time::Instant::now();
                                 let friend_slot_priority = friend_slot_takes_priority(
                                     live_secure_friend_member(
@@ -7872,7 +8727,7 @@ impl UploadHandler {
                                     &cm, &idx_snap, &peer_user_hash,
                                     current_file_hash.unwrap_or([0u8; 16]),
                                     queue_join_time.elapsed().as_secs(),
-                                    Some(peer_addr), hello_caps.emule_version_min,
+                                    Some(peer_addr), hello_caps.emule_version_byte,
                                     friend_slot_priority,
                                     hello_caps.ember_pubkey.as_ref(), ember_verified,
                                 );
@@ -8079,11 +8934,15 @@ impl UploadHandler {
                     // outgoing SECIDENTSTATE challenge until it sees our
                     // OP_PUBLICKEY anyway (BaseClient.cpp:1851), so there's
                     // no timing benefit to sending ours twice.
-                    let missing_peer_key = if state >= 2 {
+                    //
+                    // Whatever the state: a state-1 challenge (the peer
+                    // already holds our key) still needs theirs to sign, and
+                    // answering it without one sends nothing, leaving us
+                    // unidentified there for the session. eMule defers the
+                    // same way (BaseClient.cpp:1851-1852, :1907-1910).
+                    let missing_peer_key = {
                         let cm = self.credit_manager.read().await;
                         !cm.has_public_key(&peer_user_hash)
-                    } else {
-                        false
                     };
                     if missing_peer_key {
                         pending_peer_challenge = Some((challenge, state));
@@ -8175,6 +9034,7 @@ impl UploadHandler {
                                 // existed yet — otherwise a later REQUESTPARTS for
                                 // the new hash reuses the old file's sent_blocks.
                                 uploaded = 0;
+                                uploaded_wire = 0;
                                 served_bytes_per_part.clear();
                                 sent_blocks.clear();
                                 cached_part_tracker = None;
@@ -8316,14 +9176,7 @@ impl UploadHandler {
                                 &hash,
                             )
                             .await?;
-                            {
-                                let mut tracker = self.abuse_tracker.lock().await;
-                                let banned = tracker.record_file_not_found(peer_addr.ip());
-                                drop(tracker);
-                                if banned {
-                                    self.emit_auto_ban(peer_addr.ip(), "excessive file-not-found requests (hash probing)").await;
-                                }
-                            }
+                            self.note_unservable_file_request(peer_addr.ip(), hash).await;
                             current_file_hash = None;
                             total_size = 0;
                         }
@@ -8331,12 +9184,24 @@ impl UploadHandler {
                 }
 
                 (OP_EDONKEYHEADER, OP_REQUESTFILENAME) => {
-                    if current_file_hash.is_none() && payload.len() >= 16 {
+                    // The payload names the file, as in eMule's handler, even
+                    // on a connection already used for another one: answering
+                    // with the earlier file is "Wrong file ID" to the asker
+                    // (DownloadClient.cpp:442-454) and costs us that source.
+                    // A running slot keeps its file, though: retargeting it
+                    // here skipped the switch bookkeeping that OP_REQUESTPARTS
+                    // does, and reset the session's byte count on the next one.
+                    let requested = if payload.len() >= 16 {
                         let mut hash = [0u8; 16];
                         hash.copy_from_slice(&payload[..16]);
-                        current_file_hash = Some(hash);
+                        Some(hash)
+                    } else {
+                        current_file_hash
+                    };
+                    if !slot_guard.is_active() {
+                        current_file_hash = requested;
                     }
-                    if let Some(hash) = current_file_hash {
+                    if let Some(hash) = requested {
                         if let Some(file) = self.resolve_upload_file(&hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await {
                             // eMule ProcessExtendedInfo: bytes after the 16-byte
                             // hash carry the downloader's advertised part status
@@ -8373,49 +9238,63 @@ impl UploadHandler {
                                 &hash,
                             )
                             .await?;
-                            {
-                                let mut tracker = self.abuse_tracker.lock().await;
-                                let banned = tracker.record_file_not_found(peer_addr.ip());
-                                drop(tracker);
-                                if banned {
-                                    self.emit_auto_ban(peer_addr.ip(), "excessive file-not-found requests (hash probing)").await;
-                                }
+                            self.note_unservable_file_request(peer_addr.ip(), hash).await;
+                            if !slot_guard.is_active() {
+                                current_file_hash = None;
+                                total_size = 0;
                             }
-                            current_file_hash = None;
-                            total_size = 0;
                         }
                     }
                 }
 
                 (OP_EDONKEYHEADER, OP_STARTUPLOADREQ) => {
-                    if current_file_hash.is_none() && payload.len() >= 16 {
+                    // eMule takes the file from the payload whenever there is
+                    // one (ListenSocket.cpp OP_STARTUPLOADREQ). A running slot
+                    // keeps its file, as for OP_REQUESTFILENAME above.
+                    let requested = if payload.len() >= 16 {
                         let mut hash = [0u8; 16];
                         hash.copy_from_slice(&payload[..16]);
-                        current_file_hash = Some(hash);
+                        Some(hash)
+                    } else {
+                        current_file_hash
+                    };
+                    if !slot_guard.is_active() {
+                        current_file_hash = requested;
                     }
 
-                    // Turn a friends-only request away at the door rather than
-                    // letting it wait for a slot it can never be granted.
-                    // Answering QUEUEFULL reuses the refusal the soft-limit
-                    // path already sends, so the peer backs off and looks
-                    // elsewhere without learning why.
-                    if let Some(h) = current_file_hash {
-                        if self
-                            .friends_only_and_barred(
-                                &h,
-                                PeerFileAccess {
-                                    ember_hash: peer_ember_hash,
-                                    secure_v2_authenticated,
-                                },
-                            )
-                            .await
-                        {
-                            debug!(
-                                "Refusing queue admission for friends-only file {} from {peer_addr}",
-                                hex::encode(h)
-                            );
-                            break;
+                    // Resolve before queue admission. An unresolvable hash —
+                    // unknown, unshared, or friends-only for this peer — must
+                    // not earn a queue row or slot, and all three must look
+                    // identical on the wire (same answer, same probe counter,
+                    // session kept open) or this opcode becomes an oracle
+                    // for which hashes we hold privately.
+                    let Some(h) = requested else {
+                        continue;
+                    };
+                    if self
+                        .resolve_upload_file(
+                            &h,
+                            PeerFileAccess {
+                                ember_hash: peer_ember_hash,
+                                secure_v2_authenticated,
+                            },
+                        )
+                        .await
+                        .is_none()
+                    {
+                        write_packet_async(
+                            &mut writer,
+                            OP_EDONKEYHEADER,
+                            OP_FILEREQANSNOFIL,
+                            &h,
+                        )
+                        .await?;
+                        self.note_unservable_file_request(peer_addr.ip(), h).await;
+                        if !slot_guard.is_active() {
+                            current_file_hash = None;
+                            total_size = 0;
                         }
+                        continue;
                     }
 
                     // Duplicate OP_STARTUPLOADREQ on an already-granted session.
@@ -8444,12 +9323,8 @@ impl UploadHandler {
                         continue;
                     }
 
-                    if let Some(h) = current_file_hash {
-                        if self.resolve_upload_file(&h, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated }).await.is_some() {
-                            self.record_share_request_once(&h, &mut recorded_share_request)
-                                .await;
-                        }
-                    }
+                    self.record_share_request_once(&h, &mut recorded_share_request)
+                        .await;
 
                     // eMule AddRequestCount: check per-file request frequency before admitting
                     if let Some(h) = current_file_hash {
@@ -8829,7 +9704,7 @@ impl UploadHandler {
                                 &cm, &idx_snap, &peer_user_hash,
                                 current_file_hash.unwrap_or([0u8; 16]),
                                 queue[pos].join_time.elapsed().as_secs(),
-                                Some(peer_addr), hello_caps.emule_version_min,
+                                Some(peer_addr), hello_caps.emule_version_byte,
                                 friend_slot_priority,
                                 hello_caps.ember_pubkey.as_ref(), ember_verified,
                             );
@@ -8918,7 +9793,7 @@ impl UploadHandler {
                                     new_fh,
                                     0,
                                     Some(peer_addr),
-                                    hello_caps.emule_version_min,
+                                    hello_caps.emule_version_byte,
                                     friend_slot_priority,
                                     hello_caps.ember_pubkey.as_ref(),
                                     ember_verified,
@@ -8982,7 +9857,7 @@ impl UploadHandler {
                             ));
                             let my_score = score_queue_entry(
                                 &cm, &idx_snap, &peer_user_hash, new_fh,
-                                0, Some(peer_addr), hello_caps.emule_version_min,
+                                0, Some(peer_addr), hello_caps.emule_version_byte,
                                 friend_slot_priority,
                                 hello_caps.ember_pubkey.as_ref(), ember_verified,
                             );
@@ -9035,6 +9910,7 @@ impl UploadHandler {
                     // Slot already reserved atomically via `try_activate` above.
                     queued_identity = None;
                     uploaded = 0;
+                    uploaded_wire = 0;
                     served_bytes_per_part.clear();
                     sent_blocks.clear();
                     queue_wait_at_grant = queue_join_time.elapsed().as_secs();
@@ -9114,6 +9990,7 @@ impl UploadHandler {
                                         }).await;
                                     }
                                     uploaded = 0;
+                                    uploaded_wire = 0;
                                     served_bytes_per_part.clear();
                                     sent_blocks.clear();
                                     cached_part_tracker = None;
@@ -9415,21 +10292,32 @@ impl UploadHandler {
                     if !is_partial_serve {
                         cached_part_tracker = None;
                     } else {
+                        // Epoch read *before* any parse or overlay, not after:
+                        // a clear that lands meanwhile must leave this entry
+                        // stale rather than be swallowed by a newer epoch
+                        // stamped onto older state.
                         let current_verification_epoch =
                             super::part_tracker::verification_epoch();
-                        let need_rebuild = match cached_part_tracker.as_ref() {
-                            Some((p, _, at, epoch)) => {
-                                p != &file_path
-                                    || at.elapsed() >= PART_TRACKER_REFRESH
-                                    // Some tracker cleared a verified bit since
-                                    // this was parsed. Re-read rather than serve
-                                    // bytes on the strength of a hash check that
-                                    // has since been withdrawn.
-                                    || *epoch != current_verification_epoch
+                        if let Some((p, tracker, _, epoch, _)) = cached_part_tracker.as_mut() {
+                            if p == &file_path && *epoch != current_verification_epoch {
+                                // Some tracker withdrew a verified bit. The
+                                // sidecar may not carry that yet, so apply
+                                // the in-memory record instead of re-reading.
+                                tracker.apply_pending_invalidations();
+                                *epoch = current_verification_epoch;
                             }
-                            None => true,
+                        }
+                        let previous_fingerprint = match cached_part_tracker.as_ref() {
+                            Some((p, _, at, _, fingerprint)) if p == &file_path => {
+                                if at.elapsed() >= PART_TRACKER_REFRESH {
+                                    Some(*fingerprint)
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => Some(None),
                         };
-                        if need_rebuild {
+                        if let Some(previous_fingerprint) = previous_fingerprint {
                             // `PartTracker::new` synchronously reads the
                             // `.part.met` from disk; run it on the blocking pool
                             // so it never stalls a Tokio worker on the serve hot
@@ -9438,26 +10326,40 @@ impl UploadHandler {
                             // in which case we fall back to the direct call.)
                             let fp = file_path.clone();
                             let ts = total_size;
-                            let tracker = tokio::task::spawn_blocking(move || {
-                                super::part_tracker::PartTracker::new(ts, &fp)
+                            let reparsed = tokio::task::spawn_blocking(move || {
+                                let fingerprint =
+                                    super::part_tracker::part_met_fingerprint(&fp);
+                                if fingerprint.is_some() && fingerprint == previous_fingerprint {
+                                    return None;
+                                }
+                                Some((super::part_tracker::PartTracker::new(ts, &fp), fingerprint))
                             })
                             .await
                             .unwrap_or_else(|_| {
-                                super::part_tracker::PartTracker::new(total_size, &file_path)
+                                Some((
+                                    super::part_tracker::PartTracker::new(total_size, &file_path),
+                                    None,
+                                ))
                             });
-                            // Epoch read *before* the parse, not after: a clear
-                            // that lands while `.part.met` is being read must
-                            // invalidate this entry rather than be swallowed by
-                            // a newer epoch stamped onto older bytes.
-                            cached_part_tracker = Some((
-                                file_path.clone(),
-                                tracker,
-                                std::time::Instant::now(),
-                                current_verification_epoch,
-                            ));
+                            match reparsed {
+                                Some((tracker, fingerprint)) => {
+                                    cached_part_tracker = Some((
+                                        file_path.clone(),
+                                        tracker,
+                                        std::time::Instant::now(),
+                                        current_verification_epoch,
+                                        fingerprint,
+                                    ));
+                                }
+                                None => {
+                                    if let Some((_, _, at, _, _)) = cached_part_tracker.as_mut() {
+                                        *at = std::time::Instant::now();
+                                    }
+                                }
+                            }
                         }
                     }
-                    let part_tracker_ref = cached_part_tracker.as_ref().map(|(_, t, _, _)| t);
+                    let part_tracker_ref = cached_part_tracker.as_ref().map(|(_, t, _, _, _)| t);
 
                     // Hoist video-ext computation out of the per-block loop:
                     // it's a property of the file, not the block, and
@@ -10167,6 +11069,17 @@ impl UploadHandler {
                         .active_count
                         .load(std::sync::atomic::Ordering::Relaxed)
                         < self.compute_dynamic_slot_count();
+                    // Note what this makes the real floor. `compute_dynamic_slot_count`
+                    // never returns less than `ADMISSION_FLOOR_SLOTS` (4), so
+                    // `can_open_another_slot` is unconditionally true below four
+                    // active slots and the caps below cannot fire there no matter
+                    // how deep the queue is. That is the intended polarity — with
+                    // a slot available eMule adds one rather than rotating, and
+                    // the waiter is served by `try_add_up_next_client` and the
+                    // read-timeout promotion rather than by interrupting someone —
+                    // but the reach is three slots against an arbitrarily deep
+                    // queue, not the "one active slot, one waiter" case that
+                    // motivated it.
                     let must_rotate_to_serve_waiter = queue_has_waiters && !can_open_another_slot;
                     // eMule CheckForTimeOver (UploadQueue.cpp:773) returns false
                     // for a friend slot: a verified friend is NEVER rotated out,
@@ -10194,7 +11107,22 @@ impl UploadHandler {
 
                     // eMule-style score-based preemption: every ~10 seconds, check
                     // if a queued peer has a significantly higher score than us.
+                    //
+                    // Exempt for the same reason the byte and time caps above
+                    // are: eMule returns false from `CheckForTimeOver` for a
+                    // friend slot before it ever reaches the score comparison
+                    // (`UploadQueue.cpp:773`), with no LowID condition. A friend
+                    // used to be covered here only as a side effect of the
+                    // `268_435_455` score override, and `friend_slot_takes_priority`
+                    // now withholds that from LowID peers — so without this a LowID
+                    // friend was exempt from the caps but still evictable by score,
+                    // which is the interrupted-transfer stall that exemption exists
+                    // to prevent. Withholding the override is about who gets the
+                    // *next* slot, since a LowID peer cannot be dialled to hand it
+                    // one; it says nothing about a friend already connected and
+                    // actively uploading.
                     let preempted = if !session_expired
+                        && !is_verified_friend
                         && slot_guard.is_active()
                         && last_preempt_check.elapsed().as_secs() >= 10
                     {
@@ -10217,7 +11145,7 @@ impl UploadHandler {
                                     session_start.map(|t| t.elapsed()),
                                 ),
                                 Some(peer_addr),
-                                hello_caps.emule_version_min,
+                                hello_caps.emule_version_byte,
                                 friend_slot_takes_priority(
                                     is_verified_friend,
                                     &hello_caps,
@@ -10344,6 +11272,7 @@ impl UploadHandler {
                         // connection, and a firewalled peer could not be
                         // re-promoted until it dialled back in.
                         uploaded = 0;
+                        uploaded_wire = 0;
                         served_bytes_per_part.clear();
                         sent_blocks.clear();
                         self.slot_rates.lock().remove(&peer_addr);
@@ -10593,6 +11522,7 @@ impl UploadHandler {
                     slot_guard.deactivate();
                     transfer_id = None;
                     uploaded = 0;
+                    uploaded_wire = 0;
                     served_bytes_per_part.clear();
                     sent_blocks.clear();
                     session_start = None;
@@ -10634,7 +11564,12 @@ impl UploadHandler {
                         let client_id = self
                             .external_ip_shared
                             .load(std::sync::atomic::Ordering::Relaxed);
-                        let resp = self.build_shared_files_answer(client_id).await;
+                        let resp = self
+                            .build_shared_files_answer(
+                                client_id,
+                                hello_caps.supports_large_files,
+                            )
+                            .await;
                         // A full shared-file listing can reach ~500 KiB from a
                         // 6-byte request. `MIN_BROWSE_INTERVAL` bounds the rate
                         // per connection, but writing it unmetered still pushed
@@ -10650,6 +11585,12 @@ impl UploadHandler {
                         )
                         .await?;
                         debug!("Answered OP_ASKSHAREDFILES from {peer_addr}");
+                        self.note_shares_browsed(
+                            peer_addr,
+                            &hello_caps.peer_name,
+                            &ul_client_software,
+                            true,
+                        );
                     } else {
                         write_packet_async(
                             &mut writer,
@@ -10659,6 +11600,12 @@ impl UploadHandler {
                         )
                         .await?;
                         debug!("Denied OP_ASKSHAREDFILES from {peer_addr} (browsing disabled)");
+                        self.note_shares_browsed(
+                            peer_addr,
+                            &hello_caps.peer_name,
+                            &ul_client_software,
+                            false,
+                        );
                     }
                 }
 
@@ -10680,7 +11627,12 @@ impl UploadHandler {
                             continue;
                         }
                         last_browse = Some(std::time::Instant::now());
-                        let resp = self.build_shared_dirs_answer().await;
+                        let listing = self
+                            .build_dir_browse_listing(hello_caps.supports_unicode)
+                            .await;
+                        let resp = listing.encode_dirs();
+                        dir_browse = Some(listing);
+                        dir_browse_answers_served = 0;
                         self.acquire_upload_bandwidth((6 + resp.len()) as u64)
                             .await?;
                         write_packet_async(
@@ -10691,6 +11643,12 @@ impl UploadHandler {
                         )
                         .await?;
                         debug!("Answered OP_ASKSHAREDDIRS from {peer_addr}");
+                        self.note_shares_browsed(
+                            peer_addr,
+                            &hello_caps.peer_name,
+                            &ul_client_software,
+                            true,
+                        );
                     } else {
                         write_packet_async(
                             &mut writer,
@@ -10700,6 +11658,12 @@ impl UploadHandler {
                         )
                         .await?;
                         debug!("Denied OP_ASKSHAREDDIRS from {peer_addr} (browsing disabled)");
+                        self.note_shares_browsed(
+                            peer_addr,
+                            &hello_caps.peer_name,
+                            &ul_client_software,
+                            false,
+                        );
                     }
                 }
 
@@ -10724,19 +11688,38 @@ impl UploadHandler {
                         debug!("Malformed OP_ASKSHAREDFILESDIR from {peer_addr}");
                         continue;
                     };
-                    // Deliberately not charged to `last_browse`. The directory
+                    // Deliberately not charged to `last_browse`: the directory
                     // list the peer is working through is one browse, and it
                     // legitimately sends one of these per directory back to
-                    // back; the per-request cost is bounded by the answer being
-                    // a subset of the flat listing, which `MIN_BROWSE_INTERVAL`
-                    // already rate-limits at the `OP_ASKSHAREDDIRS` that
-                    // started it. Still metered against the upload cap.
+                    // back. Counted instead, because nothing else bounds it —
+                    // this arm is reachable without the `OP_ASKSHAREDDIRS` whose
+                    // throttle it was assumed to inherit. Still metered against
+                    // the upload cap. The list we advertise never exceeds the
+                    // allowance, so only a peer asking past it is charged.
+                    if dir_browse_answers_served >= MAX_DIR_BROWSE_ANSWERS_PER_SESSION {
+                        debug!("Ignoring excess OP_ASKSHAREDFILESDIR from {peer_addr}");
+                        self.note_abusive_request(peer_addr.ip()).await;
+                        continue;
+                    }
+                    dir_browse_answers_served += 1;
+                    if !dir_browse.as_ref().is_some_and(DirBrowseListing::is_fresh) {
+                        dir_browse = Some(
+                            self.build_dir_browse_listing(hello_caps.supports_unicode)
+                                .await,
+                        );
+                    }
+                    let files = dir_browse
+                        .as_ref()
+                        .map_or(&[][..], |listing| listing.files_in(&requested));
                     let client_id = self
                         .external_ip_shared
                         .load(std::sync::atomic::Ordering::Relaxed);
-                    let resp = self
-                        .build_shared_files_dir_answer(&requested, client_id)
-                        .await;
+                    let resp = self.build_shared_files_dir_answer(
+                        &requested,
+                        files,
+                        client_id,
+                        hello_caps.supports_large_files,
+                    );
                     self.acquire_upload_bandwidth((6 + resp.len()) as u64)
                         .await?;
                     write_packet_async(
@@ -10822,6 +11805,7 @@ impl UploadHandler {
 
                         match hashset_result {
                             Ok(Some(hashes)) => {
+                                let hashes = wire_md4_hashset(hashes, file_size);
                                 let Some(resp) =
                                     encode_legacy_hashset_response(&req_hash, &hashes)
                                 else {
@@ -10907,7 +11891,20 @@ impl UploadHandler {
                                 let memoized_aich = if is_partial || !request_aich {
                                     None
                                 } else {
-                                    self.aich_cache.lock().await.get(&cache_key)
+                                    let cached = self.aich_cache.lock().await.get(&cache_key);
+                                    match cached {
+                                        Some(hs) => Some(hs),
+                                        None => {
+                                            let stored = stored_aich_set(aich_root, file_size).await;
+                                            if let Some(hs) = &stored {
+                                                self.aich_cache
+                                                    .lock()
+                                                    .await
+                                                    .insert(cache_key.clone(), hs.clone());
+                                            }
+                                            stored
+                                        }
+                                    }
                                 };
                                 let compute_aich = request_aich && memoized_aich.is_none();
                                 // A request answered entirely from the memos
@@ -10977,7 +11974,9 @@ impl UploadHandler {
                                             .insert(cache_key.clone(), hs.clone());
                                     }
                                 }
-                                let md4_hashes = memoized_md4.or(computed_md4);
+                                let md4_hashes = memoized_md4
+                                    .or(computed_md4)
+                                    .map(|hashes| wire_md4_hashset(hashes, file_size));
                                 let aich_hashes = memoized_aich
                                     .or(computed_aich)
                                     .map(|hs| hs.part_hashes());
@@ -11081,6 +12080,7 @@ impl UploadHandler {
                                         }).await;
                                     }
                                     uploaded = 0;
+                                    uploaded_wire = 0;
                                     served_bytes_per_part.clear();
                                     sent_blocks.clear();
                                     cached_part_tracker = None;
@@ -11348,10 +12348,21 @@ impl UploadHandler {
                                 let mut cache = self.aich_cache.lock().await;
                                 cache.get(&hash_hex)
                             };
+                            let stored = if cached.is_none() && !file.is_partial {
+                                stored_aich_set(parse_aich_root_hash(&file.aich_hash_hex), file.size)
+                                    .await
+                            } else {
+                                None
+                            };
                             let aich_result = if let Some(hs) = cached {
                                 Ok(hs)
                             } else if file.is_partial {
                                 Err(anyhow::anyhow!("AICH unavailable for partial file"))
+                            } else if let Some(hs) = stored {
+                                // A disk read of the stored leaves, not a hash of
+                                // the file, so it spends none of the budget.
+                                self.aich_cache.lock().await.insert(hash_hex.clone(), hs.clone());
+                                Ok(hs)
                             } else if !uncached_hash_budget.try_spend() {
                                 warn!(
                                     "Peer {peer_addr} exceeded its uncached hashset budget; refusing OP_AICHREQUEST"
@@ -11381,11 +12392,18 @@ impl UploadHandler {
                                     if let Some(requested_root) = requested_root {
                                         if hs.root_hash != requested_root {
                                             debug!(
-                                                "Ignoring AICH request for {}: requested root {} does not match local {}",
+                                                "Refusing AICH request for {}: requested root {} does not match local {}",
                                                 hash_hex,
                                                 hex::encode(requested_root),
                                                 hex::encode(hs.root_hash)
                                             );
+                                            write_packet_async(
+                                                &mut writer,
+                                                OP_EMULEPROT,
+                                                OP_AICHANSWER,
+                                                &req_hash,
+                                            )
+                                            .await?;
                                             continue;
                                         }
                                     }
@@ -11443,8 +12461,23 @@ impl UploadHandler {
                                 }
                                 Err(e) => {
                                     warn!("Failed to build AICH for request: {e}");
+                                    write_packet_async(
+                                        &mut writer,
+                                        OP_EMULEPROT,
+                                        OP_AICHANSWER,
+                                        &req_hash,
+                                    )
+                                    .await?;
                                 }
                             }
+                        } else {
+                            // eMule always answers, with the bare file hash
+                            // when it has no recovery data
+                            // (DownloadClient.cpp:2133-2137); silence leaves the
+                            // asker's recovery of that part pending until it
+                            // disconnects.
+                            write_packet_async(&mut writer, OP_EMULEPROT, OP_AICHANSWER, &req_hash)
+                                .await?;
                         }
                     }
                 }
@@ -11521,18 +12554,14 @@ impl UploadHandler {
                             m.pattern,
                         );
                         // Refused in silence, as above.
-                        {
-                            let mut queue = self.upload_queue.lock().await;
-                            queue.retain(|e| {
-                                e.identity != queue_identity
-                                    || !queue_row_owned_by_session(
-                                        e.current_addr,
-                                        e.tcp_port,
-                                        peer_addr,
-                                        hello_caps.tcp_port,
-                                    )
-                            });
-                        }
+                        remove_refused_queue_row(
+                            &mut *self.upload_queue.lock().await,
+                            &queue_identity,
+                            peer_addr,
+                            hello_caps.tcp_port,
+                            hello_caps.ember_pubkey,
+                            ember_auth_state.is_verified(),
+                        );
                         break;
                     }
                 }
@@ -11572,23 +12601,27 @@ impl UploadHandler {
                         // accounting / queue scoring attribute uploads
                         // to the victim. Mod_version/nickname keep
                         // updating because they're cosmetic.
-                        let identity_changed = secure_v2_authenticated
-                            && (
-                                (ident.ed25519_pubkey.is_some()
-                                    && hello_caps.ember_pubkey.is_some()
-                                    && ident.ed25519_pubkey != hello_caps.ember_pubkey)
-                                || (ident.ember_hash != [0u8; 16]
-                                    && hello_caps.ember_hash.is_some()
-                                    && Some(ident.ember_hash) != hello_caps.ember_hash)
-                            );
+                        //
+                        // Plain sessions are locked to their first claim as
+                        // well: without that, one socket could cycle
+                        // candidate hashes through repeated HELLOs.
+                        let identity_changed = ember_hello_identity_changed(
+                            hello_caps.ember_hash,
+                            hello_caps.ember_pubkey,
+                            ident.ember_hash,
+                            ident.ed25519_pubkey,
+                        );
                         if identity_changed {
                             tracing::warn!(
-                                "Ember identity-swap rejected from {peer_addr}: peer already PoP-verified, ignoring re-keyed OP_EMBER_HELLO (old_hash={:?}, new_hash={})",
+                                "Ember identity-swap rejected from {peer_addr}: ignoring re-keyed OP_EMBER_HELLO (secure_v2={secure_v2_authenticated}, old_hash={:?}, new_hash={})",
                                 hello_caps.ember_hash.as_ref().map(hex::encode),
                                 hex::encode(ident.ember_hash),
                             );
                         }
                         hello_caps.is_ember = true;
+                        if let Some(session) = &peer_session {
+                            session.mark_ember();
+                        }
                         if !ident.mod_version.is_empty() {
                             hello_caps.mod_version = ident.mod_version.clone();
                         }
@@ -11609,6 +12642,7 @@ impl UploadHandler {
                         if peer_user_hash != [0u8; 16] {
                             self.credit_manager.write().await.note_client_identity(
                                 peer_user_hash,
+                                Some(peer_addr.ip()),
                                 &hello_caps.peer_name,
                                 &ul_client_software,
                             );
@@ -11644,7 +12678,7 @@ impl UploadHandler {
                                     info!("Ember binding: peer {peer_addr} pubkey matches advertised hash");
                                     if peer_user_hash != [0u8; 16] {
                                         let mut cm = self.credit_manager.write().await;
-                                        cm.set_ember_hash(peer_user_hash, *peer_eh);
+                                        cm.note_bound_ember_hash(peer_user_hash, *peer_eh);
                                     }
                                     // Unlock mesh + first EPX once HELLO
                                     // binding succeeds (friend privileges
@@ -11732,16 +12766,12 @@ impl UploadHandler {
                             }
                         }
 
-                        // The early gate above the dispatcher fires before
-                        // `OP_EMBER_HELLO`, so classic sessions see
-                        // `peer_ember_hash = None` / `is_friend = false`
-                        // there. Re-evaluate membership now that the hash
-                        // is known. `LEGACY_FRIEND_AUTH_ENABLED` is off, so
-                        // AUTH_RESPONSE will never send the request —
-                        // ship it here (and on mid-session promotion in
-                        // the outer loop). `friend_request_sent` stops the
-                        // HELLO + HELLOANSWER duplicate.
-                        if !is_friend {
+                        // Friend membership is never evaluated from a HELLO
+                        // claim on a plain session (see the `is_friend` seed).
+                        // Secure v2 sessions pin `peer_ember_hash` to the
+                        // Noise identity, so this only catches a request the
+                        // session-open send could not deliver.
+                        if secure_v2_authenticated && !is_friend {
                             if let Some(eh) = peer_ember_hash {
                                 if self.friend_hashes.read().await.contains(&eh) {
                                     is_friend = true;
@@ -11749,7 +12779,11 @@ impl UploadHandler {
                                 }
                             }
                         }
-                        if is_friend && hello_caps.is_ember && !friend_request_sent {
+                        if secure_v2_authenticated
+                            && is_friend
+                            && hello_caps.is_ember
+                            && !friend_request_sent
+                        {
                             info!(
                                 "Sending friend request to Ember peer {peer_addr}"
                             );
@@ -11824,6 +12858,35 @@ impl UploadHandler {
                             .send(UploadEvent {
                                 transfer_id: String::new(),
                                 kind: UploadEventKind::EmberFriendRetract { ember_hash: eh },
+                            })
+                            .await;
+                    }
+                }
+
+                // Refusal of a request we sent. Ahead of the general
+                // `OP_EMBER_EXT` arm for the mirror of the reason above: the
+                // peer refusing is someone we added and they did not, so they
+                // hold no friend privileges here either.
+                //
+                // Proof of possession alone again. The handler only ever
+                // deletes a one-sided row, so the worst a replay can do is
+                // clear a request the user could send again — where binding
+                // alone would let anyone who has seen a public key suppress
+                // requests on that identity's behalf.
+                (OP_EMULEPROT, super::messages::OP_EMBER_EXT)
+                    if secure_v2_authenticated
+                        && matches!(
+                            super::messages::parse_ember_ext(&payload),
+                            Some((super::messages::EMBER_EXT_FRIEND_DECLINE, _))
+                        ) =>
+                {
+                    if let Some(eh) = peer_ember_hash {
+                        debug!("Peer {peer_addr} declined our friend request ({})", hex::encode(eh));
+                        let _ = self
+                            .upload_event_tx
+                            .send(UploadEvent {
+                                transfer_id: String::new(),
+                                kind: UploadEventKind::EmberFriendDecline { ember_hash: eh },
                             })
                             .await;
                     }
@@ -12342,6 +13405,49 @@ impl UploadHandler {
                                         .await;
                                 }
                             }
+                            Some((super::messages::EMBER_EXT_ATTACH_OFFER
+                                | super::messages::EMBER_EXT_ATTACH_REPLY
+                                | super::messages::EMBER_EXT_ATTACH_CANCEL, _)) => {
+                                if let Some(kind) = attach_event_from_ext(eh, &payload, attach_addr) {
+                                    let _ = self
+                                        .upload_event_tx
+                                        .send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind,
+                                        })
+                                        .await;
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_BROWSE_SCOPE, body)) => {
+                                if let Some(session) = ember_session_handle.as_ref() {
+                                    let _ = self
+                                        .upload_event_tx
+                                        .send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind: UploadEventKind::EmberBrowseScope {
+                                                ember_hash: eh,
+                                                session_id: session.session_id(),
+                                                body: body.to_vec(),
+                                            },
+                                        })
+                                        .await;
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_BROWSE_SUMMARY, body)) => {
+                                if let Some(session) = ember_session_handle.as_ref() {
+                                    let _ = self
+                                        .upload_event_tx
+                                        .send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind: UploadEventKind::EmberBrowseSummary {
+                                                ember_hash: eh,
+                                                session_id: session.session_id(),
+                                                body: body.to_vec(),
+                                            },
+                                        })
+                                        .await;
+                                }
+                            }
                             // A sub-type this build predates. Ignoring it is
                             // the whole point of the envelope.
                             Some((other, _)) => debug!(
@@ -12717,6 +13823,20 @@ fn parse_aich_root_hash(hex_str: &str) -> Option<[u8; 20]> {
     Some(out)
 }
 
+/// The file's recovery set as `known2_64.met` holds it, verified against its
+/// AICH master, instead of one rebuilt by hashing the whole file. `None` when
+/// the file has no known master or the store has no matching set.
+async fn stored_aich_set(
+    aich_root: Option<[u8; 20]>,
+    file_size: u64,
+) -> Option<crate::network::ed2k::aich::AICHRecoveryHashSet> {
+    let root = aich_root?;
+    tokio::task::spawn_blocking(move || crate::network::ed2k::aich::known2_load_set(&root, file_size))
+        .await
+        .ok()
+        .flatten()
+}
+
 fn encode_legacy_hashset_response(file_hash: &[u8; 16], hashes: &[[u8; 16]]) -> Option<Vec<u8>> {
     let count = u16::try_from(hashes.len()).ok()?;
     let mut response = Vec::with_capacity(16 + 2 + hashes.len() * 16);
@@ -12847,12 +13967,28 @@ fn compute_part_hashes(file: &mut std::fs::File) -> anyhow::Result<Vec<[u8; 16]>
         remaining -= part_size;
     }
 
-    // NOTE: do NOT append trailing MD4("") here. The trailing empty hash is
-    // a computation artifact used only when deriving the overall file hash from
-    // part hashes (see ed2k_hash_from_parts). eMule's hashset answer also omits
-    // it — the receiver's verify_hashset adds it during verification.
+    // One hash per part; `wire_md4_hashset` adds eMule's trailing MD4("")
+    // when the set goes on the wire.
 
     Ok(hashes)
+}
+
+/// Part hashes as eMule puts them in `OP_HASHSETANSWER`/`OP_HASHSETANSWER2`.
+///
+/// For a size that is an exact multiple of PARTSIZE eMule hashes one more,
+/// empty part (`KnownFile.cpp:412-416`) and its reader insists on
+/// `size / PARTSIZE + 1` hashes (`GetTheoreticalMD4PartHashCount`,
+/// `FileIdentifier.cpp:187, :226-234`), throwing "bad hashset" otherwise —
+/// which sets `DS_ERROR` and dead-sources us for that file.
+fn wire_md4_hashset(mut hashes: Vec<[u8; 16]>, file_size: u64) -> Vec<[u8; 16]> {
+    use digest::Digest;
+    if file_size > 0
+        && file_size.is_multiple_of(PARTSIZE)
+        && hashes.len() as u64 == file_size / PARTSIZE
+    {
+        hashes.push(md4::Md4::digest(b"").into());
+    }
+    hashes
 }
 
 async fn read_packet_timeout<R: AsyncReadExt + Unpin>(
@@ -12866,12 +14002,46 @@ async fn read_packet_timeout<R: AsyncReadExt + Unpin>(
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
 }
 
+/// Wait up to `idle` for the peer to start another frame, then read that
+/// frame whole. `Ok(None)` means nothing arrived and the stream is still on a
+/// frame boundary, so the caller may keep using it.
+///
+/// A plain `timeout(read_packet_async_inner(..))` cannot be continued from:
+/// the timeout can fire after the header or part of the payload was consumed,
+/// leaving the next read mid-frame (and, on an obfuscated socket, the RC4
+/// keystream past bytes nobody decoded as a frame). Here the only point the
+/// timeout can cancel is the single-byte read, which is atomic; once a frame
+/// has begun, exceeding `frame` is an error the caller must treat as fatal.
+async fn read_packet_if_started<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    idle: std::time::Duration,
+    frame: std::time::Duration,
+) -> std::io::Result<Option<(u8, u8, Vec<u8>)>> {
+    let first = match tokio::time::timeout(idle, reader.read_u8()).await {
+        Ok(byte) => byte?,
+        Err(_) => return Ok(None),
+    };
+    tokio::time::timeout(frame, read_packet_after_protocol(reader, first))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "frame read timed out"))?
+        .map(Some)
+}
+
 async fn read_packet_async_inner<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
+    let protocol = reader.read_u8().await?;
+    read_packet_after_protocol(reader, protocol).await
+}
+
+/// Rest of [`read_packet_async_inner`] once the protocol byte is consumed,
+/// including `OP_PACKEDPROT` inflation.
+async fn read_packet_after_protocol<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    protocol: u8,
+) -> std::io::Result<(u8, u8, Vec<u8>)> {
     use std::io::Read as StdRead;
     const OP_PACKEDPROT: u8 = 0xD4;
-    let protocol = reader.read_u8().await?;
     let length = reader.read_u32_le().await? as usize;
     if length == 0 || length > 512 * 1024 {
         return Err(std::io::Error::new(
@@ -13051,6 +14221,120 @@ mod unique_served_tests {
              are ever equal the caller has passed one counter twice, which is \
              the bug this pins"
         );
+    }
+
+    /// A peer that never claimed Unicode support gets a label it can actually
+    /// decode, and the request it echoes back still resolves to the folder.
+    ///
+    /// The round trip is the point: the label we send is the only string the
+    /// peer has to ask with, so folding the answer without also accepting the
+    /// folded form in `OP_ASKSHAREDFILESDIR` would leave the directory visible
+    /// and permanently un-openable.
+    #[test]
+    fn a_non_unicode_peer_gets_a_label_it_can_decode() {
+        type Server = UploadHandler;
+        let folder = "Música";
+
+        let unicode = Server::browse_label_for_peer(folder, true);
+        assert_eq!(unicode, folder, "a Unicode peer gets the name unchanged");
+
+        let folded = Server::browse_label_for_peer(folder, false);
+        assert!(folded.is_ascii(), "ASCII decodes the same in every codepage");
+        assert_eq!(folded, "M_sica");
+        assert_eq!(
+            folded.chars().count(),
+            folder.chars().count(),
+            "one substitute per character, as eMule's ANSI conversion does"
+        );
+
+        // Folding is applied to the label, not the path, so it is the same
+        // string on both sides of the exchange.
+        assert_eq!(
+            Server::browse_label_for_peer(&folded, false),
+            folded,
+            "already-ASCII labels are left alone, so the match is stable"
+        );
+
+        // An ASCII folder is untouched either way — the common case pays nothing.
+        assert_eq!(Server::browse_label_for_peer("Videos", false), "Videos");
+        assert_eq!(Server::browse_label_for_peer("Videos", true), "Videos");
+    }
+
+    fn browse_entry(folder: &str, name: &str) -> (String, BrowseEntry) {
+        (
+            folder.to_string(),
+            ("00".repeat(16), name.to_string(), 1, String::new()),
+        )
+    }
+
+    fn decode_dir_labels(buf: &[u8]) -> Vec<String> {
+        let count = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+        let mut rest = &buf[4..];
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = u16::from_le_bytes(rest[..2].try_into().unwrap()) as usize;
+            out.push(String::from_utf8(rest[2..2 + len].to_vec()).unwrap());
+            rest = &rest[2 + len..];
+        }
+        assert!(rest.is_empty());
+        out
+    }
+
+    /// eMule asks for every directory it is sent, so the list must never be
+    /// longer than the per-session answer allowance — otherwise an honest
+    /// browse of a large library runs past it and is charged as abuse.
+    #[test]
+    fn dir_browse_list_is_capped_and_overflow_stays_reachable() {
+        let max = MAX_DIR_BROWSE_ANSWERS_PER_SESSION as usize;
+        let files: Vec<_> = (0..max + 50)
+            .map(|i| browse_entry(&format!("C:\\Share\\dir{i}"), &format!("f{i}")))
+            .collect();
+        let listing = DirBrowseListing::build(files, true, max);
+
+        let labels = decode_dir_labels(&listing.encode_dirs());
+        assert_eq!(labels.len(), max);
+        assert_eq!(labels[0], "dir0", "advertised in index order");
+        assert_eq!(
+            labels.last().map(String::as_str),
+            Some(super::super::messages::OP_OTHER_SHARED_FILES)
+        );
+        assert!(!labels.contains(&format!("dir{}", max - 1)));
+
+        let other = listing.files_in(super::super::messages::OP_OTHER_SHARED_FILES);
+        assert_eq!(other.len(), 51, "every overflow folder's files are kept");
+        assert_eq!(listing.files_in("dir0").len(), 1);
+        assert!(listing.files_in(&format!("dir{}", max + 10)).is_empty());
+        assert!(listing.files_in("never-sent").is_empty());
+    }
+
+    #[test]
+    fn dir_browse_list_under_cap_is_one_entry_per_label() {
+        let files = vec![
+            browse_entry("C:\\A\\Music", "a"),
+            browse_entry("D:\\B\\Music", "b"),
+            browse_entry("C:\\Videos", "c"),
+            browse_entry("C:\\A\\Music", "d"),
+        ];
+        let listing = DirBrowseListing::build(files, true, 256);
+        assert_eq!(decode_dir_labels(&listing.encode_dirs()), ["Music", "Videos"]);
+        let names: Vec<_> = listing.files_in("Music").iter().map(|e| e.1.as_str()).collect();
+        assert_eq!(names, ["a", "b", "d"]);
+    }
+
+    /// The listing is keyed by the label as sent, so the folded name a
+    /// non-Unicode peer echoes back resolves, and a Unicode peer's exact
+    /// request never lands on a different folder that folds onto it.
+    #[test]
+    fn dir_browse_lookup_matches_the_label_the_peer_was_sent() {
+        let files = vec![browse_entry("C:\\Música", "x"), browse_entry("C:\\M_sica", "y")];
+
+        let folded = DirBrowseListing::build(files.clone(), false, 256);
+        assert_eq!(decode_dir_labels(&folded.encode_dirs()), ["M_sica"]);
+        assert_eq!(folded.files_in("M_sica").len(), 2);
+
+        let unicode = DirBrowseListing::build(files, true, 256);
+        assert_eq!(unicode.files_in("Música").len(), 1);
+        assert_eq!(unicode.files_in("M_sica")[0].1, "y");
     }
 
     #[test]
@@ -13765,7 +15049,7 @@ mod browse_answer_tests {
         )];
 
         let payload =
-            encode_shared_files_answer(&files, 0x0100A8C0 /* 192.168.0.1 LE */, 4662);
+            encode_shared_files_answer(&files, 0x0100A8C0 /* 192.168.0.1 LE */, 4662, true);
 
         let mut pos = 0usize;
         let count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
@@ -13836,12 +15120,24 @@ mod browse_answer_tests {
         let big_size = OLD_MAX_EMULE_FILE_SIZE + (5u64 << 32) + 42;
         let files = vec![(hash_hex, "big.iso".to_string(), big_size, "iso".to_string())];
 
-        let payload = encode_shared_files_answer(&files, 0, 4662);
+        let payload = encode_shared_files_answer(&files, 0, 4662, true);
 
         // count(4) + hash(16) + id(4) + port(2) + tag_count(4)
         let tag_count = u32::from_le_bytes(payload[26..30].try_into().unwrap());
         // FT_FILENAME + FT_FILESIZE + FT_FILESIZE_HI + FT_FILETYPE (iso -> "Iso")
         assert_eq!(tag_count, 4);
+
+        // A peer that never told us it understands large files is not sent the
+        // file at all, the way eMule filters it out of the listing. The low 32
+        // bits on their own would read as a plausible small file and have it
+        // ask for ranges that do not exist.
+        let small_only = encode_shared_files_answer(&files, 0, 4662, false);
+        assert_eq!(
+            u32::from_le_bytes(small_only[0..4].try_into().unwrap()),
+            0,
+            "a large file must be omitted for a peer without large-file support"
+        );
+        assert_eq!(small_only.len(), 4, "omitted means no entry, not a stub");
 
         // FT_FILESIZE_HI tag header: type=0x03 (uint32), name_len=1 (LE u16:
         // 0x01, 0x00), name_id=0x3A — scan for that exact 4-byte header
@@ -13877,7 +15173,7 @@ mod browse_answer_tests {
             ),
         ];
 
-        let payload = encode_shared_files_answer(&files, 0, 4662);
+        let payload = encode_shared_files_answer(&files, 0, 4662, true);
         let count = u32::from_le_bytes(payload[0..4].try_into().unwrap());
         assert_eq!(
             count, 1,
@@ -13895,7 +15191,7 @@ mod browse_answer_tests {
     /// treating "nothing shared" as a denial.
     #[test]
     fn empty_share_list_encodes_zero_count() {
-        let payload = encode_shared_files_answer(&[], 0, 4662);
+        let payload = encode_shared_files_answer(&[], 0, 4662, true);
         assert_eq!(payload.len(), 4);
         assert_eq!(u32::from_le_bytes(payload[..4].try_into().unwrap()), 0);
     }
@@ -13922,7 +15218,7 @@ mod browse_answer_tests {
             })
             .collect();
 
-        let payload = encode_shared_files_answer(&files, 0, 4662);
+        let payload = encode_shared_files_answer(&files, 0, 4662, true);
 
         assert!(
             payload.len() < 512 * 1024,
@@ -14251,10 +15547,112 @@ mod ember_session_handle_tests {
 }
 
 #[cfg(test)]
+mod handshake_read_and_identity_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn emule_info_frame() -> Vec<u8> {
+        let mut frame = vec![OP_EMULEPROT];
+        frame.extend_from_slice(&3u32.to_le_bytes());
+        frame.extend_from_slice(&[OP_EMULEINFO, 0xAB, 0xCD]);
+        frame
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_leaves_the_stream_on_a_frame_boundary() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let idle = read_packet_if_started(
+            &mut reader,
+            Duration::from_millis(30),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(idle.is_none());
+
+        writer.write_all(&emule_info_frame()).await.unwrap();
+        let (protocol, opcode, payload) = read_packet_if_started(
+            &mut reader,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap()
+        .expect("frame after an idle timeout parses from its first byte");
+        assert_eq!((protocol, opcode), (OP_EMULEPROT, OP_EMULEINFO));
+        assert_eq!(payload, [0xAB, 0xCD]);
+    }
+
+    #[tokio::test]
+    async fn a_frame_that_stalls_midway_is_an_error_not_an_idle_timeout() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let frame = emule_info_frame();
+        writer.write_all(&frame[..3]).await.unwrap();
+        let err = read_packet_if_started(
+            &mut reader,
+            Duration::from_secs(5),
+            Duration::from_millis(30),
+        )
+        .await
+        .expect_err("partially consumed frame must not report Ok(None)");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn first_claimed_ember_identity_is_locked_for_the_session() {
+        let a = [0xA1; 16];
+        let b = [0xB2; 16];
+        let pk_a = [0x11; 32];
+        let pk_b = [0x22; 32];
+
+        assert!(!ember_hello_identity_changed(None, None, a, None));
+        assert!(!ember_hello_identity_changed(Some(a), None, a, None));
+        assert!(!ember_hello_identity_changed(Some(a), None, [0u8; 16], None));
+        assert!(!ember_hello_identity_changed(Some(a), None, a, Some(pk_a)));
+        assert!(!ember_hello_identity_changed(Some(a), Some(pk_a), a, Some(pk_a)));
+
+        assert!(ember_hello_identity_changed(Some(a), None, b, None));
+        assert!(ember_hello_identity_changed(Some(a), Some(pk_a), a, Some(pk_b)));
+        assert!(ember_hello_identity_changed(Some(a), Some(pk_a), b, Some(pk_a)));
+    }
+}
+
+#[cfg(test)]
 mod abuse_and_seniority_tests {
     //! Regression coverage for the upload-side defences that were either
     //! missing a bound or punishing honest peers.
     use super::*;
+
+    /// Repeated asks for one file we will not serve are one probe, not many;
+    /// only distinct hashes approach the ban.
+    #[test]
+    fn file_not_found_ban_counts_distinct_hashes() {
+        let mut tracker = AbuseTracker::new();
+        let ip: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        for _ in 0..50 {
+            assert!(!tracker.record_file_not_found(ip, [0x11; 16]));
+        }
+        for n in 0..(MAX_FILE_NOT_FOUND as u8 - 1) {
+            assert!(!tracker.record_file_not_found(ip, [n + 0x20; 16]));
+        }
+        assert!(tracker.record_file_not_found(ip, [0xEE; 16]), "the 11th distinct hash bans");
+    }
+
+    /// eMule's reader wants `size / PARTSIZE + 1` hashes for an exact
+    /// multiple, the last being MD4 of the empty trailing part.
+    #[test]
+    fn wire_hashset_adds_the_empty_part_for_exact_multiples() {
+        use digest::Digest;
+        let empty: [u8; 16] = md4::Md4::digest(b"").into();
+        let two = vec![[1u8; 16], [2u8; 16]];
+        assert_eq!(
+            wire_md4_hashset(two.clone(), PARTSIZE * 2),
+            vec![[1u8; 16], [2u8; 16], empty]
+        );
+        assert_eq!(wire_md4_hashset(two.clone(), PARTSIZE * 2 - 1), two);
+        let already = vec![[1u8; 16], [2u8; 16], empty];
+        assert_eq!(wire_md4_hashset(already.clone(), PARTSIZE * 2), already);
+    }
 
     /// The purge clock has to be the last *request*, not the join time, or a peer
     /// that re-asks exactly as the protocol tells it to is still evicted an hour
@@ -14638,6 +16036,152 @@ mod abuse_and_seniority_tests {
 
     fn addr(ip: &str) -> SocketAddr {
         format!("{ip}:4662").parse().unwrap()
+    }
+
+    fn waiter(ip: &str, udp_port: u16) -> QueueEntry {
+        let mut entry = queue_entry(Some(ip.parse().unwrap()), None);
+        entry.udp_port = udp_port;
+        entry
+    }
+
+    #[test]
+    fn push_grant_picker_skips_banned_backed_off_and_in_flight_rows() {
+        let e = waiter("203.0.113.7", 4672);
+        let none = HashSet::new();
+        let no_backoff = HashMap::new();
+        let never = |_: &[u8; 16], _: &SocketAddr| false;
+        assert!(push_grant_dialable(&e, &none, &no_backoff, never));
+
+        let banned_hash = |h: &[u8; 16], _: &SocketAddr| *h == [7u8; 16];
+        assert!(!push_grant_dialable(&e, &none, &no_backoff, banned_hash));
+        let banned_ip = |_: &[u8; 16], a: &SocketAddr| *a == addr("203.0.113.7");
+        assert!(!push_grant_dialable(&e, &none, &no_backoff, banned_ip));
+
+        let mut backoff = HashMap::new();
+        backoff.insert(
+            e.identity.clone(),
+            std::time::Instant::now() + std::time::Duration::from_secs(PUSH_GRANT_BACKOFF_SECS),
+        );
+        assert!(!push_grant_dialable(&e, &none, &backoff, never));
+
+        let in_flight: HashSet<QueueIdentity> = [e.identity.clone()].into_iter().collect();
+        assert!(!push_grant_dialable(&e, &in_flight, &no_backoff, never));
+
+        let mut connected = e.clone();
+        connected.current_addr = Some(addr("203.0.113.7"));
+        assert!(!push_grant_dialable(&connected, &none, &no_backoff, never));
+    }
+
+    #[test]
+    fn a_refused_peer_loses_its_row_but_not_someone_elses() {
+        let refused = waiter("203.0.113.7", 4672);
+        let mut other = waiter("198.51.100.9", 4672);
+        other.identity = QueueIdentity::UserHash([9u8; 16]);
+        other.user_hash = [9u8; 16];
+        let mut queue = vec![refused.clone(), other.clone()];
+        remove_refused_queue_row(
+            &mut queue,
+            &refused.identity,
+            addr("203.0.113.7"),
+            4662,
+            None,
+            false,
+        );
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].identity, other.identity);
+
+        // A row bound live from another address is a different client using
+        // (or spoofing) the same identity; refusing this one must not evict it.
+        let mut bound_elsewhere = refused.clone();
+        bound_elsewhere.current_addr = Some(addr("192.0.2.1"));
+        let mut queue = vec![bound_elsewhere];
+        remove_refused_queue_row(
+            &mut queue,
+            &refused.identity,
+            addr("203.0.113.7"),
+            4662,
+            None,
+            false,
+        );
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// The row's identity is the cleartext Hello hash. A peer replaying a
+    /// waiter's hash from its own address, with a mod string AntiLeech refuses,
+    /// must not take the real waiter's disconnected row down with it.
+    #[test]
+    fn a_replayed_hash_refused_elsewhere_keeps_the_real_waiters_row() {
+        let victim = waiter("203.0.113.7", 4672);
+        let attacker = addr("198.51.100.66");
+        let mut queue = vec![victim.clone()];
+        remove_refused_queue_row(&mut queue, &victim.identity, attacker, 4662, None, false);
+        assert_eq!(queue.len(), 1, "an unverified claim from a new address evicts nothing");
+
+        // An unverified claim naming the row's key is still only a claim.
+        let key = [0x42u8; 32];
+        let mut ember_victim = queue_entry(Some("203.0.113.7".parse().unwrap()), Some(key));
+        ember_victim.udp_port = 4672;
+        let mut queue = vec![ember_victim.clone()];
+        remove_refused_queue_row(&mut queue, &ember_victim.identity, attacker, 4662, Some(key), false);
+        assert_eq!(queue.len(), 1);
+
+        // Proof of possession for the row's key is the same peer on a new address.
+        remove_refused_queue_row(&mut queue, &ember_victim.identity, attacker, 4662, Some(key), true);
+        assert!(queue.is_empty());
+    }
+
+    /// A banned hash is refused for the hash itself, so every unbound row it
+    /// holds goes wherever the refused session connects from.
+    #[test]
+    fn a_banned_hash_loses_its_row_from_any_address() {
+        let banned = waiter("203.0.113.7", 4672);
+        let mut queue = vec![banned.clone()];
+        remove_banned_hash_queue_rows(&mut queue, banned.user_hash, addr("198.51.100.66"), 4662);
+        assert!(queue.is_empty());
+    }
+
+    /// Every queued socket is released after `QUEUED_SOCKET_IDLE_SECS`, so a
+    /// waiter known by user hash is disconnected nearly all the time it waits.
+    /// Its UDP re-asks used to match nothing that refreshed its purge clock,
+    /// so each waiter fell off the list an hour after its last TCP visit while
+    /// still re-asking every 29 minutes — capping the queue at about an hour of
+    /// arrivals, well below aMule on the same share.
+    #[test]
+    fn a_disconnected_waiter_is_found_by_its_last_address() {
+        let queue = vec![waiter("203.0.113.7", 4672)];
+        assert!(queue[0].current_addr.is_none());
+        let from: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(find_udp_reasker(&queue, from, 4672, &[1u8; 16]), Some(0));
+        // A NAT may remap the UDP port; alone at its address, it still matches.
+        assert_eq!(find_udp_reasker(&queue, from, 50_000, &[1u8; 16]), Some(0));
+    }
+
+    #[test]
+    fn the_udp_port_alone_is_not_an_identity() {
+        // eMule's default UDP port is shared by countless clients, so a
+        // stranger re-asking from it must not inherit someone else's place.
+        let queue = vec![waiter("203.0.113.7", 4672)];
+        let stranger: IpAddr = "198.51.100.9".parse().unwrap();
+        assert_eq!(find_udp_reasker(&queue, stranger, 4672, &[1u8; 16]), None);
+    }
+
+    #[test]
+    fn waiters_behind_one_address_are_told_apart_by_port() {
+        let queue = vec![waiter("203.0.113.7", 4672), waiter("203.0.113.7", 4673)];
+        let from: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(find_udp_reasker(&queue, from, 4673, &[1u8; 16]), Some(1));
+        assert_eq!(find_udp_reasker(&queue, from, 4672, &[1u8; 16]), Some(0));
+        // Neither port: ambiguous, so neither is claimed.
+        assert_eq!(find_udp_reasker(&queue, from, 9_999, &[1u8; 16]), None);
+    }
+
+    #[test]
+    fn udp_reask_matching_ignores_ipv4_mapping_and_other_files() {
+        let queue = vec![waiter("203.0.113.7", 4672)];
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        assert_eq!(find_udp_reasker(&queue, mapped, 4672, &[1u8; 16]), Some(0));
+        let from: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(find_udp_reasker(&queue, from, 4672, &[2u8; 16]), None);
     }
 
     fn backdate(

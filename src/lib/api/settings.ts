@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import * as m from '$lib/paraglide/messages';
 import type { AppSettings, WebService } from '$lib/types';
 
 export type SettingsUpdateOutcome = 'applied' | 'restart_required' | 'deferred';
@@ -59,7 +60,7 @@ export async function updateSettings(
  *  from here, the same way shared folders can only be added through
  *  `pick_shared_folder`. */
 export async function pickDownloadFolder(): Promise<string | null> {
-  return invoke<string | null>('pick_download_folder');
+  return invoke<string | null>('pick_download_folder', { title: m.picker_download_folder() });
 }
 
 /** Open the native picker for the external Preview player, returning the
@@ -70,7 +71,7 @@ export async function pickDownloadFolder(): Promise<string | null> {
  *  *changed* `preview_player` that did not come from this dialog. Clearing it
  *  back to empty needs no picker. */
 export async function pickPreviewPlayer(): Promise<string | null> {
-  return invoke<string | null>('pick_preview_player');
+  return invoke<string | null>('pick_preview_player', { title: m.picker_preview_player() });
 }
 
 export async function downloadNodesDat(): Promise<NodesDatDownloadResult> {
@@ -218,7 +219,7 @@ export async function openWebService(
  * would not be.
  */
 export async function importWebServicesFile(): Promise<WebService[] | null> {
-  return invoke('pick_and_import_webservices_file');
+  return invoke('pick_and_import_webservices_file', { title: m.picker_webservices() });
 }
 
 /**

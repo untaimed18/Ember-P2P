@@ -1,9 +1,9 @@
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
+use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind, RenameMode};
 use notify::{recommended_watcher, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
@@ -23,11 +23,12 @@ use crate::app_state::AppState;
 ///   scan's own `read_dir` retriggers the watcher, which rescans, which opens
 ///   the directory again — a loop every debounce window, which is what a
 ///   first Linux run produced on an empty Incoming folder.
-/// - Each accepted event sends one ping on an internal channel; the handler
-///   task coalesces multiple pings into a single reload call.
-/// - The reload path reuses the existing `reload_shared_files` Tauri command
-///   so hashing, KAD (re)publishing, and UI events behave identically to a
-///   manual reload triggered from the frontend.
+/// - Each accepted event records the paths it names and sends one ping on an
+///   internal channel; the handler task coalesces pings and rescans only
+///   those paths (see [`crate::commands::sharing::rescan_shared_paths`]).
+///   An event that names no path — the backend saying events were dropped —
+///   or more paths than a scoped pass is worth falls back to the full
+///   `reload_shared_files`.
 /// - Folders added via `add_shared_folder` are added with `sync_paths`;
 ///   folders removed via `remove_shared_folder` are unwatched the same way.
 pub struct SharedFoldersWatcher {
@@ -38,6 +39,86 @@ pub struct SharedFoldersWatcher {
     /// registered, so this is what lets the retry loop tell "not requested"
     /// apart from "requested but unavailable".
     desired: Mutex<Vec<String>>,
+    pending: Arc<Mutex<PendingRescan>>,
+    reload_tx: mpsc::Sender<()>,
+}
+
+/// Distinct paths one scoped rescan takes on before a full reload is cheaper
+/// than probing each of them.
+const MAX_SCOPED_RESCAN_PATHS: usize = 512;
+
+/// What the next rescan has to cover.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RescanScope {
+    Full,
+    Paths(Vec<PathBuf>),
+}
+
+/// Paths accepted events have named since the driver last took them.
+#[derive(Debug, Default)]
+pub(crate) struct PendingRescan {
+    full: bool,
+    paths: HashSet<PathBuf>,
+    /// Departures under a name discovery never shares (see
+    /// [`rescan_paths_for_event`]), rescanned only if the index turns out to
+    /// hold rows at or under them.
+    unconfirmed: HashSet<PathBuf>,
+}
+
+impl PendingRescan {
+    pub(crate) fn note_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        if self.full {
+            return;
+        }
+        self.paths.extend(paths);
+        if self.paths.len() > MAX_SCOPED_RESCAN_PATHS {
+            self.note_full();
+        }
+    }
+
+    pub(crate) fn note_unconfirmed(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        if self.full {
+            return;
+        }
+        for path in paths {
+            // Past the cap these are dropped rather than escalated: a file
+            // under such a name is never indexed, so only a folder could hold
+            // rows, and hundreds of those vanishing at once is not a real case.
+            if self.unconfirmed.len() >= MAX_SCOPED_RESCAN_PATHS {
+                break;
+            }
+            self.unconfirmed.insert(path);
+        }
+    }
+
+    pub(crate) fn take_unconfirmed(&mut self) -> Vec<PathBuf> {
+        self.unconfirmed.drain().collect()
+    }
+
+    pub(crate) fn note_full(&mut self) {
+        self.full = true;
+        self.paths.clear();
+        self.unconfirmed.clear();
+    }
+
+    pub(crate) fn take(&mut self) -> Option<RescanScope> {
+        if std::mem::take(&mut self.full) {
+            return Some(RescanScope::Full);
+        }
+        if self.paths.is_empty() {
+            return None;
+        }
+        Some(RescanScope::Paths(self.paths.drain().collect()))
+    }
+
+    /// Put back a scope whose rescan could not start, merged with anything
+    /// noted since.
+    pub(crate) fn restore(&mut self, scope: RescanScope) {
+        match scope {
+            RescanScope::Full => self.note_full(),
+            RescanScope::Paths(paths) => self.note_paths(paths),
+        }
+    }
 }
 
 /// How often to retry shared folders that could not be watched — an external
@@ -45,7 +126,9 @@ pub struct SharedFoldersWatcher {
 /// disappeared mid-session and took its OS watch with it.
 const WATCH_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
-/// True when this event's paths could name a file the Library would ever show.
+/// The paths of an event that could name a file the Library would ever show —
+/// what a scoped rescan of this event has to look at. Empty means the event
+/// cannot change the shared set.
 ///
 /// [`event_should_rescan`] answers "did something change"; this answers "could
 /// the thing that changed ever be shared". Discovery refuses `.part`,
@@ -65,21 +148,60 @@ const WATCH_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// to the real name, and that event carries both, so the file still reaches the
 /// Library on the next rescan exactly as before.
 ///
-/// An event with no paths is assumed to matter. `notify` emits those for
+/// An event with no paths is not handled here: `notify` emits those for
 /// backend-level notices such as an inotify queue overflow, which means events
-/// were dropped — the one case where sitting still is worst.
-pub(crate) fn event_paths_can_change_the_share(paths: &[PathBuf]) -> bool {
-    if paths.is_empty() {
-        return true;
+/// were dropped — the one case where sitting still is worst — so the callback
+/// sends them to a full reload.
+///
+/// Returns `(paths, unconfirmed)`. The name rule is only decisive for a path
+/// something arrived at. A path something *left* — a delete, or the old name of
+/// a rename — may have been a folder, and discovery walks folders whatever
+/// they are called, so rows can sit under a name the rule refuses. Those go
+/// back as `unconfirmed` for the driver to check against the index, instead of
+/// being dropped (a stale row) or rescanned outright: every `.met.tmp` →
+/// `.part.met` save an active download makes is such a departure.
+pub(crate) fn rescan_paths_for_event(
+    kind: EventKind,
+    paths: &[PathBuf],
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut rescan = Vec::new();
+    let mut unconfirmed = Vec::new();
+    for (position, path) in paths.iter().enumerate() {
+        // Names first: the name rules are pure string work while
+        // `is_excluded_share_location` canonicalizes. For the case this exists
+        // for — a download writing `.part` blocks — the name rule answers and
+        // the syscall is never reached.
+        let shareable_name = !crate::sharing::indexer::is_excluded_share_file_name(path);
+        if !shareable_name && !is_departure(kind, position) {
+            continue;
+        }
+        if crate::sharing::indexer::is_excluded_share_location(path) {
+            continue;
+        }
+        if shareable_name {
+            rescan.push(path.clone());
+        } else {
+            unconfirmed.push(path.clone());
+        }
     }
-    paths.iter().any(|path| {
-        // Name first, and let `&&` short-circuit on it: the name rules are pure
-        // string work while `is_excluded_share_location` canonicalizes. For the
-        // case this exists for — a download writing `.part` blocks — the name
-        // rule answers and the syscall is never reached.
-        !crate::sharing::indexer::is_excluded_share_file_name(path)
-            && !crate::sharing::indexer::is_excluded_share_location(path)
-    })
+    (rescan, unconfirmed)
+}
+
+/// Whether the event's path at `position` names where something used to be.
+/// A rename reported as one event carries the old name first.
+fn is_departure(kind: EventKind, position: usize) -> bool {
+    match kind {
+        EventKind::Remove(_) => true,
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => position == 0,
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => false,
+        EventKind::Modify(ModifyKind::Name(_)) => true,
+        _ => false,
+    }
+}
+
+/// Whether the index holds a row at `path` or anywhere under it.
+fn index_has_rows_at_or_under(index: &crate::search::index::LocalIndex, path: &Path) -> bool {
+    index.has_rows_at_or_under(&path.to_string_lossy())
 }
 
 /// True when this event means a shareable file may have appeared, vanished, or
@@ -114,10 +236,13 @@ impl SharedFoldersWatcher {
         // extras. This caps memory under a bulk copy that fires thousands of
         // notifications before the reload driver catches up.
         let (reload_tx, mut reload_rx) = mpsc::channel::<()>(8);
+        let pending = Arc::new(Mutex::new(PendingRescan::default()));
+        let pending_for_driver = pending.clone();
 
-        // Reload driver task: coalesces pings, emits the UI event, and
-        // reuses reload_shared_files so the heavy lifting (discover, hash,
-        // publish) is shared with the manual-reload path.
+        // Reload driver task: coalesces pings, emits the UI event, and runs
+        // either a scoped rescan of the paths the events named or the full
+        // reload_shared_files, so the heavy lifting (discover, hash, publish)
+        // is shared with the manual-reload path.
         let app_for_handler = app.clone();
         // Lets the driver re-arm itself when a reload is rejected because one
         // is already in flight.
@@ -160,6 +285,24 @@ impl SharedFoldersWatcher {
                 }
 
                 let state_ref = app_for_handler.state::<AppState>();
+                let unconfirmed = pending_for_driver.lock().take_unconfirmed();
+                if !unconfirmed.is_empty() {
+                    let confirmed = {
+                        let index = state_ref.local_index.read().await;
+                        unconfirmed
+                            .into_iter()
+                            .filter(|path| index_has_rows_at_or_under(&index, path))
+                            .collect::<Vec<_>>()
+                    };
+                    pending_for_driver.lock().note_paths(confirmed);
+                }
+
+                // Nothing noted: a re-arm whose paths an earlier pass took, or
+                // departures the index held nothing for.
+                let Some(scope) = pending_for_driver.lock().take() else {
+                    continue;
+                };
+
                 // An FS event during exit must not start a reload: shutdown has
                 // already joined the scans it tracks, so a rescan queued now
                 // would mutate `known_files` behind the authoritative flush and
@@ -193,18 +336,31 @@ impl SharedFoldersWatcher {
                     continue;
                 }
 
-                info!("FS watcher: triggering shared-folder rescan");
                 let _ = app_for_handler.emit(
                     "shared-files-changed",
                     serde_json::json!({ "phase": "fs-changed" }),
                 );
 
-                if let Err(e) = crate::commands::sharing::reload_shared_files(
-                    app_for_handler.clone(),
-                    state_ref,
-                )
-                .await
-                {
+                let result = match &scope {
+                    RescanScope::Full => {
+                        info!("FS watcher: triggering full shared-folder rescan");
+                        crate::commands::sharing::reload_shared_files(
+                            app_for_handler.clone(),
+                            state_ref,
+                        )
+                        .await
+                    }
+                    RescanScope::Paths(paths) => {
+                        info!("FS watcher: rescanning {} changed path(s)", paths.len());
+                        crate::commands::sharing::rescan_shared_paths(
+                            app_for_handler.clone(),
+                            &state_ref,
+                            paths.clone(),
+                        )
+                        .await
+                    }
+                };
+                if let Err(e) = result {
                     // A reload already running rejects this one outright, and
                     // the coalescing loop above has already drained every
                     // queued ping — so without a re-arm the notification was
@@ -213,6 +369,7 @@ impl SharedFoldersWatcher {
                     // scan, and everything copied while it runs raises exactly
                     // this rejection and never gets indexed.
                     if e.contains("sharing_reload_in_flight") {
+                        pending_for_driver.lock().restore(scope);
                         let retry_tx = reload_tx_for_retry.clone();
                         tauri::async_runtime::spawn(async move {
                             tokio::time::sleep(RELOAD_RETRY_DELAY).await;
@@ -227,17 +384,26 @@ impl SharedFoldersWatcher {
         });
 
         let tx_for_watcher = reload_tx.clone();
+        let pending_for_watcher = pending.clone();
         let watcher = match recommended_watcher(move |res: notify::Result<Event>| match res {
             Ok(event) => {
                 if !event_should_rescan(event.kind) {
                     return;
                 }
-                // Kind alone is not enough: a download writing its `.part` file
-                // produces a genuine `Modify(Data)` on a path the scan is
-                // required to ignore, so every block scheduled a walk that
-                // could not find anything.
-                if !event_paths_can_change_the_share(&event.paths) {
-                    return;
+                if event.paths.is_empty() || event.need_rescan() {
+                    pending_for_watcher.lock().note_full();
+                } else {
+                    // Kind alone is not enough: a download writing its `.part`
+                    // file produces a genuine `Modify(Data)` on a path the scan
+                    // is required to ignore, so every block scheduled a walk
+                    // that could not find anything.
+                    let (paths, unconfirmed) = rescan_paths_for_event(event.kind, &event.paths);
+                    if paths.is_empty() && unconfirmed.is_empty() {
+                        return;
+                    }
+                    let mut pending = pending_for_watcher.lock();
+                    pending.note_paths(paths);
+                    pending.note_unconfirmed(unconfirmed);
                 }
                 debug!("FS watcher: reload-worthy event ({:?})", event.kind);
                 match tx_for_watcher.try_send(()) {
@@ -262,9 +428,32 @@ impl SharedFoldersWatcher {
         let watcher = Arc::new(Self {
             watched: Mutex::new(HashSet::new()),
             watcher: Mutex::new(Some(watcher)),
-            desired: Mutex::new(Vec::new()),
+            desired: Mutex::new(initial_paths),
+            pending,
+            reload_tx,
         });
-        watcher.sync_paths(&initial_paths);
+        // `start` runs in Tauri's synchronous `setup` hook on the main thread,
+        // so registering here would put an `exists()` per shared folder — each
+        // able to stall for the OS timeout on an offline network share — and,
+        // on Linux, the recursive inotify walk of every tree in front of the
+        // first window.
+        let initial_watcher = Arc::downgrade(&watcher);
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Some(watcher) = initial_watcher.upgrade() {
+                let desired = watcher.desired.lock().clone();
+                watcher.apply_watches(&desired);
+                // The startup scan runs alongside this and may already have
+                // walked past a folder before its watch existed, so a file
+                // created in that gap would reach nothing. One scoped pass per
+                // watched root finds it; it queues behind the startup scan and
+                // reuses every row that scan indexed unchanged.
+                let roots = watcher.watched.lock().iter().cloned().collect::<Vec<_>>();
+                if !roots.is_empty() {
+                    watcher.pending.lock().note_paths(roots);
+                    let _ = watcher.reload_tx.try_send(());
+                }
+            }
+        });
 
         // Retry folders we could not watch. `sync_paths` runs only at startup
         // and on folder add/remove, so a shared folder on an external or
@@ -349,9 +538,25 @@ impl SharedFoldersWatcher {
             // Straight to `apply_watches`: we are already on a blocking thread,
             // and re-publishing our own `desired` snapshot through `sync_paths`
             // would overwrite a newer list an add/remove command may have
-            // installed while we were probing.
+            // installed while we were probing. `apply_watches` re-reads the
+            // list itself once its probes are done.
             self.apply_watches(&desired);
         }
+    }
+
+    /// Rescan `paths` once `delay` has passed, through the same driver (and
+    /// in-flight re-arm) that filesystem events use.
+    pub fn queue_rescan_after(&self, paths: Vec<PathBuf>, delay: Duration) {
+        if paths.is_empty() {
+            return;
+        }
+        let pending = self.pending.clone();
+        let reload_tx = self.reload_tx.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(delay).await;
+            pending.lock().note_paths(paths);
+            let _ = reload_tx.send(()).await;
+        });
     }
 
     /// Make the watched set exactly match `desired`. Paths that don't exist
@@ -367,9 +572,8 @@ impl SharedFoldersWatcher {
         // Tokio worker, so doing that inline parked a worker for the duration.
         // `block_in_place` hands this worker's remaining tasks to another thread
         // instead, so a stalled probe costs the caller and nothing else.
-        // Outside a multi-threaded runtime — `start()` runs in Tauri's
-        // synchronous `setup` hook — apply directly, since `block_in_place`
-        // is only valid on the multi-threaded scheduler.
+        // Outside a multi-threaded runtime apply directly, since
+        // `block_in_place` is only valid on the multi-threaded scheduler.
         let on_multi_thread_worker = tokio::runtime::Handle::try_current().is_ok_and(|handle| {
             handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
         });
@@ -381,21 +585,21 @@ impl SharedFoldersWatcher {
     }
 
     /// The blocking half of [`SharedFoldersWatcher::sync_paths`]: probe every
-    /// desired path and add/remove the OS watches to match.
-    fn apply_watches(&self, desired: &[String]) {
-        let desired_set: HashSet<PathBuf> = desired
+    /// path in `snapshot` and add/remove the OS watches to match the desired
+    /// list as it stands once the probes are done.
+    fn apply_watches(&self, snapshot: &[String]) {
+        let probed: HashMap<PathBuf, bool> = snapshot
             .iter()
-            .filter_map(|p| {
+            .map(|p| {
                 let pb = PathBuf::from(p);
-                if pb.exists() {
-                    Some(pb)
-                } else {
+                let exists = pb.exists();
+                if !exists {
                     debug!(
                         "FS watcher: {} is not available yet; will retry",
                         pb.display()
                     );
-                    None
                 }
+                (pb, exists)
             })
             .collect();
 
@@ -404,6 +608,12 @@ impl SharedFoldersWatcher {
         let Some(watcher) = watcher_guard.as_mut() else {
             return;
         };
+        // The probes above can take as long as an offline share makes them,
+        // and an add/remove may have replaced the list meanwhile. Applying the
+        // snapshot as-is unwatched folders added since and revived removed ones.
+        let desired_now: HashSet<PathBuf> =
+            self.desired.lock().iter().map(PathBuf::from).collect();
+        let desired_set = watch_targets(&desired_now, &probed, &current);
 
         let to_remove: Vec<PathBuf> = current.difference(&desired_set).cloned().collect();
         let to_add: Vec<PathBuf> = desired_set.difference(&current).cloned().collect();
@@ -435,9 +645,198 @@ impl SharedFoldersWatcher {
     }
 }
 
+/// Which folders should be watched: those desired now whose probe found them.
+/// A folder desired now but not probed — added after the probing snapshot was
+/// taken — keeps whatever state it has; the `sync_paths` that added it applies
+/// it with its own probe.
+fn watch_targets(
+    desired_now: &HashSet<PathBuf>,
+    probed: &HashMap<PathBuf, bool>,
+    current: &HashSet<PathBuf>,
+) -> HashSet<PathBuf> {
+    desired_now
+        .iter()
+        .filter(|path| match probed.get(*path) {
+            Some(&exists) => exists,
+            None => current.contains(*path),
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{event_paths_can_change_the_share, event_should_rescan};
+    use super::{
+        event_should_rescan, index_has_rows_at_or_under, rescan_paths_for_event, watch_targets,
+        PendingRescan, RescanScope, MAX_SCOPED_RESCAN_PATHS,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    const WRITE: EventKind = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+
+    /// Whether the watcher callback schedules a rescan for a write naming these
+    /// paths.
+    fn event_paths_can_change_the_share(paths: &[PathBuf]) -> bool {
+        paths.is_empty() || !rescan_paths_for_event(WRITE, paths).0.is_empty()
+    }
+
+    /// A write to a name discovery refuses is noise, but the same name
+    /// *leaving* may have been a folder full of indexed files. Those departures
+    /// are held for an index check rather than dropped or rescanned outright.
+    #[test]
+    fn departures_under_refused_names_are_held_for_an_index_check() {
+        let temp_folder = PathBuf::from("/home/u/Shared/Backup.tmp");
+        let film = PathBuf::from("/home/u/Shared/film.mkv");
+        let part = PathBuf::from("/home/u/Shared/Incomplete/a1b2c3.part");
+
+        assert_eq!(
+            rescan_paths_for_event(WRITE, std::slice::from_ref(&part)),
+            (Vec::new(), Vec::new()),
+            "a download writing its .part schedules nothing"
+        );
+        assert_eq!(
+            rescan_paths_for_event(
+                EventKind::Remove(RemoveKind::Any),
+                &[temp_folder.clone(), film.clone()]
+            ),
+            (vec![film.clone()], vec![temp_folder.clone()])
+        );
+        assert_eq!(
+            rescan_paths_for_event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+                std::slice::from_ref(&part)
+            ),
+            (Vec::new(), vec![part.clone()])
+        );
+        assert_eq!(
+            rescan_paths_for_event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                std::slice::from_ref(&part)
+            ),
+            (Vec::new(), Vec::new()),
+            "arriving at a refused name is still noise"
+        );
+    }
+
+    #[test]
+    fn a_held_departure_is_rescanned_only_if_the_index_has_rows_there() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("ember-watcher-rows-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sample = dir.join("a.mkv");
+        std::fs::write(&sample, b"x").unwrap();
+        let mut row = crate::sharing::indexer::FileIndexer::discover_file(&sample).unwrap();
+        let folder = PathBuf::from("/home/u/Shared/Backup.tmp");
+        row.path = folder.join("a.mkv").to_string_lossy().into_owned();
+        let mut index = crate::search::index::LocalIndex::new();
+        index.add_files(vec![row]);
+
+        assert!(index_has_rows_at_or_under(&index, &folder));
+        assert!(!index_has_rows_at_or_under(
+            &index,
+            &PathBuf::from("/home/u/Shared/Incomplete/a1b2c3.part")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unconfirmed_departures_are_taken_separately_and_absorbed_by_full() {
+        let mut pending = PendingRescan::default();
+        pending.note_unconfirmed([PathBuf::from("/a/x.part")]);
+        assert_eq!(pending.take(), None, "unconfirmed alone schedules no pass");
+        assert_eq!(pending.take_unconfirmed(), vec![PathBuf::from("/a/x.part")]);
+        pending.note_unconfirmed([PathBuf::from("/a/y.part")]);
+        pending.note_full();
+        assert!(pending.take_unconfirmed().is_empty());
+        assert_eq!(pending.take(), Some(RescanScope::Full));
+    }
+
+    /// A resync probes from a snapshot, and the probes can take as long as an
+    /// offline share makes them. Folders removed meanwhile must not be revived
+    /// and folders added meanwhile must not be unwatched.
+    #[test]
+    fn watch_targets_follow_the_list_as_it_stands_after_probing() {
+        let kept = PathBuf::from("/shares/kept");
+        let removed = PathBuf::from("/shares/removed");
+        let added = PathBuf::from("/shares/added");
+        let offline = PathBuf::from("/shares/offline");
+        let probed = HashMap::from([
+            (kept.clone(), true),
+            (removed.clone(), true),
+            (offline.clone(), false),
+        ]);
+        let current = HashSet::from([kept.clone(), added.clone(), offline.clone()]);
+        let desired_now = HashSet::from([kept.clone(), added.clone(), offline.clone()]);
+        let targets = watch_targets(&desired_now, &probed, &current);
+        assert_eq!(targets, HashSet::from([kept, added]));
+        assert!(!targets.contains(&removed), "a removed folder is not revived");
+    }
+
+    #[test]
+    fn pending_rescan_merges_paths_and_falls_back_to_full() {
+        let mut pending = PendingRescan::default();
+        assert_eq!(pending.take(), None);
+        pending.note_paths([PathBuf::from("/a/x.mkv"), PathBuf::from("/a/x.mkv")]);
+        assert_eq!(
+            pending.take(),
+            Some(RescanScope::Paths(vec![PathBuf::from("/a/x.mkv")]))
+        );
+        assert_eq!(pending.take(), None);
+
+        pending.restore(RescanScope::Paths(vec![PathBuf::from("/a/y.mkv")]));
+        pending.note_paths([PathBuf::from("/a/z.mkv")]);
+        match pending.take() {
+            Some(RescanScope::Paths(mut paths)) => {
+                paths.sort();
+                assert_eq!(
+                    paths,
+                    vec![PathBuf::from("/a/y.mkv"), PathBuf::from("/a/z.mkv")],
+                    "a rescan that could not start keeps its paths"
+                );
+            }
+            other => panic!("expected paths, got {other:?}"),
+        }
+
+        pending.note_paths((0..=MAX_SCOPED_RESCAN_PATHS).map(|i| PathBuf::from(format!("/b/{i}"))));
+        assert_eq!(pending.take(), Some(RescanScope::Full));
+        pending.note_full();
+        pending.note_paths([PathBuf::from("/a/x.mkv")]);
+        assert_eq!(pending.take(), Some(RescanScope::Full), "full absorbs paths");
+        assert_eq!(pending.take(), None);
+    }
+
+    /// Another program's in-progress download writes to its temp name the whole
+    /// time; only the final rename may schedule work.
+    #[test]
+    fn external_writers_temp_names_do_not_rescan() {
+        for name in [
+            "movie.mkv.crdownload",
+            "Movie.MKV.CRDOWNLOAD",
+            "linux.iso.!qB",
+            "report.docx.tmp",
+            "~$report.docx",
+        ] {
+            let path = PathBuf::from(format!("/home/u/Shared/{name}"));
+            assert!(
+                !event_paths_can_change_the_share(std::slice::from_ref(&path)),
+                "{name} must not schedule a rescan"
+            );
+        }
+        let finished = [
+            PathBuf::from("/home/u/Shared/movie.mkv.crdownload"),
+            PathBuf::from("/home/u/Shared/movie.mkv"),
+        ];
+        assert_eq!(
+            rescan_paths_for_event(EventKind::Modify(ModifyKind::Name(RenameMode::Both)), &finished),
+            (
+                vec![PathBuf::from("/home/u/Shared/movie.mkv")],
+                vec![PathBuf::from("/home/u/Shared/movie.mkv.crdownload")],
+            ),
+            "the rename to the real name is what gets rescanned"
+        );
+        assert!(event_paths_can_change_the_share(&[PathBuf::from("/x/template.docx")]));
+    }
     use notify::event::{
         AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
         RenameMode,

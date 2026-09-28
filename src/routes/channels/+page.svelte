@@ -1,5 +1,8 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
+  import { fade, fly, scale, slide } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
+  import { inertBackground, trapTabKey } from '$lib/a11y';
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -8,10 +11,34 @@
   import ChatConversation from '$lib/components/ChatConversation.svelte';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import IconX from '$lib/components/IconX.svelte';
+  import ChannelLanguagePicker from '$lib/components/ChannelLanguagePicker.svelte';
+  import {
+    type ChannelLanguage,
+    channelLanguageFlagSrc,
+    channelLanguageName,
+    channelLanguageSearchText,
+    isChannelLanguage,
+  } from '$lib/channelLanguages';
   import { appSettings, loadAppSettings } from '$lib/stores/settings';
-  import { copyToClipboard, disambiguatedMemberName, formatRelativeTime, shortPubkey } from '$lib/utils';
+  import {
+    copyToClipboard,
+    disambiguatedMemberName,
+    formatBytes,
+    formatDurationSecs,
+    formatRelativeTime,
+    formatSpeed,
+    shortPubkey,
+  } from '$lib/utils';
+  import {
+    keepXferSamples,
+    noteXferBytes,
+    xferRate,
+    xferSecondsLeft,
+    type RateSamples,
+  } from '$lib/xferRate';
   import { toast, toastError, toastSuccess } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
+  import { plural } from '$lib/plural';
   import * as m from '$lib/paraglide/messages';
   import {
     addChannelModerator,
@@ -30,6 +57,8 @@
     joinChannel,
     leaveChannel,
     listChannelMembers,
+    markChannelMessagesRead,
+    openChannelFilesFolder,
     channelPresenceConfig,
     setChannelFocus,
     pickAndOfferChannelTransfer,
@@ -38,6 +67,8 @@
     rotateChannelRoomKey,
     setChannelInvitePolicy,
     setChannelSlowMode,
+    setChannelAnnounceOnly,
+    setChannelLanguage,
     SLOW_MODE_CHOICES,
     claimChannelOwnership,
     claimChannelUsername,
@@ -47,6 +78,7 @@
     transferChannelOwnership,
     unbanChannelMember,
     updateChannelModeration,
+    renameChannel,
     type ChannelInfo,
     type ChannelMemberInfo,
     type ChannelMessageInfo,
@@ -57,29 +89,52 @@
     type GatheredChannelBatch,
   } from '$lib/api/channels';
   import { addFriend } from '$lib/api/friends';
+  import { friendsList, friendRequests, refreshFriendsList } from '$lib/stores/friends';
+  import { clearDraft } from '$lib/stores/chatTabs';
+  import { setPendingReply } from '$lib/channelReply';
   import {
     activeChannelId,
     channels as channelsStore,
+    channelNotifyLevels,
+    channelUnreadMentions,
     clearChannelUnread,
-    forgetChannelMute,
+    favouriteChannels,
+    forgetChannelFavourite,
+    forgetChannelNotifyLevel,
     hiddenChannels,
     hideChannel,
-    ignoredMemberKeys,
-    mutedChannels,
+    ignoredMembers,
+    ignoredKeysForChannel,
+    ignoreMemberEverywhere,
+    ignoreScopeFor,
+    forgetChannelIgnores,
+    notifyLevelOf,
     refreshChannels,
     unhideChannel,
     replaceChannel,
     setChannelInRoom,
     setChannelMemberCount,
+    setChannelNotifyLevel,
     upsertChannel,
     restoreActiveChannelOnEnter,
     stashActiveChannelOnLeave,
     takeStashedChannelSelection,
-    toggleChannelMute,
+    toggleChannelFavourite,
     toggleMemberIgnore,
+    toggleMemberIgnoreInChannel,
+    unreadBadgeTone,
     channelTransfers,
     mergeChannelTransfers,
+    type ChannelNotifyLevel,
   } from '$lib/stores/channels';
+  import {
+    cycleIndex,
+    highlightIndex,
+    rankRooms,
+    searchEnterTarget,
+    sectionRooms,
+  } from '$lib/channelSections';
+  import { isApplePlatform, shortcutModAria } from '$lib/platform';
 
   let channelList = $derived($channelsStore.filter((c) => !c.deleted));
   let joinedCount = $derived(channelList.filter((c) => c.in_room).length);
@@ -102,12 +157,16 @@
    *  remounted, and a counter would have restarted at the same number. */
   let gatherWalk = '';
   let pendingNotifyEmpty = $state(false);
-  let discovered: GatheredChannelInfo[] = $state([]);
+  /** Raw: only ever replaced whole, and a deep proxy made every read in the
+   *  per-row lookups below pay for tracking a list that can run to hundreds. */
+  let discovered: GatheredChannelInfo[] = $state.raw([]);
+  let discoveredById = $derived(new Map(discovered.map((item) => [item.channel_id, item])));
   let copyingInvite = $state(false);
   let deletingOwned = $state(false);
   let transferring = $state(false);
   let createName = $state('');
   let createPrivate = $state(false);
+  let createLanguage = $state<ChannelLanguage | null>(null);
   let joinUri = $state('');
   let error: string | null = $state(null);
   let leaveOpen = $state(false);
@@ -124,9 +183,16 @@
   let savingModeration = $state(false);
   let moderatingMember = $state<string | null>(null);
   let claiming = $state(false);
-  /** Matches MAX_CHANNEL_NAME_CHARS in src-tauri/src/commands/channels.rs, and
-   *  the width the list column is sized to hold. */
-  const CHANNEL_NAME_MAX = 20;
+  /** Matches MAX_CHANNEL_NAME_CHARS in src-tauri/src/commands/channels.rs. */
+  const CHANNEL_NAME_MAX = 32;
+  /** Matches MAX_CHANNEL_NAME there: the published record's ceiling, which
+   *  a CJK name reaches at about 21 characters, well inside the count. */
+  const CHANNEL_NAME_MAX_BYTES = 64;
+  const utf8 = new TextEncoder();
+  let createNameTooLong = $derived(utf8.encode(createName.trim()).length > CHANNEL_NAME_MAX_BYTES);
+  let renameDraft = $state('');
+  let renaming = $state(false);
+  let renameTooLong = $derived(utf8.encode(renameDraft.trim()).length > CHANNEL_NAME_MAX_BYTES);
   /** Matches the backend default; the backend clamps to 7–365 either way. */
   const DEFAULT_CLAIM_DAYS = 14;
   const CLAIM_WINDOWS = [7, 14, 30, 90, 180, 365];
@@ -143,6 +209,42 @@
    *  never took — clicking the next room closed it again. */
   let listCollapsed = $state(false);
   const LIST_COLLAPSED_KEY = 'channels-list-collapsed';
+
+  /** The room list's width follows the space the page has, not the names in
+   *  it: a column sized to its rooms would jump as Discover streams them in.
+   *  360 keeps a small window's conversation usable; 440 holds a full-length
+   *  name and its language flag on one line. Narrower, a long name wraps. */
+  const LIST_WIDTH_MIN = 360;
+  const LIST_WIDTH_MAX = 440;
+  const LIST_WIDTH_SHARE = 0.32;
+  let workspaceEl = $state<HTMLDivElement>();
+  let listWidth = $state(LIST_WIDTH_MIN);
+  /** Set for the frames a window resize moves the list, so the collapse
+   *  transition does not make it trail the edge being dragged. */
+  let listWidthSnapping = $state(false);
+
+  $effect(() => {
+    const el = workspaceEl;
+    if (!el) return;
+    let unsnap = 0;
+    const observer = new ResizeObserver(([entry]) => {
+      const next = Math.round(
+        Math.min(LIST_WIDTH_MAX, Math.max(LIST_WIDTH_MIN, entry.contentRect.width * LIST_WIDTH_SHARE)),
+      );
+      if (next === listWidth) return;
+      listWidthSnapping = true;
+      listWidth = next;
+      cancelAnimationFrame(unsnap);
+      unsnap = requestAnimationFrame(() => {
+        unsnap = requestAnimationFrame(() => (listWidthSnapping = false));
+      });
+    });
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(unsnap);
+    };
+  });
   let listCollapsedLoaded = $state(false);
   let roomInfoOpen = $state(false);
   let listQuery = $state('');
@@ -238,15 +340,55 @@
   let selected = $derived(
     channelList.find((c) => c.channel_id === selectedId && c.in_room) ?? null,
   );
+  let roomSettingsOverlayEl = $state<HTMLDivElement>();
+  let roomSettingsEl = $state<HTMLDivElement>();
+  let roomSettingsShown = $derived(!!selected?.is_owner && roomInfoOpen);
+  /** A drag that starts in a field and is released over the backdrop still
+   *  clicks the overlay, so closing waits for a press that began there. */
+  let roomSettingsBackdropPress = false;
+
+  $effect(() => {
+    if (!roomSettingsShown || !roomSettingsOverlayEl) return;
+    return inertBackground(roomSettingsOverlayEl);
+  });
+
+  // Focus moves into the window so Tab starts inside it and a screen reader
+  // hears its title, and goes back to whatever opened it — the gear — after.
+  $effect(() => {
+    if (!roomSettingsShown) return;
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    void tick().then(() => roomSettingsEl?.focus());
+    return () => {
+      if (opener?.isConnected) opener.focus();
+    };
+  });
+
+  function closeRoomSettings() {
+    roomInfoOpen = false;
+  }
+
+  function onRoomSettingsKey(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeRoomSettings();
+      return;
+    }
+    trapTabKey(e, roomSettingsEl);
+  }
+
   let needsUsername = $derived(!($appSettings?.channel_username ?? '').trim());
   let canModerate = $derived(!!selected && (selected.is_owner || selected.you_are_moderator));
   /**
-   * The one gate that has to serialise. Every owner moderation command —
-   * topic/welcome, ban, unban, promote, demote — is a read-modify-write of the
-   * whole signed snapshot on the backend (`load_banned_pubkeys` then
-   * `commit_channel_moderation`). Two in flight would build from the same base
-   * and the later would silently discard the earlier's change, so they share a
-   * gate rather than getting one each.
+   * One gate across every owner moderation command — topic/welcome, ban, unban,
+   * promote, demote, nominate.
+   *
+   * Not what keeps them correct: each is a read-modify-write of the whole signed
+   * snapshot, but the backend serialises them itself on `MODERATION_LOCK`
+   * (`src-tauri/src/commands/channels.rs`), so an overlap queues rather than
+   * losing an update. What this does is keep the UI honest — one write at a time
+   * means the controls reflect one state, and the flag is not cleared out from
+   * under an operation that is still running.
    */
   let moderationBusy = $derived(savingModeration || moderatingMember !== null);
   let transferPendingTo = $derived(
@@ -276,9 +418,32 @@
     const left = Math.ceil(selected.claim_after_days - elapsedDays);
     // Only worth mentioning once the owner has actually started to go quiet.
     if (left <= 0 || elapsedDays < selected.claim_after_days / 2) return '';
-    return m.channels_owner_inactive({ name: who, days: left });
+    return plural(left, {
+      one: () => m.channels_owner_inactive_one({ name: who }),
+      other: () => m.channels_owner_inactive({ name: who, days: left }),
+    });
   });
-  let selectedMuted = $derived(!!selected && $mutedChannels.includes(selected.channel_id));
+  let selectedNotifyLevel = $derived<ChannelNotifyLevel>(
+    selected ? notifyLevelOf($channelNotifyLevels, selected.channel_id) : 'all',
+  );
+  const NOTIFY_CHOICES: { level: ChannelNotifyLevel; label: () => string }[] = [
+    { level: 'all', label: () => m.channels_notify_all() },
+    { level: 'mentions', label: () => m.channels_notify_mentions() },
+    { level: 'none', label: () => m.channels_notify_none() },
+  ];
+  let roomDesktopAlertsOff = $derived(
+    !!$appSettings && (!$appSettings.notifications_enabled || !$appSettings.notify_channel_message),
+  );
+  function notifyLevelLabel(level: ChannelNotifyLevel): string {
+    return (NOTIFY_CHOICES.find((choice) => choice.level === level) ?? NOTIFY_CHOICES[0]).label();
+  }
+  /** A public room's key is in its public listing, so "encrypted" alone
+   *  would promise more than the padlock can keep. */
+  let selectedEncTitle = $derived(
+    selected?.visibility === 'private'
+      ? m.channels_encrypted_title_private()
+      : m.channels_encrypted_title_public(),
+  );
   let selectedChannelId = $derived(selected?.channel_id ?? '');
   let selectedName = $derived(selected?.name ?? '');
   let selectedBanned = $derived(selected?.you_are_banned ?? false);
@@ -289,6 +454,11 @@
     selected && !selected.is_owner && !selected.you_are_moderator
       ? selected.slow_mode_secs
       : 0,
+  );
+  /** Posting is closed to this member: an announcement-only room they neither
+   *  own nor moderate. The same exemption as slow mode. */
+  let selectedAnnounceBlocked = $derived(
+    !!selected && selected.announce_only && !selected.is_owner && !selected.you_are_moderator,
   );
   /**
    * Handles the composer can complete after `@`.
@@ -313,6 +483,9 @@
       members.map((mem) => [mem.member_pubkey, roomMemberLabel(mem)]),
     ),
   );
+  /** Discover rows from the last pass, by room id. Plain rather than state:
+   *  written from inside `directoryList`, and read only there. */
+  let discoverRowCache = new Map<string, ChannelInfo>();
   let directoryList = $derived.by(() => {
     const hidden = new Set(
       $channelsStore.filter((c) => c.deleted).map((c) => c.channel_id),
@@ -329,41 +502,74 @@
       if (hidden.has(ch.channel_id) && !ch.in_room) continue;
       byId.set(ch.channel_id, ch);
     }
-    for (const item of discovered) {
+    const rows = new Map<string, ChannelInfo>();
+    for (const item of discoveredById.values()) {
       if (hidden.has(item.channel_id) || byId.has(item.channel_id)) continue;
-      byId.set(item.channel_id, {
-        channel_id: item.channel_id,
-        pubkey: item.pubkey,
-        name: item.name,
-        visibility: 'public',
-        is_owner: false,
-        topic: '',
-        welcome: '',
-        joined_at: 0,
-        last_active: 0,
-        member_count: item.member_count ?? 0,
-        unread: 0,
-        you_are_banned: false,
-        you_are_moderator: false,
-        successor_id: '',
-        predecessor_id: '',
-        successor_nominee: '',
-        claim_after_days: 0,
-        moderation_updated_at: 0,
-        can_claim: false,
-        key_behind: false,
-        owner_pubkey: '',
-        in_room: item.joined,
-        deleted: false,
-        // A room we have not joined tells us nothing about its invite policy,
-        // and the control that reads this is owner-only anyway.
-        invites_owner_only: false,
-        // Likewise: its slow mode arrives with the moderation record on join.
-        slow_mode_secs: 0,
-      });
+      const row = discoverRow(item, discoverRowCache.get(item.channel_id));
+      rows.set(item.channel_id, row);
+      byId.set(item.channel_id, row);
     }
+    discoverRowCache = rows;
     return [...byId.values()];
   });
+
+  /**
+   * A directory listing drawn as a room row, reusing the previous row while
+   * nothing it shows has changed.
+   *
+   * `directoryList` re-runs on every channels-store write — each unread bump —
+   * and a fresh object per listing handed every keyed Discover row a new item,
+   * so a busy room re-rendered the whole directory once a message.
+   */
+  function discoverRow(item: GatheredChannelInfo, prev: ChannelInfo | undefined): ChannelInfo {
+    const memberCount = item.member_count ?? 0;
+    if (
+      prev
+      && prev.pubkey === item.pubkey
+      && prev.name === item.name
+      && prev.member_count === memberCount
+      && prev.in_room === item.joined
+      && prev.language === item.language
+    ) {
+      return prev;
+    }
+    return {
+      channel_id: item.channel_id,
+      pubkey: item.pubkey,
+      name: item.name,
+      visibility: 'public',
+      is_owner: false,
+      topic: '',
+      welcome: '',
+      joined_at: 0,
+      last_active: 0,
+      member_count: memberCount,
+      // No roster until joined; ranking reads the directory's count instead.
+      roster_count: 0,
+      unread: 0,
+      you_are_banned: false,
+      you_are_moderator: false,
+      successor_id: '',
+      predecessor_id: '',
+      successor_nominee: '',
+      claim_after_days: 0,
+      moderation_updated_at: 0,
+      can_claim: false,
+      key_behind: false,
+      owner_pubkey: '',
+      in_room: item.joined,
+      deleted: false,
+      // A room we have not joined tells us nothing about its invite policy,
+      // and the control that reads this is owner-only anyway.
+      invites_owner_only: false,
+      // Likewise: its slow mode arrives with the moderation record on join.
+      slow_mode_secs: 0,
+      announce_only: false,
+      pinned_msg_ids: [],
+      // From the room's signed listing, so it shows before joining.
+      language: item.language ?? '',
+    };
+  }
   let leaveTargetName = $derived(
     directoryList.find((c) => c.channel_id === leaveTargetId)?.name
       ?? channelList.find((c) => c.channel_id === leaveTargetId)?.name
@@ -374,30 +580,70 @@
   let forgetTargetName = $derived(
     directoryList.find((c) => c.channel_id === forgetTargetId)?.name
       ?? channelList.find((c) => c.channel_id === forgetTargetId)?.name
-      ?? discovered.find((c) => c.channel_id === forgetTargetId)?.name
+      ?? (forgetTargetId ? discoveredById.get(forgetTargetId)?.name : undefined)
       ?? '',
   );
   /** Rooms with a row on this device. A Discover-only listing has no row to
    *  delete, so removing one is a hide and nothing more. */
   let storedChannelIds = $derived(new Set(channelList.map((c) => c.channel_id)));
+  /**
+   * Largest rooms first; see `rankRooms`. Joined rooms rank on their whole
+   * roster (`roster_count`), Discover rooms on the size the directory
+   * reports. Neither is the chip's present-now count, which moves as people
+   * come and go and would shuffle the list under the pointer.
+   */
+  let directoryCounts = $derived(
+    new Map([...discoveredById].map(([id, item]) => [id, item.member_count])),
+  );
+  let sortedChannels = $derived(rankRooms(directoryList, directoryCounts));
   let visibleChannels = $derived.by(() => {
     const q = listQuery.trim().toLowerCase();
-    const list = directoryList;
+    const list = sortedChannels;
     if (!q) return list;
+    // "German" finds German rooms, but not from a letter or two, which every
+    // language name would match.
+    const byLanguage = q.length >= 3;
     return list.filter(
       (ch) =>
         ch.name.toLowerCase().includes(q) ||
-        ch.topic.toLowerCase().includes(q),
+        ch.topic.toLowerCase().includes(q) ||
+        (byLanguage && isChannelLanguage(ch.language) && channelLanguageSearchText(ch.language).includes(q)),
     );
   });
+  let favouriteSet = $derived(new Set($favouriteChannels));
+  let roomSections = $derived(sectionRooms(visibleChannels, $favouriteChannels));
+  /** Every joined room in display order, whatever the search box holds:
+   *  Alt+↑/↓ steps through the rooms you are in, not the ones a half-typed
+   *  query happens to leave on screen. */
+  let joinedInOrder = $derived(sectionRooms(sortedChannels, $favouriteChannels).yours);
+  /** Every row in the order it is drawn, which is the order the search box's
+   *  arrow keys walk. */
+  let orderedRows = $derived([...roomSections.yours, ...roomSections.discover]);
+  let unreadJoinedIds = $derived(
+    channelList.filter((c) => c.in_room && c.unread > 0).map((c) => c.channel_id),
+  );
+  let markingAllRead = $state(false);
+  let listSearchEl: HTMLInputElement | undefined = $state();
+  let listScrollEl: HTMLDivElement | undefined = $state();
+  /** The room the search box's arrow keys are on, by id. An index went stale
+   *  whenever a Discover batch landed or a count moved, and the highlight
+   *  jumped to whichever room slid into that slot. */
+  let listHighlightId = $state<string | null>(null);
+  let listHighlight = $derived(highlightIndex(orderedRows, listHighlightId));
+  let highlightedRow = $derived(listHighlight >= 0 ? orderedRows[listHighlight] : null);
+  $effect(() => {
+    if (listHighlightId !== null && listHighlight < 0) listHighlightId = null;
+  });
+  /** Senders hidden in the room on screen: those ignored everywhere, plus
+   *  anyone scoped to this one. */
+  let roomIgnoredKeys = $derived(ignoredKeysForChannel($ignoredMembers, selectedId));
   /** Hits the transcript can actually show. An ignored sender's messages are
    *  drawn nowhere, so offering them here would be a dead click. */
   let visibleSearchHits = $derived(
-    $ignoredMemberKeys.length === 0
+    roomIgnoredKeys.length === 0
       ? searchHits
       : searchHits.filter(
-          (hit) =>
-            !hit.sender_pubkey || !$ignoredMemberKeys.includes(hit.sender_pubkey.toLowerCase()),
+          (hit) => !hit.sender_pubkey || !roomIgnoredKeys.includes(hit.sender_pubkey.toLowerCase()),
         ),
   );
   let sortedMembers = $derived(
@@ -415,8 +661,25 @@
     node.focus();
   }
 
+  /** Focus goes back to the trigger: the item that was pressed is inside a
+   *  menu that is no longer drawn, and focus left there falls to the body. */
   function closeCardMenu(from: HTMLElement) {
-    (from.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open');
+    const details = from.closest('details') as HTMLDetailsElement | null;
+    details?.removeAttribute('open');
+    details?.querySelector('summary')?.focus();
+  }
+
+  /** Arrow keys walk an open menu's items, from its trigger or from inside. */
+  function moveMenuFocus(menu: HTMLElement, e: KeyboardEvent) {
+    const items = [...menu.querySelectorAll<HTMLElement>('[role^="menuitem"]:not(:disabled)')];
+    if (items.length === 0) return;
+    e.preventDefault();
+    const at = items.indexOf(document.activeElement as HTMLElement);
+    const next =
+      e.key === 'Home' ? 0
+      : e.key === 'End' ? items.length - 1
+      : cycleIndex(at, items.length, e.key === 'ArrowDown' ? 1 : -1);
+    items[next]?.focus();
   }
 
   function closeCardMenus(keepContaining?: Element | null) {
@@ -431,10 +694,196 @@
     closeCardMenus(target);
   }
 
+  /** A menu closes once focus moves somewhere else — Tab included, since its
+   *  items sit out of the tab order and Tab from one moves straight past the
+   *  menu. Focus going nowhere is left to the pointerdown handler: WebKit does
+   *  not focus a clicked button, so a click on an item reads as focus leaving,
+   *  and closing then would swallow the click. */
+  function onCardMenuFocusOut(e: FocusEvent) {
+    const menu = e.target instanceof Element ? e.target.closest('.card-more[open]') : null;
+    if (!menu) return;
+    const next = e.relatedTarget instanceof Node ? e.relatedTarget : null;
+    if (!next || menu.contains(next)) return;
+    (menu as HTMLDetailsElement).open = false;
+  }
+
+  /**
+   * Alt+↑/↓ steps through joined rooms; Ctrl/⌘+K searches the room list.
+   *
+   * On `document`, which runs ahead of the dock's `window` listener, and the
+   * dock stands down on `defaultPrevented` — so claiming Ctrl+K here is what
+   * keeps it from opening its switcher too. Keys pressed inside the dock are
+   * left alone, which is what lets the dock keep Ctrl+K while the user is
+   * working there. With no list on screen to search, the key passes through.
+   */
+  function onPageShortcut(e: KeyboardEvent) {
+    if (e.defaultPrevented) return;
+    const menuKey =
+      !e.altKey && !e.ctrlKey && !e.metaKey
+      && ['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key);
+    const roomStep =
+      e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey
+      && (e.key === 'ArrowUp' || e.key === 'ArrowDown');
+    const searchKey =
+      (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.key === 'k' || e.key === 'K');
+    // Everything below costs a DOM query, and this runs on every keypress.
+    if (!menuKey && !roomStep && !searchKey) return;
+    if (document.querySelector('[aria-modal="true"]')) return;
+    const target = e.target instanceof HTMLElement ? e.target : null;
+    if (target?.closest('.chat-dock')) return;
+    if (menuKey) {
+      const menu = target?.closest('.card-more[open]')?.querySelector<HTMLElement>('.card-more-menu');
+      if (menu) moveMenuFocus(menu, e);
+      return;
+    }
+    if (roomStep) {
+      // Alt+↓ opens a native select, and on macOS Option+arrows move the caret
+      // by paragraph, so those keep their own meaning.
+      if (target?.tagName === 'SELECT') return;
+      if (
+        isApplePlatform()
+        && (target?.tagName === 'TEXTAREA' || target?.tagName === 'INPUT' || target?.isContentEditable)
+      ) {
+        return;
+      }
+      // A half-filled create or join form would be thrown out by the switch.
+      // The room settings drafts need no guard here: they live in a modal,
+      // and the check above already stands down while one is open.
+      if (target?.closest('.add-form')) return;
+      const rooms = joinedInOrder;
+      if (rooms.length === 0) return;
+      e.preventDefault();
+      const at = rooms.findIndex((c) => c.channel_id === selectedId);
+      const next = rooms[cycleIndex(at, rooms.length, e.key === 'ArrowDown' ? 1 : -1)];
+      if (next && next.channel_id !== selectedId) void selectChannel(next.channel_id);
+      return;
+    }
+    if (!listSearchEl) return;
+    e.preventDefault();
+    void focusListSearch();
+  }
+
+  async function focusListSearch() {
+    if (listCollapsed && selected) listCollapsed = false;
+    // Narrow layouts draw one pane at a time, and the list is the one behind an
+    // open room. Nothing else would bring it forward.
+    if (selected && listSearchEl && listSearchEl.getClientRects().length === 0) clearSelection();
+    await tick();
+    listSearchEl?.focus();
+    listSearchEl?.select();
+  }
+
+  async function moveListHighlight(step: 1 | -1) {
+    const id = orderedRows[cycleIndex(listHighlight, orderedRows.length, step)]?.channel_id ?? null;
+    listHighlightId = id;
+    if (!id) return;
+    await tick();
+    listScrollEl
+      ?.querySelector(`[data-room-id="${id}"]`)
+      ?.scrollIntoView({ block: 'nearest' });
+  }
+
+  async function openListRow(ch: ChannelInfo) {
+    listHighlightId = null;
+    if (!ch.in_room) {
+      void joinCard(ch);
+      return;
+    }
+    listQuery = '';
+    await selectChannel(ch.channel_id);
+    // Picking a room from the keyboard is a request to talk in it; leaving
+    // focus in the search box would send the next keystrokes there instead.
+    await tick();
+    document.querySelector<HTMLTextAreaElement>('.conversation-pane textarea:not([disabled])')?.focus();
+  }
+
+  function onListSearchKeydown(e: KeyboardEvent) {
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Escape') {
+      if (!listQuery && listHighlightId === null) return;
+      e.preventDefault();
+      e.stopPropagation();
+      listQuery = '';
+      listHighlightId = null;
+      return;
+    }
+    // Alt+arrows switch rooms; that belongs to the page handler.
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      if (orderedRows.length === 0) return;
+      e.preventDefault();
+      void moveListHighlight(e.key === 'ArrowDown' ? 1 : -1);
+      return;
+    }
+    if (e.key === 'Enter') {
+      const row = searchEnterTarget(orderedRows, highlightedRow, listQuery);
+      if (!row) return;
+      e.preventDefault();
+      void openListRow(row);
+    }
+  }
+
+  /** Marks each room on its own, and clears its pill only once that room's
+   *  write has landed — a pill cleared ahead of a failed mark comes back on
+   *  the next refresh, which reads as the button not working.
+   *
+   *  Every joined room, not only those the search leaves on screen; the
+   *  button's label and tooltip say so. */
+  async function markAllRead() {
+    const ids = unreadJoinedIds;
+    if (markingAllRead || ids.length === 0) return;
+    markingAllRead = true;
+    try {
+      const results = await Promise.allSettled(
+        ids.map(async (id) => {
+          await markChannelMessagesRead(id);
+          clearChannelUnread(id);
+        }),
+      );
+      const failed = results.find(
+        (result): result is PromiseRejectedResult => result.status === 'rejected',
+      );
+      // The per-room error names one room's failure and carries backend detail;
+      // the toast is about the batch.
+      if (failed) {
+        console.warn('Channels: mark all as read failed for some rooms', failed.reason);
+        toastError(m.channels_mark_all_read_failed());
+      }
+    } finally {
+      markingAllRead = false;
+    }
+  }
+
+  /** Opens a room row's menu upward when there is no room for it below: the
+   *  list scrolls, and a menu hanging off the last row would be cut off. */
+  function placeRowMenu(e: Event) {
+    const details = e.currentTarget as HTMLDetailsElement;
+    const menu = details.querySelector<HTMLElement>('.card-more-menu');
+    if (!menu) return;
+    delete menu.dataset.up;
+    if (!details.open || !listScrollEl) return;
+    const box = listScrollEl.getBoundingClientRect();
+    const rect = menu.getBoundingClientRect();
+    const above = details.getBoundingClientRect().top - box.top;
+    if (rect.bottom > box.bottom && above > rect.height) menu.dataset.up = '';
+  }
+
   function onPageKeydown(e: KeyboardEvent) {
-    if (e.key !== 'Escape') return;
+    if (e.key !== 'Escape') {
+      onPageShortcut(e);
+      return;
+    }
+    // Something closer to the press already handled it — a picker or menu
+    // that closes itself on Escape — so it must not close this page's pane too.
+    if (e.defaultPrevented) return;
+    // The dock answers Escape on `window`, which this `document` listener runs
+    // ahead of — and it stands down on `defaultPrevented`, so a press in the
+    // dock's composer or search would close this page's pane instead.
+    if (e.target instanceof Element && e.target.closest('.chat-dock')) return;
     if (document.querySelector('.card-more[open]')) {
+      const owner = document.activeElement?.closest('.card-more[open]');
       closeCardMenus();
+      owner?.querySelector('summary')?.focus();
       e.preventDefault();
       e.stopPropagation();
       return;
@@ -578,9 +1027,23 @@
     listCollapsedLoaded = true;
     loadChannels();
     void refreshDirectory(false);
+    // A background browse is sixteen DHT walks plus sizing; skip it while the
+    // window is hidden or in the tray, like every other poll in the app, and
+    // catch up once on the way back if a tick was skipped.
+    let gatherMissedWhileHidden = false;
     const gatherTimer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+        gatherMissedWhileHidden = true;
+        return;
+      }
       void refreshDirectory(false);
     }, 60_000);
+    const onGatherVisibilityChange = () => {
+      if (document.visibilityState !== 'visible' || !gatherMissedWhileHidden) return;
+      gatherMissedWhileHidden = false;
+      void refreshDirectory(false);
+    };
+    document.addEventListener('visibilitychange', onGatherVisibilityChange);
     let cancelled = false;
     channelPresenceConfig()
       .then((config) => {
@@ -645,7 +1108,8 @@
       })
       .catch((e) => console.error('Failed to register channel-moderation listener:', e));
     let unlistenHandoff: UnlistenFn | undefined;
-    listen<{ channel_id: string; successor_id?: string }>('ember:channel-handoff', (event) => {
+    listen<{ channel_id: string; successor_id?: string; phase?: string }>('ember:channel-handoff', (event) => {
+      if (event.payload?.phase === 'failed') toastError(m.error_channels_handoff_stuck());
       // Only the room that actually moved: wiping the map cleared the pending
       // banner for every other room too.
       const moved = event.payload?.channel_id;
@@ -692,6 +1156,7 @@
     // between store init and this visit.
     void mergeChannelTransfers();
     document.addEventListener('pointerdown', onCardMenuPointerDown);
+    document.addEventListener('focusout', onCardMenuFocusOut);
     document.addEventListener('keydown', onPageKeydown);
     // Local arithmetic against a clock, not a poll: nothing is fetched here.
     // A second is the resolution the mesh now works at, so anything coarser
@@ -703,6 +1168,7 @@
       cancelled = true;
       clearInterval(presenceTimer);
       clearInterval(gatherTimer);
+      document.removeEventListener('visibilitychange', onGatherVisibilityChange);
       unlistenMembers?.();
       unlistenPresence?.();
       unlistenChat?.();
@@ -710,6 +1176,7 @@
       unlistenHandoff?.();
       unlistenFound?.();
       document.removeEventListener('pointerdown', onCardMenuPointerDown);
+      document.removeEventListener('focusout', onCardMenuFocusOut);
       document.removeEventListener('keydown', onPageKeydown);
       // Leaving the page is not leaving the room, but it does mean nobody is
       // reading this roster, so it goes back to the resting walk rate.
@@ -784,13 +1251,14 @@
         // moderation drafts are component state and the layout keys this page
         // on the pathname — so navigating away and back keeps the selection
         // while resetting everything around it. Re-seed both: otherwise the
-        // members pane sits on its loading text forever, and the owner's topic
-        // and welcome come up blank, which saving from there would persist.
+        // members pane sits on its loading text forever, and the owner's topic,
+        // welcome and name come up blank, which saving from there would persist.
         const ch = $channelsStore.find((c) => c.channel_id === current);
         if (!editingModeration) {
           editTopic = ch?.topic ?? '';
           editWelcome = ch?.welcome ?? '';
         }
+        renameDraft = ch?.name ?? '';
         if (members.length === 0) await refreshMembers(current, true);
       } else if (
         $channelsStore.some((c) => c.in_room && !c.deleted) &&
@@ -843,14 +1311,15 @@
     }
   }
 
-  /** Confirmed size for the directory chip. `null` means the probe did not
+  /** Confirmed size for the directory chip: who is present now in a joined
+   *  room, the directory's figure for the rest. `null` means the probe did not
    *  answer, which must not look like an empty room. */
   function directoryMemberCount(ch: ChannelInfo): number | null {
     if (ch.in_room && ch.channel_id === selectedId && members.length > 0) {
       return presentCount(members, presenceNow);
     }
     if (!ch.in_room) {
-      const gathered = discovered.find((item) => item.channel_id === ch.channel_id);
+      const gathered = discoveredById.get(ch.channel_id);
       if (gathered) return gathered.member_count;
     }
     // Joined rooms include this device, so a 0 from the table is "not
@@ -880,6 +1349,7 @@
     editTopic = ch.topic ?? '';
     editWelcome = ch.welcome ?? '';
     editingModeration = false;
+    renameDraft = ch.name;
     roomInfoOpen = false;
     resetSearch();
     // Ahead of the fetch: a roster that fails to load must not leave an unread
@@ -944,7 +1414,7 @@
   }
 
   async function handleCreate() {
-    if (creating) return;
+    if (creating || !createName.trim() || createNameTooLong) return;
     if (needsUsername) {
       composeMode = 'create';
       return;
@@ -952,9 +1422,10 @@
     error = null;
     creating = true;
     try {
-      const invite = await createChannel(createName.trim(), createPrivate);
+      const invite = await createChannel(createName.trim(), createPrivate, createLanguage);
       createName = '';
       createPrivate = false;
+      createLanguage = null;
       composeMode = null;
       deepLinkJoin = false;
       // The clipboard write needs nothing from the list refresh, so overlap
@@ -1039,6 +1510,9 @@
     );
     try {
       await leaveChannel(id);
+      clearDraft(`ch:${id}`);
+      setPendingReply(id, null);
+      forgetChannelFavourite(id);
       void refreshChannels();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -1177,11 +1651,15 @@
     // successful delete even if the following refresh throws — otherwise
     // Discover would resurrect the room.
     hideChannel(id);
-    forgetChannelMute(id);
+    forgetChannelNotifyLevel(id);
+    forgetChannelFavourite(id);
+    forgetChannelIgnores(id);
     let deleted = false;
     try {
       if (storedChannelIds.has(id)) await forgetChannel(id);
       deleted = true;
+      clearDraft(`ch:${id}`);
+      setPendingReply(id, null);
       await refreshChannels();
     } catch (e) {
       if (!deleted) unhideChannel(id);
@@ -1197,13 +1675,22 @@
     deletingOwned = true;
     try {
       await deleteOwnedChannel(id);
-      forgetChannelMute(id);
+      forgetChannelNotifyLevel(id);
+      forgetChannelFavourite(id);
+      forgetChannelIgnores(id);
+      roomInfoOpen = false;
       activeChannelId.set(null);
       members = [];
       membersLoading = false;
       membersError = null;
       discovered = discovered.filter((item) => item.channel_id !== id);
       resetSearch();
+      // After the conversation unmounts — its cleanup stashes the composer,
+      // and a draft for a room we just deleted should not come back. Effects
+      // flush in a microtask, so clearing in this tick ran before that cleanup.
+      await tick();
+      clearDraft(`ch:${id}`);
+      setPendingReply(id, null);
       await refreshChannels();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -1241,6 +1728,23 @@
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       savingModeration = false;
+    }
+  }
+
+  async function handleRename() {
+    const id = selectedId;
+    const name = renameDraft.trim();
+    if (!id || renaming || !name || name === selected?.name || renameTooLong) return;
+    renaming = true;
+    try {
+      const updated = await renameChannel(id, name);
+      replaceChannel(updated);
+      renameDraft = updated.name;
+      toastSuccess(m.channels_rename_saved());
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      renaming = false;
     }
   }
 
@@ -1309,11 +1813,56 @@
   let savingInvitePolicy = $state(false);
   let inviteOwnerOnly = $state(false);
   let savingSlowMode = $state(false);
+  let savingAnnounce = $state(false);
+  let announceOnly = $state(false);
 
   $effect(() => {
     if (savingInvitePolicy) return;
     inviteOwnerOnly = selected?.invites_owner_only ?? false;
   });
+
+  $effect(() => {
+    if (savingAnnounce) return;
+    announceOnly = selected?.announce_only ?? false;
+  });
+
+  async function handleAnnounceOnly(on: boolean) {
+    const id = selectedId;
+    if (!id || savingAnnounce) return;
+    savingAnnounce = true;
+    try {
+      replaceChannel(await setChannelAnnounceOnly(id, on));
+    } catch (e) {
+      announceOnly = !on;
+      toastError(translateError(e, m.error_operation_failed()));
+      await refreshChannels().catch(() => {});
+    } finally {
+      savingAnnounce = false;
+    }
+  }
+
+  let savingLanguage = $state(false);
+  let roomLanguage = $state<ChannelLanguage | null>(null);
+
+  $effect(() => {
+    if (savingLanguage) return;
+    const code = selected?.language;
+    roomLanguage = isChannelLanguage(code) ? code : null;
+  });
+
+  async function handleLanguage(language: ChannelLanguage | null) {
+    const id = selectedId;
+    if (!id || savingLanguage) return;
+    savingLanguage = true;
+    try {
+      replaceChannel(await setChannelLanguage(id, language));
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+      await refreshChannels().catch(() => {});
+    } finally {
+      savingLanguage = false;
+    }
+  }
 
   function slowModeLabel(secs: number): string {
     if (secs <= 0) return m.channels_slow_mode_off();
@@ -1390,7 +1939,11 @@
 
   async function handleNominee(memberPubkey: string, days = DEFAULT_CLAIM_DAYS) {
     const id = selectedId;
-    if (!id) return;
+    // Takes the gate it was already setting. Writing `savingModeration` without
+    // checking it meant two of these could overlap, and whichever finished first
+    // cleared the flag the other was still relying on — re-enabling every
+    // moderation control while a write was in flight.
+    if (!id || moderationBusy) return;
     savingModeration = true;
     try {
       await setChannelSuccessorNominee(id, memberPubkey || null, memberPubkey ? days : null);
@@ -1464,30 +2017,70 @@
   }
 
   /** Right-click opens the same menu the button does, rather than a second one
-   *  that would have to be kept in step with it. */
-  function openMemberMenu(e: MouseEvent) {
+   *  that would have to be kept in step with it. Shared by member and room rows. */
+  function openCardMenu(e: MouseEvent) {
     const row = e.currentTarget as HTMLElement;
     const menu = row.querySelector('details.card-more') as HTMLDetailsElement | null;
     if (!menu) return;
     e.preventDefault();
     closeCardMenus(menu);
     menu.open = true;
+    // Nothing was focused to open it, so without this the arrow keys and
+    // Escape would be talking to whatever had focus before.
+    menu.querySelector<HTMLElement>('[role^="menuitem"]:not(:disabled)')?.focus();
   }
 
-  function formatBytes(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  /**
+   * Friend ID → how we already know that person, rebuilt only when the friend
+   * list or the request queue changes.
+   *
+   * Indexed rather than scanned because the roster reads this per member while
+   * it re-renders on every presence tick, and a linear pass over friends plus
+   * requests for each of them turns a large room into real work once a second.
+   */
+  let friendRelationByHash = $derived.by(() => {
+    const byHash = new Map<string, 'mutual' | 'listed' | 'incoming'>();
+    for (const row of $friendsList) {
+      byHash.set(row.user_hash.toLowerCase(), row.mutual ? 'mutual' : 'listed');
+    }
+    for (const req of $friendRequests) {
+      // Someone already on the list is described by that, not by a request
+      // still sitting in the queue.
+      const hash = req.sender_hash.toLowerCase();
+      if (!byHash.has(hash)) byHash.set(hash, 'incoming');
+    }
+    return byHash;
+  });
+
+  function memberFriendRelation(mem: ChannelMemberInfo): 'none' | 'mutual' | 'listed' | 'incoming' {
+    const hash = (mem.ember_hash || '').toLowerCase();
+    if (!hash) return 'none';
+    return friendRelationByHash.get(hash) ?? 'none';
   }
 
   async function handleAddFriend(mem: ChannelMemberInfo) {
     const pk = mem.member_pubkey;
     if (addingFriend.includes(pk)) return;
+    const relation = memberFriendRelation(mem);
+    const name = roomMemberLabel(mem);
+    if (relation === 'mutual') {
+      toastSuccess(m.channels_friend_already({ name }));
+      return;
+    }
+    if (relation === 'listed') {
+      toastSuccess(m.channels_friend_already_listed({ name }));
+      return;
+    }
+    if (relation === 'incoming') {
+      toast(m.channels_friend_they_asked({ name }));
+      return;
+    }
     addingFriend = [...addingFriend, pk];
     try {
       const code = await channelMemberFriendCode(pk);
       await addFriend(code, mem.nickname || undefined);
-      toastSuccess(m.channels_friend_added({ name: roomMemberLabel(mem) }));
+      await refreshFriendsList();
+      toastSuccess(m.channels_friend_added({ name }));
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -1553,11 +2146,16 @@
   let roomTransfers = $derived(
     Object.values($channelTransfers)
       .filter((t) => t.channel_id === selectedChannelId)
+      // An offer from someone ignored here is left to expire unseen, as the
+      // toast and the nav badge already leave it; one already under way stays.
+      .filter((t) => t.status !== 'awaiting' || !roomIgnoredKeys.includes(t.peer_pubkey.toLowerCase()))
       .sort((a, b) => {
         const waiting = (t: ChannelTransferInfo) => (t.status === 'awaiting' ? 0 : 1);
         return waiting(a) - waiting(b) || a.xfer_id.localeCompare(b.xfer_id);
       }),
   );
+
+  const LEGACY_XFER_MAX_BYTES = 100 * 1024 * 1024;
 
   function transferLabel(t: ChannelTransferInfo): string {
     const who = memberNames[t.peer_pubkey] || shortId(t.peer_pubkey);
@@ -1576,7 +2174,9 @@
           ? m.channels_xfer_sent({ name: who })
           : m.channels_xfer_received({ name: who });
       case 'declined':
-        return m.channels_xfer_declined({ name: who });
+        return t.direction === 'send'
+          ? m.channels_xfer_declined({ name: who })
+          : m.channels_xfer_you_declined();
       case 'busy':
         return m.channels_xfer_peer_busy({ name: who });
       case 'too_large':
@@ -1584,7 +2184,11 @@
       case 'not_allowed':
         return m.channels_xfer_peer_refuses({ name: who });
       case 'expired':
-        return m.channels_xfer_expired();
+        // Builds before 1.7.0 drop an offer over 100 MB without answering, so
+        // for a file that size silence is as likely to be that as absence.
+        return t.direction === 'send' && t.size > LEGACY_XFER_MAX_BYTES
+          ? m.channels_xfer_expired_large()
+          : m.channels_xfer_expired();
       case 'stalled':
         return m.channels_xfer_stalled();
       case 'source_gone':
@@ -1595,6 +2199,88 @@
         return m.channels_xfer_failed();
     }
   }
+
+  const XFER_FAILED = new Set(['stalled', 'source_gone', 'failed', 'busy', 'too_large', 'not_allowed']);
+
+  function xferTone(t: ChannelTransferInfo): 'awaiting' | 'moving' | 'done' | 'failed' | 'ended' {
+    switch (t.status) {
+      case 'awaiting':
+        return 'awaiting';
+      case 'offered':
+      case 'accepted':
+      case 'active':
+        return 'moving';
+      case 'complete':
+        return 'done';
+      default:
+        return XFER_FAILED.has(t.status) ? 'failed' : 'ended';
+    }
+  }
+
+  function xferPct(t: ChannelTransferInfo): number {
+    return t.size > 0 ? Math.min(100, Math.floor((t.transferred / t.size) * 100)) : 0;
+  }
+
+  /** Every transfer's latest progress, for its speed. Kept across rooms, so
+   *  walking away and back does not start the number over. */
+  let xferSamples = $state.raw<RateSamples>(new Map());
+  $effect(() => {
+    const all = Object.values($channelTransfers);
+    const now = Date.now();
+    untrack(() => {
+      let next = keepXferSamples(xferSamples, new Set(all.map((t) => t.xfer_id)));
+      for (const t of all) {
+        if (t.status === 'active') next = noteXferBytes(next, t.xfer_id, t.transferred, now);
+      }
+      xferSamples = next;
+    });
+  });
+
+  /** Ticks while something here is moving, so a speed that stopped being
+   *  reported goes away instead of sitting there looking live. */
+  let xferNow = $state(Date.now());
+  let roomXferMoving = $derived(roomTransfers.some((t) => t.status === 'active'));
+  $effect(() => {
+    if (!roomXferMoving) return;
+    const timer = setInterval(() => (xferNow = Date.now()), 1000);
+    return () => clearInterval(timer);
+  });
+
+  let roomOffersWaiting = $derived(roomTransfers.filter((t) => t.status === 'awaiting').length);
+  let membersToggleLabel = $derived.by(() => {
+    if (membersOpen) return m.channels_hide_members();
+    if (roomOffersWaiting === 0) return m.channels_show_members();
+    return plural(roomOffersWaiting, {
+      one: m.channels_show_members_offers_one,
+      other: () => m.channels_show_members_offers_other({ count: roomOffersWaiting }),
+    });
+  });
+  let roomXferRate = $derived(
+    roomTransfers.reduce(
+      (sum, t) => (t.status === 'active' ? sum + xferRate(xferSamples, t.xfer_id, xferNow) : sum),
+      0,
+    ),
+  );
+
+  /** Collapsed to its header by the user; an arriving offer opens it again,
+   *  since the buttons that answer it are inside. */
+  let xferCollapsed = $state(false);
+
+  /** A new offer in the room on screen brings the members pane out with the
+   *  drawer open, where Accept and Deny are. Not on narrow layouts, where
+   *  the pane covers the conversation: there the badge on the toggle says it. */
+  const offersSeen = new Set<string>();
+  $effect(() => {
+    const fresh = roomTransfers.filter((t) => t.status === 'awaiting' && !offersSeen.has(t.xfer_id));
+    if (fresh.length === 0) return;
+    for (const t of fresh) offersSeen.add(t.xfer_id);
+    untrack(() => {
+      xferCollapsed = false;
+      if (!membersOpen && typeof window !== 'undefined' && !window.matchMedia(MQ_MAX_LG).matches) {
+        membersOpen = true;
+      }
+    });
+  });
 </script>
 
 <div class="page-header">
@@ -1608,9 +2294,10 @@
          someone who had joined two. -->
     {#if joinedCount > 0}
       <span class="header-count">
-        {joinedCount === 1
-          ? m.channels_count_one()
-          : m.channels_count_other({ count: joinedCount })}
+        {plural(joinedCount, {
+          one: m.channels_count_one,
+          other: () => m.channels_count_other({ count: joinedCount }),
+        })}
       </span>
     {/if}
   </div>
@@ -1629,7 +2316,7 @@
     </button>
     <button
       class="add-btn primary"
-      class:danger={composeMode === 'create'}
+      class:active-toggle={composeMode === 'create'}
       onclick={() => toggleCompose('create')}
       disabled={emberOff || (needsUsername && composeMode !== 'create')}
       title={needsUsername && composeMode !== 'create' ? m.channels_username_required() : undefined}
@@ -1678,14 +2365,14 @@
             spellcheck="false"
             autocomplete="username"
             autocapitalize="off"
-            aria-label={m.channels_username_placeholder()}
+            aria-label={m.channels_username_aria()}
             use:autoFocus
             oninput={(e) => {
               usernameDraft = sanitizeChannelUsernameInput(e.currentTarget.value);
             }}
           />
           <button type="submit" disabled={!isValidChannelUsername(usernameDraft) || claimingUsername}>
-            {claimingUsername ? m.common_loading() : m.channels_username_save()}
+            {claimingUsername ? m.channels_saving() : m.channels_username_save()}
           </button>
         </div>
       </form>
@@ -1709,9 +2396,16 @@
           <!-- The field simply stops accepting input at the cap, which reads as
                a broken key without a count next to it. `maxlength` already
                tells a screen reader the limit, so this is for the eye only. -->
-          <span class="name-count" aria-hidden="true">{createName.length}/{CHANNEL_NAME_MAX}</span>
+          <span class="name-count" class:over={createNameTooLong} aria-hidden="true">{[...createName].length}/{CHANNEL_NAME_MAX}</span>
           <ToggleSwitch bind:checked={createPrivate} label={m.channels_private_label()} />
-          <button type="submit" disabled={!createName.trim() || creating}>{creating ? m.channels_creating() : m.channels_create()}</button>
+          <button type="submit" disabled={!createName.trim() || createNameTooLong || creating}>{creating ? m.channels_creating() : m.channels_create()}</button>
+        </div>
+        {#if createNameTooLong}
+          <p class="form-hint name-too-long" role="status">{m.channels_name_too_long_bytes()}</p>
+        {/if}
+        <div class="create-language">
+          <span class="create-language-label" aria-hidden="true">{m.channels_language_label()}</span>
+          <ChannelLanguagePicker bind:value={createLanguage} disabled={creating} />
         </div>
         <!-- Said at the moment the choice is made, not buried in a panel. A
              public room's content key is derived from the address in its
@@ -1798,6 +2492,9 @@
     {:else}
       <div
         class="workspace"
+        bind:this={workspaceEl}
+        style:--list-width="{listWidth}px"
+        class:list-snapping={listWidthSnapping}
         class:has-members={!!selected}
         class:members-open={membersOpen && !!selected}
         class:list-collapsed={listCollapsed && !!selected}
@@ -1807,7 +2504,7 @@
           class:hidden-when-chat={!!selected}
           inert={listCollapsed && !!selected}
         >
-          {#if directoryList.length > 5}
+          {#if directoryList.length > 0}
             <div class="search-wrap">
               <span class="search-icon">
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
@@ -1818,41 +2515,85 @@
                 type="text"
                 class="search-input"
                 bind:value={listQuery}
-                placeholder={m.common_search() + '…'}
-                aria-label={m.common_search()}
-                onkeydown={(e) => {
-                  if (e.key !== 'Escape' || !listQuery) return;
-                  e.preventDefault();
-                  e.stopPropagation();
-                  listQuery = '';
-                }}
+                bind:this={listSearchEl}
+                placeholder={m.channels_list_search_placeholder()}
+                aria-label={m.channels_list_search_placeholder()}
+                aria-keyshortcuts={`${shortcutModAria()}+K`}
+                oninput={() => (listHighlightId = null)}
+                onblur={() => (listHighlightId = null)}
+                onkeydown={onListSearchKeydown}
               />
               {#if listQuery}
                 <button type="button" class="search-clear" onclick={() => (listQuery = '')} title={m.search_bar_clear()} aria-label={m.search_bar_clear()}><IconX size={12} /></button>
               {/if}
+              <!-- The arrow keys move a highlight the search box cannot
+                   describe on its own, so the room under it is read out. -->
+              <span class="sr-only" aria-live="polite">{highlightedRow?.name ?? ''}</span>
             </div>
           {/if}
-          <div class="list-scroll">
+          <div class="list-scroll" bind:this={listScrollEl}>
+            <!-- The header stays while a search hides every joined room, so
+                 "Mark all rooms as read" — which covers them all regardless —
+                 does not come and go with the query. -->
+            {#if roomSections.yours.length > 0 || unreadJoinedIds.length > 0}
+              <div class="list-section">
+                <h3 class="list-section-label" id="rooms-section-yours">{m.channels_section_yours()}</h3>
+                {#if unreadJoinedIds.length > 0}
+                  <button
+                    type="button"
+                    class="list-section-action"
+                    title={m.channels_mark_all_read_title()}
+                    disabled={markingAllRead}
+                    aria-busy={markingAllRead ? 'true' : undefined}
+                    onclick={markAllRead}
+                  >{m.channels_mark_all_read()}</button>
+                {/if}
+              </div>
+              {#if roomSections.yours.length > 0}
+                <div role="list" aria-labelledby="rooms-section-yours">
+                  {#each roomSections.yours as ch (ch.channel_id)}
+                    {@render roomRow(ch)}
+                  {/each}
+                </div>
+              {/if}
+            {/if}
+            {#if roomSections.discover.length > 0}
+              <div class="list-section">
+                <h3 class="list-section-label" id="rooms-section-discover">{m.channels_section_discover()}</h3>
+              </div>
+              <div role="list" aria-labelledby="rooms-section-discover">
+                {#each roomSections.discover as ch (ch.channel_id)}
+                  {@render roomRow(ch)}
+                {/each}
+              </div>
+            {/if}
             {#if visibleChannels.length === 0}
               <p class="muted list-empty">{m.channels_no_matches()}</p>
-            {:else}
-              {#each visibleChannels as ch (ch.channel_id)}
+            {/if}
+          </div>
+        </aside>
+
+        {#snippet roomRow(ch: ChannelInfo)}
                 {@const memberCount = directoryMemberCount(ch)}
                 <!-- A room whose ownership moved is dimmed rather than
                      labelled: the card carries no prose now, and opening it
                      shows the successor banner that actually explains it. -->
                 <div
                   class="chan-row"
+                  role="listitem"
                   class:active={ch.in_room && ch.channel_id === selectedId}
+                  class:highlighted={highlightedRow?.channel_id === ch.channel_id}
                   class:joining={joiningIds.includes(ch.channel_id)}
                   class:moved={!!ch.successor_id}
+                  data-room-id={ch.channel_id}
                   title={ch.successor_id ? m.channels_transferred_badge() : undefined}
+                  oncontextmenu={ch.in_room ? openCardMenu : undefined}
                 >
                   <button
                     type="button"
                     class="chan-row-main"
                     aria-current={ch.in_room && ch.channel_id === selectedId ? 'true' : undefined}
-                    aria-label={ch.in_room ? undefined : `${ch.name}. ${m.channels_join()}`}
+                    aria-label={ch.in_room ? undefined : m.channels_join_room_aria({ name: ch.name })}
                     aria-busy={!ch.in_room && joiningIds.includes(ch.channel_id) ? 'true' : undefined}
                     disabled={!ch.in_room && joiningIds.includes(ch.channel_id)}
                     onclick={() => {
@@ -1881,10 +2622,38 @@
                          Public/Private badge are gone: the room is identified
                          by its name, and everything else about it is one click
                          away inside. -->
-                    <span class="chan-name" title={ch.name}><bdi dir="auto">{ch.name}</bdi></span>
+                    <span class="chan-title">
+                      <span class="chan-name"><bdi dir="auto">{ch.name}</bdi></span>
+                      {#if isChannelLanguage(ch.language)}
+                        {@const languageName = channelLanguageName(ch.language)}
+                        <img
+                          class="chan-flag"
+                          src={channelLanguageFlagSrc(ch.language)}
+                          alt={m.channels_language_flag_title({ language: languageName })}
+                          title={m.channels_language_flag_title({ language: languageName })}
+                        />
+                      {/if}
+                    </span>
+                    {#if ch.in_room && favouriteSet.has(ch.channel_id)}
+                      <span class="chan-fav" role="img" title={m.channels_favourite_badge()} aria-label={m.channels_favourite_badge()}>
+                        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                          <path d="M8 1.8l1.85 3.75 4.15.6-3 2.92.7 4.13L8 11.25 4.3 13.2l.7-4.13-3-2.92 4.15-.6z"/>
+                        </svg>
+                      </span>
+                    {/if}
                     {#if memberCount !== null}
                       {@const count = memberCount}
-                      <span class="chan-members" title={m.channels_members_n({ count })} aria-label={m.channels_members_n({ count })}>
+                      <!-- Joined rooms show who is here now but rank on the
+                           whole roster, so the label names both; otherwise a
+                           3 sitting above a 5 reads as a broken sort. -->
+                      {@const countLabel = ch.in_room
+                        ? m.channels_members_here_of_total({ present: count, total: Math.max(ch.roster_count, count) })
+                        : plural(count, {
+                            one: m.channels_members_one,
+                            few: () => m.channels_members_few({ count }),
+                            other: () => m.channels_members_n({ count }),
+                          })}
+                      <span class="chan-members" title={countLabel} aria-label={countLabel}>
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                           <circle cx="6" cy="6" r="2.2"/>
                           <path d="M2 13c0-2.2 1.8-4 4-4s4 1.8 4 4"/>
@@ -1895,19 +2664,52 @@
                       </span>
                     {/if}
                     {#if ch.in_room && ch.unread > 0}
+                      {@const mentioned = $channelUnreadMentions.includes(ch.channel_id)}
                       <!-- A bare number beside a room name says nothing on its
-                           own to a screen reader. -->
+                           own to a screen reader. Grey when the room's level
+                           would not interrupt for what it holds; see
+                           `unreadBadgeTone`. -->
                       <span
-                        class="unread"
-                        class:silenced={$mutedChannels.includes(ch.channel_id)}
-                        aria-label={ch.unread === 1
-                          ? m.channels_unread_title_one()
-                          : m.channels_unread_title_other({ count: ch.unread })}
-                      >{ch.unread}</span>
+                        class="count-pill unread"
+                        class:silenced={unreadBadgeTone(notifyLevelOf($channelNotifyLevels, ch.channel_id), mentioned) === 'quiet'}
+                        aria-label={mentioned
+                          ? m.channels_unread_mention_aria({ count: ch.unread })
+                          : plural(ch.unread, {
+                              one: m.channels_unread_title_one,
+                              few: () => m.channels_unread_title_few({ count: ch.unread }),
+                              other: () => m.channels_unread_title_other({ count: ch.unread }),
+                            })}
+                      >{#if mentioned}<span class="unread-at" aria-hidden="true">@</span>{/if}{ch.unread > 99 ? '99+' : ch.unread}</span>
                     {/if}
                   </button>
                   <div class="chan-door-col">
                     {#if ch.in_room}
+                      {@const rowLevel = notifyLevelOf($channelNotifyLevels, ch.channel_id)}
+                      {@const rowFavourite = favouriteSet.has(ch.channel_id)}
+                      <details class="card-more row-more" ontoggle={placeRowMenu}>
+                        <summary
+                          class="card-more-btn"
+                          title={m.channels_room_options({ name: ch.name })}
+                          aria-haspopup="menu"
+                          aria-label={m.channels_room_options({ name: ch.name })}
+                        >
+                          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                            <circle cx="3.5" cy="8" r="1.4"/>
+                            <circle cx="8" cy="8" r="1.4"/>
+                            <circle cx="12.5" cy="8" r="1.4"/>
+                          </svg>
+                        </summary>
+                        <div class="card-more-menu" role="menu">
+                          <button
+                            type="button"
+                            role="menuitem"
+                            tabindex="-1"
+                            onclick={(e) => { closeCardMenu(e.currentTarget); toggleChannelFavourite(ch.channel_id); }}
+                          >{rowFavourite ? m.channels_favourite_remove() : m.channels_favourite_add()}</button>
+                          <div class="menu-sep" role="separator"></div>
+                          {@render notifyChoices(ch.channel_id, rowLevel)}
+                        </div>
+                      </details>
                       <button
                         type="button"
                         class="chan-door chan-leave"
@@ -1944,10 +2746,47 @@
                     {/if}
                   </div>
                 </div>
-              {/each}
-            {/if}
+        {/snippet}
+
+        {#snippet notifyChoices(channelId: string, current: ChannelNotifyLevel)}
+          <div role="group" aria-label={m.channels_notify_heading()}>
+            <span class="menu-heading" aria-hidden="true">{m.channels_notify_heading()}</span>
+            {#each NOTIFY_CHOICES as choice (choice.level)}
+              <button
+                type="button"
+                role="menuitemradio"
+                tabindex="-1"
+                class="menu-radio"
+                aria-checked={current === choice.level}
+                onclick={(e) => { closeCardMenu(e.currentTarget); setChannelNotifyLevel(channelId, choice.level); }}
+              >
+                <svg class="menu-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  {#if current === choice.level}<path d="M3.5 8.5l3 3 6-7"/>{/if}
+                </svg>
+                {choice.label()}
+              </button>
+            {/each}
           </div>
-        </aside>
+          <!-- These levels govern toasts; a desktop notification also needs
+               the room-message switch in Settings, which is off by default,
+               so "Mentions only" otherwise reads as a promise it cannot keep. -->
+          {#if roomDesktopAlertsOff && current !== 'none'}
+            <div class="menu-sep" role="separator"></div>
+            <button
+              type="button"
+              role="menuitem"
+              tabindex="-1"
+              class="menu-note"
+              onclick={(e) => {
+                closeCardMenu(e.currentTarget);
+                void goto('/settings?section=notifications').catch((err) => console.warn('Failed to open settings:', err));
+              }}
+            >
+              <span>{m.channels_notify_desktop_off()}</span>
+              <span class="menu-note-action">{m.channels_notify_desktop_off_action({ setting: m.settings_notify_channel_message() })}</span>
+            </button>
+          {/if}
+        {/snippet}
 
         <section class="conversation-pane" class:hidden-when-list={!selected}>
           {#if !selected}
@@ -1999,7 +2838,18 @@
                 {/if}
               </div>
               <div class="conv-heading">
-                <h3 title={selected.name}><bdi dir="auto">{selected.name}</bdi></h3>
+                <div class="conv-title">
+                  <h3><bdi dir="auto">{selected.name}</bdi></h3>
+                  {#if isChannelLanguage(selected.language)}
+                    {@const languageName = channelLanguageName(selected.language)}
+                    <img
+                      class="conv-flag"
+                      src={channelLanguageFlagSrc(selected.language)}
+                      alt={m.channels_language_flag_title({ language: languageName })}
+                      title={m.channels_language_flag_title({ language: languageName })}
+                    />
+                  {/if}
+                </div>
                 {#if selected.topic.trim()}
                   <p class="topic has-topic" title={selected.topic}>
                     <span class="topic-mark" aria-hidden="true">#</span>
@@ -2010,7 +2860,23 @@
                 {/if}
               </div>
               <div class="conv-actions">
-                <span class="enc-lock" title={m.chat_encrypted_title()} aria-label={m.chat_encrypted_aria()}>
+                <!-- Beside the padlock, as another fact about the room itself.
+                     Shown to everyone: an owner or moderator still needs to
+                     know that nobody else can answer here. -->
+                {#if selected.announce_only}
+                  <span
+                    class="enc-lock"
+                    role="img"
+                    title={m.channels_announce_badge_title()}
+                    aria-label={m.channels_announce_badge_title()}
+                  >
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M2.5 6.5v3h2l4.5 3V3.5l-4.5 3z"/>
+                      <path d="M11.5 5.5a3.5 3.5 0 0 1 0 5"/>
+                    </svg>
+                  </span>
+                {/if}
+                <span class="enc-lock" role="img" title={selectedEncTitle} aria-label={selectedEncTitle}>
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
                     <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
@@ -2020,10 +2886,11 @@
                   <button
                     class="icon-btn"
                     class:on={roomInfoOpen}
-                    onclick={() => (roomInfoOpen = !roomInfoOpen)}
-                    title={m.channels_edit_moderation()}
-                    aria-pressed={roomInfoOpen}
-                    aria-label={m.channels_edit_moderation()}
+                    onclick={() => (roomInfoOpen = true)}
+                    title={m.channels_room_settings()}
+                    aria-haspopup="dialog"
+                    aria-expanded={roomInfoOpen}
+                    aria-label={m.channels_room_settings()}
                   >
                     <!-- Drawn on a 24 grid rather than 16: the hand-fitted
                          path this replaces was a few hundredths out of true on
@@ -2036,12 +2903,12 @@
                   </button>
                 {/if}
                 <button
-                  class="icon-btn"
+                  class="icon-btn members-toggle"
                   class:on={membersOpen}
                   onclick={() => (membersOpen = !membersOpen)}
-                  title={membersOpen ? m.channels_hide_members() : m.channels_show_members()}
+                  title={membersToggleLabel}
                   aria-pressed={membersOpen}
-                  aria-label={membersOpen ? m.channels_hide_members() : m.channels_show_members()}
+                  aria-label={membersToggleLabel}
                 >
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                     <circle cx="6" cy="6" r="2.2"/>
@@ -2049,6 +2916,9 @@
                     <circle cx="11.5" cy="6.5" r="1.7"/>
                     <path d="M11.2 13c.9-.7 1.5-1.8 1.5-3"/>
                   </svg>
+                  {#if !membersOpen && roomOffersWaiting > 0}
+                    <span class="toggle-badge" aria-hidden="true">{roomOffersWaiting}</span>
+                  {/if}
                 </button>
                 <button
                   class="icon-btn"
@@ -2065,26 +2935,32 @@
                     <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
                   </svg>
                 </button>
-                <button
-                  class="icon-btn"
-                  class:on={selectedMuted}
-                  onclick={() => toggleChannelMute(selectedChannelId)}
-                  title={selectedMuted ? m.channels_unmute() : m.channels_mute()}
-                  aria-pressed={selectedMuted}
-                  aria-label={selectedMuted ? m.channels_unmute() : m.channels_mute()}
-                >
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M6.2 12.2a1.9 1.9 0 003.6 0"/>
-                    <path d="M3.6 12.2h8.8l-1.1-1.6V7.4a3.3 3.3 0 00-6.6 0v3.2z"/>
-                    {#if selectedMuted}
-                      <path d="M2.6 2.6l10.8 10.8"/>
-                    {/if}
-                  </svg>
-                </button>
+                <details class="card-more notify-more">
+                  <summary
+                    class="icon-btn"
+                    class:on={selectedNotifyLevel !== 'all'}
+                    title={m.channels_notify_title({ level: notifyLevelLabel(selectedNotifyLevel) })}
+                    aria-haspopup="menu"
+                    aria-label={m.channels_notify_title({ level: notifyLevelLabel(selectedNotifyLevel) })}
+                  >
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M6.2 12.2a1.9 1.9 0 003.6 0"/>
+                      <path d="M3.6 12.2h8.8l-1.1-1.6V7.4a3.3 3.3 0 00-6.6 0v3.2z"/>
+                      {#if selectedNotifyLevel === 'none'}
+                        <path d="M2.6 2.6l10.8 10.8"/>
+                      {:else if selectedNotifyLevel === 'mentions'}
+                        <circle cx="12.6" cy="3.4" r="1.9" fill="currentColor" stroke="none"/>
+                      {/if}
+                    </svg>
+                  </summary>
+                  <div class="card-more-menu" role="menu">
+                    {@render notifyChoices(selectedChannelId, selectedNotifyLevel)}
+                  </div>
+                </details>
                 <!-- Splits the four view toggles from the two actions that
                      actually change something. -->
                 <span class="conv-actions-sep" aria-hidden="true"></span>
-                <button class="ghost conv-action" disabled={copyingInvite} onclick={handleCopyInvite}>{copyingInvite ? m.common_loading() : m.channels_invite()}</button>
+                <button class="ghost conv-action" disabled={copyingInvite} onclick={handleCopyInvite}>{copyingInvite ? m.channels_copying_invite() : m.channels_invite()}</button>
                 <!-- Delete room used to sit here, identical red text one gap
                      away from Leave. Only one of the two can be undone, so it
                      moved in beside the owner's other room settings. -->
@@ -2117,134 +2993,9 @@
                 <span>{nomineeNotice}</span>
                 {#if selected.can_claim}
                   <button class="ghost" disabled={claiming} onclick={handleClaim}>
-                    {claiming ? m.common_loading() : m.channels_claim_ownership()}
+                    {claiming ? m.channels_taking_over() : m.channels_claim_ownership()}
                   </button>
                 {/if}
-              </div>
-            {/if}
-            {#if selected.is_owner && roomInfoOpen}
-              <form
-                class="moderation-form"
-                onsubmit={(e) => {
-                  e.preventDefault();
-                  handleSaveModeration();
-                }}
-              >
-                <p class="mod-label">{m.channels_edit_moderation()}</p>
-                <input
-                  bind:value={editTopic}
-                  maxlength="64"
-                  placeholder={m.channels_topic_placeholder()}
-                  aria-label={m.channels_topic_placeholder()}
-                  oninput={() => (editingModeration = true)}
-                />
-                <!-- Matches CHANNEL_WELCOME_MAX. The backend truncates past it
-                     rather than refusing, so a larger box silently ate half a
-                     long welcome. Bytes there, characters here, so non-ASCII
-                     can still be trimmed — but not by 2x. -->
-                <textarea
-                  bind:value={editWelcome}
-                  maxlength="256"
-                  rows="2"
-                  placeholder={m.channels_welcome_placeholder()}
-                  aria-label={m.channels_welcome_placeholder()}
-                  oninput={() => (editingModeration = true)}
-                ></textarea>
-                <button type="submit" disabled={moderationBusy}>
-                  {savingModeration ? m.common_loading() : m.channels_save_moderation()}
-                </button>
-              </form>
-              <div class="succession-form">
-                <p class="succession-title">{m.channels_invite_policy_title()}</p>
-                <p class="succession-hint">{m.channels_invite_policy_hint()}</p>
-                <ToggleSwitch
-                  bind:checked={inviteOwnerOnly}
-                  label={m.channels_invite_policy_label()}
-                  disabled={savingInvitePolicy}
-                  onchange={(v) => void handleInvitePolicy(v)}
-                />
-              </div>
-              <div class="succession-form">
-                <p class="succession-title">{m.channels_slow_mode_title()}</p>
-                <p class="succession-hint">{m.channels_slow_mode_hint()}</p>
-                <select
-                  aria-label={m.channels_slow_mode_title()}
-                  disabled={savingSlowMode}
-                  value={String(selected.slow_mode_secs)}
-                  onchange={(e) => void handleSlowMode(Number(e.currentTarget.value))}
-                >
-                  {#each SLOW_MODE_CHOICES as choice (choice)}
-                    <option value={String(choice)}>{slowModeLabel(choice)}</option>
-                  {/each}
-                </select>
-              </div>
-              <!-- Only private rooms have a key worth rotating: a public
-                   room's comes from its address, so there is nothing to
-                   change it to. -->
-              {#if selected.visibility === 'private'}
-                <div class="succession-form">
-                  <p class="succession-title">{m.channels_rotate_title()}</p>
-                  <p class="succession-hint">{m.channels_rotate_hint()}</p>
-                  <button
-                    type="button"
-                    class="ghost danger"
-                    disabled={rotatingKey || moderationBusy}
-                    onclick={() => (rotateOpen = true)}
-                  >
-                    {rotatingKey ? m.common_loading() : m.channels_rotate_btn()}
-                  </button>
-                </div>
-              {/if}
-              <div class="succession-form">
-                <p class="succession-title">{m.channels_succession()}</p>
-                <p class="succession-hint">{m.channels_succession_hint()}</p>
-                <label class="succession-field">
-                  <span>{m.channels_succession_who()}</span>
-                  <select
-                    disabled={moderationBusy}
-                    value={selected.successor_nominee}
-                    onchange={(e) => handleNominee(e.currentTarget.value)}
-                  >
-                    <option value="">{m.channels_succession_none()}</option>
-                    {#each sortedMembers as mem (mem.member_pubkey)}
-                      {#if !mem.is_self && !mem.banned}
-                        <option value={mem.member_pubkey}>
-                          {roomMemberLabel(mem)}
-                        </option>
-                      {/if}
-                    {/each}
-                  </select>
-                </label>
-                {#if selected.successor_nominee}
-                  <label class="succession-field">
-                    <span>{m.channels_succession_wait()}</span>
-                    <select
-                      aria-label={m.channels_succession_wait()}
-                      disabled={moderationBusy}
-                      value={String(selected.claim_after_days)}
-                      onchange={(e) =>
-                        handleNominee(selected.successor_nominee, Number(e.currentTarget.value))}
-                    >
-                      {#each CLAIM_WINDOWS as days (days)}
-                        <option value={String(days)}>{m.channels_succession_days({ days })}</option>
-                      {/each}
-                    </select>
-                  </label>
-                {/if}
-              </div>
-              <!-- Last, and the only irreversible control on the page. In the
-                   header it was one gap from Leave in the same red text. -->
-              <div class="succession-form danger-zone">
-                <p class="succession-title">{m.channels_delete()}</p>
-                <p class="succession-hint">{m.channels_delete_confirm_body({ name: selected.name })}</p>
-                <button
-                  type="button"
-                  class="conv-action conv-delete"
-                  disabled={deletingOwned}
-                  onclick={() => (deleteOpen = true)}
-                >
-                  {deletingOwned ? m.common_loading() : m.channels_delete()}
-                </button>
               </div>
             {/if}
             <!-- Everyone sees the room's rule, not just the owner who set it:
@@ -2261,68 +3012,6 @@
                       wait: slowModeLabel(selected.slow_mode_secs),
                     })}
               </p>
-            {/if}
-            {#if roomTransfers.length > 0}
-              <!-- Polite, not assertive: an arriving offer is worth announcing
-                   but must not cut across whatever is being read. -->
-              <div class="xfer-panel" aria-live="polite">
-                {#each roomTransfers as t (t.xfer_id)}
-                  {@const pct = t.size > 0 ? Math.min(100, Math.round((t.transferred / t.size) * 100)) : 0}
-                  {@const busy = respondingTo.includes(t.xfer_id)}
-                  <div class="xfer-row" class:awaiting={t.status === 'awaiting'}>
-                    <div class="xfer-text">
-                      <span class="xfer-name"><bdi dir="auto">{t.name}</bdi></span>
-                      <span class="xfer-meta">
-                        {formatBytes(t.size)} &middot; {transferLabel(t)}
-                      </span>
-                      {#if t.status === 'active' || t.status === 'accepted'}
-                        <div
-                          class="xfer-progress"
-                          role="progressbar"
-                          aria-label={t.name}
-                          aria-valuemin="0"
-                          aria-valuemax={t.size}
-                          aria-valuenow={Math.min(t.transferred, t.size)}
-                          aria-valuetext="{pct}%"
-                        >
-                          <div class="xfer-progress-fill" style="width: {pct}%"></div>
-                        </div>
-                      {/if}
-                    </div>
-                    <div class="xfer-actions">
-                      {#if t.status === 'awaiting'}
-                        <!-- Accepting while banned pulls room traffic we have no
-                             business receiving, and the backend refuses it.
-                             Declining stays open: that is how the offer clears. -->
-                        <button
-                          type="button"
-                          disabled={busy || selectedBanned}
-                          onclick={() => handleRespondTransfer(t.xfer_id, true)}
-                        >
-                          {m.channels_xfer_accept()}
-                        </button>
-                        <button
-                          type="button"
-                          class="ghost"
-                          disabled={busy}
-                          onclick={() => handleRespondTransfer(t.xfer_id, false)}
-                        >
-                          {m.channels_xfer_decline()}
-                        </button>
-                      {:else if t.status === 'offered' || t.status === 'accepted' || t.status === 'active'}
-                        <button
-                          type="button"
-                          class="ghost danger"
-                          disabled={busy}
-                          onclick={() => handleCancelTransfer(t.xfer_id)}
-                        >
-                          {m.common_cancel()}
-                        </button>
-                      {/if}
-                    </div>
-                  </div>
-                {/each}
-              </div>
             {/if}
             {#if searchOpen}
               <form
@@ -2345,7 +3034,7 @@
                   }}
                 />
                 <button type="submit" disabled={!searchQuery.trim() || searching}>
-                  {searching ? m.common_loading() : m.common_search()}
+                  {searching ? m.channels_discovering() : m.common_search()}
                 </button>
               </form>
               {#if searchRan}
@@ -2378,12 +3067,15 @@
                 friendHash=""
                 friendName={selectedName}
                 channelId={selectedChannelId}
-                hideHeader
                 youAreBanned={selectedBanned}
                 youAreKeyBehind={selectedKeyBehind}
                 slowModeSecs={selectedSlowMode}
+                announceOnly={selectedAnnounceBlocked}
+                pinnedMsgIds={selected?.pinned_msg_ids ?? []}
+                canPin={selected?.is_owner ?? false}
+                onchannelupdate={replaceChannel}
                 memberNames={memberNames}
-                ignoredSenders={$ignoredMemberKeys}
+                ignoredSenders={roomIgnoredKeys}
                 mentionName={$appSettings?.channel_username || $appSettings?.nickname || ''}
                 mentionCandidates={mentionCandidates}
                 focusRequest={transcriptFocus}
@@ -2436,9 +3128,11 @@
                   {@const presence = presenceOf(mem, presenceNow)}
                   {@const presenceLabel =
                     presence === 'online' ? m.channels_member_online() : m.channels_member_away()}
+                  {@const friendRelation = memberFriendRelation(mem)}
+                  {@const ignoreScope = ignoreScopeFor($ignoredMembers, mem.member_pubkey, selectedId)}
                   <li
                     class:banned={mem.banned}
-                    oncontextmenu={memberHasMenu(mem) ? openMemberMenu : undefined}
+                    oncontextmenu={memberHasMenu(mem) ? openCardMenu : undefined}
                   >
                     <div
                       class="member-avatar"
@@ -2466,8 +3160,10 @@
                         {#if mem.banned}
                           <span class="badge banned">{m.channels_banned_badge()}</span>
                         {/if}
-                        {#if $ignoredMemberKeys.includes(mem.member_pubkey.toLowerCase())}
-                          <span class="badge">{m.channels_ignored_badge()}</span>
+                        {#if ignoreScope !== 'none'}
+                          <span class="badge">{ignoreScope === 'room'
+                            ? m.channels_ignored_room_badge()
+                            : m.channels_ignored_badge()}</span>
                         {/if}
                         {#if presence !== 'online' && mem.last_seen > 0}
                           <span class="member-seen">
@@ -2491,27 +3187,58 @@
                           <button
                             type="button"
                             role="menuitem"
+                            tabindex="-1"
                             disabled={sendingTo.includes(mem.member_pubkey) || mem.banned || selectedBanned}
                             onclick={(e) => { closeCardMenu(e.currentTarget); handleSendFile(mem); }}
                           >{m.channels_send_file()}</button>
                           <button
                             type="button"
                             role="menuitem"
-                            disabled={addingFriend.includes(mem.member_pubkey)}
+                            tabindex="-1"
+                            disabled={addingFriend.includes(mem.member_pubkey) || friendRelation !== 'none'}
                             onclick={(e) => { closeCardMenu(e.currentTarget); handleAddFriend(mem); }}
-                          >{m.channels_add_friend()}</button>
+                          >{friendRelation === 'mutual'
+                            ? m.channels_friend_action_already()
+                            : friendRelation === 'listed'
+                              ? m.channels_friend_action_pending()
+                              : friendRelation === 'incoming'
+                                ? m.channels_friend_action_incoming()
+                                : m.channels_add_friend()}</button>
+                          <!-- Two scopes, because the same person can be
+                               tiresome in one room and worth reading in
+                               another. A global ignore hides the per-room
+                               item: narrowing it there would read as
+                               "un-ignore", which is what the entry below is
+                               for. -->
+                          {#if ignoreScope !== 'global'}
+                            <button
+                              type="button"
+                              role="menuitem"
+                              tabindex="-1"
+                              disabled={!selectedId}
+                              onclick={(e) => { closeCardMenu(e.currentTarget); if (selectedId) toggleMemberIgnoreInChannel(mem.member_pubkey, selectedId, mem.nickname); }}
+                            >{ignoreScope === 'room'
+                              ? m.channels_unignore_room()
+                              : m.channels_ignore_room()}</button>
+                          {/if}
                           <button
                             type="button"
                             role="menuitem"
-                            onclick={(e) => { closeCardMenu(e.currentTarget); toggleMemberIgnore(mem.member_pubkey, mem.nickname); }}
-                          >{$ignoredMemberKeys.includes(mem.member_pubkey.toLowerCase())
+                            tabindex="-1"
+                            onclick={(e) => {
+                              closeCardMenu(e.currentTarget);
+                              if (ignoreScope === 'global') toggleMemberIgnore(mem.member_pubkey, mem.nickname);
+                              else ignoreMemberEverywhere(mem.member_pubkey, mem.nickname);
+                            }}
+                          >{ignoreScope === 'global'
                             ? m.channels_unignore()
-                            : m.channels_ignore()}</button>
+                            : m.channels_ignore_everywhere()}</button>
                           {#if canModerate}
                             {#if mem.banned}
                               <button
                                 type="button"
                                 role="menuitem"
+                                tabindex="-1"
                                 disabled={moderationBusy}
                                 onclick={(e) => { closeCardMenu(e.currentTarget); handleUnban(mem.member_pubkey); }}
                               >{m.channels_unban()}</button>
@@ -2519,6 +3246,7 @@
                               <button
                                 type="button"
                                 role="menuitem"
+                                tabindex="-1"
                                 class="menu-item-danger"
                                 disabled={moderationBusy}
                                 onclick={(e) => { closeCardMenu(e.currentTarget); handleBan(mem.member_pubkey); }}
@@ -2530,6 +3258,7 @@
                               <button
                                 type="button"
                                 role="menuitem"
+                                tabindex="-1"
                                 disabled={moderationBusy}
                                 onclick={(e) => { closeCardMenu(e.currentTarget); handleRemoveModerator(mem.member_pubkey); }}
                               >{m.channels_remove_moderator()}</button>
@@ -2537,6 +3266,7 @@
                               <button
                                 type="button"
                                 role="menuitem"
+                                tabindex="-1"
                                 disabled={moderationBusy}
                                 onclick={(e) => { closeCardMenu(e.currentTarget); handleAddModerator(mem.member_pubkey); }}
                               >{m.channels_add_moderator()}</button>
@@ -2545,6 +3275,7 @@
                               <button
                                 type="button"
                                 role="menuitem"
+                                tabindex="-1"
                                 class="menu-item-danger"
                                 disabled={moderationBusy}
                                 onclick={(e) => { closeCardMenu(e.currentTarget); requestTransfer(mem); }}
@@ -2558,6 +3289,157 @@
                 {/each}
               </ul>
             {/if}
+            {#if roomTransfers.length > 0}
+              <section
+                class="xfer-drawer"
+                aria-label={m.channels_xfer_panel_title()}
+                transition:fly={{ y: 48, duration: 240 }}
+              >
+                <button
+                  type="button"
+                  class="xfer-drawer-head"
+                  aria-expanded={!xferCollapsed}
+                  aria-controls={xferCollapsed ? undefined : 'xfer-drawer-body'}
+                  title={xferCollapsed ? m.channels_xfer_show_panel() : m.channels_xfer_hide_panel()}
+                  onclick={() => (xferCollapsed = !xferCollapsed)}
+                >
+                  <svg class="xfer-drawer-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M5 13V3M2.5 5.5 5 3l2.5 2.5"/>
+                    <path d="M11 3v10M8.5 10.5 11 13l2.5-2.5"/>
+                  </svg>
+                  <span class="members-label">{m.channels_xfer_panel_title()}</span>
+                  <span class="xfer-drawer-count">{roomTransfers.length}</span>
+                  {#if roomXferRate > 0}
+                    <span class="xfer-drawer-rate">{formatSpeed(roomXferRate)}</span>
+                  {/if}
+                  <svg class="xfer-drawer-chevron" class:flipped={xferCollapsed} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="m4 6 4 4 4-4"/>
+                  </svg>
+                </button>
+                {#if !xferCollapsed}
+                  <!-- Polite, not assertive: an arriving offer is worth announcing
+                       but must not cut across whatever is being read. The
+                       per-second numbers are hidden from it; the progress bar
+                       carries the figure for anyone who asks. -->
+                  <div id="xfer-drawer-body" class="xfer-drawer-body" aria-live="polite" transition:slide={{ duration: 180 }}>
+                    {#each roomTransfers as t (t.xfer_id)}
+                      {@const tone = xferTone(t)}
+                      {@const pct = xferPct(t)}
+                      {@const rate = t.status === 'active' ? xferRate(xferSamples, t.xfer_id, xferNow) : 0}
+                      {@const left = xferSecondsLeft(t.size, t.transferred, rate)}
+                      {@const busy = respondingTo.includes(t.xfer_id)}
+                      <article class="xfer-card tone-{tone}" transition:slide={{ duration: 180 }}>
+                        <div class="xfer-card-top">
+                          <span class="xfer-dir" class:send={t.direction === 'send'} aria-hidden="true">
+                            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                              {#if t.direction === 'send'}
+                                <path d="M8 12.5v-9M4.5 7 8 3.5 11.5 7"/>
+                              {:else}
+                                <path d="M8 3.5v9M4.5 9 8 12.5 11.5 9"/>
+                              {/if}
+                            </svg>
+                          </span>
+                          <div class="xfer-text">
+                            <span class="xfer-name" title={t.name}><bdi dir="auto">{t.name}</bdi></span>
+                            <span class="xfer-meta">
+                              {#if tone === 'moving' && t.transferred > 0}
+                                {formatBytes(t.transferred)} / {formatBytes(t.size)}
+                              {:else}
+                                {formatBytes(t.size)}
+                              {/if}
+                            </span>
+                          </div>
+                        </div>
+                        {#if t.direction === 'receive' && t.risky}
+                          <p class="file-risk" role="note">
+                            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                              <path d="M8 1.8 14.6 13.5H1.4z"/>
+                              <path d="M8 6.2v3.4M8 11.6v.1"/>
+                            </svg>
+                            <span>{m.common_risky_file()}</span>
+                          </p>
+                        {/if}
+                        <p class="xfer-status">{transferLabel(t)}</p>
+                        {#if t.status === 'accepted' || t.status === 'active'}
+                          <div
+                            class="xfer-progress"
+                            class:indeterminate={t.transferred === 0}
+                            role="progressbar"
+                            aria-label={t.name}
+                            aria-valuemin="0"
+                            aria-valuemax={t.size}
+                            aria-valuenow={Math.min(t.transferred, t.size)}
+                            aria-valuetext="{pct}%"
+                          >
+                            <div class="xfer-progress-fill" style="width: {pct}%"></div>
+                          </div>
+                          <div class="xfer-stats" aria-hidden="true">
+                            {#if t.transferred === 0}
+                              <span>{m.channels_xfer_starting()}</span>
+                            {:else}
+                              <span class="xfer-pct">{pct}%</span>
+                              {#if rate > 0}
+                                <span class="xfer-speed">{formatSpeed(rate)}</span>
+                              {/if}
+                              {#if left !== null}
+                                <span class="xfer-left">
+                                  {m.channels_xfer_time_left({ time: formatDurationSecs(left) })}
+                                </span>
+                              {/if}
+                            {/if}
+                          </div>
+                        {/if}
+                        {#if t.status === 'awaiting'}
+                          <!-- Accepting while banned pulls room traffic we have no
+                               business receiving, and the backend refuses it.
+                               Denying stays open: that is how the offer clears. -->
+                          <div class="xfer-actions two">
+                            <button
+                              type="button"
+                              class="primary"
+                              disabled={busy || selectedBanned}
+                              onclick={() => handleRespondTransfer(t.xfer_id, true)}
+                            >
+                              {m.channels_xfer_accept()}
+                            </button>
+                            <button
+                              type="button"
+                              class="secondary"
+                              disabled={busy}
+                              onclick={() => handleRespondTransfer(t.xfer_id, false)}
+                            >
+                              {m.channels_xfer_decline()}
+                            </button>
+                          </div>
+                        {:else if tone === 'moving'}
+                          <div class="xfer-actions">
+                            <button
+                              type="button"
+                              class="ghost xfer-cancel"
+                              disabled={busy}
+                              onclick={() => handleCancelTransfer(t.xfer_id)}
+                            >
+                              {m.common_cancel()}
+                            </button>
+                          </div>
+                        {:else if t.status === 'complete' && t.direction === 'receive'}
+                          <div class="xfer-actions">
+                            <button
+                              type="button"
+                              class="secondary"
+                              onclick={() =>
+                                void openChannelFilesFolder().catch((e) => toastError(translateError(e)))}
+                            >
+                              {m.chat_attach_show()}
+                            </button>
+                          </div>
+                        {/if}
+                      </article>
+                    {/each}
+                  </div>
+                {/if}
+              </section>
+            {/if}
           </aside>
           </div>
         {/if}
@@ -2565,6 +3447,222 @@
     {/if}
   {/if}
 </div>
+
+{#if selected?.is_owner && roomInfoOpen}
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="modal-overlay"
+    bind:this={roomSettingsOverlayEl}
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="room-settings-title"
+    tabindex="-1"
+    onpointerdown={(e) => (roomSettingsBackdropPress = e.target === e.currentTarget)}
+    onclick={(e) => {
+      if (roomSettingsBackdropPress && e.target === e.currentTarget) closeRoomSettings();
+    }}
+    onkeydown={onRoomSettingsKey}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+  >
+    <div
+      class="modal-content room-settings"
+      bind:this={roomSettingsEl}
+      tabindex="-1"
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
+      <div class="modal-header">
+        <div class="room-settings-heading">
+          <span id="room-settings-title" class="modal-title">{m.channels_room_settings()}</span>
+          <span class="room-settings-room" title={selected.name}><bdi dir="auto">{selected.name}</bdi></span>
+        </div>
+        <button type="button" class="icon-close" onclick={closeRoomSettings} title={m.common_close()} aria-label={m.common_close()}>
+          <IconX size={15} />
+        </button>
+      </div>
+      <div class="modal-body room-settings-body">
+        {#if !selected.successor_id}
+          <form
+            class="succession-form"
+            onsubmit={(e) => {
+              e.preventDefault();
+              void handleRename();
+            }}
+          >
+            <p class="succession-title">{m.channels_rename_title()}</p>
+            <p class="succession-hint">{m.channels_rename_hint()}</p>
+            <div class="rename-row">
+              <input
+                bind:value={renameDraft}
+                maxlength={CHANNEL_NAME_MAX}
+                placeholder={m.channels_name_placeholder()}
+                aria-label={m.channels_rename_title()}
+                disabled={renaming}
+              />
+              <span class="name-count" class:over={renameTooLong} aria-hidden="true">{[...renameDraft].length}/{CHANNEL_NAME_MAX}</span>
+              <button
+                type="submit"
+                disabled={renaming || renameTooLong || !renameDraft.trim() || renameDraft.trim() === selected.name}
+              >{renaming ? m.channels_renaming() : m.channels_rename_save()}</button>
+            </div>
+            {#if renameTooLong}
+              <p class="form-hint name-too-long" role="status">{m.channels_name_too_long_bytes()}</p>
+            {/if}
+          </form>
+        {/if}
+        <form
+          class="moderation-form"
+          onsubmit={(e) => {
+            e.preventDefault();
+            handleSaveModeration();
+          }}
+        >
+          <p class="succession-title">{m.channels_edit_moderation()}</p>
+          <input
+            bind:value={editTopic}
+            maxlength="64"
+            placeholder={m.channels_topic_placeholder()}
+            aria-label={m.channels_topic_placeholder()}
+            oninput={() => (editingModeration = true)}
+          />
+          <!-- Matches CHANNEL_WELCOME_MAX. The backend truncates past it
+               rather than refusing, so a larger box silently ate half a
+               long welcome. Bytes there, characters here, so non-ASCII
+               can still be trimmed — but not by 2x. -->
+          <textarea
+            bind:value={editWelcome}
+            maxlength="256"
+            rows="2"
+            placeholder={m.channels_welcome_placeholder()}
+            aria-label={m.channels_welcome_placeholder()}
+            oninput={() => (editingModeration = true)}
+          ></textarea>
+          <button type="submit" disabled={moderationBusy}>
+            {savingModeration ? m.channels_saving() : m.channels_save_moderation()}
+          </button>
+        </form>
+        <div class="succession-form">
+          <p class="succession-title">{m.channels_language_label()}</p>
+          <p class="succession-hint" id="room-language-hint">{m.channels_language_hint()}</p>
+          <ChannelLanguagePicker
+            bind:value={roomLanguage}
+            disabled={savingLanguage}
+            describedby="room-language-hint"
+            onchange={(v) => void handleLanguage(v)}
+          />
+        </div>
+        <div class="succession-form">
+          <p class="succession-title">{m.channels_invite_policy_title()}</p>
+          <p class="succession-hint">{m.channels_invite_policy_hint()}</p>
+          <ToggleSwitch
+            bind:checked={inviteOwnerOnly}
+            label={m.channels_invite_policy_label()}
+            disabled={savingInvitePolicy}
+            onchange={(v) => void handleInvitePolicy(v)}
+          />
+        </div>
+        <div class="succession-form">
+          <p class="succession-title">{m.channels_announce_title()}</p>
+          <p class="succession-hint">{m.channels_announce_hint()}</p>
+          <ToggleSwitch
+            bind:checked={announceOnly}
+            label={m.channels_announce_label()}
+            disabled={savingAnnounce}
+            onchange={(v) => void handleAnnounceOnly(v)}
+          />
+        </div>
+        <div class="succession-form">
+          <p class="succession-title">{m.channels_slow_mode_title()}</p>
+          <p class="succession-hint">{m.channels_slow_mode_hint()}</p>
+          <select
+            aria-label={m.channels_slow_mode_title()}
+            disabled={savingSlowMode}
+            value={String(selected.slow_mode_secs)}
+            onchange={(e) => void handleSlowMode(Number(e.currentTarget.value))}
+          >
+            {#each SLOW_MODE_CHOICES as choice (choice)}
+              <option value={String(choice)}>{slowModeLabel(choice)}</option>
+            {/each}
+          </select>
+        </div>
+        <!-- Only private rooms have a key worth rotating: a public
+             room's comes from its address, so there is nothing to
+             change it to. -->
+        {#if selected.visibility === 'private'}
+          <div class="succession-form">
+            <p class="succession-title">{m.channels_rotate_title()}</p>
+            <p class="succession-hint">{m.channels_rotate_hint()}</p>
+            <!-- `aria-disabled`, not `disabled`: the confirm hands focus back
+                 here while the rotation it started is running, and a
+                 disabled button would drop it to <body>. -->
+            <button
+              type="button"
+              class="ghost danger"
+              aria-disabled={rotatingKey || moderationBusy}
+              onclick={() => {
+                if (!rotatingKey && !moderationBusy) rotateOpen = true;
+              }}
+            >
+              {rotatingKey ? m.channels_rotating() : m.channels_rotate_btn()}
+            </button>
+          </div>
+        {/if}
+        <div class="succession-form">
+          <p class="succession-title">{m.channels_succession()}</p>
+          <p class="succession-hint">{m.channels_succession_hint()}</p>
+          <label class="succession-field">
+            <span>{m.channels_succession_who()}</span>
+            <select
+              disabled={moderationBusy}
+              value={selected.successor_nominee}
+              onchange={(e) => handleNominee(e.currentTarget.value)}
+            >
+              <option value="">{m.channels_succession_none()}</option>
+              {#each sortedMembers as mem (mem.member_pubkey)}
+                {#if !mem.is_self && !mem.banned}
+                  <option value={mem.member_pubkey}>
+                    {roomMemberLabel(mem)}
+                  </option>
+                {/if}
+              {/each}
+            </select>
+          </label>
+          {#if selected.successor_nominee}
+            <label class="succession-field">
+              <span>{m.channels_succession_wait()}</span>
+              <select
+                aria-label={m.channels_succession_wait()}
+                disabled={moderationBusy}
+                value={String(selected.claim_after_days)}
+                onchange={(e) =>
+                  handleNominee(selected.successor_nominee, Number(e.currentTarget.value))}
+              >
+                {#each CLAIM_WINDOWS as days (days)}
+                  <option value={String(days)}>{m.channels_succession_days({ days })}</option>
+                {/each}
+              </select>
+            </label>
+          {/if}
+        </div>
+        <!-- Last, and the only irreversible control in the window. In the
+             header it was one gap from Leave in the same red text. -->
+        <div class="succession-form danger-zone">
+          <p class="succession-title">{m.channels_delete()}</p>
+          <p class="succession-hint">{m.channels_delete_confirm_body({ name: selected.name })}</p>
+          <button
+            type="button"
+            class="conv-action conv-delete"
+            aria-disabled={deletingOwned}
+            onclick={() => {
+              if (!deletingOwned) deleteOpen = true;
+            }}
+          >
+            {deletingOwned ? m.channels_deleting() : m.channels_delete()}
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <ConfirmDialog
   bind:open={leaveOpen}
@@ -2634,7 +3732,7 @@
   }
 
   .header-count {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
     color: var(--text-muted);
     white-space: nowrap;
@@ -2662,7 +3760,7 @@
     cursor: pointer;
     font-family: inherit;
     font-weight: 600;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .add-btn.primary:hover:not(:disabled) {
@@ -2670,16 +3768,15 @@
     border-color: var(--accent-hover);
   }
 
-  .add-btn.primary.danger {
-    background: transparent;
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  .add-btn.primary.active-toggle {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
   }
 
-  .add-btn.primary.danger:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-    color: var(--danger);
-    border-color: var(--danger);
+  .add-btn.primary.active-toggle:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    border-color: var(--accent);
   }
 
   .channels-page {
@@ -2706,7 +3803,7 @@
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-primary);
     cursor: pointer;
@@ -2734,7 +3831,7 @@
   .how-lede,
   .how-limits {
     margin: 0 0 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.5;
     color: var(--text-muted);
     max-width: 52rem;
@@ -2748,10 +3845,11 @@
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    padding: 10px 12px;
+    padding: 10px 14px;
     border-radius: var(--radius-md);
     background: var(--bg-surface);
     border: 1px solid var(--border);
+    font-size: var(--font-size-md);
   }
 
   .error-banner {
@@ -2770,7 +3868,7 @@
 
   .form-title {
     margin: 0 0 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.4px;
@@ -2801,43 +3899,71 @@
     color: var(--warning);
   }
 
+  .create-language {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+  }
+
+  .name-too-long + .create-language {
+    margin-top: 0;
+  }
+
+  .create-language-label {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+  }
+
   .name-count {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
     flex-shrink: 0;
   }
 
-  /* Fixed track widths rather than minmax(): collapsing the list animates
-     `grid-template-columns`, and browsers only interpolate that when the track
-     values are plain lengths. With minmax() the sidebar would jump.
+  .name-count.over,
+  .form-hint.name-too-long {
+    color: var(--danger);
+  }
 
-     Sized to hold a full-length room name. Names cap at 20 characters, which
-     leaves the name about 162px here once the avatar, member count and door
-     button have taken theirs — enough that a name at the limit reads whole
-     instead of trailing off. Held at one width rather than measured per room:
-     the cap already bounds the worst case to a few dozen pixels, and a column
-     that resized itself would do so repeatedly while Discover streams rooms
-     in. The narrower members-open track is gone for the same reason — a name
-     should not shorten because a roster opened beside it. */
+  /* Plain-length track widths rather than minmax() or clamp(): collapsing the
+     list animates `grid-template-columns`, and browsers only interpolate that
+     reliably when the track values are plain lengths. With minmax() the
+     sidebar would jump.
+
+     `--list-width` is measured from the workspace (see `listWidth`): 360px in
+     a small window, growing with it to 440px. Names cap at 32 characters; at
+     360px the name gets some 190px once the avatar, language flag, member
+     count and door button have taken theirs, and at 440px a full name fits on
+     one line. A name that does not fit wraps (see `.chan-title`) rather than
+     being cut off. Sized to the window rather than to the rooms:
+     a column that resized itself would do so repeatedly while Discover streams
+     rooms in. The narrower members-open track is gone for the same reason — a
+     name should not shorten because a roster opened beside it. */
   .workspace {
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns: 312px minmax(0, 1fr);
+    grid-template-columns: var(--list-width, 360px) minmax(0, 1fr);
     gap: 10px;
     position: relative;
     transition: grid-template-columns var(--transition-slow) ease;
   }
 
+  .workspace.list-snapping {
+    transition: none;
+  }
+
   /* Keep a zero-width members track while a room is open so the roster can
-     ease in and out instead of popping. The list stays 312px either way. */
+     ease in and out instead of popping. The list keeps its width either way. */
   .workspace.has-members {
-    grid-template-columns: 312px minmax(0, 1fr) 0;
+    grid-template-columns: var(--list-width, 360px) minmax(0, 1fr) 0;
   }
 
   .workspace.members-open {
-    grid-template-columns: 312px minmax(0, 1fr) 228px;
+    grid-template-columns: var(--list-width, 360px) minmax(0, 1fr) 228px;
   }
 
   .workspace.list-collapsed {
@@ -2950,7 +4076,7 @@
     border-radius: var(--radius-pill);
     background: var(--bg-input);
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .search-clear {
@@ -2983,11 +4109,52 @@
     overflow: auto;
   }
 
-  .list-empty { padding: 16px 10px; text-align: center; font-size: 12px; }
+  .list-empty { padding: 16px 10px; text-align: center; font-size: var(--font-size-sm); }
+
+  /* Sized like the dock switcher's section labels, so the two lists read as
+     one family. A fixed height keeps the header from growing when its action
+     appears and disappears. */
+  .list-section {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 22px;
+    margin: 10px 0 2px;
+    padding: 0 6px 0 8px;
+  }
+
+  .list-section:first-child { margin-top: 0; }
+
+  .list-section-label {
+    margin: 0;
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .list-section-action {
+    font-size: var(--font-size-xs);
+    font-family: inherit;
+    padding: 2px 6px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-accent);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .list-section-action:hover:not(:disabled),
+  .list-section-action:focus-visible { background: var(--bg-hover); }
+
+  .list-section-action:disabled { opacity: 0.5; cursor: wait; }
 
   .form-hint {
     margin: 0 0 10px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-secondary);
   }
 
@@ -3124,7 +4291,7 @@
   }
 
   .chan-door {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 5px 12px;
     min-width: 62px;
     text-align: center;
@@ -3173,7 +4340,7 @@
     align-items: center;
     gap: 3px;
     flex-shrink: 0;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
     line-height: 1;
@@ -3189,7 +4356,34 @@
   .chan-row.moved .chan-name,
   .chan-row.moved .chan-avatar { opacity: 0.55; }
 
-  .chan-row:hover { background: var(--bg-hover); }
+  .chan-row:hover,
+  .chan-row.highlighted { background: var(--bg-hover); }
+
+  /* The search box keeps focus while its arrows steer, so the row carries the
+     ring focus would otherwise have drawn. */
+  .chan-row.highlighted { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent); }
+
+  .chan-fav {
+    display: inline-flex;
+    flex-shrink: 0;
+    margin-inline-start: -4px;
+    color: var(--warning);
+  }
+
+  .chan-fav svg { width: 11px; height: 11px; }
+
+  /* Hidden until the row is reached, like Remove on a Discover row, and in
+     the same slot, so joined and unjoined rows line up. */
+  .row-more > summary {
+    opacity: 0;
+    transition:
+      opacity var(--transition-fast) ease,
+      background-color var(--transition-fast) ease;
+  }
+
+  .chan-row:hover .row-more > summary,
+  .chan-row:focus-within .row-more > summary,
+  .row-more[open] > summary { opacity: 1; }
 
   .chan-row.active {
     background: color-mix(in srgb, var(--accent) 12%, var(--bg-hover));
@@ -3212,8 +4406,8 @@
   /* Filled accent with a white hash, in the list and the header. A wash
      disappears against both the room card and the surface bar. */
   .chan-avatar {
-    width: 30px;
-    height: 30px;
+    width: var(--avatar-size);
+    height: var(--avatar-size);
     flex-shrink: 0;
     border-radius: var(--radius-sm);
     background: var(--accent);
@@ -3226,7 +4420,7 @@
   }
 
   .chan-avatar svg { width: 14px; height: 15px; }
-  .chan-avatar.sm { width: 28px; height: 28px; }
+  .chan-avatar.sm { width: var(--avatar-size-compact); height: var(--avatar-size-compact); }
   .chan-avatar.sm svg { width: 13px; height: 14px; }
 
   /* The only thing on the row that says a room is private, now that the badge
@@ -3247,35 +4441,45 @@
 
   .lock-dot svg { width: 8px; height: 8px; }
 
-  /* The name is the only thing that gives way when the row is tight. The
-     count is two glyphs, and hiding it would make a busy room look empty. */
-  .chan-name {
+  /* The name is the only thing that gives way when the row is tight, and it
+     gives way by wrapping rather than being cut off: a room is picked by its
+     name, and two rooms sharing a long prefix were indistinguishable once
+     ellipsised. Names cap at 32 characters, so even the narrowest list takes
+     two lines. The count is two glyphs, and hiding it would make a busy room
+     look empty. */
+  .chan-title {
     flex: 1;
     min-width: 0;
-    font-weight: 600;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    line-height: 1.3;
   }
 
-  .unread {
-    min-width: 18px;
-    height: 18px;
-    border-radius: 9px;
-    background: var(--accent);
-    color: var(--on-accent);
-    font-size: 11px;
-    font-weight: 700;
-    display: grid;
-    place-items: center;
-    padding: 0 5px;
-    flex-shrink: 0;
+  .chan-name {
+    font-weight: 600;
+    overflow-wrap: anywhere;
   }
+
+  /* Inline after the last word, so it follows the name onto a second line. */
+  .chan-flag {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    margin-inline-start: 6px;
+    vertical-align: -2px;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--text-primary) 14%, transparent);
+  }
+
+  .chan-row.moved .chan-flag { opacity: 0.55; }
 
   /* A silenced room still counts its unread, it just stops shouting about it. */
   .unread.silenced {
     background: var(--bg-tertiary);
     color: var(--text-secondary);
+  }
+
+  .unread-at {
+    margin-inline-end: 1px;
+    font-weight: 800;
   }
 
   /* A room arrives as a movement rather than in a single frame. That matters
@@ -3321,19 +4525,35 @@
     flex: 1;
     min-width: 0;
   }
+  .conv-title {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  /* Wraps like the list's names rather than being cut off. */
   .conv-heading h3 {
     margin: 0;
-    font-size: 14px;
+    min-width: 0;
+    font-size: var(--font-size-base);
     font-weight: 650;
     line-height: 1.2;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
+  }
+
+  .conv-flag {
+    flex-shrink: 0;
+    width: 15px;
+    height: 15px;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--text-primary) 14%, transparent);
   }
 
   .topic {
     margin: 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -3362,7 +4582,7 @@
   .topic-mark {
     color: var(--accent);
     font-weight: 700;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1;
     flex-shrink: 0;
   }
@@ -3401,7 +4621,7 @@
 
   .conv-action {
     padding: 5px 12px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     border-radius: var(--radius-pill);
   }
 
@@ -3431,8 +4651,96 @@
 
   .conv-delete:hover:not(:disabled) { background: var(--danger-hover); }
 
-  .danger-zone {
+  /* Room settings window, laid out like the Library's Share Folders one. */
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    background: var(--overlay-bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .modal-content {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: inset 0 1px 0 var(--surface-highlight), var(--shadow-lg);
+    display: flex;
+    flex-direction: column;
+    max-height: 85vh;
+  }
+
+  .modal-content:focus {
+    outline: none;
+  }
+
+  .room-settings {
+    width: min(620px, calc(100vw - 2rem));
+    height: min(760px, calc(100vh - 3rem));
+  }
+
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .room-settings-heading {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .modal-title {
+    font-weight: 600;
+    font-size: var(--font-size-lg);
+  }
+
+  .room-settings-room {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .room-settings-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px;
+  }
+
+  /* Cards rather than the full-width ruled bands these forms draw by default. */
+  .room-settings-body :is(.succession-form, .moderation-form) {
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+  }
+
+  .room-settings-body .moderation-form {
+    padding: 12px 14px 14px;
+    gap: 10px;
+  }
+
+  .room-settings-body .danger-zone {
     border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
+  }
+
+  /* Busy rather than `disabled`, so focus can come back to them; this is the
+     look `disabled` would have given. */
+  .room-settings-body button[aria-disabled='true'] {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 
   .back-btn { display: none; }
@@ -3478,7 +4786,7 @@
     padding: 8px 14px;
     border-bottom: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));
     background: color-mix(in srgb, var(--warning) 12%, transparent);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--badge-warning-text);
     flex-shrink: 0;
   }
@@ -3490,81 +4798,294 @@
     padding: 8px 14px;
     border-bottom: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
     background: color-mix(in srgb, var(--danger) 10%, transparent);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     flex-shrink: 0;
   }
 
   .key-behind-banner strong {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
   }
 
-  .xfer-panel {
+  /* Transfers live at the foot of the members pane, beside the people they
+     are with. `margin-top: auto` keeps it there when the roster above is a
+     one-line placeholder rather than the list that would push it down. */
+  .xfer-drawer {
+    margin-top: auto;
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
-    border-bottom: 1px solid var(--border);
+    max-height: 62%;
+    min-height: 0;
+    border-top: 1px solid var(--border);
     background: var(--bg-surface);
+    box-shadow: 0 -8px 18px -14px rgba(0, 0, 0, 0.35);
   }
 
-  .xfer-row {
+  .xfer-drawer-head {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 8px 14px;
+    gap: 6px;
+    width: 100%;
+    padding: 9px 12px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: var(--text-muted);
+    text-align: start;
+    flex-shrink: 0;
   }
 
-  .xfer-row + .xfer-row {
-    border-top: 1px solid var(--border);
+  .xfer-drawer-head:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
   }
 
-  /* An offer waiting on the user is the only row that needs to be noticed;
+  .xfer-drawer-head:focus-visible { outline-offset: -2px; }
+
+  .xfer-drawer-icon {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+  }
+
+  .xfer-drawer-count {
+    margin-right: auto;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--text-muted) 16%, transparent);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    line-height: 18px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .xfer-drawer-rate {
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .xfer-drawer-chevron {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    transition: transform var(--transition-slow) ease;
+  }
+
+  .xfer-drawer-chevron.flipped { transform: rotate(180deg); }
+
+  .xfer-drawer-body {
+    min-height: 0;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 0 8px 8px;
+  }
+
+  /* Same card as a friend chat's file attachment: corners, padding, lift. */
+  .xfer-card {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--bg-secondary);
+    box-shadow: var(--shadow-sm);
+    flex-shrink: 0;
+  }
+
+  /* An offer waiting on the user is the only card that needs to be noticed;
      the rest are progress the user already knows about. */
-  .xfer-row.awaiting {
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  .xfer-card.tone-awaiting {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    background: color-mix(in srgb, var(--accent) 7%, var(--bg-secondary));
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+
+  .xfer-card.tone-ended { opacity: 0.75; }
+
+  .xfer-card-top {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-width: 0;
+  }
+
+  .xfer-dir {
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    border-radius: var(--radius-md);
+    display: grid;
+    place-items: center;
+    background: color-mix(in srgb, var(--success) 14%, transparent);
+    color: var(--success);
+  }
+
+  .xfer-dir.send {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--accent);
+  }
+
+  .xfer-card.tone-failed .xfer-dir {
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    color: var(--danger);
+  }
+
+  .xfer-dir svg {
+    width: 15px;
+    height: 15px;
   }
 
   .xfer-text {
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 1px;
     min-width: 0;
     flex: 1;
   }
 
   .xfer-name {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
+    color: var(--text-primary);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .xfer-meta {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
   }
 
+  .xfer-status {
+    margin: 0;
+    font-size: var(--font-size-sm);
+    line-height: 1.35;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+  }
+
+  .xfer-card.tone-done .xfer-status { color: var(--success); }
+  .xfer-card.tone-failed .xfer-status { color: var(--danger); }
+
   .xfer-progress {
-    height: 3px;
-    margin-top: 4px;
+    position: relative;
+    height: 6px;
     border-radius: var(--radius-pill);
-    background: color-mix(in srgb, var(--text-muted) 30%, transparent);
+    background: color-mix(in srgb, var(--text-muted) 22%, transparent);
     overflow: hidden;
   }
 
+  /* Reports arrive about once a second; easing over most of that makes the
+     bar glide instead of stepping. */
   .xfer-progress-fill {
     height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 65%, #fff));
+    transition: width 900ms linear;
+  }
+
+  /* Accepted but nothing through yet: movement says it is working without
+     claiming a figure. */
+  .xfer-progress.indeterminate .xfer-progress-fill { display: none; }
+
+  .xfer-progress.indeterminate::after {
+    content: '';
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 35%;
+    border-radius: inherit;
     background: var(--accent);
-    transition: width var(--transition-fast) linear;
+    opacity: 0.7;
+    animation: xfer-indeterminate 1.3s ease-in-out infinite;
+  }
+
+  @keyframes xfer-indeterminate {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(290%); }
+  }
+
+  .xfer-stats {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-top: -2px;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .xfer-pct {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .xfer-speed {
+    font-weight: 600;
+    color: var(--accent);
+  }
+
+  .xfer-left {
+    margin-left: auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .xfer-actions {
     display: flex;
     gap: 6px;
-    flex-shrink: 0;
+  }
+
+  .xfer-actions button {
+    flex: 1;
+    min-width: 0;
+    padding: 5px 10px;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+  }
+
+  .xfer-actions button.xfer-cancel {
+    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+    color: var(--danger);
+  }
+
+  .xfer-actions button.xfer-cancel:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+    color: var(--danger);
+  }
+
+  .members-toggle { position: relative; }
+
+  .toggle-badge {
+    position: absolute;
+    top: 1px;
+    right: 1px;
+    min-width: 15px;
+    height: 15px;
+    padding: 0 4px;
+    border-radius: var(--radius-pill);
+    background: var(--accent);
+    color: var(--on-accent);
+    font-size: var(--font-size-2xs);
+    font-weight: 700;
+    line-height: 15px;
+    text-align: center;
+    box-shadow: 0 0 0 2px var(--bg-tertiary);
+    pointer-events: none;
   }
 
   .succession-form {
@@ -3576,16 +5097,27 @@
     background: var(--bg-surface);
   }
 
+  .rename-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .rename-row input {
+    flex: 1;
+    min-width: 0;
+  }
+
   .succession-title {
     margin: 0;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
   }
 
   .succession-hint {
     margin: -4px 0 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
     color: var(--text-secondary);
   }
@@ -3594,7 +5126,7 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
     color: var(--text-secondary);
   }
@@ -3608,7 +5140,7 @@
     padding: 8px 14px;
     border-bottom: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
     background: color-mix(in srgb, var(--accent) 8%, var(--bg-tertiary));
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     line-height: 1.45;
     flex-shrink: 0;
@@ -3632,15 +5164,13 @@
     flex-shrink: 0;
   }
 
-  .mod-label { margin: 0; font-size: 12px; color: var(--text-secondary); }
-
   .room-notice {
     margin: 0;
     padding: 8px 14px;
     border-bottom: 1px solid var(--border);
     background: var(--bg-surface);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
     flex-shrink: 0;
   }
@@ -3671,7 +5201,7 @@
     align-items: baseline;
     gap: 8px;
     padding: 7px 14px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     width: 100%;
     text-align: left;
     border: 0;
@@ -3712,7 +5242,7 @@
   .search-hit-when {
     color: var(--text-muted);
     flex-shrink: 0;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
 
   .transcript {
@@ -3737,7 +5267,7 @@
   }
 
   .members-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -3745,7 +5275,7 @@
   }
 
   .members-count {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
   }
 
@@ -3791,8 +5321,8 @@
   .member-list li.banned { opacity: 0.65; }
 
   .member-avatar {
-    width: 28px;
-    height: 28px;
+    width: var(--avatar-size-compact);
+    height: var(--avatar-size-compact);
     flex-shrink: 0;
     border-radius: 50%;
     background: var(--accent-dim);
@@ -3837,7 +5367,7 @@
   }
 
   .member-seen {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     white-space: nowrap;
   }
@@ -3854,14 +5384,14 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 500;
   }
 
   .member-badges { display: flex; flex-wrap: wrap; gap: 4px; }
 
   .badge {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     color: var(--text-secondary);
     border: 1px solid var(--border);
@@ -3917,17 +5447,17 @@
     z-index: 20;
     min-width: 180px;
     padding: 4px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    box-shadow: var(--shadow-md);
+    background: var(--ctx-surface);
+    border: 1px solid var(--ctx-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--ctx-shadow);
     display: flex;
     flex-direction: column;
   }
 
   .card-more-menu button {
     text-align: left;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-family: inherit;
     padding: 6px 10px;
     border: none;
@@ -3940,6 +5470,65 @@
   .card-more-menu button:hover:not(:disabled) { background: var(--bg-hover); }
   .card-more-menu button:disabled { opacity: 0.4; cursor: not-allowed; }
   .menu-item-danger:hover:not(:disabled) { color: var(--danger); }
+
+  /* Set from `placeRowMenu`, out of the compiler's sight. */
+  .card-more-menu:global([data-up]) {
+    top: auto;
+    bottom: calc(100% + 4px);
+  }
+
+  .card-more-menu [role='group'] {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .menu-sep {
+    height: 1px;
+    margin: 4px 2px;
+    background: var(--ctx-border);
+  }
+
+  .menu-heading {
+    padding: 4px 10px 2px;
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .card-more-menu .menu-radio {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding-inline-start: 6px;
+  }
+
+  .menu-check {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    color: var(--accent);
+  }
+
+  .card-more-menu .menu-note {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-width: 220px;
+    white-space: normal;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+  }
+
+  .menu-note-action { color: var(--text-accent); }
+
+  /* The header's bell is an `icon-btn` that happens to open a menu, so it
+     keeps that size rather than the row menus' smaller trigger. */
+  .notify-more > summary {
+    width: 30px;
+    height: 30px;
+  }
 
   .empty-state {
     text-align: center;
@@ -3965,32 +5554,9 @@
 
   .empty-icon svg { width: 32px; height: 32px; }
 
-  .empty-title {
-    font-size: 15px;
-    font-weight: 600;
-    color: var(--text-secondary);
-    margin: 0 0 6px;
-  }
-
   .empty-sub {
-    font-size: 12px;
-    color: var(--text-secondary);
     max-width: 360px;
     margin: 0 auto;
-    line-height: 1.5;
-  }
-
-  .empty-actions {
-    display: flex;
-    gap: 8px;
-    justify-content: center;
-    margin-top: 16px;
-    flex-wrap: wrap;
-  }
-
-  .empty-action {
-    font-size: 12px;
-    padding: 7px 20px;
   }
 
   .muted { color: var(--text-secondary); }
@@ -4000,7 +5566,7 @@
     .workspace,
     .workspace.has-members,
     .workspace.members-open {
-      grid-template-columns: 312px minmax(0, 1fr);
+      grid-template-columns: var(--list-width, 360px) minmax(0, 1fr);
     }
 
     /* The members pane floats over the chat at this width, so a collapsed list
@@ -4032,15 +5598,11 @@
       z-index: 4;
       border: 0;
       padding: 0;
-      background: color-mix(in srgb, #000 28%, transparent);
+      background: var(--overlay-bg);
       cursor: pointer;
       opacity: 0;
       pointer-events: none;
       transition: opacity var(--transition-slow) ease;
-    }
-
-    :global([data-theme="dark"]) .members-backdrop {
-      background: var(--overlay-bg);
     }
 
     .workspace.members-open .members-backdrop {
@@ -4112,7 +5674,7 @@
     .conversation-pane.hidden-when-list { display: none; }
 
     .conv-actions .ghost,
-    .conv-actions .conv-action { padding: 5px 9px; font-size: 12px; }
+    .conv-actions .conv-action { padding: 5px 9px; font-size: var(--font-size-sm); }
   }
 
   @media (max-width: 760px) {

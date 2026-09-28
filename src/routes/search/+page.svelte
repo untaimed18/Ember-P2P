@@ -24,6 +24,8 @@
     openSearchTab,
     patchSearchTabByRequestId,
     patchSpamFlagByHash,
+    rescoreTabAfterSpamMark,
+    searchRowPatchEpoch,
     searchTabs,
     setActiveSearchTab,
     spamFilterEpoch,
@@ -42,11 +44,13 @@
   import { get } from 'svelte/store';
   import { listen } from '@tauri-apps/api/event';
   import type { SearchResult, SpamExplanation } from '$lib/types';
-  import { formatSize, formatSpeed, copyToClipboard } from '$lib/utils';
+  import { formatNumber, formatSize, formatSpeed, copyToClipboard, sizeUnitLabel } from '$lib/utils';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { addToast } from '$lib/stores/toast';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
+  import { passiveScroll } from '$lib/actions/passiveScroll';
+  import { computeRowWindow } from '$lib/rowWindow';
   import { openWebService } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
   import IconX from '$lib/components/IconX.svelte';
@@ -60,6 +64,7 @@
     spamProfileText,
     transferFailureReasonText,
   } from '$lib/i18n';
+  import { plural } from '$lib/plural';
 
   const searchTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
   /** Request ids whose invoke has settled (success or error). Prevents a late
@@ -98,6 +103,7 @@
   let resultsSyncTimer: ReturnType<typeof setTimeout> | null = null;
   let syncedTabId: string | null = null;
   let syncedLength = 0;
+  let syncedPatchEpoch = 0;
 
   function syncVisibleResults(list: SearchResult[], tabId: string | null) {
     if (resultsSyncTimer !== null) {
@@ -106,6 +112,7 @@
     }
     syncedTabId = tabId;
     syncedLength = list.length;
+    syncedPatchEpoch = get(searchRowPatchEpoch);
     resultsSyncedAt = Date.now();
     visibleResults = list;
   }
@@ -113,14 +120,21 @@
   $effect(() => {
     const list = searchResultsList;
     const tabId = $activeSearchTabId;
+    const patchEpoch = $searchRowPatchEpoch;
     const elapsed = Date.now() - resultsSyncedAt;
     // Bypass the throttle on: tab switch; a shorter list (Clear / close / cap
-    // eviction); the 400ms interval; and the first 0→N fill. Empty states read
-    // this snapshot, so delaying the first hits until after search-complete
-    // flashes "No results" on a fast Ember complete.
+    // eviction); an in-place row edit; the 400ms interval; and the first 0→N
+    // fill. Empty states read this snapshot, so delaying the first hits until
+    // after search-complete flashes "No results" on a fast Ember complete.
+    //
+    // The row-edit case is the user's own mark spam / mark not spam and the
+    // re-score behind it. Those keep the row count identical, so without the
+    // epoch they fell through to the trailing timer and the row the user just
+    // marked stayed on screen for up to the full interval.
     if (
       tabId !== syncedTabId ||
       list.length < syncedLength ||
+      patchEpoch !== syncedPatchEpoch ||
       elapsed >= RESULTS_SYNC_MIN_INTERVAL_MS ||
       (syncedLength === 0 && list.length > 0)
     ) {
@@ -141,6 +155,30 @@
   // Per-hash sequence for optimistic mark/unmark so out-of-order IPC
   // completions cannot desync the UI from the latest user action.
   const spamToggleGen = new Map<string, number>();
+  /** Ceiling on that sequence table. Nothing pruned it — a hash entered on the
+   *  first mark and stayed for the session — so it gets the same bound as
+   *  `SPAM_CACHE_MAX` below. Eviction is only safe because it is far above the
+   *  number of marks that can be in flight at once: the handlers read the entry
+   *  back to decide whether their IPC was superseded, and an evicted entry reads
+   *  as superseded, which would skip the revert on a failed mark. */
+  const SPAM_TOGGLE_MAX = 500;
+
+  /** Claim the next generation for a hash, evicting the least-recently-marked
+   *  hashes once the table is over budget. */
+  function nextSpamToggleGen(hash: string): number {
+    const gen = (spamToggleGen.get(hash) ?? 0) + 1;
+    // Re-inserted rather than overwritten so the hash moves to the back of the
+    // insertion order eviction reads from, which keeps the entry a request is
+    // waiting on out of reach of it.
+    spamToggleGen.delete(hash);
+    spamToggleGen.set(hash, gen);
+    while (spamToggleGen.size > SPAM_TOGGLE_MAX) {
+      const oldest = spamToggleGen.keys().next().value;
+      if (oldest === undefined) break;
+      spamToggleGen.delete(oldest);
+    }
+    return gen;
+  }
   // Per-hash "last applied generation". `getDownloadHistory` IPC
   // round-trips can resolve out of order (cold DB vs warm cache),
   // and the previous merge happily let an older batch overwrite a
@@ -440,10 +478,10 @@
   ];
 
   const SIZE_UNITS = [
-    { value: 1, label: 'B' },
-    { value: 1024, label: 'KB' },
-    { value: 1024 * 1024, label: 'MB' },
-    { value: 1024 * 1024 * 1024, label: 'GB' },
+    { value: 1, label: sizeUnitLabel(0) },
+    { value: 1024, label: sizeUnitLabel(1) },
+    { value: 1024 * 1024, label: sizeUnitLabel(2) },
+    { value: 1024 * 1024 * 1024, label: sizeUnitLabel(3) },
   ];
 
   let filterType = $state('');
@@ -485,9 +523,16 @@
     return net.length === 0;
   }
 
+  // Mirrors the backend `is_invisible_or_bidi_control` set plus C0/C1 controls:
+  // `<bdi dir="auto">` isolates direction but does not neutralize an embedded RLO.
+  const DISPLAY_NAME_STRIP_RE =
+    /[\u0000-\u001F\u007F-\u009F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060-\u2064\u2066-\u2069\uFE00-\uFE0F\uFEFF\u{E0100}-\u{E01EF}]/gu;
+
   function displayName(result: SearchResult): string {
-    return result.clean_name || result.file.name;
+    const clean = (result.clean_name ?? '').replace(DISPLAY_NAME_STRIP_RE, '').trim();
+    return clean || (result.file.name ?? '').replace(DISPLAY_NAME_STRIP_RE, '');
   }
+  let selectedOriginalName = $derived((selectedResult?.file.name ?? '').replace(DISPLAY_NAME_STRIP_RE, ''));
 
   /**
    * What the Sources number on a row actually counted.
@@ -501,10 +546,12 @@
   function sourceCountHint(r: SearchResult): string | undefined {
     const origin = r.result_origin || '';
     if (!origin.includes('Ember')) return undefined;
-    if (origin !== 'Ember') return m.search_sources_ember_mixed_hint({ count: r.availability });
-    return r.availability === 1
-      ? m.search_sources_ember_hint_one()
-      : m.search_sources_ember_hint_other({ count: r.availability });
+    if (origin !== 'Ember') return m.search_sources_ember_mixed_hint();
+    return plural(r.availability, {
+      one: m.search_sources_ember_hint_one,
+      few: () => m.search_sources_ember_hint_few({ count: r.availability }),
+      other: () => m.search_sources_ember_hint_other({ count: r.availability }),
+    });
   }
   let spamProfile = $derived(
     ($appSettings?.spam_filter_profile as 'relaxed' | 'balanced' | 'aggressive' | undefined)
@@ -975,7 +1022,7 @@
   }
 
   function sortIndicator(field: SortField): string {
-    if (sortField !== field) return '';
+    if (sortField !== field) return ' \u00A0';
     return sortDir === 'asc' ? ' \u25B2' : ' \u25BC';
   }
 
@@ -1135,6 +1182,11 @@
   let emberJoinActiveSince = $state<number | null>(null);
   let emberDiagnosticsStale = $state(false);
   let emberSearchUsable = $derived(emberEnabled && emberContacts > 0);
+  // The Ember option is not rendered while Ember is off, so a method restored
+  // from storage or a tab would leave the dropdown blank and Search disabled.
+  $effect(() => {
+    if ($appSettings && !emberEnabled && searchMethod === 'ember') searchMethod = 'global';
+  });
   // A wedged diagnostics poll leaves `emberContacts` at whatever it last was —
   // 0 for the whole session if the very first poll never landed. Gating submit
   // on that number then disables Search and blames the DHT for having no
@@ -1187,6 +1239,11 @@
 
   onMount(() => {
     loadPersistedPrefs();
+    const restoredTab = get(searchTabs).find((t) => t.id === get(activeSearchTabId));
+    if (restoredTab) {
+      barQuery = restoredTab.query;
+      restoreTabSearchParams(restoredTab);
+    }
     prefsRestored = true;
 
     // Arriving on this page puts the caret in the query box. Typing is what
@@ -1410,6 +1467,10 @@
       clearTimeout(dlMapTimer);
       dlMapTimer = null;
     }
+    if (rowWindowRaf !== null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(rowWindowRaf);
+      rowWindowRaf = null;
+    }
   });
 
   function getDownloadTransfer(result: SearchResult): Transfer | undefined {
@@ -1449,17 +1510,17 @@
 
   function dlBadgeClass(t: Transfer): string {
     switch (t.status) {
-      case 'completed': return 'dl-badge-success';
-      case 'active': return 'dl-badge-active';
+      case 'completed': return 'tone-success';
+      case 'active':
       case 'verifying':
       case 'completing':
-      case 'hashing': return 'dl-badge-progress';
+      case 'hashing': return 'tone-accent';
       case 'paused':
-      case 'stopped': return 'dl-badge-warning';
+      case 'stopped': return 'tone-warning';
       case 'failed':
       case 'insufficient':
-      case 'noneneeded': return 'dl-badge-danger';
-      default: return 'dl-badge-neutral';
+      case 'noneneeded': return 'tone-danger';
+      default: return 'tone-muted';
     }
   }
 
@@ -1493,10 +1554,12 @@
     // proportionally to the number of active filters.
     const ext = filterExtension.trim().toLowerCase().replace(/^\./, '');
     const hasExt = ext.length > 0;
-    const minParsed = filterMinSize !== null ? filterMinSize * filterMinUnit : NaN;
-    const minBytes = Number.isFinite(minParsed) && minParsed > 0 ? minParsed : 0;
-    const maxParsed = filterMaxSize !== null ? filterMaxSize * filterMaxUnit : NaN;
-    const maxBytes = Number.isFinite(maxParsed) && maxParsed > 0 ? maxParsed : 0;
+    // `sizeToBytes`, the same conversion the wire filter uses, so a fractional
+    // size cannot mean one thing to the server and another to this table: the
+    // boxes are `step="any"`, and rounding only on the way out left rows near
+    // the boundary passing one filter and failing the other.
+    const minBytes = sizeToBytes(filterMinSize, filterMinUnit) ?? 0;
+    const maxBytes = sizeToBytes(filterMaxSize, filterMaxUnit) ?? 0;
     const minSrcParsed = filterMinSources !== null ? Math.trunc(filterMinSources) : NaN;
     const minSrc = Number.isFinite(minSrcParsed) && minSrcParsed > 0 ? minSrcParsed : 0;
     const minCompleteParsed = filterMinComplete !== null ? Math.trunc(filterMinComplete) : NaN;
@@ -1513,7 +1576,12 @@
       if (hasExt && (r.file.extension ?? '').toLowerCase() !== ext) continue;
       if (minBytes > 0 && r.file.size < minBytes) continue;
       if (maxBytes > 0 && r.file.size > maxBytes) continue;
-      if (minSrc > 0 && r.availability < minSrc) continue;
+      // A library-only row's source count is the placeholder `1` the backend
+      // fills in for a file that is on this disk rather than in a swarm, so it
+      // survives this filter the way an unknown complete count survives the
+      // next one. Mirrors `result_matches_client_filters` in merge.rs; a file
+      // the network also answered for carries that count and a wider origin.
+      if (minSrc > 0 && r.availability < minSrc && r.result_origin !== 'Local') continue;
       // A row whose complete count is unknown survives this filter rather than
       // being judged on a figure the column itself declines to show. eMule does
       // the same: `CSearchListCtrl::IsComplete` returns true for unknown.
@@ -1585,6 +1653,121 @@
 
   let filteredResults: SearchResult[] = $derived(filterPass.rows);
   let spamHiddenCount = $derived(filterPass.spamCount);
+
+  /* --- Row windowing ---------------------------------------------------
+   *
+   * Only the rows around the viewport are in the DOM. A tab holds up to
+   * `MAX_TAB_RESULTS` (15,000) and every row here is a real `<tr>` with a
+   * dozen cells, a download button and its own reactive `@const` block — so
+   * with the whole list mounted, anything that invalidated the list walked all
+   * of it. Marking one result as spam was the worst case and the reason this
+   * exists: with "Hide spam" on it removes a keyed row, which re-runs every
+   * surviving row's template and shifts `idx` on all of them. On a large
+   * search that froze the window for seconds per click.
+   *
+   * `content-visibility: auto` used to stand in for this. It skips layout and
+   * paint for offscreen rows, which helps scrolling and does nothing for the
+   * cost above: the nodes are still created, still keyed, still re-evaluated.
+   * The Library table windows its rows for the same reason
+   * (`LibraryVirtualTable.svelte`); this is the table-friendly form of it,
+   * two spacer rows around a slice, so the sticky header, the fixed column
+   * layout and every cell stay exactly as they were.
+   *
+   * eMule's own search list is a Win32 list control and has never had this
+   * problem — but `CSearchListCtrl::OnCommand` still wraps a spam mark in
+   * `SetRedraw(false)` and a wait cursor, for the identical reason.
+   */
+  /** Until a row has been measured. The real height is whatever the row's
+   *  tallest cell (the 26px action button plus its padding) comes to under
+   *  the user's font and zoom, so it is measured rather than assumed. */
+  const DEFAULT_ROW_HEIGHT = 34;
+  let resultsScrollEl: HTMLDivElement | undefined = $state(undefined);
+  let resultsBodyEl: HTMLTableSectionElement | undefined = $state(undefined);
+  let rowHeight = $state(DEFAULT_ROW_HEIGHT);
+  let rowWindowStart = $state(0);
+  let rowWindowEnd = $state(0);
+  let rowWindowRaf: number | null = null;
+
+  /** Columns the table is currently rendering, for the spacer rows' `colspan`.
+   *  Fixed part: checkbox, name, size, type, origin, sources, history, action. */
+  let renderedColumnCount = $derived(
+    8 + MEDIA_COLUMNS.reduce((n, c) => n + (columnVis[c.key] ? 1 : 0), 0),
+  );
+
+  function updateRowWindow() {
+    const scroller = resultsScrollEl;
+    const body = resultsBodyEl;
+    const total = filteredResults.length;
+    if (!scroller || !body || total === 0) {
+      rowWindowStart = 0;
+      rowWindowEnd = 0;
+      return;
+    }
+    // This side owns the measuring, because only this side can read the DOM;
+    // `computeRowWindow` owns the rule and is tested against it.
+    const { start, end } = computeRowWindow({
+      total,
+      bodyTop: body.getBoundingClientRect().top - scroller.getBoundingClientRect().top,
+      viewportHeight: scroller.clientHeight,
+      rowHeight,
+    });
+    rowWindowStart = start;
+    rowWindowEnd = end;
+  }
+
+  function scheduleRowWindowUpdate() {
+    if (rowWindowRaf !== null) return;
+    if (typeof requestAnimationFrame !== 'function') {
+      updateRowWindow();
+      return;
+    }
+    rowWindowRaf = requestAnimationFrame(() => {
+      rowWindowRaf = null;
+      if (!destroyed) updateRowWindow();
+    });
+  }
+
+  let windowedResults = $derived(filteredResults.slice(rowWindowStart, rowWindowEnd));
+  let rowsBelowWindow = $derived(Math.max(0, filteredResults.length - rowWindowEnd));
+
+  $effect(() => {
+    // The list, its height or the elements changed; the scrollport did not, so
+    // this is the one path that does not go through the scroll handler.
+    void filteredResults;
+    void rowHeight;
+    void resultsScrollEl;
+    void resultsBodyEl;
+    untrack(() => updateRowWindow());
+  });
+
+  $effect(() => {
+    const el = resultsScrollEl;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    // Through the scheduler, not straight into `updateRowWindow`. Measuring
+    // synchronously from inside the observer callback forced three layout reads
+    // and wrote `$state` per observation, and it can feed itself: a new row
+    // window changes the content height, which can bring a scrollbar in or out
+    // and so change the `clientHeight` this reads — the observation that
+    // re-observes. The rAF coalescing is what stops that becoming a loop, and it
+    // is the same path the scroll handler already takes.
+    const ro = new ResizeObserver(() => scheduleRowWindowUpdate());
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
+
+  // Row height comes from the rows themselves, so a different font size, a
+  // longer locale or browser zoom cannot desync the spacers from the content.
+  // Safe to read now that nothing is `content-visibility: auto`: every
+  // rendered row has real layout, including the overscan.
+  $effect(() => {
+    void windowedResults;
+    untrack(() => {
+      const row = resultsBodyEl?.querySelector<HTMLTableRowElement>('tr.result-row');
+      if (!row) return;
+      const measured = row.getBoundingClientRect().height;
+      if (measured > 0 && Math.abs(measured - rowHeight) >= 0.5) rowHeight = measured;
+    });
+  });
 
   // O(1) instead of two more full scans of `filteredResults`. The effect below
   // reconciles `checkedKeys` down to the visible set on every change, and
@@ -1856,9 +2039,10 @@
     const preview = tab.query.length > 60 ? `${tab.query.slice(0, 59)}…` : tab.query;
     confirmMessage = tab.isSearching
       ? m.search_confirm_stop_message({ preview })
-      : (tab.results.length === 1
-          ? m.search_confirm_close_message_one({ preview })
-          : m.search_confirm_close_message_other({ preview, count: tab.results.length }));
+      : plural(tab.results.length, {
+          one: () => m.search_confirm_close_message_one({ preview }),
+          other: () => m.search_confirm_close_message_other({ preview, count: tab.results.length }),
+        });
     confirmOpen = true;
   }
 
@@ -2649,17 +2833,21 @@
   }
 
   async function handleMarkSpam(result: SearchResult) {
-    const prevSpam = result.is_spam;
-    const prevRating = result.spam_rating ?? 0;
-    const prevReasons = result.spam_reasons?.slice() ?? [];
     const hash = result.file.hash;
-    const gen = (spamToggleGen.get(hash) ?? 0) + 1;
-    spamToggleGen.set(hash, gen);
+    // The learned entry is keyed by hash and `mark_spam` rejects anything that
+    // is not one, so there is nothing to record for a hashless row. The menu
+    // item is disabled for those; this is the guard behind it.
+    if (!hash) return;
+    const gen = nextSpamToggleGen(hash);
+    // The tab the row belongs to, captured before the IPC: eMule re-rates
+    // `pSpamFile->GetSearchID()`, not whatever search is on screen when the
+    // call comes back.
+    const markedTabId = activeTab?.id ?? null;
     // Close the menu first so the dismiss paints before filter/sort work.
     // Persist in the background; waiting on IPC (incl. disk) used to freeze the UI.
     contextMenu = null;
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
-    patchSpamFlagByHash(hash, true, spamThreshold, [m.search_spam_reason_manual_spam()]);
+    const undoPatch = patchSpamFlagByHash(hash, true, spamThreshold, [m.search_spam_reason_manual_spam()]);
     clearSpamExplainForResult(result);
     try {
       await markSpam(
@@ -2674,33 +2862,38 @@
       );
       // A newer mark/unmark superseded this request — leave its optimistic state.
       if (spamToggleGen.get(hash) !== gen) return;
+      // What the mark was *for*: the backend has just learned this filename,
+      // its keyword-stripped form, its size and its sources, and every one of
+      // those is a rule about the other rows in this tab.
+      if (markedTabId) rescoreTabAfterSpamMark(markedTabId, 'spam');
     } catch (e) {
       console.error('Failed to mark spam:', e);
       if (spamToggleGen.get(hash) === gen) {
-        patchSpamFlagByHash(hash, prevSpam, prevRating, prevReasons);
+        undoPatch();
         addToast('error', m.search_failed_mark_spam());
       }
     }
   }
 
   async function handleMarkNotSpam(result: SearchResult) {
-    const prevSpam = result.is_spam;
-    const prevRating = result.spam_rating ?? 0;
-    const prevReasons = result.spam_reasons?.slice() ?? [];
     const hash = result.file.hash;
-    const gen = (spamToggleGen.get(hash) ?? 0) + 1;
-    spamToggleGen.set(hash, gen);
+    if (!hash) return;
+    const gen = nextSpamToggleGen(hash);
+    const markedTabId = activeTab?.id ?? null;
     contextMenu = null;
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
-    patchSpamFlagByHash(hash, false, 0, [m.search_spam_reason_manual_not_spam()]);
+    const undoPatch = patchSpamFlagByHash(hash, false, 0, [m.search_spam_reason_manual_not_spam()]);
     clearSpamExplainForResult(result);
     try {
       await markNotSpam(hash);
       if (spamToggleGen.get(hash) !== gen) return;
+      // Unmarking drops the collateral the mark taught — the filename, the
+      // size, the IPs — so rows flagged only by those are clean again.
+      if (markedTabId) rescoreTabAfterSpamMark(markedTabId, 'not-spam');
     } catch (e) {
       console.error('Failed to unmark spam:', e);
       if (spamToggleGen.get(hash) === gen) {
-        patchSpamFlagByHash(hash, prevSpam, prevRating, prevReasons);
+        undoPatch();
         addToast('error', m.search_failed_unmark_spam());
       }
     }
@@ -2745,9 +2938,11 @@
     if (!tab || tab.results.length === 0) return;
     pendingConfirm = { kind: 'clear-results' };
     confirmTitle = m.search_confirm_clear_title();
-    confirmMessage = tab.results.length === 1
-      ? m.search_confirm_clear_message_one()
-      : m.search_confirm_clear_message_other({ count: tab.results.length });
+    confirmMessage = plural(tab.results.length, {
+      one: m.search_confirm_clear_message_one,
+      few: () => m.search_confirm_clear_message_few({ count: tab.results.length }),
+      other: () => m.search_confirm_clear_message_other({ count: tab.results.length }),
+    });
     confirmOpen = true;
   }
 
@@ -2950,9 +3145,10 @@
         addToast('error', m.search_copy_failed());
         return;
       }
-      addToast('success', targets.length === 1
-        ? m.search_copied_link_one()
-        : m.search_copied_links_other({ count: targets.length }));
+      addToast('success', plural(targets.length, {
+        one: m.search_copied_link_one,
+        other: () => m.search_copied_links_other({ count: targets.length }),
+      }));
     } catch (e: unknown) {
       addToast('error', translateError(e, m.search_copy_failed()));
     } finally {
@@ -2976,7 +3172,7 @@
     }
     pendingConfirm = { kind: 'copy-all-links', results: targets };
     confirmTitle = m.search_copy_all_confirm_title();
-    confirmMessage = m.search_copy_all_confirm({ count: targets.length.toLocaleString() });
+    confirmMessage = m.search_copy_all_confirm({ count: formatNumber(targets.length) });
     confirmOpen = true;
   }
 
@@ -3063,7 +3259,7 @@
 
     const parts: string[] = [];
     if (queued > 0) parts.push(m.search_bulk_queued({ count: queued }));
-    if (alreadyQueued > 0) parts.push(`${alreadyQueued}× ${m.search_already_in_queue()}`);
+    if (alreadyQueued > 0) parts.push(m.search_bulk_already_queued({ count: alreadyQueued }));
     if (skippedLocal > 0) parts.push(m.search_bulk_already_in_library({ count: skippedLocal }));
     if (failed > 0) parts.push(m.search_bulk_failed({ count: failed }));
     bulkDownloadMessage = parts.join(', ');
@@ -3074,7 +3270,10 @@
     }, 3000);
 
     if (queued > 0 && failed === 0) {
-      const base = queued === 1 ? m.search_bulk_queued_one() : m.search_bulk_queued_other({ count: queued });
+      const base = plural(queued, {
+        one: m.search_bulk_queued_one,
+        other: () => m.search_bulk_queued_other({ count: queued }),
+      });
       addToast('success', skippedLocal > 0 ? m.search_bulk_queued_with_local({ base, local: skippedLocal }) : base);
     } else if (queued === 0 && alreadyQueued > 0 && failed === 0) {
       addToast('info', m.search_already_in_queue());
@@ -3111,6 +3310,12 @@
   // throttled count with an unthrottled one makes "showing X of Y" briefly
   // disagree with the rows actually on screen (and X - Y go negative).
   let resultsHidden = $derived(visibleResults.length - filteredResults.length);
+  let allHiddenSpamLabel = $derived(
+    plural(visibleResults.length, {
+      one: m.search_all_hidden_spam_one,
+      other: () => m.search_all_hidden_spam_other({ count: formatNumber(visibleResults.length) }),
+    }),
+  );
   // `.mp3` / `.mp4` on Ember or KAD walk a key publishers almost never
   // write (trailing three-letter extensions are stripped from the index).
   let extensionOnlyHintExt = $derived(
@@ -3189,7 +3394,7 @@
   if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C')) {
     const target = e.target as HTMLElement | null;
     if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
-    if (confirmOpen || !(window.getSelection()?.isCollapsed ?? true)) return;
+    if (confirmOpen || networkAlertOpen || selectedResult || !(window.getSelection()?.isCollapsed ?? true)) return;
     if (filteredResults.length === 0) return;
     e.preventDefault();
     if (checkedCount > 0) copyCheckedLinks();
@@ -3250,7 +3455,7 @@
       {m.common_stop()}
     </button>
   {:else}
-    <button onclick={() => handleSearch(barQuery)} disabled={searchSubmitBlocked}>{m.search_title()}</button>
+    <button onclick={() => handleSearch(barQuery)} disabled={searchSubmitBlocked} title={searchSubmitBlocked ? searchNetworkHint(searchMethod) : undefined}>{m.search_title()}</button>
   {/if}
 </div>
 
@@ -3269,15 +3474,15 @@
           tabindex={tab.id === $activeSearchTabId ? 0 : -1}
         >
           <span class="search-tab-label">{searchTabLabel(tab)}</span>
-          <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : m.search_results_aria({ count: tab.results.length })}>
+          <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : plural(tab.results.length, { one: m.search_results_aria_one, other: () => m.search_results_aria({ count: tab.results.length }) })}>
             {#if tab.isSearching}
               {m.search_searching_label()}
             {:else}
-              {tab.results.length}
+              {formatNumber(tab.results.length)}
             {/if}
           </span>
           {#if tab.isSearching}
-            <span class="search-tab-spinner" aria-hidden="true"></span>
+            <span class="spinner xs" aria-hidden="true"></span>
           {/if}
         </button>
         <div class="search-tab-actions">
@@ -3347,7 +3552,7 @@
       </select>
     </div>
 
-    <button class="ghost advanced-toggle" onclick={() => (showAdvancedFilters = !showAdvancedFilters)}>
+    <button class="ghost advanced-toggle" aria-expanded={showAdvancedFilters} aria-controls="search-advanced-filters" onclick={() => (showAdvancedFilters = !showAdvancedFilters)}>
       {showAdvancedFilters ? m.search_hide_advanced() : (advancedFilterCount > 0 ? m.search_advanced_filters_count({ count: advancedFilterCount }) : m.search_advanced_filters())}
     </button>
 
@@ -3357,7 +3562,7 @@
   </div>
 
   {#if showAdvancedFilters}
-    <div class="filter-advanced-row">
+    <div class="filter-advanced-row" id="search-advanced-filters">
       <div class="filter-toggles" role="group" aria-label={m.search_visibility_filters_aria()}>
         <label class="filter-toggle">
           <input type="checkbox" bind:checked={hideSpam} />
@@ -3374,7 +3579,7 @@
               onmouseleave={() => (showSpamHelp = false)}
               onfocus={() => (showSpamHelp = true)}
               onblur={() => (showSpamHelp = false)}
-              onclick={() => (showSpamHelp = !showSpamHelp)}
+              onclick={() => (showSpamHelp = true)}
             >
               <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <circle cx="8" cy="8" r="6.25"/>
@@ -3385,7 +3590,10 @@
             {#if showSpamHelp}
               <div class="filter-help-popover" role="tooltip">
                 {#if hideSpam && spamHiddenCount > 0}
-                  {m.search_spam_hidden_count({ count: spamHiddenCount })}
+                  {plural(spamHiddenCount, {
+                    one: m.search_spam_hidden_count_one,
+                    other: () => m.search_spam_hidden_count({ count: spamHiddenCount }),
+                  })}
                 {:else}
                   {m.search_spam_hidden_none()}
                 {/if}
@@ -3420,7 +3628,7 @@
           />
           <!-- The visible label belongs to the number input beside it, so the
                unit picker had no accessible name of its own. -->
-          <select bind:value={filterMinUnit} aria-label={m.search_min_size()}>
+          <select bind:value={filterMinUnit} aria-label={m.search_min_size_unit()}>
             {#each SIZE_UNITS as u}
               <option value={u.value}>{u.label}</option>
             {/each}
@@ -3439,7 +3647,7 @@
             placeholder="—"
             bind:value={filterMaxSize}
           />
-          <select bind:value={filterMaxUnit} aria-label={m.search_max_size()}>
+          <select bind:value={filterMaxUnit} aria-label={m.search_max_size_unit()}>
             {#each SIZE_UNITS as u}
               <option value={u.value}>{u.label}</option>
             {/each}
@@ -3492,7 +3700,7 @@
   <p class="filter-help">{m.search_filter_help_prefix()} <code>-</code> {m.search_filter_help_suffix()}</p>
 </div>
 
-<div class="page-content">
+<div class="page-content" bind:this={resultsScrollEl} use:passiveScroll={scheduleRowWindowUpdate}>
   {#if emberDrivesThisSearch && emberReadinessUnknown}
     <div class="search-readiness-hint" role="status">
       {m.search_network_ember_diagnostics_hint()}
@@ -3539,19 +3747,27 @@
           <line x1="30" y1="30" x2="41" y2="41"/>
         </svg>
       </div>
-      <p>{m.search_empty_title()}</p>
-      <p class="hint">{m.search_empty_hint()}</p>
+      <p class="empty-title">{m.search_empty_title()}</p>
+      <p class="empty-sub">{m.search_empty_hint()}</p>
     </div>
   {:else if activeTab?.isSearching && visibleResults.length === 0}
     <div class="empty-state">
       <div class="spinner lg"></div>
-      <p>{m.search_searching_network()}</p>
+      <p class="empty-title">{m.search_searching_network()}</p>
       {#if activeTab.progress}
         {@const phase = searchPhaseLabel(activeTab.progress.phase)}
+        {@const nodes = activeTab.progress.nodes_contacted}
+        {@const found = activeTab.progress.results_so_far}
         <p class="search-detail">
-          {m.search_contacted_nodes({ count: activeTab.progress.nodes_contacted })}
-          {#if activeTab.progress.results_so_far > 0}
-            &middot; {m.search_results_so_far({ count: activeTab.progress.results_so_far })}
+          {plural(nodes, {
+            one: m.search_contacted_nodes_one,
+            other: () => m.search_contacted_nodes({ count: nodes }),
+          })}
+          {#if found > 0}
+            &middot; {plural(found, {
+              one: m.search_results_so_far_one,
+              other: () => m.search_results_so_far({ count: formatNumber(found) }),
+            })}
           {/if}
           {#if phase}
             &middot; {phase}
@@ -3572,10 +3788,10 @@
            answering "nothing" is a fact about its index rather than something
            the user can retype. Saying so is the difference between the
            feature looking broken and looking finished. -->
-      <p>{activeTab?.related ? m.search_no_results_related() : m.search_no_results()}</p>
-      <p class="hint">{activeTab?.related ? m.search_no_results_related_hint() : m.search_no_results_hint()}</p>
+      <p class="empty-title">{activeTab?.related ? m.search_no_results_related() : m.search_no_results()}</p>
+      <p class="empty-sub">{activeTab?.related ? m.search_no_results_related_hint() : m.search_no_results_hint()}</p>
       {#if extensionOnlyHintExt}
-        <p class="hint">{m.search_extension_keyword_hint({ ext: extensionOnlyHintExt })}</p>
+        <p class="empty-sub">{m.search_extension_keyword_hint({ ext: extensionOnlyHintExt })}</p>
       {/if}
     </div>
   {:else}
@@ -3586,9 +3802,14 @@
             <span class="searching-indicator">{m.search_searching_indicator()}</span>
           {/if}
           {#if filteredResults.length > 0}
-            {filteredResults.length === 1 ? m.search_showing_one() : m.search_showing_other({ count: filteredResults.length })}{#if resultsHidden > 0} {m.search_filtered_from({ total: visibleResults.length })}{/if}
+            {plural(filteredResults.length, { one: m.search_showing_one, other: () => m.search_showing_other({ count: formatNumber(filteredResults.length) }) })}{#if resultsHidden > 0} {m.search_filtered_from({ total: formatNumber(visibleResults.length) })}{/if}
+          {:else if visibleResults.length > 0 && !hasActiveFilters}
+            {allHiddenSpamLabel}
           {:else if visibleResults.length > 0}
-            {visibleResults.length === 1 ? m.search_zero_of_one({ what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() }) : m.search_zero_of_other({ count: visibleResults.length, what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() })}
+            {plural(visibleResults.length, {
+              one: () => m.search_zero_of_one({ what: m.search_filters_word() }),
+              other: () => m.search_zero_of_other({ count: formatNumber(visibleResults.length), what: m.search_filters_word() }),
+            })}
           {:else}
             {m.search_zero_results()}
           {/if}
@@ -3599,7 +3820,7 @@
       </div>
       <div class="results-info-actions">
         <details class="column-menu" bind:open={showColumnMenu}>
-          <summary class="column-menu-summary" title={m.search_columns_aria()} aria-haspopup="true">
+          <summary class="column-menu-summary" title={m.search_columns_aria()} aria-label={m.search_columns_aria()} aria-haspopup="true">
             <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
               <rect x="2" y="2.5" width="12" height="11" rx="1.5"/>
               <line x1="6.5" y1="2.5" x2="6.5" y2="13.5"/>
@@ -3629,10 +3850,10 @@
       <div class="bulk-actions" role="toolbar" aria-label={m.search_bulk_actions_aria()}>
         <span class="bulk-count">{m.search_bulk_selected({ count: checkedCount })}</span>
         <button class="bulk-download-btn" onclick={downloadChecked} disabled={bulkDownloadPending}>
-          {bulkDownloadPending ? m.search_downloading_ellipsis() : (checkedCount === 1 ? m.search_bulk_download_one() : m.search_bulk_download_other({ count: checkedCount }))}
+          {bulkDownloadPending ? m.search_downloading_ellipsis() : plural(checkedCount, { one: m.search_bulk_download_one, other: () => m.search_bulk_download_other({ count: checkedCount }) })}
         </button>
         <button class="ghost bulk-copy-btn" onclick={copyCheckedLinks} disabled={copyingLinks} title={m.search_bulk_copy_links_title()}>
-          {checkedCount === 1 ? m.search_bulk_copy_link_one() : m.search_bulk_copy_links_other({ count: checkedCount })}
+          {plural(checkedCount, { one: m.search_bulk_copy_link_one, other: () => m.search_bulk_copy_links_other({ count: checkedCount }) })}
         </button>
         <button class="ghost bulk-clear-btn" onclick={clearChecked} title={m.search_clear_selection_title()}>{m.search_clear_selection()}</button>
         {#if bulkDownloadMessage}
@@ -3640,9 +3861,18 @@
         {/if}
       </div>
     {/if}
-    <table class="search-results-table">
+    <!-- The rows in the DOM are a ~28-row window over `filteredResults`, and the
+         spacers standing in for the rest stay `aria-hidden` — their cells are
+         empty, so anything that announced them would read out a run of blank
+         rows. That left a screen reader being told the table's entire contents
+         were the mounted slice: "row 4 of 28" on a search holding nine thousand
+         hits, and no way to tell that scrolling would bring more. `aria-rowcount`
+         with a per-row `aria-rowindex` is what the spec provides for a grid whose
+         DOM holds only part of its rows. Both count the header row, which is why
+         the data rows start at 2. -->
+    <table class="search-results-table" aria-rowcount={filteredResults.length + 1}>
       <thead oncontextmenu={openColumnMenuFromHeader}>
-        <tr>
+        <tr aria-rowindex="1">
           <th class="col-check">
             <input
               type="checkbox"
@@ -3713,8 +3943,17 @@
           <th class="col-action" aria-label={m.search_th_actions_aria()}></th>
         </tr>
       </thead>
-      <tbody title={m.search_double_click_hint()}>
-        {#each filteredResults as result, idx (resultKey(result))}
+      <tbody title={m.search_double_click_hint()} bind:this={resultsBodyEl}>
+        <!-- Scroll space for the rows above and below the window. Empty cells
+             with no padding, so each spacer is exactly the height of the rows
+             it stands in for and the scrollbar matches the full list. -->
+        {#if rowWindowStart > 0}
+          <tr class="row-spacer" aria-hidden="true" style="height:{rowWindowStart * rowHeight}px">
+            <td colspan={renderedColumnCount}></td>
+          </tr>
+        {/if}
+        {#each windowedResults as result, windowIdx (resultKey(result))}
+          {@const idx = rowWindowStart + windowIdx}
           {@const rKey = resultKey(result)}
           {@const dlTransfer = getDownloadTransfer(result)}
           {@const blockingDl = getBlockingDownloadTransfer(result)}
@@ -3722,14 +3961,19 @@
           {@const originText = originLabel(result.result_origin || '')}
           {@const spamExplain = spamExplainFor(result)}
           <tr
-            class="{dlRowClass(dlTransfer)}"
+            class="result-row {dlRowClass(dlTransfer)}"
+            aria-rowindex={idx + 2}
+            class:row-alt={(idx & 1) === 1}
             class:spam-row={result.is_spam}
             class:row-checked={checkedKeys.has(rKey)}
             class:in-library-row={isInLibraryOnly(result)}
             class:history-completed-row={!isInLibraryOnly(result) && downloadHistoryMap[result.file.hash] === 'completed'}
             class:history-cancelled-row={!isInLibraryOnly(result) && downloadHistoryMap[result.file.hash] === 'cancelled'}
             oncontextmenu={(e) => showContextMenu(e, result)}
-            ondblclick={() => { if (!blockingDl) download(result); }}
+            ondblclick={(e) => {
+              if ((e.target as HTMLElement).closest('input, button')) return;
+              if (!blockingDl) download(result);
+            }}
           >
             <td class="col-check">
               <input
@@ -3755,7 +3999,7 @@
               <div class="name-cell-wrap">
                 <button class="ghost link-btn" onclick={() => showFileDetails(result)}><bdi dir="auto">{displayName(result)}</bdi></button>
                 {#if dlTransfer}
-                  <span class="dl-status-badge {dlBadgeClass(dlTransfer)}" title="{dlBadgeLabel(dlTransfer)}: {dlTransfer.file_name}">
+                  <span class="badge sm {dlBadgeClass(dlTransfer)}" title="{dlBadgeLabel(dlTransfer)}: {dlTransfer.file_name}">
                     {dlBadgeLabel(dlTransfer)}
                   </span>
                 {/if}
@@ -3826,7 +4070,7 @@
               {:else if cs.kind === 'yes'}
                 <td class="col-complete" title={m.search_complete_single_part()}>{m.common_yes()}</td>
               {:else}
-                <td class="col-complete" title={`${cs.complete} / ${cs.sources}`}>{cs.percent}%</td>
+                <td class="col-complete" title={m.search_complete_ratio_title({ complete: cs.complete, sources: cs.sources })}>{cs.percent}%</td>
               {/if}
             {/if}
             {#if columnVis.length}
@@ -3849,11 +4093,11 @@
             {/if}
             <td class="col-history">
               {#if isInLibraryOnly(result)}
-                <span class="history-badge in-library" title={m.search_history_in_library_title()}>{m.search_history_in_library()}</span>
+                <span class="badge sm tone-accent" title={m.search_history_in_library_title()}>{m.search_history_in_library()}</span>
               {:else if downloadHistoryMap[result.file.hash] === 'completed'}
-                <span class="history-badge history-completed" title={m.search_history_downloaded_title()}>{m.search_history_downloaded()}</span>
+                <span class="badge sm tone-success" title={m.search_history_downloaded_title()}>{m.search_history_downloaded()}</span>
               {:else if downloadHistoryMap[result.file.hash] === 'cancelled'}
-                <span class="history-badge history-cancelled" title={m.search_history_cancelled_title()}>{m.search_history_cancelled()}</span>
+                <span class="badge sm tone-warning" title={m.search_history_cancelled_title()}>{m.search_history_cancelled()}</span>
               {/if}
             </td>
             <td class="col-action">
@@ -3898,7 +4142,7 @@
                   aria-label={m.search_action_download_aria({ name: displayName(result) })}
                 >
                   {#if downloadPending[rKey]}
-                    <span class="row-dl-spinner" aria-hidden="true"></span>
+                    <span class="spinner xs" aria-hidden="true"></span>
                   {:else}
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <line x1="8" y1="2.5" x2="8" y2="11"/>
@@ -3911,12 +4155,35 @@
             </td>
           </tr>
         {/each}
+        {#if rowsBelowWindow > 0}
+          <tr class="row-spacer" aria-hidden="true" style="height:{rowsBelowWindow * rowHeight}px">
+            <td colspan={renderedColumnCount}></td>
+          </tr>
+        {/if}
       </tbody>
     </table>
     {#if filteredResults.length === 0 && visibleResults.length > 0}
       <div class="empty-state">
-        <p>{m.search_no_results_filters()}</p>
-        <button class="ghost" onclick={clearFilters}>{m.common_clear_filters()}</button>
+        {#if hasActiveFilters}
+          <div class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3z"/>
+            </svg>
+          </div>
+          <p class="empty-title">{m.search_no_results_filters()}</p>
+          <button type="button" class="ghost empty-action" onclick={clearFilters}>{m.common_clear_filters()}</button>
+        {:else}
+          <div class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
+              <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
+              <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/>
+              <line x1="1" y1="1" x2="23" y2="23"/>
+            </svg>
+          </div>
+          <p class="empty-title">{allHiddenSpamLabel}</p>
+          <button type="button" class="ghost empty-action" onclick={() => (hideSpam = false)}>{m.search_show_spam()}</button>
+        {/if}
       </div>
     {/if}
 
@@ -3930,7 +4197,7 @@
       ></button>
       <div class="ctx-menu" role="menu" use:ctxMenuPosition={{ x: contextMenu.x, y: contextMenu.y }}>
         <div class="ctx-header" role="presentation">
-          <bdi dir="auto">{contextMenu.result.file.name}</bdi>
+          <bdi dir="auto">{displayName(contextMenu.result)}</bdi>
         </div>
         <button
           class="ctx-item"
@@ -3974,15 +4241,20 @@
         <!-- eMule's right-click → Web services. Shown even when nothing is
              configured, so the feature is discoverable from a result rather
              than only from Settings. -->
-        <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
         <div
           class="ctx-item ctx-sub"
           class:ctx-sub-open={ctxWebSub}
           role="menuitem"
-          tabindex="-1"
+          tabindex="0"
           aria-haspopup="menu"
           aria-expanded={ctxWebSub}
           onclick={(e) => { e.stopPropagation(); ctxWebSub = !ctxWebSub; }}
+          onkeydown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowRight') {
+              e.preventDefault();
+              ctxWebSub = true;
+            }
+          }}
         >
           {m.webservices_ctx_menu()}
           {#if ctxWebSub}
@@ -4006,8 +4278,23 @@
         </div>
         <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) showFileDetails(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_details()}</button>
         <div class="ctx-sep" role="separator"></div>
-        <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}>{m.search_mark_spam()}</button>
-        <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}>{m.search_mark_not_spam()}</button>
+        <!-- The learned entry is keyed by file hash, so a hashless row has
+             nothing to record and `mark_spam` rejects it. Greyed out rather
+             than left to fail with a toast. -->
+        <button
+          class="ctx-item"
+          role="menuitem"
+          disabled={!contextMenu.result.file.hash}
+          title={contextMenu.result.file.hash ? undefined : m.search_spam_requires_hash()}
+          onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}
+        >{m.search_mark_spam()}</button>
+        <button
+          class="ctx-item"
+          role="menuitem"
+          disabled={!contextMenu.result.file.hash}
+          title={contextMenu.result.file.hash ? undefined : m.search_spam_requires_hash()}
+          onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}
+        >{m.search_mark_not_spam()}</button>
         {#if downloadHistoryMap[contextMenu.result.file.hash]}
           <div class="ctx-sep" role="separator"></div>
           <button
@@ -4041,7 +4328,7 @@
         >
         <div class="modal-header">
           <span id="file-details-title" class="modal-title">{m.search_file_details()}</span>
-          <button type="button" class="modal-close" bind:this={detailsCloseBtn} title={m.search_close_details_aria()} aria-label={m.search_close_details_aria()} onclick={closeFileDetails}>
+          <button type="button" class="icon-close" bind:this={detailsCloseBtn} title={m.search_close_details_aria()} aria-label={m.search_close_details_aria()} onclick={closeFileDetails}>
             <IconX size={15} />
           </button>
         </div>
@@ -4055,10 +4342,10 @@
                  separators — so the name it produces is a label. Shown only when
                  the two actually differ, which keeps it off most files, and this
                  is the name the file downloads and reshares under. -->
-            {#if selectedResult.file.name && selectedResult.file.name !== displayName(selectedResult)}
+            {#if selectedOriginalName && selectedOriginalName !== displayName(selectedResult)}
               <span class="detail-hero-original">
                 {m.search_detail_original_name()}
-                <bdi dir="auto">{selectedResult.file.name}</bdi>
+                <bdi dir="auto">{selectedOriginalName}</bdi>
               </span>
             {/if}
           </div>
@@ -4112,9 +4399,9 @@
               {:else if selectedSpam}
                 {selectedSpam.score}/{selectedSpam.threshold}
                 {#if selectedSpam.is_spam}
-                  <span class="spam-chip">{m.search_spam_flagged({ profile: selectedSpam.profile })}</span>
+                  <span class="spam-chip">{m.search_spam_flagged({ profile: spamProfileText(selectedSpam.profile) })}</span>
                 {:else}
-                  <span class="ham-chip">{m.search_spam_not_flagged({ profile: selectedSpam.profile })}</span>
+                  <span class="ham-chip">{m.search_spam_not_flagged({ profile: spamProfileText(selectedSpam.profile) })}</span>
                 {/if}
               {:else}
                 {selectedResult.spam_rating}
@@ -4138,7 +4425,7 @@
               <h4>{m.search_download_status()}</h4>
               <dl class="detail-grid">
                 <dt>{m.search_status_label()}</dt>
-                <dd><span class="dl-status-badge {dlBadgeClass(selectedDlTransfer)}">{dlBadgeLabel(selectedDlTransfer)}</span></dd>
+                <dd><span class="badge {dlBadgeClass(selectedDlTransfer)}">{dlBadgeLabel(selectedDlTransfer)}</span></dd>
                 {#if selectedDlTransfer.status === 'active' || selectedDlTransfer.progress > 0}
                   <dt>{m.search_progress_label()}</dt>
                   <!--
@@ -4220,7 +4507,7 @@
     : pendingConfirm?.kind === 'copy-all-links'
       ? m.search_copy_all_confirm_btn()
       : m.search_confirm_clear_btn()}
-  cancelLabel={m.search_confirm_keep()}
+  cancelLabel={pendingConfirm?.kind === 'copy-all-links' ? m.common_cancel() : m.search_confirm_keep()}
   danger={pendingConfirm?.kind !== 'copy-all-links'}
   onconfirm={handleConfirm}
   oncancel={handleConfirmCancel}
@@ -4252,7 +4539,7 @@
 
   .type-select {
     padding: 7px 28px 7px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
@@ -4288,7 +4575,7 @@
     overflow: hidden;
     flex-shrink: 0;
     box-shadow: var(--shadow-sm);
-    transition: transform 0.12s ease, box-shadow 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+    transition: transform var(--transition-fast) ease, box-shadow var(--transition-normal) ease, border-color var(--transition-normal) ease, background-color var(--transition-normal) ease;
   }
 
   .search-tab:hover {
@@ -4314,7 +4601,7 @@
     border: none;
     background: transparent;
     color: var(--text-primary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 500;
     cursor: pointer;
     text-align: left;
@@ -4341,7 +4628,7 @@
   }
 
   .search-tab-meta {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     background: color-mix(in srgb, var(--bg-hover) 78%, var(--bg-secondary));
     border: 1px solid var(--border);
@@ -4355,22 +4642,6 @@
     color: var(--text-accent);
     border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
     background: var(--accent-fill);
-  }
-
-  .search-tab-spinner {
-    width: 11px;
-    height: 11px;
-    border: 2px solid var(--border);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    flex-shrink: 0;
-    animation: search-tab-spin 0.7s linear infinite;
-  }
-
-  @keyframes search-tab-spin {
-    to {
-      transform: rotate(360deg);
-    }
   }
 
   .search-tab-actions {
@@ -4401,9 +4672,9 @@
     cursor: pointer;
     flex-shrink: 0;
     transition:
-      color 0.14s ease,
-      background-color 0.14s ease,
-      transform 0.1s ease;
+      color var(--transition-fast) ease,
+      background-color var(--transition-fast) ease,
+      transform var(--transition-fast) ease;
   }
 
   .search-tab-action:focus-visible {
@@ -4483,7 +4754,7 @@
     border-radius: var(--radius-pill);
     overflow: hidden;
     background: var(--bg-surface);
-    transition: border-color 0.15s;
+    transition: border-color var(--transition-normal);
     min-height: 34px;
   }
 
@@ -4494,7 +4765,7 @@
 
   .column-select {
     background-color: var(--bg-input);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 6px 28px 6px 8px;
     min-width: 110px;
     color: var(--text-secondary);
@@ -4505,7 +4776,7 @@
     border: none;
     outline: none;
     box-shadow: none;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     padding: 5px 8px;
     background: transparent;
     color: var(--text-primary);
@@ -4544,7 +4815,7 @@
   }
 
   .filter-group label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.4px;
@@ -4552,7 +4823,7 @@
 
   .filter-group select,
   .filter-group input {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     padding: 6px 8px;
     min-width: 0;
   }
@@ -4584,24 +4855,24 @@
   }
 
   .clear-filters {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 6px 12px;
   }
 
   .advanced-toggle {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 6px 12px;
   }
 
   .filter-help {
     margin-top: 4px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
   }
 
   .filter-help code {
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     background: var(--bg-hover);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -4622,7 +4893,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-weight: 700;
     color: var(--text-secondary);
     border: 1px solid var(--border);
@@ -4664,7 +4935,7 @@
 
   .search-syntax-ed2k {
     margin: 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
     color: var(--text-secondary);
   }
@@ -4675,7 +4946,7 @@
     align-items: flex-start;
     gap: 8px;
     padding: 7px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
     color: var(--text-secondary);
     background: color-mix(in srgb, var(--ember-color) 8%, var(--bg-surface));
@@ -4686,7 +4957,7 @@
   .search-syntax-ember-tag {
     flex-shrink: 0;
     margin-top: 1px;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     letter-spacing: 0.04em;
     text-transform: uppercase;
@@ -4698,7 +4969,7 @@
 
   .results-info {
     padding: 10px 20px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     border-bottom: 1px solid var(--border);
     background: var(--bg-secondary);
@@ -4719,7 +4990,7 @@
   }
 
   .clear-results-btn {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 4px 10px;
   }
 
@@ -4737,7 +5008,7 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 4px 10px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -4757,6 +5028,11 @@
     color: var(--text-primary);
   }
 
+  .column-menu-summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
   .column-menu[open] .column-menu-summary {
     border-color: var(--accent);
     color: var(--text-primary);
@@ -4768,10 +5044,10 @@
     right: 0;
     z-index: 9999;
     min-width: 180px;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-md);
+    background: var(--ctx-surface);
+    border: 1px solid var(--ctx-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--ctx-shadow);
     padding: 6px;
     display: flex;
     flex-direction: column;
@@ -4784,7 +5060,7 @@
     gap: 8px;
     padding: 6px 8px;
     border-radius: var(--radius-sm);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     cursor: pointer;
   }
@@ -4808,21 +5084,21 @@
   }
 
   .bulk-count {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-accent);
   }
 
   .bulk-download-btn {
     padding: 5px 14px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     border: none;
     border-radius: var(--radius-md);
     background: var(--accent);
     color: var(--on-accent);
     cursor: pointer;
-    transition: opacity 0.15s;
+    transition: opacity var(--transition-normal);
   }
 
   .bulk-download-btn:hover:not(:disabled) {
@@ -4836,12 +5112,12 @@
 
   .bulk-clear-btn,
   .bulk-copy-btn {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 5px 10px;
   }
 
   .copy-links-btn {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 4px 10px;
   }
 
@@ -4852,7 +5128,7 @@
   }
 
   :global(tr.row-checked td) {
-    background: var(--accent-fill) !important;
+    background: var(--table-row-selected) !important;
   }
 
   .col-check {
@@ -4886,7 +5162,7 @@
 
   .col-origin {
     width: 12%;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
   }
 
@@ -4935,7 +5211,7 @@
 
   .col-sources {
     width: 7%;
-    text-align: center;
+    text-align: right;
     font-variant-numeric: tabular-nums;
   }
 
@@ -4952,7 +5228,7 @@
 
   .col-complete {
     width: 7%;
-    text-align: center;
+    text-align: right;
     font-variant-numeric: tabular-nums;
   }
 
@@ -4976,7 +5252,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
   }
 
@@ -5014,42 +5290,6 @@
     cursor: default;
     opacity: 0.6;
   }
-  .row-dl-spinner {
-    width: 12px;
-    height: 12px;
-    border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: row-dl-spin 0.7s linear infinite;
-  }
-  @keyframes row-dl-spin { to { transform: rotate(360deg); } }
-  @media (prefers-reduced-motion: reduce) {
-    .row-dl-spinner { animation: none; }
-  }
-
-  .history-badge {
-    display: inline-block;
-    padding: 1px 6px;
-    border-radius: var(--radius-sm);
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-  }
-
-  .in-library {
-    background: color-mix(in srgb, var(--accent) 20%, transparent);
-    color: var(--accent);
-  }
-
-  .history-completed {
-    background: color-mix(in srgb, var(--success) 20%, transparent);
-    color: var(--success);
-  }
-
-  .history-cancelled {
-    background: color-mix(in srgb, var(--warning) 20%, transparent);
-    color: var(--warning);
-  }
 
   :global(tr.in-library-row:not(.row-checked):not(:hover) td) {
     color: var(--accent);
@@ -5061,27 +5301,30 @@
 
   .search-results-table th {
     padding: 6px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-xs);
   }
 
   .search-results-table td {
     padding: 4px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.2;
+    border-bottom-color: var(--table-row-divider);
   }
 
   .search-results-table tbody tr {
     height: 30px;
-    /*
-     * Chromium-native virtualization: skips layout/paint for rows that are
-     * offscreen, using the intrinsic-size hint to reserve scroll space.
-     * Tauri ships with WebView2 (Chromium) on Windows, so this is always
-     * available in the app; other engines gracefully fall back to normal
-     * rendering. This gives large result sets (thousands of rows) a huge
-     * scroll-perf win without fragile manual row windowing.
-     */
-    content-visibility: auto;
-    contain-intrinsic-size: auto 30px;
+  }
+
+  /*
+   * Deliberately no `content-visibility: auto` here. It skipped layout and
+   * paint for offscreen rows but still built every one of them, which is the
+   * cost that mattered — see the row-windowing block in the script. It would
+   * also lie to the measurement that sizes the spacers, since a skipped row
+   * reports its `contain-intrinsic-size` rather than its real height.
+   */
+  .row-spacer td {
+    padding: 0;
+    border: 0;
   }
 
   th.sortable {
@@ -5101,11 +5344,14 @@
     position: sticky;
     top: 0;
     z-index: 2;
-    background: var(--bg-secondary);
+    background: var(--table-head-bg);
   }
 
-  tbody tr:nth-child(even) td {
-    background: color-mix(in srgb, var(--bg-secondary) 82%, var(--bg-primary));
+  /* Striping follows the row's place in the whole list, not its place in the
+     DOM: the window renders a slice, and `:nth-child` would restripe the
+     table on every scroll (and count the spacer rows while doing it). */
+  tbody tr.row-alt td {
+    background: var(--table-row-alt);
   }
 
   .source-count {
@@ -5114,7 +5360,7 @@
     text-align: center;
     padding: 1px 5px;
     border-radius: var(--radius-pill);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     background: var(--bg-hover);
   }
@@ -5136,8 +5382,8 @@
     font-weight: 600;
     cursor: pointer;
     flex-shrink: 0;
-    box-shadow: 0 1px 0 color-mix(in srgb, #000 12%, transparent);
-    transition: background-color 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
+    box-shadow: var(--shadow-sm);
+    transition: background-color var(--transition-normal) ease, transform var(--transition-fast) ease, box-shadow var(--transition-normal) ease;
   }
 
   .stop-btn:hover {
@@ -5158,6 +5404,7 @@
     color: var(--accent);
     font-weight: 600;
     margin-right: 8px;
+    animation: pulse-opacity 1.5s ease-in-out infinite;
   }
 
   @keyframes pulse-opacity {
@@ -5165,30 +5412,26 @@
     50% { opacity: 0.5; }
   }
 
-  .searching-indicator {
-    animation: pulse-opacity 1.5s ease-in-out infinite;
-  }
-
   .hint, .search-detail {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-muted);
   }
 
   .error-msg {
     color: var(--danger);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     margin-left: 8px;
   }
 
   .success-msg {
     color: var(--success);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     margin-left: 8px;
   }
 
   .search-readiness-hint {
     padding: 9px 20px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--badge-warning-text);
     background: color-mix(in srgb, var(--warning) 9%, var(--bg-secondary));
     border-bottom: 1px solid color-mix(in srgb, var(--warning) 36%, var(--border));
@@ -5196,14 +5439,6 @@
 
   .search-readiness-muted {
     color: var(--text-secondary);
-  }
-
-  .search-error-banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 10px 20px;
-    font-size: 13px;
   }
 
   /* --- File details modal --- */
@@ -5246,30 +5481,7 @@
 
   .modal-title {
     font-weight: 600;
-    font-size: 14px;
-  }
-
-  .modal-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    flex-shrink: 0;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    line-height: 1;
-    transition: background 0.12s, border-color 0.12s, color 0.12s;
-  }
-
-  .modal-close:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    font-size: var(--font-size-lg);
   }
 
   .modal-body {
@@ -5300,14 +5512,14 @@
   }
 
   .detail-hero-name {
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-weight: 600;
     line-height: 1.35;
     overflow-wrap: anywhere;
   }
 
   .detail-hero-original {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     overflow-wrap: anywhere;
   }
@@ -5319,7 +5531,7 @@
     grid-template-columns: max-content minmax(0, 1fr);
     gap: 4px 12px;
     margin: 0 0 12px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
 
   .detail-grid dt {
@@ -5335,14 +5547,14 @@
 
   .detail-grid code {
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     /* A 32-char hash is the one value worth selecting by hand. */
     user-select: all;
   }
 
   .detail-row {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     margin-bottom: 6px;
   }
 
@@ -5363,7 +5575,7 @@
     margin-left: 8px;
     padding: 1px 8px;
     border-radius: var(--radius-pill);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
   }
 
@@ -5391,7 +5603,7 @@
   .note-item {
     padding: 6px 0;
     border-bottom: 1px solid var(--border);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     /* Peer-supplied and up to 4096 chars; without this an unbroken run turns
        the details panel into a horizontal scroller. */
     overflow-wrap: anywhere;
@@ -5402,7 +5614,7 @@
   }
 
   .publish-note h4 {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     margin-bottom: 8px;
   }
 
@@ -5414,7 +5626,7 @@
   }
 
   .note-form label {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
 
@@ -5465,7 +5677,7 @@
     border: 1px solid color-mix(in srgb, var(--danger) 55%, var(--border));
     background: color-mix(in srgb, var(--danger) 15%, transparent);
     color: var(--danger);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     letter-spacing: 0.02em;
     line-height: 1.5;
@@ -5487,7 +5699,7 @@
     background: var(--bg-secondary);
     box-shadow: var(--shadow-md);
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     line-height: 1.35;
   }
 
@@ -5522,7 +5734,7 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-pill);
@@ -5530,7 +5742,7 @@
     padding: 5px 10px;
     cursor: pointer;
     user-select: none;
-    transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+    transition: border-color var(--transition-normal) ease, background-color var(--transition-normal) ease, color var(--transition-normal) ease;
   }
 
   .filter-toggle:hover {
@@ -5550,7 +5762,7 @@
   }
 
   .filter-count {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
   }
 
@@ -5568,7 +5780,7 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     border: 1px solid var(--border);
     background: var(--bg-secondary);
@@ -5592,7 +5804,7 @@
     border: 1px solid var(--border);
     background: var(--bg-secondary);
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     line-height: 1.35;
     box-shadow: var(--shadow-md);
   }
@@ -5607,40 +5819,6 @@
   }
   :global(tr.spam-row td:first-child) {
     box-shadow: inset 3px 0 0 0 var(--warning);
-  }
-
-  .dl-status-badge {
-    display: inline-block;
-    padding: 2px 7px;
-    border-radius: var(--radius-sm);
-    font-size: 11px;
-    font-weight: 500;
-    white-space: nowrap;
-    line-height: 1.3;
-  }
-  .dl-badge-success {
-    background: color-mix(in srgb, var(--success) 18%, transparent);
-    color: var(--success);
-  }
-  .dl-badge-active {
-    background: color-mix(in srgb, var(--accent) 18%, transparent);
-    color: var(--accent);
-  }
-  .dl-badge-progress {
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    color: var(--accent);
-  }
-  .dl-badge-warning {
-    background: color-mix(in srgb, var(--warning) 18%, transparent);
-    color: var(--warning);
-  }
-  .dl-badge-danger {
-    background: color-mix(in srgb, var(--danger) 18%, transparent);
-    color: var(--danger);
-  }
-  .dl-badge-neutral {
-    background: color-mix(in srgb, var(--text-secondary) 12%, transparent);
-    color: var(--text-secondary);
   }
 
   .row-dl-completed {

@@ -1478,7 +1478,7 @@ checksum = "4ef6b89e5b37196644d8796de5268852ff179b44e96276cf4290264843743bb7"
 
 [[package]]
 name = "ember"
-version = "1.6.7"
+version = "1.7.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -5908,6 +5908,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

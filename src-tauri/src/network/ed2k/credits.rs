@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use zeroize::ZeroizeOnDrop;
 
 const MAX_CREDIT_RATIO: f64 = 10.0;
@@ -11,6 +11,69 @@ const MIN_CREDIT_RATIO: f64 = 1.0;
 /// without bound between sweeps. At capacity, inserting a new record evicts
 /// the least-recently-seen one, mirroring the bounded DHT store / comment maps.
 const MAX_CREDIT_RECORDS: usize = 50_000;
+
+/// Upper bound on binding-only eD2K→Ember mappings held in memory; see
+/// [`CreditManager::note_bound_ember_hash`].
+const MAX_BOUND_EMBER_HASHES: usize = 4_096;
+
+/// `last_seen` ordering over one credit map, so eviction at
+/// `MAX_CREDIT_RECORDS` pops the oldest key instead of scanning the map under
+/// the credit lock on every new Hello.
+///
+/// `get_or_create` hands out `&mut` to the record, so a caller can rewrite
+/// `last_seen` behind the index's back (the startup loader does exactly that).
+/// Eviction therefore re-checks the popped entry against the record, and
+/// `cleanup_stale` re-syncs every key.
+#[derive(Debug)]
+struct LastSeenIndex<K: Ord + Copy + std::hash::Hash> {
+    order: BTreeSet<(i64, K)>,
+    indexed_at: HashMap<K, i64>,
+}
+
+impl<K: Ord + Copy + std::hash::Hash> Default for LastSeenIndex<K> {
+    fn default() -> Self {
+        Self {
+            order: BTreeSet::new(),
+            indexed_at: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Ord + Copy + std::hash::Hash> LastSeenIndex<K> {
+    fn set(&mut self, key: K, last_seen: i64) {
+        match self.indexed_at.insert(key, last_seen) {
+            Some(old) if old == last_seen => return,
+            Some(old) => {
+                self.order.remove(&(old, key));
+            }
+            None => {}
+        }
+        self.order.insert((last_seen, key));
+    }
+
+    fn remove(&mut self, key: &K) {
+        if let Some(old) = self.indexed_at.remove(key) {
+            self.order.remove(&(old, *key));
+        }
+    }
+
+    /// Least-recently-seen key in `map`, correcting stale entries on the way.
+    fn oldest<V>(&mut self, map: &HashMap<K, V>, last_seen_of: impl Fn(&V) -> i64) -> Option<K> {
+        while let Some(&(indexed, key)) = self.order.first() {
+            match map.get(&key) {
+                None => self.remove(&key),
+                Some(record) => {
+                    let actual = last_seen_of(record);
+                    if actual == indexed {
+                        return Some(key);
+                    }
+                    self.set(key, actual);
+                }
+            }
+        }
+        None
+    }
+}
 
 // --- Ember credit scoring constants ---
 //
@@ -235,6 +298,17 @@ pub struct CreditRecord {
     pub peer_name: String,
     /// Client software and version, as `client_software_from_caps` renders it.
     pub client_software: String,
+    /// IPv4 (big-endian, like `ident_ip`) of the last session we held with
+    /// this peer, whatever SecIdent made of it.
+    ///
+    /// Display only. `ident_ip` is the address an identity was *proven* from
+    /// and drives BadGuy detection, so it is only written after a signature
+    /// verifies — which leaves it at 0 for every peer that lacks SecIdent,
+    /// never finishes the challenge, or meets us while our own key is
+    /// unavailable. The Known Clients tab fell back to nothing for those and
+    /// showed no IP and no flag. This field is what it falls back to instead,
+    /// and nothing that scores or trusts a peer reads it.
+    pub seen_ip: u32,
 }
 
 /// Enhanced credit record for verified Ember peers.
@@ -363,6 +437,7 @@ impl CreditRecord {
             crypto_verified_once: false,
             peer_name: String::new(),
             client_software: String::new(),
+            seen_ip: 0,
         }
     }
 }
@@ -438,6 +513,16 @@ pub struct CreditManager {
     #[zeroize(skip)]
     ember_credits: HashMap<[u8; 32], EmberCreditRecord>,
     #[zeroize(skip)]
+    credit_seen: LastSeenIndex<[u8; 16]>,
+    #[zeroize(skip)]
+    ember_seen: LastSeenIndex<[u8; 32]>,
+    /// eD2K user hash → Ember hash learned from an offline binding check on a
+    /// session that was not Noise-authenticated. Anyone can mint a keypair
+    /// that passes binding and pair it with a public user hash, so these are
+    /// never persisted and never displace [`CreditRecord::ember_hash`].
+    #[zeroize(skip)]
+    bound_ember_hashes: HashMap<[u8; 16], [u8; 16]>,
+    #[zeroize(skip)]
     our_public_key: Vec<u8>,
     our_private_key: Vec<u8>,
     #[zeroize(skip)]
@@ -450,8 +535,8 @@ pub struct CreditManager {
     crypto_unreadable: bool,
     /// Whether anything has changed since the last successful flush.
     ///
-    /// Persisting credits is expensive — `DELETE`+re-`INSERT` of both tables,
-    /// an `incremental_vacuum`, and a full `clients.met` rewrite with an
+    /// Persisting credits is expensive — a SQLite transaction, an
+    /// `incremental_vacuum`, and a full `clients.met` rewrite with an
     /// fsync — and the 60s flush timer used to pay all of it unconditionally,
     /// rewriting identical bytes ~1,440 times a day on a node whose peers had
     /// gone quiet. Mirrors the `KnownFileList` dirty/generation pair so an
@@ -460,6 +545,50 @@ pub struct CreditManager {
     dirty: bool,
     #[zeroize(skip)]
     dirty_generation: u64,
+    /// Keys whose SQLite row may differ from memory: created, mutated, or
+    /// evicted since they were last handed to a flush. A key absent from its
+    /// map at flush time is a row to delete.
+    #[zeroize(skip)]
+    unsaved_credit_keys: HashSet<[u8; 16]>,
+    #[zeroize(skip)]
+    unsaved_ember_keys: HashSet<[u8; 32]>,
+    /// Keys handed to a flush that has not confirmed success. They stay here
+    /// until [`Self::finish_flush`], so a failed, panicked or aborted flush is
+    /// retried by the next one instead of dropping the rows.
+    #[zeroize(skip)]
+    in_flight_credit_keys: HashSet<[u8; 16]>,
+    #[zeroize(skip)]
+    in_flight_ember_keys: HashSet<[u8; 32]>,
+    /// Until one flush has succeeded, which rows on disk match memory is
+    /// unknown: startup may have loaded from SQLite or fallen back to
+    /// `clients.met`. The first flush reconciles the whole table against
+    /// SQLite instead of upserting every key, which is why the loaders
+    /// (`insert_loaded_credit`) mark nothing.
+    #[zeroize(skip)]
+    needs_full_sync: bool,
+    /// Bumped by every [`Self::begin_flush`]; see [`Self::finish_flush`].
+    #[zeroize(skip)]
+    flush_epoch: u64,
+}
+
+/// What the next credit flush must write, from [`CreditManager::begin_flush`].
+///
+/// With `full_sync` the key lists are empty and the caller reconciles every
+/// record. Otherwise each key is either upserted (still in the map) or
+/// deleted (gone from it).
+#[derive(Debug, Default)]
+pub struct CreditFlushKeys {
+    pub full_sync: bool,
+    pub credit_keys: Vec<[u8; 16]>,
+    pub ember_keys: Vec<[u8; 32]>,
+    epoch: u64,
+}
+
+impl CreditFlushKeys {
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        !self.full_sync && self.credit_keys.is_empty() && self.ember_keys.is_empty()
+    }
 }
 
 impl CreditManager {
@@ -467,19 +596,29 @@ impl CreditManager {
         Self {
             credits: HashMap::new(),
             ember_credits: HashMap::new(),
+            credit_seen: LastSeenIndex::default(),
+            ember_seen: LastSeenIndex::default(),
+            bound_ember_hashes: HashMap::new(),
             our_public_key: Vec::new(),
             our_private_key: Vec::new(),
             crypto_available: false,
             crypto_unreadable: false,
             dirty: false,
             dirty_generation: 0,
+            unsaved_credit_keys: HashSet::new(),
+            unsaved_ember_keys: HashSet::new(),
+            in_flight_credit_keys: HashSet::new(),
+            in_flight_ember_keys: HashSet::new(),
+            needs_full_sync: true,
+            flush_epoch: 0,
         }
     }
 
     /// Mark the in-memory credit state as needing a flush.
     ///
-    /// Called from `get_or_create` / `get_or_create_ember` — the only two
-    /// methods that hand out `&mut` to a record, and therefore the choke point
+    /// Reached (through `mark_credit_unsaved` / `mark_ember_unsaved`, which
+    /// also record the key) from `get_or_create` / `get_or_create_ember` — the
+    /// only two methods that hand out `&mut` to a record, and therefore the choke point
     /// every mutating operation (`add_uploaded`, `set_public_key`,
     /// `set_ident_state`, `record_ember_session`, …) already routes through.
     /// Deliberately over-approximates: a caller that takes `&mut` and changes
@@ -507,6 +646,57 @@ impl CreditManager {
     pub fn mark_saved_if_generation(&mut self, generation: u64) {
         if self.dirty_generation == generation {
             self.dirty = false;
+        }
+    }
+
+    fn mark_credit_unsaved(&mut self, user_hash: [u8; 16]) {
+        self.unsaved_credit_keys.insert(user_hash);
+        self.touch_dirty();
+    }
+
+    fn mark_ember_unsaved(&mut self, pub_key: [u8; 32]) {
+        self.unsaved_ember_keys.insert(pub_key);
+        self.touch_dirty();
+    }
+
+    /// Hand the rows the next flush must write to the caller, which snapshots
+    /// them under the same lock. Keys from an earlier flush that never
+    /// reported success are included again.
+    pub fn begin_flush(&mut self) -> CreditFlushKeys {
+        self.in_flight_credit_keys
+            .extend(self.unsaved_credit_keys.drain());
+        self.in_flight_ember_keys
+            .extend(self.unsaved_ember_keys.drain());
+        self.flush_epoch = self.flush_epoch.wrapping_add(1);
+        if self.needs_full_sync {
+            return CreditFlushKeys {
+                full_sync: true,
+                epoch: self.flush_epoch,
+                ..CreditFlushKeys::default()
+            };
+        }
+        CreditFlushKeys {
+            full_sync: false,
+            credit_keys: self.in_flight_credit_keys.iter().copied().collect(),
+            ember_keys: self.in_flight_ember_keys.iter().copied().collect(),
+            epoch: self.flush_epoch,
+        }
+    }
+
+    /// The flush that `keys` came from reached SQLite. Edits made since its
+    /// [`Self::begin_flush`] are in the unsaved sets and are not affected.
+    pub fn finish_flush(&mut self, keys: &CreditFlushKeys) {
+        // A later `begin_flush` merged everything in flight into its own
+        // batch, and the in-flight sets are that batch's only retry record.
+        // Clearing them (or `needs_full_sync`) here would lose those keys if
+        // the later flush then fails, so only the latest flush settles them.
+        if keys.epoch != self.flush_epoch {
+            return;
+        }
+        self.in_flight_credit_keys.clear();
+        self.in_flight_ember_keys.clear();
+        if keys.full_sync {
+            self.needs_full_sync = false;
         }
     }
 
@@ -666,6 +856,35 @@ impl CreditManager {
                     }
                 }
             }
+            // An eMule or aMule `cryptkey.dat` copied in by someone moving
+            // over. It is the identity peers hold that user's credits against,
+            // so adopting it is the point; calling it corrupt left SecIdent off
+            // for good (issue 126).
+            if !was_protected {
+                if let Some((public, private)) = decode_emule_cryptkey(&data) {
+                    let original = key_path.with_extension("dat.emule");
+                    if std::fs::copy(&key_path, &original).is_ok() {
+                        crate::security::restrict_file_permissions(&original);
+                    }
+                    let rewritten = encode_keypair_file(&public, &private).and_then(|bytes| {
+                        crate::security::atomic_write(&key_path, &bytes, true)
+                            .map_err(anyhow::Error::from)
+                    });
+                    match rewritten {
+                        Ok(()) => tracing::info!(
+                            "Adopted an eMule-format cryptkey.dat; the original is kept as cryptkey.dat.emule"
+                        ),
+                        Err(e) => tracing::warn!(
+                            "Adopted an eMule-format cryptkey.dat for this session but could not rewrite it: {e}"
+                        ),
+                    }
+                    self.our_public_key = public;
+                    self.our_private_key = private;
+                    self.crypto_available = true;
+                    self.crypto_unreadable = false;
+                    return;
+                }
+            }
             let backup = key_path.with_extension(format!(
                 "dat.{}.corrupt",
                 chrono::Utc::now().format("%Y%m%d%H%M%S")
@@ -731,25 +950,87 @@ impl CreditManager {
         // MAX_CREDIT_RECORDS): when full, evict the least-recently-seen entry.
         // Only runs on genuine inserts — updating an existing record can't grow
         // the map, so it never evicts.
-        if !self.credits.contains_key(&user_hash) && self.credits.len() >= MAX_CREDIT_RECORDS {
-            if let Some(oldest) = self
-                .credits
-                .iter()
-                .min_by_key(|(_, r)| r.last_seen)
-                .map(|(k, _)| *k)
-            {
-                self.credits.remove(&oldest);
-            }
-        }
+        self.make_room_for_credit(&user_hash);
         // Before handing out `&mut`: the caller may mutate any field, and once
         // `record` is borrowed from `self` we can no longer touch the flag.
-        self.touch_dirty();
+        self.mark_credit_unsaved(user_hash);
+        self.credit_seen.set(user_hash, now);
         let record = self
             .credits
             .entry(user_hash)
             .or_insert_with(|| CreditRecord::new(user_hash));
         record.last_seen = now;
         record
+    }
+
+    fn make_room_for_credit(&mut self, incoming: &[u8; 16]) {
+        if self.credits.contains_key(incoming) || self.credits.len() < MAX_CREDIT_RECORDS {
+            return;
+        }
+        if let Some(oldest) = self.credit_seen.oldest(&self.credits, |r| r.last_seen) {
+            self.credits.remove(&oldest);
+            self.credit_seen.remove(&oldest);
+            self.mark_credit_unsaved(oldest);
+        }
+    }
+
+    /// Adopt a record read from storage exactly as stored, indexed at its
+    /// persisted `last_seen`.
+    ///
+    /// Unlike [`Self::get_or_create`] this neither bumps `last_seen` nor marks
+    /// the row for rewrite: it already matches disk, and the first flush
+    /// reconciles the whole table anyway (`needs_full_sync`). Past
+    /// `MAX_CREDIT_RECORDS` the least-recently-seen record by stored age —
+    /// possibly this one — is dropped and queued for deletion, so a store
+    /// that outgrew the cap keeps its most recent peers.
+    pub fn insert_loaded_credit(&mut self, record: CreditRecord) {
+        let user_hash = record.user_hash;
+        if let Some(existing) = self.credits.get_mut(&user_hash) {
+            self.credit_seen.set(user_hash, record.last_seen);
+            *existing = record;
+            return;
+        }
+        if self.credits.len() >= MAX_CREDIT_RECORDS {
+            if let Some(oldest) = self.credit_seen.oldest(&self.credits, |r| r.last_seen) {
+                let oldest_seen = self.credits.get(&oldest).map_or(i64::MAX, |r| r.last_seen);
+                if record.last_seen <= oldest_seen {
+                    self.mark_credit_unsaved(user_hash);
+                    return;
+                }
+                self.credits.remove(&oldest);
+                self.credit_seen.remove(&oldest);
+                self.mark_credit_unsaved(oldest);
+            }
+        }
+        self.credit_seen.set(user_hash, record.last_seen);
+        self.credits.insert(user_hash, record);
+    }
+
+    /// Ember counterpart of [`Self::insert_loaded_credit`].
+    pub fn insert_loaded_ember_credit(&mut self, record: EmberCreditRecord) {
+        let pub_key = record.pub_key;
+        if let Some(existing) = self.ember_credits.get_mut(&pub_key) {
+            self.ember_seen.set(pub_key, record.last_seen);
+            *existing = record;
+            return;
+        }
+        if self.ember_credits.len() >= MAX_CREDIT_RECORDS {
+            if let Some(oldest) = self.ember_seen.oldest(&self.ember_credits, |r| r.last_seen) {
+                let oldest_seen = self
+                    .ember_credits
+                    .get(&oldest)
+                    .map_or(i64::MAX, |r| r.last_seen);
+                if record.last_seen <= oldest_seen {
+                    self.mark_ember_unsaved(pub_key);
+                    return;
+                }
+                self.ember_credits.remove(&oldest);
+                self.ember_seen.remove(&oldest);
+                self.mark_ember_unsaved(oldest);
+            }
+        }
+        self.ember_seen.set(pub_key, record.last_seen);
+        self.ember_credits.insert(pub_key, record);
     }
 
     /// Remember what a peer calls itself and what it runs.
@@ -771,13 +1052,27 @@ impl CreditManager {
     /// `CT_NAME` on its first handshake and omits it on a later one is
     /// common, and treating the omission as "my name is now blank" would lose
     /// the name for exactly the peers we talk to most.
+    ///
+    /// `peer_ip` is the address of the session this came from, recorded as
+    /// [`CreditRecord::seen_ip`]. Unlike the strings it always replaces the
+    /// stored value: a peer on a dynamic address should show where it is now.
     pub fn note_client_identity(
         &mut self,
         user_hash: [u8; 16],
+        peer_ip: Option<std::net::IpAddr>,
         peer_name: &str,
         client_software: &str,
     ) {
-        if user_hash == [0u8; 16] || (peer_name.is_empty() && client_software.is_empty()) {
+        let seen_ip = peer_ip
+            .and_then(|ip| match ip {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+            })
+            .filter(|v4| !v4.is_unspecified())
+            .map(|v4| u32::from_be_bytes(v4.octets()));
+        if user_hash == [0u8; 16]
+            || (peer_name.is_empty() && client_software.is_empty() && seen_ip.is_none())
+        {
             return;
         }
         let record = self.get_or_create(user_hash);
@@ -786,6 +1081,9 @@ impl CreditManager {
         }
         if !client_software.is_empty() {
             record.client_software = truncate_identity(client_software);
+        }
+        if let Some(ip) = seen_ip {
+            record.seen_ip = ip;
         }
     }
 
@@ -1148,16 +1446,41 @@ impl CreditManager {
         false
     }
 
-    /// Remember the Ember identity bound to an eD2K `user_hash` after a
-    /// successful offline binding check (`verify_ember_hash_binding`).
-    /// No-op for the all-zero sentinel hashes. Overwrites a previous
-    /// binding so a peer that rotated keys still links correctly.
+    /// Persist the Ember identity bound to an eD2K `user_hash`. Only for
+    /// identities proven on this session (Noise-authenticated friend
+    /// sessions); a bare `verify_ember_hash_binding` pass goes through
+    /// [`Self::note_bound_ember_hash`] instead. No-op for the all-zero
+    /// sentinel hashes. Overwrites a previous binding so a peer that rotated
+    /// keys still links correctly.
     pub fn set_ember_hash(&mut self, user_hash: [u8; 16], ember_hash: [u8; 16]) {
         if user_hash == [0u8; 16] || ember_hash == [0u8; 16] {
             return;
         }
+        self.bound_ember_hashes.remove(&user_hash);
         let record = self.get_or_create(user_hash);
         record.ember_hash = Some(ember_hash);
+    }
+
+    /// Remember, for this run only, the Ember identity an unauthenticated
+    /// session bound to `user_hash` with the offline binding check.
+    ///
+    /// The binding only proves the pubkey hashes to the Ember hash; it says
+    /// nothing about who owns the eD2K user hash, which travels in the clear.
+    /// Writing it to the persisted record let anyone with a fresh keypair
+    /// claim a friend's user hash and break friend source recognition. A
+    /// persisted mapping always wins over this one in the lookups.
+    pub fn note_bound_ember_hash(&mut self, user_hash: [u8; 16], ember_hash: [u8; 16]) {
+        if user_hash == [0u8; 16] || ember_hash == [0u8; 16] {
+            return;
+        }
+        if !self.bound_ember_hashes.contains_key(&user_hash)
+            && self.bound_ember_hashes.len() >= MAX_BOUND_EMBER_HASHES
+        {
+            if let Some(victim) = self.bound_ember_hashes.keys().next().copied() {
+                self.bound_ember_hashes.remove(&victim);
+            }
+        }
+        self.bound_ember_hashes.insert(user_hash, ember_hash);
     }
 
     /// Reverse of [`Self::set_ember_hash`]: find the eD2K `user_hash` we last
@@ -1167,9 +1490,22 @@ impl CreditManager {
         if *ember_hash == [0u8; 16] {
             return None;
         }
-        self.credits.iter().find_map(|(user_hash, record)| {
-            (record.ember_hash.as_ref() == Some(ember_hash)).then_some(*user_hash)
-        })
+        self.credits
+            .iter()
+            .find_map(|(user_hash, record)| {
+                (record.ember_hash.as_ref() == Some(ember_hash)).then_some(*user_hash)
+            })
+            .or_else(|| {
+                self.bound_ember_hashes
+                    .iter()
+                    .find_map(|(user_hash, bound)| {
+                        let persisted = self
+                            .credits
+                            .get(user_hash)
+                            .and_then(|record| record.ember_hash);
+                        (bound == ember_hash && persisted.is_none()).then_some(*user_hash)
+                    })
+            })
     }
 
     /// The Ember identity bound to `user_hash`, if we have ever seen one.
@@ -1185,6 +1521,7 @@ impl CreditManager {
         self.credits
             .get(user_hash)
             .and_then(|record| record.ember_hash)
+            .or_else(|| self.bound_ember_hashes.get(user_hash).copied())
     }
 
     pub fn set_ident_state(&mut self, user_hash: [u8; 16], state: IdentState) {
@@ -1248,12 +1585,34 @@ impl CreditManager {
     pub fn cleanup_stale(&mut self, max_age_days: i64) {
         let cutoff = chrono::Utc::now().timestamp() - (max_age_days * 86400);
         let before = self.credits.len() + self.ember_credits.len();
-        self.credits.retain(|_, r| r.last_seen > cutoff);
+        let unsaved_credit_keys = &mut self.unsaved_credit_keys;
+        let credit_seen = &mut self.credit_seen;
+        self.credits.retain(|k, r| {
+            let keep = r.last_seen > cutoff;
+            if keep {
+                credit_seen.set(*k, r.last_seen);
+            } else {
+                credit_seen.remove(k);
+                unsaved_credit_keys.insert(*k);
+            }
+            keep
+        });
         // Same cutoff for Ember records so the two tables age in
         // lockstep. `last_seen` on EmberCreditRecord is bumped by
         // every credit-granting or session-recording operation, so
         // active peers stay regardless of their public-key format.
-        self.ember_credits.retain(|_, r| r.last_seen > cutoff);
+        let unsaved_ember_keys = &mut self.unsaved_ember_keys;
+        let ember_seen = &mut self.ember_seen;
+        self.ember_credits.retain(|k, r| {
+            let keep = r.last_seen > cutoff;
+            if keep {
+                ember_seen.set(*k, r.last_seen);
+            } else {
+                ember_seen.remove(k);
+                unsaved_ember_keys.insert(*k);
+            }
+            keep
+        });
         // Only dirty when the sweep actually evicted something. This runs on
         // the same 60s tick as the flush, so bumping unconditionally would
         // re-dirty the state every tick and defeat the gate entirely.
@@ -1277,17 +1636,15 @@ impl CreditManager {
         if !self.ember_credits.contains_key(&pub_key)
             && self.ember_credits.len() >= MAX_CREDIT_RECORDS
         {
-            if let Some(oldest) = self
-                .ember_credits
-                .iter()
-                .min_by_key(|(_, r)| r.last_seen)
-                .map(|(k, _)| *k)
-            {
+            if let Some(oldest) = self.ember_seen.oldest(&self.ember_credits, |r| r.last_seen) {
                 self.ember_credits.remove(&oldest);
+                self.ember_seen.remove(&oldest);
+                self.mark_ember_unsaved(oldest);
             }
         }
         // Same reason as `get_or_create`: flag before the borrow escapes.
-        self.touch_dirty();
+        self.mark_ember_unsaved(pub_key);
+        self.ember_seen.set(pub_key, now);
         let record = self
             .ember_credits
             .entry(pub_key)
@@ -1296,7 +1653,6 @@ impl CreditManager {
         record
     }
 
-    #[allow(dead_code)]
     pub fn get_ember_record(&self, pub_key: &[u8; 32]) -> Option<&EmberCreditRecord> {
         self.ember_credits.get(pub_key)
     }
@@ -1657,7 +2013,13 @@ impl CreditManager {
                 downloaded,
                 last_seen,
                 public_key,
-                ident_state,
+                // Identification is per session, like the database load in
+                // `network::mod`; the stored state still seeds the anchor
+                // below.
+                ident_state: match ident_state {
+                    IdentState::Verified | IdentState::Failed => IdentState::Needed,
+                    other => other,
+                },
                 ident_ip,
                 ember_hash,
                 // Fallback for files written before v3, which the anchor
@@ -1672,8 +2034,11 @@ impl CreditManager {
                 // user_hash and may name only some of these records.
                 peer_name: String::new(),
                 client_software: String::new(),
+                // `clients.met` has no field for it; the SQLite table, which
+                // is the primary store, does.
+                seen_ip: 0,
             };
-            self.credits.insert(user_hash, record);
+            self.insert_loaded_credit(record);
             loaded_hashes.push(user_hash);
             loaded += 1;
         }
@@ -1876,6 +2241,54 @@ fn generate_rsa_keypair() -> (Vec<u8>, Vec<u8>) {
     };
 
     (pub_der.as_ref().to_vec(), priv_der.as_bytes().to_vec())
+}
+
+/// `cryptkey.dat` as eMule and aMule write it: the RSA-384 private key as
+/// PKCS#8 DER, base64-encoded by Crypto++ with a line break every 72 columns
+/// (`CClientCreditsList::CreateKeyPair`). Raw DER, and PKCS#1 rather than
+/// PKCS#8, are accepted too, for a file someone has already converted.
+///
+/// Returns `(public SPKI, private PKCS#8)`, the pair Ember stores. Only 384-bit
+/// keys are taken: that is the size eMule's SecIdent uses, and the one whose
+/// public key fits the 80-byte `MAXPUBKEYSIZE` peers accept.
+pub(crate) fn decode_emule_cryptkey(raw: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    use base64::Engine as _;
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+    use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
+    use rsa::traits::PublicKeyParts;
+    use rsa::RsaPrivateKey;
+
+    let der = if raw.first() == Some(&0x30) {
+        raw.to_vec()
+    } else {
+        let text: Vec<u8> = raw
+            .iter()
+            .copied()
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect();
+        base64::engine::general_purpose::STANDARD.decode(text).ok()?
+    };
+    let key = RsaPrivateKey::from_pkcs8_der(&der)
+        .or_else(|_| RsaPrivateKey::from_pkcs1_der(&der))
+        .ok()?;
+    if key.size() * 8 != 384 {
+        return None;
+    }
+    let public = key.to_public_key().to_public_key_der().ok()?;
+    let private = key.to_pkcs8_der().ok()?;
+    Some((public.as_ref().to_vec(), private.as_bytes().to_vec()))
+}
+
+/// Ember's `cryptkey.dat` bytes for a keypair, wrapped for this account:
+/// `u32 LE len | public SPKI | u32 LE len | private PKCS#8`, then
+/// `secret_store::protect`.
+pub(crate) fn encode_keypair_file(public_der: &[u8], private_der: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(8 + public_der.len() + private_der.len());
+    out.extend_from_slice(&(public_der.len() as u32).to_le_bytes());
+    out.extend_from_slice(public_der);
+    out.extend_from_slice(&(private_der.len() as u32).to_le_bytes());
+    out.extend_from_slice(private_der);
+    crate::storage::secret_store::protect(&out)
 }
 
 /// Re-encode a cached public key as SPKI if it's in the bare PKCS#1
@@ -2406,8 +2819,8 @@ mod tests {
     fn a_later_handshake_without_a_name_does_not_erase_the_stored_one() {
         let mut cm = CreditManager::new();
         let peer = [0x44u8; 16];
-        cm.note_client_identity(peer, "Aoife", "eMule 0.60a");
-        cm.note_client_identity(peer, "", "eMule 0.60b");
+        cm.note_client_identity(peer, None, "Aoife", "eMule 0.60a");
+        cm.note_client_identity(peer, None, "", "eMule 0.60b");
         let record = cm.get_record(&peer).expect("record");
         assert_eq!(record.peer_name, "Aoife");
         assert_eq!(
@@ -2426,10 +2839,31 @@ mod tests {
         let peer = [0x45u8; 16];
         // 3 bytes each, so the cap lands mid-character if taken naively.
         let long = "☃".repeat(100);
-        cm.note_client_identity(peer, &long, "");
+        cm.note_client_identity(peer, None, &long, "");
         let stored = &cm.get_record(&peer).expect("record").peer_name;
         assert!(stored.len() <= MAX_IDENTITY_LEN, "{}", stored.len());
         assert!(stored.chars().all(|c| c == '☃'), "{stored}");
+    }
+
+    /// A peer that never completes SecIdent still gets an address on its
+    /// ledger row, and recording it leaves the identity pin alone.
+    #[test]
+    fn a_session_records_the_address_without_touching_the_ident_pin() {
+        let mut cm = CreditManager::new();
+        let peer = [0x46u8; 16];
+        let first: std::net::IpAddr = std::net::Ipv4Addr::new(9, 8, 7, 6).into();
+        let moved: std::net::IpAddr = std::net::Ipv4Addr::new(9, 8, 7, 7).into();
+
+        cm.note_client_identity(peer, Some(first), "", "");
+        let record = cm.get_record(&peer).expect("an address alone creates the row");
+        assert_eq!(record.seen_ip, 0x0908_0706);
+        assert_eq!(record.ident_ip, 0, "only a verified signature pins ident_ip");
+
+        cm.note_client_identity(peer, Some(moved), "Aoife", "");
+        assert_eq!(cm.get_record(&peer).unwrap().seen_ip, 0x0908_0707, "the newest session wins");
+
+        cm.note_client_identity(peer, None, "Aoife", "");
+        assert_eq!(cm.get_record(&peer).unwrap().seen_ip, 0x0908_0707, "no address keeps the last");
     }
 
     /// Monotonic-ish suffix for temp filenames so concurrent test runs don't
@@ -2716,6 +3150,79 @@ mod tests {
         );
     }
 
+    /// The first flush reconciles everything; later ones carry only the keys
+    /// touched since, and a flush that never confirms success hands its keys
+    /// to the next one rather than losing them.
+    #[test]
+    fn flush_keys_cover_edits_and_evictions_and_survive_a_failed_flush() {
+        let mut cm = CreditManager::new();
+        let first = cm.begin_flush();
+        assert!(first.full_sync, "nothing is known about disk before one flush lands");
+        cm.finish_flush(&first);
+        assert!(cm.begin_flush().is_empty(), "a clean manager owes no rows");
+
+        let a = [0x11u8; 16];
+        let b = [0x12u8; 16];
+        let pk = [0x21u8; 32];
+        cm.add_uploaded(a, 10);
+        cm.add_ember_uploaded(pk, 10, true);
+        let failed = cm.begin_flush();
+        assert!(!failed.full_sync);
+        assert_eq!(failed.credit_keys, vec![a]);
+        assert_eq!(failed.ember_keys, vec![pk]);
+
+        // That flush failed (no `finish_flush`); a later edit joins the retry.
+        cm.add_uploaded(b, 10);
+        let retry = cm.begin_flush();
+        let mut keys = retry.credit_keys.clone();
+        keys.sort();
+        assert_eq!(keys, vec![a, b], "a failed flush must not drop its rows");
+        assert_eq!(retry.ember_keys, vec![pk]);
+        cm.finish_flush(&retry);
+        assert!(cm.begin_flush().is_empty());
+
+        cm.get_or_create(a).last_seen = chrono::Utc::now().timestamp() - 100 * 86400;
+        cm.get_or_create_ember(pk).last_seen = chrono::Utc::now().timestamp() - 100 * 86400;
+        let edited = cm.begin_flush();
+        cm.finish_flush(&edited);
+        cm.cleanup_stale(90);
+        let evicted = cm.begin_flush();
+        assert_eq!(evicted.credit_keys, vec![a], "an evicted row must be deleted on disk");
+        assert_eq!(evicted.ember_keys, vec![pk]);
+        assert!(cm.get_record(&a).is_none() && cm.get_ember_record(&pk).is_none());
+    }
+
+    /// A flush that finishes after a newer one has begun must not settle the
+    /// newer one's keys: if the newer flush then fails, they would be in
+    /// neither set and never reach SQLite.
+    #[test]
+    fn an_older_flush_finishing_late_cannot_settle_a_newer_ones_keys() {
+        let mut cm = CreditManager::new();
+        let a = [0x31u8; 16];
+        let b = [0x32u8; 16];
+
+        let startup = cm.begin_flush();
+        cm.add_uploaded(a, 10);
+        let periodic = cm.begin_flush();
+        assert!(periodic.full_sync, "nothing has confirmed the first sync yet");
+        cm.finish_flush(&startup);
+        // `periodic` fails: no `finish_flush`.
+        let retry = cm.begin_flush();
+        assert!(retry.full_sync, "a stale finish must not cancel the pending full sync");
+        cm.finish_flush(&retry);
+        assert!(cm.begin_flush().is_empty(), "the latest flush settles everything");
+
+        cm.add_uploaded(a, 10);
+        let older = cm.begin_flush();
+        cm.add_uploaded(b, 10);
+        let _newer = cm.begin_flush();
+        cm.finish_flush(&older);
+        // `newer` fails.
+        let mut keys = cm.begin_flush().credit_keys;
+        keys.sort();
+        assert_eq!(keys, vec![a, b], "keys handed to the failed newer flush must survive");
+    }
+
     /// The credit map must stay bounded under user_hash churn (a peer
     /// rotating its hash across reconnects, seeding one record per OP_PUBLICKEY)
     /// even between 90-day cleanup sweeps. See MAX_CREDIT_RECORDS.
@@ -2732,6 +3239,142 @@ mod tests {
             "credit map ({}) must stay within MAX_CREDIT_RECORDS ({})",
             cm.credits.len(),
             MAX_CREDIT_RECORDS,
+        );
+    }
+
+    #[test]
+    fn eviction_at_capacity_drops_the_least_recently_seen_record() {
+        let key = |i: u64| {
+            let mut h = [0u8; 16];
+            h[..8].copy_from_slice(&i.to_le_bytes());
+            h[15] = 1;
+            h
+        };
+        let mut cm = CreditManager::new();
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..MAX_CREDIT_RECORDS as u64 {
+            cm.get_or_create(key(i)).last_seen = now;
+        }
+        // Rewritten through the `&mut` behind the index's back, the way the
+        // startup loader restores persisted timestamps before its sweep.
+        cm.get_or_create(key(777)).last_seen = now - 10 * 86400;
+        cm.get_or_create(key(42)).last_seen = now - 20 * 86400;
+        cm.cleanup_stale(90);
+        let settled = cm.begin_flush();
+        cm.finish_flush(&settled);
+
+        cm.get_or_create(key(u64::MAX));
+        assert_eq!(cm.credits.len(), MAX_CREDIT_RECORDS);
+        assert!(cm.get_record(&key(42)).is_none(), "oldest record is evicted");
+        assert!(cm.get_record(&key(777)).is_some());
+        let flush = cm.begin_flush();
+        assert!(
+            flush.credit_keys.contains(&key(42)),
+            "an evicted row must still reach the flush so SQLite deletes it"
+        );
+        cm.finish_flush(&flush);
+
+        cm.get_or_create(key(u64::MAX - 1));
+        assert!(cm.get_record(&key(777)).is_none(), "next oldest goes next");
+        assert!(cm.get_record(&key(u64::MAX)).is_some());
+    }
+
+    #[test]
+    fn loading_past_the_cap_keeps_the_most_recently_seen_records() {
+        let key = |i: u64| {
+            let mut h = [0u8; 16];
+            h[..8].copy_from_slice(&i.to_le_bytes());
+            h[15] = 3;
+            h
+        };
+        let now = chrono::Utc::now().timestamp();
+        let extra = 100u64;
+        let total = MAX_CREDIT_RECORDS as u64 + extra;
+        // Ages are a permutation of 0..total in an order unrelated to the
+        // keys, as SQLite hands rows back in no particular age order.
+        let age_of = |i: u64| ((i * 7919) % total) as i64;
+        let mut cm = CreditManager::new();
+        for i in 0..total {
+            let mut record = CreditRecord::new(key(i));
+            record.last_seen = now - age_of(i);
+            record.uploaded = i;
+            cm.insert_loaded_credit(record);
+        }
+        assert_eq!(cm.credits.len(), MAX_CREDIT_RECORDS);
+        let cutoff = now - (MAX_CREDIT_RECORDS as i64 - 1);
+        for i in 0..total {
+            let kept = cm.get_record(&key(i)).is_some();
+            assert_eq!(
+                kept,
+                now - age_of(i) >= cutoff,
+                "row {i} (age {}s) kept={kept}",
+                age_of(i)
+            );
+        }
+
+        let flush = cm.begin_flush();
+        assert!(flush.full_sync, "the first flush still reconciles the whole table");
+        let mut ember_cm = CreditManager::new();
+        for i in 0..10u64 {
+            let mut pk = [0u8; 32];
+            pk[..8].copy_from_slice(&i.to_le_bytes());
+            let mut record = EmberCreditRecord::new(pk);
+            record.last_seen = now - i as i64;
+            ember_cm.insert_loaded_ember_credit(record);
+        }
+        assert!(
+            !ember_cm.is_dirty(),
+            "rows that fit and match disk are not queued for a rewrite"
+        );
+        assert_eq!(ember_cm.get_ember_record(&[0u8; 32]).map(|r| r.last_seen), Some(now));
+    }
+
+    #[test]
+    fn eviction_skips_a_record_touched_since_it_was_oldest() {
+        let key = |i: u64| {
+            let mut h = [0u8; 16];
+            h[..8].copy_from_slice(&i.to_le_bytes());
+            h[15] = 2;
+            h
+        };
+        let mut cm = CreditManager::new();
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..MAX_CREDIT_RECORDS as u64 {
+            cm.get_or_create(key(i)).last_seen = now - 1_000 + (i % 500) as i64;
+        }
+        cm.cleanup_stale(90);
+        // key(0) is among the oldest until it is seen again.
+        cm.add_uploaded(key(0), 1);
+        cm.get_or_create(key(u64::MAX));
+        assert!(cm.get_record(&key(0)).is_some(), "a freshly seen record survives");
+        assert_eq!(cm.credits.len(), MAX_CREDIT_RECORDS);
+    }
+
+    #[test]
+    fn binding_only_ember_hash_is_session_scoped_and_never_displaces_a_persisted_one() {
+        let mut cm = CreditManager::new();
+        let friend_user_hash = [0x51u8; 16];
+        let friend_ember = [0x61u8; 16];
+        let attacker_ember = [0x62u8; 16];
+        cm.set_ember_hash(friend_user_hash, friend_ember);
+
+        cm.note_bound_ember_hash(friend_user_hash, attacker_ember);
+        assert_eq!(cm.find_ember_by_user_hash(&friend_user_hash), Some(friend_ember));
+        assert_eq!(cm.find_user_hash_by_ember(&friend_ember), Some(friend_user_hash));
+        assert_eq!(cm.find_user_hash_by_ember(&attacker_ember), None);
+        assert_eq!(
+            cm.get_record(&friend_user_hash).and_then(|r| r.ember_hash),
+            Some(friend_ember)
+        );
+
+        let stranger = [0x52u8; 16];
+        let stranger_ember = [0x63u8; 16];
+        cm.note_bound_ember_hash(stranger, stranger_ember);
+        assert_eq!(cm.find_ember_by_user_hash(&stranger), Some(stranger_ember));
+        assert_eq!(cm.find_user_hash_by_ember(&stranger_ember), Some(stranger));
+        assert!(
+            cm.get_record(&stranger).is_none(),
+            "a binding-only mapping must not create a persisted credit row"
         );
     }
 
@@ -3041,11 +3684,14 @@ mod tests {
         assert_eq!(n, 1);
         let rec = loaded.get_record(&hash).expect("record must load");
         assert_eq!(rec.ident_ip, 0x0102_0304, "ident_ip must survive restart");
+        // Identification is per session, as in eMule: the peer proves its key
+        // again, and the anchor keeps its totals through that.
         assert_eq!(
             rec.ident_state,
-            IdentState::Verified,
-            "ident_state must survive restart"
+            IdentState::Needed,
+            "a verified peer must identify again after a restart"
         );
+        assert!(rec.crypto_verified_once, "the anchor must survive restart");
         assert_eq!(rec.uploaded, 4096);
         assert_eq!(rec.downloaded, 8192);
         assert_eq!(rec.last_seen, 1_700_000_123);
@@ -3212,6 +3858,44 @@ mod tests {
         let peer = [0x33u8; 16];
         assert!(!cm.add_uploaded(peer, 2_000_000));
         assert!(!cm.has_download_bonus(&peer, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue 126: eMule's `cryptkey.dat` copied into the data folder used to be
+    /// quarantined as corrupt, leaving SecIdent off and the user's credits on
+    /// the network unreachable.
+    #[test]
+    fn an_emule_cryptkey_dropped_in_is_adopted_and_rewritten() {
+        use base64::Engine as _;
+        use rsa::pkcs8::EncodePrivateKey;
+        let dir = std::env::temp_dir().join(format!(
+            "ember-cryptkey-emule-{}-{}",
+            std::process::id(),
+            unique_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 384).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(key.to_pkcs8_der().unwrap().as_bytes());
+        let wrapped: String = b64
+            .as_bytes()
+            .chunks(72)
+            .map(|line| format!("{}\n", String::from_utf8_lossy(line)))
+            .collect();
+        std::fs::write(dir.join("cryptkey.dat"), &wrapped).unwrap();
+
+        let mut cm = CreditManager::new();
+        cm.load_or_create_keypair(&dir);
+        assert!(!cm.crypto_unreadable());
+        let adopted = cm.our_public_key().to_vec();
+        assert!(dir.join("cryptkey.dat.emule").exists(), "the original is kept");
+
+        let mut again = CreditManager::new();
+        again.load_or_create_keypair(&dir);
+        assert_eq!(again.our_public_key(), adopted.as_slice(), "rewritten in Ember's layout");
+
+        let bits_512 = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 512).unwrap();
+        assert!(decode_emule_cryptkey(bits_512.to_pkcs8_der().unwrap().as_bytes()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

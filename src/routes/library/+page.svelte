@@ -1,10 +1,11 @@
 <script lang="ts">
   import {
-    addSharedFolder,
     deleteSharedFile,
     removeSharedFolder,
-    getSharedFiles,
+    getSharedFilesIfChanged,
     getSharedFolders,
+    getUnapprovedSharedFolders,
+    reapproveSharedFolder,
     reloadSharedFiles,
     getScanStatus,
     getLibraryScanTruncated,
@@ -14,12 +15,10 @@
     resumeHashing,
     setFilePriority,
     unshareFile,
-    shareFile,
     unshareFolder,
     openSharedFile as openSharedFileCommand,
     openSharedFolder as openSharedFolderCommand,
     batchSetPriority,
-    batchShare,
     batchUnshare,
     setFilesFriendsOnly,
     republishFile,
@@ -28,6 +27,7 @@
     getFolderPriorities,
     setFolderPriority,
     getFileMediaMetadata,
+    type SharedFolderPick,
   } from '$lib/api/sharing';
   import { getFileComments, setFileComment, type FileCommentInfo } from '$lib/api/comments';
   import { getStatistics, type TransferStats } from '$lib/api/statistics';
@@ -40,7 +40,13 @@
   } from '$lib/stores/collection';
   import { toast as toastInfo, toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
-  import { formatSize, copyToClipboard as writeClipboard } from '$lib/utils';
+  import {
+    formatSize,
+    formatNumber,
+    formatDateTime,
+    formatClockTime,
+    copyToClipboard as writeClipboard,
+  } from '$lib/utils';
   import type { FileInfo, MediaMetadata } from '$lib/types';
   import { onMount, tick, untrack } from 'svelte';
   import { fly } from 'svelte/transition';
@@ -50,15 +56,39 @@
   import LibraryVirtualTable from '$lib/components/LibraryVirtualTable.svelte';
   import LibraryMediaPlayer from '$lib/components/LibraryMediaPlayer.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import FileTypeIcon from '$lib/components/FileTypeIcon.svelte';
+  import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
+  import ShareFolderBrowser from '$lib/components/ShareFolderBrowser.svelte';
   import IconX from '$lib/components/IconX.svelte';
+  import {
+    FILE_TYPE_FILTERS,
+    extensionFromPath,
+    fileTypeFilterLabel,
+    fileTypeKey,
+    type FileTypeFilter,
+  } from '$lib/fileTypes';
+  import {
+    ancestorFolderPaths,
+    buildLibraryFolderTree,
+    flattenLibraryFolderTree,
+  } from '$lib/libraryFolderTree';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { plural } from '$lib/plural';
+  import { openChatFilesFolder } from '$lib/api/friends';
+  import { openChannelFilesFolder } from '$lib/api/channels';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { appSettings } from '$lib/stores/settings';
   import { openWebService } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
+  import { createMaxWaitDebounce } from '$lib/debounce';
+  import {
+    applySharedFileStats,
+    isUploadCounterPhase,
+    type SharedFileStats,
+  } from '$lib/sharedFileStats';
 
   // All three are replace-only — never mutated in place — so `$state.raw`
   // avoids building a deep proxy with a signal per property. That matters here:
@@ -66,6 +96,8 @@
   // several fields per row on every pass. If you ever need an in-place edit,
   // switch back to `$state` rather than mutating these.
   let folders: string[] = $state.raw([]);
+  /** Shares present on disk that Ember will not upload from until re-approved. */
+  let unapprovedFolders: string[] = $state.raw([]);
   let folderPriorities: Record<string, string> = $state.raw({});
   /** A library row plus the three keys the filter chain would otherwise derive
    *  from it on every pass.
@@ -122,6 +154,7 @@
   // the DOM yet because the table is virtualized).
   let libraryTableRef: { scrollRowIntoView: (i: number) => void; openColumnMenu: (e: MouseEvent) => void } | undefined = $state(undefined);
   let filterFolder: string | null = $state(null);
+  let expandedFolders: Set<string> = $state(new Set());
   /** `upgrading` is how many files in this pass are a one-time index top-up
    *  rather than newly discovered ones — see `HashProgressEmitter` in
    *  `commands/sharing.rs`. Shown differently because it is a different thing:
@@ -153,6 +186,8 @@
   let playerStopToken = $state(0);
 
   let hashedLibraryFiles = $derived.by(() => files.filter((f) => !!f.hash));
+  /** The collection picker selects by hash, so its total counts hashes too. */
+  let hashedUniqueCount = $derived(new Set(hashedLibraryFiles.map((f) => f.hash)).size);
 
   // --- Collections ---
   let collectionsOpen = $state(false);
@@ -167,6 +202,7 @@
     if (!createCollectionOpen || !createCollectionOverlay) return;
     return inertBackground(createCollectionOverlay);
   });
+  let addFolderOpen = $state(false);
   let newCollName = $state('');
   let newCollAuthor = $state('');
   let selectedFileHashes: Set<string> = $state(new Set());
@@ -181,7 +217,13 @@
       if (!collection) return;
       collectionsOpen = true;
       loadedCollection = collection;
-      toastSuccess(m.library_collection_loaded({ name: loadedCollection.name, count: loadedCollection.files.length }));
+      const count = loadedCollection.files.length;
+      const name = loadedCollection.name;
+      toastSuccess(plural(count, {
+        one: () => m.library_collection_loaded_one({ name }),
+        few: () => m.library_collection_loaded_few({ name, count: formatNumber(count) }),
+        other: () => m.library_collection_loaded({ name, count: formatNumber(count) }),
+      }));
     } catch (e: unknown) {
       toastError(toErr(e));
     } finally {
@@ -220,14 +262,23 @@
         }
       }
       if (queued > 0) {
-        toastSuccess(m.library_queued_files_download({ count: queued }));
+        toastSuccess(plural(queued, {
+          one: m.library_queued_files_download_one,
+          other: () => m.library_queued_files_download({ count: formatNumber(queued) }),
+        }));
       }
       if (skipped > 0 || oversize > 0) {
         const totalSkipped = skipped + oversize;
-        toastWarning(m.library_collection_entries_skipped({ count: totalSkipped }));
+        toastWarning(plural(totalSkipped, {
+          one: m.library_collection_entries_skipped_one,
+          other: () => m.library_collection_entries_skipped({ count: formatNumber(totalSkipped) }),
+        }));
       }
       if (failed > 0) {
-        toastWarning(m.library_collection_start_failed({ count: failed }));
+        toastWarning(plural(failed, {
+          one: m.library_collection_start_failed_one,
+          other: () => m.library_collection_start_failed({ count: formatNumber(failed) }),
+        }));
       }
       if (firstError) throw firstError;
     } catch (e: unknown) {
@@ -259,7 +310,7 @@
         toastError(m.library_copy_failed());
         return;
       }
-      toastSuccess(files.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: files.length }));
+      toastSuccess(copiedLinksText(files.length));
     } catch (e: unknown) {
       toastError(toErr(e));
     } finally {
@@ -369,7 +420,13 @@
         isBinary,
       );
       if (!msg) return;
-      toastSuccess(msg || m.library_collection_created({ name: newCollName.trim(), count: collFiles.length }));
+      const name = newCollName.trim();
+      const count = formatNumber(collFiles.length);
+      toastSuccess(plural(collFiles.length, {
+        one: () => m.library_collection_created_one({ name }),
+        few: () => m.library_collection_created_few({ name, count }),
+        other: () => m.library_collection_created({ name, count }),
+      }));
       closeCreateDialog();
     } catch (e: unknown) {
       toastError(toErr(e));
@@ -416,8 +473,8 @@
     };
   });
   let searchInputEl: HTMLInputElement | undefined = $state(undefined);
-  const typeFilterOptions = ['All', 'Audio', 'Video', 'Image', 'Archive', 'Document', 'CD/DVD'] as const;
-  type TypeFilter = (typeof typeFilterOptions)[number];
+  const typeFilterOptions = FILE_TYPE_FILTERS;
+  type TypeFilter = FileTypeFilter;
   let typeFilter: TypeFilter = $state('All');
   let showDuplicatesOnly = $state(false);
   let showMissingOnly = $state(false);
@@ -479,7 +536,11 @@
       // authorizes the loop below to remove every missing index row.
       const count = Math.max(missingTotalCount, missingPathSet.size);
       const confirmed = await askConfirm(
-        count === 1 ? m.library_confirm_remove_missing_one() : m.library_confirm_remove_missing_other({ count }),
+        plural(count, {
+          one: m.library_confirm_remove_missing_one,
+          few: () => m.library_confirm_remove_missing_few({ count }),
+          other: () => m.library_confirm_remove_missing_other({ count }),
+        }),
         m.library_remove_missing_title(),
       );
       if (!confirmed) return;
@@ -493,9 +554,7 @@
         await refreshMissingSet(true);
         if (removedThisBatch === 0) break;
       }
-      if (removed > 0) {
-        toastSuccess(removed === 1 ? m.library_removed_missing_one() : m.library_removed_missing_other({ count: removed }));
-      }
+      if (removed > 0) toastSuccess(removedMissingText(removed));
       if (missingPathSet.size === 0) showMissingOnly = false;
       await refresh();
     } catch (e: unknown) {
@@ -513,7 +572,7 @@
       );
       if (!confirmed) return;
       const removed = await removeMissingFiles([f.path]);
-      toastSuccess(removed === 1 ? m.library_removed_missing_one() : m.library_removed_missing_other({ count: removed }));
+      toastSuccess(removedMissingText(removed));
       const next = new Set(missingPathSet);
       next.delete(f.path);
       missingPathSet = next;
@@ -594,8 +653,14 @@
     return normalizePathForMatch(a) === normalizePathForMatch(b);
   }
 
+  function parentFolderName(path: string): string {
+    const parts = path.split(/[\\/]/).filter(Boolean);
+    parts.pop();
+    return parts.pop() || path;
+  }
+
   function folderDisplayName(path: string | null): string {
-    if (!path) return m.library_all_folders();
+    if (!path) return m.library_all_files();
     return path.split(/[\\/]/).filter(Boolean).pop() || path;
   }
 
@@ -656,8 +721,11 @@
   let initialLoadDone = $state(false);
   let firstLoadSlow = $state(false);
   let pendingRefresh = false;
-  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  const refreshDebounce = createMaxWaitDebounce(() => { refresh(); });
   let loadGen = 0;
+  /** Etag of the backend rows `files` was last built from. A refresh passes it
+   *  back, and an unchanged library comes back without its rows. */
+  let filesEtag: string | null = null;
 
   /** Coalescing window for `shared-files-changed` while a scan is running.
    *
@@ -668,14 +736,34 @@
    *  library was serialised, transferred and re-derived three times a second
    *  for the whole run. Nothing on screen changes usefully at that rate: the
    *  scan banner has its own progress events, and the scan-completion poll
-   *  pulls a final snapshot regardless. */
+   *  pulls a final snapshot regardless.
+   *
+   *  Each window also has a max-wait: a pure trailing debounce never fires
+   *  while events keep landing inside it, so a steady stream left the list
+   *  stale until the stream stopped. */
   const SCAN_REFRESH_DEBOUNCE_MS = 3000;
+  const SCAN_REFRESH_MAX_WAIT_MS = 15_000;
   const IDLE_REFRESH_DEBOUNCE_MS = 300;
+  const IDLE_REFRESH_MAX_WAIT_MS = 2000;
 
   function debouncedRefresh() {
-    if (refreshTimer) clearTimeout(refreshTimer);
-    const delay = scanning ? SCAN_REFRESH_DEBOUNCE_MS : IDLE_REFRESH_DEBOUNCE_MS;
-    refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, delay);
+    if (scanning) refreshDebounce.schedule(SCAN_REFRESH_DEBOUNCE_MS, SCAN_REFRESH_MAX_WAIT_MS);
+    else refreshDebounce.schedule(IDLE_REFRESH_DEBOUNCE_MS, IDLE_REFRESH_MAX_WAIT_MS);
+  }
+
+  /** Upload counters arrive on their own event so they can be patched into the
+   *  affected rows without the full re-read `refresh()` does. The header total
+   *  is advanced by the same growth until the next refresh re-reads it. */
+  function applyUploadStats(stats: SharedFileStats[]) {
+    const applied = applySharedFileStats(files, stats);
+    if (!applied.changed) return;
+    files = applied.rows;
+    if (applied.uploadedDelta > 0 && aggregateStats) {
+      aggregateStats = {
+        ...aggregateStats,
+        session_uploaded: aggregateStats.session_uploaded + applied.uploadedDelta,
+      };
+    }
   }
 
   async function refresh(force = false) {
@@ -690,11 +778,12 @@
     if (!initialLoadDone) firstLoadSlow = false;
     const work = Promise.all([
       getSharedFolders(),
-      getSharedFiles(),
+      getSharedFilesIfChanged(force ? null : filesEtag),
       getScanStatus(),
       getFolderPriorities(),
       getLibraryScanTruncated(),
       getStatistics().catch(() => null),
+      getUnapprovedSharedFolders().catch(() => [] as string[]),
     ]);
     // The watchdog must not discard the in-flight result. A large library can
     // take longer than 5s, and racing Promise.race used to drop that payload
@@ -710,11 +799,16 @@
       }
     }, 5000);
     try {
-      const [newFolders, newFiles, isScanning, newPriorities, newScanTruncated, newAggregateStats] = await work;
+      const [newFolders, snapshot, isScanning, newPriorities, newScanTruncated, newAggregateStats, newUnapproved] = await work;
       if (!mounted || gen !== loadGen) return;
       folders = newFolders;
+      unapprovedFolders = newUnapproved;
       if (!stoppedByUser) scanning = isScanning;
-      files = newFiles.map(withMatchKeys);
+      // The library is the offer list. A file that is not offered stays on
+      // disk and stays out of this view; sharing it again is the folder window.
+      const offered = snapshot.files ? snapshot.files.filter((f) => f.shared) : null;
+      if (offered) files = offered.map(withMatchKeys);
+      filesEtag = snapshot.etag;
       folderPriorities = newPriorities;
       scanTruncated = newScanTruncated;
       aggregateStats = newAggregateStats;
@@ -726,13 +820,13 @@
         if (error === lastLoadError) error = null;
         lastLoadError = null;
       }
-      // Drop selection entries whose file no longer exists in the library
-      // (deleted on disk, folder unshared, etc.). `newFiles` is the full
-      // library — not the filtered view — so this only prunes truly-gone
-      // paths, never rows merely hidden by an active filter. Without this the
+      // Drop selection entries whose file is no longer offered (unshared,
+      // deleted, or removed with its folder). `offered` is the library, not
+      // the filtered view, so this only prunes files that left the list.
+      // Without this the
       // bulk-bar count and later bulk ops could reference ghost paths.
-      if (checkedPaths.size > 0 || selectedPath) {
-        const present = new Set(newFiles.map((f) => f.path));
+      if (offered && (checkedPaths.size > 0 || selectedPath)) {
+        const present = new Set(offered.map((f) => f.path));
         if (checkedPaths.size > 0) {
           let removed = false;
           const nextChecked = new Set<string>();
@@ -781,6 +875,45 @@
     return translateError(e, m.error_operation_failed());
   }
 
+  function copiedLinksText(count: number): string {
+    return plural(count, {
+      one: m.library_copied_link_one,
+      other: () => m.library_copied_links_other({ count }),
+    });
+  }
+
+  function removedMissingText(count: number): string {
+    return plural(count, {
+      one: m.library_removed_missing_one,
+      other: () => m.library_removed_missing_other({ count }),
+    });
+  }
+
+  function unsharedText(count: number): string {
+    return plural(count, {
+      one: m.library_unshared_one,
+      other: () => m.library_unshared_other({ count }),
+    });
+  }
+
+  function starsText(count: number): string {
+    return plural(count, {
+      one: m.library_star_one,
+      few: () => m.library_star_few({ count }),
+      other: () => m.library_star_other({ count }),
+    });
+  }
+
+  function collectionMetaText(collection: Collection): string {
+    const author = collection.author || m.common_unknown();
+    const count = formatNumber(collection.files.length);
+    return plural(collection.files.length, {
+      one: () => m.library_collection_meta_one({ author }),
+      few: () => m.library_collection_meta_few({ author, count }),
+      other: () => m.library_collection_meta_other({ author, count }),
+    });
+  }
+
   async function openSharedFile(path: string) {
     // No in-app player on Linux, so there is nothing to open "into": media and
     // everything else alike go to the user's default application.
@@ -823,14 +956,6 @@
     } catch (e: unknown) {
       error = toErr(e);
       toastError(error);
-    }
-  }
-
-  async function copyToClipboard(text: string, label: string) {
-    if (await writeClipboard(text)) {
-      toastSuccess(label);
-    } else {
-      toastError(m.library_copy_failed());
     }
   }
 
@@ -883,7 +1008,7 @@
     }
     if (targets.length >= COPY_ALL_LINKS_CONFIRM_AT) {
       const confirmed = await askConfirm(
-        m.library_copy_all_confirm({ count: targets.length.toLocaleString() }),
+        m.library_copy_all_confirm({ count: formatNumber(targets.length) }),
         m.library_copy_all_confirm_title(),
       );
       if (!confirmed) return;
@@ -897,11 +1022,7 @@
         toastError(m.library_copy_failed());
         return;
       }
-      toastSuccess(
-        targets.length === 1
-          ? m.library_copied_link_one()
-          : m.library_copied_links_other({ count: targets.length })
-      );
+      toastSuccess(copiedLinksText(targets.length));
     } catch (e: unknown) {
       toastError(toErr(e));
     } finally {
@@ -909,15 +1030,16 @@
     }
   }
 
-  async function handleAddFolder() {
+  async function onFoldersPicked(selected: SharedFolderPick) {
     error = null;
     try {
-      const selected = await addSharedFolder();
       if (!mounted) return;
-      // The OS folder dialog shows a plain tree with no way to mark what is
-      // already shared, so picking a folder that was already in the list used
-      // to look exactly like adding one: a scanning banner, then nothing new.
-      // Say so instead — it is the only chance the user gets to find out.
+      // Part of the selection did not land. The rest is reported below, so
+      // this is the only place the user would learn about it.
+      const failed = selected.failed ?? [];
+      if (failed.length > 0) toastError(toErr(failed[0]));
+      // The in-app explorer marks already-shared folders, but the system-dialog
+      // fallback cannot, so a selection that changed nothing still needs a toast.
       if (selected.already_shared.length === 1) {
         const path = selected.already_shared[0];
         toastInfo(m.library_folder_already_shared({
@@ -925,23 +1047,43 @@
         }));
       } else if (selected.already_shared.length > 1) {
         toastInfo(m.library_folders_already_shared({
-          count: selected.already_shared.length.toLocaleString(),
+          count: formatNumber(selected.already_shared.length),
         }));
       }
-      if (selected.added.length === 0) return;
+      const sharedFiles = selected.files_shared ?? [];
+      if (sharedFiles.length > 0) {
+        const folderNames = new Set(sharedFiles.map(parentFolderName));
+        if (folderNames.size === 1) {
+          const name = [...folderNames][0];
+          toastSuccess(plural(sharedFiles.length, {
+            one: () => m.library_shared_from_one({ name }),
+            other: () => m.library_shared_from_other({ count: formatNumber(sharedFiles.length), name }),
+          }));
+        } else {
+          toastSuccess(plural(sharedFiles.length, {
+            one: m.library_shared_one,
+            other: () => m.library_shared_other({ count: formatNumber(sharedFiles.length) }),
+          }));
+        }
+      }
+      if (selected.added.length === 0) {
+        if (sharedFiles.length > 0 && mounted) await refresh();
+        return;
+      }
       stoppedByUser = false;
       scanning = true;
       scanTruncated = false;
       if (mounted) await refresh();
     } catch (e: unknown) {
-      // On success the scanning banner is cleared by the background
-      // hash-progress "done" event; on an `addSharedFolder` failure no such
-      // event fires, so clear it here or the banner sticks until the 3s poll.
       if (mounted) {
         scanning = false;
         error = toErr(e);
       }
     }
+  }
+
+  function handleAddFolder() {
+    addFolderOpen = true;
   }
 
   async function handleSetFolderPriority(path: string, priority: string, el?: HTMLSelectElement) {
@@ -952,7 +1094,10 @@
       if (!mounted) return;
       if (priority) {
         folderPriorities = { ...folderPriorities, [path]: priority };
-        toastSuccess(m.library_folder_priority_set({ count: count.toLocaleString() }));
+        toastSuccess(plural(count, {
+          one: m.library_folder_priority_set_one,
+          other: () => m.library_folder_priority_set({ count: formatNumber(count) }),
+        }));
       } else {
         const next = { ...folderPriorities };
         delete next[path];
@@ -973,20 +1118,21 @@
   }
 
   async function handleRemoveFolder(path: string) {
-    const stats = folderStats.counts.get(path) ?? 0;
+    const stats = shareFileCounts.get(path) ?? 0;
     try {
       const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
       const body = stats > 0
-        ? (stats === 1
-            ? m.library_confirm_remove_folder_one({ name: displayName })
-            : m.library_confirm_remove_folder_other({ name: displayName, count: stats.toLocaleString() }))
+        ? plural(stats, {
+            one: () => m.library_confirm_remove_folder_one({ name: displayName }),
+            other: () => m.library_confirm_remove_folder_other({ name: displayName, count: formatNumber(stats) }),
+          })
         : m.library_confirm_remove_folder_empty({ name: displayName });
       const confirmed = await askConfirm(body, m.library_remove_folder_title());
       if (!confirmed || !mounted) return;
       error = null;
       await removeSharedFolder(path);
       if (!mounted) return;
-      if (filterFolder !== null && pathsEqualForFolder(filterFolder, path)) filterFolder = null;
+      if (filterFolder !== null && (pathsEqualForFolder(filterFolder, path) || isPathInFolder(filterFolder, path))) filterFolder = null;
       await refresh();
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
@@ -1055,7 +1201,7 @@
     const shown = names.slice(0, STOP_FOLDERS_NAMED);
     shown.push(
       m.library_stop_confirm_more_folders({
-        count: (names.length - STOP_FOLDERS_NAMED).toLocaleString(),
+        count: formatNumber(names.length - STOP_FOLDERS_NAMED),
       }),
     );
     return shown.join(', ');
@@ -1168,19 +1314,10 @@
   });
 
   let hasActiveLibraryFilters = $derived(!!filterFolder || !!searchQuery.trim() || typeFilter !== 'All' || showDuplicatesOnly || showMissingOnly);
-  let libraryFileStats = $derived.by(() => {
-    let shared = 0;
+  let libraryHashedCount = $derived.by(() => {
     let hashed = 0;
-    for (const f of files) {
-      if (f.shared) shared++;
-      if (f.hash) hashed++;
-    }
-    return { shared, hashed };
-  });
-  let filteredSharedCount = $derived.by(() => {
-    let n = 0;
-    for (const f of filteredFiles) if (f.shared) n++;
-    return n;
+    for (const f of files) if (f.hash) hashed++;
+    return hashed;
   });
   let allHashedFilesSelected = $derived.by(() => {
     const list = collectionFilteredFiles;
@@ -1210,11 +1347,6 @@
   let checkedHashedCount = $derived.by(() => {
     let n = 0;
     for (const f of files) if (checkedPaths.has(f.path) && f.hash) n++;
-    return n;
-  });
-  let checkedShareCount = $derived.by(() => {
-    let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash && !f.shared) n++;
     return n;
   });
   let checkedRestrictCount = $derived.by(() => {
@@ -1342,34 +1474,14 @@
         targets,
         (paths) => batchSetPriority(paths, priority),
       );
-      toastSuccess(count === 1
-        ? m.library_set_priority_one({ priority: priorityLabel(priority) })
-        : m.library_set_priority_other({ priority: priorityLabel(priority), count }));
+      toastSuccess(plural(count, {
+        one: () => m.library_set_priority_one({ priority: priorityLabel(priority) }),
+        other: () => m.library_set_priority_other({ priority: priorityLabel(priority), count }),
+      }));
     } catch (e: unknown) { error = toErr(e); }
     finally {
       // Earlier batches may have committed before a later IPC batch failed.
       // Always reconcile the table with the backend, not only on full success.
-      await refresh();
-      bulkBusy = false;
-    }
-  }
-
-  async function bulkShare() {
-    if (bulkBusy) return;
-    const checked = getCheckedFiles();
-    const targets = checked.filter(f => !!f.hash && !f.shared);
-    if (targets.length === 0) {
-      if (checked.some(f => !f.hash)) toastWarning(m.library_selection_still_hashing());
-      else if (checked.length > 0) toastWarning(m.library_selection_already_shared());
-      else toastWarning(m.library_no_hashed_in_selection());
-      return;
-    }
-    bulkBusy = true;
-    try {
-      const count = await runBulkBatches(targets, batchShare);
-      toastSuccess(count === 1 ? m.library_shared_one() : m.library_shared_other({ count }));
-    } catch (e: unknown) { error = toErr(e); }
-    finally {
       await refresh();
       bulkBusy = false;
     }
@@ -1388,7 +1500,7 @@
     bulkBusy = true;
     try {
       const count = await runBulkBatches(targets, batchUnshare);
-      toastSuccess(count === 1 ? m.library_unshared_one() : m.library_unshared_other({ count }));
+      toastSuccess(unsharedText(count));
     } catch (e: unknown) { error = toErr(e); }
     finally {
       await refresh();
@@ -1416,8 +1528,14 @@
       const count = await runBulkBatches(targets, paths => setFilesFriendsOnly(paths, friendsOnly));
       toastSuccess(
         friendsOnly
-          ? m.library_friends_only_on_count({ count })
-          : m.library_friends_only_off_count({ count }),
+          ? plural(count, {
+              one: m.library_friends_only_on_count_one,
+              other: () => m.library_friends_only_on_count({ count: formatNumber(count) }),
+            })
+          : plural(count, {
+              one: m.library_friends_only_off_count_one,
+              other: () => m.library_friends_only_off_count({ count: formatNumber(count) }),
+            }),
       );
     } catch (e: unknown) { error = toErr(e); }
     finally {
@@ -1434,9 +1552,11 @@
     bulkBusy = true;
     try {
       const confirmed = await askConfirm(
-        targets.length === 1
-          ? m.library_confirm_delete_one({ size: formatSize(totalBytes) })
-          : m.library_confirm_delete_other({ count: targets.length.toLocaleString(), size: formatSize(totalBytes) }),
+        plural(targets.length, {
+          one: () => m.library_confirm_delete_one({ size: formatSize(totalBytes) }),
+          few: () => m.library_confirm_delete_few({ count: formatNumber(targets.length), size: formatSize(totalBytes) }),
+          other: () => m.library_confirm_delete_other({ count: formatNumber(targets.length), size: formatSize(totalBytes) }),
+        }),
         m.library_delete_files_title(),
       );
       if (!confirmed) return;
@@ -1461,7 +1581,10 @@
       clearChecked();
       await refresh();
       if (deleted > 0) {
-        const base = deleted === 1 ? m.library_deleted_one() : m.library_deleted_other({ count: deleted });
+        const base = plural(deleted, {
+          one: m.library_deleted_one,
+          other: () => m.library_deleted_other({ count: deleted }),
+        });
         toastSuccess(failures.length ? m.library_deleted_with_failures({ base, failed: failures.length }) : base);
       }
       if (failures.length > 0) {
@@ -1494,17 +1617,7 @@
         toastError(m.library_copy_failed());
         return;
       }
-      const unsharedCount = targets.filter(f => !f.shared).length;
-      if (unsharedCount > 0) {
-        toastWarning(m.library_copied_with_unshared({
-          links: files.length,
-          link_label: files.length === 1 ? m.library_link_singular() : m.library_link_plural(),
-          unshared: unsharedCount,
-          unshared_label: unsharedCount === 1 ? m.library_file_is_unshared() : m.library_files_are_unshared(),
-        }));
-      } else {
-        toastSuccess(files.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: files.length }));
-      }
+      toastSuccess(copiedLinksText(files.length));
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -1544,12 +1657,24 @@
   let sortedFiles = $derived.by(() => {
     const copy = [...filteredFiles];
     const dir = sortAsc ? 1 : -1;
+    // The Type column shows the category label where there is one, so sort by
+    // that label rather than the raw extension.
+    const typeLabels = new Map<string, string>();
+    const typeSortKey = (f: LibraryRow): string => {
+      if (!f.matchType) return f.extension;
+      let label = typeLabels.get(f.matchType);
+      if (label === undefined) {
+        label = fileTypeFilterLabel(f.matchType);
+        typeLabels.set(f.matchType, label);
+      }
+      return label;
+    };
     copy.sort((a, b) => {
       let cmp = 0;
       switch (sortField) {
         case 'name': cmp = collator.compare(a.name, b.name); break;
         case 'size': cmp = a.size - b.size; break;
-        case 'extension': cmp = collator.compare(a.extension, b.extension); break;
+        case 'extension': cmp = collator.compare(typeSortKey(a), typeSortKey(b)) || collator.compare(a.extension, b.extension); break;
         case 'priority': cmp = (priorityOrder[a.priority] ?? 2) - (priorityOrder[b.priority] ?? 2); break;
         case 'hash': cmp = collator.compare(a.hash, b.hash); break;
         case 'requests': cmp = a.requests - b.requests; break;
@@ -1575,36 +1700,41 @@
     return copy;
   });
 
-  // Per-folder count AND size. Superset of the old `folderCounts` map;
-  // main's cherry-picked bulk-folder-delete handler reads `.counts` and
-  // `.sizes`, and ember-V2's tree UI reads `.counts` via the same derived
-  // store. Sort shared folders by depth (deepest first) so nested
-  // shared folders attribute each file to the most specific ancestor.
-  let folderStats = $derived.by(() => {
+  // One pass over the library builds the whole sidebar: the tree's top level
+  // is the shared folders, each carrying the count and size of everything
+  // beneath it, with a file attributed to the deepest share that contains it.
+  let folderTree = $derived(buildLibraryFolderTree(folders, files, normalizePathForMatch));
+  /** Files under each shared folder, for the remove-folder confirmation. */
+  let shareFileCounts = $derived.by(() => {
     const counts = new Map<string, number>();
-    const sizes = new Map<string, number>();
-    if (folders.length === 0) return { counts, sizes };
+    for (const node of folderTree) counts.set(node.path, node.count);
+    return counts;
+  });
+  let folderRows = $derived(flattenLibraryFolderTree(folderTree, expandedFolders));
+  let activeFolderLabel = $derived(folderDisplayName(filterFolder));
 
-    const normalizedFolders = folders
-      .map((folder) => ({ folder, norm: normalizePathForMatch(folder) }))
-      .sort((a, b) => b.norm.length - a.norm.length);
-    for (const { folder } of normalizedFolders) {
-      counts.set(folder, 0);
-      sizes.set(folder, 0);
-    }
-    for (const f of files) {
-      const np = f.matchPath;
-      for (const { folder, norm } of normalizedFolders) {
-        if (np === norm || np.startsWith(`${norm}/`)) {
-          counts.set(folder, (counts.get(folder) ?? 0) + 1);
-          sizes.set(folder, (sizes.get(folder) ?? 0) + f.size);
-          break;
-        }
+  function toggleFolderExpanded(path: string, e?: Event) {
+    e?.stopPropagation();
+    const next = new Set(expandedFolders);
+    if (next.has(path)) next.delete(path);
+    else next.add(path);
+    expandedFolders = next;
+  }
+
+  $effect(() => {
+    if (!filterFolder) return;
+    const ancestors = ancestorFolderPaths(folderTree, filterFolder, normalizePathForMatch);
+    if (ancestors.length === 0) return;
+    const next = new Set(untrack(() => expandedFolders));
+    let changed = false;
+    for (const path of ancestors) {
+      if (!next.has(path)) {
+        next.add(path);
+        changed = true;
       }
     }
-    return { counts, sizes };
+    if (changed) expandedFolders = next;
   });
-  let activeFolderLabel = $derived(folderDisplayName(filterFolder));
 
   // --- Top Uploads (popularity panel) ---
   let topPanelOpen = $state(false);
@@ -1659,52 +1789,14 @@
   }
 
   // --- File type display ---
-  const audioExts = new Set([
-    'aac','ac3','aif','aifc','aiff','amr','ape','au','aud','audio','cda',
-    'dmf','dsm','dts','far','flac','it','m1a','m2a','m4a','mdl','med',
-    'mid','midi','mka','mod','mp1','mp2','mp3','mpa','mpc','mtm','ogg',
-    'opus','psm','ptm','ra','rmi','s3m','snd','stm','umx','wav','wma','xm',
-  ]);
-  const videoExts = new Set([
-    '3g2','3gp','3gp2','3gpp','amv','asf','avi','bik','divx','dvr-ms',
-    'flc','fli','flic','flv','hdmov','ifo','m1v','m2t','m2ts','m2v',
-    'm4b','m4v','mkv','mov','movie','mp1v','mp2v','mp4','mpe','mpeg',
-    'mpg','mpv','mpv1','mpv2','ogm','pva','qt','ram','ratdvd','rm',
-    'rmm','rmvb','rv','smil','smk','swf','tp','ts','vid','video','vob',
-    'vp6','webm','wm','wmv','xvid',
-  ]);
   /** Formats WebView2 / Media Foundation commonly decode without extra codecs. */
   const playableAudioExts = new Set(['aac', 'flac', 'm4a', 'mp3', 'ogg', 'opus', 'wav']);
   const playableVideoExts = new Set(['m4v', 'mov', 'mp4', 'webm']);
-  const imageExts = new Set([
-    'bmp','emf','gif','ico','jfif','jpe','jpeg','jpg','pct','pcx','pic',
-    'pict','png','psd','psp','svg','tga','tif','tiff','webp','wmf','wmp','xif',
-  ]);
-  const archiveExts = new Set([
-    '7z','ace','alz','arc','arj','bz2','cab','cbr','cbz','gz','hqx',
-    'lha','lzh','msi','pak','par','par2','rar','sit','sitx','tar',
-    'tbz2','tgz','xpi','xz','z','zip',
-  ]);
-  const docExts = new Set([
-    'chm','css','diz','doc','docx','dot','djvu','epub','hlp','htm',
-    'html','lit','mobi','azw','nfo','ods','odt','odp','pdf','pps',
-    'ppt','pptx','ps','rtf','text','txt','wri','xls','xlsx','xml',
-  ]);
-  const isoExts = new Set([
-    'bin','bwa','bwi','bws','bwt','ccd','cue','dmg','img','iso',
-    'mdf','mds','nrg','sub','toast',
-  ]);
   function playableKind(ext: string): 'audio' | 'video' | null {
     const lower = ext.toLowerCase();
     if (playableAudioExts.has(lower)) return 'audio';
     if (playableVideoExts.has(lower)) return 'video';
     return null;
-  }
-  function extensionFromPath(path: string): string {
-    const base = path.replace(/^.*[/\\]/, '');
-    const dot = base.lastIndexOf('.');
-    if (dot <= 0 || dot === base.length - 1) return '';
-    return base.slice(dot + 1);
   }
   let selectedPlayableKind = $derived(
     selectedFile ? playableKind(selectedFile.extension || extensionFromPath(selectedFile.path)) : null,
@@ -1713,35 +1805,14 @@
    *  both the player itself and the Open button that assumes one exists. */
   let inAppPlayerKind = $derived(IS_LINUX_DESKTOP ? null : selectedPlayableKind);
   function fileType(ext: string): string {
-    const lower = ext.toLowerCase();
-    if (audioExts.has(lower)) return m.library_type_audio();
-    if (videoExts.has(lower)) return m.library_type_video();
-    if (imageExts.has(lower)) return m.library_type_image();
-    if (archiveExts.has(lower)) return m.library_type_archive();
-    if (docExts.has(lower)) return m.library_type_document();
-    if (isoExts.has(lower)) return m.library_type_cd_dvd();
+    const key = fileTypeKey(ext);
+    if (key) return fileTypeFilterLabel(key);
     return ext ? ext.toUpperCase() : '\u2014';
-  }
-
-  // Stable, locale-independent category key used by the type filter. The
-  // `typeFilter` state holds the English option *values* ('Audio', 'Video',
-  // ...), so the filter must compare against these keys rather than against
-  // `fileType()`, whose return value is translated (e.g. 'Vídeo' in Spanish)
-  // and would never match the stored value in non-English locales.
-  function fileTypeKey(ext: string): TypeFilter | '' {
-    const lower = ext.toLowerCase();
-    if (audioExts.has(lower)) return 'Audio';
-    if (videoExts.has(lower)) return 'Video';
-    if (imageExts.has(lower)) return 'Image';
-    if (archiveExts.has(lower)) return 'Archive';
-    if (docExts.has(lower)) return 'Document';
-    if (isoExts.has(lower)) return 'CD/DVD';
-    return '';
   }
 
   function formatTransferred(session: number, alltime: number): string {
     if (session === 0 && alltime === 0) return '\u2014';
-    const s = session > 0 ? formatSize(session) : '0';
+    const s = formatSize(session);
     if (alltime > 0 && alltime !== session) return `${s} (${formatSize(alltime)})`;
     return s;
   }
@@ -1775,6 +1846,7 @@
     // new file's stored comment with an empty save before the fetch lands.
     ourComment = '';
     ourRating = 0;
+    commentLastSavedAt = null;
     commentBaselineRating = 0;
     commentBaselineText = '';
     if (commentSaveTimer) {
@@ -1788,7 +1860,6 @@
     if (!hash) {
       commentInfo = null;
       commentLoading = false;
-      commentLastSavedAt = null;
       return;
     }
     commentLoading = true;
@@ -1929,21 +2000,90 @@
       sendableFriends = [];
     }
   }
+  let ctxMenuEl: HTMLDivElement | undefined = $state(undefined);
+  /** What had focus when the menu opened, so it can be handed back rather
+   *  than dropped on the body when the menu unmounts. */
+  let ctxReturnFocus: HTMLElement | null = null;
+
+  /** Enabled items of one menu level, excluding those of submenus nested in it. */
+  function ctxMenuItems(menu: Element | null | undefined): HTMLElement[] {
+    if (!menu) return [];
+    return [...menu.querySelectorAll<HTMLElement>('[role^="menuitem"]:not(:disabled)')]
+      .filter((el) => el.closest('[role="menu"]') === menu);
+  }
+
   function onCtx(e: MouseEvent, f: FileInfo) {
     e.preventDefault();
     ctxPrioritySub = false;
     ctxCopySub = false;
+    ctxSendSub = false;
+    ctxWebSub = false;
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && active !== document.body && !ctxMenuEl?.contains(active)) {
+      ctxReturnFocus = active;
+    }
     // Highlight the target row without opening the properties drawer
     // (drawer stays tied to left-click / Properties menu item).
     // `ctxMenuPosition` measures the panel and keeps it inside the viewport;
     // the submenus pick their own side via `ctxSubmenuPlacement`.
     ctxMenu = { x: e.clientX, y: e.clientY, file: f };
+    // Without focus inside the menu, the arrow keys would keep moving the
+    // table selection underneath it.
+    void tick().then(() => ctxMenuItems(ctxMenuEl)[0]?.focus());
   }
   function closeCtx() {
     ctxMenu = null;
     ctxPrioritySub = false;
     ctxCopySub = false;
+    ctxSendSub = false;
     ctxWebSub = false;
+    ctxReturnFocus = null;
+  }
+  function closeCtxAndRefocus() {
+    const target = ctxReturnFocus;
+    closeCtx();
+    if (target?.isConnected) target.focus();
+  }
+
+  /** Arrow-key movement inside the open context menu. Returns true when handled. */
+  function handleCtxMenuKey(e: KeyboardEvent): boolean {
+    const active = document.activeElement instanceof HTMLElement && ctxMenuEl?.contains(document.activeElement)
+      ? document.activeElement
+      : null;
+    if (
+      e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Home' || e.key === 'End'
+      || e.key === 'PageUp' || e.key === 'PageDown'
+    ) {
+      e.preventDefault();
+      const items = ctxMenuItems(active?.closest('[role="menu"]') ?? ctxMenuEl);
+      if (items.length === 0) return true;
+      const i = active ? items.indexOf(active) : -1;
+      const next =
+        e.key === 'Home' || e.key === 'PageUp' ? 0
+        : e.key === 'End' || e.key === 'PageDown' ? items.length - 1
+        : e.key === 'ArrowDown' ? (i + 1) % items.length
+        : i <= 0 ? items.length - 1 : i - 1;
+      items[next].focus();
+      return true;
+    }
+    if (e.key === 'ArrowRight' && active?.getAttribute('aria-haspopup') === 'menu') {
+      // The item's own handler has just opened its submenu.
+      e.preventDefault();
+      void tick().then(() => ctxMenuItems(active.querySelector('[role="menu"]'))[0]?.focus());
+      return true;
+    }
+    if (e.key === 'ArrowLeft' && active) {
+      const parentItem = active.closest('[role="menu"]')?.closest<HTMLElement>('[aria-haspopup="menu"]');
+      if (!parentItem) return false;
+      e.preventDefault();
+      parentItem.focus();
+      ctxPrioritySub = false;
+      ctxCopySub = false;
+      ctxSendSub = false;
+      ctxWebSub = false;
+      return true;
+    }
+    return false;
   }
   function onDocClick() { if (mounted) closeCtx(); }
 
@@ -2008,17 +2148,7 @@
           toastError(m.library_copy_failed());
           return;
         }
-        const unsharedCount = targets.filter(f => !f.shared).length;
-        if (unsharedCount > 0) {
-          toastWarning(m.library_copied_with_unshared({
-            links: files.length,
-            link_label: files.length === 1 ? m.library_link_singular() : m.library_link_plural(),
-            unshared: unsharedCount,
-            unshared_label: unsharedCount === 1 ? m.library_file_is_unshared() : m.library_files_are_unshared(),
-          }));
-        } else {
-          toastSuccess(files.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: files.length }));
-        }
+        toastSuccess(copiedLinksText(files.length));
       } catch (e: unknown) { error = toErr(e); }
       return;
     }
@@ -2038,17 +2168,14 @@
         toastError(m.library_copy_failed());
         return;
       }
-      if (!selectedFile.shared) {
-        toastWarning(m.library_copied_link_unshared_single());
-      } else {
-        toastSuccess(m.library_copied_link_one());
-      }
+      toastSuccess(m.library_copied_link_one());
     } catch (e: unknown) { error = toErr(e); }
   }
 
   function onPageKeyDown(e: KeyboardEvent) {
     if (!mounted) return;
-    if (ctxMenu && e.key === 'Escape') { closeCtx(); e.preventDefault(); e.stopPropagation(); return; }
+    if (ctxMenu && e.key === 'Escape') { closeCtxAndRefocus(); e.preventDefault(); e.stopPropagation(); return; }
+    if (ctxMenu && handleCtxMenuKey(e)) return;
 
     // Ignore shortcuts while a modal is open. Must run before Escape so a
     // discard/delete confirm isn't also treated as "deselect the row".
@@ -2056,13 +2183,19 @@
     // panel is an inline collapsible (the file table stays visible and
     // interactive below it), not a modal, and it has no keyboard handling of
     // its own that these shortcuts could conflict with.
-    if (createCollectionOpen || confirmOpen || confirmDiscardComment || stopConfirmVisible) {
+    if (createCollectionOpen || addFolderOpen || confirmOpen || confirmDiscardComment || stopConfirmVisible) {
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
+        if (addFolderOpen) addFolderOpen = false;
+        else if (stopConfirmVisible) handleStopCancel();
       }
       return;
     }
+    // A dialog owned elsewhere (the shortcut sheet, Share Folders) or the chat
+    // dock has the keyboard; it handles its own Escape.
+    if (document.querySelector('[aria-modal="true"]')) return;
+    if (e.target instanceof Element && e.target.closest('.chat-dock')) return;
 
     const typing = isTypingTarget(e.target);
 
@@ -2127,6 +2260,8 @@
 
     // Ctrl/Cmd+C copies links for the current check selection or selected row.
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'c' || e.key === 'C')) {
+      // Selected text (a path or comment in the drawer) keeps the normal copy.
+      if (window.getSelection()?.toString()) return;
       const hasChecked = checkedCount > 0;
       const hasSelected = !!selectedFile;
       if (!hasChecked && !hasSelected) return;
@@ -2222,7 +2357,7 @@
     // actions were unaffected either way, but copy_link, send_to_friend and
     // republish would carry the ed2k identity the file no longer has.
     const f = fileByPath.get(ctxMenu.file.path) ?? ctxMenu.file;
-    closeCtx();
+    closeCtxAndRefocus();
     try {
       switch (action) {
         case 'properties':
@@ -2283,43 +2418,11 @@
           break;
         }
         case 'priority':
-          if (extra) {
-            await setFilePriority(f.path, extra as 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto');
-            await refresh();
-            toastSuccess(m.library_set_priority_one({ priority: priorityLabel(extra) }));
-          }
+          if (extra) await applyFilePriority(f, extra as FileInfo['priority']);
           break;
-        case 'copy_link': {
-          let link: string;
-          const emberHash = f.ember_file_hash || undefined;
-          if (extra === 'aich') {
-            link = await buildEd2kLink(f.name, f.size, f.hash, {
-              aichHash: f.aich_hash || undefined,
-              emberFileHash: emberHash,
-            });
-          } else if (extra === 'sources') {
-            link = await buildEd2kLink(f.name, f.size, f.hash, {
-              withSources: true,
-              emberFileHash: emberHash,
-            });
-          } else {
-            link = await formatEd2kLink(f.name, f.size, f.hash, emberHash);
-          }
-          if (!(await writeClipboard(link))) {
-            toastError(m.library_copy_failed());
-            break;
-          }
-          if (!f.shared) {
-            toastWarning(m.library_copied_link_unshared_single());
-          } else if (extra === 'aich') {
-            toastSuccess(m.library_copied_ed2k_link_aich());
-          } else if (extra === 'sources') {
-            toastSuccess(m.library_copied_ed2k_link_sources());
-          } else {
-            toastSuccess(m.library_copied_ed2k_link());
-          }
+        case 'copy_link':
+          await copyFileLink(f, extra === 'aich' || extra === 'sources' ? extra : undefined);
           break;
-        }
         case 'unshare': {
           const confirmed = await askConfirm(
             m.library_confirm_unshare_file({ name: f.name }),
@@ -2331,11 +2434,6 @@
           toastSuccess(m.library_unshared_named({ name: f.name }));
           break;
         }
-        case 'share':
-          await shareFile(f.path);
-          await refresh();
-          toastSuccess(m.library_shared_named({ name: f.name }));
-          break;
         case 'send_to_friend': {
           if (!extra) break;
           const { offerFileToFriend } = await import('$lib/api/friends');
@@ -2343,17 +2441,9 @@
           toastSuccess(m.library_sent_offer_named({ name: f.name }));
           break;
         }
-        case 'friends_only': {
-          const restrict = !f.friends_only;
-          await setFilesFriendsOnly([f.path], restrict);
-          await refresh();
-          toastSuccess(
-            restrict
-              ? m.library_friends_only_on_named({ name: f.name })
-              : m.library_friends_only_off_named({ name: f.name }),
-          );
+        case 'friends_only':
+          await applyFriendsOnly(f, !f.friends_only);
           break;
-        }
         case 'republish': {
           if (!f.hash || !f.shared) break;
           await republishFile(f.hash);
@@ -2368,6 +2458,115 @@
     } catch (e: unknown) { error = toErr(e); }
   }
 
+  // One file's settings and links, for the context menu and the details
+  // drawer alike. They throw; each caller reports the error its own way.
+
+  async function applyFilePriority(f: FileInfo, priority: FileInfo['priority']) {
+    await setFilePriority(f.path, priority);
+    await refresh();
+    toastSuccess(m.library_set_priority_one({ priority: priorityLabel(priority) }));
+  }
+
+  async function applyFriendsOnly(f: FileInfo, restrict: boolean) {
+    await setFilesFriendsOnly([f.path], restrict);
+    await refresh();
+    toastSuccess(
+      restrict
+        ? m.library_friends_only_on_named({ name: f.name })
+        : m.library_friends_only_off_named({ name: f.name }),
+    );
+  }
+
+  /** Copy the file's eD2K link: plain, with its AICH root, or with sources. */
+  async function copyFileLink(f: FileInfo, variant?: 'aich' | 'sources'): Promise<boolean> {
+    const emberHash = f.ember_file_hash || undefined;
+    let link: string;
+    if (variant === 'aich') {
+      link = await buildEd2kLink(f.name, f.size, f.hash, {
+        aichHash: f.aich_hash || undefined,
+        emberFileHash: emberHash,
+      });
+    } else if (variant === 'sources') {
+      link = await buildEd2kLink(f.name, f.size, f.hash, {
+        withSources: true,
+        emberFileHash: emberHash,
+      });
+    } else {
+      link = await formatEd2kLink(f.name, f.size, f.hash, emberHash);
+    }
+    if (!(await writeClipboard(link))) {
+      toastError(m.library_copy_failed());
+      return false;
+    }
+    if (variant === 'aich') {
+      toastSuccess(m.library_copied_ed2k_link_aich());
+    } else if (variant === 'sources') {
+      toastSuccess(m.library_copied_ed2k_link_sources());
+    } else {
+      toastSuccess(m.library_copied_ed2k_link());
+    }
+    return true;
+  }
+
+  // ── Details drawer ──────────────────────────────────────────────────────
+  let selectedKind = $derived(
+    selectedFile ? fileTypeKey(selectedFile.extension || extensionFromPath(selectedFile.path)) : '',
+  );
+  /** Everything uploaded, as a multiple of the file: "shared out N times". */
+  let selectedUploadRatio = $derived(
+    selectedFile && selectedFile.size > 0 ? selectedFile.alltime_transferred / selectedFile.size : 0,
+  );
+  /** Two decimals under 10×, one above: "0.35×", "3.2×", "48.5×". */
+  function roundRatio(ratio: number): number {
+    const scale = ratio < 10 ? 100 : 10;
+    return Math.round(ratio * scale) / scale;
+  }
+  /** Which copy button just worked, for a moment's check mark. */
+  let drawerCopied = $state<string | null>(null);
+  let drawerCopiedTimer: ReturnType<typeof setTimeout> | null = null;
+  let drawerBusy = $state(false);
+  $effect(() => () => {
+    if (drawerCopiedTimer) clearTimeout(drawerCopiedTimer);
+  });
+
+  function flashCopied(key: string) {
+    drawerCopied = key;
+    if (drawerCopiedTimer) clearTimeout(drawerCopiedTimer);
+    drawerCopiedTimer = setTimeout(() => (drawerCopied = null), 1500);
+  }
+
+  async function drawerCopy(key: string, text: string, label: string) {
+    if (!(await writeClipboard(text))) {
+      toastError(m.library_copy_failed());
+      return;
+    }
+    toastSuccess(label);
+    flashCopied(key);
+  }
+
+  async function drawerCopyLink(f: FileInfo) {
+    try {
+      if (await copyFileLink(f)) flashCopied('link');
+    } catch (e: unknown) {
+      error = toErr(e);
+    }
+  }
+
+  /** A drawer control that changes the file; one at a time. */
+  async function drawerChange(action: () => Promise<void>) {
+    if (drawerBusy) return;
+    drawerBusy = true;
+    try {
+      await action();
+    } catch (e: unknown) {
+      error = toErr(e);
+    } finally {
+      drawerBusy = false;
+    }
+  }
+
+  const PRIORITY_CHOICES: FileInfo['priority'][] = ['verylow', 'low', 'normal', 'high', 'release', 'auto'];
+
   async function handleUnshareFolder(path: string) {
     try {
       const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
@@ -2377,21 +2576,34 @@
         return;
       }
       const confirmed = await askConfirm(
-        sharedCount === 1
-          ? m.library_confirm_unshare_folder_one({ name: displayName })
-          : m.library_confirm_unshare_folder_other({ count: sharedCount.toLocaleString(), name: displayName }),
+        plural(sharedCount, {
+          one: () => m.library_confirm_unshare_folder_one({ name: displayName }),
+          other: () => m.library_confirm_unshare_folder_other({ count: formatNumber(sharedCount), name: displayName }),
+        }),
         m.library_unshare_folder_title(),
       );
       if (!confirmed) return;
       await unshareFolder(path);
       await refresh();
-      toastSuccess(sharedCount === 1 ? m.library_unshared_one() : m.library_unshared_other({ count: sharedCount }));
+      toastSuccess(unsharedText(sharedCount));
+    } catch (e: unknown) { error = toErr(e); }
+  }
+
+  // The confirmation is a native dialog raised by the backend, not
+  // `askConfirm`: re-approving trusts whatever is at the path now, so the
+  // answer has to come from somewhere the page cannot answer for the user.
+  async function handleReapproveFolder(path: string) {
+    try {
+      if (!(await reapproveSharedFolder(path))) return;
+      const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
+      toastSuccess(m.library_folder_reapproved({ name: displayName }));
+      await refresh();
     } catch (e: unknown) { error = toErr(e); }
   }
 
   function formatSavedTime(ts: number | null): string {
     if (!ts) return '';
-    return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return formatClockTime(ts / 1000, { hour: '2-digit', minute: '2-digit' });
   }
 
   // --- Persisted filters / sort ---
@@ -2449,6 +2661,16 @@
         if (parsed.topPanelScope === 'session' || parsed.topPanelScope === 'alltime') {
           topPanelScope = parsed.topPanelScope;
         }
+        if (Array.isArray(parsed.expandedFolders)) {
+          const restored = new Set<string>();
+          for (const path of parsed.expandedFolders) {
+            if (typeof path === 'string' && path.length > 0 && path.length <= 1024) {
+              restored.add(path);
+              if (restored.size >= 200) break;
+            }
+          }
+          expandedFolders = restored;
+        }
       }
     } catch {
       try { localStorage.removeItem(FILTERS_KEY); } catch {}
@@ -2468,6 +2690,7 @@
         topPanelOpen,
         topPanelMetric,
         topPanelScope,
+        expandedFolders: [...expandedFolders],
       }));
     } catch {}
   }
@@ -2476,14 +2699,18 @@
     if (!filtersRestored) return;
     // Track dependencies explicitly so this effect re-runs when any filter/sort changes.
     void typeFilter; void filterFolder; void searchQuery; void sortField; void sortAsc; void showDuplicatesOnly; void showMissingOnly;
-    void topPanelOpen; void topPanelMetric; void topPanelScope;
+    void topPanelOpen; void topPanelMetric; void topPanelScope; void expandedFolders;
     persistFilters();
   });
 
   // If the persisted folder no longer exists after folders load, clear it silently.
   $effect(() => {
     if (!filtersRestored) return;
-    if (filterFolder && folders.length > 0 && !folders.some((f) => pathsEqualForFolder(f, filterFolder!))) {
+    if (
+      filterFolder &&
+      folders.length > 0 &&
+      !folders.some((f) => pathsEqualForFolder(f, filterFolder!) || isPathInFolder(filterFolder!, f))
+    ) {
       filterFolder = null;
     }
   });
@@ -2657,11 +2884,20 @@
       let u3: (() => void) | null = null;
       let u4: (() => void) | null = null;
       let u5: (() => void) | null = null;
+      let u6: (() => void) | null = null;
       try {
         u1 = await listen<{ phase: string; count: number }>(
-          'shared-files-changed', () => { if (mounted) debouncedRefresh(); }
+          'shared-files-changed', (event) => {
+            if (!mounted || isUploadCounterPhase(event.payload)) return;
+            debouncedRefresh();
+          }
         );
         if (destroyed) { u1(); return; }
+        u6 = await listen<SharedFileStats[]>('shared-file-stats', (event) => {
+          if (!mounted || !Array.isArray(event.payload)) return;
+          applyUploadStats(event.payload);
+        });
+        if (destroyed) { u1(); u6(); return; }
         u2 = await listen<{ current: number; total: number; file_name: string; done?: boolean; upgrading?: number }>(
           'file-hash-progress', (event) => {
             if (!mounted || stoppedByUser) return;
@@ -2680,12 +2916,12 @@
             }
           }
         );
-        if (destroyed) { u1(); u2(); return; }
+        if (destroyed) { u1(); u6(); u2(); return; }
         u3 = await listen<{ folder?: string; folders?: string[]; limit: number }>(
           'shared-files-scan-truncated',
           () => { if (mounted) scanTruncated = true; },
         );
-        if (destroyed) { u1(); u2(); u3(); return; }
+        if (destroyed) { u1(); u6(); u2(); u3(); return; }
         // "Sent" only ever meant the invitation reached the network task. The
         // recipient's answer arrives here, and a refusal was going unreported
         // entirely — nothing in the app listened for this event — so a friend
@@ -2716,11 +2952,12 @@
           scanTruncated = false;
           void refresh();
         });
-        if (destroyed) { u1(); u2(); u3(); u4(); u5(); return; }
-        unlisteners.push(u1, u2, u3, u4, u5);
+        if (destroyed) { u1(); u6(); u2(); u3(); u4(); u5(); return; }
+        unlisteners.push(u1, u6, u2, u3, u4, u5);
       } catch (e) {
         console.warn('library: failed to register file-system event listeners', e);
         if (u1) u1();
+        if (u6) u6();
         if (u2) u2();
         if (u3) u3();
         if (u4) u4();
@@ -2771,7 +3008,7 @@
       if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', onScanVisibilityChange);
       }
-      if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
+      refreshDebounce.cancel();
       if (searchDebounceTimer) { clearTimeout(searchDebounceTimer); searchDebounceTimer = null; }
       if (commentSaveTimer) {
         clearTimeout(commentSaveTimer);
@@ -2786,6 +3023,28 @@
     };
   });
 </script>
+
+{#snippet copyButton(key: string, text: string, copiedLabel: string, label: string)}
+  <button
+    type="button"
+    class="copy-icon-btn"
+    class:copied={drawerCopied === key}
+    onclick={() => void drawerCopy(key, text, copiedLabel)}
+    title={label}
+    aria-label={label}
+  >
+    {#if drawerCopied === key}
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m3.5 8.5 3 3 6-7"/>
+      </svg>
+    {:else}
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/>
+        <path d="M10.5 5.5V4A1.5 1.5 0 0 0 9 2.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5"/>
+      </svg>
+    {/if}
+  </button>
+{/snippet}
 
 <svelte:document onclick={onDocClick} onkeydown={onPageKeyDown} />
 
@@ -2815,16 +3074,39 @@
 <div class="page-header">
   <h2>{m.library_title()}</h2>
   <div class="header-actions">
+    <!-- Files people handed you, kept apart from Downloads and not shared. -->
+    <button
+      type="button"
+      class="ghost folder-btn"
+      title={m.library_chat_files_title()}
+      onclick={() => void openChatFilesFolder().catch((e) => toastError(translateError(e)))}
+    >
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+      </svg>
+      {m.library_chat_files()}
+    </button>
+    <button
+      type="button"
+      class="ghost folder-btn"
+      title={m.library_channel_files_title()}
+      onclick={() => void openChannelFilesFolder().catch((e) => toastError(translateError(e)))}
+    >
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+      </svg>
+      {m.library_channel_files()}
+    </button>
+    <span class="header-divider" aria-hidden="true"></span>
     <button class="ghost" onclick={handleOpenCollection} disabled={collectionLoading}>
       {#if collectionLoading}
-        <span class="spinner-inline" aria-hidden="true"></span> {m.library_opening()}
+        <span class="spinner xs current" aria-hidden="true"></span> {m.library_opening()}
       {:else}
         {m.library_open_collection()}
       {/if}
     </button>
     <button class="ghost" onclick={() => openCreateDialog()}>{m.library_create_collection()}</button>
     <button class="ghost" onclick={handleReload} disabled={reloading}>{m.library_reload()}</button>
-    <button onclick={handleAddFolder}>{m.library_add_folder()}</button>
   </div>
 </div>
 
@@ -2852,14 +3134,7 @@
     </div>
     <select class="filter-type" bind:value={typeFilter} aria-label={m.library_type_filter_aria()}>
       {#each typeFilterOptions as opt}
-        <option value={opt}>{opt === 'All' ? m.library_all_types() : (
-          opt === 'Audio' ? m.library_type_audio() :
-          opt === 'Video' ? m.library_type_video() :
-          opt === 'Image' ? m.library_type_image() :
-          opt === 'Archive' ? m.library_type_archive() :
-          opt === 'Document' ? m.library_type_document() :
-          opt === 'CD/DVD' ? m.library_type_cd_dvd() : opt
-        )}</option>
+        <option value={opt}>{fileTypeFilterLabel(opt)}</option>
       {/each}
     </select>
     <button
@@ -2867,9 +3142,14 @@
       class:active={showDuplicatesOnly}
       disabled={duplicateHashes.size === 0}
       onclick={() => (showDuplicatesOnly = !showDuplicatesOnly)}
-      title={duplicateHashes.size === 0 ? m.library_no_duplicates() : m.library_duplicates_tooltip({ files: duplicateFileCount, hashes: duplicateHashes.size })}
+      title={duplicateHashes.size === 0
+        ? m.library_no_duplicates()
+        : plural(duplicateHashes.size, {
+            one: () => m.library_duplicates_tooltip_one({ files: formatNumber(duplicateFileCount) }),
+            other: () => m.library_duplicates_tooltip({ files: formatNumber(duplicateFileCount), hashes: formatNumber(duplicateHashes.size) }),
+          })}
     >
-      {m.library_duplicates()}{duplicateHashes.size > 0 ? ` (${duplicateFileCount})` : ''}
+      {m.library_duplicates()}{duplicateHashes.size > 0 ? ` (${formatNumber(duplicateFileCount)})` : ''}
     </button>
     <button
       class="dupes-toggle missing-toggle"
@@ -2883,18 +3163,18 @@
             ? m.library_no_missing()
             : missingScanTruncated
               ? m.library_missing_truncated({
-                  shown: missingPathSet.size,
-                  total: missingTotalCount,
-                  limit: 10_000,
+                  shown: formatNumber(missingPathSet.size),
+                  total: formatNumber(missingTotalCount),
+                  limit: formatNumber(10_000),
                 })
-              : m.library_missing_tooltip({ count: missingTotalCount })
+              : m.library_missing_tooltip({ count: formatNumber(missingTotalCount) })
       }
     >
       {#if missingScanInFlight}
-        <span class="scan-spinner" aria-hidden="true"></span>
+        <span class="spinner xs" aria-hidden="true"></span>
         {m.library_missing()}
       {:else}
-        {m.library_missing()}{missingTotalCount > 0 ? ` (${missingTotalCount})` : ''}
+        {m.library_missing()}{missingTotalCount > 0 ? ` (${formatNumber(missingTotalCount)})` : ''}
       {/if}
     </button>
     {#if showMissingOnly && missingPathSet.size > 0}
@@ -2915,14 +3195,18 @@
         filteredHashedFiles.length === 0
           ? m.library_copy_all_none()
           : hasActiveLibraryFilters
-            ? m.library_copy_all_filtered_title({ count: filteredHashedFiles.length })
+            ? plural(filteredHashedFiles.length, {
+                one: m.library_copy_all_filtered_title_one,
+                few: () => m.library_copy_all_filtered_title_few({ count: formatNumber(filteredHashedFiles.length) }),
+                other: () => m.library_copy_all_filtered_title({ count: formatNumber(filteredHashedFiles.length) }),
+              })
             : m.library_copy_all_links_title()
       }
     >
       {#if copyingAllLibraryLinks}
         {m.library_copying()}
       {:else}
-        {m.library_copy_all_links()}{filteredHashedFiles.length > 0 ? ` (${filteredHashedFiles.length.toLocaleString()})` : ''}
+        {m.library_copy_all_links()}{filteredHashedFiles.length > 0 ? ` (${formatNumber(filteredHashedFiles.length)})` : ''}
       {/if}
     </button>
     <button
@@ -2938,15 +3222,24 @@
       {m.library_columns_button()}
     </button>
     <span class="inline-stats">
-      <span class="inline-stat">{m.library_stat_files({ count: files.length.toLocaleString() })}</span>
+      <span class="inline-stat">{plural(files.length, {
+        one: m.library_stat_files_one,
+        few: () => m.library_stat_files_few({ count: formatNumber(files.length) }),
+        other: () => m.library_stat_files({ count: formatNumber(files.length) }),
+      })}</span>
       <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{m.library_stat_shared({ count: libraryFileStats.shared.toLocaleString() })}</span>
+      <span class="inline-stat">{plural(libraryHashedCount, {
+        one: m.library_stat_hashed_one,
+        other: () => m.library_stat_hashed({ count: formatNumber(libraryHashedCount) }),
+      })}</span>
       <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{m.library_stat_hashed({ count: libraryFileStats.hashed.toLocaleString() })}</span>
+      <span class="inline-stat">{plural(folders.length, {
+        one: m.library_stat_folders_one,
+        few: () => m.library_stat_folders_few({ count: formatNumber(folders.length) }),
+        other: () => m.library_stat_folders({ count: formatNumber(folders.length) }),
+      })}</span>
       <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{m.library_stat_folders({ count: folders.length.toLocaleString() })}</span>
-      <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{m.stats_total_uploaded()}: {formatSize(aggregateUploaded)}</span>
+      <span class="inline-stat">{m.library_stat_total_uploaded({ size: formatSize(aggregateUploaded) })}</span>
     </span>
   </div>
 </div>
@@ -2954,15 +3247,13 @@
 {#if loadedCollection || collectionLoading}
   <div class="collection-section">
     <div class="collection-toggle-bar">
-      <button class="collection-toggle" onclick={() => collectionsOpen = !collectionsOpen}>
+      <button type="button" class="collection-toggle" aria-expanded={collectionsOpen} onclick={() => collectionsOpen = !collectionsOpen}>
         <span class="toggle-arrow" class:open={collectionsOpen} aria-hidden="true">{'\u25B6'}</span>
         <span class="collection-title">
           {m.library_collection_label({ name: loadedCollection?.name ?? m.library_loading_ellipsis() })}
           {#if loadedCollection}
             <span class="collection-meta">
-              {loadedCollection.files.length === 1
-                ? m.library_collection_meta_one({ author: loadedCollection.author || m.common_unknown() })
-                : m.library_collection_meta_other({ author: loadedCollection.author || m.common_unknown(), count: loadedCollection.files.length })}
+              {collectionMetaText(loadedCollection)}
             </span>
           {/if}
         </span>
@@ -2971,7 +3262,7 @@
         <button class="coll-action-btn download-all-btn" onclick={handleDownloadAll} disabled={downloadingCollection}>
           {downloadingCollection ? m.library_queueing() : m.library_download_all()}
         </button>
-        <button class="coll-action-btn ghost" onclick={handleCopyCollectionLinks} disabled={copyingCollectionLinks || loadedCollection.files.length === 0} title={m.library_copy_all_links_title()}>
+        <button class="coll-action-btn ghost" onclick={handleCopyCollectionLinks} disabled={copyingCollectionLinks || loadedCollection.files.length === 0} title={m.library_copy_collection_links_title()}>
           {copyingCollectionLinks ? m.library_copying() : m.library_copy_links()}
         </button>
         <button class="coll-action-btn ghost" onclick={() => { loadedCollection = null; collectionsOpen = false; }}>{m.common_close()}</button>
@@ -2980,13 +3271,13 @@
     {#if collectionsOpen}
       <div class="collection-files">
         {#if collectionLoading}
-          <div class="coll-loading"><span class="scan-spinner"></span> {m.library_loading_collection()}</div>
+          <div class="coll-loading"><span class="spinner xs"></span> {m.library_loading_collection()}</div>
         {:else if loadedCollection}
           {#if loadedCollection.files.length > displayedLoadedCollectionFiles.length}
             <div class="coll-pick-note">
               {m.library_status_showing({
-                shown: displayedLoadedCollectionFiles.length.toLocaleString(),
-                total: loadedCollection.files.length.toLocaleString()
+                shown: formatNumber(displayedLoadedCollectionFiles.length),
+                total: formatNumber(loadedCollection.files.length)
               })}
             </div>
           {/if}
@@ -3001,7 +3292,7 @@
             <tbody>
               {#each displayedLoadedCollectionFiles as cf, i (`${cf.hash}:${i}`)}
                 <tr>
-                  <td title={cf.name}>{cf.name}</td>
+                  <td title={cf.name}><bdi dir="auto">{cf.name}</bdi></td>
                   <td class="coll-col-size">{formatSize(cf.size)}</td>
                   <td class="coll-col-hash" title={cf.hash}>{cf.hash.substring(0, 16)}&hellip;</td>
                 </tr>
@@ -3013,6 +3304,12 @@
     {/if}
   </div>
 {/if}
+
+<ShareFolderBrowser
+  bind:open={addFolderOpen}
+  onshared={(selected) => void onFoldersPicked(selected)}
+  onerror={(e) => { error = toErr(e); }}
+/>
 
 {#if createCollectionOpen}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -3036,7 +3333,7 @@
     <div class="modal-content create-coll-modal" bind:this={createCollectionModal}>
       <div class="modal-header">
         <span id="create-coll-title" class="modal-title">{m.library_create_collection()}</span>
-        <button type="button" class="modal-close" onclick={closeCreateDialog} disabled={creatingCollection} aria-label={m.common_close()}><IconX size={15} /></button>
+        <button type="button" class="icon-close" onclick={closeCreateDialog} disabled={creatingCollection} aria-label={m.common_close()}><IconX size={15} /></button>
       </div>
       <div class="modal-body">
         <div class="form-row">
@@ -3079,7 +3376,7 @@
           </div>
         </div>
         <div class="form-row">
-          <span class="form-label">{m.library_coll_select_files({ selected: selectedFileHashes.size, total: hashedLibraryFiles.length })}</span>
+          <span class="form-label">{m.library_coll_select_files({ selected: formatNumber(selectedFileHashes.size), total: formatNumber(hashedUniqueCount) })}</span>
           <button class="ghost select-all-btn" onclick={toggleAllFileSelection}>
             {allHashedFilesSelected ? m.common_deselect_all() : m.common_select_all()}
           </button>
@@ -3103,7 +3400,7 @@
           {/each}
           {#if collectionFilteredFiles.length > displayedCollectionFiles.length}
             <div class="coll-pick-empty">
-              {m.library_status_showing({ shown: displayedCollectionFiles.length.toLocaleString(), total: collectionFilteredFiles.length.toLocaleString() })}
+              {m.library_status_showing({ shown: formatNumber(displayedCollectionFiles.length), total: formatNumber(collectionFilteredFiles.length) })}
             </div>
           {/if}
           {#if collectionFilteredFiles.length === 0 && hashedLibraryFiles.length > 0}
@@ -3152,7 +3449,12 @@
 <div class="shared-layout" class:dragging={sidebarDragging}>
   <!-- Sidebar: folder filter tree -->
   <div class="sidebar" style="width: {sidebarWidth}px; min-width: {sidebarWidth}px;">
-    <div class="sidebar-header">{m.library_shared_folders()}</div>
+    <div class="sidebar-header">
+      <span class="sidebar-header-title">{m.library_shared_folders()}</span>
+      <button type="button" class="sidebar-add-btn" onclick={handleAddFolder}>
+        {m.library_add_folder()}
+      </button>
+    </div>
     <div class="folder-tree">
       <div
         class="tree-item"
@@ -3177,35 +3479,80 @@
           <span class="tree-folder-name">{m.library_all_files()}</span>
         </span>
         <div class="tree-meta">
-          <span class="tree-count">{files.length.toLocaleString()}</span>
+          <span class="tree-count">{formatNumber(files.length)}</span>
         </div>
       </div>
-      {#each folders as folder (folder)}
+      {#each folderRows as row (row.path)}
+        {@const folder = row.path}
         <div
           class="tree-item"
+          class:child={!row.isShare}
           class:active={filterFolder !== null && pathsEqualForFolder(filterFolder, folder)}
+          style="--depth: {row.depth}"
           onclick={() => filterFolder = folder}
           role="button"
           tabindex="0"
+          aria-expanded={row.hasChildren ? row.expanded : undefined}
           onkeydown={(e) => {
+            // The row holds its own buttons and a select; leave their keys alone.
+            if (e.target !== e.currentTarget) return;
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
               filterFolder = folder;
+            } else if (e.key === 'ArrowRight' && row.hasChildren && !row.expanded) {
+              e.preventDefault();
+              toggleFolderExpanded(folder);
+            } else if (e.key === 'ArrowLeft' && row.expanded) {
+              e.preventDefault();
+              toggleFolderExpanded(folder);
             }
           }}
         >
           <span class="tree-main">
-            <span class="tree-icon">
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
-                <path d="M2 4.5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/>
-              </svg>
-            </span>
+            {#if row.hasChildren}
+              <button
+                type="button"
+                class="tree-icon"
+                class:open={row.expanded}
+                onclick={(e) => toggleFolderExpanded(folder, e)}
+                title={row.expanded ? m.library_folder_collapse() : m.library_folder_expand()}
+                aria-label={row.expanded ? m.library_folder_collapse() : m.library_folder_expand()}
+              >
+                {#if row.expanded}
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+                    <path d="M2 6.2h12.4L13 12.4a1 1 0 0 1-1 .8H3.4a1 1 0 0 1-1-.7z"/>
+                    <path d="M2 6.2 3.3 4.4A1 1 0 0 1 4.1 4h2.1L7.6 5.4H12"/>
+                  </svg>
+                {:else}
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+                    <path d="M2 4.5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/>
+                  </svg>
+                {/if}
+              </button>
+            {:else}
+              <span class="tree-icon">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+                  <path d="M2 4.5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/>
+                </svg>
+              </span>
+            {/if}
             <span class="tree-folder-name" title={folder}>
-              {folder.split(/[\\/]/).filter(Boolean).pop() || folder}
+              {row.name}
             </span>
           </span>
           <div class="tree-meta">
-            <span class="tree-count">{(folderStats.counts.get(folder) ?? 0).toLocaleString()} &middot; {formatSize(folderStats.sizes.get(folder) ?? 0)}</span>
+            <span class="tree-count">{formatNumber(row.count)} &middot; {formatSize(row.size)}</span>
+            {#if row.isShare}
+            {#if unapprovedFolders.some((f) => pathsEqualForFolder(f, folder))}
+              <button
+                type="button"
+                class="tree-unapproved"
+                onclick={(e) => { e.stopPropagation(); handleReapproveFolder(folder); }}
+                title={m.library_folder_unapproved_title()}
+              >
+                {m.library_folder_reapprove()}
+              </button>
+            {/if}
             <select
               class="tree-prio"
               class:tree-prio-set={!!folderPriorities[folder]}
@@ -3261,6 +3608,7 @@
                 <span class="tree-btn-confirm" aria-hidden="true"><IconX size={12} /></span>
               </button>
             </span>
+            {/if}
           </div>
         </div>
       {/each}
@@ -3348,7 +3696,11 @@
                   <span class="top-value">
                     {topPanelMetric === 'bytes'
                       ? formatSize(val)
-                      : (val === 1 ? m.library_uploads_one() : m.library_uploads_other({ count: val.toLocaleString() }))}
+                      : plural(val, {
+                          one: m.library_uploads_one,
+                          few: () => m.library_uploads_few({ count: formatNumber(val) }),
+                          other: () => m.library_uploads_other({ count: formatNumber(val) }),
+                        })}
                   </span>
                 </span>
               </button>
@@ -3381,14 +3733,14 @@
   <div class="file-list-area">
     {#if stoppingHashing || scanning || hashProgress}
       <div class="scan-banner">
-        <span class="scan-spinner"></span>
+        <span class="spinner xs"></span>
         <span class="scan-text">
           {#if stoppingHashing}
             {m.library_stopping_hashing()}
           {:else if hashProgress && hashProgress.upgrading >= hashProgress.total && hashProgress.total > 0}
-            {m.library_upgrading_index({ current: hashProgress.current, total: hashProgress.total })}
+            {m.library_upgrading_index({ current: formatNumber(hashProgress.current), total: formatNumber(hashProgress.total) })}
           {:else if hashProgress}
-            {m.library_hashing_file({ current: hashProgress.current, total: hashProgress.total, name: hashProgress.file_name })}
+            {m.library_hashing_file({ current: formatNumber(hashProgress.current), total: formatNumber(hashProgress.total), name: hashProgress.file_name })}
           {:else}
             {m.library_scanning_files()}
           {/if}
@@ -3409,7 +3761,7 @@
            an AICH root, an Ember digest, or both — repair and verification data
            for whoever downloads it, never a condition of serving it. -->
       <div class="backfill-note">
-        {m.library_digest_backfill({ current: hashTopUp[0], total: hashTopUp[1] })}
+        {m.library_digest_backfill({ current: formatNumber(hashTopUp[0]), total: formatNumber(hashTopUp[1]) })}
       </div>
     {/if}
     {#if stopConfirmVisible}
@@ -3438,10 +3790,10 @@
     {/if}
     {#if scanTruncated}
       <div class="scan-banner scan-warning" role="status">
-        <span class="scan-text">{m.library_scan_truncated({ limit: 100000 })}</span>
+        <span class="scan-text">{m.library_scan_truncated({ limit: formatNumber(100000) })}</span>
       </div>
     {/if}
-    {#if sortedFiles.length === 0 && !scanning && hasActiveLibraryFilters && files.length > 0}
+    {#if sortedFiles.length === 0 && hasActiveLibraryFilters && files.length > 0}
       <div class="empty-state">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
           <circle cx="11" cy="11" r="8"></circle>
@@ -3449,8 +3801,8 @@
           <line x1="11" y1="8" x2="11" y2="14"></line>
           <line x1="8" y1="11" x2="14" y2="11"></line>
         </svg>
-        <p>{m.library_empty_no_matches()}</p>
-        <p class="sub"><button class="link-btn" onclick={clearLibraryFilters}>{m.common_clear_filters()}</button></p>
+        <p class="empty-title">{m.library_empty_no_matches()}</p>
+        <button type="button" class="ghost empty-action" onclick={clearLibraryFilters}>{m.common_clear_filters()}</button>
       </div>
     {:else if sortedFiles.length === 0 && !initialLoadDone}
       <!-- Ahead of the "nothing shared yet" pitch: until a load has actually
@@ -3459,11 +3811,11 @@
            their shares are gone. -->
       <div class="empty-state">
         {#if firstLoadSlow}
-          <p>{m.library_load_timeout()}</p>
+          <p class="empty-title">{m.library_load_timeout()}</p>
           <button type="button" class="empty-action" onclick={() => { error = null; void refresh(true); }}>{m.common_retry()}</button>
         {:else}
           <div class="spinner lg"></div>
-          <p>{m.common_loading()}</p>
+          <p class="empty-title">{m.common_loading()}</p>
         {/if}
       </div>
     {:else if sortedFiles.length === 0 && !scanning}
@@ -3473,14 +3825,14 @@
           <line x1="12" y1="13" x2="12" y2="17"></line>
           <line x1="10" y1="15" x2="14" y2="15"></line>
         </svg>
-        <p>{m.library_empty_no_shared()}</p>
-        <p class="sub">{m.library_empty_no_shared_sub()}</p>
-        <button class="empty-action" onclick={handleAddFolder}>{m.library_add_folder()}</button>
+        <p class="empty-title">{m.library_empty_no_shared()}</p>
+        <p class="empty-sub">{m.library_empty_no_shared_sub()}</p>
+        <button type="button" class="empty-action" onclick={handleAddFolder}>{m.library_add_folder()}</button>
       </div>
     {:else if sortedFiles.length === 0 && scanning}
       <div class="empty-state">
         <div class="spinner lg"></div>
-        <p>{m.library_waiting_scan()}</p>
+        <p class="empty-title">{m.library_waiting_scan()}</p>
       </div>
     {:else}
       <LibraryVirtualTable
@@ -3509,7 +3861,7 @@
 
     {#if checkedCount > 0}
       <div class="bulk-action-bar">
-        <span class="bulk-count">{checkedCount === 1 ? m.library_bulk_count_one() : m.library_bulk_count_other({ count: checkedCount })}</span>
+        <span class="bulk-count">{plural(checkedCount, { one: m.library_bulk_count_one, other: () => m.library_bulk_count_other({ count: checkedCount }) })}</span>
         {#if checkedHiddenCount > 0}
           <button
             type="button"
@@ -3519,7 +3871,7 @@
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
               <path d="M2 3h12l-4.5 5.5V13l-3 1.5V8.5z"/>
             </svg>
-            {checkedHiddenCount === 1 ? m.library_bulk_hidden_one() : m.library_bulk_hidden_other({ count: checkedHiddenCount.toLocaleString() })}
+            {plural(checkedHiddenCount, { one: m.library_bulk_hidden_one, other: () => m.library_bulk_hidden_other({ count: formatNumber(checkedHiddenCount) }) })}
           </button>
         {/if}
         <div class="bulk-prio-group">
@@ -3531,7 +3883,6 @@
           </div>
         </div>
         <span class="bulk-sep" aria-hidden="true"></span>
-        <button class="tb-btn" disabled={bulkBusy || checkedShareCount === 0} onclick={bulkShare} title={checkedShareCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_share_title()}>{m.library_bulk_share()}</button>
         <button class="tb-btn" disabled={bulkBusy || checkedUnshareCount === 0} onclick={bulkUnshare} title={checkedUnshareCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_unshare_title()}>{m.library_bulk_unshare()}</button>
         {#if checkedUnrestrictCount > 0 && checkedRestrictCount === 0}
           <button class="tb-btn" disabled={bulkBusy} onclick={() => bulkFriendsOnly(false)} title={m.library_bulk_friends_only_off_title()}>{m.library_bulk_friends_only_off()}</button>
@@ -3545,8 +3896,8 @@
           <span class="bulk-progress" role="status">
             <span class="spinner"></span>
             {m.library_bulk_progress({
-              done: bulkProgress.done.toLocaleString(),
-              total: bulkProgress.total.toLocaleString(),
+              done: formatNumber(bulkProgress.done),
+              total: formatNumber(bulkProgress.total),
             })}
           </span>
         {/if}
@@ -3557,9 +3908,7 @@
 
     <div class="status-bar">
       {#if hasActiveLibraryFilters && filteredFiles.length !== files.length}
-        <span>{m.library_status_showing({ shown: filteredFiles.length.toLocaleString(), total: files.length.toLocaleString() })}</span>
-        <span class="status-sep">&middot;</span>
-        <span>{m.library_status_shared_in_view({ count: filteredSharedCount.toLocaleString() })}</span>
+        <span>{m.library_status_showing({ shown: formatNumber(filteredFiles.length), total: formatNumber(files.length) })}</span>
         <span class="status-sep">&middot;</span>
       {/if}
       <span>{activeFolderLabel}</span>
@@ -3574,19 +3923,22 @@
   {#if selectedFile}
     <div class="detail-drawer" transition:fly={{ x: 24, duration: prefersReducedMotion.current ? 0 : 200 }}>
       <div class="drawer-header">
+        <FileTypeIcon kind={selectedKind} size={40} />
         <div class="drawer-header-text">
-          <span class="drawer-title" title={selectedFile.name}>{selectedFile.name}</span>
+          <span class="drawer-title" title={selectedFile.name}><bdi dir="auto">{selectedFile.name}</bdi></span>
           <span class="drawer-subtitle">
             <span>{fileType(selectedFile.extension) || (selectedFile.extension ? selectedFile.extension.toUpperCase() : '—')}</span>
             <span class="drawer-sub-sep" aria-hidden="true">·</span>
             <span>{formatSize(selectedFile.size)}</span>
-            {#if selectedFile.shared}
-              <span class="drawer-sub-sep" aria-hidden="true">·</span>
-              <span class="drawer-sub-shared">{m.library_shared()}</span>
+            <!-- The Library lists what is offered, so this is who it is offered to. -->
+            {#if selectedFile.friends_only}
+              <span class="drawer-status drawer-status-friends" title={m.library_friends_only_badge_title()}>{m.library_friends_only_badge()}</span>
+            {:else}
+              <span class="drawer-status">{m.library_shared()}</span>
             {/if}
           </span>
         </div>
-        <button type="button" class="drawer-close" onclick={() => requestSelectPath(null)} title={m.library_close_details()} aria-label={m.library_close_details()}>
+        <button type="button" class="icon-close drawer-close" onclick={() => requestSelectPath(null)} title={m.library_close_details()} aria-label={m.library_close_details()}>
           <IconX size={15} />
         </button>
       </div>
@@ -3617,6 +3969,21 @@
           </svg>
           {m.library_open_folder()}
         </button>
+        {#if selectedFile.hash}
+          <button class="drawer-action-btn" onclick={() => { const f = selectedFile; if (f) void drawerCopyLink(f); }}>
+            {#if drawerCopied === 'link'}
+              <svg class="copied-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="13" height="13" aria-hidden="true">
+                <path d="m3.5 8.5 3 3 6-7"/>
+              </svg>
+            {:else}
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13" aria-hidden="true">
+                <path d="M6.5 9.5a3 3 0 0 0 4.2 0l2-2a3 3 0 0 0-4.2-4.2l-.8.8"/>
+                <path d="M9.5 6.5a3 3 0 0 0-4.2 0l-2 2a3 3 0 0 0 4.2 4.2l.8-.8"/>
+              </svg>
+            {/if}
+            {m.servers_copy_ed2k_link()}
+          </button>
+        {/if}
       </div>
 
       <div class="drawer-body">
@@ -3635,30 +4002,33 @@
           <h3 class="drawer-block-title">{m.library_section_file()}</h3>
           <div class="details-meta-grid">
             <span class="meta-label">{m.library_meta_path()}</span>
-            <span class="meta-value meta-path" title={selectedFile.path}>{selectedFile.path}</span>
+            <span class="meta-value meta-copyable">
+              <span class="meta-path" title={selectedFile.path}><bdi dir="auto">{selectedFile.path}</bdi></span>
+              {@render copyButton('path', selectedFile.path, m.library_copied_path(), m.library_meta_copy_path())}
+            </span>
             {#if selectedFile.modified_at}
               <span class="meta-label">{m.library_col_modified()}</span>
-              <span class="meta-value">{new Date(selectedFile.modified_at * 1000).toLocaleString()}</span>
+              <span class="meta-value">{formatDateTime(selectedFile.modified_at)}</span>
             {/if}
             {#if selectedFile.hash}
               <span class="meta-label">{m.library_meta_hash()}</span>
-              <span class="meta-value meta-hash">
-                <code title={selectedFile.hash}>{selectedFile.hash}</code>
-                <button type="button" class="copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.hash, m.library_copied_hash()); }} title={m.library_meta_copy_hash()}>{m.common_copy()}</button>
+              <span class="meta-value meta-copyable">
+                <code class="meta-hash" title={selectedFile.hash}>{selectedFile.hash}</code>
+                {@render copyButton('hash', selectedFile.hash, m.library_copied_hash(), m.library_meta_copy_hash())}
               </span>
             {/if}
             {#if selectedFile.aich_hash}
               <span class="meta-label">{m.library_meta_aich()}</span>
-              <span class="meta-value meta-hash">
-                <code title={selectedFile.aich_hash}>{selectedFile.aich_hash}</code>
-                <button type="button" class="copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.aich_hash, m.library_copied_aich()); }} title={m.library_meta_copy_aich()}>{m.common_copy()}</button>
+              <span class="meta-value meta-copyable">
+                <code class="meta-hash" title={selectedFile.aich_hash}>{selectedFile.aich_hash}</code>
+                {@render copyButton('aich', selectedFile.aich_hash, m.library_copied_aich(), m.library_meta_copy_aich())}
               </span>
             {/if}
             {#if selectedFile.ember_file_hash}
               <span class="meta-label">{m.library_meta_ember()}</span>
-              <span class="meta-value meta-hash">
-                <code title={selectedFile.ember_file_hash}>{selectedFile.ember_file_hash}</code>
-                <button type="button" class="copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.ember_file_hash, m.library_copied_ember()); }} title={m.library_meta_copy_ember()}>{m.common_copy()}</button>
+              <span class="meta-value meta-copyable">
+                <code class="meta-hash" title={selectedFile.ember_file_hash}>{selectedFile.ember_file_hash}</code>
+                {@render copyButton('ember', selectedFile.ember_file_hash, m.library_copied_ember(), m.library_meta_copy_ember())}
               </span>
             {/if}
           </div>
@@ -3667,28 +4037,68 @@
         <section class="drawer-block">
           <h3 class="drawer-block-title">{m.library_section_sharing()}</h3>
           <div class="details-meta-grid">
-            <span class="meta-label">{m.library_col_shared()}</span>
+            <span class="meta-label">{m.library_col_published()}</span>
             <span class="meta-value meta-shared-row">
-              <span class="shared-status" class:is-shared={selectedFile.shared}>
-                {selectedFile.shared ? m.library_shared() : m.library_not_shared()}
-              </span>
               {#if selectedFile.hash}
                 <span class="meta-badges">
-                  {#if selectedFile.shared && selectedFile.shared_kad}<span class="meta-badge meta-badge-kad" title={m.library_published_kad()}>KAD</span>{/if}
-                  {#if selectedFile.shared && selectedFile.shared_ed2k}<span class="meta-badge meta-badge-ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
-                  {#if selectedFile.shared && selectedFile.shared_ember}<span class="meta-badge meta-badge-ember" title={m.library_published_ember()}>Ember</span>{/if}
+                  {#if selectedFile.shared_kad}<span class="meta-badge meta-badge-kad" title={m.library_published_kad()}>KAD</span>{/if}
+                  {#if selectedFile.shared_ed2k}<span class="meta-badge meta-badge-ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
+                  {#if selectedFile.shared_ember}<span class="meta-badge meta-badge-ember" title={m.library_published_ember()}>Ember</span>{/if}
                   {#if selectedFile.aich_hash}<span class="meta-badge meta-badge-aich" title={m.library_aich_available()}>AICH</span>{/if}
                 </span>
+                {#if !selectedFile.shared_kad && !selectedFile.shared_ed2k && !selectedFile.shared_ember}
+                  <span class="shared-status">{m.library_not_published_yet()}</span>
+                {/if}
+              {:else}
+                <span class="shared-status">{m.common_pending()}</span>
               {/if}
             </span>
-            <span class="meta-label">{m.library_col_priority()}</span>
+            <!-- The same two settings the context menu changes, here where the
+                 file is being looked at. Both wait for the hash, as there. -->
+            <span class="meta-label" id="drawer-priority-label">{m.library_col_priority()}</span>
             <span class="meta-value">
-              <span class="prio-badge prio-{selectedFile.priority}">{priorityLabel(selectedFile.priority)}</span>
+              <!-- Remounted once a change settles, like the switch below, so a
+                   refused change does not stay selected. -->
+              {#key `${selectedFile.path}:${selectedFile.priority}:${drawerBusy}`}
+                <select
+                  class="drawer-select prio-{selectedFile.priority}"
+                  aria-labelledby="drawer-priority-label"
+                  value={selectedFile.priority}
+                  disabled={!selectedFile.hash || drawerBusy}
+                  onchange={(e) => {
+                    const f = selectedFile;
+                    const next = e.currentTarget.value as FileInfo['priority'];
+                    if (f && next !== f.priority) void drawerChange(() => applyFilePriority(f, next));
+                  }}
+                >
+                  {#each PRIORITY_CHOICES as prio (prio)}
+                    <option value={prio}>{priorityLabel(prio)}</option>
+                  {/each}
+                </select>
+              {/key}
+            </span>
+            <span class="meta-label">{m.library_friends_only_toggle()}</span>
+            <span class="meta-value meta-toggle">
+              <!-- Remounted from the file's state once a change settles: the
+                   switch flips itself on click, and a change that failed must
+                   not leave it showing what was only asked for. -->
+              {#key `${selectedFile.path}:${selectedFile.friends_only}:${drawerBusy}`}
+                <ToggleSwitch
+                  checked={selectedFile.friends_only}
+                  disabled={!selectedFile.hash || drawerBusy}
+                  ariaLabel={m.library_friends_only_toggle()}
+                  onchange={(restrict) => {
+                    const f = selectedFile;
+                    if (f && restrict !== f.friends_only) void drawerChange(() => applyFriendsOnly(f, restrict));
+                  }}
+                />
+              {/key}
+              <span class="meta-hint">{m.library_friends_only_hint()}</span>
             </span>
             {#if selectedFile.complete_sources > 0}
               <span class="meta-label">{m.library_col_peers()}</span>
               <span class="meta-value" title={m.library_meta_peers_title()}>
-                {m.library_meta_peers_count({ count: selectedFile.complete_sources.toLocaleString() })}
+                {m.library_meta_peers_count({ count: formatNumber(selectedFile.complete_sources) })}
               </span>
             {/if}
           </div>
@@ -3699,26 +4109,31 @@
           <div class="activity-stats">
             <div class="activity-stat">
               <span class="activity-stat-label">{m.library_col_requests()}</span>
-              <span class="activity-stat-value">{selectedFile.requests.toLocaleString()}</span>
+              <span class="activity-stat-value">{formatNumber(selectedFile.requests)}</span>
               {#if selectedFile.alltime_requests}
-                <span class="activity-stat-sub">{m.library_drawer_alltime()}: {selectedFile.alltime_requests.toLocaleString()}</span>
+                <span class="activity-stat-sub">{m.library_drawer_alltime_value({ value: formatNumber(selectedFile.alltime_requests) })}</span>
               {/if}
             </div>
             <div class="activity-stat">
               <span class="activity-stat-label">{m.library_col_accepted()}</span>
-              <span class="activity-stat-value">{selectedFile.accepted.toLocaleString()}</span>
+              <span class="activity-stat-value">{formatNumber(selectedFile.accepted)}</span>
               {#if selectedFile.alltime_accepted}
-                <span class="activity-stat-sub">{m.library_drawer_alltime()}: {selectedFile.alltime_accepted.toLocaleString()}</span>
+                <span class="activity-stat-sub">{m.library_drawer_alltime_value({ value: formatNumber(selectedFile.alltime_accepted) })}</span>
               {/if}
             </div>
             <div class="activity-stat">
               <span class="activity-stat-label">{m.library_col_transferred()}</span>
               <span class="activity-stat-value">{formatSize(selectedFile.bytes_transferred)}</span>
               {#if selectedFile.alltime_transferred}
-                <span class="activity-stat-sub">{m.library_drawer_alltime()}: {formatSize(selectedFile.alltime_transferred)}</span>
+                <span class="activity-stat-sub">{m.library_drawer_alltime_value({ value: formatSize(selectedFile.alltime_transferred) })}</span>
               {/if}
             </div>
           </div>
+          {#if selectedUploadRatio >= 0.01}
+            <p class="activity-ratio">
+              {m.library_drawer_ratio({ ratio: formatNumber(roundRatio(selectedUploadRatio)) })}
+            </p>
+          {/if}
         </section>
 
         {#if selectedMedia}
@@ -3791,9 +4206,9 @@
                       type="button"
                       class="star-btn"
                       onclick={() => ourRating = star}
-                      aria-label={star === 1 ? m.library_star_one() : m.library_star_other({ count: star })}
+                      aria-label={starsText(star)}
                       aria-pressed={star <= ourRating}
-                      title={star === 1 ? m.library_star_one() : m.library_star_other({ count: star })}
+                      title={starsText(star)}
                     >
                       <span aria-hidden="true">{star <= ourRating ? '\u2605' : '\u2606'}</span>
                     </button>
@@ -3843,9 +4258,13 @@
                   {#each commentInfo.peer_comments as pc, i (i)}
                     <div class="comment-peer-item">
                       <span class="comment-peer-name"><bdi dir="auto">{pc.user_name}</bdi></span>
-                      <span class="comment-peer-stars">
+                      <span
+                        class="comment-peer-stars"
+                        role="img"
+                        aria-label={starsText(pc.rating)}
+                      >
                         {#each [1,2,3,4,5] as s}
-                          <span class="star-display">{s <= pc.rating ? '\u2605' : '\u2606'}</span>
+                          <span class="star-display" aria-hidden="true">{s <= pc.rating ? '\u2605' : '\u2606'}</span>
                         {/each}
                       </span>
                       {#if pc.comment}
@@ -3868,7 +4287,7 @@
 <!-- Context menu -->
 {#if ctxMenu}
   {@const fileHashed = !!ctxMenu.file.hash}
-  <div class="ctx-menu" role="menu" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
+  <div class="ctx-menu" role="menu" bind:this={ctxMenuEl} use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
     <div class="ctx-header" role="presentation">
       <bdi dir="auto">{ctxMenu.file.name}</bdi>
     </div>
@@ -3943,15 +4362,21 @@
       <!-- eMule's right-click → Web services. Shown even when nothing is
            configured, so the feature is discoverable from the file it applies
            to rather than only from Settings. -->
-      <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
       <div
         class="ctx-item ctx-sub"
         class:ctx-sub-open={ctxWebSub}
         role="menuitem"
-        tabindex="-1"
+        tabindex="0"
         aria-haspopup="menu"
         aria-expanded={ctxWebSub}
         onclick={(e) => { e.stopPropagation(); ctxWebSub = !ctxWebSub; }}
+        onkeydown={(e) => {
+          if (e.target !== e.currentTarget) return;
+          if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowRight') {
+            e.preventDefault();
+            ctxWebSub = true;
+          }
+        }}
       >
         {m.webservices_ctx_menu()}
         {#if ctxWebSub}
@@ -4026,8 +4451,6 @@
           title={m.library_friends_only_hint()}
         >{m.library_friends_only_toggle()}</button>
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>{m.library_unshare_file()}</button>
-      {:else}
-        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('share')}>{m.library_share_file()}</button>
       {/if}
     {:else}
       <button class="ctx-item ctx-disabled" role="menuitem" disabled>{m.library_hashing_in_progress()}</button>
@@ -4050,7 +4473,7 @@
     background: var(--overlay-bg);
     backdrop-filter: blur(2px);
     border: 3px dashed var(--accent);
-    transition: background 0.12s ease;
+    transition: background var(--transition-fast) ease;
   }
   .dnd-overlay.hover { background: color-mix(in srgb, var(--accent) 22%, transparent); }
   .dnd-hint {
@@ -4064,8 +4487,8 @@
     max-width: 360px;
   }
   .dnd-icon { color: var(--accent); margin-bottom: 6px; }
-  .dnd-title { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
-  .dnd-sub { font-size: 12px; color: var(--text-muted); }
+  .dnd-title { font-size: var(--font-size-lg); font-weight: 600; margin-bottom: 4px; }
+  .dnd-sub { font-size: var(--font-size-sm); color: var(--text-muted); }
 
   /* --- Layout --- */
   .page-header {
@@ -4073,14 +4496,25 @@
     flex-wrap: wrap;
   }
   .page-header h2 { margin: 0; }
-  .header-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .header-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
-  .error-banner {
-    display: flex;
+  .folder-btn {
+    display: inline-flex;
     align-items: center;
-    justify-content: space-between;
-    padding: 8px 20px;
-    font-size: 13px;
+    gap: 6px;
+  }
+
+  .folder-btn svg {
+    width: 15px;
+    height: 15px;
+    flex-shrink: 0;
+  }
+
+  .header-divider {
+    width: 1px;
+    align-self: stretch;
+    margin: 4px 2px;
+    background: var(--border);
   }
 
   .scan-banner {
@@ -4091,7 +4525,7 @@
     background: color-mix(in srgb, var(--accent) 8%, var(--bg-secondary));
     border-bottom: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
     color: var(--badge-accent-text);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     flex-shrink: 0;
   }
   .scan-text { flex: 1; }
@@ -4102,7 +4536,7 @@
     background: var(--bg-secondary);
     border-bottom: 1px solid var(--border);
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     flex-shrink: 0;
   }
   .hash-progress-track {
@@ -4125,7 +4559,7 @@
     background: color-mix(in srgb, var(--danger) 9%, var(--bg-secondary));
     border-bottom: 1px solid color-mix(in srgb, var(--danger) 36%, var(--border));
     color: var(--badge-danger-text);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     flex-shrink: 0;
   }
   .confirm-text { flex: 1; }
@@ -4141,7 +4575,7 @@
   }
   .scan-btn {
     padding: 2px 10px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
     cursor: pointer;
@@ -4151,19 +4585,6 @@
   .stop-btn:hover { opacity: 0.85; }
   .resume-btn { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
   .resume-btn:hover { opacity: 0.85; }
-
-  .scan-spinner {
-    width: 12px;
-    height: 12px;
-    border: 2px solid var(--border);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
 
   .shared-layout {
     display: flex;
@@ -4183,14 +4604,35 @@
     box-shadow: var(--shadow-sm);
   }
   .sidebar-header {
-    padding: 9px 12px;
-    font-size: 11px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 8px 5px 12px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
     color: var(--text-muted);
     border-bottom: 1px solid var(--border);
     background: var(--bg-surface);
+  }
+  /* The button keeps its width; the caption gives way, because a sidebar
+     dragged narrow still needs the action it labels. */
+  .sidebar-header-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sidebar-add-btn {
+    flex-shrink: 0;
+    padding: 3px 9px;
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    /* Both inherit from the uppercase section caption beside it. */
+    text-transform: none;
+    letter-spacing: normal;
   }
   .folder-tree { flex: 1 1 auto; overflow-y: auto; padding: 8px; min-height: 80px; }
 
@@ -4213,7 +4655,7 @@
     border: none;
     border-bottom: 1px solid var(--border);
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -4239,13 +4681,13 @@
   .top-metric-switch button {
     flex: 1;
     padding: 3px 6px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     background: var(--bg-primary);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     color: var(--text-muted);
     cursor: pointer;
-    transition: background 0.12s, color 0.12s, border-color 0.12s;
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
   }
   .top-metric-switch button:hover { color: var(--text-primary); }
   .top-metric-switch button.active {
@@ -4266,7 +4708,7 @@
     gap: 8px;
     padding: 4px 10px 6px;
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-variant-numeric: tabular-nums;
   }
   .top-total strong {
@@ -4275,7 +4717,7 @@
   }
   .top-empty {
     padding: 10px 8px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     font-style: italic;
     line-height: 1.4;
@@ -4294,7 +4736,7 @@
     cursor: pointer;
     font: inherit;
     text-align: left;
-    transition: background 0.12s, border-color 0.12s;
+    transition: background var(--transition-fast), border-color var(--transition-fast);
   }
   .top-row:hover {
     background: var(--bg-hover);
@@ -4309,7 +4751,7 @@
     flex-shrink: 0;
     width: 16px;
     text-align: right;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
   }
@@ -4321,7 +4763,7 @@
     flex: 1;
   }
   .top-name {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -4341,7 +4783,7 @@
     transition: width 0.25s ease;
   }
   .top-value {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
   }
@@ -4352,14 +4794,37 @@
     gap: 6px;
     padding: 7px 10px;
     margin-bottom: 6px;
+    margin-left: calc(var(--depth, 0) * 12px);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     background: var(--bg-surface);
     box-shadow: inset 3px 0 0 transparent;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     cursor: pointer;
     color: var(--text-secondary);
-    transition: background 0.12s, border-color 0.12s, color 0.12s, box-shadow 0.12s;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast), box-shadow var(--transition-fast);
+  }
+  .tree-item.child {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    margin-bottom: 2px;
+    border-color: transparent;
+    background: transparent;
+    box-shadow: none;
+  }
+  .tree-item.child .tree-main {
+    flex: 1 1 auto;
+  }
+  .tree-item.child .tree-meta {
+    padding-left: 0;
+    margin-left: auto;
+    flex-wrap: nowrap;
+  }
+  .tree-item.child .tree-icon {
+    width: 18px;
+    height: 18px;
   }
   .tree-item:hover {
     background: var(--bg-hover);
@@ -4395,20 +4860,32 @@
     padding-left: 32px;
     min-width: 0;
   }
-  /* Folder icon sits in a rounded tinted chip for a more deliberate, app-like
-     look; the chip and glyph both intensify on the active row. */
+  /* Folder icon sits in a rounded tinted chip. When the folder has children
+     the chip is the expander: a closed folder folds them away, an open one
+     shows them. The global button style would otherwise paint it accent-blue. */
   .tree-icon {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     width: 24px;
     height: 24px;
+    padding: 0;
+    border: 1px solid transparent;
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--accent) 12%, transparent);
     color: var(--accent);
     flex-shrink: 0;
+    line-height: 1;
   }
-  .tree-item.active .tree-icon {
+  button.tree-icon { cursor: pointer; }
+  button.tree-icon:hover,
+  button.tree-icon:active:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    color: var(--accent);
+    transform: none;
+  }
+  .tree-item.active .tree-icon,
+  .tree-item.active button.tree-icon:hover {
     background: color-mix(in srgb, var(--accent) 22%, transparent);
     color: var(--accent);
   }
@@ -4417,7 +4894,7 @@
     overflow-wrap: anywhere;
     word-break: break-word;
     line-height: 1.3;
-    font-size: 12.5px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
   }
@@ -4425,7 +4902,7 @@
     display: inline-flex;
     align-items: center;
     height: 22px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 500;
     font-variant-numeric: tabular-nums;
     color: var(--text-secondary);
@@ -4446,56 +4923,98 @@
     gap: 4px;
     flex-shrink: 0;
   }
-  .tree-btn {
+  /* The global `button` rule paints these accent-blue with white icons and
+     7px 14px of padding. Name the element so color, fill, and padding win,
+     otherwise both chips collapse to the same empty grey square. */
+  button.tree-btn {
     width: 22px;
     height: 22px;
     border-radius: var(--radius-sm);
     border: 1px solid transparent;
-    background: transparent;
+    background: var(--bg-secondary);
     color: var(--text-muted);
     display: inline-flex;
     align-items: center;
     justify-content: center;
     padding: 0;
     line-height: 1;
-    transition: background 0.12s, border-color 0.12s, color 0.12s;
+    overflow: visible;
+    transform: none;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
   }
-  .tree-btn:focus-visible {
+  button.tree-btn svg {
+    width: 13px;
+    height: 13px;
+    min-width: 13px;
+    min-height: 13px;
+    flex-shrink: 0;
+    display: block;
+    stroke: currentColor;
+  }
+  button.tree-btn:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
+  button.tree-btn:hover,
+  button.tree-btn:active:not(:disabled) {
+    transform: none;
+  }
   /* Rest: tinted chips with distinct glyphs (share-off vs trash). Hover/focus
-     fills the chip and swaps to a white X so the two actions stay readable
+     fills the chip and swaps to an X so the two actions stay readable
      before you point at them, then match as confirm-style controls. */
-  .tree-btn .tree-btn-idle,
-  .tree-btn .tree-btn-confirm {
+  button.tree-btn .tree-btn-idle,
+  button.tree-btn .tree-btn-confirm {
     display: inline-flex;
     align-items: center;
     justify-content: center;
   }
-  .tree-btn .tree-btn-confirm { display: none; }
-  .tree-btn:hover .tree-btn-idle,
-  .tree-btn:focus-visible .tree-btn-idle { display: none; }
-  .tree-btn:hover .tree-btn-confirm,
-  .tree-btn:focus-visible .tree-btn-confirm { display: inline-flex; }
-  .tree-btn.tree-unshare {
+  button.tree-btn .tree-btn-confirm { display: none; }
+  button.tree-btn:hover .tree-btn-idle,
+  button.tree-btn:focus-visible .tree-btn-idle { display: none; }
+  button.tree-btn:hover .tree-btn-confirm,
+  button.tree-btn:focus-visible .tree-btn-confirm { display: inline-flex; }
+  button.tree-btn.tree-unshare,
+  button.tree-btn.tree-unshare:active:not(:disabled) {
     color: var(--warning);
-    border-color: color-mix(in srgb, var(--warning) 38%, var(--border));
-    background: color-mix(in srgb, var(--warning) 12%, transparent);
+    border-color: color-mix(in srgb, var(--warning) 55%, var(--border));
+    background: color-mix(in srgb, var(--warning) 18%, var(--bg-secondary));
   }
-  .tree-btn.tree-unshare:hover,
-  .tree-btn.tree-unshare:focus-visible {
+  button.tree-btn.tree-unshare:hover,
+  button.tree-btn.tree-unshare:focus-visible {
     color: var(--on-warning);
     border-color: var(--warning);
     background: var(--warning);
   }
-  .tree-btn.tree-remove {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 38%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
+  button.tree-unapproved {
+    flex-shrink: 0;
+    height: 22px;
+    padding: 0 8px;
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    line-height: 20px;
+    white-space: nowrap;
+    border-radius: var(--radius-sm);
+    color: var(--warning);
+    border: 1px solid color-mix(in srgb, var(--warning) 55%, var(--border));
+    background: color-mix(in srgb, var(--warning) 18%, var(--bg-secondary));
   }
-  .tree-btn.tree-remove:hover,
-  .tree-btn.tree-remove:focus-visible {
+  button.tree-unapproved:hover,
+  button.tree-unapproved:focus-visible {
+    color: var(--on-warning);
+    border-color: var(--warning);
+    background: var(--warning);
+  }
+  button.tree-unapproved:active:not(:disabled) {
+    transform: none;
+  }
+  button.tree-btn.tree-remove,
+  button.tree-btn.tree-remove:active:not(:disabled) {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
+    background: color-mix(in srgb, var(--danger) 16%, var(--bg-secondary));
+  }
+  button.tree-btn.tree-remove:hover,
+  button.tree-btn.tree-remove:focus-visible {
     color: var(--on-danger);
     border-color: var(--danger);
     background: var(--danger);
@@ -4508,7 +5027,7 @@
     height: 22px;
     margin: 0;
     padding: 0 18px 0 6px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 500;
     line-height: 20px;
     border-radius: var(--radius-sm);
@@ -4532,8 +5051,16 @@
     cursor: col-resize;
     background: var(--border);
     flex-shrink: 0;
+    transition: background var(--transition-fast);
   }
   .sidebar-divider:hover { background: var(--accent); }
+  /* Arrow keys resize it, so it needs to show where focus is, as the
+     Transfers splitter does. */
+  .sidebar-divider:focus-visible {
+    background: var(--accent);
+    outline: 2px solid var(--accent);
+    outline-offset: -1px;
+  }
 
   /* --- File list area --- */
   .file-list-area {
@@ -4559,22 +5086,22 @@
   }
   .drawer-header {
     display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    padding: 12px 14px 10px;
+    align-items: center;
+    padding: 12px 12px 12px 14px;
     border-bottom: 1px solid var(--border);
     background: var(--bg-surface);
-    gap: 10px;
+    gap: 11px;
   }
   .drawer-header-text {
+    flex: 1;
     min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: 4px;
   }
   .drawer-title {
     font-weight: 700;
-    font-size: 14px;
+    font-size: var(--font-size-base);
     line-height: 1.3;
     color: var(--text-primary);
     overflow: hidden;
@@ -4591,61 +5118,58 @@
     flex-wrap: wrap;
     align-items: center;
     gap: 4px 6px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     line-height: 1.3;
   }
   .drawer-sub-sep { opacity: 0.55; }
-  .drawer-sub-shared {
+  .drawer-status {
+    margin-left: 2px;
+    padding: 0 7px;
+    border-radius: var(--radius-pill);
+    background: var(--accent-fill);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
     color: var(--accent);
+    font-size: var(--font-size-xs);
     font-weight: 600;
+    line-height: 16px;
+  }
+  /* Keep in step with `.shared-badge.friends` in LibraryVirtualTable. */
+  .drawer-status.drawer-status-friends {
+    background: color-mix(in srgb, var(--warning) 15%, transparent);
+    border-color: color-mix(in srgb, var(--warning) 32%, transparent);
+    color: var(--warning);
   }
   .drawer-close {
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    cursor: pointer;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: var(--text-secondary);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
     margin-top: 1px;
-    line-height: 1;
-    transition: background 0.12s, border-color 0.12s, color 0.12s;
-  }
-  .drawer-close:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-  }
-  .drawer-close:active {
-    background: color-mix(in srgb, var(--danger) 20%, transparent);
   }
   .drawer-body {
     flex: 1;
     overflow-y: auto;
-    padding: 12px 14px 16px;
-    font-size: 12px;
+    padding: 10px 12px 16px;
+    font-size: var(--font-size-sm);
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: 10px;
   }
+  /* Each section a card, so File / Sharing / Activity read as groups rather
+     than one long list of labels. */
   .drawer-block {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 9px;
+    padding: 10px 12px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
   }
   .drawer-block-title {
     margin: 0;
     font-weight: 700;
-    font-size: 11px;
-    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
     text-transform: uppercase;
-    letter-spacing: 0.4px;
+    letter-spacing: 0.5px;
   }
   .drawer-block-comments .drawer-section-header {
     margin-bottom: 0;
@@ -4657,7 +5181,7 @@
     gap: 10px;
     padding: 8px 10px;
     border-radius: var(--radius-sm);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.35;
   }
   .drawer-alert-danger {
@@ -4673,7 +5197,7 @@
   .drawer-alert-btn {
     flex-shrink: 0;
     padding: 3px 8px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     border-radius: var(--radius-sm);
     border: 1px solid currentColor;
     background: transparent;
@@ -4689,26 +5213,18 @@
   }
   .drawer-section-title {
     font-weight: 700;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     text-transform: uppercase;
     letter-spacing: 0.35px;
   }
+  /* Fills the table area; everything else comes from app.css. */
   .empty-state {
     flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    color: var(--text-muted);
-    padding: 40px;
   }
-  .empty-state .sub { font-size: 13px; margin-top: 4px; }
-  .empty-action { margin-top: 12px; font-size: 12px; padding: 6px 18px; }
-
   .status-bar {
     padding: 6px 12px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     border-top: 1px solid var(--border);
     background: var(--bg-secondary);
@@ -4753,7 +5269,7 @@
     align-items: center;
     gap: 6px;
     margin-left: auto;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     white-space: nowrap;
     flex-shrink: 0;
@@ -4791,7 +5307,7 @@
     border: none;
     background: transparent;
     padding: 7px 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: inherit;
   }
 
@@ -4823,7 +5339,7 @@
 
   .filter-type {
     padding: 7px 28px 7px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background-color: var(--bg-primary);
@@ -4832,19 +5348,19 @@
   }
 
   .clear-library-filters {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 7px 12px;
   }
   .dupes-toggle {
     padding: 7px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--bg-primary);
     color: inherit;
     cursor: pointer;
     white-space: nowrap;
-    transition: background 0.12s, border-color 0.12s, color 0.12s;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -4891,7 +5407,7 @@
     gap: 8px;
     flex-wrap: wrap;
     flex-shrink: 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
   .bulk-count {
     font-weight: 600;
@@ -4900,30 +5416,6 @@
     border-radius: var(--radius-pill);
     background: color-mix(in srgb, var(--accent) 16%, transparent);
     white-space: nowrap;
-  }
-  /* Toolbar-style buttons: the library page has no base .tb-btn rule, so without
-     this they fall back to the global accent-filled <button> style. Match the
-     clean bordered look used by the other toolbars. */
-  .bulk-action-bar .tb-btn {
-    font-size: 12px;
-    font-weight: 500;
-    padding: 4px 11px;
-    min-height: 26px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-    cursor: pointer;
-    white-space: nowrap;
-    transition: background 0.13s ease, border-color 0.13s ease, color 0.13s ease;
-  }
-  .bulk-action-bar .tb-btn:hover:not(:disabled) {
-    background: var(--bg-hover);
-    border-color: var(--border-light);
-  }
-  .bulk-action-bar .tb-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
   }
   .bulk-sep {
     width: 1px;
@@ -4944,7 +5436,7 @@
     gap: 6px;
     flex: 0 0 auto;
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
@@ -4952,7 +5444,7 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     color: var(--warning);
     background: color-mix(in srgb, var(--warning) 14%, transparent);
@@ -4963,7 +5455,7 @@
     cursor: pointer;
     white-space: nowrap;
     font-family: inherit;
-    transition: background 0.12s ease, border-color 0.12s ease;
+    transition: background var(--transition-fast) ease, border-color var(--transition-fast) ease;
   }
   .bulk-hidden-note:hover {
     background: color-mix(in srgb, var(--warning) 24%, transparent);
@@ -4975,7 +5467,7 @@
   }
   .bulk-label {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     white-space: nowrap;
   }
   .bulk-prio-group {
@@ -4991,11 +5483,12 @@
     border-radius: var(--radius-sm);
     overflow: hidden;
   }
+  /* 22px inside the group's 1px border, level with the 24px `.tb-btn`s. */
   .bulk-prio-btn {
-    font-size: 11px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
-    padding: 3px 9px;
-    min-height: 26px;
+    padding: 2px 9px;
+    min-height: 22px;
     border: none;
     border-left: 1px solid var(--border);
     border-radius: 0;
@@ -5003,77 +5496,122 @@
     color: var(--text-secondary);
     cursor: pointer;
     white-space: nowrap;
-    transition: background 0.13s ease, color 0.13s ease;
+    transition: background var(--transition-fast) ease, color var(--transition-fast) ease;
   }
   .bulk-prio-btn:first-child { border-left: none; }
   .bulk-prio-btn:hover:not(:disabled) {
     background: var(--accent);
     color: var(--on-accent);
   }
-  .spinner-inline {
-    display: inline-block;
-    width: 10px;
-    height: 10px;
-    border: 2px solid var(--text-muted);
-    border-top-color: transparent;
-    border-radius: 50%;
-    animation: spinner-rotate 0.9s linear infinite;
-    vertical-align: -1px;
-    margin-right: 4px;
-  }
-  @keyframes spinner-rotate {
-    to { transform: rotate(360deg); }
-  }
-
-  .tb-btn.tb-danger {
-    border-color: color-mix(in srgb, var(--danger) 40%, transparent);
-    color: var(--danger);
-  }
-  .tb-btn.tb-danger:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-    border-color: var(--danger);
-  }
 
   /* --- Details meta grid --- */
+  /* The label column fits its longest label (up to a cap) rather than a fixed
+     72px, which a German "Veröffentlicht" overflowed into the values. */
   .details-meta-grid {
     display: grid;
-    grid-template-columns: 72px 1fr;
-    gap: 6px 10px;
+    grid-template-columns: minmax(64px, max-content) minmax(0, 1fr);
+    gap: 8px 12px;
     align-items: baseline;
   }
   .meta-label {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     text-align: left;
     white-space: nowrap;
+    max-width: 130px;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .meta-value {
     color: var(--text-primary);
     word-break: break-word;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     min-width: 0;
   }
+  .meta-copyable {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+  }
+  /* Two lines of path before it gives up, so the folder is readable and not
+     only its first few characters. */
   .meta-path {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 100%;
+    flex: 1;
+    min-width: 0;
     color: var(--text-secondary);
+    word-break: break-all;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    line-height: 1.4;
   }
   .meta-hash {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-family: var(--font-mono, monospace);
-    font-size: 11px;
+    flex: 1;
     min-width: 0;
-  }
-  .meta-hash code {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+    line-height: 20px;
     color: var(--text-secondary);
+  }
+  .copy-icon-btn {
+    flex-shrink: 0;
+    width: 22px;
+    height: 20px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+  }
+  .copy-icon-btn svg { width: 13px; height: 13px; }
+  .copy-icon-btn:hover {
+    background: var(--bg-hover);
+    border-color: var(--border);
+    color: var(--accent);
+  }
+  .copy-icon-btn.copied,
+  .copy-icon-btn.copied:hover {
+    color: var(--success);
+  }
+  .copied-check { color: var(--success); }
+  .drawer-select {
+    max-width: 100%;
+    padding: 3px 8px;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+  .drawer-select:disabled { cursor: default; opacity: 0.6; }
+  .drawer-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .drawer-select.prio-verylow { color: var(--priority-verylow); }
+  .drawer-select.prio-low { color: var(--priority-low); }
+  .drawer-select.prio-high { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+  .drawer-select.prio-release { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+  .drawer-select.prio-auto { color: var(--priority-auto); }
+  .drawer-select option { color: var(--text-primary); }
+  .meta-toggle {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .meta-hint {
+    font-size: var(--font-size-xs);
+    line-height: 1.4;
+    color: var(--text-muted);
   }
   .meta-shared-row {
     display: flex;
@@ -5082,12 +5620,12 @@
     gap: 6px;
   }
   .shared-status {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     padding: 1px 7px;
     border-radius: var(--radius-pill);
     border: 1px solid var(--border);
-    background: var(--bg-surface);
+    background: var(--bg-secondary);
     color: var(--text-muted);
   }
   .shared-status.is-shared {
@@ -5107,29 +5645,36 @@
     padding: 8px 9px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    background: var(--bg-surface);
+    background: var(--bg-secondary);
     min-width: 0;
   }
+  .activity-ratio {
+    margin: 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+  }
   .activity-stat-label {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.3px;
     color: var(--text-muted);
   }
   .activity-stat-value {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 700;
     color: var(--text-primary);
     font-variant-numeric: tabular-nums;
   }
   .activity-stat-sub {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     line-height: 1.3;
   }
   .drawer-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 6px;
     padding: 8px 14px;
     border-bottom: 1px solid var(--border);
@@ -5141,14 +5686,14 @@
     align-items: center;
     gap: 5px;
     padding: 5px 12px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--bg-surface);
     color: var(--text-secondary);
     cursor: pointer;
-    transition: background 0.12s, color 0.12s, border-color 0.12s;
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
   }
   .drawer-action-btn:hover {
     background: var(--bg-hover);
@@ -5158,24 +5703,12 @@
   .drawer-action-btn svg {
     flex-shrink: 0;
   }
-  .copy-btn {
-    font-size: 10px;
-    padding: 1px 5px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--bg-surface);
-    color: var(--text-secondary);
-    flex-shrink: 0;
-    cursor: pointer;
-    line-height: 1.3;
-  }
-  .copy-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--bg-surface); }
   .meta-badges { display: inline-flex; gap: 4px; }
   /* Tinted-chip recipe matching the same badges in the file table
      (LibraryVirtualTable's .shared-badge) so KAD/eD2K/AICH read as the
      same concept — and the same color — in both places. */
   .meta-badge {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     padding: 1px 6px;
     border-radius: var(--radius-pill);
@@ -5209,26 +5742,9 @@
     margin: 10px 0;
   }
 
-  /* Priority pill in the properties drawer — mirrors the table cell colors. */
-  .prio-badge {
-    display: inline-block;
-    font-size: 11px;
-    font-weight: 600;
-    padding: 1px 7px;
-    border-radius: var(--radius-pill);
-    border: 1px solid var(--border);
-    background: var(--bg-surface);
-  }
-  .prio-badge.prio-verylow { color: var(--priority-verylow); }
-  .prio-badge.prio-low { color: var(--priority-low); }
-  .prio-badge.prio-normal { color: var(--text-primary); }
-  .prio-badge.prio-high { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
-  .prio-badge.prio-release { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
-  .prio-badge.prio-auto { color: var(--priority-auto); }
-
   /* --- Comment panel --- */
   .comment-last-saved {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
   }
   .comment-loading {
@@ -5241,7 +5757,7 @@
     padding: 8px 10px;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    background: var(--bg-surface);
+    background: var(--bg-secondary);
   }
   .comment-rating-row {
     display: flex;
@@ -5251,7 +5767,7 @@
     flex-wrap: wrap;
   }
   .comment-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     margin-right: 4px;
     font-weight: 600;
@@ -5260,7 +5776,7 @@
     background: none;
     border: none;
     cursor: pointer;
-    font-size: 16px;
+    font-size: var(--font-size-lg);
     color: var(--warning);
     padding: 0 1px;
     line-height: 1;
@@ -5290,7 +5806,7 @@
   .comment-input {
     flex: 1;
     padding: 6px 8px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-family: inherit;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
@@ -5306,7 +5822,7 @@
   .comment-input:focus { border-color: var(--accent); }
   .comment-save {
     padding: 6px 12px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     border: 1px solid var(--accent);
     border-radius: var(--radius-sm);
     background: var(--accent);
@@ -5318,7 +5834,7 @@
   .comment-save:hover { opacity: 0.85; }
   .comment-save-state {
     margin-top: 6px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--success);
     font-weight: 600;
   }
@@ -5348,7 +5864,7 @@
   }
   .comment-peer-stars {
     color: var(--warning);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     letter-spacing: 1px;
   }
   .star-display { pointer-events: none; }
@@ -5363,7 +5879,7 @@
   .comment-empty {
     color: var(--text-muted);
     font-style: italic;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     padding: 10px 2px;
   }
 
@@ -5389,18 +5905,18 @@
     background: none;
     color: inherit;
     font: inherit;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     cursor: pointer;
     text-align: left;
   }
   .collection-toggle:hover { background: var(--bg-hover); }
-  .toggle-arrow { font-size: 10px; color: var(--text-muted); flex-shrink: 0; display: inline-block; transition: transform var(--transition-normal) ease; }
+  .toggle-arrow { font-size: var(--font-size-2xs); color: var(--text-muted); flex-shrink: 0; display: inline-block; transition: transform var(--transition-normal) ease; }
   .toggle-arrow.open { transform: rotate(90deg); }
   .collection-title { flex: 1; font-weight: 600; }
-  .collection-meta { font-weight: 400; color: var(--text-muted); font-size: 12px; margin-left: 6px; }
+  .collection-meta { font-weight: 400; color: var(--text-muted); font-size: var(--font-size-sm); margin-left: 6px; }
   .coll-action-btn {
     padding: 3px 10px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
     cursor: pointer;
@@ -5419,12 +5935,12 @@
     gap: 8px;
     padding: 12px 16px;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
-  .coll-table { font-size: 12px; }
+  .coll-table { font-size: var(--font-size-sm); }
   .coll-table th {
     padding: 5px 10px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     background: var(--bg-secondary);
     border-bottom: 1px solid var(--border);
@@ -5440,7 +5956,7 @@
     text-overflow: ellipsis;
   }
   .coll-col-size { width: 90px; text-align: right; }
-  .coll-col-hash { width: 160px; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+  .coll-col-hash { width: 160px; font-family: var(--font-mono); font-size: var(--font-size-xs); color: var(--text-muted); }
 
   /* --- Create Collection modal --- */
   .modal-overlay {
@@ -5490,26 +6006,7 @@
     padding: 12px 16px;
     border-bottom: 1px solid var(--border);
   }
-  .modal-title { font-weight: 600; font-size: 14px; }
-  .modal-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    cursor: pointer;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: var(--text-secondary);
-    transition: background 0.12s, border-color 0.12s, color 0.12s;
-  }
-  .modal-close:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-  }
+  .modal-title { font-weight: 600; font-size: var(--font-size-lg); }
   .modal-body { padding: 16px; overflow-y: auto; flex: 1; }
   .modal-footer {
     display: flex;
@@ -5525,7 +6022,7 @@
     margin-bottom: 10px;
   }
   .form-label {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-secondary);
     width: 80px;
@@ -5534,7 +6031,7 @@
   .form-input {
     flex: 1;
     padding: 5px 8px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--bg-input);
@@ -5557,7 +6054,7 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     cursor: pointer;
-    transition: background 0.12s, border-color 0.12s;
+    transition: background var(--transition-fast), border-color var(--transition-fast);
   }
   .format-option:hover { background: var(--bg-hover); }
   .format-option input[type="radio"] { margin-top: 2px; flex-shrink: 0; cursor: pointer; }
@@ -5571,16 +6068,16 @@
     gap: 2px;
     line-height: 1.3;
   }
-  .format-name { font-size: 12px; font-weight: 600; color: var(--text-primary); }
-  .format-desc { font-size: 11px; color: var(--text-muted); }
+  .format-name { font-size: var(--font-size-sm); font-weight: 600; color: var(--text-primary); }
+  .format-desc { font-size: var(--font-size-xs); color: var(--text-muted); }
 
-  .select-all-btn { font-size: 11px; margin-left: auto; padding: 2px 8px; }
+  .select-all-btn { font-size: var(--font-size-xs); margin-left: auto; padding: 2px 8px; }
   .coll-search-row {
     margin-bottom: 6px;
   }
   .coll-search-input {
     width: 100%;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
   .coll-file-picker {
     max-height: 260px;
@@ -5594,9 +6091,9 @@
     align-items: center;
     gap: 8px;
     padding: 4px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     cursor: pointer;
-    transition: background 0.1s;
+    transition: background var(--transition-fast);
   }
   .coll-pick-row:hover { background: var(--bg-hover); }
   .coll-pick-name {
@@ -5605,25 +6102,13 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .coll-pick-size { color: var(--text-muted); flex-shrink: 0; font-size: 11px; }
+  .coll-pick-size { color: var(--text-muted); flex-shrink: 0; font-size: var(--font-size-xs); }
   .coll-pick-empty {
     padding: 16px;
     text-align: center;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-style: italic;
-  }
-
-  @media (max-width: 640px) {
-    .library-filter-row {
-      align-items: stretch;
-    }
-    .filter-search-wrap,
-    .filter-type {
-      max-width: none;
-      width: 100%;
-    }
-    .inline-stats { display: none; }
   }
 
   /* Overlay the detail drawer earlier so the file table keeps usable width
@@ -5641,12 +6126,15 @@
   }
 
   @media (max-width: 760px) {
-    .detail-drawer {
-      width: min(90vw, 420px);
+    .library-filter-row {
+      align-items: stretch;
     }
-  }
-
-  @media (max-width: 520px) {
+    .filter-search-wrap,
+    .filter-type {
+      max-width: none;
+      width: 100%;
+    }
+    .inline-stats { display: none; }
     .sidebar,
     .sidebar-divider { display: none; }
     .detail-drawer { width: min(100vw, 420px); }

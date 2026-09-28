@@ -1012,6 +1012,19 @@ pub fn is_expected_aich_mismatch(err: &str) -> bool {
 pub const EMBER_BLAKE3_MISMATCH_MSG: &str =
     "ember blake3 mismatch: content did not match the expected Ember hash";
 
+/// Error for a completed download whose final check neither passed nor showed
+/// bad bytes: the `.part` could not be read, or a re-read found every part
+/// intact. Neither this nor [`LOCAL_READ_FAILED_MSG`] is evidence against a
+/// source, so both must classify as Transient and must not contain "hash
+/// mismatch" or "hash verification failed".
+pub const FINAL_VERIFY_INCONCLUSIVE_MSG: &str =
+    "Final verification inconclusive — .part and progress kept, will re-verify";
+
+/// Terminal error once repeated verifications and a part-by-part re-read still
+/// cannot read the finished `.part`. The event loop does not re-queue it.
+pub const LOCAL_READ_FAILED_MSG: &str =
+    "Finished .part cannot be read back from the local drive — not retrying";
+
 /// Classify an error string into transient vs permanent failure.
 pub fn classify_error(err: &str) -> SourceFailureKind {
     let lower = err.to_lowercase();
@@ -1049,6 +1062,45 @@ pub fn is_disk_full_error(err: &str) -> bool {
         || (cfg!(unix) && lower.contains("os error 28")) // ENOSPC
         || (cfg!(windows) && lower.contains("os error 112")) // ERROR_DISK_FULL
         || lower.contains("storagefull")
+}
+
+/// Prefix on every error raised while preparing the local download folder or
+/// opening a `.part` inside it.
+///
+/// Such an error involves no peer, so it is not a source failure, and retrying
+/// another source cannot fix it. Untagged, it fell through `classify_failure` to
+/// "Transient connection failure": the row went back to Searching and retried
+/// forever while telling the user to look at the network (issue 128).
+pub(crate) const DOWNLOAD_FOLDER_STAGE: &str = "stage:download_folder";
+
+pub(crate) fn is_download_folder_error(error: &str) -> bool {
+    error.contains(DOWNLOAD_FOLDER_STAGE)
+}
+
+pub(crate) fn download_folder_error(
+    what: &str,
+    download_dir: &std::path::Path,
+    error: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::anyhow!("{DOWNLOAD_FOLDER_STAGE}: {what} in {}: {error}", download_dir.display())
+}
+
+/// Create `<download_dir>/Temp` (for `.part` files) and `<download_dir>/Downloads`
+/// (for completed ones) inside the approved root, returning both.
+pub(crate) async fn prepare_download_dirs(
+    download_dir: &std::path::Path,
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let root = download_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let allowed = vec![root.to_string_lossy().into_owned()];
+        let temp = crate::security::filesystem::prepare_approved_subdir(&root, "Temp", &allowed)?;
+        let done =
+            crate::security::filesystem::prepare_approved_subdir(&root, "Downloads", &allowed)?;
+        Ok::<_, std::io::Error>((temp, done))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("download folder task failed: {e}"))?
+    .map_err(|e| download_folder_error("preparing Temp and Downloads", download_dir, e))
 }
 
 pub(crate) fn failure_kind_name(kind: &SourceFailureKind) -> String {
@@ -1119,10 +1171,16 @@ transfer_failure_codes! {
     PermanentFailure => "permanent_failure", "Permanent transfer failure";
     TransientFailure => "transient_failure", "Transient connection failure";
     NetworkChannelUnavailable => "network_channel_unavailable", "Network channel unavailable";
+    DownloadFolderUnavailable => "download_folder_unavailable",
+        "The download folder cannot be written; check it in Settings";
     EmberPinCorrupt => "ember_pin_corrupt",
         "Persisted Ember digest was corrupt; cancel and re-add the eh= link";
     AichPinCorrupt => "aich_pin_corrupt",
         "Persisted AICH pin was corrupt; cancel and re-add the AICH link";
+    FinalVerifyInconclusive => "final_verify_inconclusive",
+        "Couldn't read the finished file to verify it";
+    LocalReadFailed => "local_read_failed",
+        "The finished file can't be read from the drive";
 }
 
 /// Reduce a raw error to the canned failure the UI shows.
@@ -1135,6 +1193,15 @@ pub(crate) fn classify_failure(error: &str, kind: &SourceFailureKind) -> Transfe
     let lower = error.to_lowercase();
     if lower.contains("cancelled") {
         return TransferFailureCode::Cancelled;
+    }
+    if is_download_folder_error(error) {
+        return TransferFailureCode::DownloadFolderUnavailable;
+    }
+    if error.contains(LOCAL_READ_FAILED_MSG) {
+        return TransferFailureCode::LocalReadFailed;
+    }
+    if error.contains(FINAL_VERIFY_INCONCLUSIVE_MSG) {
+        return TransferFailureCode::FinalVerifyInconclusive;
     }
     if lower.contains("does not have the file")
         || lower.contains("filereqansnofil")
@@ -1176,6 +1243,9 @@ pub(crate) fn classify_failure(error: &str, kind: &SourceFailureKind) -> Transfe
 
 
 pub(crate) fn infer_stage_from_error(error: &str) -> &'static str {
+    if is_download_folder_error(error) {
+        return "download_folder";
+    }
     if error.contains("stage:tcp_connect") {
         return "tcp_connect";
     }
@@ -1389,6 +1459,13 @@ mod tests {
                 Transient,
                 C::ConnectionFailed,
             ),
+            (
+                "stage:download_folder: opening the part file in /x: Permission denied",
+                Transient,
+                C::DownloadFolderUnavailable,
+            ),
+            (FINAL_VERIFY_INCONCLUSIVE_MSG, Transient, C::FinalVerifyInconclusive),
+            (LOCAL_READ_FAILED_MSG, Transient, C::LocalReadFailed),
             ("unrecognised", Permanent, C::PermanentFailure),
             ("unrecognised", Transient, C::TransientFailure),
             ("unrecognised", DownloadTimeout, C::DownloadTimedOut),
@@ -1665,6 +1742,38 @@ mod tests {
         assert_eq!(failure.message(), "Remote missing file");
     }
 
+    /// The raw error names a path and an OS error, and the path must not reach
+    /// the UI; the code is what says which folder problem this is.
+    #[test]
+    fn a_download_folder_error_is_not_reported_as_a_connection_failure() {
+        let raw = download_folder_error(
+            "opening the part file",
+            std::path::Path::new("/home/someone/Ember"),
+            "Permission denied (os error 13)",
+        )
+        .to_string();
+        let kind = classify_error(&raw);
+        assert_eq!(kind, SourceFailureKind::Transient, "it still re-queues");
+        assert_eq!(classify_failure(&raw, &kind), TransferFailureCode::DownloadFolderUnavailable);
+        assert_eq!(infer_stage_from_error(&raw), "download_folder");
+        assert!(!TransferFailureCode::DownloadFolderUnavailable.message().contains("/home"));
+    }
+
+    // The registry lock is held across the await on purpose: it serialises
+    // tests that swap the process-global approved-root registry, and the
+    // folder check under test is the window it has to cover. Current-thread
+    // runtime, so there is no executor thread for the guard to strand.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_download_folder_that_is_not_an_approved_root_is_tagged() {
+        let _registry = crate::security::filesystem::test_registry_lock();
+        let dir = std::env::temp_dir().join(format!("ember-unapproved-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let error = prepare_download_dirs(&dir).await.expect_err("not approved").to_string();
+        assert!(is_download_folder_error(&error), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn ember_blake3_mismatch_is_permanent_and_distinct() {
         let raw = "ember blake3 mismatch: expected=aa got=bb";
@@ -1684,6 +1793,25 @@ mod tests {
             !is_ember_blake3_mismatch("Download hash mismatch for file: expected=x, got=y"),
             "ed2k mismatch must not be classified as an Ember pin failure"
         );
+    }
+
+    /// An unreadable `.part` must not blame the source, and must not look like
+    /// a user cancel, a full disk, or a pin failure — each of which the event
+    /// loop handles differently.
+    #[test]
+    fn local_read_failures_are_transient_and_keep_their_own_codes() {
+        for (msg, code) in [
+            (FINAL_VERIFY_INCONCLUSIVE_MSG, TransferFailureCode::FinalVerifyInconclusive),
+            (LOCAL_READ_FAILED_MSG, TransferFailureCode::LocalReadFailed),
+        ] {
+            let kind = classify_error(msg);
+            assert_eq!(kind, SourceFailureKind::Transient, "{msg}");
+            assert_eq!(classify_failure(msg, &kind), code);
+            assert!(!is_user_cancel_error(msg));
+            assert!(!is_disk_full_error(msg));
+            assert!(!is_ember_blake3_mismatch(msg));
+            assert!(!is_expected_aich_mismatch(msg));
+        }
     }
 
     #[test]
@@ -1706,6 +1834,20 @@ mod tests {
         assert!(
             is_expected_aich_mismatch("AICH hash mismatch"),
             "the canned UI summary must also classify as an AICH pin failure"
+        );
+    }
+
+    #[test]
+    fn completed_download_name_uses_tracker_then_fallback() {
+        assert_eq!(
+            completed_download_name("renamed.bin", "original.bin"),
+            "renamed.bin"
+        );
+        assert_eq!(completed_download_name("", "original.bin"), "original.bin");
+        assert_eq!(
+            completed_download_name("../evil.txt", "original.bin"),
+            "evil.txt",
+            "completion must still sanitize a renamed display name"
         );
     }
 
@@ -1973,9 +2115,13 @@ impl Ed2kDownload {
                 );
             }
         }
+        let zero_name = self
+            .control
+            .seal_pending_rename()
+            .unwrap_or_else(|| self.file_name.clone());
         let final_path = finalize_zero_ed2k_file(
             &self.transfer_id,
-            &self.file_name,
+            &zero_name,
             self.file_hash,
             &self.download_dir,
         )
@@ -2143,6 +2289,15 @@ impl Ed2kDownload {
         self.emit_source_detail(&event_tx, "connected (callback)", None, 0, 0, "", "")
             .await;
 
+        let _peer_session = match self.source_addr.ip() {
+            std::net::IpAddr::V4(v4) => Some(super::peer_sessions::register(
+                Some(peer_user_hash),
+                v4,
+                peer_caps.tcp_port,
+            )),
+            std::net::IpAddr::V6(_) => None,
+        };
+
         if let Some(sm) = &self.source_manager {
             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                 let mut sm = sm.write().await;
@@ -2156,6 +2311,9 @@ impl Ed2kDownload {
                     peer_user_hash,
                     0,
                     peer_caps.is_high_id(),
+                    // `on_kad_callback_conn` registered this peer with the
+                    // route's origin before starting this download.
+                    None,
                 );
             }
         }
@@ -2528,13 +2686,19 @@ impl Ed2kDownload {
                 // Ember-to-Ember single-source downloads.
                 pkt
             } else {
-                match tokio::time::timeout(
+                match read_packet_within(
+                    &mut reader,
                     std::time::Duration::from_secs(3),
-                    read_packet_async(&mut reader),
+                    std::time::Duration::from_secs(
+                        super::multi_source::HANDSHAKE_READ_TIMEOUT_SECS,
+                    ),
                 )
                 .await
                 {
-                    Ok(Ok(pkt)) => pkt,
+                    Ok(Some(pkt)) => pkt,
+                    Err(e) if e.get_ref().is_some_and(|i| i.is::<PacketStreamDesynced>()) => {
+                        return Err(anyhow::Error::from(e).context("stage:emule_info_wait"));
+                    }
                     _ => break,
                 }
             };
@@ -2583,15 +2747,13 @@ impl Ed2kDownload {
                 (OP_EMULEPROT, OP_SECIDENTSTATE) if pl.len() >= 5 => {
                     let state = pl[0];
                     let challenge = u32::from_le_bytes([pl[1], pl[2], pl[3], pl[4]]);
-                    let missing_peer_key = if state >= 2 {
-                        if let Some(cm) = &self.credit_manager {
-                            let cm = cm.read().await;
-                            !cm.has_public_key(&peer_user_hash)
-                        } else {
-                            true
-                        }
+                    // Any state needs the peer's key to sign against
+                    // (BaseClient.cpp:1851-1852).
+                    let missing_peer_key = if let Some(cm) = &self.credit_manager {
+                        let cm = cm.read().await;
+                        !cm.has_public_key(&peer_user_hash)
                     } else {
-                        false
+                        true
                     };
                     if missing_peer_key {
                         pending_peer_challenge = Some((challenge, state));
@@ -2852,7 +3014,7 @@ impl Ed2kDownload {
                                     );
                                     if peer_user_hash != [0u8; 16] {
                                         if let Some(cm) = &self.credit_manager {
-                                            cm.write().await.set_ember_hash(peer_user_hash, *eh);
+                                            cm.write().await.note_bound_ember_hash(peer_user_hash, *eh);
                                         }
                                     }
                                 } else {
@@ -3598,7 +3760,7 @@ impl Ed2kDownload {
                                     );
                                     if peer_user_hash != [0u8; 16] {
                                         if let Some(cm) = &self.credit_manager {
-                                            cm.write().await.set_ember_hash(peer_user_hash, *eh);
+                                            cm.write().await.note_bound_ember_hash(peer_user_hash, *eh);
                                         }
                                     }
                                     if peer_is_ember && !mesh_discovered_emitted {
@@ -3941,6 +4103,7 @@ impl Ed2kDownload {
                         debug!("Waiting for hashset, got proto=0x{proto:02X} op=0x{opcode:02X} — skipping");
                     }
                 }
+                Err(e) if is_packet_stream_desynced(&e) => return Err(e),
                 Err(e) => {
                     debug!("No hashset answer (peer may not support it): {e}");
                     break;
@@ -3948,9 +4111,11 @@ impl Ed2kDownload {
             }
         }
 
-        // Request source exchange only when not already sent in multipacket, and throttled
+        // Request source exchange only when not already sent in multipacket, and throttled.
+        // eMule asks only a peer with SX2 or an SX1 version above 1.
         if !(peer_supports_file_ident || peer_supports_ext_multipacket || peer_supports_multipacket)
             && sx_allowed
+            && (peer_supports_source_ex2 || peer_source_exchange_ver > 1)
         {
             if peer_supports_source_ex2 {
                 let mut sx2_req = Vec::with_capacity(19);
@@ -3995,17 +4160,47 @@ impl Ed2kDownload {
                 })
                 .await;
         } else {
-            // Request upload slot
-            let upload_req = build_file_request(&self.file_hash);
-            write_packet_async(
-                &mut writer,
-                OP_EDONKEYHEADER,
-                OP_STARTUPLOADREQ,
-                &upload_req,
-            )
-            .await?;
-            self.file_req_overhead
-                .record_upload((6 + upload_req.len()) as u64);
+            // Inside eMule's MIN_REQUESTTIME of our last ask we are still on
+            // its queue, and asking again only counts toward `BADCLIENTBAN`.
+            let ask_ports = [self.source_addr.port(), initial_caps.tcp_port];
+            let source_v4 = match self.source_addr.ip() {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                _ => None,
+            };
+            let ask_wait = source_v4.and_then(|v4| {
+                super::peer_sessions::upload_request_wait(
+                    Some(peer_user_hash),
+                    v4,
+                    &ask_ports,
+                    &self.file_hash,
+                )
+            });
+            if let Some(wait) = ask_wait {
+                debug!(
+                    "Not re-sending StartUploadReq to {} ({}s left of MIN_REQUESTTIME)",
+                    self.source_addr,
+                    wait.as_secs()
+                );
+            } else {
+                let upload_req = build_file_request(&self.file_hash);
+                write_packet_async(
+                    &mut writer,
+                    OP_EDONKEYHEADER,
+                    OP_STARTUPLOADREQ,
+                    &upload_req,
+                )
+                .await?;
+                self.file_req_overhead
+                    .record_upload((6 + upload_req.len()) as u64);
+                if let Some(v4) = source_v4 {
+                    super::peer_sessions::note_upload_request(
+                        Some(peer_user_hash),
+                        v4,
+                        &ask_ports,
+                        self.file_hash,
+                    );
+                }
+            }
 
             let _ = event_tx
                 .send(DownloadEvent::SourcesUpdate {
@@ -4395,28 +4590,9 @@ impl Ed2kDownload {
         //   <download_dir>/Temp/     -- .part files during download
         //   <download_dir>/Downloads/ -- completed files
         let allowed_roots = vec![self.download_dir.to_string_lossy().into_owned()];
-        let temp_dir = {
-            let root = self.download_dir.clone();
-            let allowed = allowed_roots.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::security::filesystem::prepare_approved_subdir(&root, "Temp", &allowed)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("temp dir task failed: {e}"))??
-        };
-        let completed_dir = {
-            let root = self.download_dir.clone();
-            let allowed = allowed_roots.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::security::filesystem::prepare_approved_subdir(&root, "Downloads", &allowed)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("downloads dir task failed: {e}"))??
-        };
+        let (temp_dir, completed_dir) = prepare_download_dirs(&self.download_dir).await?;
 
-        let safe_name = crate::security::sanitize_filename(&self.file_name);
         let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
-        let final_path = completed_dir.join(&safe_name);
 
         let file_size = self.file_size;
         let load_path = part_path.clone();
@@ -4449,6 +4625,7 @@ impl Ed2kDownload {
 
         tracker.set_file_hash(self.file_hash);
         tracker.set_file_name(&self.file_name);
+        apply_control_rename(&self.control, &mut tracker);
         if !part_hashes.is_empty() {
             tracker.set_part_hashes(part_hashes.clone());
         } else {
@@ -4491,8 +4668,9 @@ impl Ed2kDownload {
         // Publish initial preview-readiness onto the shared transfer control so
         // the UI's Preview button is correct on resume (first part already
         // verified on disk). Refreshed below as parts verify.
+        let preview_name = completed_download_name(tracker.file_name(), &self.file_name);
         self.control
-            .set_preview_ready(tracker.is_preview_ready(&self.file_name, self.file_size));
+            .set_preview_ready(tracker.is_preview_ready(&preview_name, self.file_size));
 
         // Per-file writer: dedicated thread + bounded channel replaces the
         // previous `Arc<Mutex<File>>`-with-`spawn_blocking`-per-block pattern
@@ -4537,7 +4715,7 @@ impl Ed2kDownload {
                 Some(self.control.discarding_flag()),
             )
             .await
-            .map_err(|e| anyhow::anyhow!("open part file: {e}"))?
+            .map_err(|e| download_folder_error("opening the part file", &self.download_dir, e))?
         };
 
         let mut downloaded: u64 = tracker.completed_bytes();
@@ -4762,10 +4940,14 @@ impl Ed2kDownload {
                             .max(std::time::Duration::from_secs(1))
                     };
 
+                    let packet_started = std::sync::atomic::AtomicBool::new(false);
                     let read_outcome = if let Some(packet) = auth_deferred.pop_front() {
                         Ok(Ok(packet))
                     } else {
-                        let mut read_fut = std::pin::pin!(read_packet_async(&mut reader));
+                        let mut read_fut = std::pin::pin!(read_packet_marking_start(
+                            &mut reader,
+                            &packet_started
+                        ));
                         let mut hard_deadline = tokio::time::Instant::now() + read_timeout;
                         let mut expire_tick =
                             tokio::time::interval(std::time::Duration::from_secs(2));
@@ -4836,7 +5018,10 @@ impl Ed2kDownload {
                                         push_outstanding_batch(&mut outstanding_ranges, batch);
                                         sent_idx += 1;
                                     }
-                                    if total_received >= total_sent_bytes {
+                                    if total_received >= total_sent_bytes
+                                        && !packet_started
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
                                         break Err(());
                                     }
                                     hard_deadline = tokio::time::Instant::now() + read_timeout;
@@ -4849,7 +5034,9 @@ impl Ed2kDownload {
                         Ok(Ok(pkt)) => pkt,
                         Ok(Err(e)) => return Err(e.into()),
                         Err(()) => {
-                            if total_received >= total_sent_bytes {
+                            let mid_packet =
+                                packet_started.load(std::sync::atomic::Ordering::Relaxed);
+                            if total_received >= total_sent_bytes && !mid_packet {
                                 continue;
                             }
                             let _ = write_packet_async(
@@ -4859,6 +5046,13 @@ impl Ed2kDownload {
                                 &[],
                             )
                             .await;
+                            if mid_packet {
+                                return Err(anyhow::Error::from(packet_stream_desynced_error())
+                                    .context(format!(
+                                        "stage:data_wait download timeout: stalled mid-packet for {}s",
+                                        read_timeout.as_secs()
+                                    )));
+                            }
                             if !got_any_data {
                                 debug!("Source {} accepted transfer but sent no data in {}s — disconnecting",
                                     self.source_addr, INITIAL_DATA_TIMEOUT_SECS);
@@ -5531,7 +5725,7 @@ impl Ed2kDownload {
                                                 if let Some(cm) = &self.credit_manager {
                                                     cm.write()
                                                         .await
-                                                        .set_ember_hash(peer_user_hash, *eh);
+                                                        .note_bound_ember_hash(peer_user_hash, *eh);
                                                 }
                                             }
                                             if peer_is_ember && !mesh_discovered_emitted {
@@ -5713,11 +5907,14 @@ impl Ed2kDownload {
                         .map_err(|e| anyhow::anyhow!("part hash read at {ps}: {e}"))?;
 
                     if actual_hash != expected_hash {
-                        let aich_part = super::aich::compute_aich_part(
-                            &part_data,
+                        let part_data = std::sync::Arc::new(part_data);
+                        let aich_part = super::aich::compute_aich_part_blocking(
+                            part_data.clone(),
                             part_idx,
                             tracker.part_count,
-                        );
+                        )
+                        .await
+                        .unwrap_or([0u8; 20]);
                         let total_blocks = (part_data.len() + super::aich::AICH_BLOCK_SIZE - 1)
                             / super::aich::AICH_BLOCK_SIZE;
                         warn!(
@@ -5802,16 +5999,17 @@ impl Ed2kDownload {
                             }
 
                             let mut narrowed = false;
-                            if let Some(ref rec) = recovery_bytes {
+                            if let Some(rec) = recovery_bytes.take() {
                                 if let Some(corrupt) =
-                                    super::aich::corrupt_blocks_from_aich_recovery(
+                                    super::aich::corrupt_blocks_from_aich_recovery_blocking(
                                         master_hash,
                                         rec,
                                         part_idx,
-                                        &part_data,
+                                        part_data.clone(),
                                         part_len,
                                         self.file_size,
                                     )
+                                    .await
                                 {
                                     if !corrupt.is_empty() {
                                         let (ps, _) = tracker.part_range(part_idx);
@@ -5928,8 +6126,12 @@ impl Ed2kDownload {
                     tracker.set_part_verified(part_idx);
                     // A newly verified part may make this download previewable
                     // (first part done + media type) — refresh the UI flag.
+                    // By the current name: a rename can change the type.
+                    apply_control_rename(&self.control, &mut tracker);
+                    let preview_name =
+                        completed_download_name(tracker.file_name(), &self.file_name);
                     self.control.set_preview_ready(
-                        tracker.is_preview_ready(&self.file_name, self.file_size),
+                        tracker.is_preview_ready(&preview_name, self.file_size),
                     );
                     // D12: flush the peer's pending credit bytes now that
                     // the part they contributed to actually verified.
@@ -5979,8 +6181,10 @@ impl Ed2kDownload {
             peer_out_of_parts = false;
         }
 
-        // Signal the uploader that we're done downloading from them
-        write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_END_OF_DOWNLOAD, &[])
+        // Signal the uploader that we're done downloading from them. eMule
+        // counts a payload without the file hash as a failed file request
+        // (ListenSocket.cpp OP_END_OF_DOWNLOAD -> CheckFailedFileIdReqs).
+        write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_END_OF_DOWNLOAD, &self.file_hash)
             .await
             .ok();
 
@@ -6020,6 +6224,21 @@ impl Ed2kDownload {
             .map_err(|e| anyhow::anyhow!("part file fsync: {e}"))?;
         drop(output);
 
+        let retry_delay = super::multi_source::final_verify_retry_delay(
+            super::multi_source::prior_inconclusive_final_verifies(&self.transfer_id),
+        );
+        if !retry_delay.is_zero() {
+            info!(
+                "Waiting {}s before re-verifying {} after an unreadable attempt",
+                retry_delay.as_secs(),
+                self.file_name
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(retry_delay) => {}
+                _ = self.control.wait_cancelled() => anyhow::bail!("cancelled by user"),
+            }
+        }
+
         let _ = event_tx
             .send(DownloadEvent::Verifying {
                 transfer_id: self.transfer_id.clone(),
@@ -6036,6 +6255,7 @@ impl Ed2kDownload {
         let expected_aich = self.expected_aich_master;
         let ember_expected = self.ember_file_hash;
         let mut ember_pin_failed = false;
+        let mut could_not_verify = false;
         // `handle.abort()` cannot interrupt `spawn_blocking`, so a Stop or Pause
         // during "Verifying" would otherwise leave a thread reading a multi-GB
         // file for minutes. `TransferControl` does not expose its inner atomic,
@@ -6116,16 +6336,18 @@ impl Ed2kDownload {
                         self.file_name
                     );
                 } else {
+                    could_not_verify = true;
                     warn!(
-                        "Could not verify hash for {}: {e} — treating as failed",
+                        "Could not verify hash for {}: {e} — keeping progress",
                         self.file_name
                     );
                 }
                 None
             }
             Err(e) => {
+                could_not_verify = true;
                 warn!(
-                    "Hash verification task failed for {}: {e} — treating as failed",
+                    "Hash verification task failed for {}: {e} — keeping progress",
                     self.file_name
                 );
                 None
@@ -6135,6 +6357,7 @@ impl Ed2kDownload {
 
         let Some((verified_identity, actual_aich, verified_part_hashes)) = verified_result else {
             if ember_pin_failed {
+                super::multi_source::clear_inconclusive_final_verifies(&self.transfer_id);
                 anyhow::bail!(EMBER_BLAKE3_MISMATCH_MSG);
             }
             // A Stop aborts the verification read part-way through the file.
@@ -6147,49 +6370,66 @@ impl Ed2kDownload {
             // path does. Re-opening every part cost a full re-download of a
             // multi-GB file for one bad 9.28 MB chunk — and the per-part MD4s
             // all passed during transfer, so the usual causes (a write lost to
-            // a crash, external modification of `Temp/`) are localized. Falls
-            // back to every part when there is no hashset to diagnose with, or
-            // the re-read itself fails.
-            let diagnosed = if part_hashes.is_empty() {
-                None
+            // a crash, external modification of `Temp/`) are localized. With no
+            // hashset to diagnose with, every part is re-opened.
+            use super::multi_source::FinalVerifyRecovery;
+            let recovery = if could_not_verify {
+                FinalVerifyRecovery::Reverify
             } else {
-                let diagnose_path = part_path.clone();
-                let diagnose_size = self.file_size;
-                let expected = part_hashes.clone();
-                tokio::task::spawn_blocking(move || {
-                    super::multi_source::corrupt_part_indices_on_disk(
-                        &diagnose_path,
-                        diagnose_size,
-                        &expected,
-                    )
-                })
+                super::multi_source::diagnose_final_hash_mismatch(
+                    part_path.clone(),
+                    self.file_hash,
+                    self.file_size,
+                    part_hashes.clone(),
+                )
                 .await
-                .ok()
-                .and_then(Result::ok)
             };
-            let reopened = match diagnosed {
-                Some(parts) if !parts.is_empty() => {
-                    for i in &parts {
-                        tracker.mark_incomplete(*i);
-                    }
-                    parts.len()
+            let inconclusive = recovery == FinalVerifyRecovery::Reverify;
+            let recovery = super::multi_source::settle_final_verify_recovery(
+                &self.transfer_id,
+                recovery,
+                part_path.clone(),
+                self.file_size,
+                part_hashes.clone(),
+            )
+            .await;
+            let parts = match recovery {
+                FinalVerifyRecovery::Reopen(parts) => parts,
+                FinalVerifyRecovery::Reverify => {
+                    warn!(
+                        "Final verification of {} was inconclusive — gap list kept, will re-verify",
+                        self.file_name
+                    );
+                    anyhow::bail!(FINAL_VERIFY_INCONCLUSIVE_MSG);
                 }
-                _ => {
-                    for i in 0..tracker.part_count {
-                        tracker.mark_incomplete(i);
-                    }
-                    tracker.part_count
+                FinalVerifyRecovery::Unreadable => {
+                    warn!(
+                        "{} still cannot be read after repeated verification attempts and a \
+                         part-by-part re-read — giving up",
+                        self.file_name
+                    );
+                    anyhow::bail!(LOCAL_READ_FAILED_MSG);
                 }
             };
+            for &i in &parts {
+                if i < tracker.part_count {
+                    tracker.mark_incomplete(i);
+                }
+            }
+            let reopened = parts.len();
             super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
             warn!(
                 "Final hash failed for {} — re-opened {} of {} parts for retry",
                 self.file_name, reopened, tracker.part_count
             );
+            if inconclusive {
+                anyhow::bail!(FINAL_VERIFY_INCONCLUSIVE_MSG);
+            }
             anyhow::bail!(
                 "Final hash verification failed — .part and .part.met preserved for retry"
             );
         };
+        super::multi_source::clear_inconclusive_final_verifies(&self.transfer_id);
         if let Some(expected_aich) = self.expected_aich_master {
             let actual = actual_aich
                 .ok_or_else(|| anyhow::anyhow!("AICH verification did not produce a root"))?;
@@ -6207,6 +6447,11 @@ impl Ed2kDownload {
         // files that have no per-part hashset, and acts as a belt-and-braces
         // reset for multi-part files).
         tracker.mark_file_hash_verified();
+        seal_control_rename(&self.control, &mut tracker);
+        let final_path = completed_dir.join(completed_download_name(
+            tracker.file_name(),
+            &self.file_name,
+        ));
         {
             let pp = part_path.clone();
             let fp = final_path.clone();
@@ -6298,6 +6543,41 @@ fn outstanding_requests_for_speed_with_remaining(
     ((blocks + 2) / 3).max(1)
 }
 
+/// Display name used when a finished `.part` is moved into Downloads.
+///
+/// The `.part` itself is named by transfer id, so a rename while downloading
+/// is metadata: the live tracker holds the current name, and this is what
+/// completion must read. An empty tracker name (a tracker that never got
+/// `set_file_name`) falls back to the name the download task started with.
+pub(super) fn completed_download_name(tracker_name: &str, fallback: &str) -> String {
+    crate::security::sanitize_filename(if tracker_name.is_empty() {
+        fallback
+    } else {
+        tracker_name
+    })
+}
+
+pub(super) fn apply_control_rename(
+    control: &crate::sharing::manager::TransferControl,
+    tracker: &mut super::part_tracker::PartTracker,
+) {
+    if let Some(name) = control.pending_rename() {
+        tracker.set_file_name(&name);
+    }
+}
+
+/// [`apply_control_rename`] for the moment completion reads the name it moves
+/// the file under: renames after this are refused rather than left to relabel
+/// a row whose file already carries the old name.
+pub(super) fn seal_control_rename(
+    control: &crate::sharing::manager::TransferControl,
+    tracker: &mut super::part_tracker::PartTracker,
+) {
+    if let Some(name) = control.seal_pending_rename() {
+        tracker.set_file_name(&name);
+    }
+}
+
 /// Writes an empty `.part`, verifies ed2k hash ([`super::hash::empty_ed2k_file_md4`]), moves to Downloads.
 pub(super) async fn finalize_zero_ed2k_file(
     transfer_id: &str,
@@ -6312,24 +6592,7 @@ pub(super) async fn finalize_zero_ed2k_file(
         );
     }
     let allowed = vec![download_dir.to_string_lossy().into_owned()];
-    let temp_dir = {
-        let root = download_dir.to_path_buf();
-        let allowed = allowed.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::security::filesystem::prepare_approved_subdir(&root, "Temp", &allowed)
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("temp dir task failed: {error}"))??
-    };
-    let completed_dir = {
-        let root = download_dir.to_path_buf();
-        let allowed = allowed.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::security::filesystem::prepare_approved_subdir(&root, "Downloads", &allowed)
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("downloads dir task failed: {error}"))??
-    };
+    let (temp_dir, completed_dir) = prepare_download_dirs(download_dir).await?;
     let safe_name = crate::security::sanitize_filename(file_name);
     let part_path = temp_dir.join(format!("{transfer_id}.part"));
     let final_path = completed_dir.join(&safe_name);
@@ -6814,6 +7077,20 @@ pub(crate) async fn maybe_send_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     Ok(Some(challenge))
 }
 
+/// A peer's IPv4 as SecIdent v2 signs it: eMule's in-memory network-order
+/// `dwIP`, which `PokeUInt32` writes back out as the octets in order
+/// (`ClientCredits.cpp:440, :481-495`) — the same form as a HighID client ID,
+/// not the big-endian value credit bookkeeping keys on.
+fn secident_wire_ip(peer_addr: SocketAddr) -> u32 {
+    match peer_addr.ip() {
+        std::net::IpAddr::V4(v4) => u32::from_le_bytes(v4.octets()),
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(|v4| u32::from_le_bytes(v4.octets()))
+            .unwrap_or(0),
+    }
+}
+
 pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Sized>(
     writer: &mut W,
     credit_manager: Option<&Arc<tokio::sync::RwLock<CreditManager>>>,
@@ -6827,13 +7104,6 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     let Some(cm) = credit_manager else {
         return Ok(());
     };
-    let peer_ip_u32 = match peer_addr.ip() {
-        std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(|v4| u32::from_be_bytes(v4.octets()))
-            .unwrap_or(0),
-    };
     let (challenge_ip_kind, challenge_ip, add_trailer) = if (peer_secident_level & 1) != 0 {
         (None, 0u32, false)
     } else {
@@ -6841,7 +7111,7 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
         if our_client_id == 0 || our_client_id < 0x0100_0000 {
             (
                 Some(super::credits::CRYPT_CIP_REMOTECLIENT),
-                peer_ip_u32,
+                secident_wire_ip(peer_addr),
                 true,
             )
         } else {
@@ -6935,7 +7205,7 @@ pub(crate) async fn handle_secident_signature(
             &peer_user_hash,
             challenge,
             challenge_kind,
-            peer_ip_u32,
+            secident_wire_ip(peer_addr),
             local_ip,
             sig_bytes,
         )
@@ -7030,20 +7300,22 @@ async fn wait_for_aich_recovery_answer<R: AsyncReadExt + Unpin + ?Sized>(
             // packed frame is capped at 2 MiB on the wire but may inflate to
             // 10 MiB — roughly 640 MiB resident per connection, on a path the
             // sender reaches by corrupting a part so its MD4 fails. Both limits
-            // leave the stream on a packet boundary, so refusing is safe either
-            // way.
+            // leave the stream on a packet boundary, so giving up on the answer
+            // is safe either way. The packet just read is kept (overshooting
+            // the byte cap by at most one packet): it is usually a requested
+            // data block, and dropping it loses that range for the session.
             const MAX_DEFERRED_PACKETS: usize = 64;
             const MAX_DEFERRED_BYTES: usize = 4 * 1024 * 1024;
+            deferred_packets.push_back((proto, opcode, payload));
             let deferred_bytes: usize = deferred_packets
                 .iter()
                 .map(|(_, _, buffered)| buffered.len())
                 .sum();
             if deferred_packets.len() >= MAX_DEFERRED_PACKETS
-                || deferred_bytes.saturating_add(payload.len()) > MAX_DEFERRED_BYTES
+                || deferred_bytes >= MAX_DEFERRED_BYTES
             {
                 return AichAnswerOutcome::NotAvailable;
             }
-            deferred_packets.push_back((proto, opcode, payload));
         }
     };
 
@@ -7068,30 +7340,116 @@ async fn wait_for_aich_recovery_answer<R: AsyncReadExt + Unpin + ?Sized>(
 /// could hold a callback download at 0% for close to half an hour without ever
 /// timing out. `multi_source` has always used the short handshake bound here,
 /// for the reason its constant documents.
+///
+/// A timeout while no packet has begun is a plain `TimedOut` and leaves the
+/// stream on a packet boundary; a stall part-way through a packet is reported
+/// as [`PacketStreamDesynced`] (see [`read_packet_within`]).
 async fn read_packet_with_timeout<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(super::multi_source::HANDSHAKE_READ_TIMEOUT_SECS),
-        read_packet_async(reader),
+    let bound =
+        std::time::Duration::from_secs(super::multi_source::HANDSHAKE_READ_TIMEOUT_SECS);
+    read_packet_within(reader, bound, bound)
+        .await?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))
+}
+
+/// Carried inside the `io::Error` of a packet read that was abandoned after
+/// consuming part of a packet. The next read would start mid-frame (and, on an
+/// obfuscated link, mid-keystream), so the connection must be dropped.
+#[derive(Debug)]
+pub(super) struct PacketStreamDesynced(String);
+
+impl std::fmt::Display for PacketStreamDesynced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}; stream can no longer be framed", self.0)
+    }
+}
+
+impl std::error::Error for PacketStreamDesynced {}
+
+pub(super) fn packet_stream_desynced_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        PacketStreamDesynced("peer stalled mid-packet".to_string()),
     )
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
+}
+
+/// Re-tag an error raised after a packet's first byte was consumed. The kind
+/// is kept so reset/EOF classification still sees it.
+pub(super) fn desynced_io_error(cause: std::io::Error) -> std::io::Error {
+    if cause
+        .get_ref()
+        .is_some_and(|inner| inner.is::<PacketStreamDesynced>())
+    {
+        return cause;
+    }
+    std::io::Error::new(cause.kind(), PacketStreamDesynced(cause.to_string()))
+}
+
+pub(super) fn is_packet_stream_desynced(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+            .is_some_and(|inner| inner.is::<PacketStreamDesynced>())
+    })
+}
+
+/// Wait up to `start_within` for a packet to begin, then up to `finish_within`
+/// for the rest of it.
+///
+/// Only the protocol byte races the idle deadline: a one-byte read consumes
+/// that byte or nothing, so `Ok(None)` leaves the stream on a packet boundary.
+/// Once a packet has begun, abandoning it would strand the reader mid-frame,
+/// so that expiry is an error carrying [`PacketStreamDesynced`].
+async fn read_packet_within<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
+    start_within: std::time::Duration,
+    finish_within: std::time::Duration,
+) -> std::io::Result<Option<(u8, u8, Vec<u8>)>> {
+    let protocol = match tokio::time::timeout(start_within, reader.read_u8()).await {
+        Ok(result) => result?,
+        Err(_) => return Ok(None),
+    };
+    match tokio::time::timeout(finish_within, read_packet_body(reader, protocol)).await {
+        Ok(result) => result.map(Some),
+        Err(_) => Err(packet_stream_desynced_error()),
+    }
 }
 
 async fn read_packet_async<R: AsyncReadExt + Unpin + ?Sized>(
     reader: &mut R,
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
-    const OP_PACKEDPROT: u8 = 0xD4;
     let protocol = reader.read_u8().await?;
-    let length = reader.read_u32_le().await? as usize;
+    read_packet_body(reader, protocol).await
+}
+
+/// [`read_packet_async`] that sets `started` once the first byte is consumed,
+/// so a caller dropping the future can tell whether the stream is still framed.
+async fn read_packet_marking_start<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
+    started: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<(u8, u8, Vec<u8>)> {
+    let protocol = reader.read_u8().await?;
+    started.store(true, std::sync::atomic::Ordering::Relaxed);
+    read_packet_body(reader, protocol).await
+}
+
+/// The rest of a packet once its protocol byte has been read.
+async fn read_packet_body<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
+    protocol: u8,
+) -> std::io::Result<(u8, u8, Vec<u8>)> {
+    const OP_PACKEDPROT: u8 = 0xD4;
+    let length = reader.read_u32_le().await.map_err(desynced_io_error)? as usize;
     if length == 0 || length > MAX_WIRE_PACKET_LEN {
-        return Err(std::io::Error::new(
+        return Err(desynced_io_error(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid packet length",
-        ));
+        )));
     }
-    let opcode = reader.read_u8().await?;
+    let opcode = reader.read_u8().await.map_err(desynced_io_error)?;
     let payload_len = length - 1;
     // Grow the buffer on the heap with bytes that actually arrive rather than
     // trusting the declared length up front. A peer that announces a large
@@ -7109,7 +7467,10 @@ async fn read_packet_async<R: AsyncReadExt + Unpin + ?Sized>(
         let want = remaining.min(READ_STEP);
         let start = payload.len();
         payload.resize(start + want, 0);
-        reader.read_exact(&mut payload[start..start + want]).await?;
+        reader
+            .read_exact(&mut payload[start..start + want])
+            .await
+            .map_err(desynced_io_error)?;
         remaining -= want;
     }
     if protocol == OP_PACKEDPROT {
@@ -7154,4 +7515,158 @@ async fn write_packet_async<W: AsyncWriteExt + Unpin + ?Sized>(
     writer.write_all(payload).await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod packet_framing_tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn send(peer: &mut tokio::io::DuplexStream, protocol: u8, opcode: u8, payload: &[u8]) {
+        write_packet_async(peer, protocol, opcode, payload)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_packet_split_across_the_idle_tick_is_read_whole() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        let writer = tokio::spawn(async move {
+            let mut frame = Vec::new();
+            write_packet_async(&mut frame, OP_EDONKEYHEADER, OP_HASHSETANSWER, &[0x5A; 700])
+                .await
+                .unwrap();
+            peer.write_all(&frame[..4]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            peer.write_all(&frame[4..]).await.unwrap();
+            send(&mut peer, OP_EMULEPROT, OP_SECIDENTSTATE, &[1, 2, 3, 4, 5]).await;
+            peer
+        });
+
+        let got = read_packet_within(&mut reader, Duration::from_millis(40), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(got, Some((OP_EDONKEYHEADER, OP_HASHSETANSWER, vec![0x5A; 700])));
+        let next = read_packet_within(&mut reader, Duration::from_millis(40), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(next, Some((OP_EMULEPROT, OP_SECIDENTSTATE, vec![1, 2, 3, 4, 5])));
+        drop(writer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_idle_tick_leaves_the_stream_framed() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        assert_eq!(
+            read_packet_within(&mut reader, Duration::from_millis(20), Duration::from_secs(5))
+                .await
+                .unwrap(),
+            None
+        );
+        send(&mut peer, OP_EMULEPROT, OP_PUBLICKEY, &[3, 9, 9, 9]).await;
+        assert_eq!(
+            read_packet_within(&mut reader, Duration::from_millis(500), Duration::from_secs(5))
+                .await
+                .unwrap(),
+            Some((OP_EMULEPROT, OP_PUBLICKEY, vec![3, 9, 9, 9]))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stall_mid_packet_is_reported_as_desync() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        let mut frame = Vec::new();
+        write_packet_async(&mut frame, OP_EDONKEYHEADER, OP_HASHSETANSWER, &[0; 64])
+            .await
+            .unwrap();
+        peer.write_all(&frame[..7]).await.unwrap();
+        let err = read_packet_within(&mut reader, Duration::from_millis(500), Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(is_packet_stream_desynced(
+            &anyhow::Error::from(err).context("stage:hashset_wait")
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_invalid_length_after_the_header_is_a_desync() {
+        let (mut peer, mut reader) = tokio::io::duplex(64);
+        peer.write_all(&[OP_EDONKEYHEADER, 0, 0, 0, 0, OP_HASHSETANSWER])
+            .await
+            .unwrap();
+        let err = read_packet_with_timeout(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(is_packet_stream_desynced(
+            &anyhow::Error::from(err).context("stage:hashset_wait")
+        ));
+    }
+
+    #[tokio::test]
+    async fn eof_mid_packet_is_a_desync_but_eof_on_a_boundary_is_not() {
+        let (mut peer, mut reader) = tokio::io::duplex(64);
+        let mut frame = Vec::new();
+        write_packet_async(&mut frame, OP_EMULEPROT, OP_PUBLICKEY, &[0; 20])
+            .await
+            .unwrap();
+        peer.write_all(&frame[..12]).await.unwrap();
+        drop(peer);
+        let err = read_packet_async(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(is_packet_stream_desynced(&anyhow::Error::from(err)));
+
+        let (peer, mut reader) = tokio::io::duplex(64);
+        drop(peer);
+        let err = read_packet_async(&mut reader).await.unwrap_err();
+        assert!(!is_packet_stream_desynced(&anyhow::Error::from(err)));
+    }
+
+    #[tokio::test]
+    async fn a_bad_packed_payload_leaves_the_stream_framed() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        send(&mut peer, 0xD4, 0x40, &[0xDE, 0xAD, 0xBE, 0xEF]).await;
+        send(&mut peer, OP_EMULEPROT, OP_PUBLICKEY, &[1]).await;
+        let err = read_packet_async(&mut reader).await.unwrap_err();
+        assert!(!is_packet_stream_desynced(&anyhow::Error::from(err)));
+        assert_eq!(
+            read_packet_async(&mut reader).await.unwrap(),
+            (OP_EMULEPROT, OP_PUBLICKEY, vec![1])
+        );
+    }
+
+    #[test]
+    fn retagging_keeps_the_kind_and_message() {
+        let tagged = desynced_io_error(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "forcibly closed",
+        ));
+        assert_eq!(tagged.kind(), std::io::ErrorKind::ConnectionReset);
+        assert!(tagged.to_string().contains("forcibly closed"));
+        let twice = desynced_io_error(tagged);
+        assert_eq!(
+            twice.to_string(),
+            "forcibly closed; stream can no longer be framed"
+        );
+    }
+
+    #[tokio::test]
+    async fn marking_read_flags_a_packet_only_once_it_has_begun() {
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        let started = std::sync::atomic::AtomicBool::new(false);
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            read_packet_marking_start(&mut reader, &started)
+        )
+        .await
+        .is_err());
+        assert!(!started.load(std::sync::atomic::Ordering::Relaxed));
+
+        peer.write_all(&[OP_EDONKEYHEADER, 9]).await.unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            read_packet_marking_start(&mut reader, &started)
+        )
+        .await
+        .is_err());
+        assert!(started.load(std::sync::atomic::Ordering::Relaxed));
+    }
 }

@@ -17,13 +17,12 @@ const MAX_OUTGOING_PER_IP_PER_SEC: u32 = 30;
 /// packets, so one response per request is too strict; leaving the request as
 /// an unlimited pass until the 180s expiry is too loose.
 ///
-/// Sized to carry a whole `FETCH_PAGE_SIZE` page of results. A responder
-/// fragments a page to fit `UDP_KAD_MAXFRAGMENT` (1420 bytes), so at the ~120
-/// bytes a keyword entry with a typical filename occupies, a 200-entry page
-/// needs roughly 18 datagrams. The previous 8 admitted only ~88 entries, so the
-/// page-complete test that drives pagination could never fire for realistic
-/// result sizes and every peer contributed only part of its first page.
-const SEARCH_RES_BUDGET_PER_REQUEST: u32 = 20;
+/// Sized to carry a whole eMule answer. eMule returns up to 300 results per
+/// request (`Indexed.cpp`) and fragments them at `UDP_KAD_MAXFRAGMENT` (1420
+/// bytes) of uncompressed data; keyword entries with publisher, AICH and
+/// media tags run 150-250 bytes, so a full answer is 35-60 datagrams. The
+/// previous 20 kept well under half of a popular keyword's results.
+const SEARCH_RES_BUDGET_PER_REQUEST: u32 = 64;
 
 /// Per-IP global cap (second-level, matching eMule's "massive flood" detection).
 const MAX_PACKETS_PER_SEC_UNKNOWN: u32 = 20;
@@ -41,17 +40,12 @@ const MAX_PACKETS_PER_SEC_KNOWN: u32 = 40;
 const MAX_EMBER_PACKETS_PER_SEC_UNKNOWN: u32 = 20;
 const MAX_EMBER_PACKETS_PER_SEC_KNOWN: u32 = 40;
 
-/// Request opcodes whose responses are big enough to arrive packed. An
-/// outstanding one of these in `outgoing_requests` marks the source as
-/// answering us, which exempts it from the aggregate compressed budget in
-/// `over_compressed_budget`.
-const PACKED_RESPONSE_REQUESTS: [u8; 5] = [
-    0x01, // BootstrapReq -> BootstrapRes (up to 20 contacts)
-    0x21, // KadReq -> KadRes
-    0x33, // SearchKeyReq -> SearchRes
-    0x34, // SearchSourceReq -> SearchRes
-    0x35, // SearchNotesReq -> SearchRes
-];
+/// Datagrams past each per-IP cap that one of our Search*Req buys its node.
+/// eMule sends a whole answer as one burst, and that burst is the only
+/// traffic that may exceed the caps; bounding it per request keeps a node
+/// we queried from buying unlimited decrypt and unpack work with packets
+/// that never turn out to be results.
+const SEARCH_BURST_PER_REQUEST: u32 = SEARCH_RES_BUDGET_PER_REQUEST;
 
 const MAX_IP_ENTRIES: usize = 10_000;
 const MAX_OPCODE_ENTRIES: usize = 50_000;
@@ -245,6 +239,10 @@ pub struct FloodProtection {
     /// Bounded SearchRes batches per outstanding Search* request. SearchRes is
     /// the one response type that is legitimately multi-packet per request.
     search_response_budgets: HashMap<(IpAddr, u8), u32>,
+    /// What is left of [`SEARCH_BURST_PER_REQUEST`] per queried IP: datagrams
+    /// past the per-IP packet cap, and packed datagrams past the per-IP
+    /// decompression cap.
+    search_bursts: HashMap<IpAddr, (u32, u32)>,
     request_times: HashMap<(IpAddr, u8), Instant>,
     outgoing_counters: HashMap<IpAddr, (u32, Instant)>,
     recent_ips: HashMap<IpAddr, Instant>,
@@ -327,6 +325,7 @@ impl FloodProtection {
             opcode_counters: HashMap::new(),
             outgoing_requests: HashMap::new(),
             search_response_budgets: HashMap::new(),
+            search_bursts: HashMap::new(),
             request_times: HashMap::new(),
             outgoing_counters: HashMap::new(),
             recent_ips: HashMap::new(),
@@ -379,7 +378,9 @@ impl FloodProtection {
     /// K21: returns true when `ip` has exceeded its compressed-packet
     /// decompression budget for the current 1-second window. Callers
     /// should drop the packet (skip decompression) when this is true.
-    pub fn over_compressed_budget(&mut self, ip: IpAddr, wire_bytes: usize) -> bool {
+    ///
+    /// `opcode` is the packed packet's second byte, which zlib does not cover.
+    pub fn over_compressed_budget(&mut self, ip: IpAddr, opcode: u8, wire_bytes: usize) -> bool {
         const MAX_COMPRESSED_PER_SEC: u32 = 10;
         const MAX_COMPRESSED_BYTES_PER_SEC: usize = 64 * 1024;
         const MAX_COMPRESSED_ENTRIES: usize = 10_000;
@@ -404,8 +405,8 @@ impl FloodProtection {
         // A peer answering a request we actually sent must never be starved by
         // unsolicited traffic from elsewhere: the aggregate budget exists to
         // bound decompression work from strangers, not to drop the search
-        // results we asked for. Probing the fixed set of request opcodes whose
-        // replies can arrive packed keeps this O(1) on the packet path.
+        // results we asked for. Only the reply type the request asked for
+        // counts, so a node we queried gets no exemption for anything else.
         //
         // Established before the per-IP table is consulted because table
         // pressure must not deny it either: the table holds one row per source
@@ -413,9 +414,7 @@ impl FloodProtection {
         // `MAX_COMPRESSED_ENTRIES` spoofed addresses at a packet a second
         // otherwise blackhole every packed `KADEMLIA2_SEARCH_RES` we are
         // waiting on.
-        let solicited = PACKED_RESPONSE_REQUESTS
-            .iter()
-            .any(|opcode| self.outgoing_requests.contains_key(&(ip, *opcode)));
+        let solicited = self.answers_outstanding_request(ip, opcode);
 
         let has_slot = if self.compressed_counters.contains_key(&ip) {
             true
@@ -446,12 +445,18 @@ impl FloodProtection {
                 entry.0 = entry.0.saturating_add(1);
                 entry.1 = entry.1.saturating_add(wire_bytes);
             }
-            if entry.0 > MAX_COMPRESSED_PER_SEC || entry.1 > MAX_COMPRESSED_BYTES_PER_SEC {
-                // Return before charging the aggregate counter. Charging it
-                // first meant a source already over its own allowance still
-                // spent budget it was never going to be permitted to use,
-                // which is what let a handful of spoofed addresses buy a
-                // global denial for free.
+            let over_source_budget =
+                entry.0 > MAX_COMPRESSED_PER_SEC || entry.1 > MAX_COMPRESSED_BYTES_PER_SEC;
+            // Return before charging the aggregate counter. Charging it
+            // first meant a source already over its own allowance still
+            // spent budget it was never going to be permitted to use,
+            // which is what let a handful of spoofed addresses buy a
+            // global denial for free.
+            //
+            // A search answer is exempt, up to its burst allowance: eMule
+            // sends a whole one as a burst of packed datagrams, well past
+            // ten a second.
+            if over_source_budget && !(opcode == 0x3B && self.take_search_burst(ip, true)) {
                 return true;
             }
         }
@@ -611,7 +616,7 @@ impl FloodProtection {
         // relationship with degrade onto a shared counter; strangers are
         // still refused. `over_per_ip_budget` owns that rule.
         let has_relationship = self.has_relationship(ip, known_peer);
-        over_per_ip_budget(
+        let over = over_per_ip_budget(
             &mut self.ip_counters,
             &mut self.ip_order,
             &mut self.ip_fallback,
@@ -619,7 +624,12 @@ impl FloodProtection {
             max_packets,
             has_relationship,
             now,
-        )
+        );
+        // A node answering one of our searches sends its results as a single
+        // burst of datagrams, past the per-second cap. Each request buys it a
+        // bounded overrun. Obfuscated packets (0xFF) cannot be told apart
+        // until decrypted and draw on the same allowance.
+        over && !(matches!(opcode, 0x3B | 0xFF) && self.take_search_burst(ip, false))
     }
 
     /// Returns true if a packet from port 53 should be dropped (unencrypted).
@@ -673,6 +683,9 @@ impl FloodProtection {
         if matches!(opcode, 0x33..=0x35) {
             let budget = self.search_response_budgets.entry(key).or_insert(0);
             *budget = budget.saturating_add(SEARCH_RES_BUDGET_PER_REQUEST);
+            let burst = self.search_bursts.entry(addr.ip()).or_insert((0, 0));
+            burst.0 = burst.0.saturating_add(SEARCH_BURST_PER_REQUEST);
+            burst.1 = burst.1.saturating_add(SEARCH_BURST_PER_REQUEST);
         }
         // `request_times` is dual-purpose:
         //   1. `cleanup()` expires (ip, opcode) entries whose most
@@ -795,6 +808,45 @@ impl FloodProtection {
         false
     }
 
+    /// Whether `ip` still has `KADEMLIA2_SEARCH_RES` budget from one of our
+    /// Search*Req.
+    fn awaiting_search_results(&self, ip: IpAddr) -> bool {
+        [0x33u8, 0x34, 0x35].iter().any(|opcode| {
+            self.search_response_budgets
+                .get(&(ip, *opcode))
+                .is_some_and(|budget| *budget > 0)
+        })
+    }
+
+    /// Whether a packet with `opcode` from `ip` is the reply to a request we
+    /// have outstanding there.
+    fn answers_outstanding_request(&self, ip: IpAddr, opcode: u8) -> bool {
+        match opcode {
+            0x09 => self.outgoing_requests.contains_key(&(ip, 0x01)),
+            0x29 => self.outgoing_requests.contains_key(&(ip, 0x21)),
+            0x3B => self.awaiting_search_results(ip),
+            _ => false,
+        }
+    }
+
+    /// Spend one datagram of `ip`'s search burst allowance: past the packet
+    /// cap, or past the decompression cap when `packed`. False when it is
+    /// used up or no search there still expects results.
+    fn take_search_burst(&mut self, ip: IpAddr, packed: bool) -> bool {
+        if !self.awaiting_search_results(ip) {
+            return false;
+        }
+        let Some(burst) = self.search_bursts.get_mut(&ip) else {
+            return false;
+        };
+        let left = if packed { &mut burst.1 } else { &mut burst.0 };
+        if *left == 0 {
+            return false;
+        }
+        *left -= 1;
+        true
+    }
+
     /// O(1) check if we've communicated with this IP recently.
     pub fn has_recent_ip(&self, ip: IpAddr) -> bool {
         if let Some(last) = self.recent_ips.get(&ip) {
@@ -834,6 +886,11 @@ impl FloodProtection {
             self.search_response_budgets.remove(&key);
             self.request_times.remove(&key);
         }
+        self.search_bursts.retain(|ip, _| {
+            [0x33u8, 0x34, 0x35]
+                .iter()
+                .any(|opcode| self.search_response_budgets.contains_key(&(*ip, *opcode)))
+        });
 
         self.recent_ips
             .retain(|_, last| now.saturating_duration_since(*last).as_secs() < TRACKER_EXPIRY_SECS);
@@ -1148,10 +1205,10 @@ mod kad_protection_tests {
         let mut fp = FloodProtection::new();
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
         for _ in 0..10 {
-            assert!(!fp.over_compressed_budget(ip, 1400));
+            assert!(!fp.over_compressed_budget(ip, 0x43, 1400));
         }
         assert!(
-            fp.over_compressed_budget(ip, 1400),
+            fp.over_compressed_budget(ip, 0x43, 1400),
             "11th compressed packet must trip the budget"
         );
     }
@@ -1160,8 +1217,8 @@ mod kad_protection_tests {
     fn compressed_byte_budget_is_independent_of_packet_count() {
         let mut fp = FloodProtection::new();
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8));
-        assert!(!fp.over_compressed_budget(ip, 32 * 1024));
-        assert!(fp.over_compressed_budget(ip, 32 * 1024 + 1));
+        assert!(!fp.over_compressed_budget(ip, 0x43, 32 * 1024));
+        assert!(fp.over_compressed_budget(ip, 0x43, 32 * 1024 + 1));
     }
 
     /// K21: the per-IP window is charged once per source address, so a
@@ -1171,12 +1228,12 @@ mod kad_protection_tests {
         let mut fp = FloodProtection::new();
         for i in 0..16 {
             assert!(
-                !fp.over_compressed_budget(filler_ip(i), 64 * 1024),
+                !fp.over_compressed_budget(filler_ip(i), 0x43, 64 * 1024),
                 "packet {i} from a distinct source is within both budgets"
             );
         }
         assert!(
-            fp.over_compressed_budget(filler_ip(16), 64 * 1024),
+            fp.over_compressed_budget(filler_ip(16), 0x43, 64 * 1024),
             "a fresh source address must not buy more aggregate \
              decompression once the global byte budget is spent"
         );
@@ -1194,11 +1251,11 @@ mod kad_protection_tests {
         // per-IP allowance stops paying — either side of the packet cap.
         for i in 0..60 {
             for _ in 0..20 {
-                fp.over_compressed_budget(filler_ip(i), 400);
+                fp.over_compressed_budget(filler_ip(i), 0x43, 400);
             }
         }
         assert!(
-            !fp.over_compressed_budget(filler_ip(1000), 400),
+            !fp.over_compressed_budget(filler_ip(1000), 0x43, 400),
             "a flood that is already being refused per-IP must not deny \
              service to everyone else"
         );
@@ -1216,15 +1273,72 @@ mod kad_protection_tests {
         // Spend the whole aggregate byte budget from other sources, staying
         // inside each one's per-IP allowance so it is genuinely charged.
         for i in 0..17 {
-            fp.over_compressed_budget(filler_ip(i), 64 * 1024);
+            fp.over_compressed_budget(filler_ip(i), 0x43, 64 * 1024);
         }
         assert!(
-            fp.over_compressed_budget(filler_ip(100), 1400),
+            fp.over_compressed_budget(filler_ip(100), 0x3B, 1400),
             "an unsolicited source must be refused once the aggregate budget is spent"
         );
         assert!(
-            !fp.over_compressed_budget(peer.ip(), 1400),
+            fp.over_compressed_budget(peer.ip(), 0x43, 1400),
+            "nor does a peer we queried get past it with anything but the answer"
+        );
+        assert!(
+            !fp.over_compressed_budget(peer.ip(), 0x3B, 1400),
             "a SearchRes from a peer we queried must still be decoded"
+        );
+    }
+
+    /// eMule sends a whole search answer as one burst of packed datagrams;
+    /// the node we queried gets all of it past the per-IP caps, a stranger
+    /// sending the same burst does not.
+    #[test]
+    fn a_solicited_search_answer_burst_is_admitted() {
+        let mut fp = FloodProtection::new();
+        let peer: SocketAddr = "203.0.113.21:4672".parse().unwrap();
+        fp.track_request(peer, 0x34);
+        for i in 0..60 {
+            assert!(
+                !fp.check_rate_limit_with_opcode(peer.ip(), true, 0x3B),
+                "datagram {i} must pass the per-IP packet cap"
+            );
+            assert!(
+                !fp.over_compressed_budget(peer.ip(), 0x3B, 900),
+                "datagram {i} must pass the per-IP compressed cap"
+            );
+        }
+        let stranger = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 22));
+        assert!(
+            (0..60).any(|_| fp.check_rate_limit_with_opcode(stranger, true, 0x3B)),
+            "an unsolicited burst is still capped"
+        );
+    }
+
+    /// What a queried node may send past the per-IP caps is one bounded burst
+    /// per request, and only as search answers: packets that never turn out to
+    /// be results cannot buy unlimited decrypt and unpack work.
+    #[test]
+    fn a_queried_node_gets_one_bounded_burst_per_request() {
+        let mut fp = FloodProtection::new();
+        let peer: SocketAddr = "203.0.113.23:4672".parse().unwrap();
+        fp.track_request(peer, 0x34);
+
+        let other = (0..30)
+            .filter(|_| !fp.over_compressed_budget(peer.ip(), 0x29, 400))
+            .count();
+        assert_eq!(other, 10, "packed traffic other than the answer gets the plain cap");
+        let answers = (0..200)
+            .filter(|_| !fp.over_compressed_budget(peer.ip(), 0x3B, 400))
+            .count();
+        assert_eq!(answers, SEARCH_BURST_PER_REQUEST as usize);
+
+        let refused = (0..200)
+            .filter(|_| fp.check_rate_limit_with_opcode(peer.ip(), true, 0xFF))
+            .count();
+        assert_eq!(
+            refused,
+            200 - MAX_PACKETS_PER_SEC_KNOWN as usize - SEARCH_BURST_PER_REQUEST as usize,
+            "obfuscated datagrams past the cap draw on the same bounded allowance"
         );
     }
 

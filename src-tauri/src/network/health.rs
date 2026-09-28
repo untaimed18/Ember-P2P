@@ -100,6 +100,9 @@ pub(crate) struct XferFinishResult {
     pub(crate) size: u64,
     /// `"complete"` or `"failed"`, as `emit_xfer_update` reports it.
     pub(crate) status: &'static str,
+    /// Where a completed file landed, so a cancel that raced the move can
+    /// still take it back out.
+    pub(crate) final_path: Option<std::path::PathBuf>,
 }
 
 /// Outcome of one TCP STUN observation against the current TCP

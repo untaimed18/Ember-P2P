@@ -103,6 +103,7 @@ const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     "folder_priorities",
     "pending_share_states",
     "pending_file_priorities",
+    "pending_folder_allowlists",
     "shared_folder_scan_cursors",
     // Historical one-shot marker; the overlay is now always on, but the
     // renderer still must not clear it (it would re-run the migration).
@@ -174,7 +175,10 @@ fn picked_download_roots() -> &'static std::sync::Mutex<Vec<Vec<String>>> {
 
 /// Remembered in the same normalized form the change check below compares in,
 /// so a path can never be authorized and then fail to match itself.
-fn remember_picked_download_root(path: &std::path::Path) {
+///
+/// Also called by the eMule import for the incoming folder it read from an
+/// eMule folder the user picked, which is the same provenance one step removed.
+pub(crate) fn remember_picked_download_root(path: &std::path::Path) {
     const MAX_REMEMBERED: usize = 16;
     let key = normalized_path_components(path);
     let mut picked = picked_download_roots()
@@ -187,6 +191,34 @@ fn remember_picked_download_root(path: &std::path::Path) {
         picked.remove(0);
     }
     picked.push(key);
+}
+
+/// Prove a newly chosen download folder can hold a download before it is saved.
+///
+/// Creates the two subfolders every download needs and writes, syncs and removes
+/// a probe file in `Temp`, which is where a `.part` goes. The folder picker
+/// happily returns a folder the user cannot write (root-owned, read-only
+/// mount), and nothing else checks until a download starts, where the failure
+/// used to surface only as a retry loop with no mention of the folder.
+fn probe_download_folder_writable(folder: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+    for sub in ["Temp", "Downloads"] {
+        std::fs::create_dir_all(folder.join(sub))?;
+    }
+    let probe = folder
+        .join("Temp")
+        .join(format!(".ember-write-probe-{:016x}", rand::random::<u64>()));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|mut file| {
+            file.write_all(b"ember")?;
+            file.sync_all()
+        });
+    let removed = std::fs::remove_file(&probe);
+    written?;
+    removed
 }
 
 fn download_root_was_picked(path: &std::path::Path) -> bool {
@@ -342,7 +374,9 @@ pub(crate) fn elide_for_dialog(value: &str) -> String {
 pub async fn pick_download_folder(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
+    title: Option<String>,
 ) -> Result<Option<String>, String> {
+    let dialog_title = super::picker_title(title, "Choose where downloads are saved");
     if window.label() != "main" {
         return Err(coded(
             "settings_download_folder_picker_failed",
@@ -354,7 +388,7 @@ pub async fn pick_download_folder(
         picker_app
             .dialog()
             .file()
-            .set_title("Choose where downloads are saved")
+            .set_title(dialog_title)
             .blocking_pick_folder()
             .map(|folder| {
                 folder.into_path().map_err(|error| {
@@ -397,7 +431,9 @@ pub async fn pick_download_folder(
 pub async fn pick_preview_player(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
+    title: Option<String>,
 ) -> Result<Option<String>, String> {
+    let dialog_title = super::picker_title(title, "Choose a media player for Preview");
     if window.label() != "main" {
         return Err(coded(
             "settings_preview_player_picker_failed",
@@ -409,7 +445,7 @@ pub async fn pick_preview_player(
         let dialog = picker_app
             .dialog()
             .file()
-            .set_title("Choose a media player for Preview");
+            .set_title(dialog_title);
         // Filtered on Windows only. There an executable *is* its extension, so
         // the filter is a real help; on Linux the thing to pick has no
         // extension at all (`/usr/bin/mpv`) and a filter would hide every valid
@@ -447,6 +483,18 @@ pub async fn pick_preview_player(
     let Some(path) = selected else {
         return Ok(None);
     };
+    // Preview refuses to start a player from a network location, so accepting
+    // one here would only produce a setting that is silently ignored. The
+    // lexical check runs first so a UNC path is refused without being opened.
+    let not_local = || {
+        coded(
+            "settings_preview_player_not_local",
+            "Choose a media player installed on this computer, not on a network location",
+        )
+    };
+    if !crate::network::ed2k::preview::player_path_is_local(&path) {
+        return Err(not_local());
+    }
     // A directory would spawn nothing; catching it here means the Settings
     // form never shows a path that Preview would then quietly ignore.
     if !path.is_file() {
@@ -454,6 +502,11 @@ pub async fn pick_preview_player(
             "settings_preview_player_not_a_file",
             "That is not a program",
         ));
+    }
+    // The launch's own validator: a local-looking path that links onto a
+    // share, or cannot be resolved, is ignored by Preview.
+    if !crate::network::ed2k::preview::player_is_usable(&path) {
+        return Err(not_local());
     }
     remember_picked_preview_player(&path);
     Ok(Some(path.to_string_lossy().into_owned()))
@@ -597,10 +650,10 @@ fn prune_removed_shared_folder_state(
     }
     let is_under_removed_root = |path: &str| {
         removed_folders.iter().any(|root| {
-            crate::security::path_matches_dir(path, root)
+            crate::security::path_within_dir(path, root)
                 && !active_folders
                     .iter()
-                    .any(|active| crate::security::path_matches_dir(path, active))
+                    .any(|active| crate::security::path_within_dir(path, active))
         })
     };
 
@@ -613,6 +666,9 @@ fn prune_removed_shared_folder_state(
     settings
         .pending_file_priorities
         .retain(|path, _| !is_under_removed_root(path));
+    settings
+        .pending_folder_allowlists
+        .retain(|folder, _| !is_under_removed_root(folder));
     settings
         .shared_folder_scan_cursors
         .retain(|folder, _| !is_under_removed_root(folder));
@@ -680,6 +736,14 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     } else if offers != settings.channel_file_offers {
         settings.channel_file_offers = offers;
+        changed = true;
+    }
+
+    // Past the attachment size cap the ceiling means nothing, and a hand-edited
+    // config with an absurd value should read as "accept everything a friend can
+    // send", not overflow the byte arithmetic that compares against it.
+    if settings.chat_attachment_auto_accept_mb > crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB {
+        settings.chat_attachment_auto_accept_mb = crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB;
         changed = true;
     }
 
@@ -837,6 +901,13 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         return Err(coded(
             "settings_channel_file_offers_invalid",
             "Channel file offers must be 'everyone', 'friends', or 'nobody'",
+        ));
+    }
+    if settings.chat_attachment_auto_accept_mb > crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB {
+        return Err(coded_ctx(
+            "settings_chat_attachment_auto_accept_invalid",
+            "The automatic download limit is larger than any file a friend can send",
+            crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB,
         ));
     }
     if settings.update_check_frequency != "daily"
@@ -1141,16 +1212,16 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
                 folder,
             ));
         }
-        if is_filesystem_root(path)
-            || path
-                .canonicalize()
-                .ok()
-                .as_deref()
-                .is_some_and(is_filesystem_root)
-        {
+        // A data drive's root is allowed: it only reaches the config through
+        // `add_shared_folder_limited`, which asked first, or an eMule import
+        // the user approved. The system and profile drives never are.
+        let refused_root = |p: &std::path::Path| {
+            crate::sharing::drive_root_share(p) == crate::sharing::DriveRootShare::Refused
+        };
+        if refused_root(path) || path.canonicalize().ok().as_deref().is_some_and(refused_root) {
             return Err(coded_ctx(
                 "settings_shared_folder_root",
-                "Cannot share a filesystem root",
+                "Cannot share the system drive or the drive holding your user profile",
                 folder,
             ));
         }
@@ -1207,6 +1278,24 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Best-effort undo of a registry claim whose settings save then failed, so
+/// the registry and config.json go on naming the same handle. A claim is a
+/// rename, so re-claiming the previous name is the undo; with no previous name
+/// there is nothing to go back to and the stray claim is only logged.
+async fn restore_previous_username_claim(state: &AppState, previous: &str) {
+    if previous.is_empty() {
+        warn!("Settings save failed after claiming a Channel username; the registry keeps the new claim");
+        return;
+    }
+    match crate::commands::channels::claim_username_on_registry(state, previous).await {
+        Ok(_) => info!("Settings save failed; restored the previous Channel username claim"),
+        Err(error) => warn!(
+            "Settings save failed after claiming a new Channel username, and restoring the \
+             previous claim failed too: {error}"
+        ),
+    }
 }
 
 #[tauri::command]
@@ -1326,11 +1415,10 @@ pub async fn update_settings(
                 ));
             }
         } else {
-            settings.channel_username = crate::commands::channels::claim_username_on_registry(
-                &state,
-                &settings.channel_username,
-            )
-            .await?;
+            // Shape only. The registry claim is a remote side effect, so it
+            // waits until every local check below has passed.
+            settings.channel_username =
+                crate::commands::channels::sanitize_channel_username(&settings.channel_username)?;
         }
     }
     let username_changed = settings.channel_username != old_settings.channel_username
@@ -1437,6 +1525,17 @@ pub async fn update_settings(
                     "Choose the download folder with Browse before saving",
                 ));
             }
+            let folder = std::path::PathBuf::from(&settings.download_folder);
+            tokio::task::spawn_blocking(move || probe_download_folder_writable(&folder))
+                .await
+                .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?
+                .map_err(|e| {
+                    coded_ctx(
+                        "settings_download_folder_not_writable",
+                        "Ember cannot write to this download folder",
+                        e,
+                    )
+                })?;
             explicit_additions.push(settings.download_folder.clone());
         }
         // Same provenance rule for the media player, and the same narrowness:
@@ -1481,9 +1580,20 @@ pub async fn update_settings(
                 &settings.download_folder,
             )
             .await;
+        // Last, immediately before the commit and still under
+        // `settings_save_lock`: any refusal after the claim would leave the
+        // registry and config.json naming different handles. The claim stores
+        // the sanitized form already in `settings`, so `save_data` is accurate.
+        if username_changed {
+            crate::commands::channels::claim_username_on_registry(
+                &state,
+                &settings.channel_username,
+            )
+            .await?;
+        }
         let download_folder = settings.download_folder.clone();
         let (data, tmp, final_path) = save_data;
-        tokio::task::spawn_blocking(move || {
+        let persisted = tokio::task::spawn_blocking(move || {
             let mut reapprovals = Vec::new();
             if reapprove_download_root
                 && !download_folder.is_empty()
@@ -1504,8 +1614,14 @@ pub async fn update_settings(
             )
         })
         .await
-        .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?
-        .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
+        .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))
+        .and_then(|result| result.map_err(|e| coded_ctx("settings_save_failed", "Save failed", e)));
+        if let Err(error) = persisted {
+            if username_changed {
+                restore_previous_username_claim(&state, &old_settings.channel_username).await;
+            }
+            return Err(error);
+        }
     }
     {
         let mut config = state.config.write().await;
@@ -1551,9 +1667,22 @@ pub async fn update_settings(
     // lock, preserving commit order with a concurrent settings save. Root
     // reconciliation below may wait for a scan that persists cursors under
     // this same lock, so it must run only after the durable transaction ends.
-    let runtime_update_deferred = match state.network_tx.try_send(NetworkCommand::UpdateSettings {
-        settings: settings.clone(),
-    }) {
+    //
+    // Waits briefly for room rather than giving up at once. By now the
+    // approved-root set already names the new download folder and no longer
+    // names the old one, so a dropped update left the loop starting every
+    // download in a folder it could no longer write to until a restart. A full
+    // queue is a busy loop, not a dead one, and a few seconds is normally enough.
+    let runtime_update_deferred = match state
+        .network_tx
+        .send_timeout(
+            NetworkCommand::UpdateSettings {
+                settings: settings.clone(),
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    {
         Ok(()) => false,
         Err(e) => {
             tracing::warn!(
@@ -1875,8 +2004,10 @@ pub async fn download_ipfilter(
     {
         let filter_path_w = filter_path.clone();
         let write_bytes = extracted.clone();
+        // Gated so a manual range edit still queued on the network task can't
+        // land the old list over this one.
         tokio::task::spawn_blocking(move || {
-            crate::security::atomic_write(&filter_path_w, &write_bytes, false)
+            crate::network::write_ipfilter_dat_superseding(&filter_path_w, &write_bytes)
         })
         .await
         .map_err(|e| coded_ctx("settings_save_task_failed", "Save task failed", e))?
@@ -1964,6 +2095,7 @@ pub async fn download_ipfilter(
 
 #[tauri::command]
 pub fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
+    crate::commands::chat_window::set_chat_window_visible(&app, false);
     if let Some(window) = app.get_webview_window("main") {
         window.hide().map_err(|e| {
             coded_ctx(
@@ -1978,6 +2110,7 @@ pub fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    crate::commands::chat_window::set_chat_window_visible(&app, true);
     if let Some(window) = app.get_webview_window("main") {
         // Unminimize first — `show()` doesn't restore from minimized on
         // Windows, only from the hidden state. Without this the tray-icon
@@ -2503,13 +2636,15 @@ pub async fn open_web_service(
 #[tauri::command]
 pub async fn pick_and_import_webservices_file(
     app: tauri::AppHandle,
+    title: Option<String>,
 ) -> Result<Option<Vec<crate::webservices::WebService>>, String> {
+    let dialog_title = super::picker_title(title, "Choose an eMule webservices.dat");
     let picker = app.clone();
     let selected = tokio::task::spawn_blocking(move || {
         picker
             .dialog()
             .file()
-            .set_title("Choose an eMule webservices.dat")
+            .set_title(dialog_title)
             .add_filter("eMule web services", &["dat", "txt"])
             .blocking_pick_file()
             .map(|file| {
@@ -2713,6 +2848,34 @@ pub async fn open_ember_share(target: String, text: String) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Removing one root must not prune state that belongs to a whole-drive
+    /// share still in the list, and removing the drive share prunes its own.
+    #[cfg(windows)]
+    #[test]
+    fn pruning_a_removed_root_respects_a_shared_drive_root() {
+        let drive = r"\\?\D:\".to_string();
+        let other = r"\\?\E:\Music".to_string();
+        let on_drive = crate::search::index::normalize_path_key(r"D:\Films\a.mkv");
+        let on_other = crate::search::index::normalize_path_key(r"E:\Music\b.mp3");
+        let mut settings = AppSettings::default();
+        settings.pending_share_states.insert(on_drive.clone(), false);
+        settings.pending_share_states.insert(on_other.clone(), false);
+
+        prune_removed_shared_folder_state(
+            &mut settings,
+            std::slice::from_ref(&other),
+            std::slice::from_ref(&drive),
+        );
+        assert!(settings.pending_share_states.contains_key(&on_drive));
+        assert!(!settings.pending_share_states.contains_key(&on_other));
+
+        prune_removed_shared_folder_state(&mut settings, std::slice::from_ref(&drive), &[]);
+        assert!(
+            settings.pending_share_states.is_empty(),
+            "unsharing the drive clears what was kept under it"
+        );
+    }
 
     /// A link in a room is written by whoever is in the room. `opener::open`
     /// hands whatever it is given to the shell, so the scheme check is the
@@ -2969,6 +3132,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_download_folder_probe_leaves_only_the_folders_downloads_need() {
+        let base = std::env::temp_dir().join(format!("ember-probe-{:016x}", rand::random::<u64>()));
+        let folder = base.join("Ember");
+        std::fs::create_dir_all(&folder).unwrap();
+
+        probe_download_folder_writable(&folder).expect("a writable folder passes");
+        assert!(folder.join("Downloads").is_dir());
+        let leftovers: Vec<_> = std::fs::read_dir(folder.join("Temp")).unwrap().collect();
+        assert!(leftovers.is_empty(), "the probe file must be removed: {leftovers:?}");
+
+        // A path that cannot be a folder at all: its parent is a file.
+        let file = base.join("not-a-folder");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(probe_download_folder_writable(&file.join("Ember")).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The default has to be absolute, or `AppSettings::default()` composes
     /// `completed_dir` against whatever directory the process happens to be in.
     #[test]
@@ -3200,6 +3382,10 @@ mod tests {
         authoritative
             .pending_file_priorities
             .insert("/trusted/share/pending.bin".into(), "release".into());
+        authoritative.pending_folder_allowlists.insert(
+            "/trusted/share".into(),
+            vec!["/trusted/share/keep.bin".into()],
+        );
         authoritative
             .shared_folder_scan_cursors
             .insert("/trusted/share".into(), "cursor-7".into());
@@ -3228,6 +3414,10 @@ mod tests {
             serde_json::json!({"/renderer/injected/file": "high"}),
         );
         object.insert(
+            "pending_folder_allowlists".into(),
+            serde_json::json!({"/renderer/injected": ["/renderer/injected/file"]}),
+        );
+        object.insert(
             "shared_folder_scan_cursors".into(),
             serde_json::json!({"/renderer/injected": "stolen"}),
         );
@@ -3247,6 +3437,10 @@ mod tests {
         assert_eq!(
             merged.pending_file_priorities,
             authoritative.pending_file_priorities
+        );
+        assert_eq!(
+            merged.pending_folder_allowlists,
+            authoritative.pending_folder_allowlists
         );
         assert_eq!(
             merged.shared_folder_scan_cursors,

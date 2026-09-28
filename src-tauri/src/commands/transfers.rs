@@ -127,6 +127,27 @@ pub(crate) fn emit_transfer_status(
     );
 }
 
+/// One `transfer-status-batch` event for a batch command instead of a
+/// `transfer-status` per row. Carries the same `{id, status}` items.
+pub(crate) fn emit_transfer_statuses(app: &tauri::AppHandle, statuses: &[(String, TransferStatus)]) {
+    if statuses.is_empty() {
+        return;
+    }
+    let items: Vec<serde_json::Value> = statuses
+        .iter()
+        .map(|(id, status)| {
+            serde_json::json!({
+                "id": id,
+                "status": transfer_status_key(status),
+            })
+        })
+        .collect();
+    let _ = app.emit(
+        "transfer-status-batch",
+        serde_json::json!({ "items": items }),
+    );
+}
+
 /// Persist a transfer before exposing it to the network worker or UI.
 ///
 /// A transfer without a durable row is unsafe to start: after a restart the
@@ -325,7 +346,8 @@ async fn persist_transfer_status(state: &AppState, transfer_id: &str, status: &T
 /// while the IPC call itself did not return.
 ///
 /// Sequence numbers are taken up front so the relative order of these writes is
-/// fixed before any of them runs.
+/// fixed before any of them runs, and the rows that survive the per-id stale
+/// check commit in one transaction rather than one fsync each.
 async fn persist_transfer_statuses(state: &AppState, statuses: Vec<(String, String)>) {
     if statuses.is_empty() {
         return;
@@ -340,9 +362,7 @@ async fn persist_transfer_statuses(state: &AppState, statuses: Vec<(String, Stri
         })
         .collect();
     if let Err(e) = tokio::task::spawn_blocking(move || {
-        for (id, status, seq) in sequenced {
-            crate::network::apply_transfer_status_write(&clock, &db, &id, &status, seq);
-        }
+        clock.apply_status_writes(&db, &sequenced);
     })
     .await
     {
@@ -662,13 +682,24 @@ pub async fn sweep_orphan_part_files(
         } else {
             continue;
         };
-        if uuid::Uuid::parse_str(uuid_str).is_err() {
-            // Not an Ember-managed file; leave it alone.
-            continue;
-        }
-        if known_ids.contains(uuid_str) || owns_partial.contains(uuid_str) {
-            skipped_known += 1;
-            continue;
+        // A room transfer lives only in memory, so at startup every one of its
+        // part files belongs to a transfer that ended with the last run —
+        // except those `known_ids` names, accepted since this run began.
+        let room_xfer = !is_met && name.starts_with("ember-xfer-");
+        if room_xfer {
+            if known_ids.contains(uuid_str) {
+                skipped_known += 1;
+                continue;
+            }
+        } else {
+            if uuid::Uuid::parse_str(uuid_str).is_err() {
+                // Not an Ember-managed file; leave it alone.
+                continue;
+            }
+            if known_ids.contains(uuid_str) || owns_partial.contains(uuid_str) {
+                skipped_known += 1;
+                continue;
+            }
         }
         let allowed = vec![download_folder.to_string()];
         let deletion = tokio::task::spawn_blocking({
@@ -893,6 +924,7 @@ pub async fn start_download(
         up_part_count: None,
         up_peer_part_status: None,
         ember_verified: false,
+        friends_only: false,
     };
 
     let active_now = {
@@ -1074,14 +1106,14 @@ fn check_batch_size(transfer_ids: &[String]) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn pause_transfers_batch(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
-    let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
-    for transfer_id in &transfer_ids {
-        let (status, promoted) = {
-            let mut manager = state.transfer_manager.write().await;
+    let (paused, promoted) = {
+        let mut manager = state.transfer_manager.write().await;
+        for transfer_id in &transfer_ids {
             if let Some(control) = manager.get_control(transfer_id) {
                 control.pause();
                 // Cancel too, exactly as the single-transfer pause does: pause
@@ -1092,17 +1124,22 @@ pub async fn pause_transfers_batch(
                 // registered and installs a fresh control.
                 control.cancel();
             }
-            let promoted = manager.pause_and_promote(transfer_id);
-            let status = manager.get_transfer(transfer_id).map(|t| t.status.clone());
-            (status, promoted)
-        };
-        for p in promoted {
-            promoted_by_id.entry(p.id.clone()).or_insert(p);
         }
-        if let Some(status) = status {
-            persist_transfer_status(&state, transfer_id, &status).await;
-        }
-    }
+        manager.pause_and_promote_many(&transfer_ids)
+    };
+    let statuses: Vec<(String, TransferStatus)> = paused
+        .iter()
+        .map(|id| (id.clone(), TransferStatus::Paused))
+        .collect();
+    emit_transfer_statuses(&app, &statuses);
+    persist_transfer_statuses(
+        &state,
+        paused
+            .into_iter()
+            .map(|id| (id, transfer_status_key(&TransferStatus::Paused).to_string()))
+            .collect(),
+    )
+    .await;
     let mut send_error = None;
     for transfer_id in &transfer_ids {
         // `bounded_send`, like the single-row sibling. A raw `send().await` on
@@ -1127,7 +1164,6 @@ pub async fn pause_transfers_batch(
             break;
         }
     }
-    let promoted: Vec<Transfer> = promoted_by_id.into_values().collect();
     start_promoted_downloads(&state, &promoted).await;
     match send_error {
         Some(e) => Err(e),
@@ -1137,59 +1173,38 @@ pub async fn pause_transfers_batch(
 
 #[tauri::command]
 pub async fn resume_transfers_batch(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
-    let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
-    let mut restart_ids: Vec<String> = Vec::new();
-    for transfer_id in transfer_ids {
-        let (was_paused_active, promoted) = {
-            let mut manager = state.transfer_manager.write().await;
-            // `Insufficient` belongs here alongside `Paused`, as it does in
-            // `resume_transfer` and `resume_all_transfers`. `resume` clears
-            // that state in place and returns no promotions (the row never
-            // left `active`), so without it nothing reaches `restart_ids`,
-            // `start_promoted_downloads` is never called, and no
-            // `PendingDownload` is re-inserted — `mark_download_insufficient`
-            // dropped it. The row then reads `Searching`, which
-            // `active_download_count` *does* count, so the cap is
-            // oversubscribed and the transfer never dials again: the retry
-            // timer only walks `pending_downloads`.
-            let was_paused_active = manager
-                .active
-                .get(&transfer_id)
-                .map(|t| {
-                    matches!(
-                        t.status,
-                        TransferStatus::Paused | TransferStatus::Insufficient
-                    )
-                })
-                .unwrap_or(false);
-            if manager.get_control(&transfer_id).is_none() {
-                manager.register_control(&transfer_id, TransferControl::new());
-            }
-            let promoted = manager.resume(&transfer_id);
-            (was_paused_active, promoted)
-        };
-        if was_paused_active && promoted.is_empty() {
-            restart_ids.push(transfer_id.clone());
-        }
-        for p in promoted {
-            promoted_by_id.entry(p.id.clone()).or_insert(p);
-        }
-        let status = {
-            let manager = state.transfer_manager.read().await;
-            manager.get_transfer(&transfer_id).map(|t| t.status.clone())
-        };
-        if let Some(status) = status {
-            persist_transfer_status(&state, &transfer_id, &status).await;
-        }
-    }
-    let mut to_start: Vec<Transfer> = promoted_by_id.into_values().collect();
+    // `restart_ids` holds `active` rows resumed from `Insufficient` as well as
+    // `Paused`, as in `resume_transfer` and `resume_all_transfers`. `resume`
+    // clears that state in place and returns no promotions (the row never
+    // left `active`), so without it `start_promoted_downloads` is never
+    // called and no `PendingDownload` is re-inserted —
+    // `mark_download_insufficient` dropped it. The row then reads `Searching`,
+    // which `active_download_count` *does* count, so the cap is oversubscribed
+    // and the transfer never dials again: the retry timer only walks
+    // `pending_downloads`.
+    let outcome = {
+        let mut manager = state.transfer_manager.write().await;
+        manager.resume_many(&transfer_ids, true)
+    };
+    emit_transfer_statuses(&app, &outcome.statuses);
+    persist_transfer_statuses(
+        &state,
+        outcome
+            .statuses
+            .iter()
+            .map(|(id, status)| (id.clone(), transfer_status_key(status).to_string()))
+            .collect(),
+    )
+    .await;
+    let mut to_start: Vec<Transfer> = outcome.promoted;
     {
         let manager = state.transfer_manager.read().await;
-        for id in restart_ids {
+        for id in outcome.restart_ids {
             if let Some(t) = manager.get_transfer(&id) {
                 to_start.push(t.clone());
             }
@@ -1845,6 +1860,19 @@ pub async fn get_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<Tran
     Ok(manager.get_all())
 }
 
+/// What changed since the caller's last answer, for the Transfers poll: only
+/// rows whose payload differs, the ids that left, and the revision to pass
+/// next time. `since: 0` (or a revision from another run) returns every row.
+#[tauri::command]
+pub async fn get_transfers_since(
+    state: tauri::State<'_, AppState>,
+    epoch: Option<u64>,
+    since: u64,
+) -> Result<crate::sharing::manager::TransferDelta, String> {
+    let manager = state.transfer_manager.read().await;
+    Ok(manager.get_transfers_since(epoch, since))
+}
+
 /// Chunk map and part counters for one download, for the "File Details"
 /// window. Read on demand rather than carried on every transfers poll, because
 /// a per-part bitmap on every tick would be paid for by every user who never
@@ -2009,6 +2037,133 @@ pub async fn set_transfer_category(
 }
 
 #[tauri::command]
+pub async fn rename_transfer(
+    state: tauri::State<'_, AppState>,
+    transfer_id: String,
+    file_name: String,
+) -> Result<String, String> {
+    let trimmed = file_name.trim();
+    if trimmed.is_empty() {
+        return Err(coded(
+            "transfers_invalid_file_name",
+            "Enter a valid file name",
+        ));
+    }
+    let sanitized = crate::security::sanitize_filename(trimmed);
+    if sanitized.is_empty() || (sanitized == "unnamed_file" && trimmed != "unnamed_file") {
+        return Err(coded(
+            "transfers_invalid_file_name",
+            "Enter a valid file name",
+        ));
+    }
+
+    let previous = {
+        let manager = state.transfer_manager.read().await;
+        let Some(transfer) = manager.get_transfer(&transfer_id) else {
+            return Err(coded("transfers_transfer_not_found", "Transfer not found"));
+        };
+        // Refused once the file is being hashed or moved as well as after it
+        // has finished: the completion path has already read the name it will
+        // move under, so a rename accepted inside that window would leave the
+        // row and the file on disk disagreeing.
+        if transfer.direction != TransferDirection::Download
+            || matches!(
+                transfer.status,
+                TransferStatus::Verifying
+                    | TransferStatus::Completing
+                    | TransferStatus::Hashing
+                    | TransferStatus::Completed
+            )
+        {
+            return Err(coded(
+                "transfers_cannot_rename",
+                "This download cannot be renamed",
+            ));
+        }
+        transfer.file_name.clone()
+    };
+
+    // Persisted first, because a failure here has to leave every copy of the
+    // name untouched — the rename simply did not happen.
+    let db = state.db.clone();
+    let tid = transfer_id.clone();
+    let name = sanitized.clone();
+    tokio::task::spawn_blocking(move || db.update_transfer_file_name(&tid, &name))
+        .await
+        .map_err(|e| coded_ctx("transfers_rename_task_failed", "Rename failed", e))?
+        .map_err(|e| coded_ctx("transfers_rename_persist_failed", "Rename failed", e))?;
+
+    // The network task sets the control flag that completion reads, so the
+    // rename reaches the file on disk only once the hand-over has actually
+    // happened. Setting it here would let a rename we then reported as failed
+    // still name the finished file.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handed_over = match state.network_tx.try_send(NetworkCommand::RenameDownload {
+        transfer_id: transfer_id.clone(),
+        file_name: sanitized.clone(),
+        tx,
+    }) {
+        Ok(()) => match await_reply(rx, "transfers_rename_failed", "Failed to rename download").await {
+            // Completion read the name after the status check above.
+            Ok(false) => Err(coded("transfers_cannot_rename", "This download cannot be renamed")),
+            other => other.map(|_| ()),
+        },
+        Err(e) => Err(coded_ctx("network_busy", "Network busy", e)),
+    };
+    if let Err(error) = handed_over {
+        restore_transfer_file_name(&state, &transfer_id, &previous).await;
+        return Err(error);
+    }
+
+    let refused = {
+        let mut manager = state.transfer_manager.write().await;
+        if manager.set_file_name(&transfer_id, &sanitized) {
+            None
+        } else {
+            // Finished or removed between the check above and here. The row
+            // keeps the name it has, so the persisted copy has to go back to
+            // it or the next restart shows a name nothing else agrees with.
+            Some(
+                manager
+                    .get_transfer(&transfer_id)
+                    .map(|transfer| transfer.file_name.clone()),
+            )
+        }
+    };
+    if let Some(current) = refused {
+        let still_listed = current.is_some();
+        restore_transfer_file_name(&state, &transfer_id, &current.unwrap_or(previous)).await;
+        return Err(if still_listed {
+            coded("transfers_cannot_rename", "This download cannot be renamed")
+        } else {
+            coded("transfers_transfer_not_found", "Transfer not found")
+        });
+    }
+
+    Ok(sanitized)
+}
+
+/// Put the persisted name back when a rename could not be handed to the
+/// network task or the row refused it. Best effort: the command already
+/// reports the rename as failed, so a failure here costs only that the
+/// persisted name disagrees with the row until the next rename or restart.
+async fn restore_transfer_file_name(state: &AppState, transfer_id: &str, previous: &str) {
+    let db = state.db.clone();
+    let tid = transfer_id.to_string();
+    let name = previous.to_string();
+    let restored = tokio::task::spawn_blocking(move || db.update_transfer_file_name(&tid, &name))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|result| result.map_err(|e| e.to_string()));
+    if let Err(error) = restored {
+        tracing::warn!(
+            "Rename of transfer {} did not take and its persisted name was not rolled back: {error}",
+            transfer_id_short(transfer_id)
+        );
+    }
+}
+
+#[tauri::command]
 pub async fn set_preview_priority(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
@@ -2043,7 +2198,7 @@ pub async fn pause_all_transfers(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let (statuses, pause_ids) = {
+    let (paused, pause_ids) = {
         let mut manager = state.transfer_manager.write().await;
         let active_ids: Vec<String> = manager
             .active
@@ -2056,33 +2211,36 @@ pub async fn pause_all_transfers(
                 control.pause();
                 control.cancel();
             }
-            manager.pause(id);
         }
-        let queued_ids: Vec<String> = manager
-            .queue
+        let queued_ids = manager.queue.iter().filter(|t| {
+            t.direction == TransferDirection::Download
+                && t.status != TransferStatus::Paused
+                && t.status != TransferStatus::Stopped
+        });
+        let pause_ids: Vec<String> = active_ids
             .iter()
-            .filter(|t| {
-                t.direction == TransferDirection::Download
-                    && t.status != TransferStatus::Paused
-                    && t.status != TransferStatus::Stopped
-            })
-            .map(|t| t.id.clone())
-            .collect();
-        for id in &queued_ids {
-            manager.pause(id);
-        }
-        let all_ids: Vec<String> = active_ids
-            .iter()
-            .chain(queued_ids.iter())
             .cloned()
+            .chain(queued_ids.map(|t| t.id.clone()))
             .collect();
-        let statuses = active_ids
-            .into_iter()
-            .chain(queued_ids)
-            .filter_map(|id| manager.get_transfer(&id).map(|t| (id, t.status.clone())))
-            .collect::<Vec<_>>();
-        (statuses, all_ids)
+        let paused = manager.pause_many(&pause_ids);
+        (paused, pause_ids)
     };
+    // Immediate UI feedback for every paused row (see pause_transfer).
+    let statuses: Vec<(String, TransferStatus)> = paused
+        .iter()
+        .map(|id| (id.clone(), TransferStatus::Paused))
+        .collect();
+    emit_transfer_statuses(&app, &statuses);
+    persist_transfer_statuses(
+        &state,
+        paused
+            .into_iter()
+            .map(|id| (id, transfer_status_key(&TransferStatus::Paused).to_string()))
+            .collect(),
+    )
+    .await;
+    // Last: with a full channel each send can wait up to `CMD_SEND_TIMEOUT`,
+    // and the UI and the database already reflect the pause.
     for id in &pause_ids {
         let _ = bounded_send(
             &state.network_tx,
@@ -2092,18 +2250,6 @@ pub async fn pause_all_transfers(
         )
         .await;
     }
-    // Immediate UI feedback for every paused row (see pause_transfer).
-    for (id, status) in &statuses {
-        emit_transfer_status(&app, id, status);
-    }
-    persist_transfer_statuses(
-        &state,
-        statuses
-            .into_iter()
-            .map(|(id, status)| (id, transfer_status_key(&status).to_string()))
-            .collect(),
-    )
-    .await;
     Ok(())
 }
 
@@ -2114,79 +2260,49 @@ pub async fn resume_all_transfers(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let (promoted, restart_ids, statuses) = {
+    let outcome = {
         let mut manager = state.transfer_manager.write().await;
-        let active_ids: Vec<String> = manager.active.keys().cloned().collect();
-        let mut promoted = Vec::new();
-        let mut restart_ids: Vec<String> = Vec::new();
-        for id in active_ids {
-            let was_active_resumable = manager
-                .active
-                .get(&id)
-                .map(|t| {
-                    matches!(
-                        t.status,
-                        TransferStatus::Paused | TransferStatus::Insufficient
-                    )
-                })
-                .unwrap_or(false);
-            let p = manager.resume(&id);
-            if was_active_resumable && p.is_empty() {
-                restart_ids.push(id.clone());
-            }
-            promoted.extend(p);
-        }
-        let queued_ids: Vec<String> = manager
-            .queue
-            .iter()
-            .filter(|t| {
-                matches!(
-                    t.status,
-                    TransferStatus::Paused | TransferStatus::Stopped | TransferStatus::Insufficient
-                )
-            })
-            .map(|t| t.id.clone())
-            .collect();
-        for id in queued_ids {
-            promoted.extend(manager.resume(&id));
-        }
-        let statuses = manager
+        // Every active row goes through `resume`, not only paused ones, so
+        // each live control is resumed as before.
+        let queued_ids = manager.queue.iter().filter(|t| {
+            matches!(
+                t.status,
+                TransferStatus::Paused | TransferStatus::Stopped | TransferStatus::Insufficient
+            )
+        });
+        let resume_ids: Vec<String> = manager
             .active
             .keys()
             .cloned()
-            .chain(manager.queue.iter().map(|t| t.id.clone()))
-            .filter_map(|id| manager.get_transfer(&id).map(|t| (id, t.status.clone())))
-            .collect::<Vec<_>>();
-        (promoted, restart_ids, statuses)
+            .chain(queued_ids.map(|t| t.id.clone()))
+            .collect();
+        manager.resume_many(&resume_ids, false)
     };
+    let resumed: Vec<(String, TransferStatus)> = outcome
+        .statuses
+        .into_iter()
+        .filter(|(_, status)| {
+            matches!(
+                status,
+                TransferStatus::Searching | TransferStatus::Queued | TransferStatus::Active
+            )
+        })
+        .collect();
     // Immediate UI feedback: flip every resumed row off Paused/Stopped now
     // (see resume_transfer) rather than waiting for the next poll.
-    for (id, status) in &statuses {
-        if matches!(
-            status,
-            TransferStatus::Searching | TransferStatus::Queued | TransferStatus::Active
-        ) {
-            emit_transfer_status(&app, id, status);
-        }
-    }
+    emit_transfer_statuses(&app, &resumed);
     persist_transfer_statuses(
         &state,
-        statuses
+        resumed
             .into_iter()
-            .filter(|(_, status)| {
-                matches!(
-                    status,
-                    TransferStatus::Searching | TransferStatus::Queued | TransferStatus::Active
-                )
-            })
             .map(|(id, status)| (id, transfer_status_key(&status).to_string()))
             .collect(),
     )
     .await;
-    let mut to_start = promoted;
+    let mut to_start = outcome.promoted;
     {
         let manager = state.transfer_manager.read().await;
-        for id in restart_ids {
+        for id in outcome.restart_ids {
             if let Some(t) = manager.get_transfer(&id) {
                 to_start.push(t.clone());
             }

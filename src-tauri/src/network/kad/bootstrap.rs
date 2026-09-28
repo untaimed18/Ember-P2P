@@ -367,6 +367,38 @@ fn read_contact_v2(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<KadContact> {
     })
 }
 
+/// A nodes.dat with at least this many contacts is not replaced by a table of
+/// fewer than [`NODES_DAT_MIN_REPLACEMENT`].
+const NODES_DAT_PROTECTED_COUNT: usize = 100;
+const NODES_DAT_MIN_REPLACEMENT: usize = 25;
+
+/// The contact count a nodes.dat header declares: v0 starts with the count;
+/// v1/v2 with a zero marker, the version, then the count; v3 puts its
+/// bootstrap-edition word before the count (`RoutingZone.cpp` `ReadFile`).
+///
+/// `None` unless the file is long enough to hold that many contacts, so a
+/// corrupt header cannot pass for a well-stocked file.
+fn nodes_dat_contact_count(path: &Path) -> Option<usize> {
+    use std::io::Read;
+    // v0/v1 and bootstrap-edition records lack v2's UDP key and verified byte.
+    const RECORD_V0: u64 = 25;
+    const RECORD_V2: u64 = 34;
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header).ok()?;
+    let word = |i: usize| u32::from_le_bytes([header[i], header[i + 1], header[i + 2], header[i + 3]]);
+    let (count, header_len, record_len) = match (word(0), word(4)) {
+        (0, 1) => (word(8), 12, RECORD_V0),
+        (0, 2) => (word(8), 12, RECORD_V2),
+        (0, 3) if word(8) == 1 => (word(12), 16, RECORD_V0),
+        (0, 3) => (word(12), 16, RECORD_V2),
+        (0, _) => return None,
+        (count, _) => (count, 4, RECORD_V0),
+    };
+    (len >= header_len + u64::from(count) * record_len).then_some(count as usize)
+}
+
 /// Save contacts to a nodes.dat file (v2 format).
 /// Uses atomic write (temp file + rename) to prevent corruption on crash.
 /// Skips saving if contacts is empty and a valid nodes.dat already exists
@@ -378,6 +410,20 @@ pub fn save_nodes_dat(path: &Path, contacts: &[KadContact]) -> anyhow::Result<()
     }
     if contacts.is_empty() {
         return Ok(());
+    }
+    // A table reduced to a handful (a network outage, a resume that had not
+    // re-verified anyone yet) is worse bootstrap material than the file it
+    // would replace, and the `.bak` below goes with it on the second save.
+    if contacts.len() < NODES_DAT_MIN_REPLACEMENT {
+        if let Some(existing) = nodes_dat_contact_count(path) {
+            if existing >= NODES_DAT_PROTECTED_COUNT {
+                info!(
+                    "Skipping nodes.dat save: {} contacts would replace a file holding {existing}",
+                    contacts.len()
+                );
+                return Ok(());
+            }
+        }
     }
 
     let mut buf = Vec::with_capacity(contacts.len() * 35 + 12);
@@ -468,5 +514,40 @@ mod tests {
                 contact.ip
             );
         }
+    }
+
+    /// A small table does not replace a well-stocked nodes.dat, but a header
+    /// merely claiming to be one — more contacts than the file holds — does
+    /// not earn that protection.
+    #[test]
+    fn only_a_nodes_dat_that_holds_its_declared_contacts_is_protected() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-nodes-dat-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nodes.dat");
+        let contact = |i: u16| {
+            let mut c = default_bootstrap_contacts().remove(0);
+            c.id = KadId::from_u32(u32::from(i) + 1);
+            c.udp_port = 4000 + i;
+            c
+        };
+        let many: Vec<KadContact> = (0..NODES_DAT_PROTECTED_COUNT as u16).map(contact).collect();
+        save_nodes_dat(&path, &many).unwrap();
+        assert_eq!(nodes_dat_contact_count(&path), Some(NODES_DAT_PROTECTED_COUNT));
+        let few: Vec<KadContact> = (0..3).map(contact).collect();
+        save_nodes_dat(&path, &few).unwrap();
+        assert_eq!(load_nodes_dat(&path).unwrap().len(), NODES_DAT_PROTECTED_COUNT);
+
+        // The same header over a file cut short after one record.
+        let mut truncated = std::fs::read(&path).unwrap();
+        truncated.truncate(12 + 34);
+        std::fs::write(&path, &truncated).unwrap();
+        assert_eq!(nodes_dat_contact_count(&path), None);
+        save_nodes_dat(&path, &few).unwrap();
+        assert_eq!(load_nodes_dat(&path).unwrap().len(), few.len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

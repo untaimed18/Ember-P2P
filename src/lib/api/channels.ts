@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import * as m from '$lib/paraglide/messages';
 
 export interface ChannelInfo {
   channel_id: string;
@@ -10,7 +11,12 @@ export interface ChannelInfo {
   welcome: string;
   joined_at: number;
   last_active: number;
+  /** Members seen inside the presence window, including this device. */
   member_count: number;
+  /** Everyone on this device's roster for the room, present or not, less the
+   *  banned. Holds still as people come and go, so it is what rooms are
+   *  ranked by. */
+  roster_count: number;
   unread: number;
   you_are_banned: boolean;
   you_are_moderator: boolean;
@@ -35,6 +41,27 @@ export interface ChannelInfo {
   invites_owner_only: boolean;
   /** Seconds a member must wait between messages; 0 when slow mode is off. */
   slow_mode_secs: number;
+  /** Only the owner and moderators may post. Enforced by each sender, like
+   *  slow mode; reactions stay open. */
+  announce_only: boolean;
+  /** Wire ids of the owner's pinned messages, oldest pin first. */
+  pinned_msg_ids: string[];
+  /** The owner's default language code for the room, empty for none. Shown as
+   *  a flag; nothing is filtered on it. */
+  language: string;
+}
+
+/** Most messages a room can pin, mirroring `CHANNEL_PIN_MAX` in
+ *  `src-tauri/src/network/ember/dht/publish.rs`. */
+export const CHANNEL_PIN_MAX = 3;
+
+/** One pinned message as the pin bar draws it. */
+export interface ChannelPinInfo {
+  msg_id: string;
+  /** The line as this device holds it, or null when it has not arrived here. */
+  message: ChannelReplyParent | null;
+  /** Removed from this device, which the bar hides. */
+  deleted: boolean;
 }
 
 /** Slow-mode delays an owner can pick, mirroring `SLOW_MODE_CHOICES` in
@@ -49,6 +76,8 @@ export interface ChannelMemberInfo {
   banned: boolean;
   is_self: boolean;
   moderator: boolean;
+  /** BLAKE3(pubkey)[..16] hex, same identity friends use. Empty if the key is invalid. */
+  ember_hash: string;
 }
 
 /** The windows the roster's presence dots are drawn with.
@@ -75,6 +104,10 @@ export interface ChannelPresenceDelta {
   members: { member_pubkey: string; last_seen: number }[];
 }
 
+/** Whether an originated room line reached anybody. Received lines are always
+ *  `delivered` — we have it, which is the whole claim. */
+export type ChannelDelivery = 'delivered' | 'queued' | 'failed';
+
 export interface ChannelMessageInfo {
   id: number;
   sender_pubkey: string;
@@ -90,21 +123,53 @@ export interface ChannelMessageInfo {
    * meaningless to the peer that sent it — so the UI needs this to match them up.
    */
   msg_id: string;
+  delivery: ChannelDelivery;
+  /** Wire id of the message this one replies to, or null for a plain line.
+   *  Signed by the author along with the text; `message` is the body alone. */
+  reply_to: string | null;
+  /** The parent was written by this device's identity — someone answering us,
+   *  which notifications treat like a mention. False when the parent is not
+   *  held here, since nothing else says who wrote it. */
+  reply_to_me: boolean;
+  /** The parent as this device holds it now, or null when it is not here. */
+  reply_parent: ChannelReplyParent | null;
+  /** The parent is missing because it was removed from this device, rather
+   *  than never received. */
+  reply_parent_deleted: boolean;
 }
 
-/** Wire values for a reaction. `None` withdraws one. */
+/** What a reply's quote needs of the message it answers. */
+export interface ChannelReplyParent {
+  /** Local row id, which is what the transcript pages and jumps by. */
+  id: number;
+  sender_pubkey: string;
+  /** The start of the parent's text, formatting markers included. */
+  excerpt: string;
+}
+
+/** Wire values for a reaction. `None` withdraws one. The rest of the curated
+ *  set, and the glyph each code draws as, is in `$lib/channelReactions`. */
 export const REACTION_NONE = 0;
 export const REACTION_UP = 1;
 export const REACTION_DOWN = 2;
 export const REACTION_HEART = 3;
 
+/** How many members hold one reaction on one line. */
+export interface ChannelReactionTally {
+  reaction: number;
+  count: number;
+  /** A few member keys, ours first when we are among them. May be shorter
+   *  than `count`; the rest are summed into "and N others". */
+  members: string[];
+}
+
 /** Reaction tally for one line, counted by the backend. */
 export interface ChannelReactionInfo {
   msg_id: string;
-  up: number;
-  down: number;
-  heart: number;
-  /** This device's own reaction, so its button can show as pressed. 0 is none. */
+  /** Curated reactions somebody holds, in code order. */
+  reactions: ChannelReactionTally[];
+  /** This device's own reaction, so its button can show as pressed. 0 is none.
+   *  One per member: picking another replaces it. */
   mine: number;
 }
 
@@ -124,14 +189,20 @@ export interface GatheredChannelInfo {
   /** Members announcing themselves right now, or null when we could not find
    *  out. A confirmed 0 is not the same as an unanswered probe. */
   member_count: number | null;
+  /** Default language code from the room's signed listing, empty for none. */
+  language: string;
 }
 
 export async function listChannels(): Promise<ChannelInfo[]> {
   return invoke('list_channels');
 }
 
-export async function createChannel(name: string, privateChannel: boolean): Promise<ChannelInviteInfo> {
-  return invoke('create_channel', { name, private: privateChannel });
+export async function createChannel(
+  name: string,
+  privateChannel: boolean,
+  language: string | null = null,
+): Promise<ChannelInviteInfo> {
+  return invoke('create_channel', { name, private: privateChannel, language });
 }
 
 export async function joinChannel(uri: string): Promise<ChannelInfo> {
@@ -207,12 +278,24 @@ export async function getChannelMessages(
   });
 }
 
+/**
+ * Send a line to a room. `replyTo` is the wire id (`msg_id`) of a message in
+ * the same room that this line answers; the backend refuses one it does not
+ * hold with `channels_reply_target_invalid`. The reference is signed with the
+ * text, and older Embers show the line as an ordinary message.
+ */
 export async function sendChannelMessage(
   channelId: string,
   message: string,
+  replyTo?: string | null,
 ): Promise<ChannelMessageInfo> {
-  return invoke('send_channel_message', { channelId, message });
+  return invoke('send_channel_message', { channelId, message, replyTo: replyTo ?? null });
 }
+
+/** UTF-8 bytes a reply's signed reference adds to the message on the wire.
+ *  Mirrors `REPLY_TRAILER_BYTES` in `src-tauri/src/network/ember/channel.rs`;
+ *  the 4096-byte cap counts it, so a reply leaves this much less room. */
+export const REPLY_REFERENCE_BYTES = 136;
 
 export async function markChannelMessagesRead(channelId: string): Promise<void> {
   return invoke('mark_channel_messages_read', { channelId });
@@ -263,6 +346,12 @@ export async function setChannelMessageReaction(
   return invoke('set_channel_message_reaction', { channelId, messageId, reaction });
 }
 
+/** Tell the room this device is (or has stopped) composing. Best effort: the
+ *  backend drops it whenever it has nobody to tell or no right to say it. */
+export async function sendChannelTyping(channelId: string, typing: boolean): Promise<void> {
+  return invoke('send_channel_typing', { channelId, typing });
+}
+
 /** Every live reaction tally in a room, in one read rather than one per bubble. */
 export async function getChannelReactions(
   channelId: string,
@@ -301,6 +390,13 @@ export async function updateChannelModeration(
   welcome: string,
 ): Promise<ChannelInfo> {
   return invoke('update_channel_moderation', { channelId, topic, welcome });
+}
+
+/** Rename a room this device owns. Fails with `channels_name_taken` when the
+ *  name belongs to another room, and `channels_rename_too_soon` within a day
+ *  of the last rename. */
+export async function renameChannel(channelId: string, name: string): Promise<ChannelInfo> {
+  return invoke('rename_channel', { channelId, name });
 }
 
 export async function banChannelMember(channelId: string, memberPubkey: string): Promise<void> {
@@ -363,6 +459,36 @@ export async function setChannelSlowMode(
   return invoke('set_channel_slow_mode', { channelId, secs });
 }
 
+/** Owner only. Only the owner and moderators may post while this is on. */
+export async function setChannelAnnounceOnly(
+  channelId: string,
+  announceOnly: boolean,
+): Promise<ChannelInfo> {
+  return invoke('set_channel_announce_only', { channelId, announceOnly });
+}
+
+/** `null` clears the room's default language. */
+export async function setChannelLanguage(
+  channelId: string,
+  language: string | null,
+): Promise<ChannelInfo> {
+  return invoke('set_channel_language', { channelId, language });
+}
+
+/** Owner only. Pin or unpin one message by its wire id. */
+export async function setChannelMessagePinned(
+  channelId: string,
+  msgId: string,
+  pinned: boolean,
+): Promise<ChannelInfo> {
+  return invoke('set_channel_message_pinned', { channelId, msgId, pinned });
+}
+
+/** The room's pins, oldest first, resolved against local history. */
+export async function getChannelPins(channelId: string): Promise<ChannelPinInfo[]> {
+  return invoke('get_channel_pins', { channelId });
+}
+
 /** `ember2:<hash>:<pubkey>` for a room member, ready to hand to `addFriend`.
  *  The hash is derived from the member's Ed25519 key on the backend, which is
  *  the one place that binding is implemented. */
@@ -397,6 +523,8 @@ export interface ChannelTransferInfo {
   size: number;
   transferred: number;
   status: ChannelTransferStatus;
+  /** A program, shortcut or script, or one named like a document. */
+  risky?: boolean;
 }
 
 /** Offer one file to one member. Returns the transfer id, or `null` if the
@@ -409,7 +537,11 @@ export async function pickAndOfferChannelTransfer(
   channelId: string,
   memberPubkey: string,
 ): Promise<string | null> {
-  return invoke('pick_and_offer_channel_transfer', { channelId, memberPubkey });
+  return invoke('pick_and_offer_channel_transfer', {
+    channelId,
+    memberPubkey,
+    title: m.picker_file_to_send(),
+  });
 }
 
 export async function respondChannelTransfer(xferId: string, accept: boolean): Promise<void> {
@@ -422,5 +554,11 @@ export async function cancelChannelTransfer(xferId: string): Promise<void> {
 
 export async function listChannelTransfers(): Promise<ChannelTransferInfo[]> {
   return invoke('list_channel_transfers');
+}
+
+/** Open the folder received room transfers are saved to. It is not shared,
+ *  unlike `Downloads`. */
+export async function openChannelFilesFolder(): Promise<void> {
+  return invoke('open_channel_files_folder');
 }
 

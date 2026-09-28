@@ -8,11 +8,37 @@ export type Theme = 'light' | 'dark';
 // before first paint so dark-mode users do not flash the light canvas.
 const STORAGE_KEY = 'ember-theme';
 
+// Storage access can throw (SecurityError when storage is disabled), and this
+// module is evaluated while the layout loads, so every touch is guarded.
+function readStoredTheme(): string | null {
+  try {
+    return localStorage.getItem(STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredTheme(t: Theme): void {
+  try {
+    localStorage.setItem(STORAGE_KEY, t);
+  } catch {
+    // The theme still applies for this session.
+  }
+}
+
+function prefersDark(): boolean {
+  try {
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
+  } catch {
+    return false;
+  }
+}
+
 export function getInitialTheme(): Theme {
   if (browser) {
-    const stored = localStorage.getItem(STORAGE_KEY);
+    const stored = readStoredTheme();
     if (stored === 'light' || stored === 'dark') return stored;
-    if (window.matchMedia('(prefers-color-scheme: dark)').matches) return 'dark';
+    if (prefersDark()) return 'dark';
   }
   return 'light';
 }
@@ -40,7 +66,7 @@ function applyResolvedTheme(t: Theme) {
 
 export function applyTheme(t: Theme) {
   applyResolvedTheme(t);
-  if (browser) localStorage.setItem(STORAGE_KEY, t);
+  if (browser) writeStoredTheme(t);
 }
 
 let themeCleanup: (() => void) | null = null;
@@ -65,7 +91,7 @@ export function initTheme() {
     if (themeCleanup) themeCleanup();
     const mq = window.matchMedia('(prefers-color-scheme: dark)');
     const handler = (e: MediaQueryListEvent) => {
-      const userChose = localStorage.getItem(STORAGE_KEY);
+      const userChose = readStoredTheme();
       if (!userChose) {
         const next: Theme = e.matches ? 'dark' : 'light';
         applyResolvedTheme(next);

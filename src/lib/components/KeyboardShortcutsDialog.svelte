@@ -33,7 +33,7 @@
       const active = typeof document !== 'undefined' ? document.activeElement : null;
       if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
       requestAnimationFrame(() => {
-        (panelEl?.querySelector<HTMLButtonElement>('.shortcut-close') ?? panelEl)?.focus();
+        (panelEl?.querySelector<HTMLButtonElement>('.icon-close') ?? panelEl)?.focus();
       });
     }
     return () => {
@@ -140,6 +140,7 @@
     {
       title: () => m.shortcuts_section_search(),
       shortcuts: [
+        { keys: ['/'], label: () => m.shortcuts_library_focus_search() },
         { keys: [modifierKey, 'C'], label: () => m.shortcuts_search_copy_links() },
       ],
     },
@@ -147,6 +148,7 @@
       title: () => m.shortcuts_section_transfers(),
       shortcuts: [
         { keys: ['↑ / ↓'], label: () => m.shortcuts_transfers_navigate() },
+        { keys: ['F2'], label: () => m.shortcuts_transfers_rename() },
         { keys: ['Delete'], label: () => m.shortcuts_transfers_delete() },
       ],
     },
@@ -154,9 +156,19 @@
       title: () => m.shortcuts_section_chat(),
       shortcuts: [
         { keys: [modifierKey, '/'], label: () => m.shortcuts_toggle_chat() },
+        { keys: [modifierKey, 'K'], label: () => m.shortcuts_chat_switcher() },
         { keys: [modifierKey, 'Tab'], label: () => m.shortcuts_chat_cycle_tabs() },
         { keys: [modifierKey, 'W'], label: () => m.shortcuts_chat_close_tab() },
         { keys: ['Esc'], label: () => m.shortcuts_chat_close_dock() },
+      ],
+    },
+    {
+      title: () => m.shortcuts_section_channels(),
+      shortcuts: [
+        { keys: ['Alt', '↑ / ↓'], label: () => m.shortcuts_channels_prev_next() },
+        { keys: [modifierKey, 'K'], label: () => m.shortcuts_channels_search() },
+        { keys: ['↑ / ↓'], label: () => m.shortcuts_channels_search_navigate() },
+        { keys: ['Enter'], label: () => m.shortcuts_channels_search_open() },
       ],
     },
   ]);
@@ -189,7 +201,7 @@
     >
       <div class="shortcut-header">
         <h3 id="kbd-shortcut-title">{m.shortcuts_dialog_title()}</h3>
-        <button type="button" class="shortcut-close" aria-label={m.common_close()} onclick={() => (open = false)}><IconX size={16} /></button>
+        <button type="button" class="icon-close" title={m.common_close()} aria-label={m.common_close()} onclick={() => (open = false)}><IconX size={16} /></button>
       </div>
       <div class="shortcut-body">
         {#each groups as group, gi (gi)}
@@ -227,10 +239,6 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    backdrop-filter: blur(2px);
-  }
-  :global([data-theme="dark"]) .shortcut-overlay {
-    backdrop-filter: blur(6px) saturate(1.15);
   }
 
   .shortcut-panel {
@@ -255,30 +263,8 @@
 
   .shortcut-header h3 {
     margin: 0;
-    font-size: 15px;
+    font-size: var(--font-size-lg);
     font-weight: 600;
-  }
-
-  .shortcut-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    background: none;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    color: var(--text-secondary);
-    cursor: pointer;
-    line-height: 1;
-    transition: background 0.12s, border-color 0.12s, color 0.12s;
-  }
-
-  .shortcut-close:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
   }
 
   .shortcut-body {
@@ -292,7 +278,7 @@
 
   .shortcut-group h4 {
     margin: 0 0 8px 0;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.6px;
@@ -329,13 +315,13 @@
 
   .shortcut-row dd {
     margin: 0;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-secondary);
   }
 
   .shortcut-plus {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     padding: 0 1px;
   }
 
@@ -351,7 +337,7 @@
     border-bottom-width: 2px;
     border-radius: var(--radius-sm);
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     color: var(--text-primary);
     line-height: 1;
@@ -370,13 +356,13 @@
     display: flex;
     justify-content: flex-end;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .shortcut-hint kbd {
     min-width: auto;
     height: 18px;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     padding: 0 5px;
     margin: 0 2px;
   }

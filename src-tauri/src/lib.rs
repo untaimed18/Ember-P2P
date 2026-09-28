@@ -25,11 +25,13 @@ mod app_state;
 mod background;
 mod bandwidth;
 mod commands;
+mod emule_import;
 mod geoip;
 mod network;
 mod power;
 mod search;
 pub mod security;
+mod session_end;
 mod sharing;
 mod storage;
 mod types;
@@ -279,6 +281,8 @@ pub(crate) async fn run_graceful_shutdown(
         );
     }
 
+    network::ed2k::peer_sessions::save_upload_requests(&storage::paths::resolve_data_dir());
+
     // Flush any learned spam signals not yet persisted by the periodic flush
     // (e.g. an auto-not-spam that landed since the last tick). Wait briefly for
     // the lock rather than the old non-blocking `try_write`, which silently
@@ -294,6 +298,8 @@ pub(crate) async fn run_graceful_shutdown(
         Ok(mut filter) => filter.save(),
         Err(_) => tracing::warn!("Spam filter save skipped on shutdown: lock busy"),
     };
+
+    state.db.mark_clean_shutdown();
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -422,6 +428,10 @@ pub fn run() {
     // Keep the guard alive for the entire app lifetime
     let _log_guard = log_guard;
 
+    // Before any download can dial: an uploader we asked just before the
+    // last exit still counts that ask against the next one.
+    network::ed2k::peer_sessions::load_upload_requests(&data_dir);
+
     // Route panics into the log file. Release builds are linked with
     // `windows_subsystem = "windows"` (no console), so the default hook's
     // stderr message goes nowhere and a startup panic is indistinguishable
@@ -475,6 +485,7 @@ pub fn run() {
             // re-launched the app to bring it to the front).
             let payloads = commands::deeplink::extract_deep_link_payloads(&args);
             if payloads.is_empty() {
+                commands::chat_window::set_chat_window_visible(app, true);
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.unminimize();
                     let _ = window.show();
@@ -576,6 +587,7 @@ pub fn run() {
             // are latched for a blocking UI notice — logging alone left users
             // running on mixed or pre-restore files with no explanation.
             let mut restore_failed_notice = false;
+            let mut restore_applied = false;
             match storage::paths::ensure_data_dir_with_app(&app_handle) {
                 Ok(dir) => {
                     match commands::backup::apply_pending_restore(&dir) {
@@ -593,7 +605,7 @@ pub fn run() {
                                 restore_failed_notice = true;
                             }
                         }
-                        Ok(Some(_)) => {}
+                        Ok(Some(_)) => restore_applied = true,
                     }
                 }
                 Err(e) => tracing::error!("Failed to prepare the data dir: {e}"),
@@ -606,13 +618,18 @@ pub fn run() {
                 })?,
             );
 
-            let config = AppConfig::load(&app_handle).map_err(|e| {
+            let mut config = AppConfig::load(&app_handle).map_err(|e| {
                 tracing::error!("Failed to load config: {e}");
                 e
             })?;
-            let settings = config.settings.clone();
             let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
             std::fs::create_dir_all(&data_dir)?;
+            // An eMule import staged last session. Here because it rewrites
+            // what the identity, the approved roots, the credit store and the
+            // network all read below, and none of them can take a change once
+            // they have.
+            let emule_import = emule_import::apply::apply_pending(&data_dir, &db, &mut config);
+            let settings = config.settings.clone();
             // Best-effort, never fatal. A download folder on an unplugged USB
             // drive, an offline NAS or an unmapped share makes these fail, and
             // propagating that out of `setup` returns Err from `build()` — which
@@ -638,12 +655,32 @@ pub fn run() {
             if !settings.download_folder.is_empty() {
                 configured_roots.push(settings.download_folder.clone());
             }
-            let approved_roots = security::filesystem::initialize_approved_roots(
+            let mut import_roots =
+                emule_import::apply::pending_root_additions(&data_dir, emule_import.as_ref());
+            // The backup deliberately leaves out `approved_roots.json`, whose
+            // records bind folders to one machine's file identities, so the
+            // folders a restore just brought back are approved here, as the
+            // ones an eMule import names are. Left out, a restore onto a new
+            // install kept them configured but unapproved: every download
+            // refused its target and every upload its file.
+            if restore_applied {
+                for root in &configured_roots {
+                    if !import_roots.contains(root) {
+                        import_roots.push(root.clone());
+                    }
+                }
+            }
+            let approved_roots = security::filesystem::initialize_approved_roots_with_additions(
                 &data_dir,
                 &configured_roots,
+                &import_roots,
             )
             .map_err(|error| anyhow::anyhow!("Failed to load approved filesystem roots: {error}"))?;
-            storage::share_intent::initialize(&data_dir)
+            emule_import::apply::root_additions_approved(&data_dir);
+            // Only share_intent.json is read here; the known.met migration runs
+            // on its own thread, and every share-intent reader and known.met
+            // writer (including `migrate_aich_v2` below) blocks until it lands.
+            storage::share_intent::initialize_in_background(&data_dir)
                 .map_err(|error| anyhow::anyhow!("Failed to load durable share intent: {error}"))?;
             // Load the persistent identity once before commands or the network
             // task can run. Re-reading/creating it independently at several
@@ -662,6 +699,11 @@ pub fn run() {
             // across restarts — the subscriber is installed before this so a
             // failure in between still reaches the log file.
             security::logging::install_pseudonym_key(&identity.ed25519_secret_key);
+            network::friend_intro::set_own_intro_secret(identity.intro_secret);
+            match db.get_friend_intro_secrets() {
+                Ok(secrets) => network::friend_intro::load_friend_intro_secrets(secrets),
+                Err(e) => tracing::warn!("Failed to load friend intro secrets: {e}"),
+            }
             // If config.json was corrupt and reset to defaults, surface it to the
             // user once the webview has mounted (the file is preserved as a .bak).
             let corrupt_backup = config.corrupt_backup.clone();
@@ -968,6 +1010,8 @@ pub fn run() {
                 }
             }
 
+            session_end::watch(app.handle());
+
             // System tray icon. Rendered unconditionally so users who pick
             // "Minimize to Tray" (or the saved `tray` behavior) always have
             // a way back into the running app — without this, hiding the
@@ -1005,6 +1049,7 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "tray_show" => {
+                        commands::chat_window::set_chat_window_visible(app, true);
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.unminimize();
                             let _ = window.show();
@@ -1033,6 +1078,7 @@ pub fn run() {
                     } = event
                     {
                         let app = tray.app_handle();
+                        commands::chat_window::set_chat_window_visible(app, true);
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.unminimize();
                             let _ = window.show();
@@ -1139,17 +1185,42 @@ pub fn run() {
                     return;
                 }
 
-                let known_list = {
-                    let data_dir = storage::paths::resolve_data_dir_with_app(&startup_app);
-                    storage::known_files::KnownFileList::load(&data_dir.join("known.met"))
+                let known_path =
+                    storage::paths::resolve_data_dir_with_app(&startup_app).join("known.met");
+                let known_list = match tokio::task::spawn_blocking(move || {
+                    let known_list = storage::known_files::KnownFileList::load(&known_path);
+                    // The per-file `effective_shared` calls below would
+                    // otherwise wait out the share-intent migration on this
+                    // runtime worker.
+                    storage::share_intent::wait_until_initialized();
+                    known_list
+                })
+                .await
+                {
+                    Ok(known_list) => known_list,
+                    Err(e) => {
+                        tracing::error!("Startup known.met load panicked: {e}");
+                        startup_cancel_flags.write().await.remove("__startup__");
+                        let _ = startup_app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
+                        return;
+                    }
                 };
 
                 let mut files_to_hash: Vec<crate::types::FileInfo> = Vec::new();
-                // Already-servable rows wanting only the Ember digest. Kept
-                // out of `files_to_hash` so a cold start is not a full re-read
-                // of the library; handed to the background pass once the scan
-                // has finished with the drives.
-                let mut startup_hash_top_up: Vec<crate::types::FileInfo> = Vec::new();
+                // Rows wanting only a digest repair are deliberately *not*
+                // accumulated here. They are already servable, so they stay out
+                // of `files_to_hash` — a cold start is not a full re-read of the
+                // library — and the background pass is handed `all_discovered`
+                // itself once the scan has finished with the drives. Collecting
+                // them separately meant cloning a whole `FileInfo` per row and
+                // holding both copies until the pass drained, which on the run
+                // that matters most (first launch after an upgrade, library big
+                // enough to paginate) is the entire share resident twice.
+                // `queue_hash_top_up` applies the same `wants_hash_top_up`
+                // predicate and narrows to the few columns the pass reads, so
+                // the list it builds is the same one — minus the rows the
+                // shared-folder retain below drops, which have no business
+                // costing a whole-file read.
                 // Paths with no known.met record at all — genuinely new to
                 // this library, as opposed to a previously-shared file that's
                 // merely being rediscovered. Only these should inherit a
@@ -1205,12 +1276,39 @@ pub fn run() {
                         // its content-hash id and enters the index as an
                         // ordinary entry. ed2k comes out identical either way;
                         // only the missing digests are filled.
-                        if commands::sharing::wants_hash_top_up(file) {
-                            startup_hash_top_up.push(file.clone());
-                        }
                     } else {
                         new_paths.insert(crate::search::index::normalize_path_key(&file.path));
                         files_to_hash.push(file.clone());
+                    }
+                }
+                // Before any hashing starts, so a log from a launch that
+                // re-hashes says why even if the user stops it partway.
+                {
+                    let found = all_discovered.len();
+                    let matched = found - files_to_hash.len();
+                    let records = known_list.file_count();
+                    let shift = if files_to_hash.is_empty() {
+                        None
+                    } else {
+                        known_list.time_shift_summary(
+                            files_to_hash.iter().map(|f| (f.name.as_str(), f.size, f.modified_at)),
+                        )
+                    };
+                    match shift {
+                        Some(shift) => info!(
+                            "Startup scan: {found} files found, {matched} matched in known.met \
+                             ({records} records), {} to hash; {} of those match a known file by \
+                             name and size but not by modification time ({} are off by {:+} s)",
+                            files_to_hash.len(),
+                            shift.files,
+                            shift.common_count,
+                            shift.common_delta_secs,
+                        ),
+                        None => info!(
+                            "Startup scan: {found} files found, {matched} matched in known.met \
+                             ({records} records), {} to hash",
+                            files_to_hash.len(),
+                        ),
                     }
                 }
 
@@ -1358,25 +1456,33 @@ pub fn run() {
                         // Handing the whole library to the pass rather than one
                         // page of it is affordable because the pass is not
                         // paginated in the first place: it works at a duty
-                        // cycle, stands aside for real scans, persists every
-                        // 256 files and resumes where it stopped. Its cost is
-                        // set by the drives, not by how much is queued.
-                        if commands::sharing::wants_hash_top_up(&hydrated) {
-                            startup_hash_top_up.push(hydrated.clone());
-                        }
+                        // cycle, stands aside for real scans, checkpoints as it
+                        // goes and resumes where it stopped. Its cost is set by
+                        // the drives, not by how much is queued.
                         all_discovered.push(hydrated);
                     }
                 }
 
-                let (folder_priorities, pending_share_states, pending_file_priorities) = {
+                let (
+                    folder_priorities,
+                    pending_share_states,
+                    pending_file_priorities,
+                    pending_folder_allowlists,
+                ) = {
                     let state = startup_app.state::<AppState>();
                     let cfg = state.config.read().await;
                     (
                         cfg.settings.folder_priorities.clone(),
                         cfg.settings.pending_share_states.clone(),
                         cfg.settings.pending_file_priorities.clone(),
+                        cfg.settings.pending_folder_allowlists.clone(),
                     )
                 };
+                commands::sharing::apply_folder_allowlists(
+                    &mut all_discovered,
+                    &mut files_to_hash,
+                    &pending_folder_allowlists,
+                );
                 commands::sharing::apply_pending_intents(
                     &mut all_discovered,
                     &mut files_to_hash,
@@ -1486,9 +1592,11 @@ pub fn run() {
                         "file_name": file.name,
                     }));
 
-                    let hash_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(300),
+                    let hash_result = commands::sharing::await_hash(
                         &mut hash_task,
+                        &started.progress,
+                        &file.path,
+                        hash_claim,
                     )
                     .await;
 
@@ -1621,8 +1729,8 @@ pub fn run() {
                             drop(idx);
                             commands::sharing::release_in_flight_hash(&file.path, hash_claim);
                         }
-                        Err(_) => {
-                            // One slow file must not end the scan. Cancelling the
+                        Err(commands::sharing::HashStalled) => {
+                            // One stuck file must not end the scan. Cancelling the
                             // whole pass here and dropping the pending rows made
                             // every file after this one silently un-indexed, and
                             // it recurred on every launch because the queue is
@@ -1631,8 +1739,9 @@ pub fn run() {
                             // prevent. Leave the row pending, mark the page
                             // incomplete so nothing is reconciled away, and move on.
                             tracing::warn!(
-                                "Startup hash timed out for {} (file may be on cloud storage or locked); leaving pending for retry",
-                                file.name
+                                "Startup hash of {} read nothing for {} min (file may be on cloud storage or locked); leaving pending for retry",
+                                file.name,
+                                commands::sharing::HASH_STALL_TIMEOUT.as_secs() / 60
                             );
                             page_complete = false;
                             // Drain the abandoned blocking hash and release its
@@ -1731,7 +1840,7 @@ pub fn run() {
                     // Last, and only once the scan has let go of the drives.
                     commands::sharing::queue_hash_top_up(
                         startup_app.clone(),
-                        startup_hash_top_up,
+                        &all_discovered,
                     )
                     .await;
                 }
@@ -1924,6 +2033,7 @@ pub fn run() {
             commands::transfers::cancel_transfer,
             commands::transfers::remove_transfer,
             commands::transfers::get_transfers,
+            commands::transfers::get_transfers_since,
             commands::transfers::get_upload_queue,
             commands::transfers::get_download_file_details,
             commands::transfers::get_known_clients,
@@ -1932,6 +2042,7 @@ pub fn run() {
             commands::transfers::get_transfer_sources,
             commands::transfers::set_transfer_priority,
             commands::transfers::set_transfer_category,
+            commands::transfers::rename_transfer,
             commands::transfers::set_preview_priority,
             commands::transfers::pause_all_transfers,
             commands::transfers::resume_all_transfers,
@@ -1941,12 +2052,32 @@ pub fn run() {
             commands::transfers::open_downloads_folder,
             commands::transfers::recover_archive,
             commands::sharing::pick_shared_folder,
+            commands::share_browser::open_share_browser,
+            commands::share_browser::list_share_browser_children,
+            commands::share_browser::navigate_share_browser,
+            commands::share_browser::share_browser_selection,
+            commands::share_browser::measure_share_browser_entries,
+            commands::share_browser::close_share_browser,
+            commands::chat_attachments::pick_and_send_chat_attachment,
+            commands::chat_attachments::respond_chat_attachment,
+            commands::chat_attachments::cancel_chat_attachment,
+            commands::chat_attachments::list_chat_attachments,
+            commands::chat_attachments::open_chat_attachment,
+            commands::chat_attachments::open_chat_files_folder,
+            commands::channels::open_channel_files_folder,
+            commands::chat_window::open_chat_window,
+            commands::chat_window::close_chat_window,
+            commands::chat_window::focus_main_window,
             commands::sharing::confirm_dropped_folders,
             commands::sharing::dismiss_dropped_folders,
             commands::sharing::remove_shared_folder,
             commands::sharing::get_shared_files,
+            commands::sharing::get_shared_files_if_changed,
             commands::sharing::get_shared_file_count,
+            commands::sharing::library_has_hashes,
             commands::sharing::get_shared_folders,
+            commands::sharing::get_unapproved_shared_folders,
+            commands::sharing::reapprove_shared_folder,
             commands::sharing::get_file_media_metadata,
             commands::sharing::get_folder_priorities,
             commands::sharing::set_folder_priority,
@@ -1984,6 +2115,7 @@ pub fn run() {
             commands::peers::get_friends,
             commands::peers::update_friend_nickname,
             commands::peers::get_my_ember_hash,
+            commands::peers::reset_friend_code,
             commands::peers::send_chat_message,
             commands::peers::get_chat_messages,
             commands::peers::is_chat_locked,
@@ -2027,6 +2159,10 @@ pub fn run() {
             commands::channels::rotate_channel_room_key,
             commands::channels::set_channel_invite_policy,
             commands::channels::set_channel_slow_mode,
+            commands::channels::set_channel_announce_only,
+            commands::channels::set_channel_language,
+            commands::channels::set_channel_message_pinned,
+            commands::channels::get_channel_pins,
             commands::channels::delete_owned_channel,
             commands::channels::get_channel_invite,
             commands::channels::list_channel_members,
@@ -2037,12 +2173,14 @@ pub fn run() {
             commands::channels::delete_channel_message,
             commands::channels::edit_channel_message,
             commands::channels::set_channel_message_reaction,
+            commands::channels::send_channel_typing,
             commands::channels::get_channel_reactions,
             commands::channels::send_channel_message,
             commands::channels::mark_channel_messages_read,
             commands::channels::gather_channels,
             commands::channels::cached_channels,
             commands::channels::update_channel_moderation,
+            commands::channels::rename_channel,
             commands::channels::ban_channel_member,
             commands::channels::unban_channel_member,
             commands::channels::add_channel_moderator,
@@ -2059,6 +2197,13 @@ pub fn run() {
             commands::settings::update_settings,
             commands::settings::pick_download_folder,
             commands::settings::pick_preview_player,
+            commands::emule_import::detect_emule_installs,
+            commands::emule_import::pick_emule_folder,
+            commands::emule_import::preview_emule_import,
+            commands::emule_import::stage_emule_import,
+            commands::emule_import::discard_emule_import,
+            commands::emule_import::pending_emule_import,
+            commands::emule_import::get_emule_import_report,
             commands::settings::download_nodes_dat,
             commands::settings::download_ipfilter,
             commands::settings::hide_to_tray,
@@ -2154,19 +2299,40 @@ pub fn run() {
             // Title-bar X handler. Decides whether to fully exit, hide to
             // the system tray, or hand off to the frontend dialog based on
             // the user's saved `close_to_tray_behavior`. Only the main
-            // window participates — auxiliary windows (none today, but
-            // future about/preview popups) keep their normal close path.
+            // window participates. The popped-out chat window's X docks the
+            // chat back into the main window instead; see `chat_window`.
+            if window.label() == commands::chat_window::CHAT_WINDOW_LABEL {
+                match event {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        // Quitting closes every window; only a close the user
+                        // asked of this one docks the chat back first.
+                        let quitting = window.app_handle().try_state::<AppState>().is_some_and(|state| {
+                            state.quit_confirmed.load(std::sync::atomic::Ordering::Acquire)
+                        });
+                        if !quitting {
+                            api.prevent_close();
+                            commands::chat_window::request_redock(window);
+                        }
+                    }
+                    tauri::WindowEvent::Destroyed => {
+                        let _ = window
+                            .app_handle()
+                            .emit(commands::chat_window::CHAT_WINDOW_CLOSED_EVENT, ());
+                    }
+                    _ => {}
+                }
+                return;
+            }
             if window.label() != "main" {
                 return;
             }
 
             // Files and folders dropped onto the window. Handled here rather
-            // than in the webview's own drag-drop event because that is what
-            // makes the paths usable at all: `add_shared_folder` is not an
-            // invokable command, so a path arriving from the renderer is not
-            // authorization, while one the OS delivered to this window is. The
-            // frontend still draws the drop overlay; it just no longer decides
-            // what was dropped.
+            // than in the webview's own drag-drop event because a drop the OS
+            // delivered to this window is authorization, the same way the
+            // in-app folder browser's session tokens are. The frontend still
+            // draws the drop overlay; it just no longer decides what was
+            // dropped.
             if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
                 let app_handle = window.app_handle().clone();
                 let paths = paths.clone();
@@ -2208,11 +2374,20 @@ pub fn run() {
 
             match behavior {
                 "exit" => {
-                    // Default close path. Don't call `prevent_close`; let
-                    // Tauri tear the window down and fire `RunEvent::Exit`.
+                    // Exit the app rather than close this window: closing the
+                    // main window alone would leave a popped-out chat window
+                    // keeping Ember running with no way back to the rest of it.
+                    // The same path as `quit_app`, so `RunEvent::Exit` still
+                    // runs the shutdown.
+                    api.prevent_close();
+                    state
+                        .quit_confirmed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    app_handle.exit(0);
                 }
                 "tray" => {
                     api.prevent_close();
+                    commands::chat_window::set_chat_window_visible(app_handle, false);
                     if let Err(e) = window.hide() {
                         tracing::warn!("Failed to hide window for close-to-tray: {e}");
                     }

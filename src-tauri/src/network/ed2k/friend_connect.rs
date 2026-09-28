@@ -86,6 +86,7 @@ pub async fn open_and_run_friend_session(
         Box::new(raw_r),
         Box::new(raw_w),
         addr,
+        false,
         expected_ember_hash,
         our_user_hash,
         our_ember_hash,
@@ -127,6 +128,79 @@ pub async fn open_and_run_friend_session(
 #[allow(clippy::too_many_arguments)]
 pub async fn send_friend_request_retraction(
     addr: SocketAddr,
+    expected_ember_hash: [u8; 16],
+    our_user_hash: [u8; 16],
+    our_ember_hash: [u8; 16],
+    our_nickname: String,
+    our_client_id: u32,
+    tcp_port: u16,
+    udp_port: u16,
+    obfuscate: bool,
+    ed25519_pubkey: Option<[u8; 32]>,
+    ed25519_secret_key: Option<[u8; 32]>,
+) -> anyhow::Result<()> {
+    send_friend_request_verdict(
+        addr,
+        EMBER_EXT_FRIEND_RETRACT,
+        expected_ember_hash,
+        our_user_hash,
+        our_ember_hash,
+        our_nickname,
+        our_client_id,
+        tcp_port,
+        udp_port,
+        obfuscate,
+        ed25519_pubkey,
+        ed25519_secret_key,
+    )
+    .await
+}
+
+/// Tell `expected_ember_hash` that the friend request *they* sent is refused.
+///
+/// The same courier as the withdrawal above and for the same reasons — they
+/// are not a friend, so a friend session would refuse the dial, and neither
+/// message is worth loosening that guard for. Only the sub-type differs.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_friend_request_decline(
+    addr: SocketAddr,
+    expected_ember_hash: [u8; 16],
+    our_user_hash: [u8; 16],
+    our_ember_hash: [u8; 16],
+    our_nickname: String,
+    our_client_id: u32,
+    tcp_port: u16,
+    udp_port: u16,
+    obfuscate: bool,
+    ed25519_pubkey: Option<[u8; 32]>,
+    ed25519_secret_key: Option<[u8; 32]>,
+) -> anyhow::Result<()> {
+    send_friend_request_verdict(
+        addr,
+        EMBER_EXT_FRIEND_DECLINE,
+        expected_ember_hash,
+        our_user_hash,
+        our_ember_hash,
+        our_nickname,
+        our_client_id,
+        tcp_port,
+        udp_port,
+        obfuscate,
+        ed25519_pubkey,
+        ed25519_secret_key,
+    )
+    .await
+}
+
+/// The shared dial behind a withdrawal and a decline.
+///
+/// `ext_type` is the only thing that differs between them: both are one
+/// body-less `OP_EMBER_EXT` frame delivered to somebody who is not a friend,
+/// and both depend on the same handshake to prove who is saying it.
+#[allow(clippy::too_many_arguments)]
+async fn send_friend_request_verdict(
+    addr: SocketAddr,
+    ext_type: u8,
     expected_ember_hash: [u8; 16],
     our_user_hash: [u8; 16],
     our_ember_hash: [u8; 16],
@@ -185,7 +259,7 @@ pub async fn send_friend_request_retraction(
     let hello_payload = build_hello_with_buddy_opts(
         &our_user_hash,
         our_client_id,
-        tcp_port,
+        super::peer_sessions::advertised_tcp_port_or(tcp_port),
         &our_nickname,
         None,
         &hello_options,
@@ -210,10 +284,10 @@ pub async fn send_friend_request_retraction(
         &mut writer,
         OP_EMULEPROT,
         OP_EMBER_EXT,
-        &build_ember_ext(EMBER_EXT_FRIEND_RETRACT, &[]),
+        &build_ember_ext(ext_type, &[]),
     )
     .await
-    .context("failed to send friend-request withdrawal")?;
+    .context("failed to send the friend-request verdict")?;
 
     // This connection has said everything it was opened to say, but it is the
     // peer that has to hang up first. TCP delivers in order, so the peer
@@ -248,7 +322,12 @@ pub async fn send_friend_request_retraction(
         }
     }
     info!(
-        "Withdrew friend request at {} ({})",
+        "Delivered friend-request {} at {} ({})",
+        if ext_type == EMBER_EXT_FRIEND_DECLINE {
+            "decline"
+        } else {
+            "withdrawal"
+        },
         addr,
         crate::security::short_hash(&expected_ember_hash)
     );
@@ -262,15 +341,18 @@ pub async fn send_friend_request_retraction(
 /// hole-punch and rendezvous-relay transports, which hand back boxed
 /// `AsyncRead`/`AsyncWrite` halves rather than a `TcpStream`.
 ///
-/// `addr` is used only for logging and the identity-guard error message —
-/// for non-TCP transports pass the best available description of where
-/// the peer was actually reached (e.g. the rendezvous-reported punch
-/// address, or `0.0.0.0:0` for a pure relay hop).
+/// `addr` is where the session reports the peer to be, and it is the IP a
+/// connect-back from this session goes to — for non-TCP transports pass where
+/// the peer was actually reached (the punched address), or the best address
+/// known for it when a relay hop has none. `relayed` marks that last case: a
+/// chat attachment is then refused rather than dialled at an address the
+/// session itself could not reach.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_friend_session_over_transport(
     raw_r: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
     raw_w: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     addr: SocketAddr,
+    relayed: bool,
     expected_ember_hash: [u8; 16],
     our_user_hash: [u8; 16],
     our_ember_hash: [u8; 16],
@@ -319,7 +401,7 @@ pub async fn run_friend_session_over_transport(
     let hello_payload = build_hello_with_buddy_opts(
         &our_user_hash,
         our_client_id,
-        tcp_port,
+        super::peer_sessions::advertised_tcp_port_or(tcp_port),
         &our_nickname,
         None,
         &hello_options,
@@ -403,7 +485,9 @@ pub async fn run_friend_session_over_transport(
     // stale or key-mismatched entry.
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     let ember_session_handle =
-        EmberSessionHandle::new_secure(outbound_tx.clone(), peer_pk, peer_ember_hash);
+        EmberSessionHandle::new_secure(outbound_tx.clone(), peer_pk, peer_ember_hash)
+            .via_relay(relayed)
+            .with_peer_addr((!relayed).then_some(addr));
     {
         let mut sessions = ember_sessions.write().await;
         // The user may have gone offline while this dial was in flight.
@@ -818,6 +902,23 @@ pub async fn run_friend_session_over_transport(
                                                 },
                                             }).await;
                                         }
+                                        Some((super::messages::EMBER_EXT_FRIEND_DECLINE, _)) => {
+                                            // They are refusing a request we
+                                            // sent. Same proof of possession as
+                                            // the retraction above, and the
+                                            // handler only ever clears a row we
+                                            // have not had accepted.
+                                            debug!(
+                                                "Friend {} declined our friend request",
+                                                crate::security::short_hash(&peer_ember_hash)
+                                            );
+                                            let _ = session_ul_event_tx.send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberFriendDecline {
+                                                    ember_hash: peer_ember_hash,
+                                                },
+                                            }).await;
+                                        }
                                         Some((super::messages::EMBER_EXT_CHAT_TYPING, body)) => {
                                             if let Some(typing) = decrypt_chat_typing(
                                                 &session_our_ed25519_secret,
@@ -878,6 +979,40 @@ pub async fn run_friend_session_over_transport(
                                                     },
                                                 }).await;
                                             }
+                                        }
+                                        Some((super::messages::EMBER_EXT_ATTACH_OFFER
+                                            | super::messages::EMBER_EXT_ATTACH_REPLY
+                                            | super::messages::EMBER_EXT_ATTACH_CANCEL, _)) => {
+                                            if let Some(kind) = super::upload::attach_event_from_ext(
+                                                peer_ember_hash,
+                                                &payload,
+                                                (!relayed).then_some(addr),
+                                            ) {
+                                                let _ = session_ul_event_tx.send(UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind,
+                                                }).await;
+                                            }
+                                        }
+                                        Some((super::messages::EMBER_EXT_BROWSE_SCOPE, body)) => {
+                                            let _ = session_ul_event_tx.send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberBrowseScope {
+                                                    ember_hash: peer_ember_hash,
+                                                    session_id: session_ember_session_handle.session_id(),
+                                                    body: body.to_vec(),
+                                                },
+                                            }).await;
+                                        }
+                                        Some((super::messages::EMBER_EXT_BROWSE_SUMMARY, body)) => {
+                                            let _ = session_ul_event_tx.send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberBrowseSummary {
+                                                    ember_hash: peer_ember_hash,
+                                                    session_id: session_ember_session_handle.session_id(),
+                                                    body: body.to_vec(),
+                                                },
+                                            }).await;
                                         }
                                         // A sub-type this build predates. Ignoring
                                         // it is the whole point of the envelope.
@@ -1131,7 +1266,7 @@ pub async fn connect_friend_with_fallback(
     )
     .await
     {
-        Ok(FallbackTransport::Punch(send, recv)) => {
+        Ok(FallbackTransport::Punch((send, recv, punched_addr))) => {
             info!(
                 "Friend hole-punch to {} succeeded",
                 hex::encode(expected_ember_hash)
@@ -1139,7 +1274,8 @@ pub async fn connect_friend_with_fallback(
             run_friend_session_over_transport(
                 Box::new(recv),
                 Box::new(send),
-                addr,
+                punched_addr,
+                false,
                 expected_ember_hash,
                 our_user_hash,
                 our_ember_hash,
@@ -1163,10 +1299,14 @@ pub async fn connect_friend_with_fallback(
                 hex::encode(expected_ember_hash)
             );
             let (r, w) = tokio::io::split(ws_stream);
+            // A relay hop has no direct address of its own. The one we dialled
+            // is still the friend's last known one — the address this session
+            // reports, and the only IP anything dialled back from it may use.
             run_friend_session_over_transport(
                 Box::new(r),
                 Box::new(w),
                 addr,
+                true,
                 expected_ember_hash,
                 our_user_hash,
                 our_ember_hash,
@@ -1202,9 +1342,13 @@ pub async fn connect_friend_with_fallback(
 /// buy nothing: the value is moved once and read through thereafter.
 #[allow(clippy::large_enum_variant)]
 enum FallbackTransport {
-    Punch(quinn::SendStream, quinn::RecvStream),
+    Punch(PunchedStreams),
     Relay(crate::network::ember::relay::WsStream),
 }
+
+/// A punched friend connection's stream, and the address it actually landed
+/// on — the friend's current mapping, which the saved address may not be.
+type PunchedStreams = (quinn::SendStream, quinn::RecvStream, SocketAddr);
 
 struct AbortOnDropTask<T>(Option<tokio::task::JoinHandle<T>>);
 
@@ -1604,7 +1748,7 @@ async fn nat_fallback_transport(
                 crate::network::ember::relay::close_server_relay(stream).await;
             }
             abandon_offered_ticket(&offered_ticket).await;
-            Ok(FallbackTransport::Punch(value.0, value.1))
+            Ok(FallbackTransport::Punch(value))
         }
         FallbackRace::Relay { value } => Ok(FallbackTransport::Relay(value)),
         FallbackRace::Failed(error) => {
@@ -1637,7 +1781,7 @@ async fn punch_from_register(
     secret_key: [u8; 32],
     deadline: tokio::time::Instant,
     skip_tx: tokio::sync::watch::Sender<bool>,
-) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+) -> Result<PunchedStreams, String> {
     // Register a port on the QUIC endpoint's own socket, not
     // `our_external_addr.port()` — that address comes from the KAD UDP
     // STUN probe (a *different* socket than the QUIC endpoint the friend
@@ -1749,7 +1893,7 @@ async fn punch_friend_until(
     friend_ember_hash: [u8; 16],
     secret_key: &[u8; 32],
     deadline: tokio::time::Instant,
-) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+) -> Result<PunchedStreams, String> {
     for _ in 0..FRIEND_PUNCH_POLL_ATTEMPTS {
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -1812,7 +1956,7 @@ async fn try_complete_friend_punch(
     friend_ember_hash: [u8; 16],
     secret_key: &[u8; 32],
     info: crate::network::ember::relay::PunchInfo,
-) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+) -> Result<PunchedStreams, String> {
     let our_pubkey = ed25519_dalek::SigningKey::from_bytes(secret_key)
         .verifying_key()
         .to_bytes();
@@ -1884,7 +2028,7 @@ async fn try_complete_friend_punch(
     )
     .await
     {
-        Ok(streams) => {
+        Ok((send, recv)) => {
             crate::network::ember::relay::ack_punch(
                 rendezvous_url,
                 &our_ember_hash,
@@ -1894,7 +2038,7 @@ async fn try_complete_friend_punch(
                 secret_key,
             )
             .await?;
-            Ok(streams)
+            Ok((send, recv, peer_addr))
         }
         Err(error) => {
             debug!("Friend QUIC punch to {peer_addr} failed: {error}");
@@ -2782,6 +2926,7 @@ mod tests {
             Box::new(client_r),
             Box::new(client_w),
             addr,
+            false,
             peer_ember_hash,
             [0x11; 16],
             our_ember_hash,
@@ -2927,6 +3072,7 @@ mod tests {
             Box::new(client_r),
             Box::new(client_w),
             addr,
+            false,
             peer_ember_hash,
             [0x11; 16],
             our_ember_hash,
@@ -3057,6 +3203,7 @@ mod tests {
             Box::new(client_r),
             Box::new(client_w),
             addr,
+            false,
             peer_ember_hash,
             [0x11; 16],
             our_ember_hash,
@@ -3196,6 +3343,7 @@ mod tests {
             Box::new(client_r),
             Box::new(client_w),
             addr,
+            false,
             peer_ember_hash,
             [0x11; 16],
             our_ember_hash,

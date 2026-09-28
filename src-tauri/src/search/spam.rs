@@ -171,6 +171,19 @@ pub struct BatchSpamContext {
     /// directly — so the exemption reaches the scorer without a `local_index`
     /// read on the network loop or a new argument on four call chains.
     owned_hashes: HashSet<String>,
+    /// Batch-signal verdicts rows already carry, by hash. See
+    /// [`Self::carry_batch_signals`].
+    carried: HashMap<String, CarriedBatchSignals>,
+}
+
+/// The batch signals one row was scored with by the pass that saw its batch.
+#[derive(Debug, Clone, Copy, Default)]
+struct CarriedBatchSignals {
+    /// The distinct-hash count its `BatchNameManyHashes` reason reported.
+    name_many_hashes: Option<u32>,
+    /// The distinct-name count its `BatchHashManyNames` reason reported.
+    hash_many_names: Option<u32>,
+    source_concentration: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +236,50 @@ impl BatchSpamContext {
             .map(|h| normalize_hash(&h))
             .filter(|h| !h.is_empty())
             .collect();
+    }
+
+    /// Keep the batch signals `results` were already flagged with, for a pass
+    /// that re-scores them without the batch that produced them.
+    ///
+    /// A re-score after Mark spam / Mark not spam hands back rows one at a time,
+    /// so it cannot rebuild the search-wide context the stream scored them
+    /// against — and scoring without it, then adopting the result outright,
+    /// cleared every flag that context had raised. One unmark un-flagged the
+    /// whole coordinated flood beside it. What a re-score exists to move is the
+    /// learned-data signals; the batch ones are facts about the search, which
+    /// the re-score has not seen change, so they are re-applied as they were.
+    /// Read from `spam_reason_details`, the only place a row records them.
+    ///
+    /// Still gated like the live signals: a profile without network signals
+    /// drops them, and an explicit Mark not spam or an owned file outranks them.
+    pub fn carry_batch_signals(&mut self, results: &[SearchResult]) {
+        let name_code = SpamReasonCode::BatchNameManyHashes.as_code();
+        let hash_code = SpamReasonCode::BatchHashManyNames.as_code();
+        let source_code = SpamReasonCode::BatchSourceConcentration.as_code();
+        for r in results {
+            let hash = normalize_hash(&r.file.hash);
+            if hash.is_empty() {
+                continue;
+            }
+            let mut signals = CarriedBatchSignals::default();
+            for reason in &r.spam_reason_details {
+                if reason.code == name_code {
+                    signals.name_many_hashes =
+                        Some(reason.count.unwrap_or(BATCH_NAME_DISTINCT_HASHES_MIN as u32));
+                } else if reason.code == hash_code {
+                    signals.hash_many_names =
+                        Some(reason.count.unwrap_or(BATCH_HASH_DISTINCT_NAMES_MIN as u32));
+                } else if reason.code == source_code {
+                    signals.source_concentration = true;
+                }
+            }
+            if signals.name_many_hashes.is_some()
+                || signals.hash_many_names.is_some()
+                || signals.source_concentration
+            {
+                self.carried.insert(hash, signals);
+            }
+        }
     }
 
     /// Whether `hash` is a file this library already holds.
@@ -1225,31 +1282,45 @@ impl SpamFilter {
             ));
         }
 
-        // Intra-result-set statistical signals (coordinated poisoning).
-        if network_signals && batch.enabled {
-            if batch.name_collision(&name_norm) {
+        // Intra-result-set statistical signals (coordinated poisoning), live
+        // from this batch or carried by a row whose batch is not here — see
+        // `BatchSpamContext::carry_batch_signals`.
+        if network_signals {
+            let carried = batch.carried.get(&hash).copied().unwrap_or_default();
+            let name_hashes = if batch.enabled && batch.name_collision(&name_norm) {
+                Some(batch.name_hash_count(&name_norm) as u32)
+            } else {
+                carried.name_many_hashes
+            };
+            let hash_names = if batch.enabled && batch.hash_collision(&hash) {
+                Some(batch.hash_name_count(&hash) as u32)
+            } else {
+                carried.hash_many_names
+            };
+            if let Some(count) = name_hashes {
                 score += SPAM_BATCH_NAME_MANY_HASHES_HIT;
                 reasons.push(SpamReason::new(
                     SpamReasonCode::BatchNameManyHashes,
                     &[
-                        (SpamParam::Count, batch.name_hash_count(&name_norm) as u32),
+                        (SpamParam::Count, count),
                         (SpamParam::Weight, SPAM_BATCH_NAME_MANY_HASHES_HIT),
                     ],
                 ));
                 strong_local = true;
             }
-            if batch.hash_collision(&hash) {
+            if let Some(count) = hash_names {
                 score += SPAM_BATCH_HASH_MANY_NAMES_HIT;
                 reasons.push(SpamReason::new(
                     SpamReasonCode::BatchHashManyNames,
                     &[
-                        (SpamParam::Count, batch.hash_name_count(&hash) as u32),
+                        (SpamParam::Count, count),
                         (SpamParam::Weight, SPAM_BATCH_HASH_MANY_NAMES_HIT),
                     ],
                 ));
                 strong_local = true;
             }
-            if batch.source_concentrated(result) {
+            if (batch.enabled && batch.source_concentrated(result)) || carried.source_concentration
+            {
                 score += SPAM_BATCH_SOURCE_CONCENTRATION_HIT;
                 reasons.push(SpamReason::new(
                     SpamReasonCode::BatchSourceConcentration,
@@ -2672,6 +2743,104 @@ mod tests {
             .reason_details
             .iter()
             .all(|r| r.code != "owned_file"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A re-score after Mark not spam sends rows back one by one, with no batch
+    /// to rebuild the collision statistics from, and the UI adopts its verdict
+    /// outright — so one unmark cleared every row the batch had flagged. The
+    /// marked row clears; its siblings keep what the batch said about them.
+    #[test]
+    fn a_rescore_keeps_the_batch_signals_rows_were_flagged_with() {
+        let dir = temp_dir("carry-batch");
+        let mut filter = SpamFilter::load(&dir);
+        // Four hashes, each advertised under the same three names from one
+        // flooding IP: both collision bars and the source bar, which together
+        // convict under `balanced` while no single row signal does.
+        let names = [
+            "Popular Movie 2026 1080p BluRay.mkv",
+            "Popular Movie 2026 720p WEB.mkv",
+            "Popular Movie 2026 Remux.mkv",
+        ];
+        let hashes: Vec<String> = (0..4).map(|i| format!("{:032x}", i + 1)).collect();
+        let mut stream = Vec::new();
+        for hash in &hashes {
+            for name in names {
+                stream.push(sized_result(hash, name, 1000, &["93.184.216.34:4662"]));
+            }
+        }
+        let live = BatchSpamContext::analyze(&stream);
+        let mut shown: Vec<SearchResult> = hashes
+            .iter()
+            .map(|hash| {
+                let mut row = sized_result(hash, names[0], 1000, &["93.184.216.34:4662"]);
+                let verdict = filter.explain_result(
+                    &row,
+                    &[],
+                    None,
+                    SpamFilterProfile::Balanced,
+                    CommunityRating::default(),
+                    &live,
+                );
+                assert!(verdict.is_spam, "the stream flags it (score {})", verdict.score);
+                row.is_spam = verdict.is_spam;
+                row.spam_rating = verdict.score;
+                row.spam_reason_details = verdict.reason_details;
+                row
+            })
+            .collect();
+        let streamed_score = shown[1].spam_rating;
+
+        filter.mark_not_spam(&hashes[0]);
+        let bare = BatchSpamContext::default();
+        let uncarried = filter.explain_result(
+            &shown[1],
+            &[],
+            None,
+            SpamFilterProfile::Balanced,
+            CommunityRating::default(),
+            &bare,
+        );
+        assert!(
+            !uncarried.is_spam,
+            "without the batch the sibling reads clean, which is what the UI then adopted"
+        );
+
+        let mut carried = BatchSpamContext::default();
+        carried.carry_batch_signals(&shown);
+        let rescore = |row: &SearchResult, profile| {
+            filter.explain_result(row, &[], None, profile, CommunityRating::default(), &carried)
+        };
+        let unmarked = rescore(&shown[0], SpamFilterProfile::Balanced);
+        assert!(!unmarked.is_spam, "the row the user unmarked clears");
+        assert_eq!(unmarked.reason_details[0].code, "not_spam_marked");
+        for row in &shown[1..] {
+            let verdict = rescore(row, SpamFilterProfile::Balanced);
+            assert!(verdict.is_spam, "a sibling flagged only by the batch was cleared");
+            assert_eq!(verdict.score, streamed_score);
+            assert!(verdict
+                .reason_details
+                .iter()
+                .any(|r| r.code == "batch_name_many_hashes" && r.count == Some(4)));
+        }
+
+        // Carried signals are still network signals.
+        assert!(!rescore(&shown[1], SpamFilterProfile::Relaxed).is_spam);
+
+        // And carry nothing for a row that was not flagged by them.
+        shown[2].spam_reason_details.clear();
+        let mut carried = BatchSpamContext::default();
+        carried.carry_batch_signals(&shown[2..3]);
+        assert!(!filter
+            .explain_result(
+                &shown[2],
+                &[],
+                None,
+                SpamFilterProfile::Balanced,
+                CommunityRating::default(),
+                &carried,
+            )
+            .is_spam);
         let _ = std::fs::remove_dir_all(dir);
     }
 

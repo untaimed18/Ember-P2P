@@ -310,7 +310,20 @@ pub(crate) async fn quic_mapping_keepalive(
 }
 
 /// Background cycle: TCP hold + TCP STUN on `tcp_port`.
+///
+/// Windows only. Both halves bind a second socket to the listener's port,
+/// which `SO_REUSEADDR` allows there but Linux refuses while the listener is
+/// up (it would take `SO_REUSEPORT` on the listener too, letting any process
+/// of the same user share its accepts). Elsewhere every attempt failed at
+/// `bind` after seven DNS lookups and logged a warning every cycle.
 pub async fn tcp_mapping_cycle(local_tcp_port: u16) -> (bool, Option<SocketAddr>) {
+    if !cfg!(windows) {
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        NOTED.call_once(|| {
+            info!("TCP port-mapping keep-alive is Windows-only; UDP keep-alive continues")
+        });
+        return (false, None);
+    }
     let hold_stream = open_tcp_mapping_hold(local_tcp_port).await;
     let hold_ok = hold_stream.is_some();
     if hold_ok {

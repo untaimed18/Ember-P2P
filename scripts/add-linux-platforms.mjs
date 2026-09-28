@@ -33,11 +33,10 @@ const LINUX_TARGETS = [
  * The release's asset directory, taken from a platform entry already in the
  * manifest rather than rebuilt from the owner, repository and tag.
  *
- * Those entries are written by `tauri-action`, which is the only thing that
- * knows the URL shape it uploaded under, and the hardening step that runs after
- * this one resolves each entry to a local file by reading the last path segment
- * as the asset name. Deriving the Linux URLs from a sibling keeps all four
- * entries in one shape by construction, so a change to that shape cannot leave
+ * Those entries are written by `compose-update-manifest.mjs`, and the hardening
+ * step that runs after this one resolves each entry to a local file by reading
+ * the last path segment as the asset name. Deriving the Linux URLs from a
+ * sibling keeps every entry in one shape by construction, so a change to that shape cannot leave
  * Windows resolvable and Linux silently broken.
  */
 export function releaseAssetBase(manifest) {
@@ -118,29 +117,24 @@ export function collectLinuxBundles({ directory }) {
 }
 
 /**
- * Add the Linux entries to a manifest `tauri-action` has already written the
- * Windows ones into.
+ * Add the Linux entries to a manifest `compose-update-manifest.mjs` has already
+ * written the Windows ones into.
  *
- * Only `url` and `signature` are set, which is the whole of what `tauri-action`
- * writes for a platform. `target`, `sha256` and `size` are added afterwards by
+ * Only `url` and `signature` are set, which is the whole of what the Windows
+ * entries carry at this point. `target`, `sha256` and `size` are added afterwards by
  * `harden-update-manifest.mjs`, from the artifact bytes themselves, so that
  * every entry in the finished manifest is bound the same way no matter which
  * runner built it.
  */
 export function addLinuxPlatforms({ manifest, bundles, assetBase }) {
-  // Every `linux-` entry is dropped first, so this rewrites rather than adds.
+  // Every `linux-` entry is dropped first, so this rewrites rather than adds:
+  // a manifest carrying a previous attempt's entries would otherwise pair that
+  // run's signature with this run's bytes. Clearing the whole prefix also
+  // removes a bare `linux-x86_64` if anything ever writes one, which is the key
+  // this deliberately omits.
   //
-  // A re-run of the signing job does not start from a clean manifest:
-  // `tauri-action` seeds `platforms` from the `latest.json` already attached to
-  // the release, so a retry after a failed upload finds the previous attempt's
-  // Linux entries carried straight back in. Refusing them — which this did —
-  // made a retried release unrecoverable without deleting that asset by hand,
-  // and keeping them would leave the previous run's signature against this
-  // run's bytes. Clearing the whole prefix also removes a bare `linux-x86_64`
-  // if anything ever writes one, which is the key this deliberately omits.
-  //
-  // The base URL is read after the clear so it can only come from an entry
-  // `tauri-action` wrote during this run.
+  // The base URL is read after the clear so it can only come from a Windows
+  // entry composed during this run.
   for (const target of Object.keys(manifest.platforms)) {
     if (target.startsWith("linux-")) delete manifest.platforms[target];
   }

@@ -173,15 +173,20 @@ impl EmberContact {
 
     /// Subnet key (first 3 octets for IPv4, first 48 bits for IPv6).
     pub fn subnet_key(&self) -> u64 {
-        match self.addr.ip() {
-            std::net::IpAddr::V4(ip) => {
-                let o = ip.octets();
-                u64::from(u32::from_be_bytes([o[0], o[1], o[2], 0]))
-            }
-            std::net::IpAddr::V6(ip) => {
-                let s = ip.segments();
-                ((s[0] as u64) << 32) | ((s[1] as u64) << 16) | (s[2] as u64)
-            }
+        subnet_key_of(self.addr.ip())
+    }
+}
+
+/// [`EmberContact::subnet_key`] for a bare address.
+pub fn subnet_key_of(ip: std::net::IpAddr) -> u64 {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let o = ip.octets();
+            u64::from(u32::from_be_bytes([o[0], o[1], o[2], 0]))
+        }
+        std::net::IpAddr::V6(ip) => {
+            let s = ip.segments();
+            ((s[0] as u64) << 32) | ((s[1] as u64) << 16) | (s[2] as u64)
         }
     }
 }

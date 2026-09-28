@@ -60,13 +60,6 @@ fn backup_before_overwrite(path: &Path) {
     }
 }
 
-/// Persist the bootstrap cache to `nodes_ember.dat`.
-///
-/// Format:
-///   magic(4) + version(1) + count(u16 LE) +
-///   for each contact:
-///     node_id(16) + addr_type(1) + ip(4 or 16) + port(2 BE) +
-///     noise_pub(32) + ed25519_pub(32) + last_seen(i64 LE) + misses(1)
 /// What this session knows about the on-disk nodes file, which is what decides
 /// whether overwriting it is safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +74,89 @@ pub enum NodesFileState {
     Truncated { recovered: usize },
 }
 
+/// Why `nodes_ember.dat` did not load, which decides whether the file may be
+/// moved aside or has to be left exactly where it is.
+#[derive(Debug)]
+pub enum NodesLoadError {
+    /// The file could not be read at all — on Windows, routinely a sharing
+    /// violation from antivirus, the indexer or backup software. Says nothing
+    /// about the contents, so the next launch simply tries again.
+    Io(std::io::Error),
+    /// Written by a newer build. Intact, and readable again once that build is
+    /// back, so it must not be moved or overwritten by this one.
+    TooNew(u8),
+    /// Not a nodes file any build could read: too small, too large or the
+    /// wrong magic.
+    Corrupt(String),
+}
+
+impl std::fmt::Display for NodesLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "could not read nodes_ember.dat: {e}"),
+            Self::TooNew(version) => write!(
+                f,
+                "nodes_ember.dat is version {version}, newer than this build reads \
+                 ({NODES_EMBER_VERSION})"
+            ),
+            Self::Corrupt(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
+impl std::error::Error for NodesLoadError {}
+
+/// Deal with a nodes file that failed to load, and return the state the save
+/// path should run under for the rest of the session.
+///
+/// Only a corrupt file is moved aside, to a dated `.unreadable.<ts>` copy:
+/// left in place it would keep this session and every later one `Unread`, so
+/// the node could never persist a contact again. Anything else stays put and
+/// `Unread`, because the contents are intact — a newer build's file is the
+/// whole address book for when that build is back, and an I/O failure is
+/// usually gone by the next launch.
+pub fn settle_unloadable_nodes(path: &Path, err: &NodesLoadError) -> NodesFileState {
+    let NodesLoadError::Corrupt(_) = err else {
+        warn!(
+            "{err}; leaving {} in place, and this session will not overwrite it",
+            path.display()
+        );
+        return NodesFileState::Unread;
+    };
+    warn!("Failed to load {}: {err}", path.display());
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let quarantine = path.with_extension(format!("dat.unreadable.{ts}"));
+    match std::fs::rename(path, &quarantine) {
+        Ok(()) => {
+            warn!(
+                "Moved the unreadable {} aside to {} so this node can remember peers again",
+                path.display(),
+                quarantine.display()
+            );
+            NodesFileState::Loaded
+        }
+        Err(e) => {
+            warn!(
+                "Could not move the unreadable {} aside ({e}); peer persistence stays \
+                 disabled until it is removed",
+                path.display()
+            );
+            NodesFileState::Unread
+        }
+    }
+}
+
+/// Persist the bootstrap cache to `nodes_ember.dat`, unless `file_state` says
+/// the file on disk holds contacts this session has no right to discard.
+///
+/// Format:
+///   magic(4) + version(1) + count(u16 LE) +
+///   for each contact:
+///     node_id(16) + addr_type(1) + ip(4 or 16) + port(2 BE) +
+///     noise_pub(32) + ed25519_pub(32) + last_seen(i64 LE) + misses(1)
 pub fn save_nodes(
     path: &Path,
     contacts: &[CachedContact],
@@ -99,12 +175,14 @@ pub fn save_nodes(
     }
 
     // A file we could not read is not a file with nothing in it. `load_nodes`
-    // fails with the contents perfectly intact on a version downgrade, a bad
-    // magic, an oversized file, or — routinely on Windows — a sharing violation
-    // from antivirus, the indexer or backup software. The cache then starts
-    // empty, nothing re-reads the file, and the next save would overwrite two
-    // hundred remembered peers with whatever this one session managed to find.
-    // `save_store` has taken the same flag for the same reason all along.
+    // fails with the contents perfectly intact on a version downgrade or —
+    // routinely on Windows — a sharing violation from antivirus, the indexer
+    // or backup software. The cache then starts empty, nothing re-reads the
+    // file, and the next save would overwrite two hundred remembered peers with
+    // whatever this one session managed to find. Only a file no build could
+    // read is moved aside and released from this guard — see
+    // `settle_unloadable_nodes`. `save_store` has taken the same flag for the
+    // same reason all along.
     if matches!(file_state, NodesFileState::Unread) && path.exists() {
         info!(
             "Skipping Ember nodes save: this session never loaded {}, so what it \
@@ -185,38 +263,47 @@ pub fn save_nodes(
 /// save path has to know whether the file came back whole.
 #[cfg(test)]
 pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<CachedContact>> {
-    load_nodes_with_state(path).map(|(contacts, _)| contacts)
+    load_nodes_with_state(path)
+        .map(|(contacts, _)| contacts)
+        .map_err(Into::into)
 }
 
 /// [`load_nodes`], plus whether the file was whole. The save path needs the
 /// second half — see [`NodesFileState`].
-pub fn load_nodes_with_state(path: &Path) -> anyhow::Result<(Vec<CachedContact>, NodesFileState)> {
+pub fn load_nodes_with_state(
+    path: &Path,
+) -> Result<(Vec<CachedContact>, NodesFileState), NodesLoadError> {
     crate::security::recover_interrupted_replace(path);
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.len() > MAX_NODES_EMBER_BYTES {
-            anyhow::bail!(
+            return Err(NodesLoadError::Corrupt(format!(
                 "nodes_ember.dat too large ({} bytes, max {MAX_NODES_EMBER_BYTES})",
                 meta.len()
-            );
+            )));
         }
     }
-    let data = std::fs::read(path)?;
+    let data = std::fs::read(path).map_err(NodesLoadError::Io)?;
+    // The seven-byte header is all the reads below take before the loop, so
+    // past this check none of them can fail.
     if data.len() < 7 {
-        anyhow::bail!("nodes_ember.dat too small");
+        return Err(NodesLoadError::Corrupt("nodes_ember.dat too small".into()));
     }
+    let short = |_| NodesLoadError::Corrupt("nodes_ember.dat header is short".into());
 
     let mut cursor = std::io::Cursor::new(&data);
-    let magic = cursor.read_u32::<LittleEndian>()?;
+    let magic = cursor.read_u32::<LittleEndian>().map_err(short)?;
     if magic != NODES_EMBER_MAGIC {
-        anyhow::bail!("Invalid nodes_ember.dat magic: 0x{magic:08x}");
+        return Err(NodesLoadError::Corrupt(format!(
+            "Invalid nodes_ember.dat magic: 0x{magic:08x}"
+        )));
     }
 
-    let version = cursor.read_u8()?;
+    let version = cursor.read_u8().map_err(short)?;
     if version > NODES_EMBER_VERSION {
-        anyhow::bail!("Unsupported nodes_ember.dat version {version}");
+        return Err(NodesLoadError::TooNew(version));
     }
 
-    let declared = cursor.read_u16::<LittleEndian>()? as usize;
+    let declared = cursor.read_u16::<LittleEndian>().map_err(short)? as usize;
     if declared > MAX_PERSISTED_CONTACTS {
         warn!(
             "nodes_ember.dat declares {declared} contacts, more than this build writes; \
@@ -665,10 +752,10 @@ mod tests {
     }
 
     /// A file we could not read is not a file with nothing in it. `load_nodes`
-    /// fails with the contents intact on a version downgrade, a bad magic, an
-    /// oversized file, or a Windows sharing violation from antivirus or backup
-    /// software — and the next save would then bury two hundred remembered
-    /// peers under whatever one session happened to find.
+    /// fails with the contents intact on a version downgrade or a Windows
+    /// sharing violation from antivirus or backup software — and the next save
+    /// would then bury two hundred remembered peers under whatever one session
+    /// happened to find.
     #[test]
     fn a_session_that_could_not_read_the_file_must_not_overwrite_it() {
         let dir = temp_nodes_dir("unread");
@@ -739,6 +826,82 @@ mod tests {
         let grown: Vec<CachedContact> = (1..=12).map(make_contact).collect();
         save_nodes(&path, &grown, file_state).unwrap();
         assert_eq!(load_nodes(&path).unwrap().len(), 12);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A downgrade followed by an upgrade must find the newer build's address
+    /// book where it left it. Quarantining the file, or releasing the guard so
+    /// this build's first save replaced it, would lose the whole book.
+    #[test]
+    fn a_file_from_a_newer_build_is_left_in_place_and_guarded() {
+        let dir = temp_nodes_dir("too-new");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nodes_ember.dat");
+
+        let book: Vec<CachedContact> = (1..=4).map(make_contact).collect();
+        save_nodes(&path, &book, NodesFileState::Loaded).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4] = NODES_EMBER_VERSION + 1;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = load_nodes_with_state(&path).unwrap_err();
+        assert!(matches!(err, NodesLoadError::TooNew(v) if v == NODES_EMBER_VERSION + 1));
+        let file_state = settle_unloadable_nodes(&path, &err);
+        assert_eq!(file_state, NodesFileState::Unread);
+
+        save_nodes(&path, &[make_contact(9)], file_state).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "the newer build's file must survive this session untouched"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "nothing moved aside");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A read that failed says nothing about the contents, so it is retried
+    /// next launch rather than treated as corruption.
+    #[test]
+    fn a_file_that_could_not_be_read_is_left_in_place_and_guarded() {
+        let dir = temp_nodes_dir("io");
+        // A directory where the file should be: `metadata` succeeds, `read`
+        // fails, on every platform.
+        let path = dir.join("nodes_ember.dat");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let err = load_nodes_with_state(&path).unwrap_err();
+        assert!(matches!(err, NodesLoadError::Io(_)), "{err:?}");
+        assert_eq!(settle_unloadable_nodes(&path, &err), NodesFileState::Unread);
+        assert!(path.is_dir(), "left exactly where it was");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file no build could read would keep persistence disabled on every
+    /// launch, so it is moved aside once and saving resumes.
+    #[test]
+    fn a_corrupt_file_is_moved_aside_and_saving_resumes() {
+        let dir = temp_nodes_dir("corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nodes_ember.dat");
+        std::fs::write(&path, b"definitely not a nodes file").unwrap();
+
+        let err = load_nodes_with_state(&path).unwrap_err();
+        assert!(matches!(err, NodesLoadError::Corrupt(_)), "{err:?}");
+        let file_state = settle_unloadable_nodes(&path, &err);
+        assert_eq!(file_state, NodesFileState::Loaded);
+        assert!(!path.exists(), "moved aside");
+        let aside: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert!(aside[0].starts_with("nodes_ember.dat.unreadable."), "{aside:?}");
+
+        save_nodes(&path, &[make_contact(9)], file_state).unwrap();
+        assert_eq!(load_nodes(&path).unwrap().len(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }

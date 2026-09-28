@@ -22,6 +22,7 @@
  */
 import {
   baseLocale,
+  extractLocaleFromNavigator,
   locales,
   getLocale,
   setLocale,
@@ -29,6 +30,7 @@ import {
   type Locale,
 } from '$lib/paraglide/runtime';
 import * as m from '$lib/paraglide/messages';
+import { TimeoutError } from '$lib/timeout';
 import type { SpamReason } from '$lib/types';
 
 export { baseLocale, locales, getLocale, setLocale };
@@ -73,43 +75,19 @@ export function useSystemLocale(): void {
 
 /**
  * The locale that `preferredLanguage` would resolve to right
- * now — i.e. the first compiled locale whose language tag is a
- * prefix match for `navigator.language`, otherwise the base.
- * Used by the Settings picker to show e.g. "System (Spanish)"
+ * now. Used by the Settings picker to show e.g. "System (Spanish)"
  * so the user knows what they'd be following.
+ *
+ * Delegates to the same Paraglide function the strategy chain runs,
+ * so the label always names the locale that would actually load.
  */
 export function systemLocale(): Locale {
   if (typeof navigator === 'undefined') return baseLocale;
-  const nav = (navigator.languages?.[0] ?? navigator.language ?? '').toLowerCase();
-  if (!nav) return baseLocale;
-  const lang = nav.split('-')[0];
-  const compiled = locales as readonly Locale[];
-  // exact match first (e.g. zh-CN), then language-only (e.g. es),
-  // then script/region-aware Chinese, then primary-subtag match.
-  const exact = compiled.find((l) => l.toLowerCase() === nav);
-  if (exact) return exact;
-  const prefix = compiled.find((l) => l.toLowerCase() === lang);
-  if (prefix) return prefix;
-  if (lang === 'zh') {
-    // Match whole subtags, not substrings. An explicit script wins over the
-    // region, so `zh-Hans-HK` is Simplified even though its region normally
-    // implies Traditional — a substring test read the `hk` and got it
-    // backwards.
-    const parts = nav.split(/[-_]/);
-    const hant = parts.includes('hant')
-      ? true
-      : parts.includes('hans')
-        ? false
-        : parts.some((part) => part === 'tw' || part === 'hk' || part === 'mo');
-    const want = hant ? 'zh-tw' : 'zh-cn';
-    const preferred = compiled.find((l) => l.toLowerCase() === want);
-    if (preferred) return preferred;
+  try {
+    return extractLocaleFromNavigator() ?? baseLocale;
+  } catch {
+    return baseLocale;
   }
-  const regional = compiled.find((l) => {
-    const lower = l.toLowerCase();
-    return lower.startsWith(`${lang}-`) || lower.startsWith(`${lang}_`);
-  });
-  return regional ?? baseLocale;
 }
 
 /**
@@ -331,7 +309,7 @@ export function degradedReasonText(reason: string | undefined): string {
 const TRANSFER_FAILURE_CODES = new Map<string, () => string>([
   ['cancelled', m.transfers_failure_reason_cancelled],
   ['remote_missing_file', m.transfers_failure_reason_remote_missing],
-  // Same wording as the row badge, which the Ember page and docs also use.
+  // Same wording as the status label on the row, which the Ember page and docs also use.
   ['ember_content_hash_mismatch', m.transfers_ember_mismatch_label],
   ['aich_hash_mismatch', m.transfers_failure_reason_aich_mismatch],
   ['hash_mismatch', m.transfers_failure_reason_hash_mismatch],
@@ -345,8 +323,11 @@ const TRANSFER_FAILURE_CODES = new Map<string, () => string>([
   ['permanent_failure', m.transfers_failure_reason_permanent],
   ['transient_failure', m.transfers_failure_reason_transient],
   ['network_channel_unavailable', m.transfers_failure_reason_no_channel],
+  ['download_folder_unavailable', m.transfers_failure_reason_download_folder],
   ['ember_pin_corrupt', m.transfers_failure_reason_ember_pin_corrupt],
   ['aich_pin_corrupt', m.transfers_failure_reason_aich_pin_corrupt],
+  ['final_verify_inconclusive', m.transfers_failure_reason_final_verify_inconclusive],
+  ['local_read_failed', m.transfers_failure_reason_local_read_failed],
 ]);
 
 /**
@@ -605,6 +586,7 @@ export function firewallStatusText(status: string | undefined): string {
  * still decoded while the bespoke fallback is preserved.
  */
 export function translateError(input: unknown, fallback?: string): string {
+  if (input instanceof TimeoutError) return m.error_timed_out();
   const raw = input instanceof Error
     ? input.message
     : typeof input === 'string'

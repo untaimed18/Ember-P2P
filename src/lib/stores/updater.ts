@@ -121,6 +121,10 @@ const FREQUENCY_MS: Record<UpdateCheckFrequency, number> = {
 // from Settings → About also updates it, since that makes an automatic
 // check redundant until the configured interval elapses again.
 const LAST_CHECK_STORAGE_KEY = 'ember.updater.lastCheckedAt';
+// A stamp further ahead than this was written while the clock was wrong. Taken
+// at face value it keeps `Date.now() - last` negative, and so silences every
+// silent check, until wall time catches up — months, for a clock set a year out.
+const MAX_LAST_CHECK_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
 const DISMISSED_UPDATE_STORAGE_KEY = 'ember.updater.dismissedUpdate';
 const LEGACY_DISMISSED_VERSION_STORAGE_KEY = 'ember.updater.dismissedVersion';
 
@@ -133,7 +137,12 @@ function readLastCheckedAt(): number {
   try {
     const raw = localStorage.getItem(LAST_CHECK_STORAGE_KEY);
     const parsed = raw === null ? NaN : Number(raw);
-    return Number.isFinite(parsed) ? parsed : 0;
+    if (!Number.isFinite(parsed)) return 0;
+    if (parsed > Date.now() + MAX_LAST_CHECK_FUTURE_SKEW_MS) {
+      localStorage.removeItem(LAST_CHECK_STORAGE_KEY);
+      return 0;
+    }
+    return parsed;
   } catch {
     // Storage unavailable (private mode / disabled) — treat as "never
     // checked" so callers fall back to a safe (if more frequent) default.

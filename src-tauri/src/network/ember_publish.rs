@@ -14,7 +14,7 @@
 //! `maybe_publish_ember_sources`). Those need the live state and stay in the
 //! parent module.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::ember;
 use super::EMBER_SEARCH_QUEUED_QUERY_TIMEOUT;
@@ -37,7 +37,7 @@ pub(crate) enum EmberPublishKind {
 /// published only once *every* one of its records has landed somewhere —
 /// retiring it when the first one lands would leave its other keywords
 /// unsearchable for a full republish interval.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct EmberRecordRef {
     pub(crate) file_hash: [u8; 16],
     pub(crate) kind: EmberPublishKind,
@@ -58,6 +58,9 @@ pub(crate) struct EmberPublishAttempts {
 pub(crate) struct EmberQueuedRecord {
     pub(crate) reference: EmberRecordRef,
     pub(crate) record: ember::dht::messages::BatchedRecord,
+    /// When the record entered the queue. Carry-over keeps it, so this is its
+    /// age across every flush that held it over. See [`EMBER_QUEUED_RECORD_TTL`].
+    pub(crate) queued_at: std::time::Instant,
 }
 
 /// What one publish pass picked up and what its flush achieved.
@@ -104,6 +107,22 @@ pub(crate) struct EmberBatchInFlight {
     pub(crate) node_id: ember::dht::EmberNodeId,
     pub(crate) records: Vec<EmberRecordRef>,
     pub(crate) deadline: std::time::Instant,
+    /// Positions in `records` whose copy went stale after it was sent, as a
+    /// bitmap like the ack's. Their ack or expiry settles nothing: the round
+    /// they belonged to is gone, and a new round for the same file shares their
+    /// reference. Kept in place rather than removed so the positions still line
+    /// up with the ack bitmap.
+    pub(crate) voided: u64,
+}
+
+impl EmberBatchInFlight {
+    fn live_records(&self) -> impl Iterator<Item = (usize, EmberRecordRef)> + '_ {
+        self.records
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(i, _)| self.voided & (1u64 << i) == 0)
+    }
 }
 
 /// Groups a publish tick's records by destination so each peer receives one
@@ -285,6 +304,19 @@ pub(crate) const EMBER_FLUSH_INTERVAL: std::time::Duration = std::time::Duration
 /// [`super::ember_source_files_per_tick`] size themselves so this is not
 /// reached in the steady state.
 pub(crate) const EMBER_MAX_CARRY_OVER_PER_PEER: usize = 256;
+
+/// How long a record may wait in the queue before it is given up on.
+///
+/// A destination whose sends keep failing holds its records over on every
+/// flush, and while any copy of a record is still queued, the other replicas'
+/// refusals and timeouts cannot settle its file — so without an age limit one
+/// such destination would keep files marked pending, and out of selection, for
+/// the rest of the session. A destination that is merely busy drains
+/// [`EMBER_MAX_CARRY_OVER_PER_PEER`] records at
+/// [`EMBER_STORE_RECORDS_PER_PEER_PER_MIN`] in under three minutes, well inside
+/// this.
+pub(crate) const EMBER_QUEUED_RECORD_TTL: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
 /// How many nodes each record is replicated to. Kademlia's k, and the same
 /// value `PublishManager` uses for the single-record path.
 pub(crate) const K_EMBER_REPLICAS: usize = ember::dht::K_BUCKET_SIZE;
@@ -327,6 +359,7 @@ impl EmberBatchPublisher {
         {
             return false;
         }
+        let queued_at = std::time::Instant::now();
         for contact in targets {
             let entry = self
                 .queued
@@ -335,6 +368,7 @@ impl EmberBatchPublisher {
             entry.1.push(EmberQueuedRecord {
                 reference,
                 record: record.clone(),
+                queued_at,
             });
             self.queued_count += 1;
         }
@@ -368,7 +402,7 @@ impl EmberBatchPublisher {
         }
         let batch = self.in_flight.remove(&request_id).expect("just checked");
         let mut outcome = EmberBatchAckOutcome::default();
-        for (i, reference) in batch.records.into_iter().enumerate() {
+        for (i, reference) in batch.live_records() {
             if accepted & (1u64 << i) != 0 {
                 outcome.placed.push(reference);
             } else {
@@ -389,11 +423,23 @@ impl EmberBatchPublisher {
         self.in_flight.retain(|_, b| {
             let live = now < b.deadline;
             if !live {
-                abandoned.extend_from_slice(&b.records);
+                abandoned.extend(b.live_records().map(|(_, reference)| reference));
             }
             live
         });
         abandoned
+    }
+
+    /// Void every in-flight record of `kind`, so a late ack or timeout for a
+    /// copy sent before its content went stale cannot settle a newer round.
+    pub(crate) fn void_in_flight_kind(&mut self, kind: EmberPublishKind) {
+        for batch in self.in_flight.values_mut() {
+            for (i, reference) in batch.records.iter().enumerate() {
+                if reference.kind == kind {
+                    batch.voided |= 1u64 << i;
+                }
+            }
+        }
     }
 
     /// Whether `reference` still sits in a queued or in-flight batch, so a
@@ -401,7 +447,7 @@ impl EmberBatchPublisher {
     pub(crate) fn record_still_outstanding(&self, reference: EmberRecordRef) -> bool {
         self.in_flight
             .values()
-            .any(|b| b.records.contains(&reference))
+            .any(|b| b.live_records().any(|(_, r)| r == reference))
             || self
                 .queued
                 .values()
@@ -464,6 +510,65 @@ impl EmberBatchPublisher {
         dropped
     }
 
+    /// Drop every queued record of `kind`, returning how many were removed.
+    ///
+    /// For a class of record whose content goes stale all at once: a source
+    /// record names our address, so an address change voids every copy still
+    /// waiting, and a storer would refuse each one.
+    pub(crate) fn drop_kind(&mut self, kind: EmberPublishKind) -> usize {
+        let mut dropped = 0usize;
+        self.queued.retain(|_, (_, records)| {
+            let before = records.len();
+            records.retain(|queued| queued.reference.kind != kind);
+            dropped += before - records.len();
+            !records.is_empty()
+        });
+        self.queued_count = self.queued_count.saturating_sub(dropped);
+        dropped
+    }
+
+    /// Remove records that have waited longer than [`EMBER_QUEUED_RECORD_TTL`],
+    /// returning them so the caller can release their files.
+    pub(crate) fn expire_queued(&mut self, now: std::time::Instant) -> Vec<EmberQueuedRecord> {
+        let mut expired = Vec::new();
+        self.queued.retain(|_, (_, records)| {
+            let is_stale =
+                |q: &EmberQueuedRecord| now.saturating_duration_since(q.queued_at) >= EMBER_QUEUED_RECORD_TTL;
+            if records.iter().any(is_stale) {
+                let (stale, live): (Vec<_>, Vec<_>) =
+                    std::mem::take(records).into_iter().partition(is_stale);
+                *records = live;
+                expired.extend(stale);
+            }
+            !records.is_empty()
+        });
+        self.queued_count = self.queued_count.saturating_sub(expired.len());
+        expired
+    }
+
+    /// Remove every queued destination `refused` rejects, returning the records
+    /// it held so the caller can hand them back to the schedule. Batches already
+    /// in flight are left to resolve or expire as usual.
+    pub(crate) fn drop_destinations(
+        &mut self,
+        mut refused: impl FnMut(&ember::dht::EmberContact) -> bool,
+    ) -> Vec<EmberQueuedRecord> {
+        let doomed: Vec<ember::dht::EmberNodeId> = self
+            .queued
+            .iter()
+            .filter(|(_, (contact, _))| refused(contact))
+            .map(|(node_id, _)| *node_id)
+            .collect();
+        let mut dropped = Vec::new();
+        for node_id in doomed {
+            if let Some((_, records)) = self.queued.remove(&node_id) {
+                dropped.extend(records);
+            }
+        }
+        self.queued_count = self.queued_count.saturating_sub(dropped.len());
+        dropped
+    }
+
     /// Records this peer may still be sent this minute.
     pub(crate) fn record_allowance(
         &mut self,
@@ -511,6 +616,143 @@ impl EmberBatchPublisher {
         self.queued_count = 0;
         self.in_flight.clear();
         self.sent_window.clear();
+    }
+}
+
+/// Rounds of `PROXY_STORE` asks a buddy may let expire in a row, with nothing
+/// heard from it since they were sent, before a firewalled publisher stops
+/// naming it.
+pub(crate) const EMBER_BUDDY_SILENT_ROUNDS_BEFORE_SKIP: u32 = 3;
+
+/// Asks sent this close together are one round. A publish tick sends its whole
+/// burst at once and ticks are a full [`ember::dht::engine::PROXY_FORWARD_WINDOW`]
+/// apart, so a burst lost with one handshake counts once rather than once per
+/// ask in it.
+const EMBER_BUDDY_ASK_ROUND: std::time::Duration =
+    std::time::Duration::from_secs(ember::dht::engine::PROXY_FORWARD_WINDOW.as_secs() / 2);
+
+/// How long a buddy that stopped answering is passed over for another
+/// endorsed one.
+pub(crate) const EMBER_BUDDY_SKIP: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// A firewalled publisher's view of each buddy it proxies through: how much of
+/// the buddy's per-sender allowance it has used, and whether the buddy is still
+/// answering.
+///
+/// The allowance mirrors the buddy's own gate
+/// (`EmberDht::can_accept_proxy_forward`), which admits
+/// [`ember::dht::engine::MAX_PROXY_FORWARDS_PER_SENDER`] forwards per
+/// [`ember::dht::engine::PROXY_FORWARD_WINDOW`] and silently refuses the rest.
+/// An ask it has already acked still counts: the buddy charges an accepted
+/// forward for the whole window. Firewalled selection is capped at what is left,
+/// because every ask past it is refused without an ack and its file only comes
+/// back as due once the ask expires, having cost a signature for nothing.
+#[derive(Default)]
+pub(crate) struct EmberProxyBuddyPacer {
+    buddies: HashMap<ember::dht::EmberNodeId, ProxyBuddyHealth>,
+}
+
+#[derive(Default)]
+struct ProxyBuddyHealth {
+    /// When each ask still inside the buddy's window went out.
+    asked: VecDeque<std::time::Instant>,
+    last_ack: Option<std::time::Instant>,
+    /// Rounds whose asks expired with nothing heard from the buddy since.
+    silent_rounds: u32,
+    /// When the asks of the last round counted in `silent_rounds` went out.
+    last_silent_round: Option<std::time::Instant>,
+    skip_until: Option<std::time::Instant>,
+}
+
+impl ProxyBuddyHealth {
+    fn age(&mut self, now: std::time::Instant) {
+        while self.asked.front().is_some_and(|at| {
+            now.saturating_duration_since(*at) >= ember::dht::engine::PROXY_FORWARD_WINDOW
+        }) {
+            self.asked.pop_front();
+        }
+    }
+}
+
+impl EmberProxyBuddyPacer {
+    /// Asks `buddy` will still accept from us in its current window.
+    pub(crate) fn allowance(&mut self, buddy: ember::dht::EmberNodeId, now: std::time::Instant) -> usize {
+        let Some(health) = self.buddies.get_mut(&buddy) else {
+            return ember::dht::engine::MAX_PROXY_FORWARDS_PER_SENDER;
+        };
+        health.age(now);
+        ember::dht::engine::MAX_PROXY_FORWARDS_PER_SENDER.saturating_sub(health.asked.len())
+    }
+
+    pub(crate) fn note_asked(&mut self, buddy: ember::dht::EmberNodeId, now: std::time::Instant) {
+        let health = self.buddies.entry(buddy).or_default();
+        health.age(now);
+        health.asked.push_back(now);
+    }
+
+    pub(crate) fn note_acked(&mut self, buddy: ember::dht::EmberNodeId, now: std::time::Instant) {
+        let health = self.buddies.entry(buddy).or_default();
+        health.last_ack = Some(now);
+        health.silent_rounds = 0;
+        health.last_silent_round = None;
+        health.skip_until = None;
+    }
+
+    /// An ask sent at `asked_at` expired without an ack.
+    ///
+    /// Held against the buddy only if it has not acked anything since: a buddy
+    /// that answered later asks is alive and merely refused this one (its
+    /// global in-flight cap, or a window boundary), which is no reason to leave
+    /// it. Every ask of a tick goes out before any ack is read, so one ack from
+    /// that tick clears the whole batch. Asks of one round expire together and
+    /// count as a single silent round.
+    pub(crate) fn note_expired(
+        &mut self,
+        buddy: ember::dht::EmberNodeId,
+        asked_at: std::time::Instant,
+        now: std::time::Instant,
+    ) {
+        let health = self.buddies.entry(buddy).or_default();
+        if health.last_ack.is_some_and(|ack| ack >= asked_at) {
+            return;
+        }
+        let same_round = health.last_silent_round.is_some_and(|round| {
+            round.max(asked_at).saturating_duration_since(round.min(asked_at)) < EMBER_BUDDY_ASK_ROUND
+        });
+        if same_round {
+            return;
+        }
+        health.last_silent_round = Some(asked_at);
+        health.silent_rounds += 1;
+        if health.silent_rounds >= EMBER_BUDDY_SILENT_ROUNDS_BEFORE_SKIP {
+            health.silent_rounds = 0;
+            health.skip_until = Some(now + EMBER_BUDDY_SKIP);
+        }
+    }
+
+    /// Whether `buddy` has stopped answering recently enough to be passed over.
+    pub(crate) fn is_skipped(&self, buddy: &ember::dht::EmberNodeId, now: std::time::Instant) -> bool {
+        self.buddies
+            .get(buddy)
+            .and_then(|health| health.skip_until)
+            .is_some_and(|until| now < until)
+    }
+
+    /// Forget buddies with nothing left to remember.
+    pub(crate) fn prune(&mut self, now: std::time::Instant) {
+        self.buddies.retain(|_, health| {
+            health.age(now);
+            !health.asked.is_empty()
+                || health.silent_rounds > 0
+                || health.skip_until.is_some_and(|until| now < until)
+                || health
+                    .last_ack
+                    .is_some_and(|ack| now.saturating_duration_since(ack) < EMBER_BUDDY_SKIP)
+        });
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.buddies.clear();
     }
 }
 
@@ -631,5 +873,198 @@ mod tests {
             .values()
             .flat_map(|(_, records)| records)
             .all(|queued| !gone.contains(&queued.reference.file_hash)));
+    }
+
+    /// An address change voids every queued source record at once, and nothing
+    /// else: keyword and replication records carry no address.
+    #[test]
+    fn drop_kind_removes_only_that_kind_and_keeps_the_count_honest() {
+        let mut publisher = EmberBatchPublisher::default();
+        let targets = [contact(1), contact(2)];
+        assert!(publisher.enqueue(&targets, reference(0xA1, EmberPublishKind::Source, 0xA1), record(0xA1)));
+        assert!(publisher.enqueue(&targets, reference(0xA1, EmberPublishKind::Keyword, 0x11), record(0x11)));
+        assert!(publisher.enqueue(&[contact(3)], reference(0xB2, EmberPublishKind::Source, 0xB2), record(0xB2)));
+        assert!(publisher.enqueue(&targets, reference(0xC3, EmberPublishKind::Replication, 0x33), record(0x33)));
+        assert_eq!(publisher.queued_count, 7);
+
+        assert_eq!(publisher.drop_kind(EmberPublishKind::Source), 3);
+        assert_eq!(publisher.queued_count, 4);
+        assert!(
+            !publisher.queued.contains_key(&contact(3).node_id),
+            "a destination left holding nothing leaves the map"
+        );
+        assert!(publisher
+            .queued
+            .values()
+            .flat_map(|(_, records)| records)
+            .all(|queued| queued.reference.kind != EmberPublishKind::Source));
+    }
+
+    /// A destination that can never be sent to must not hold its records, and
+    /// with them their files' pending markers, for ever.
+    #[test]
+    fn queued_records_age_out_across_carry_over() {
+        let mut publisher = EmberBatchPublisher::default();
+        let stuck = reference(0xD4, EmberPublishKind::Keyword, 0x44);
+        assert!(publisher.enqueue(&[contact(4), contact(5)], stuck, record(0x44)));
+        let queued_at = publisher.queued[&contact(4).node_id].1[0].queued_at;
+
+        // Every flush to one of them fails, so its copy is held over each time.
+        let node = contact(4).node_id;
+        let (held_contact, held) = publisher.queued.remove(&node).expect("queued");
+        publisher.queued_count -= held.len();
+        assert!(publisher.carry_over(node, &held_contact, held).is_empty());
+        assert_eq!(
+            publisher.queued[&node].1[0].queued_at, queued_at,
+            "carry-over keeps the original age"
+        );
+
+        assert!(publisher
+            .expire_queued(queued_at + EMBER_QUEUED_RECORD_TTL - std::time::Duration::from_secs(1))
+            .is_empty());
+        let expired = publisher.expire_queued(queued_at + EMBER_QUEUED_RECORD_TTL);
+        assert_eq!(expired.len(), 2, "both copies were queued at once");
+        assert!(expired.iter().all(|q| q.reference == stuck));
+        assert_eq!(publisher.queued_count, 0);
+        assert!(publisher.queued.is_empty());
+        assert!(!publisher.record_still_outstanding(stuck));
+    }
+
+    fn buddy(id: u8) -> ember::dht::EmberNodeId {
+        ember::dht::EmberNodeId([id; 16])
+    }
+
+    /// The buddy charges every forward it accepts for its whole window, acked or
+    /// not, so our view of the allowance has to count the same way.
+    #[test]
+    fn the_proxy_allowance_mirrors_the_buddys_window() {
+        let per_sender = ember::dht::engine::MAX_PROXY_FORWARDS_PER_SENDER;
+        let window = ember::dht::engine::PROXY_FORWARD_WINDOW;
+        let mut pacer = EmberProxyBuddyPacer::default();
+        let start = std::time::Instant::now();
+        assert_eq!(pacer.allowance(buddy(1), start), per_sender);
+
+        for _ in 0..per_sender - 4 {
+            pacer.note_asked(buddy(1), start);
+        }
+        pacer.note_acked(buddy(1), start + std::time::Duration::from_secs(1));
+        assert_eq!(pacer.allowance(buddy(1), start + std::time::Duration::from_secs(2)), 4);
+        assert_eq!(
+            pacer.allowance(buddy(2), start),
+            per_sender,
+            "each buddy has an allowance of its own"
+        );
+        assert_eq!(pacer.allowance(buddy(1), start + window), per_sender);
+    }
+
+    /// A buddy that stops answering is passed over, but one that merely refused
+    /// some asks while acking others is not.
+    #[test]
+    fn a_buddy_that_lets_asks_expire_unanswered_is_skipped_for_a_while() {
+        let mut pacer = EmberProxyBuddyPacer::default();
+        let start = std::time::Instant::now();
+        let later = start + std::time::Duration::from_secs(90);
+
+        let window = ember::dht::engine::PROXY_FORWARD_WINDOW;
+
+        // Refused, not lost: the buddy acked something sent at the same time.
+        pacer.note_asked(buddy(1), start);
+        pacer.note_acked(buddy(1), start + std::time::Duration::from_secs(1));
+        for _ in 0..EMBER_BUDDY_SILENT_ROUNDS_BEFORE_SKIP * 2 {
+            pacer.note_expired(buddy(1), start, later);
+        }
+        assert!(!pacer.is_skipped(&buddy(1), later));
+
+        // Silent: nothing heard since the asks of each round went out.
+        let round = |n: u32| start + window * n;
+        for n in 0..EMBER_BUDDY_SILENT_ROUNDS_BEFORE_SKIP - 1 {
+            pacer.note_expired(buddy(2), round(n), later);
+        }
+        assert!(!pacer.is_skipped(&buddy(2), later));
+        pacer.note_expired(buddy(2), round(EMBER_BUDDY_SILENT_ROUNDS_BEFORE_SKIP - 1), later);
+        assert!(pacer.is_skipped(&buddy(2), later));
+        assert!(
+            !pacer.is_skipped(&buddy(2), later + EMBER_BUDDY_SKIP),
+            "it gets another chance once the skip runs out"
+        );
+
+        // An ack is proof of life and ends the skip early.
+        pacer.note_acked(buddy(2), later);
+        assert!(!pacer.is_skipped(&buddy(2), later));
+
+        pacer.prune(later + EMBER_BUDDY_SKIP * 2);
+        assert!(pacer.buddies.is_empty(), "nothing left worth remembering");
+    }
+
+    /// A source copy sent under an address we have since left names the wrong
+    /// endpoint, and its reference is the one the republish round tracks, so
+    /// neither its ack nor its timeout may settle anything. Other records in
+    /// the same batch still resolve by their own bits.
+    #[test]
+    fn voided_in_flight_copies_settle_nothing_while_the_rest_of_the_batch_does() {
+        let now = std::time::Instant::now();
+        let source = reference(0xAA, EmberPublishKind::Source, 0xAA);
+        let keyword = reference(0xAA, EmberPublishKind::Keyword, 0x11);
+        let node = contact(1).node_id;
+        let batch = |deadline| EmberBatchInFlight {
+            node_id: node,
+            records: vec![source, keyword],
+            deadline,
+            voided: 0,
+        };
+        let mut publisher = EmberBatchPublisher::default();
+        publisher.in_flight.insert(1, batch(now + EMBER_BATCH_ACK_TIMEOUT));
+        publisher.in_flight.insert(2, batch(now));
+
+        publisher.void_in_flight_kind(EmberPublishKind::Source);
+        assert!(!publisher.record_still_outstanding(source));
+        assert!(publisher.record_still_outstanding(keyword));
+
+        let outcome = publisher.note_ack(1, 0b11, node);
+        assert_eq!(outcome.placed, vec![keyword]);
+        assert!(outcome.refused.is_empty());
+        assert_eq!(publisher.expire(now + EMBER_BATCH_ACK_TIMEOUT), vec![keyword]);
+    }
+
+    /// A whole tick's burst lost at once — one failed handshake — is one bad
+    /// round, not a full allowance of them.
+    #[test]
+    fn one_lost_burst_of_asks_does_not_skip_the_buddy() {
+        let mut pacer = EmberProxyBuddyPacer::default();
+        let start = std::time::Instant::now();
+        let later = start + std::time::Duration::from_secs(90);
+        for i in 0..ember::dht::engine::MAX_PROXY_FORWARDS_PER_SENDER as u64 {
+            pacer.note_expired(buddy(3), start + std::time::Duration::from_micros(i), later);
+        }
+        assert!(!pacer.is_skipped(&buddy(3), later));
+    }
+
+    #[test]
+    fn drop_destinations_returns_the_refused_peers_records_and_keeps_the_rest() {
+        let mut publisher = EmberBatchPublisher::default();
+        let targets = [contact(1), contact(2), contact(3)];
+        for key in 0u8..2 {
+            assert!(publisher.enqueue(
+                &targets,
+                reference(0xAA, EmberPublishKind::Keyword, key),
+                record(key)
+            ));
+        }
+        assert_eq!(publisher.queued_count, 6);
+
+        let blocked = contact(2).addr;
+        let dropped = publisher.drop_destinations(|c| c.addr == blocked);
+        assert_eq!(dropped.len(), 2);
+        assert!(dropped
+            .iter()
+            .all(|q| q.reference.file_hash == [0xAA; 16]));
+        assert_eq!(publisher.queued_count, 4);
+        assert!(!publisher.queued.contains_key(&contact(2).node_id));
+        // The other replicas still carry the record, which is what tells the
+        // caller not to hand it back to the schedule yet.
+        assert!(publisher.record_still_outstanding(reference(0xAA, EmberPublishKind::Keyword, 0)));
+
+        assert!(publisher.drop_destinations(|_| false).is_empty());
+        assert_eq!(publisher.queued_count, 4);
     }
 }

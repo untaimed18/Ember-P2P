@@ -2,12 +2,12 @@
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import PartsBar from '$lib/components/PartsBar.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
-  import { transfers, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, IDLE_STATUSES } from '$lib/stores/transfers';
+  import { transfers, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
-    clearCompleted, setTransferPriority, setTransferCategory, setPreviewPriority,
-    pauseTransfersBatch, resumeTransfersBatch, cancelTransfersBatch,
+    clearCompleted, setTransferPriority, setTransferCategory, renameTransfer, setPreviewPriority,
+    pauseTransfersBatch, resumeTransfersBatch, stopTransfersBatch, cancelTransfersBatch,
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
     getUploadQueue, getKnownClients, getKnownClientCounts, getDownloadFileDetails,
   } from '$lib/api/transfers';
@@ -15,10 +15,11 @@
   import { startRelatedSearch } from '$lib/relatedSearch';
   import { previewFile } from '$lib/api/preview';
   import { addFriend, getFriends } from '$lib/api/friends';
+  import { beginFriendsListFetch, commitFriendsList } from '$lib/stores/friends';
   import { banPeer } from '$lib/api/kad';
   import { getPeerReputationBatch, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
   import {
-    formatSize, formatSpeed, formatDate, formatDateWithYear, formatDuration,
+    formatSize, formatSpeed, formatDate, formatDateWithYear, formatDurationSecs,
     formatRemaining, formatRelativeTime, copyToClipboard, readFromClipboard,
   } from '$lib/utils';
   import { onMount, onDestroy, untrack } from 'svelte';
@@ -35,7 +36,9 @@
   import { appSettings } from '$lib/stores/settings';
   import { openWebService } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
+  import { mapSettledWithLimit } from '$lib/concurrency';
   import * as m from '$lib/paraglide/messages';
+  import { plural } from '$lib/plural';
   import {
     translateError,
     transferFailureKindText,
@@ -44,7 +47,9 @@
     transferHealthReasonText,
   } from '$lib/i18n';
   import { isEmberBlake3Mismatch } from '$lib/emberIntegrity';
-  import { uploadScaleFactor, uploadSumBound } from '$lib/uploadSpeed';
+  import { uploadCapInForce, uploadScaleFactor, uploadSumBound } from '$lib/uploadSpeed';
+  import { computeSegmentWindow, segmentRowOffset } from '$lib/segmentWindow';
+  import { passiveScroll } from '$lib/actions/passiveScroll';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import IconX from '$lib/components/IconX.svelte';
 
@@ -137,7 +142,7 @@
     { key: 'progress', get label() { return m.transfers_col_progress(); }, width: 170, minWidth: 96, className: 'col-dl-progress', sortField: 'progress' },
     { key: 'sources', get label() { return m.transfers_col_sources(); }, width: 60, minWidth: 56, className: 'col-dl-sources', sortField: 'sources' },
     { key: 'priority', get label() { return m.transfers_col_priority(); }, width: 60, minWidth: 60, className: 'col-dl-prio', sortField: 'priority' },
-    { key: 'status', get label() { return m.transfers_col_status(); }, width: 70, minWidth: 80, className: 'col-dl-status', sortField: 'status' },
+    { key: 'status', get label() { return m.transfers_col_status(); }, width: 100, minWidth: 80, className: 'col-dl-status', sortField: 'status' },
     { key: 'remaining', get label() { return m.transfers_col_remaining(); }, width: 110, minWidth: 88, className: 'col-dl-remain', sortField: 'remaining' },
     { key: 'last_seen_complete', get label() { return m.transfers_col_last_seen_complete(); }, width: 150, minWidth: 110, className: 'col-dl-lastseen', sortField: 'last_seen_complete' },
     { key: 'last_received', get label() { return m.transfers_col_last_reception(); }, width: 120, minWidth: 100, className: 'col-dl-lastrx', sortField: 'last_received' },
@@ -444,13 +449,13 @@
       let msg: string;
       switch (d.kind) {
         case 'server_query': msg = m.transfers_src_server_query(); break;
-        case 'server_found': msg = count === 1 ? m.transfers_src_server_found_one() : m.transfers_src_server_found_other({ count }); break;
+        case 'server_found': msg = plural(count, { one: m.transfers_src_server_found_one, other: () => m.transfers_src_server_found_other({ count }) }); break;
         case 'server_empty': msg = m.transfers_src_server_empty(); break;
-        case 'udp_found': msg = count === 1 ? m.transfers_src_udp_found_one() : m.transfers_src_udp_found_other({ count }); break;
+        case 'udp_found': msg = plural(count, { one: m.transfers_src_udp_found_one, other: () => m.transfers_src_udp_found_other({ count }) }); break;
         case 'udp_empty': msg = m.transfers_src_udp_empty(); break;
         case 'kad_search': msg = m.transfers_src_kad_search(); break;
-        case 'kad_found': msg = count === 1 ? m.transfers_src_kad_found_one() : m.transfers_src_kad_found_other({ count }); break;
-        case 'kad_indirect': msg = count === 1 ? m.transfers_src_kad_indirect_one() : m.transfers_src_kad_indirect_other({ count }); break;
+        case 'kad_found': msg = plural(count, { one: m.transfers_src_kad_found_one, other: () => m.transfers_src_kad_found_other({ count }) }); break;
+        case 'kad_indirect': msg = plural(count, { one: m.transfers_src_kad_indirect_one, other: () => m.transfers_src_kad_indirect_other({ count }) }); break;
         case 'kad_empty': msg = m.transfers_src_kad_empty(); break;
         default: msg = m.transfers_src_unknown(); break;
       }
@@ -551,6 +556,17 @@
   // D27: confirmation + in-flight tracker for archive recovery, which
   // can take noticeable time for large partials and isn't reversible.
   let confirmRecover: { open: boolean; id: string; name: string } = $state({ open: false, id: '', name: '' });
+  let renameDialog: {
+    open: boolean;
+    id: string;
+    value: string;
+    error: string | null;
+    busy: boolean;
+  } = $state({ open: false, id: '', value: '', error: null, busy: false });
+  let renameInputEl: HTMLInputElement | undefined = $state();
+  let renameModalEl: HTMLDivElement | undefined = $state();
+  let renameOverlayEl: HTMLDivElement | undefined = $state();
+  let renameReturnFocusEl: HTMLElement | null = null;
   let recoveringIds: Set<string> = $state(new Set());
   // L14: persist the Completed-section collapsed state so it survives
   // navigation. Falls back to expanded on first load or invalid storage.
@@ -625,7 +641,11 @@
         for (const s of expandedSources) {
           liveByKey.set(`${s.ip}:${s.port}`, s);
         }
-        const merged: SourceInfo[] = [...expandedSources];
+        const snapshotByKey = new Map(sources.map((s) => [`${s.ip}:${s.port}`, s] as const));
+        const merged: SourceInfo[] = expandedSources.map((s) => {
+          const snapshot = snapshotByKey.get(`${s.ip}:${s.port}`);
+          return snapshot ? mergeLiveSource(s, snapshot) : s;
+        });
         for (const s of sources) {
           const key = `${s.ip}:${s.port}`;
           if (!liveByKey.has(key)) merged.push(s);
@@ -647,8 +667,30 @@
     }
   }
 
+  /// Retry for a failed source load. `toggleSourceDetail` on the open row
+  /// would collapse it, so reopen it from scratch instead.
+  function reloadSourceDetail(t: Transfer) {
+    if (expandedTransferId === t.id) expandedTransferId = null;
+    void toggleSourceDetail(t);
+  }
+
   // Consecutive empty API snapshots are tracked via emptySourceSnapshotStreak
   // (declared with the source-drawer state above).
+
+  /// A row built from push events is fresher than the snapshot, but it only
+  /// knows what those events carried. Let it win on state and fill its gaps from
+  /// the snapshot: the origin in particular is recorded once, often before the
+  /// peer's first event, and letting the live row win outright kept any row
+  /// that missed it on a dash through every later refresh.
+  function mergeLiveSource(live: SourceInfo, snapshot: SourceInfo): SourceInfo {
+    return {
+      ...live,
+      origin: live.origin ?? snapshot.origin,
+      country_code: live.country_code ?? snapshot.country_code,
+      peer_name: live.peer_name || snapshot.peer_name,
+      client_software: live.client_software || snapshot.client_software,
+    };
+  }
 
   async function refreshExpandedSourceDetails(transferId: string, authoritativeEmpty = false) {
     // Do NOT bump sourceDetailRequestId — that would invalidate the open
@@ -687,7 +729,10 @@
           return;
         }
         emptySourceSnapshotStreak = 0;
-        expandedSources = sources.map((s) => liveByKey.get(`${s.ip}:${s.port}`) ?? s);
+        expandedSources = sources.map((s) => {
+          const live = liveByKey.get(`${s.ip}:${s.port}`);
+          return live ? mergeLiveSource(live, s) : s;
+        });
       }
       if (expandedTransferId === transferId) {
         loadingSources = false;
@@ -908,6 +953,10 @@
   });
   let allDownloads = $derived(downloadPartition.all);
   let activeDownloads = $derived(downloadPartition.active);
+  /// The live download whose sources the Download Clients tab is showing.
+  let expandedClientsParent = $derived(
+    expandedTransferId ? (activeDownloads.find((d) => d.id === expandedTransferId) ?? null) : null,
+  );
   let completedDownloads = $derived(downloadPartition.completed);
   // Lower-cased hashes of files we're still downloading (have a `.part` for).
   // An upload whose hash is in this set is the eMule-style partial-file share:
@@ -981,15 +1030,22 @@
     return { all, active, completed, failed, queued };
   });
   let activeUploads = $derived(uploadPartition.active);
+  // The cap in force, which a schedule rule or USS can hold away from the
+  // manual setting — see `uploadCapInForce`.
+  let uploadCap = $derived(uploadCapInForce($effectiveUploadSpeed, $appSettings?.max_upload_speed));
   // Scale displayed upload-slot speeds so their sum cannot exceed the
-  // configured cap or the status-bar total (issue 115). A slot handover
-  // otherwise left the remaining rows at their pre-handover window rates
-  // while a fresh slot added a burst, so the column sum read above both
-  // the limit and the dipping total. The arithmetic lives in `$lib/uploadSpeed`
-  // so it can be tested; the rows excluded here are the ones rendered idle.
+  // cap in force (issue 115). A slot handover otherwise left the remaining
+  // rows at their pre-handover window rates while a fresh slot added a burst,
+  // so the column sum read above the limit the user had set. Deliberately not
+  // bounded by `$networkStats.upload_speed` as well: that figure is sampled
+  // every 3 s (and not at all while the window is hidden) and is itself a ~3 s
+  // EWMA, so dividing 200 ms-fresh row rates by it understated every slot for
+  // the whole ramp-up — see `uploadSumBound`. The arithmetic lives in
+  // `$lib/uploadSpeed` so it can be tested; the rows excluded here are the ones
+  // rendered idle.
   let uploadSpeedScale = $derived.by(() =>
     uploadScaleFactor(
-      uploadSumBound($appSettings?.max_upload_speed ?? 0, $networkStats.upload_speed),
+      uploadSumBound(uploadCap),
       activeUploads.filter((t) => !IDLE_STATUSES.has(t.status)).map((t) => t.speed),
     ),
   );
@@ -1105,9 +1161,19 @@
    */
   let uploadQueueLoadFailed = $state(false);
   let knownClientsLoadFailed = $state(false);
+  // Requests still outstanding per poll. A tick is skipped while one is: the
+  // backend answers each from the network task with up to a 10 s reply
+  // timeout, so a 3 s tick would otherwise stack copies of the same request
+  // behind a busy task. The generation counters above still decide which
+  // answer lands when a user action refreshes on top of a poll.
+  let uploadQueueInFlight = 0;
+  let knownClientsInFlight = 0;
+  let knownCountsInFlight = 0;
+  let friendHashesInFlight = 0;
 
   async function refreshUploadQueue() {
     const gen = ++uploadQueueGen;
+    uploadQueueInFlight++;
     try {
       const data = await getUploadQueue();
       if (!mounted || gen !== uploadQueueGen) return;
@@ -1124,11 +1190,14 @@
         uploadQueueLoaded = true;
         uploadQueueLoadFailed = true;
       }
+    } finally {
+      uploadQueueInFlight--;
     }
   }
   /** Refresh just the tab-label counts. Cheap enough to run on any tab. */
   async function refreshKnownCounts() {
     const gen = ++knownCountsGen;
+    knownCountsInFlight++;
     try {
       const counts = await getKnownClientCounts();
       if (!mounted || gen !== knownCountsGen) return;
@@ -1137,12 +1206,15 @@
       // Leave the last good figures up rather than blanking the labels; the
       // next tick retries.
       console.warn('Failed to refresh known client counts:', e);
+    } finally {
+      knownCountsInFlight--;
     }
   }
 
   async function refreshKnownClients(refreshBadges = true) {
     const gen = ++knownClientsGen;
     const countGen = ++knownCountsGen;
+    knownClientsInFlight++;
     try {
       const data = await getKnownClients();
       if (!mounted || gen !== knownClientsGen) return;
@@ -1180,7 +1252,22 @@
         knownClientsLoaded = true;
         knownClientsLoadFailed = true;
       }
+    } finally {
+      knownClientsInFlight--;
     }
+  }
+
+  /** The poll ticks' entry points: each skips while its previous request is
+   *  still unanswered. */
+  function pollUploadQueue() {
+    if (uploadQueueInFlight === 0) void refreshUploadQueue();
+  }
+  function pollKnownClients() {
+    if (knownClientsInFlight === 0) void refreshKnownClients();
+    if (friendHashesInFlight === 0) void refreshFriendHashes();
+  }
+  function pollKnownCounts() {
+    if (knownCountsInFlight === 0) void refreshKnownCounts();
   }
 
   /** Per-hash reputation cache. Populated lazily when the Known
@@ -1276,9 +1363,14 @@
   }
 
   async function refreshFriendHashes() {
+    friendHashesInFlight++;
     try {
+      const ticket = beginFriendsListFetch();
       const list = await getFriends();
       if (!mounted) return;
+      // Share the rows rather than keeping them to this page; the ticket stops
+      // a slow load here from landing on top of a newer one elsewhere.
+      commitFriendsList(ticket, list);
       const hashes = new Set<string>();
       const nicks: Record<string, string> = {};
       for (const f of list) {
@@ -1292,13 +1384,16 @@
       // Non-fatal: an unavailable friends list just means we won't
       // mark friend rows. The rest of the table still renders.
       console.warn('Failed to load friend hashes for known peers:', e);
+    } finally {
+      friendHashesInFlight--;
     }
   }
 
   // Filtered + sorted view that the table actually iterates over. Search
   // matches any of: user_hash (full or truncated form the user might have
-  // copied), last IP, country code, or — when the row is a friend — the
-  // friend nickname. Empty filter passes through everything.
+  // copied), last IP, country code, the peer's Hello name, its client
+  // software, or — when the row is a friend — the friend nickname. Empty
+  // filter passes through everything.
   const KNOWN_CLIENT_DISPLAY_LIMIT = 1000;
   let filteredKnownClients = $derived.by(() => {
     const q = knownFilter.trim().toLowerCase();
@@ -1312,6 +1407,8 @@
       if (kc.country_code && kc.country_code.toLowerCase().includes(q)) return true;
       const nick = (ember ? friendNickById[ember] : undefined) || kc.nickname;
       if (nick && nick.toLowerCase().includes(q)) return true;
+      if (kc.peer_name && kc.peer_name.toLowerCase().includes(q)) return true;
+      if (kc.client_software && kc.client_software.toLowerCase().includes(q)) return true;
       return false;
     });
   });
@@ -1368,7 +1465,7 @@
         if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
           return;
         }
-        refreshUploadQueue();
+        pollUploadQueue();
       },
       fast ? QUEUE_POLL_INTERVAL_MS : QUEUE_BADGE_POLL_INTERVAL_MS,
     );
@@ -1378,7 +1475,7 @@
     if (typeof document !== 'undefined' && queueVisibilityHandler === null) {
       queueVisibilityHandler = () => {
         if (document.visibilityState !== 'visible') return;
-        refreshUploadQueue();
+        pollUploadQueue();
       };
       document.addEventListener('visibilitychange', queueVisibilityHandler);
     }
@@ -1434,7 +1531,8 @@
         if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
           return;
         }
-        pump();
+        if (onTab) pollKnownClients();
+        else pollKnownCounts();
       },
       onTab ? KNOWN_POLL_INTERVAL_MS : KNOWN_BADGE_POLL_INTERVAL_MS,
     );
@@ -1447,12 +1545,8 @@
     if (typeof document !== 'undefined' && knownVisibilityHandler === null) {
       knownVisibilityHandler = () => {
         if (document.visibilityState !== 'visible') return;
-        if (isKnownLedgerView(bottomView)) {
-          refreshKnownClients();
-          void refreshFriendHashes();
-        } else {
-          void refreshKnownCounts();
-        }
+        if (isKnownLedgerView(bottomView)) pollKnownClients();
+        else pollKnownCounts();
       };
       document.addEventListener('visibilitychange', knownVisibilityHandler);
     }
@@ -1748,7 +1842,7 @@
     }
   }
   function sortArrow(current: string, field: string, asc: boolean): string {
-    if (current !== field) return '';
+    if (current !== field) return ' \u00A0';
     return asc ? ' \u25B2' : ' \u25BC';
   }
 
@@ -1757,7 +1851,7 @@
 
   // Client-side EWMA speed tracker: computes speed from transferred-byte
   // deltas so the display works even when the backend reports speed=0.
-  const speedHistory: Map<string, { ewma: number; lastTransferred: number; lastTime: number }> = new Map();
+  const speedHistory: Map<string, { ewma: number; lastTransferred: number; lastTime: number; row: Transfer }> = new Map();
 
   // Prune `speedHistory` entries for transfers that no longer exist in the
   // store. Without this the map grows unbounded for the life of the page
@@ -1765,7 +1859,11 @@
   // local `speedHistory.delete(...)` callers don't cover (e.g. backend
   // finalise / retention policies, or peers dropping).
   $effect(() => {
-    const liveIds = new Set($transfers.map((t) => t.id));
+    const list = $transfers;
+    // Sweep only once a map outgrows the list; until then its stale entries
+    // are bounded by the list size, and this runs on every store update.
+    if (speedHistory.size <= list.length && uploadTooltipCache.size <= list.length) return;
+    const liveIds = new Set(list.map((t) => t.id));
     if (speedHistory.size > liveIds.size) {
       for (const id of Array.from(speedHistory.keys())) {
         if (!liveIds.has(id)) speedHistory.delete(id);
@@ -1790,9 +1888,13 @@
     for (const t of list) {
       const entry = speedHistory.get(t.id);
       if (!entry) {
-        speedHistory.set(t.id, { ewma: 0, lastTransferred: t.transferred, lastTime: now });
+        speedHistory.set(t.id, { ewma: 0, lastTransferred: t.transferred, lastTime: now, row: t });
         continue;
       }
+      // The store keeps a row's object when nothing in it changed, so the
+      // same object means no new bytes; only a live average can still decay.
+      if (entry.row === t && entry.ewma === 0) continue;
+      entry.row = t;
       const dt = (now - entry.lastTime) / 1000;
       if (dt < 0.5) continue;
       const bytesThisPeriod = t.transferred - entry.lastTransferred;
@@ -1832,12 +1934,11 @@
       // counter used to be payload (compression-inflated) and is sampled
       // against the time since the row appeared, which is how a fresh slot
       // printed 350 kB/s against a 200 kB/s cap (issue 115). Scale the
-      // backend rates so the visible slot sum cannot exceed the configured
-      // limit or the status-bar total.
+      // backend rates so the visible slot sum cannot exceed the limit in
+      // force.
       if (t.speed <= 0) return 0;
       const scaled = t.speed * uploadSpeedScale;
-      const cap = $appSettings?.max_upload_speed ?? 0;
-      return cap > 0 ? Math.min(scaled, cap) : scaled;
+      return uploadCap > 0 ? Math.min(scaled, uploadCap) : scaled;
     }
     if (t.speed > 0) return t.speed;
     const entry = speedHistory.get(t.id);
@@ -1987,6 +2088,147 @@
   );
   let visibleSelectableDownloadIds = $derived.by(() => new Set(filteredSelectableDownloads.map((t) => t.id)));
 
+  // --- Downloads table windowing ---
+  // Both sections render only the rows near the viewport, with spacer rows
+  // standing in for the rest. Selection, sorting and the context menu all work
+  // on the lists above, not on DOM rows, so none of them notice.
+  const DL_WINDOW_MIN_ROWS = 80;
+  const DL_WINDOW_OVERSCAN = 12;
+  let downloadsScrollEl: HTMLDivElement | undefined = $state(undefined);
+  let dlActiveTopPadEl: HTMLTableRowElement | undefined = $state(undefined);
+  let dlCompletedTopPadEl: HTMLTableRowElement | undefined = $state(undefined);
+  let dlRowHeight = $state(22);
+  let dlExpandedExtra = $state(0);
+  let dlActiveBodyTop = $state(0);
+  let dlCompletedBodyTop = $state(0);
+  let dlViewportHeight = $state(600);
+  let dlExpandedIndex = $derived(
+    expandedTransferId ? filteredActiveDownloads.findIndex((t) => t.id === expandedTransferId) : -1,
+  );
+  let dlActiveWindow = $derived(
+    computeSegmentWindow({
+      total: filteredActiveDownloads.length,
+      bodyTop: dlActiveBodyTop,
+      viewportHeight: dlViewportHeight,
+      rowHeight: dlRowHeight,
+      expandedIndex: dlExpandedIndex,
+      expandedExtra: dlExpandedExtra,
+      overscan: DL_WINDOW_OVERSCAN,
+      minRows: DL_WINDOW_MIN_ROWS,
+    }),
+  );
+  let dlCompletedWindow = $derived(
+    computeSegmentWindow({
+      total: completedCollapsed ? 0 : filteredCompletedDownloads.length,
+      bodyTop: dlCompletedBodyTop,
+      viewportHeight: dlViewportHeight,
+      rowHeight: dlRowHeight,
+      overscan: DL_WINDOW_OVERSCAN,
+      minRows: DL_WINDOW_MIN_ROWS,
+    }),
+  );
+  let dlActiveSlice = $derived(filteredActiveDownloads.slice(dlActiveWindow.start, dlActiveWindow.end));
+  let dlCompletedSlice = $derived(
+    completedCollapsed ? [] : filteredCompletedDownloads.slice(dlCompletedWindow.start, dlCompletedWindow.end),
+  );
+
+  /** Read the geometry the window depends on. Only the DOM knows where each
+   *  section starts (banners and the header sit above it) and how tall a row
+   *  and the open source block really are. */
+  function measureDownloadWindow() {
+    const scroller = downloadsScrollEl;
+    if (!scroller) return;
+    const top = scroller.getBoundingClientRect().top;
+    dlViewportHeight = scroller.clientHeight;
+    if (dlActiveTopPadEl) dlActiveBodyTop = dlActiveTopPadEl.getBoundingClientRect().top - top;
+    if (dlCompletedTopPadEl) dlCompletedBodyTop = dlCompletedTopPadEl.getBoundingClientRect().top - top;
+    const table = downloadTableEl;
+    if (!table) return;
+    const sample = table.querySelector<HTMLTableRowElement>('tr.dl-row:not(.expanded)');
+    const h = sample?.getBoundingClientRect().height ?? 0;
+    if (h > 0) dlRowHeight = h;
+    if (!expandedTransferId) {
+      dlExpandedExtra = 0;
+      return;
+    }
+    // Measured only while the block is rendered; off screen it keeps the
+    // last height, which is what its spacer already accounts for.
+    const expanded = table.querySelector<HTMLTableRowElement>('tr.dl-row.expanded');
+    if (!expanded) return;
+    let extra = 0;
+    for (
+      let el = expanded.nextElementSibling;
+      el instanceof HTMLTableRowElement && el.classList.contains('source-child-row');
+      el = el.nextElementSibling
+    ) {
+      extra += el.getBoundingClientRect().height;
+    }
+    dlExpandedExtra = extra;
+  }
+
+  let dlScrollRaf = 0;
+  function onDownloadsScroll() {
+    if (dlScrollRaf) return;
+    dlScrollRaf = requestAnimationFrame(() => {
+      dlScrollRaf = 0;
+      measureDownloadWindow();
+    });
+  }
+
+  // Re-measure after anything that moves rows or changes what is rendered.
+  $effect(() => {
+    void filteredActiveDownloads.length;
+    void filteredCompletedDownloads.length;
+    void completedCollapsed;
+    void expandedTransferId;
+    void expandedSources;
+    void loadingSources;
+    void dlActiveWindow.start;
+    void dlActiveWindow.end;
+    void dlCompletedWindow.start;
+    void dlCompletedWindow.end;
+    untrack(measureDownloadWindow);
+  });
+
+  $effect(() => {
+    const el = downloadsScrollEl;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => measureDownloadWindow());
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      if (dlScrollRaf) cancelAnimationFrame(dlScrollRaf);
+      dlScrollRaf = 0;
+    };
+  });
+
+  /** Scroll a download row into view: arrow-key navigation can move the
+   *  selection onto a row the window has not rendered. */
+  function revealDownloadRow(id: string) {
+    const scroller = downloadsScrollEl;
+    if (!scroller) return;
+    measureDownloadWindow();
+    const headerHeight = downloadTableEl?.tHead?.getBoundingClientRect().height ?? 0;
+    let rowTop: number;
+    const activeIdx = filteredActiveDownloads.findIndex((t) => t.id === id);
+    if (activeIdx >= 0) {
+      rowTop = dlActiveBodyTop + segmentRowOffset(activeIdx, dlRowHeight, dlExpandedIndex, dlExpandedExtra);
+    } else {
+      const completedIdx = completedCollapsed ? -1 : filteredCompletedDownloads.findIndex((t) => t.id === id);
+      if (completedIdx < 0) return;
+      rowTop = dlCompletedBodyTop + segmentRowOffset(completedIdx, dlRowHeight);
+    }
+    const rowBottom = rowTop + dlRowHeight;
+    if (rowTop < headerHeight) {
+      scroller.scrollTop += rowTop - headerHeight;
+    } else if (rowBottom > scroller.clientHeight) {
+      scroller.scrollTop += rowBottom - scroller.clientHeight;
+    } else {
+      return;
+    }
+    measureDownloadWindow();
+  }
+
   let selectedTransfer = $derived.by(() => {
     if (selectedDownloadIds.length !== 1) return null;
     return allDownloads.find((t) => t.id === selectedDownloadIds[0]) ?? null;
@@ -2104,14 +2346,21 @@
   let selectedStoppableCount = $derived(selectedBatchTransfers.filter((t) => canStop(t)).length);
   let selectedCancellableCount = $derived(selectedBatchTransfers.filter((t) => !isFinished(t)).length);
   let selectedFinishedCount = $derived(selectedBatchTransfers.filter((t) => isFinished(t)).length);
-  // Helper that prefers the EWMA-smoothed `liveSpeed` rate used for row
-  // cells, falling back to the raw `t.speed` value from the backend. Sort
-  // and totals need to agree with what the user sees in each row; using
-  // `t.speed` alone diverges when the backend reports 0 but bytes are
-  // still flowing (very common during brief scheduling gaps).
+  // The rate a row's Speed cell actually prints, for the sorts and counts that
+  // have to agree with it. `liveSpeed` already prefers the backend rate and
+  // falls back to the EWMA only where that is right, so this is that function
+  // and nothing else.
+  //
+  // It used to add `live > 0 ? live : (t.speed > 0 ? t.speed : 0)`, which looked
+  // like a safety net and was the opposite: the only rows for which `liveSpeed`
+  // returns 0 while `t.speed` is positive are the `IDLE_STATUSES` ones it
+  // deliberately zeroes, so the fall-back reinstated exactly the stale rate that
+  // guard exists to suppress. The Uploads table sorted its Speed column through
+  // here while rendering it through `liveSpeed`, so a paused or stopped slot
+  // sorted by a number the column showed as "—", and the "Active" chip counted
+  // downloads that had stopped moving bytes.
   function displaySpeed(t: Transfer): number {
-    const live = liveSpeed(t);
-    return live > 0 ? live : (t.speed > 0 ? t.speed : 0);
+    return liveSpeed(t);
   }
   // Match eMule-style behavior: show rate when transfer data is actually flowing.
   let transferringDownloads = $derived(activeDownloads.filter((t) => displaySpeed(t) > 0).length);
@@ -2174,6 +2423,10 @@
       .join(' — ');
   }
 
+  function isRemotelyQueued(t: Transfer): boolean {
+    return (t.queued_sources || 0) > 0;
+  }
+
   function dlStatusLabel(t: Transfer): string {
     switch (t.status) {
       case 'active':
@@ -2183,12 +2436,21 @@
         return m.transfers_dl_status_downloading();
       case 'searching': {
         if (t.health === 'degraded' && t.health_reason) return m.transfers_dl_status_searching_delayed();
-        if (t.sources > 0) return m.transfers_dl_status_searching_with_sources({ count: t.sources });
+        if (t.sources > 0) {
+          return plural(t.sources, {
+            one: m.transfers_dl_status_searching_with_sources_one,
+            other: () => m.transfers_dl_status_searching_with_sources_other({ count: t.sources }),
+          });
+        }
         const connected = $networkStats.status === 'connected' || $networkStats.status === 'connecting';
         return connected ? m.transfers_dl_status_searching() : m.transfers_dl_status_waiting();
       }
       case 'queued':
         if (t.sources === 0) return m.transfers_dl_status_searching();
+        // The backend reports `queued` for any idle download with a non-empty
+        // source list; only claim "Queued" when a peer actually holds us in its
+        // upload queue. Otherwise it is eMule's "Waiting".
+        if (!isRemotelyQueued(t)) return m.transfers_dl_status_waiting();
         // Transfer-level queue_rank is never populated by the backend; per-source
         // ranks still show in the source drawer via SourceInfo.queue_rank.
         return m.transfer_status_queued();
@@ -2357,6 +2619,19 @@
     return t.status === 'paused' || t.status === 'stopped' || t.status === 'insufficient';
   }
 
+  // Not while the file is being hashed or moved: completion has already read
+  // the name it will write, so a rename accepted there would leave the row
+  // and the file on disk disagreeing. The backend refuses the same window.
+  function canRename(t: Transfer): boolean {
+    return (
+      t.direction === 'download'
+      && t.status !== 'completed'
+      && t.status !== 'verifying'
+      && t.status !== 'completing'
+      && t.status !== 'hashing'
+    );
+  }
+
   // Preview is only meaningful for downloads whose first part is downloaded +
   // MD4-verified and that are a previewable media type. The backend reports
   // this as `preview_ready`; we mirror it here to grey out the action until a
@@ -2364,6 +2639,66 @@
   function canPreview(t: Transfer): boolean {
     return t.direction === 'download' && t.preview_ready === true;
   }
+
+  function openRename(t: Transfer) {
+    if (!canRename(t)) return;
+    const active = typeof document !== 'undefined' ? document.activeElement : null;
+    renameReturnFocusEl =
+      active instanceof HTMLElement && active !== document.body ? active : null;
+    renameDialog = {
+      open: true,
+      id: t.id,
+      value: t.file_name,
+      error: null,
+      busy: false,
+    };
+  }
+
+  function closeRename() {
+    if (renameDialog.busy) return;
+    renameDialog = { open: false, id: '', value: '', error: null, busy: false };
+  }
+
+  async function submitRename() {
+    if (!renameDialog.open || renameDialog.busy) return;
+    const id = renameDialog.id;
+    const value = renameDialog.value;
+    renameDialog.busy = true;
+    renameDialog.error = null;
+    try {
+      const name = await renameTransfer(id, value);
+      transfers.update((list) =>
+        list.map((t) => (t.id === id ? { ...t, file_name: name } : t)),
+      );
+      renameDialog = { open: false, id: '', value: '', error: null, busy: false };
+    } catch (e: unknown) {
+      renameDialog.busy = false;
+      renameDialog.error = toErrorMsg(e);
+    }
+  }
+
+  // Focus the field on open and hand focus back to whatever opened the dialog
+  // — the row, the context menu's anchor, or the File Details name button.
+  $effect(() => {
+    if (!renameDialog.open) return;
+    const raf = requestAnimationFrame(() => {
+      renameInputEl?.focus();
+      renameInputEl?.select();
+    });
+    return () => {
+      cancelAnimationFrame(raf);
+      const el = renameReturnFocusEl;
+      renameReturnFocusEl = null;
+      if (el && typeof document !== 'undefined' && document.contains(el)) {
+        requestAnimationFrame(() => el.focus());
+      }
+    };
+  });
+
+  $effect(() => {
+    if (!renameDialog.open || !renameOverlayEl) return;
+    return inertBackground(renameOverlayEl);
+  });
 
   const archiveExts = ['zip', 'cbz', 'jar', 'rar', 'cbr', 'ace'];
   function isArchive(t: Transfer): boolean {
@@ -2477,6 +2812,9 @@
   let fileDetailsCloseBtn: HTMLButtonElement | undefined = $state();
   let fileDetailsReturnFocusEl: HTMLElement | null = null;
   let fileDetailsGen = 0;
+  /** Transfer ids with a details request outstanding; the poll skips a tick
+   *  for an id still waiting on its previous answer. */
+  const fileDetailsInFlight = new Map<string, number>();
   /// Slower than the transfers poll: a chunk map that redraws every second is
   /// harder to read than one that settles, and parts complete in minutes.
   const FILE_DETAILS_POLL_MS = 4000;
@@ -2489,6 +2827,7 @@
 
   async function refreshFileDetails(transferId: string) {
     const gen = ++fileDetailsGen;
+    fileDetailsInFlight.set(transferId, (fileDetailsInFlight.get(transferId) ?? 0) + 1);
     try {
       const data = await getDownloadFileDetails(transferId);
       if (!mounted || gen !== fileDetailsGen || fileDetailsId !== transferId) return;
@@ -2500,6 +2839,9 @@
       // a reason to show stale parts, not no parts.
       if (!fileDetails) fileDetailsError = translateError(e, m.transfers_file_details_failed());
     } finally {
+      const outstanding = (fileDetailsInFlight.get(transferId) ?? 1) - 1;
+      if (outstanding > 0) fileDetailsInFlight.set(transferId, outstanding);
+      else fileDetailsInFlight.delete(transferId);
       if (mounted && gen === fileDetailsGen && fileDetailsId === transferId) {
         fileDetailsLoading = false;
       }
@@ -2559,6 +2901,7 @@
       // Same gate as every other poll here: nothing to redraw for a window
       // nobody can see.
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      if (fileDetailsInFlight.has(id)) return;
       void refreshFileDetails(id);
     }, FILE_DETAILS_POLL_MS);
     return () => clearInterval(handle);
@@ -2566,10 +2909,12 @@
 
   function handleFileDetailsKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
-      // Handled here so the page-level Escape does not also fire; that one
-      // stays as the fallback for when focus is somehow outside.
       e.preventDefault();
       e.stopPropagation();
+      if (renameDialog.open) {
+        closeRename();
+        return;
+      }
       closeFileDetails();
       return;
     }
@@ -2657,7 +3002,7 @@
             transferError = m.transfers_no_ember_hash();
             break;
           }
-          const nick = friendNickById[kc.ember_hash.toLowerCase()];
+          const nick = kc.peer_name || undefined;
           await addFriend(kc.ember_hash, nick);
           await refreshFriendHashes();
           showInfo(m.transfers_added_friend({
@@ -2693,9 +3038,19 @@
         // does: a `getTransfers()` snapshot already in flight when the backend
         // drops the row still carries it, and without the tombstone the next
         // merge pushed the row straight back for a poll cycle.
-        case 'remove': markDownloadRemoved(t.id); await removeTransfer(t.id); speedHistory.delete(t.id); forgetTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id)); break;
+        case 'remove':
+          markDownloadRemoved(t.id);
+          try {
+            await removeTransfer(t.id);
+          } catch (e: unknown) {
+            clearDownloadRemoved(t.id);
+            throw e;
+          }
+          speedHistory.delete(t.id); forgetTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id));
+          break;
         case 'open': await openFile(t.id); break;
         case 'open_location': await openTransferFileLocation(t.id); break;
+        case 'rename': openRename(t); return;
         case 'priority': if (extra) await setTransferPriority(t.id, extra as 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto'); break;
         case 'find_sources': {
           try {
@@ -2789,20 +3144,26 @@
   async function handlePauseAll() {
     const ids = globalDownloadTargets().filter((t) => canPause(t)).map((t) => t.id);
     if (!ids.length) { showInfo(m.transfers_nothing_to_pause()); return; }
-    try {
-      await pauseTransfersBatch(ids);
-      const filter = transferFilter.trim();
-      if (filter) showInfo(m.transfers_paused_matching({ count: ids.length, filter }));
-    } catch (e: unknown) { transferError = toErrorMsg(e); }
+    const ok = await runBatchCommand(ids, pauseTransfersBatch, m.transfers_batch_label_paused());
+    const filter = transferFilter.trim();
+    if (filter && ok) {
+      showInfo(plural(ids.length, {
+        one: () => m.transfers_paused_matching_one({ filter }),
+        other: () => m.transfers_paused_matching_other({ count: ids.length, filter }),
+      }));
+    }
   }
   async function handleResumeAll() {
     const ids = globalDownloadTargets().filter((t) => canResume(t)).map((t) => t.id);
     if (!ids.length) { showInfo(m.transfers_nothing_to_resume()); return; }
-    try {
-      await resumeTransfersBatch(ids);
-      const filter = transferFilter.trim();
-      if (filter) showInfo(m.transfers_resumed_matching({ count: ids.length, filter }));
-    } catch (e: unknown) { transferError = toErrorMsg(e); }
+    const ok = await runBatchCommand(ids, resumeTransfersBatch, m.transfers_batch_label_resumed());
+    const filter = transferFilter.trim();
+    if (filter && ok) {
+      showInfo(plural(ids.length, {
+        one: () => m.transfers_resumed_matching_one({ filter }),
+        other: () => m.transfers_resumed_matching_other({ count: ids.length, filter }),
+      }));
+    }
   }
 
   /** Downloads in the visible list that have a hash to build a link from. */
@@ -2851,9 +3212,10 @@
         return;
       }
       showInfo(
-        targets.length === 1
-          ? m.transfers_copied_links_one()
-          : m.transfers_copied_links_other({ count: targets.length }),
+        plural(targets.length, {
+          one: m.transfers_copied_links_one,
+          other: () => m.transfers_copied_links_other({ count: targets.length }),
+        }),
       );
     } catch (e: unknown) {
       transferError = toErrorMsg(e);
@@ -2985,7 +3347,10 @@
     searchStatus = new Map(searchStatus);
     const ask = await findSources(t.id, t.file_hash, t.total_size);
     if (!ask.kad && !ask.ember && !ask.server && !ask.server_udp) {
-      searchStatus.set(t.id, m.transfers_src_asking_none());
+      searchStatus.set(
+        t.id,
+        ask.server_recent ? m.transfers_src_asked_recently() : m.transfers_src_asking_none(),
+      );
       searchStatus = new Map(searchStatus);
     }
   }
@@ -3023,9 +3388,10 @@
    *  user knows which rows in a batch didn't get the action applied. */
   function summarizeBatchResult(label: string, total: number, failed: { id: string; name: string; error: string }[]) {
     if (failed.length === 0) {
-      showInfo(total === 1
-        ? m.transfers_batch_done_one({ label })
-        : m.transfers_batch_done_other({ label, count: total }));
+      showInfo(plural(total, {
+        one: () => m.transfers_batch_done_one({ label }),
+        other: () => m.transfers_batch_done_other({ label, count: total }),
+      }));
       return;
     }
     const firstName = failed[0].name || failed[0].id.slice(0, 8);
@@ -3041,47 +3407,52 @@
     });
   }
 
-  /** Run a per-id action in a bounded-concurrency loop so one bad id
-   *  doesn't block the rest of the batch. */
-  async function runBatchPerId(
+  /** Apply a batch command to `ids` in one round trip. The backend answers
+   *  for the whole batch rather than per row (it stops at the first network
+   *  send that fails), so a failure is reported as that error. Returns whether
+   *  the command succeeded. */
+  async function runBatchCommand(
     ids: string[],
-    fn: (id: string) => Promise<void>,
+    fn: (ids: string[]) => Promise<void>,
     label: string,
-  ): Promise<number> {
-    if (!ids.length) return 0;
-    const failed: { id: string; name: string; error: string }[] = [];
-    const byId = new Map($transfers.map((t) => [t.id, t.file_name] as const));
-    for (const id of ids) {
-      try {
-        await fn(id);
-      } catch (e: unknown) {
-        failed.push({ id, name: byId.get(id) ?? '', error: toErrorMsg(e) });
-      }
+  ): Promise<boolean> {
+    if (!ids.length) return true;
+    try {
+      await fn(ids);
+    } catch (e: unknown) {
+      transferError = toErrorMsg(e);
+      return false;
     }
-    summarizeBatchResult(label, ids.length, failed);
-    return failed.length;
+    summarizeBatchResult(label, ids.length, []);
+    return true;
   }
 
   async function handleBatchPauseDownloads() {
     const ids = selectedBatchTransfers.filter((t) => canPause(t)).map((t) => t.id);
-    await runBatchPerId(ids, (id) => pauseTransfer(id), m.transfers_batch_label_paused());
+    await runBatchCommand(ids, pauseTransfersBatch, m.transfers_batch_label_paused());
   }
 
   async function handleBatchResumeDownloads() {
     const ids = selectedBatchTransfers.filter((t) => canResume(t)).map((t) => t.id);
-    await runBatchPerId(ids, (id) => resumeTransfer(id), m.transfers_batch_label_resumed());
+    await runBatchCommand(ids, resumeTransfersBatch, m.transfers_batch_label_resumed());
   }
 
   async function handleBatchStopDownloads() {
     const ids = selectedBatchTransfers.filter((t) => canStop(t)).map((t) => t.id);
-    await runBatchPerId(ids, (id) => stopTransfer(id), m.transfers_batch_label_stopped());
+    await runBatchCommand(ids, stopTransfersBatch, m.transfers_batch_label_stopped());
   }
+
+  /** `remove_transfer` has no batch form and each call can wait up to 10 s on
+   *  the network task's cleanup ack, so run a few at a time: one after another
+   *  took minutes for a large selection, and all at once flooded the channel
+   *  the ack waits on. */
+  const REMOVE_CONCURRENCY = 4;
 
   /** Drop finished rows from the list. Same contract as the single-row
    *  "Remove from List" action: the file on disk is left alone, only the
    *  transfer record goes away, so this needs no confirmation. Rows leave
    *  the table immediately and come back if the backend refuses. */
-  async function removeTransfersBatch(ids: string[]): Promise<void> {
+  async function removeTransfersBatch(ids: string[], announceSuccess = true): Promise<void> {
     if (!ids.length) return;
     const idSet = new Set(ids);
     const byId = new Map($transfers.map((t) => [t.id, t.file_name] as const));
@@ -3098,23 +3469,28 @@
     selectedDownloadIds = selectedDownloadIds.filter((id) => !idSet.has(id));
     if (lastClickedDlId && idSet.has(lastClickedDlId)) lastClickedDlId = null;
     const failed: { id: string; name: string; error: string }[] = [];
-    for (const id of ids) {
-      try {
-        await removeTransfer(id);
-      } catch (e: unknown) {
-        failed.push({ id, name: byId.get(id) ?? '', error: toErrorMsg(e) });
+    const results = await mapSettledWithLimit(ids, REMOVE_CONCURRENCY, (id) => removeTransfer(id));
+    results.forEach((r, i) => {
+      if (r.status === 'rejected') {
+        failed.push({ id: ids[i], name: byId.get(ids[i]) ?? '', error: toErrorMsg(r.reason) });
       }
-    }
+    });
     if (failed.length) {
       const failedIds = new Set(failed.map((f) => f.id));
       for (const id of failedIds) clearDownloadRemoved(id);
       transfers.update((list) => {
         const existing = new Set(list.map((x) => x.id));
-        const toRestore = snapshots.filter((s) => failedIds.has(s.id) && !existing.has(s.id));
+        // Copies, not the snapshots themselves: the store skips merging a row
+        // object it already reconciled, and these missed every poll since.
+        const toRestore = snapshots
+          .filter((s) => failedIds.has(s.id) && !existing.has(s.id))
+          .map((s) => ({ ...s }));
         return toRestore.length ? [...list, ...toRestore] : list;
       });
     }
-    summarizeBatchResult(m.transfers_batch_label_removed(), ids.length, failed);
+    if (failed.length || announceSuccess) {
+      summarizeBatchResult(m.transfers_batch_label_removed(), ids.length, failed);
+    }
   }
 
   async function handleBatchRemoveDownloads() {
@@ -3168,10 +3544,13 @@
   async function handleStopAll() {
     const ids = globalDownloadTargets().filter((t) => canStop(t)).map((t) => t.id);
     if (!ids.length) { showInfo(m.transfers_nothing_to_stop()); return; }
-    const failedCount = await runBatchPerId(ids, (id) => stopTransfer(id), m.transfers_batch_label_stopped());
+    const ok = await runBatchCommand(ids, stopTransfersBatch, m.transfers_batch_label_stopped());
     const filter = transferFilter.trim();
-    if (filter && failedCount === 0) {
-      showInfo(m.transfers_stopped_matching({ count: ids.length, filter }));
+    if (filter && ok) {
+      showInfo(plural(ids.length, {
+        one: () => m.transfers_stopped_matching_one({ filter }),
+        other: () => m.transfers_stopped_matching_other({ count: ids.length, filter }),
+      }));
     }
   }
 
@@ -3186,6 +3565,52 @@
       removeIds: [],
       filter: transferFilter.trim(),
     };
+  }
+
+  function batchCancelMixedMessage(count: number, removed: number): string {
+    return plural(count, {
+      one: () => plural(removed, {
+        one: m.transfers_confirm_batch_cancel_mixed_one_one,
+        other: () => m.transfers_confirm_batch_cancel_mixed_one_other({ removed }),
+      }),
+      other: () => plural(removed, {
+        one: () => m.transfers_confirm_batch_cancel_mixed_other_one({ count }),
+        other: () => m.transfers_confirm_batch_cancel_mixed_other_other({ count, removed }),
+      }),
+    });
+  }
+
+  /** `filter` is empty when the command was not scoped by the filter box. */
+  function batchCancelMessage(count: number, filter: string): string {
+    if (filter) {
+      return plural(count, {
+        one: () => m.transfers_confirm_batch_cancel_filtered_one({ filter }),
+        few: () => m.transfers_confirm_batch_cancel_filtered_few({ count, filter }),
+        other: () => m.transfers_confirm_batch_cancel_filtered_other({ count, filter }),
+      });
+    }
+    return plural(count, {
+      one: m.transfers_confirm_batch_cancel_one,
+      few: () => m.transfers_confirm_batch_cancel_few({ count }),
+      other: () => m.transfers_confirm_batch_cancel_other({ count }),
+    });
+  }
+
+  function clearCompletedFilteredMessage(count: number, filter: string): string {
+    return plural(count, {
+      one: () => m.transfers_confirm_clear_completed_filtered_one({ filter }),
+      few: () => m.transfers_confirm_clear_completed_filtered_few({ count, filter }),
+      other: () => m.transfers_confirm_clear_completed_filtered_other({ count, filter }),
+    });
+  }
+
+  /** The noun after a bolded peer count ("12 peers"). */
+  function peersNoun(count: number): string {
+    return plural(count, {
+      one: m.transfers_known_peers_one,
+      few: m.transfers_known_peers_few,
+      other: m.transfers_known_peers_other,
+    });
   }
 
   // --- Splitter ---
@@ -3795,6 +4220,16 @@
     }
   }
 
+  function reputationLabelText(label: ReturnType<typeof labelForReputation>): string {
+    switch (label) {
+      case 'trusted': return m.transfers_rep_trusted();
+      case 'neutral': return m.transfers_rep_neutral();
+      case 'suspect': return m.transfers_rep_suspect();
+      case 'banned': return m.transfers_rep_banned();
+      default: return '\u2014';
+    }
+  }
+
   function dlStatusTooltip(t: Transfer): string {
     switch (t.status) {
       case 'active': {
@@ -3829,6 +4264,9 @@
       }
       case 'queued': {
         if (t.sources === 0) return m.transfers_dl_tooltip_queued_no_sources();
+        // The backend's age-based "waiting for an upload slot" reason assumes a
+        // remote queue, so it is skipped along with the queue wording.
+        if (!isRemotelyQueued(t)) return m.transfers_dl_tooltip_queued_idle();
         const health = transferHealthReasonText(t.health_reason, t.health_code, t.failure_code);
         return health
           ? m.transfers_dl_tooltip_queued_reason({ reason: health })
@@ -4043,7 +4481,8 @@
     // The dialog handles its own Escape and stops it there; this is the
     // fallback for when focus has somehow ended up outside it, and it comes
     // first because the dialog sits above everything else.
-    if (fileDetailsId) { closeFileDetails(); e.preventDefault(); e.stopPropagation(); }
+    if (renameDialog.open) { closeRename(); e.preventDefault(); e.stopPropagation(); }
+    else if (fileDetailsId) { closeFileDetails(); e.preventDefault(); e.stopPropagation(); }
     else if (ctxMenu) { closeCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (paneCtxMenu) { closePaneCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (uploadsPaneCtxMenu) { closeUploadsPaneCtx(); e.preventDefault(); e.stopPropagation(); }
@@ -4067,21 +4506,40 @@
     }
     return;
   }
+  // Already handled by the control that has focus (the splitter, the tab
+  // strip) — the same arrow key must not also move the row selection.
+  if (e.defaultPrevented) return;
   // D33: keyboard nav for download rows. Only hijack when focus is not
   // in a text input and no dialogs are open, so we don't disrupt the
   // filter box or confirm dialogs.
   const target = e.target as HTMLElement | null;
   const inEditable = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
-  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted.open || confirmBatchCancel.open || confirmRecover.open) return;
+  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || columnMenu || uploadsPaneCtxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted.open || confirmBatchCancel.open || confirmRecover.open || renameDialog.open) return;
+  // A dialog owned elsewhere (the shortcut sheet, a settings modal) or the
+  // chat dock has the keyboard; File Details is this page's own and keeps F2.
+  if (target?.closest('.chat-dock')) return;
+  if ([...document.querySelectorAll('[aria-modal="true"]')].some((el) => el !== fileDetailsOverlayEl)) return;
+  if (e.key === 'F2') {
+    const t = fileDetailsId
+      ? (fileDetailsTransfer && canRename(fileDetailsTransfer) ? fileDetailsTransfer : null)
+      : [...selectedBatchTransfers].reverse().find((row) => canRename(row));
+    if (t) {
+      e.preventDefault();
+      openRename(t);
+    }
+    return;
+  }
+  // File Details is modal: the list behind it keeps its selection.
+  if (fileDetailsId) return;
   if (filteredSelectableDownloads.length === 0) return;
   const currentId = selectedDownloadIds[selectedDownloadIds.length - 1];
   const idx = currentId ? filteredSelectableDownloads.findIndex((t) => t.id === currentId) : -1;
   if (e.key === 'ArrowDown') {
     const next = filteredSelectableDownloads[Math.min(filteredSelectableDownloads.length - 1, idx + 1)];
-    if (next) { selectedDownloadIds = [next.id]; lastClickedDlId = next.id; e.preventDefault(); }
+    if (next) { selectedDownloadIds = [next.id]; lastClickedDlId = next.id; e.preventDefault(); revealDownloadRow(next.id); }
   } else if (e.key === 'ArrowUp') {
     const next = filteredSelectableDownloads[Math.max(0, idx < 0 ? 0 : idx - 1)];
-    if (next) { selectedDownloadIds = [next.id]; lastClickedDlId = next.id; e.preventDefault(); }
+    if (next) { selectedDownloadIds = [next.id]; lastClickedDlId = next.id; e.preventDefault(); revealDownloadRow(next.id); }
   } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedDownloadIds.length > 0) {
     e.preventDefault();
     const cancelIds = selectedBatchTransfers.filter((t) => !isFinished(t)).map((t) => t.id);
@@ -4138,14 +4596,26 @@
     <div class="transfer-overview-bar">
       <span class="overview-chip"><span class="overview-label">{m.transfers_overview_label_active()}</span> {transferringDownloads}</span>
       <span class="overview-chip"><span class="overview-label">{m.transfers_overview_label_sources()}</span> {activeConnectedSources}/{totalKnownSources}</span>
-      <label class="filter-wrap" aria-label={m.transfers_filter_aria()}>
-        <span class="filter-label">{m.transfers_filter_label()}</span>
+      <label class="pill-search dl-filter">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <circle cx="7" cy="7" r="4.5"/>
+          <line x1="10.5" y1="10.5" x2="14" y2="14"/>
+        </svg>
         <input
           class="filter-input"
           type="text"
           placeholder={m.transfers_filter_placeholder()}
+          aria-label={m.transfers_filter_aria()}
           bind:value={transferFilter}
         />
+        {#if transferFilter}
+          <button
+            type="button"
+            class="pill-search-clear"
+            aria-label={m.transfers_known_clear_filter()}
+            onclick={() => (transferFilter = '')}
+          ><IconX size={13} /></button>
+        {/if}
       </label>
     </div>
     <div class="pane-toolbar">
@@ -4172,7 +4642,7 @@
       </div>
     </div>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="pane-content scroll-shadows" oncontextmenu={onDownloadsPaneCtx}>
+    <div class="pane-content scroll-shadows" bind:this={downloadsScrollEl} use:passiveScroll={onDownloadsScroll} oncontextmenu={onDownloadsPaneCtx}>
       <table
         class="transfer-table dl-table"
         bind:this={downloadTableEl}
@@ -4215,7 +4685,7 @@
                 ondrop={(e) => handleColumnDrop(e, 'downloads', column.key)}
                 ondragend={handleColumnDragEnd}
               >
-                <span class="header-content">
+                <span class="header-content" title={column.title}>
                   {column.label}{column.sortField ? sortArrow(dlSortField, column.sortField, dlSortAsc) : ''}
                 </span>
                 <button
@@ -4232,9 +4702,11 @@
           </tr>
         </thead>
         <tbody>
-          {#each filteredActiveDownloads as t (t.id)}
+          <tr class="vpad-row" aria-hidden="true" bind:this={dlActiveTopPadEl} style="height: {dlActiveWindow.topPad}px;"><td colspan={dlColCount}></td></tr>
+          {#each dlActiveSlice as t, i (t.id)}
             <tr
               class="dl-row {t.status}"
+              class:row-alt={((dlActiveWindow.start + i) & 1) === 1}
               class:expanded={expandedTransferId === t.id}
               class:selected={selectedDlIdSet.has(t.id)}
               onclick={(e) => onDownloadRowClick(e, t)}
@@ -4265,7 +4737,7 @@
                   <td class="progress-cell">
                     {#if t.status === 'searching' && t.sources === 0 && t.progress === 0}
                       <span class="searching-label">
-                        {dlStatusLabel(t)}...
+                        {m.transfers_status_ellipsis({ status: dlStatusLabel(t) })}
                         {#if searchStatus.get(t.id)}
                           <span class="search-detail">{searchStatus.get(t.id)}</span>
                         {/if}
@@ -4286,12 +4758,7 @@
                   </td>
                 {:else if column.key === 'status'}
                   <td class="status-cell">
-                    <span class="status-label st-{t.status}" title={dlStatusTooltip(t)}>{dlStatusLabel(t)}</span>
-                    {#if t.status === 'completed' && t.ember_verified}
-                      <span class="ember-verified-badge" title={m.transfers_ember_verified_title()}>{m.transfers_ember_verified_badge()}</span>
-                    {:else if t.status === 'failed' && isEmberHashMismatch(t)}
-                      <span class="ember-mismatch-badge" title={m.transfers_ember_mismatch_title()}>{m.transfers_ember_mismatch_badge()}</span>
-                    {/if}
+                    <span class="status-label st-{t.status}" title={dlStatusTooltip(t)} aria-label={m.transfers_status_label_aria({ label: dlStatusLabel(t), tooltip: dlStatusTooltip(t) })}>{dlStatusLabel(t)}</span>
                   </td>
                 {:else if column.key === 'remaining'}
                   {@const spd = liveSpeed(t)}
@@ -4327,7 +4794,7 @@
                   <td class="source-child-cell" colspan={dlColCount}>
                     <span class="source-indent">
                       {sourceLoadError}
-                      <button class="source-inline-btn" onclick={() => toggleSourceDetail(t)}>{m.common_retry()}</button>
+                      <button class="source-inline-btn" onclick={() => reloadSourceDetail(t)}>{m.common_retry()}</button>
                     </span>
                   </td>
                 </tr>
@@ -4336,9 +4803,10 @@
                   <td class="source-child-cell" colspan={dlColCount}>
                     <span class="source-indent">
                       {t.sources > 0
-                        ? (t.sources === 1
-                          ? m.transfers_connecting_sources_one()
-                          : m.transfers_connecting_sources_other({ count: t.sources }))
+                        ? plural(t.sources, {
+                          one: m.transfers_connecting_sources_one,
+                          other: () => m.transfers_connecting_sources_other({ count: t.sources }),
+                        })
                         : m.transfers_no_source_details()}
                       <button class="source-inline-btn" onclick={() => findSourcesInline(t)}>{m.transfers_find_sources()}</button>
                     </span>
@@ -4372,7 +4840,7 @@
                 <tr class="source-child-row source-summary-row" in:fade={{ duration: 150 }}>
                   <td class="source-child-cell" colspan={dlColCount}>
                     <span class="source-summary">
-                      <strong>{expandedSources.length}</strong> {expandedSources.length === 1 ? m.transfers_known_peers_one() : m.transfers_known_peers_other()}
+                      <strong>{expandedSources.length}</strong> {peersNoun(expandedSources.length)}
                       {#if xferCount > 0}<span class="ss-chip ss-xfer">{m.transfers_chip_transferring({ count: xferCount })}</span>{/if}
                       {#if queuedCount > 0}<span class="ss-chip ss-queued">{m.transfers_chip_queued({ count: queuedCount })}</span>{/if}
                       {#if waitCallbackCount > 0}<span class="ss-chip ss-wait-callback">{m.transfers_chip_wait_callback({ count: waitCallbackCount })}</span>{/if}
@@ -4418,26 +4886,31 @@
                 {#if failedCount > 0}
                   <tr class="source-child-row src-failed-summary">
                     <td class="source-child-cell" colspan={dlColCount}>
-                      <span class="source-indent source-failed-note">{failedCount === 1 ? m.transfers_failed_sources_hidden_one() : m.transfers_failed_sources_hidden_other({ count: failedCount })}</span>
+                      <span class="source-indent source-failed-note">{plural(failedCount, { one: m.transfers_failed_sources_hidden_one, other: () => m.transfers_failed_sources_hidden_other({ count: failedCount }) })}</span>
                     </td>
                   </tr>
                 {/if}
               {/if}
             {/if}
           {/each}
+          {#if dlActiveWindow.bottomPad > 0}
+            <tr class="vpad-row" aria-hidden="true" style="height: {dlActiveWindow.bottomPad}px;"><td colspan={dlColCount}></td></tr>
+          {/if}
           {#if filteredCompletedDownloads.length > 0}
             <tr class="section-divider-row">
               <td colspan={dlColCount}>
-                <button class="divider-toggle" onclick={() => completedCollapsed = !completedCollapsed}>
+                <button type="button" class="divider-toggle" aria-expanded={!completedCollapsed} onclick={() => completedCollapsed = !completedCollapsed}>
                   <span class="divider-chevron" class:collapsed={completedCollapsed} aria-hidden="true">{'\u25B6'}</span>
                   {m.transfers_completed_failed_section({ count: filteredCompletedDownloads.length })}
                 </button>
               </td>
             </tr>
             {#if !completedCollapsed}
-            {#each filteredCompletedDownloads as t (t.id)}
+            <tr class="vpad-row" aria-hidden="true" bind:this={dlCompletedTopPadEl} style="height: {dlCompletedWindow.topPad}px;"><td colspan={dlColCount}></td></tr>
+            {#each dlCompletedSlice as t, i (t.id)}
               <tr
                 class="dl-row completed-row {t.status}"
+                class:row-alt={((filteredActiveDownloads.length + dlCompletedWindow.start + i) & 1) === 1}
                 class:selected={selectedDlIdSet.has(t.id)}
                 onclick={(e) => onDownloadRowClick(e, t)}
                 oncontextmenu={(e) => onCtx(e, t, 'completed')}
@@ -4476,11 +4949,6 @@
                   {:else if column.key === 'status'}
                     <td class="status-cell">
                       <span class="status-label st-{t.status}" title={dlStatusTooltip(t)} aria-label={m.transfers_status_label_aria({ label: dlStatusLabel(t), tooltip: dlStatusTooltip(t) })}>{dlStatusLabel(t)}</span>
-                      {#if t.status === 'completed' && t.ember_verified}
-                        <span class="ember-verified-badge" title={m.transfers_ember_verified_title()}>{m.transfers_ember_verified_badge()}</span>
-                      {:else if t.status === 'failed' && isEmberHashMismatch(t)}
-                        <span class="ember-mismatch-badge" title={m.transfers_ember_mismatch_title()}>{m.transfers_ember_mismatch_badge()}</span>
-                      {/if}
                       <!--
                         L10: surface failure_kind / failure_stage in the
                         tooltip so the user can distinguish transient from
@@ -4507,29 +4975,32 @@
                 {/each}
               </tr>
             {/each}
+            {#if dlCompletedWindow.bottomPad > 0}
+              <tr class="vpad-row" aria-hidden="true" style="height: {dlCompletedWindow.bottomPad}px;"><td colspan={dlColCount}></td></tr>
+            {/if}
             {/if}
           {/if}
           {#if allDownloads.length === 0}
             <tr class="empty-row"><td colspan={dlColCount} class="empty-cell">
-              <div class="empty-cell-body">
-                <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+              <div class="empty-state compact">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                   <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
                   <polyline points="7 10 12 15 17 10"></polyline>
                   <line x1="12" y1="15" x2="12" y2="3"></line>
                 </svg>
-                <p class="empty-cell-title">{m.transfers_empty_no_downloads()}</p>
-                <p class="empty-cell-sub"><a href="/search">{m.transfers_empty_start_search_prefix()}</a>{m.transfers_empty_start_search_suffix()}</p>
+                <p class="empty-title">{m.transfers_empty_no_downloads()}</p>
+                <p class="empty-sub"><a href="/search">{m.transfers_empty_start_search_prefix()}</a>{m.transfers_empty_start_search_suffix()}</p>
               </div>
             </td></tr>
           {:else if filteredActiveDownloads.length === 0 && filteredCompletedDownloads.length === 0}
             <tr class="empty-row"><td colspan={dlColCount} class="empty-cell">
-              <div class="empty-cell-body">
-                <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+              <div class="empty-state compact">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                   <circle cx="11" cy="11" r="8"></circle>
                   <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                 </svg>
-                <p class="empty-cell-title">{m.transfers_empty_no_matches()}</p>
-                <button class="empty-cell-action" type="button" onclick={() => (transferFilter = '')}>{m.transfers_known_clear_filter()}</button>
+                <p class="empty-title">{m.transfers_empty_no_matches()}</p>
+                <button class="secondary empty-action" type="button" onclick={() => (transferFilter = '')}>{m.transfers_known_clear_filter()}</button>
               </div>
             </td></tr>
           {/if}
@@ -4545,8 +5016,8 @@
           <button class="tb-btn" disabled={selectedPausableCount === 0} onclick={handleBatchPauseDownloads} title={m.transfers_batch_pause_title()}>{m.common_pause()}</button>
           <button class="tb-btn" disabled={selectedResumableCount === 0} onclick={handleBatchResumeDownloads} title={m.transfers_batch_resume_title()}>{m.common_resume()}</button>
           <button class="tb-btn" disabled={selectedStoppableCount === 0} onclick={handleBatchStopDownloads} title={m.transfers_batch_stop_title()}>{m.common_stop()}</button>
-          <button class="tb-btn danger-outline" disabled={selectedCancellableCount === 0} onclick={handleBatchCancelDownloads} title={m.transfers_batch_cancel_title()}>{m.common_cancel()}</button>
-          <button class="tb-btn" disabled={copyingAllDownloadLinks || linkableSelectedCount === 0} onclick={() => void copyDownloadLinks(selectedBatchTransfers)} title={m.transfers_copy_all_links()}>{m.transfers_copy_all_links_btn()}</button>
+          <button class="tb-btn tb-danger" disabled={selectedCancellableCount === 0} onclick={handleBatchCancelDownloads} title={m.transfers_batch_cancel_title()}>{m.common_cancel()}</button>
+          <button class="tb-btn" disabled={copyingAllDownloadLinks || linkableSelectedCount === 0} onclick={() => void copyDownloadLinks(selectedBatchTransfers)} title={m.transfers_copy_selected_links_title()}>{m.transfers_copy_links_btn()}</button>
           {#if selectedFinishedCount > 0}
             <button class="tb-btn" onclick={handleBatchRemoveDownloads} title={m.transfers_batch_remove_title()}>
               {m.transfers_batch_remove({ count: selectedFinishedCount })}
@@ -4556,6 +5027,8 @@
         </div>
       </div>
     {:else if selectedTransfer}
+      {@const selectedSourcesLabel = sourcesLabel(selectedTransfer)}
+      {@const selectedSourcesTotal = selectedTransfer.sources || ((selectedTransfer.active_sources || 0) + (selectedTransfer.queued_sources || 0))}
       <div class="selection-footer">
         <div class="selection-meta" title={selectedTransfer.file_name}>
           <strong>{selectedTransfer.file_name}</strong>
@@ -4566,7 +5039,7 @@
           -->
           <span>{formatSize(selectedTransfer.completed_size ?? selectedTransfer.transferred)} / {formatSize(selectedTransfer.total_size)}</span>
           <span>{dlStatusLabel(selectedTransfer)}</span>
-          <span>{sourcesLabel(selectedTransfer)} {m.transfers_src_suffix()}{#if selectedTransfer.ember_sources > 0} {m.transfers_epx_count({ count: selectedTransfer.ember_sources })}{/if}</span>
+          <span>{selectedSourcesLabel}{#if selectedSourcesLabel !== '\u2014'} {plural(selectedSourcesTotal, { one: m.transfers_src_suffix_one, other: m.transfers_src_suffix_other })}{/if}{#if selectedTransfer.ember_sources > 0} {m.transfers_epx_count({ count: selectedTransfer.ember_sources })}{/if}</span>
         </div>
         <div class="selection-actions">
           <span class="tb-btn-wrap" title={!canPause(selectedTransfer) ? m.transfers_action_cannot_pause() : undefined}>
@@ -4636,19 +5109,21 @@
           const order: typeof bottomView[] = ['uploading', 'queued', 'known_clients', 'known_ember', 'download_clients'];
           const idx = order.indexOf(bottomView);
           if (idx < 0) return;
+          let next: typeof bottomView;
           if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
-            e.preventDefault();
-            bottomView = order[(idx + 1) % order.length];
+            next = order[(idx + 1) % order.length];
           } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
-            e.preventDefault();
-            bottomView = order[(idx - 1 + order.length) % order.length];
+            next = order[(idx - 1 + order.length) % order.length];
           } else if (e.key === 'Home') {
-            e.preventDefault();
-            bottomView = order[0];
+            next = order[0];
           } else if (e.key === 'End') {
-            e.preventDefault();
-            bottomView = order[order.length - 1];
+            next = order[order.length - 1];
+          } else {
+            return;
           }
+          e.preventDefault();
+          bottomView = next;
+          e.currentTarget.querySelectorAll<HTMLElement>('[role="tab"]')[order.indexOf(next)]?.focus();
         }}
       >
         <button
@@ -4669,7 +5144,7 @@
           tabindex={bottomView === 'queued' ? 0 : -1}
           onclick={() => bottomView = 'queued'}
           title={m.transfers_tab_queued_title()}
-        >{uploadQueueLoaded ? m.transfers_tab_queued_count({ count: uploadQueueClients.length }) : m.transfers_tab_queued()}</button>
+        >{uploadQueueLoaded && !uploadQueueLoadFailed ? m.transfers_tab_queued_count({ count: uploadQueueClients.length }) : m.transfers_tab_queued()}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'known_clients'}
@@ -4791,9 +5266,9 @@
                   {:else if column.key === 'total_size'}
                     <td class="num-cell">{formatSize(t.total_size)}</td>
                   {:else if column.key === 'waited'}
-                    <td class="num-cell">{formatDuration(t.wait_time * 1000)}</td>
+                    <td class="num-cell">{t.wait_time > 0 ? formatDurationSecs(t.wait_time) : '\u2014'}</td>
                   {:else if column.key === 'upload_time'}
-                    <td class="num-cell">{formatDuration(t.upload_time)}</td>
+                    <td class="num-cell">{t.upload_time > 0 ? formatDurationSecs(Math.floor(t.upload_time / 1000)) : '\u2014'}</td>
                   {:else if column.key === 'status'}
                     <td class="status-cell"><span class="status-label st-{t.status}" title={ulStatusTooltip(t)}>{ulStatusLabel(t)}</span></td>
                   {:else if column.key === 'up_status'}
@@ -4847,25 +5322,25 @@
             -->
             {#if activeUploads.length === 0}
               <tr class="empty-row"><td colspan={ulColCount} class="empty-cell">
-                <div class="empty-cell-body">
-                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                <div class="empty-state compact">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                     <path d="M3 15v4a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-4"></path>
                     <polyline points="17 8 12 3 7 8"></polyline>
                     <line x1="12" y1="3" x2="12" y2="15"></line>
                   </svg>
-                  <p class="empty-cell-title">{m.transfers_empty_no_uploads()}</p>
-                  <p class="empty-cell-sub">{m.transfers_empty_no_uploads_sub()}</p>
+                  <p class="empty-title">{m.transfers_empty_no_uploads()}</p>
+                  <p class="empty-sub">{m.transfers_empty_no_uploads_sub()}</p>
                 </div>
               </td></tr>
             {:else if filteredActiveUploads.length === 0}
               <tr class="empty-row"><td colspan={ulColCount} class="empty-cell">
-                <div class="empty-cell-body">
-                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                <div class="empty-state compact">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                     <circle cx="11" cy="11" r="8"></circle>
                     <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                   </svg>
-                  <p class="empty-cell-title">{m.transfers_empty_no_upload_matches()}</p>
-                  <button class="empty-cell-action" type="button" onclick={() => (transferFilter = '')}>{m.transfers_known_clear_filter()}</button>
+                  <p class="empty-title">{m.transfers_empty_no_upload_matches()}</p>
+                  <button class="secondary empty-action" type="button" onclick={() => (transferFilter = '')}>{m.transfers_known_clear_filter()}</button>
                 </div>
               </td></tr>
             {/if}
@@ -4940,7 +5415,7 @@
                   {:else if column.key === 'file_name'}
                     <td class="name-cell" title={q.file_name}><bdi dir="auto">{q.file_name}</bdi></td>
                   {:else if column.key === 'wait_time'}
-                    <td class="num-cell">{formatDuration(q.wait_seconds * 1000)}</td>
+                    <td class="num-cell">{q.wait_seconds > 0 ? formatDurationSecs(q.wait_seconds) : '\u2014'}</td>
                   {:else if column.key === 'queue_rank'}
                     <!-- Always a number. The rank is computed from the whole
                          queue, so it is known whether or not the peer happens
@@ -4962,23 +5437,23 @@
             {#if uploadQueueClients.length === 0}
               <tr class="empty-row"><td colspan={queueColCount} class="empty-cell">
                 {#if uploadQueueLoadFailed}
-                  <div class="empty-cell-body">
-                    <p class="empty-cell-title">{m.transfers_load_unavailable()}</p>
-                    <p class="empty-cell-sub">{m.transfers_load_retrying()}</p>
+                  <div class="empty-state compact">
+                    <p class="empty-title">{m.transfers_load_unavailable()}</p>
+                    <p class="empty-sub">{m.transfers_load_retrying()}</p>
                   </div>
                 {:else if uploadQueueLoaded}
-                  <div class="empty-cell-body">
-                    <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                  <div class="empty-state compact">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                       <circle cx="12" cy="12" r="10"></circle>
                       <polyline points="12 6 12 12 16 14"></polyline>
                     </svg>
-                    <p class="empty-cell-title">{m.transfers_empty_no_queue()}</p>
-                    <p class="empty-cell-sub">{m.transfers_empty_no_queue_sub()}</p>
+                    <p class="empty-title">{m.transfers_empty_no_queue()}</p>
+                    <p class="empty-sub">{m.transfers_empty_no_queue_sub()}</p>
                   </div>
                 {:else}
-                  <div class="empty-cell-body">
+                  <div class="empty-state compact">
                     <div class="spinner"></div>
-                    <p class="empty-cell-sub">{m.transfers_loading_short()}</p>
+                    <p class="empty-sub">{m.transfers_loading_short()}</p>
                   </div>
                 {/if}
               </td></tr>
@@ -5001,7 +5476,7 @@
           totals reflect the full ledger, not the filtered view.
         -->
         <div class="known-toolbar" role="group" aria-label={showingEmberKnown ? m.transfers_known_ember_filter_aria() : m.transfers_known_filter_aria()}>
-          <label class="known-search">
+          <label class="pill-search known-search">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
               <circle cx="7" cy="7" r="4.5"/>
               <line x1="10.5" y1="10.5" x2="14" y2="14"/>
@@ -5015,7 +5490,7 @@
             {#if knownFilter}
               <button
                 type="button"
-                class="known-search-clear"
+                class="pill-search-clear"
                 aria-label={m.transfers_known_clear_filter()}
                 onclick={() => (knownFilter = '')}
               ><IconX size={13} /></button>
@@ -5025,12 +5500,16 @@
             <div class="known-stats" aria-live="polite">
               <span class="known-stat">
                 <strong>{knownStats.total}</strong>
-                {knownStats.total === 1 ? m.transfers_known_peers_one() : m.transfers_known_peers_other()}
+                {peersNoun(knownStats.total)}
               </span>
               {#if knownStats.friends > 0}
                 <span class="known-stat known-stat-friends" title={m.transfers_known_friends_title()}>
                   <strong>{knownStats.friends}</strong>
-                  {knownStats.friends === 1 ? m.transfers_known_friends_one() : m.transfers_known_friends_other()}
+                  {plural(knownStats.friends, {
+                    one: m.transfers_known_friends_one,
+                    few: m.transfers_known_friends_few,
+                    other: m.transfers_known_friends_other,
+                  })}
                 </span>
               {/if}
               <span class="known-stat" title={m.transfers_known_total_up_title()}>
@@ -5039,14 +5518,13 @@
               <span class="known-stat" title={m.transfers_known_total_down_title()}>
                 &darr; <strong>{formatSize(knownStats.totalDown)}</strong>
               </span>
-              {#if knownFilter && filteredKnownClients.length !== knownStats.total}
-                <span class="known-stat known-stat-match" aria-live="polite">
-                  {m.transfers_known_showing_label()} <strong>{filteredKnownClients.length}</strong>
-                </span>
-              {/if}
               {#if displayedKnownClients.length < filteredKnownClients.length}
                 <span class="known-stat known-stat-match" aria-live="polite">
                   {m.transfers_known_showing_label()} <strong>{displayedKnownClients.length}</strong> / <strong>{filteredKnownClients.length}</strong>
+                </span>
+              {:else if knownFilter && filteredKnownClients.length !== knownStats.total}
+                <span class="known-stat known-stat-match" aria-live="polite">
+                  {m.transfers_known_showing_label()} <strong>{filteredKnownClients.length}</strong>
                 </span>
               {/if}
             </div>
@@ -5083,7 +5561,7 @@
                   ondrop={(e) => handleColumnDrop(e, 'known', column.key)}
                   ondragend={handleColumnDragEnd}
                 >
-                  <span class="header-content">
+                  <span class="header-content" title={column.title}>
                     {column.label}{column.sortField ? sortArrow(knSortField, column.sortField, knSortAsc) : ''}
                   </span>
                   <button
@@ -5125,7 +5603,7 @@
                         onclick={() => copyKnownHash(shownHash)}
                       >
                         {#if isFriend}
-                          <span class="known-friend-dot" aria-label={m.transfers_known_friend()} title={friendNick ? m.transfers_known_friend_named({ nick: friendNick }) : m.transfers_known_friend()}></span>
+                          <span class="known-friend-dot" role="img" aria-label={m.transfers_known_friend()} title={friendNick ? m.transfers_known_friend_named({ nick: friendNick }) : m.transfers_known_friend()}></span>
                         {/if}
                         {#if friendNick}
                           <span class="known-hash-nick"><bdi dir="auto">{friendNick}</bdi></span>
@@ -5163,7 +5641,7 @@
                             ? m.transfers_known_rep_no_record()
                             : m.transfers_known_rep_fetching()}
                       >
-                        {label === 'unknown' ? '—' : label}
+                        {reputationLabelText(label)}
                       </span>
                     </td>
                   {:else if column.key === 'ident_state'}
@@ -5184,38 +5662,38 @@
             {#if filteredKnownClients.length === 0}
               <tr class="empty-row"><td colspan={knownColCount} class="empty-cell">
                 {#if !knownClientsLoaded}
-                  <div class="empty-cell-body">
+                  <div class="empty-state compact">
                     <div class="spinner"></div>
-                    <p class="empty-cell-sub">{m.transfers_loading_short()}</p>
+                    <p class="empty-sub">{m.transfers_loading_short()}</p>
                   </div>
                 {:else if knownClientsLoadFailed && knownLedger.length === 0}
-                  <div class="empty-cell-body">
-                    <p class="empty-cell-title">{m.transfers_load_unavailable()}</p>
-                    <p class="empty-cell-sub">{m.transfers_load_retrying()}</p>
+                  <div class="empty-state compact">
+                    <p class="empty-title">{m.transfers_load_unavailable()}</p>
+                    <p class="empty-sub">{m.transfers_load_retrying()}</p>
                   </div>
                 {:else if knownLedger.length === 0}
-                  <div class="empty-cell-body">
-                    <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                  <div class="empty-state compact">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                       <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
                       <circle cx="12" cy="7" r="4"></circle>
                     </svg>
                     {#if showingEmberKnown}
-                      <p class="empty-cell-title">{m.transfers_empty_no_ember()}</p>
-                      <p class="empty-cell-sub">{m.transfers_empty_no_ember_sub()}</p>
+                      <p class="empty-title">{m.transfers_empty_no_ember()}</p>
+                      <p class="empty-sub">{m.transfers_empty_no_ember_sub()}</p>
                     {:else}
-                      <p class="empty-cell-title">{m.transfers_empty_no_credit()}</p>
-                      <p class="empty-cell-sub">{m.transfers_empty_no_credit_sub()}</p>
+                      <p class="empty-title">{m.transfers_empty_no_credit()}</p>
+                      <p class="empty-sub">{m.transfers_empty_no_credit_sub()}</p>
                     {/if}
                   </div>
                 {:else}
-                  <div class="empty-cell-body">
-                    <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                  <div class="empty-state compact">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                       <circle cx="11" cy="11" r="7"/>
                       <line x1="16" y1="16" x2="20" y2="20"/>
                     </svg>
-                    <p class="empty-cell-title">{m.transfers_known_no_matches()}</p>
-                    <p class="empty-cell-sub">{m.transfers_known_no_matches_sub({ query: knownFilter })}</p>
-                    <button class="empty-cell-action" type="button" onclick={() => (knownFilter = '')}>{m.transfers_known_clear_filter()}</button>
+                    <p class="empty-title">{m.transfers_known_no_matches()}</p>
+                    <p class="empty-sub">{m.transfers_known_no_matches_sub({ query: knownFilter })}</p>
+                    <button class="secondary empty-action" type="button" onclick={() => (knownFilter = '')}>{m.transfers_known_clear_filter()}</button>
                   </div>
                 {/if}
               </td></tr>
@@ -5255,7 +5733,7 @@
                   ondrop={(e) => handleColumnDrop(e, 'clients', column.key)}
                   ondragend={handleColumnDragEnd}
                 >
-                  <span class="header-content">
+                  <span class="header-content" title={column.title}>
                     {column.label}{column.sortField ? sortArrow(clSortField ?? '', column.sortField, clSortAsc) : ''}
                   </span>
                   <button
@@ -5307,73 +5785,96 @@
               {/each}
               {#if clientSources.length === 0}
                 <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
-                  <div class="empty-cell-body">
-                    <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                  <div class="empty-state compact">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                       <circle cx="12" cy="12" r="10"></circle>
                       <line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line>
                     </svg>
-                    <p class="empty-cell-title">{m.transfers_empty_all_sources_failed()}</p>
-                    <p class="empty-cell-sub">{m.transfers_empty_all_sources_failed_sub()}</p>
+                    <p class="empty-title">{m.transfers_empty_all_sources_failed()}</p>
+                    <p class="empty-sub">{m.transfers_empty_all_sources_failed_sub()}</p>
                   </div>
                 </td></tr>
               {/if}
             {:else if loadingSources && expandedTransferId}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
-                <div class="empty-cell-body">
+                <div class="empty-state compact">
                   <div class="spinner"></div>
-                  <p class="empty-cell-sub">{m.transfers_loading_sources_dots()}</p>
+                  <p class="empty-sub">{m.transfers_loading_sources_dots()}</p>
                 </div>
               </td></tr>
             {:else if selectedDownloadIds.length > 1}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
-                <div class="empty-cell-body">
-                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                <div class="empty-state compact">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                     <circle cx="9" cy="7" r="4"></circle>
                     <path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"></path>
                     <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
                     <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
                   </svg>
-                  <p class="empty-cell-title">{m.transfers_empty_multiple_selected()}</p>
-                  <p class="empty-cell-sub">{m.transfers_empty_multiple_selected_sub()}</p>
+                  <p class="empty-title">{m.transfers_empty_multiple_selected()}</p>
+                  <p class="empty-sub">{m.transfers_empty_multiple_selected_sub()}</p>
                 </div>
               </td></tr>
             {:else if selectedDownloadIds.length === 1 && !activeDownloads.some((d) => d.id === selectedDownloadIds[0])}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
-                <div class="empty-cell-body">
-                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                <div class="empty-state compact">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                     <circle cx="9" cy="7" r="4"></circle>
                     <path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"></path>
                     <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
                     <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
                   </svg>
-                  <p class="empty-cell-title">{m.transfers_empty_finished_dl()}</p>
-                  <p class="empty-cell-sub">{m.transfers_empty_finished_dl_sub()}</p>
+                  <p class="empty-title">{m.transfers_empty_finished_dl()}</p>
+                  <p class="empty-sub">{m.transfers_empty_finished_dl_sub()}</p>
+                </div>
+              </td></tr>
+            {:else if expandedClientsParent && sourceLoadError}
+              {@const parent = expandedClientsParent}
+              <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
+                <div class="empty-state compact">
+                  <p class="empty-title">{sourceLoadError}</p>
+                  <button class="secondary empty-action" type="button" onclick={() => reloadSourceDetail(parent)}>{m.common_retry()}</button>
+                </div>
+              </td></tr>
+            {:else if expandedClientsParent}
+              {@const parent = expandedClientsParent}
+              <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
+                <div class="empty-state compact">
+                  <p class="empty-title">
+                    {parent.sources > 0
+                      ? plural(parent.sources, {
+                        one: m.transfers_connecting_sources_one,
+                        other: () => m.transfers_connecting_sources_other({ count: parent.sources }),
+                      })
+                      : m.transfers_no_source_details()}
+                  </p>
+                  <button class="secondary empty-action" type="button" onclick={() => findSourcesInline(parent)}>{m.transfers_find_sources()}</button>
                 </div>
               </td></tr>
             {:else if activeDownloads.length === 0}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
-                <div class="empty-cell-body">
-                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                <div class="empty-state compact">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                     <circle cx="9" cy="7" r="4"></circle>
                     <path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"></path>
                     <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
                     <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
                   </svg>
-                  <p class="empty-cell-title">{m.transfers_empty_no_active_dl()}</p>
-                  <p class="empty-cell-sub">{m.transfers_empty_no_active_dl_sub()}</p>
+                  <p class="empty-title">{m.transfers_empty_no_active_dl()}</p>
+                  <p class="empty-sub">{m.transfers_empty_no_active_dl_sub()}</p>
                 </div>
               </td></tr>
             {:else}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
-                <div class="empty-cell-body">
-                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                <div class="empty-state compact">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                     <circle cx="9" cy="7" r="4"></circle>
                     <path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"></path>
                     <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
                     <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
                   </svg>
-                  <p class="empty-cell-title">{m.transfers_empty_select_dl()}</p>
-                  <p class="empty-cell-sub">{m.transfers_empty_select_dl_sub()}</p>
+                  <p class="empty-title">{m.transfers_empty_select_dl()}</p>
+                  <p class="empty-sub">{m.transfers_empty_select_dl_sub()}</p>
                 </div>
               </td></tr>
             {/if}
@@ -5489,6 +5990,9 @@
       {/if}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openFileDetails(t); }}>{m.transfers_ctx_file_details()}</button>
+      {#if canRename(ctxTransfer)}
+        <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openRename(t); }}>{m.transfers_ctx_rename()}</button>
+      {/if}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" disabled={!canPreview(ctxTransfer)} title={canPreview(ctxTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => ctxAction('preview')}>{m.transfers_preview()}</button>
       <button
@@ -5580,7 +6084,7 @@
         >{m.search_ctx_find_related_selected({ count: selectedDownloadCount })}</button>
       {/if}
       <div class="ctx-sep" role="separator"></div>
-      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
+      <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
       <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
     {:else if ctxMenu.section === 'completed'}
       <!--
@@ -5594,6 +6098,9 @@
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openFileDetails(t); }}>{m.transfers_ctx_file_details()}</button>
+      {#if canRename(ctxTransfer)}
+        <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openRename(t); }}>{m.transfers_ctx_rename()}</button>
+      {/if}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
       <button
@@ -5614,7 +6121,7 @@
         >{m.search_ctx_find_related_selected({ count: selectedDownloadCount })}</button>
       {/if}
       <div class="ctx-sep" role="separator"></div>
-      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
+      <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
       <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_ctx_remove_from_list()}</button>
     {:else}
       {@const uploadFriendHash = emberHashForUpload(ctxTransfer)}
@@ -5651,6 +6158,7 @@
     <div class="ctx-header" role="presentation">
       <bdi dir="auto">
         {knownCtxMenu.client.nickname
+          || knownCtxMenu.client.peer_name
           || knownCtxMenu.client.last_known_ip
           || knownCtxMenu.client.user_hash.slice(0, 12)}
       </bdi>
@@ -5698,7 +6206,8 @@
     } catch (e: unknown) {
       clearDownloadRemoved(id);
       if (snapshot) {
-        const restore = snapshot;
+        // A copy so the next poll merges it; see `removeTransfersBatch`.
+        const restore = { ...snapshot };
         transfers.update((list) =>
           list.some((x) => x.id === id) ? list : [...list, restore],
         );
@@ -5733,10 +6242,26 @@
   bind:open={confirmClearCompleted.open}
   title={m.transfers_clear_completed()}
   message={confirmClearCompleted.filter
-    ? m.transfers_confirm_clear_completed_filtered({ count: confirmClearCompleted.count, filter: confirmClearCompleted.filter })
+    ? clearCompletedFilteredMessage(confirmClearCompleted.count, confirmClearCompleted.filter)
     : m.transfers_confirm_clear_completed_msg()}
   confirmLabel={m.common_clear()}
-  onconfirm={async () => { try { if (transferFilter.trim()) { const targets = clearCompletedTargets(); const ids = new Set(targets.map((t) => t.id)); for (const id of ids) markDownloadRemoved(id); await Promise.all(targets.map((t) => removeTransfer(t.id))); transfers.update((list) => { for (const id of ids) { speedHistory.delete(id); forgetTransfer(id); } return list.filter((x) => !ids.has(x.id)); }); } else { const clearedIds = $transfers.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id); for (const id of clearedIds) markDownloadRemoved(id); await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) { speedHistory.delete(id); forgetTransfer(id); } return remaining; }); } } catch (e: unknown) { transferError = toErrorMsg(e); } }}
+  onconfirm={async () => {
+    let markedIds: string[] = [];
+    try {
+      if (transferFilter.trim()) {
+        await removeTransfersBatch(clearCompletedTargets().map((t) => t.id), false);
+      } else {
+        markedIds = $transfers.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id);
+        for (const id of markedIds) markDownloadRemoved(id);
+        await clearCompleted();
+        markedIds = [];
+        transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) { speedHistory.delete(id); forgetTransfer(id); } return remaining; });
+      }
+    } catch (e: unknown) {
+      for (const id of markedIds) clearDownloadRemoved(id);
+      transferError = toErrorMsg(e);
+    }
+  }}
 />
 
 <!-- D27: recover-archive confirm + async feedback -->
@@ -5763,12 +6288,8 @@
   bind:open={confirmBatchCancel.open}
   title={m.transfers_confirm_batch_cancel_title()}
   message={confirmBatchCancel.removeIds.length > 0
-    ? m.transfers_confirm_batch_cancel_mixed({ count: confirmBatchCancel.count, removed: confirmBatchCancel.removeIds.length })
-    : confirmBatchCancel.filter
-      ? m.transfers_confirm_batch_cancel_filtered({ count: confirmBatchCancel.count, filter: confirmBatchCancel.filter })
-      : confirmBatchCancel.count === 1
-        ? m.transfers_confirm_batch_cancel_one()
-        : m.transfers_confirm_batch_cancel_other({ count: confirmBatchCancel.count })}
+    ? batchCancelMixedMessage(confirmBatchCancel.count, confirmBatchCancel.removeIds.length)
+    : batchCancelMessage(confirmBatchCancel.count, confirmBatchCancel.filter)}
   confirmLabel={m.transfers_confirm_batch_cancel_label()}
   danger={true}
   onconfirm={async () => {
@@ -5797,7 +6318,8 @@
       for (const id of idSet) clearDownloadRemoved(id);
       transfers.update((list) => {
         const existing = new Set(list.map((x) => x.id));
-        const toRestore = snapshots.filter((s) => !existing.has(s.id));
+        // Copies so the next poll merges them; see `removeTransfersBatch`.
+        const toRestore = snapshots.filter((s) => !existing.has(s.id)).map((s) => ({ ...s }));
         return toRestore.length ? [...list, ...toRestore] : list;
       });
       transferError = toErrorMsg(e);
@@ -5829,7 +6351,7 @@
         <span id="dl-file-details-title" class="modal-title">{m.transfers_file_details_title()}</span>
         <button
           type="button"
-          class="modal-close"
+          class="icon-close"
           bind:this={fileDetailsCloseBtn}
           title={m.common_close()}
           aria-label={m.common_close()}
@@ -5840,7 +6362,18 @@
       </div>
       <div class="modal-body">
         <div class="dl-details-hero">
-          <bdi class="dl-details-name" dir="auto">{t.file_name}</bdi>
+          {#if canRename(t)}
+            <button
+              type="button"
+              class="dl-details-name-btn"
+              title={m.transfers_file_details_rename()}
+              onclick={() => openRename(t)}
+            >
+              <bdi class="dl-details-name" dir="auto">{t.file_name}</bdi>
+            </button>
+          {:else}
+            <bdi class="dl-details-name" dir="auto">{t.file_name}</bdi>
+          {/if}
           <span class="dl-details-sub">{formatSize(t.total_size)}</span>
         </div>
 
@@ -5946,6 +6479,65 @@
   </div>
 {/if}
 
+{#if renameDialog.open}
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="modal-overlay rename-overlay"
+    bind:this={renameOverlayEl}
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="dl-rename-title"
+    tabindex="-1"
+    onclick={(e) => { if (e.target === e.currentTarget) closeRename(); }}
+    onkeydown={(e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        closeRename();
+        return;
+      }
+      trapTabKey(e, renameModalEl);
+    }}
+  >
+    <div class="modal-content rename-modal" bind:this={renameModalEl}>
+      <div class="modal-header">
+        <span id="dl-rename-title" class="modal-title">{m.transfers_rename_title()}</span>
+        <button
+          type="button"
+          class="icon-close"
+          title={m.common_close()}
+          aria-label={m.common_close()}
+          disabled={renameDialog.busy}
+          onclick={closeRename}
+        >
+          <IconX size={15} />
+        </button>
+      </div>
+      <form
+        class="modal-body"
+        onsubmit={(e) => { e.preventDefault(); void submitRename(); }}
+      >
+        <label class="rename-label" for="dl-rename-input">{m.transfers_rename_label()}</label>
+        <input
+          id="dl-rename-input"
+          class="rename-input"
+          bind:this={renameInputEl}
+          bind:value={renameDialog.value}
+          disabled={renameDialog.busy}
+          spellcheck="false"
+        />
+        {#if renameDialog.error}
+          <p class="dl-details-note error-msg">{renameDialog.error}</p>
+        {/if}
+        <div class="modal-footer rename-actions">
+          <button type="button" class="ghost" disabled={renameDialog.busy} onclick={closeRename}>{m.common_cancel()}</button>
+          <button type="submit" disabled={renameDialog.busy || !renameDialog.value.trim()}>{m.transfers_rename_save()}</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{/if}
+
 <style>
   /* --- File Details dialog ---
      Same shell as the Search page's details modal, so the two read as the same
@@ -5990,30 +6582,7 @@
 
   .modal-title {
     font-weight: 600;
-    font-size: 14px;
-  }
-
-  .modal-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    flex-shrink: 0;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    line-height: 1;
-    transition: background 0.12s, border-color 0.12s, color 0.12s;
-  }
-
-  .modal-close:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    font-size: var(--font-size-lg);
   }
 
   .modal-body {
@@ -6045,19 +6614,73 @@
 
   .dl-details-name {
     font-weight: 600;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     overflow-wrap: anywhere;
+  }
+
+  .dl-details-name-btn {
+    display: block;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: inherit;
+    cursor: pointer;
+  }
+
+  .dl-details-name-btn:hover .dl-details-name,
+  .dl-details-name-btn:focus-visible .dl-details-name {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .rename-overlay {
+    z-index: 10001;
+  }
+
+  .rename-modal {
+    width: min(420px, 100%);
+  }
+
+  .rename-label {
+    display: block;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    margin-bottom: 6px;
+  }
+
+  .rename-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font: inherit;
+  }
+
+  .rename-actions {
+    margin-top: 14px;
+    padding: 0;
+    border: 0;
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
   }
 
   .dl-details-sub,
   .dl-chunk-legend {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
   }
 
   .dl-details-note {
     margin: 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
   }
 
@@ -6069,7 +6692,7 @@
   }
 
   .dl-chunk-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -6081,7 +6704,7 @@
     grid-template-columns: minmax(0, auto) minmax(0, 1fr);
     gap: 6px 16px;
     margin: 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .dl-details-grid dt {
@@ -6094,7 +6717,7 @@
     overflow-wrap: anywhere;
   }
 
-  @media (max-width: 560px) {
+  @media (max-width: 760px) {
     .modal-overlay {
       padding: 0;
       align-items: stretch;
@@ -6140,7 +6763,7 @@
     flex-wrap: wrap;
   }
   .overview-chip {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
     border: 1px solid var(--border);
@@ -6153,30 +6776,12 @@
     color: var(--text-muted);
     margin-right: 2px;
   }
-  .filter-wrap {
+  /* The Known Clients search, at the right of the downloads overview bar. */
+  .pill-search.dl-filter {
     margin-left: auto;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 11px;
-    color: var(--text-muted);
-  }
-  .filter-label {
-    white-space: nowrap;
-  }
-  .filter-input {
-    width: 220px;
-    max-width: 45vw;
-    padding: 2px 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--bg-primary);
-    color: var(--text-primary);
-    font-size: 11px;
-  }
-  .filter-input:focus {
-    outline: 1px solid var(--accent);
-    outline-offset: 0;
+    flex: 0 1 240px;
+    padding-top: 1px;
+    padding-bottom: 1px;
   }
   .pane-toolbar {
     display: flex;
@@ -6189,7 +6794,7 @@
     gap: 6px;
   }
   .pane-title {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-secondary);
   }
@@ -6198,30 +6803,23 @@
     align-items: center;
     gap: 4px;
   }
+  /* Below the shared mid breakpoint the action row wraps under the pane title
+     rather than running off the pane; the advanced columns have already gone
+     at 1200 (see `applyViewportDownloadCompact`). */
+  @media (max-width: 980px) {
+    .pane-toolbar:not(.tabs-bar) {
+      flex-wrap: wrap;
+      row-gap: 4px;
+    }
+    .toolbar-actions {
+      flex-wrap: wrap;
+    }
+  }
   .toolbar-sep {
     width: 1px;
     height: 14px;
     background: var(--border);
     margin: 0 2px;
-  }
-  .tb-btn {
-    font-size: 11px;
-    padding: 1px 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--bg-primary);
-    color: var(--text-primary);
-    cursor: pointer;
-    transition: background 0.15s;
-    min-height: 20px;
-  }
-  .tb-btn:hover {
-    background: var(--bg-hover);
-  }
-  .tb-btn:disabled {
-    opacity: 0.5;
-    cursor: default;
-    background: var(--bg-primary);
   }
   .tb-btn-wrap {
     display: inline-flex;
@@ -6229,21 +6827,14 @@
   .tb-btn-wrap .tb-btn:disabled {
     pointer-events: none;
   }
+  /* A view option rather than an action: dashed until pointed at. */
   .tb-btn.tb-toggle {
     color: var(--text-muted);
     border-style: dashed;
-    font-size: 10px;
   }
-  .tb-btn.tb-toggle:hover {
+  .tb-btn.tb-toggle:hover:not(:disabled) {
     color: var(--text-primary);
     border-style: solid;
-  }
-  .tb-btn.danger-outline {
-    border-color: var(--danger);
-    color: var(--danger);
-  }
-  .tb-btn.danger-outline:hover {
-    background: color-mix(in srgb, var(--danger) 12%, var(--bg-primary));
   }
   .toolbar-more {
     position: relative;
@@ -6261,17 +6852,17 @@
     z-index: 9999;
     min-width: 160px;
     padding: 4px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    box-shadow: var(--shadow-md, 0 4px 12px rgba(0, 0, 0, 0.15));
+    background: var(--ctx-surface);
+    border: 1px solid var(--ctx-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--ctx-shadow);
     display: flex;
     flex-direction: column;
     gap: 2px;
   }
   .toolbar-more-menu button {
     text-align: left;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 6px 10px;
     border: none;
     border-radius: var(--radius-sm);
@@ -6320,7 +6911,7 @@
     position: relative;
     display: inline-flex;
     align-items: center;
-    font-size: 11.5px;
+    font-size: var(--font-size-sm);
     font-family: inherit;
     min-height: 30px;
     padding: 6px 13px 7px;
@@ -6332,10 +6923,10 @@
     cursor: pointer;
     white-space: nowrap;
     transition:
-      background-color 0.15s ease,
-      border-color 0.15s ease,
-      color 0.15s ease,
-      box-shadow 0.15s ease;
+      background-color var(--transition-normal) ease,
+      border-color var(--transition-normal) ease,
+      color var(--transition-normal) ease,
+      box-shadow var(--transition-normal) ease;
   }
   .tab-btn:hover {
     background: color-mix(in srgb, var(--bg-hover) 80%, transparent);
@@ -6399,7 +6990,7 @@
     transform: none;
     box-shadow: none;
     will-change: auto;
-    transition: background 0.1s;
+    transition: background var(--transition-fast);
   }
   .splitter-bar::after {
     content: '';
@@ -6414,7 +7005,7 @@
     border-radius: 2px;
     box-sizing: border-box;
     pointer-events: none;
-    transition: border-color 0.1s, background 0.1s;
+    transition: border-color var(--transition-fast), background var(--transition-fast);
   }
   .splitter-bar:hover,
   .splitter-bar.dragging {
@@ -6453,19 +7044,19 @@
   .transfer-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     table-layout: fixed;
   }
   .transfer-table th {
     position: sticky;
     top: 0;
     z-index: 1;
-    background: var(--bg-secondary);
+    background: var(--table-head-bg);
     padding: 3px 6px;
-    font-size: 11px;
-    font-weight: 500;
+    font-size: var(--font-size-xs);
+    font-weight: 600;
     text-align: left;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     border-bottom: 1px solid var(--border);
     white-space: nowrap;
     user-select: none;
@@ -6477,6 +7068,7 @@
   }
   .transfer-table th.sortable:hover {
     color: var(--text-primary);
+    background: var(--bg-hover);
   }
   .transfer-table th.drag-enabled {
     cursor: grab;
@@ -6520,7 +7112,7 @@
     width: 1px;
     transform: translateX(-50%);
     background: transparent;
-    transition: background 0.12s ease;
+    transition: background var(--transition-fast) ease;
   }
   .transfer-table th:hover .col-resize-handle::after,
   .transfer-table th.resizing .col-resize-handle::after,
@@ -6536,16 +7128,33 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
+    border-bottom: 1px solid var(--table-row-divider);
   }
-  .transfer-table tbody tr:nth-child(even of :not(.source-child-row):not(.section-divider-row):not(.src-failed-summary)) {
-    background: color-mix(in srgb, var(--bg-secondary) 40%, var(--bg-primary));
+  .transfer-table tbody tr:nth-child(even of :not(.source-child-row):not(.section-divider-row):not(.src-failed-summary):not(.dl-row):not(.vpad-row)) {
+    background: var(--table-row-alt);
+  }
+  /* Download rows are windowed, so which of them is an even child changes
+     as the table scrolls; they carry their stripe from their list index. */
+  .transfer-table tbody tr.dl-row.row-alt {
+    background: var(--table-row-alt);
+  }
+  .transfer-table tbody tr.vpad-row,
+  .transfer-table tbody tr.vpad-row:hover {
+    background: transparent;
+  }
+  .transfer-table tbody tr.vpad-row td {
+    padding: 0;
+    border: 0;
+    height: inherit;
   }
   .transfer-table tbody tr:hover {
     background: var(--bg-hover);
   }
-  .dl-row.selected {
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  /* As specific as the stripe and hover rules above, and after them, so a
+     selected row stays selected on a striped line and under the pointer. */
+  .transfer-table tbody tr.dl-row.selected,
+  .transfer-table tbody tr.dl-row.selected:hover {
+    background: var(--table-row-selected);
   }
 
   .col-dl-check {
@@ -6574,7 +7183,7 @@
     margin-left: 6px;
     padding: 0 6px;
     border-radius: var(--radius-pill);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     line-height: 16px;
     white-space: nowrap;
@@ -6629,17 +7238,17 @@
   }
   .sw-cell {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .date-cell {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
   .cat-cell {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
   .progress-cell {
     padding: 2px 6px;
@@ -6658,66 +7267,17 @@
   }
   .no-bar {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
-  .empty-cell {
-    text-align: center;
-    padding: 30px 16px !important;
-    color: var(--text-muted);
-    font-size: 13px;
-  }
+  /* The row only hosts a shared `.empty-state compact`, which carries its own
+     padding and type; the cell must not add a second layer of either. */
   .empty-row td.empty-cell {
-    padding: 40px 16px !important;
+    padding: 0 !important;
+    white-space: normal;
     background: transparent;
   }
   .empty-row:hover td.empty-cell {
     background: transparent;
-  }
-  .empty-cell-body {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 8px;
-    color: var(--text-muted);
-  }
-  .empty-cell-icon {
-    color: var(--text-muted);
-    opacity: 0.65;
-  }
-  .empty-cell-title {
-    font-size: 14px;
-    font-weight: 500;
-    color: var(--text-secondary);
-    margin: 0;
-  }
-  .empty-cell-action {
-    margin-top: 4px;
-    padding: 4px 12px;
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--text-secondary);
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
-  }
-  .empty-cell-action:hover {
-    background: var(--bg-hover);
-    color: var(--accent);
-    border-color: var(--accent);
-  }
-  .empty-cell-sub {
-    font-size: 12px;
-    color: var(--text-muted);
-    margin: 0;
-  }
-  .empty-cell-sub a {
-    color: var(--accent);
-    text-decoration: none;
-  }
-  .empty-cell-sub a:hover {
-    text-decoration: underline;
   }
   .selection-footer {
     display: flex;
@@ -6733,7 +7293,7 @@
     align-items: center;
     gap: 8px;
     min-width: 0;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
     overflow: hidden;
     white-space: nowrap;
@@ -6748,7 +7308,7 @@
     padding: 2px 8px;
   }
   .selection-idle-hint {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
   }
   .selection-actions {
@@ -6779,7 +7339,7 @@
     margin-top: 0;
   }
   .status-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 500;
   }
   .status-label::before {
@@ -6823,9 +7383,8 @@
     display: inline-block;
     padding: 2px 8px;
     border-radius: var(--radius-pill);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
-    text-transform: capitalize;
     line-height: 1.3;
     border: 1px solid transparent;
     white-space: nowrap;
@@ -6855,42 +7414,11 @@
     background: transparent;
     border-color: var(--border);
   }
-  /* Ember content-hash verification badge: a completed download whose
-     BLAKE3 was actually re-checked on disk (see `Transfer.ember_verified`),
-     not merely a file that happened to have one known. Pill shape shared
-     with `.rep-badge` but kept as its own class since the two badges sit
-     in different columns and answer unrelated questions. */
-  .ember-verified-badge {
-    display: inline-block;
-    margin-left: 4px;
-    padding: 1px 6px;
-    border-radius: var(--radius-pill);
-    font-size: 9px;
-    font-weight: 600;
-    line-height: 1.4;
-    vertical-align: middle;
-    color: var(--success);
-    background: color-mix(in srgb, var(--success) 14%, transparent);
-    border: 1px solid color-mix(in srgb, var(--success) 34%, transparent);
-  }
-  .ember-mismatch-badge {
-    display: inline-block;
-    margin-left: 4px;
-    padding: 1px 6px;
-    border-radius: var(--radius-pill);
-    font-size: 9px;
-    font-weight: 600;
-    line-height: 1.4;
-    vertical-align: middle;
-    color: var(--danger);
-    background: color-mix(in srgb, var(--danger) 14%, transparent);
-    border: 1px solid color-mix(in srgb, var(--danger) 34%, transparent);
-  }
   /* Monospace cell — used for raw user-hash columns where alignment
      across rows matters more than narrow rendering. */
-  .mono { font-family: var(--font-mono, ui-monospace, 'Cascadia Code', Consolas, monospace); font-size: 11px; }
+  .mono { font-family: var(--font-mono); font-size: var(--font-size-xs); }
   .failure-hint {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--danger);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -6900,24 +7428,24 @@
   /* --- Priority badges --- */
   .prio-cell { text-align: center; }
   .prio-badge {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 500;
     padding: 0;
     border-radius: 0;
   }
-  .prio-release { color: var(--warning); font-weight: 700; }
-  .prio-high { color: var(--danger); }
+  /* Same colors as the Library's priority column, so a priority reads the
+     same on both pages. */
+  .prio-release { color: var(--danger); font-weight: 600; }
+  .prio-high { color: var(--warning); }
   .prio-normal { color: var(--text-secondary); }
-  /* L8: distinguish prio-low from prio-verylow visually — prior rules
-     only differed in opacity and were hard to tell apart at a glance. */
-  .prio-low { color: var(--text-secondary); font-style: italic; }
-  .prio-verylow { color: var(--text-muted); opacity: 0.55; font-style: italic; }
-  .prio-auto { color: var(--accent); }
+  .prio-low { color: var(--priority-low); }
+  .prio-verylow { color: var(--priority-verylow); }
+  .prio-auto { color: var(--priority-auto); }
 
   /* --- Section divider --- */
   .section-divider-row td {
     background: var(--bg-secondary);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     color: var(--text-muted);
     padding: 2px 6px !important;
@@ -6926,18 +7454,28 @@
     letter-spacing: 0.03em;
   }
   .divider-toggle {
-    all: unset;
     cursor: pointer;
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    font-size: 10px;
+    padding: 0;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: none;
+    font: inherit;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     color: var(--text-muted);
     letter-spacing: 0.03em;
+    text-transform: uppercase;
   }
   .divider-toggle:hover {
+    background: none;
     color: var(--text-secondary);
+  }
+  .divider-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .divider-chevron {
     font-size: 8px;
@@ -6946,7 +7484,7 @@
        collapse/expand reads as one continuous motion. Expanded = pointing
        down (90deg); collapsed = pointing right (0deg). */
     transform: rotate(90deg);
-    transition: transform 0.15s ease;
+    transition: transform var(--transition-normal) ease;
   }
   .divider-chevron.collapsed {
     transform: rotate(0deg);
@@ -6954,7 +7492,7 @@
 
   .completed-row { opacity: 1; }
   .searching-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--warning);
     font-style: italic;
     animation: pulse 1.5s ease-in-out infinite;
@@ -6963,7 +7501,7 @@
     gap: 1px;
   }
   .search-detail {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     font-style: normal;
     animation: none;
@@ -6988,7 +7526,7 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 5px 12px;
   }
   .paste-link-icon {
@@ -7002,23 +7540,6 @@
   }
 
   /* --- Error banner --- */
-  .error-banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 6px 16px;
-    font-size: 12px;
-    flex-shrink: 0;
-  }
-
-  .info-banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 6px 16px;
-    font-size: 12px;
-    flex-shrink: 0;
-  }
 
   /* Context menu styling is shared app-wide — see `.ctx-menu` in app.css. */
 
@@ -7070,43 +7591,43 @@
     top: 0;
     z-index: 1;
   }
-  .known-search {
+  .pill-search {
     display: inline-flex;
     align-items: center;
     gap: 6px;
     padding: 3px 8px;
-    background: var(--bg-input, var(--bg-primary));
+    background: var(--bg-input);
     border: 1px solid var(--border);
     border-radius: var(--radius-pill);
     flex: 1 1 240px;
     max-width: 360px;
     transition: border-color var(--transition-fast);
   }
-  .known-search:focus-within {
+  .pill-search:focus-within {
     border-color: var(--accent);
     box-shadow: 0 0 0 2px var(--accent-halo);
   }
-  .known-search svg {
+  .pill-search svg {
     width: 14px;
     height: 14px;
     color: var(--text-muted);
     flex-shrink: 0;
   }
-  .known-search input {
+  .pill-search input {
     flex: 1;
     border: none;
     background: transparent;
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 2px 0;
     outline: none;
     box-shadow: none;
     min-width: 0;
   }
-  .known-search input::placeholder {
+  .pill-search input::placeholder {
     color: var(--text-muted);
   }
-  .known-search-clear {
+  .pill-search-clear {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -7121,7 +7642,7 @@
     line-height: 1;
     transition: color var(--transition-fast), background var(--transition-fast);
   }
-  .known-search-clear:hover {
+  .pill-search-clear:hover {
     color: var(--text-primary);
     background: var(--bg-hover);
   }
@@ -7129,7 +7650,7 @@
     display: inline-flex;
     align-items: center;
     gap: 14px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     flex-wrap: wrap;
   }
@@ -7197,7 +7718,7 @@
   }
   .known-hash-hex {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-variant-numeric: tabular-nums;
     min-width: 0;
     overflow: hidden;
@@ -7211,7 +7732,7 @@
   .known-hash-copied {
     margin-left: auto;
     font-family: var(--font-sans, inherit);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     color: var(--success);
     text-transform: uppercase;
@@ -7236,7 +7757,7 @@
     border-bottom: 1px solid var(--border);
   }
   .source-child-cell {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
     white-space: nowrap;
     overflow: hidden;
@@ -7268,8 +7789,11 @@
      failed, and the source recovers on its own once reachability changes. */
   .src-dot-unreachable { background: var(--warning); box-shadow: 0 0 3px color-mix(in srgb, var(--warning) 45%, transparent); }
   .src-dot-queued { background: var(--warning); box-shadow: 0 0 3px color-mix(in srgb, var(--warning) 45%, transparent); }
+  .src-dot-waiting_for_slot,
+  .src-dot-stalled { background: var(--warning); box-shadow: 0 0 3px color-mix(in srgb, var(--warning) 45%, transparent); }
   .src-dot-queue_full { background: var(--text-muted); }
-  .src-dot-no_needed_parts { background: var(--text-muted); }
+  .src-dot-no_needed_parts,
+  .src-dot-parts_busy { background: var(--text-muted); }
   .src-dot-transferring { background: var(--accent); box-shadow: 0 0 4px color-mix(in srgb, var(--accent) 60%, transparent); }
   .src-dot-completed { background: var(--success); box-shadow: 0 0 3px color-mix(in srgb, var(--success) 50%, transparent); }
   .src-dot-failed { background: var(--danger); }
@@ -7335,7 +7859,7 @@
   .source-client {
     color: var(--text-primary);
     font-weight: 600;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     max-width: 200px;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -7349,7 +7873,7 @@
      lighter weight so the name still leads the row. */
   .source-software {
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     max-width: 150px;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -7364,18 +7888,18 @@
   .source-addr {
     color: var(--text-muted);
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     letter-spacing: -0.2px;
   }
   .source-state {
     font-weight: 600;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     padding: 1px 7px;
     border-radius: var(--radius-sm);
     line-height: 1.4;
   }
   .source-tag {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     background: color-mix(in srgb, var(--bg-hover) 60%, var(--bg-secondary));
     border: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
@@ -7391,7 +7915,7 @@
   }
   .source-inline-btn {
     margin-left: 8px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     padding: 2px 8px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -7418,12 +7942,15 @@
     color: var(--warning);
     background: color-mix(in srgb, var(--warning) 12%, transparent);
   }
-  .src-st-queued {
+  .src-st-queued,
+  .src-st-waiting_for_slot,
+  .src-st-stalled {
     color: var(--warning);
     background: color-mix(in srgb, var(--warning) 12%, transparent);
   }
   .src-st-queue_full,
-  .src-st-no_needed_parts {
+  .src-st-no_needed_parts,
+  .src-st-parts_busy {
     color: var(--text-muted);
     background: color-mix(in srgb, var(--text-muted) 8%, transparent);
   }
@@ -7442,11 +7969,11 @@
   .source-failed-note {
     font-style: italic;
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
   }
   .flag-cell {
     text-align: center;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     line-height: 1;
     padding: 2px 0 !important;
     white-space: nowrap;
@@ -7459,7 +7986,7 @@
     align-items: center;
     gap: 6px;
     padding-left: 20px;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
   }
   .source-summary strong {
@@ -7467,7 +7994,7 @@
     font-weight: 700;
   }
   .ss-chip {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     padding: 0 5px;
     border-radius: var(--radius-sm);
     font-variant-numeric: tabular-nums;

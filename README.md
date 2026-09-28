@@ -74,7 +74,7 @@ Shared files are published as keyword records (findable by name) and source reco
 
 ### Current limits
 
-- **Library content still moves over eD2K.** Ember discovers the source; the bytes travel the eMule wire. The one exception is **Ember Transfer** ([`ember/xfer.rs`](src-tauri/src/network/ember/xfer.rs)), which hands a file from one channel member to another over the room's own session — accept-first, receiver-driven, up to 100 MB. It borrows the BLAKE3 hash tree from [`ember/transfer.rs`](src-tauri/src/network/ember/transfer.rs) to identify a file; that module's QUIC chunk-stream framing is still unused. Putting ordinary downloads on the same footing is the largest remaining piece toward a network that does not need the eMule wire at all.
+- **Library content still moves over eD2K.** Ember discovers the source; the bytes travel the eMule wire. The one exception is **Ember Transfer** ([`ember/xfer.rs`](src-tauri/src/network/ember/xfer.rs)), which hands a file from one channel member to another over the room's own session — accept-first, receiver-driven, up to 2 GB. It borrows the BLAKE3 hash tree from [`ember/transfer.rs`](src-tauri/src/network/ember/transfer.rs) to identify a file; that module's QUIC chunk-stream framing is still unused. Putting ordinary downloads on the same footing is the largest remaining piece toward a network that does not need the eMule wire at all.
 - **Bootstrap depends on eMule** — as described above; seed lists are deliberately not planned.
 - **Version mismatches are silent** — incompatible peers refuse each other cleanly, but neither side is told why and there is no upgrade prompt. They simply never fold each other into a routing table.
 - **Multi-keyword search is approximate** — sparse DHT intersection (missing secondary keys are skipped) plus a filename match at emit time, not a strict worldwide AND of every keyword.
@@ -170,17 +170,17 @@ Ember includes a friend system that works only between Ember users. It runs on a
 
 ### Friend Codes
 
-The Ember Hash is your **Friend ID**. The Friends page presents it as a **v2 Friend Code**, which carries the public key alongside it:
+The Ember Hash is your **Friend ID**. The Friends page presents it as a **v3 Friend Code**, which carries the public key and a random per-identity *intro secret* alongside it:
 
 ```
-ember2:<32 hex — Ember Hash>:<64 hex — Ed25519 public key>
+ember3:<32 hex — Ember Hash>:<64 hex — Ed25519 public key>:<32 hex — intro secret>
 ```
 
-The key must BLAKE3-bind to the hash or the code is rejected at parse time (`verify_ember_hash_binding`), so a code cannot advertise an identity its holder does not own. Bare-hex Friend IDs are still accepted for compatibility with older codes.
+The key must BLAKE3-bind to the hash or the code is rejected at parse time (`verify_ember_hash_binding`), so a code cannot advertise an identity its holder does not own. The intro secret lives in `identity.json` and can be regenerated with **Reset code**, which invalidates every code shared so far. `ember2:` codes, bare-hex Friend IDs and bare public keys are still accepted, but they can only locate peers running builds from before v3 codes.
 
 ### Discovery
 
-Discovery runs through a lightweight **rendezvous server** ([`rendezvous-server/`](rendezvous-server/)). Ember registers presence under 32-byte *capabilities* rather than a raw Friend ID, and every register and lookup is Ed25519-signed by the identity that owns it, so an entry cannot be spoofed with a stolen hash alone. Pairwise capabilities are derived from the friend relationship and ACL-gated to that peer; a separate intro capability (`open_intro`) is derived from the owner's public key plus an epoch, so anyone who already knows the Friend ID / public key can resolve it while it is advertised. Pairwise capabilities rotate on a 15-minute epoch (`PAIRWISE_CAPABILITY_EPOCH_SECS`) and server-side entries expire 5 minutes after the last heartbeat (`ENTRY_TTL`), so nothing stored there is a long-lived identifier. Adding or accepting a friend forces a presence refresh instead of waiting out the normal heartbeat interval.
+Discovery runs through a lightweight **rendezvous server** ([`rendezvous-server/`](rendezvous-server/)). Ember registers presence under 32-byte *capabilities* rather than a raw Friend ID, and every register and lookup is Ed25519-signed by the identity that owns it, so an entry cannot be spoofed with a stolen hash alone. Pairwise capabilities are derived from the friend relationship and ACL-gated to that peer; a separate intro capability (`open_intro`) is derived from the owner's public key, intro secret and epoch, so only holders of the owner's v3 Friend Code can resolve it — a public key seen in a room roster is not enough. The owner proves each registration with a per-epoch key the server checks the capability against, without the server learning the secret itself. Deploy the rendezvous server update before (or with) the client: clients only register the sealed intro where `/v4/protocol` advertises `sealed_intro`, and on older or third-party servers fall back to the legacy public-key-derived intro, where current friend codes do not find them. The legacy intro is also kept alongside the sealed one while the user has *mutual* friends Ember holds no public key for (older friendships); each heartbeat looks up a few of those keys so pairwise presence can take over, after which the legacy intro stops. A friend who has not been seen for 14 days, or whose key still cannot be found after about a day of lookups, stops keeping it published (they are then looked up weekly), and the Friends page asks the user to send them a current code. Pairwise capabilities rotate on a 15-minute epoch (`PAIRWISE_CAPABILITY_EPOCH_SECS`) and server-side entries expire 5 minutes after the last heartbeat (`ENTRY_TTL`), so nothing stored there is a long-lived identifier. Adding or accepting a friend forces a presence refresh instead of waiting out the normal heartbeat interval.
 
 Between Ember peers, the Ember Hash and its public key are exchanged over the private `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER` handshake. The legacy EmuleInfo tag harvest (`ET_EMBER_HASH`, `0x56`) has been removed — nothing is learned from ordinary eMule metadata any more.
 
@@ -201,7 +201,7 @@ This is a **static** DH, not a ratchet. It gives confidentiality and integrity a
 
 ### Friend features
 
-- **v2 Friend Codes** — Share the code from the Friends page and add theirs. Ember finds them through the rendezvous server and sends a friend request.
+- **v3 Friend Codes** — Share the code from the Friends page and add theirs. Ember finds them through the rendezvous server and sends a friend request.
 - **Mutual Friend Requests** — The recipient sees an incoming request on the Friends page and can accept or reject it. Chat, browse, offers and priority uploads activate only once both sides have accepted **and** a secure session is up.
 - **Real-Time Online Status** — Live online/offline indicators, plus a banner when your own identity is registered and discoverable (and a warning when registration failed, so you know friends may not find you).
 - **End-to-End Encrypted Chat** — A slide-out conversation sidebar with an **Encrypted** badge, durable history, and messages that queue while a friend is offline.
@@ -225,7 +225,7 @@ Channels are in beta and the app marks them so. The format is still settling; re
 
 You need a **Channel username** first: two to twelve letters or numbers, claimed across Ember so two people in a room are never the same name. It is separate from your friend nickname, and Create and Join stay disabled until you have one.
 
-From there, create a room (names are up to 20 characters, claimed once, first come first served), paste an `ember-channel:` invite, or browse **Discover** for public rooms other people have published.
+From there, create a room (names are up to 32 characters, claimed once, first come first served), paste an `ember-channel:` invite, or browse **Discover** for public rooms other people have published.
 
 ### Public and private
 
@@ -255,7 +255,7 @@ Every member can **mute** a room and **ignore** a member. Both are local to the 
 
 ### Sending files
 
-A member can send one other member a file, up to **100 MB**, and only after they accept the offer. Unanswered offers lapse after five minutes and up to 4 transfers run at once. Files go directly between the two members, not to the room. Two firewalled members need a relay and may not connect at all.
+A member can send one other member a file, up to **2 GB**, and only after they accept the offer. Unanswered offers lapse after five minutes and up to 4 transfers run at once. Files go directly between the two members, not to the room. Two firewalled members need a relay and may not connect at all.
 
 ### What to expect
 
@@ -310,7 +310,7 @@ Ember's own additions — the [Ember Network](#ember-network) overlay and the [E
 
 ### Social
 
-- **Friends** — Ember-exclusive friend system with v2 Friend Codes, Noise-secured sessions, end-to-end encrypted chat, remote browsing, friends-only shares, file offers, priority uploads, a block list, and transfers that can work without HighID (see [above](#friends--ember-exclusive-social-features)).
+- **Friends** — Ember-exclusive friend system with v3 Friend Codes, Noise-secured sessions, end-to-end encrypted chat, remote browsing, friends-only shares, file offers, priority uploads, a block list, and transfers that can work without HighID (see [above](#friends--ember-exclusive-social-features)).
 - **Channels (beta)** — Group rooms carried over the Ember Network itself: public rooms anyone can find, private rooms that need an invite, moderation with bans, moderators, owner-only invites and slow mode, and member-to-member file sending. Nobody publishes their IP address to the room (see [above](#channels--group-rooms-beta)).
 - **Credits & SecIdent** — RSA-based Secure Identification prevents credit theft; upload priority follows the standard credit ratio formula.
 

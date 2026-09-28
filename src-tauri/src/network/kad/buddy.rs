@@ -821,7 +821,7 @@ async fn buddy_hello_handshake_outgoing(
     );
     write_ed2k_packet(writer, OP_EDONKEYHEADER, OP_HELLO, &hello).await?;
 
-    let (proto, opcode, _payload) =
+    let (proto, opcode, hello_answer) =
         tokio::time::timeout(std::time::Duration::from_secs(15), read_ed2k_packet(reader))
             .await
             .map_err(|_| anyhow::anyhow!("Hello handshake timeout"))??;
@@ -830,19 +830,29 @@ async fn buddy_hello_handshake_outgoing(
         anyhow::bail!("Expected HelloAnswer, got proto=0x{proto:02X} op=0x{opcode:02X}");
     }
 
-    let emule_info =
-        crate::network::ed2k::messages::build_emule_info(udp_port, obfuscation_enabled, None, None);
-    write_ed2k_packet(writer, OP_EMULEPROT, OP_EMULEINFO, &emule_info).await?;
+    let needs_mule_info = crate::network::ed2k::messages::parse_hello_answer(&hello_answer)
+        .is_ok_and(|(hash, caps)| {
+            crate::network::ed2k::messages::dialer_needs_mule_info(&hash, &caps)
+        });
+    if needs_mule_info {
+        let emule_info = crate::network::ed2k::messages::build_emule_info(
+            udp_port,
+            obfuscation_enabled,
+            None,
+            None,
+        );
+        write_ed2k_packet(writer, OP_EMULEPROT, OP_EMULEINFO, &emule_info).await?;
 
-    let (proto2, opcode2, _) =
-        tokio::time::timeout(std::time::Duration::from_secs(10), read_ed2k_packet(reader))
-            .await
-            .map_err(|_| anyhow::anyhow!("EmuleInfo timeout"))??;
+        let (proto2, opcode2, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), read_ed2k_packet(reader))
+                .await
+                .map_err(|_| anyhow::anyhow!("EmuleInfo timeout"))??;
 
-    if proto2 == OP_EMULEPROT && opcode2 == OP_EMULEINFOANSWER {
-        debug!("Buddy EmuleInfo exchange complete");
-    } else {
-        debug!("Buddy peer did not send EmuleInfoAnswer (proto=0x{proto2:02X} op=0x{opcode2:02X}), continuing");
+        if proto2 == OP_EMULEPROT && opcode2 == OP_EMULEINFOANSWER {
+            debug!("Buddy EmuleInfo exchange complete");
+        } else {
+            debug!("Buddy peer did not send EmuleInfoAnswer (proto=0x{proto2:02X} op=0x{opcode2:02X}), continuing");
+        }
     }
 
     debug!("Buddy handshake complete (outgoing)");

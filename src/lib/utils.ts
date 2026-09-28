@@ -1,12 +1,12 @@
 import { getLocale } from '$lib/i18n';
 
 /**
- * Format a byte count as a human-readable string (e.g. "1.5 MB").
+ * Format a byte count as a human-readable string (e.g. "1.5 MB", "1,5 Mo").
  * Uses iterative division to avoid floating-point edge cases.
  */
 export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const units = SIZE_UNITS.units;
+  if (!Number.isFinite(bytes) || bytes <= 0) return `${SIZE_FORMATTER.format(0)} ${units[0]}`;
   let i = 0;
   let val = bytes;
   while (val >= 1024 && i < units.length - 1) {
@@ -19,8 +19,7 @@ export function formatBytes(bytes: number): string {
     val /= 1024;
     i++;
   }
-  const formatted = val.toFixed(1);
-  return `${formatted.endsWith('.0') ? formatted.slice(0, -2) : formatted} ${units[i]}`;
+  return `${SIZE_FORMATTER.format(Number(val.toFixed(1)))} ${units[i]}`;
 }
 
 /**
@@ -35,9 +34,19 @@ export function isAppVisible(): boolean {
 /** Alias for formatBytes -- used in file-size contexts. */
 export const formatSize = formatBytes;
 
-/** Format bytes/sec as a speed string (e.g. "1.5 MB/s"). */
+/** Format bytes/sec as a speed string (e.g. "1.5 MB/s", "1,5 МБ/с"). */
 export function formatSpeed(bytesPerSec: number): string {
-  return `${formatBytes(bytesPerSec)}/s`;
+  return `${formatBytes(bytesPerSec)}${SIZE_UNITS.perSecond}`;
+}
+
+/** The app language's label for 1024^`power` bytes: "KB", "Ko", "КБ". */
+export function sizeUnitLabel(power: number): string {
+  return SIZE_UNITS.units[power] ?? '';
+}
+
+/** The app language's label for 1024^`power` bytes per second: "KB/s", "КБ/с". */
+export function speedUnitLabel(power: number): string {
+  return `${sizeUnitLabel(power)}${SIZE_UNITS.perSecond}`;
 }
 
 /*
@@ -68,6 +77,80 @@ const COMPACT_COUNT_FORMATTER = new Intl.NumberFormat(APP_LOCALE, {
   notation: 'compact',
   maximumFractionDigits: 1,
 });
+const NUMBER_FORMATTER = new Intl.NumberFormat(APP_LOCALE);
+const DATE_FORMATTERS = new Map<string, Intl.DateTimeFormat>();
+// Sizes stay binary (1 KB = 1024 B), so these are hand-written rather than
+// Intl's `kilobyte` units, which are decimal and would print "kB" everywhere.
+// The per-second suffix follows the units' script: "Mo/s", but "МБ/с".
+const SIZE_UNITS: { units: readonly string[]; perSecond: string } = ({
+  fr: { units: ['o', 'Ko', 'Mo', 'Go', 'To'], perSecond: '/s' },
+  ru: { units: ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'], perSecond: '/с' },
+} as Record<string, { units: readonly string[]; perSecond: string }>)[APP_LOCALE]
+  ?? { units: ['B', 'KB', 'MB', 'GB', 'TB'], perSecond: '/s' };
+const SIZE_FORMATTER = new Intl.NumberFormat(APP_LOCALE, {
+  maximumFractionDigits: 1,
+  useGrouping: false,
+});
+const DURATION_UNIT_FORMATTERS = new Map<string, Intl.NumberFormat>();
+let durationJoiner: string | undefined;
+
+function dateFormatter(options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
+  const key = JSON.stringify(options);
+  let formatter = DATE_FORMATTERS.get(key);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(APP_LOCALE, options);
+    DATE_FORMATTERS.set(key, formatter);
+  }
+  return formatter;
+}
+
+function formatUnixWith(ts: number, options: Intl.DateTimeFormatOptions): string {
+  if (!Number.isFinite(ts) || ts <= 0) return '\u2014';
+  return dateFormatter(options).format(new Date(ts * 1000));
+}
+
+/**
+ * A count with the app language's digit grouping ("12,345", "12.345",
+ * "12 345"). `n.toLocaleString()` groups by the OS locale instead, which
+ * disagrees with the surrounding sentence whenever the two differ.
+ */
+export function formatNumber(n: number): string {
+  if (!Number.isFinite(n)) return '\u2014';
+  return NUMBER_FORMATTER.format(n);
+}
+
+/** A unix timestamp as date and time in the app language — the in-app
+ *  replacement for `new Date(ts * 1000).toLocaleString()`. */
+export function formatDateTime(
+  ts: number,
+  options: Intl.DateTimeFormatOptions = {
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    second: '2-digit',
+  },
+): string {
+  return formatUnixWith(ts, options);
+}
+
+/** A unix timestamp's calendar date in the app language. Named apart from
+ *  {@link formatDate}, which is the short table-cell date *and* time. */
+export function formatCalendarDate(
+  ts: number,
+  options: Intl.DateTimeFormatOptions = { year: 'numeric', month: 'numeric', day: 'numeric' },
+): string {
+  return formatUnixWith(ts, options);
+}
+
+/** A unix timestamp's time of day in the app language. */
+export function formatClockTime(
+  ts: number,
+  options: Intl.DateTimeFormatOptions = { hour: 'numeric', minute: '2-digit', second: '2-digit' },
+): string {
+  return formatUnixWith(ts, options);
+}
 
 /**
  * Abbreviate a large count for a narrow column ("12.3K").
@@ -137,34 +220,76 @@ export function formatRelativeTime(ts: number, nowSecs: number = Math.floor(Date
   return RELATIVE_TIME_FORMATTER.format(-y, 'year');
 }
 
+type DurationUnit = 'day' | 'hour' | 'minute' | 'second';
+
+function formatDurationUnit(value: number, unit: DurationUnit, digits: number): string {
+  const key = `${unit}:${digits}`;
+  let formatter = DURATION_UNIT_FORMATTERS.get(key);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat(APP_LOCALE, {
+      style: 'unit',
+      unit,
+      unitDisplay: 'narrow',
+      minimumIntegerDigits: digits,
+    });
+    DURATION_UNIT_FORMATTERS.set(key, formatter);
+  }
+  return formatter.format(value);
+}
+
 /**
- * Format milliseconds as HH:MM (eMule CastSecondsToHM style).
- * Returns "\u2014" for zero or invalid values.
+ * Join duration parts compactly in the app language's narrow units: "2h 15m",
+ * "2h 15 Min.", "2 ч 15 мин", "2小时15分钟".
  *
- * @param ms - Duration in **milliseconds** (not seconds).
- *   Callers passing seconds should use {@link formatDurationSecs} instead.
+ * Deliberately not `Intl.ListFormat` / `Intl.DurationFormat`: their narrow
+ * style joins as a list ("2h, 15 Min.", "1h, 05 Min. und 09 Sek."), which reads
+ * as prose in a table column. Parts are spaced, except where the units are
+ * Chinese or Japanese set solid; zh-TW's narrow units carry their own space
+ * ("2 小時"), so that locale is spaced like the rest.
+ * `pad` zero-pads every part after the first, for counters that tick in place.
  */
-export function formatDuration(ms: number): string {
-  if (!Number.isFinite(ms) || ms <= 0) return '\u2014';
-  const totalSecs = Math.floor(ms / 1000);
-  const hrs = Math.floor(totalSecs / 3600);
-  const mins = Math.floor((totalSecs % 3600) / 60);
-  if (hrs > 0) return `${hrs}:${String(mins).padStart(2, '0')}`;
-  if (mins > 0) return `${mins} min`;
-  return `${totalSecs}s`;
+function formatDurationParts(parts: [number, DurationUnit][], pad = false): string {
+  if (durationJoiner === undefined) {
+    const sample = formatDurationUnit(1, 'hour', 1);
+    durationJoiner =
+      /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(sample) && !/\s/u.test(sample)
+        ? ''
+        : ' ';
+  }
+  return parts
+    .map(([value, unit], i) => formatDurationUnit(value, unit, pad && i > 0 ? 2 : 1))
+    .join(durationJoiner);
+}
+
+/** The two most significant units of a non-negative duration, for table columns. */
+function compactDuration(secs: number): string {
+  const days = Math.floor(secs / 86400);
+  const hrs = Math.floor((secs % 86400) / 3600);
+  const mins = Math.floor((secs % 3600) / 60);
+  if (days > 0) return formatDurationParts([[days, 'day'], [hrs, 'hour']]);
+  if (hrs > 0) return formatDurationParts([[hrs, 'hour'], [mins, 'minute']]);
+  if (mins > 0) return formatDurationParts([[mins, 'minute']]);
+  return formatDurationParts([[Math.floor(secs), 'second']]);
 }
 
 /** Format seconds as a human-readable duration (e.g. "2h 15m"). */
 export function formatDurationSecs(secs: number): string {
   if (!Number.isFinite(secs) || secs < 0) return '\u2014';
-  if (secs === 0) return '0s';
-  const days = Math.floor(secs / 86400);
-  const hrs = Math.floor((secs % 86400) / 3600);
-  const mins = Math.floor((secs % 3600) / 60);
-  if (days > 0) return `${days}d ${hrs}h`;
-  if (hrs > 0) return `${hrs}h ${mins}m`;
-  if (mins > 0) return `${mins}m`;
-  return `${Math.floor(secs)}s`;
+  return compactDuration(secs);
+}
+
+/**
+ * Format elapsed seconds down to the second, zero-padding minutes and seconds
+ * so a live counter keeps its width (e.g. "1h 05m 09s").
+ */
+export function formatElapsed(secs: number): string {
+  const total = Number.isFinite(secs) && secs > 0 ? Math.floor(secs) : 0;
+  const h = Math.floor(total / 3600);
+  const min = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return formatDurationParts([[h, 'hour'], [min, 'minute'], [s, 'second']], true);
+  if (min > 0) return formatDurationParts([[min, 'minute'], [s, 'second']], true);
+  return formatDurationParts([[s, 'second']]);
 }
 
 /** Format remaining size + ETA combined (eMule Remaining column style). */
@@ -175,16 +300,7 @@ export function formatRemaining(totalSize: number, transferred: number, speed: n
   // Guard against a non-finite speed (NaN/Infinity) — `NaN <= 0` is false, so
   // without `Number.isFinite` the ETA math below would render "NaNd NaNh".
   if (!Number.isFinite(speed) || speed <= 0) return remainStr;
-  const secs = Math.round(remaining / speed);
-  const days = Math.floor(secs / 86400);
-  const hrs = Math.floor((secs % 86400) / 3600);
-  const mins = Math.floor((secs % 3600) / 60);
-  let timeStr: string;
-  if (days > 0) timeStr = `${days}d ${hrs}h`;
-  else if (hrs > 0) timeStr = `${hrs}h ${mins}m`;
-  else if (mins > 0) timeStr = `${mins}m`;
-  else timeStr = `${secs}s`;
-  return `${timeStr} (${remainStr})`;
+  return `${compactDuration(Math.round(remaining / speed))} (${remainStr})`;
 }
 
 /** Truncate a hex hash with ellipsis. */
@@ -193,32 +309,9 @@ export function truncateHash(hash: string, len = 16): string {
   return `${hash.slice(0, len)}\u2026`;
 }
 
-/**
- * Race a promise (in practice a Tauri `invoke()`) against a deadline.
- *
- * K24: without this the UI hangs indefinitely when the backend is wedged —
- * blocked on a slow DNS resolution, a stuck oneshot receiver — and a poll's
- * in-flight guard stays latched for the rest of the session. Rejects with a
- * normal `Error` carrying a recognisable message so callers can show a
- * "timed out, please try again" toast instead of a spinner that never
- * resolves.
- *
- * Only for calls whose expected duration is short and bounded. Anything
- * legitimately long-running — library scans, file hashing, native file
- * dialogs waiting on the user — must not be wrapped: a deadline there
- * reports failure for an operation that is still succeeding.
- */
-export function withTimeout<T>(promise: Promise<T>, label: string, ms = 20_000): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`));
-    }, ms);
-    promise.then(
-      (v) => { clearTimeout(timer); resolve(v); },
-      (e) => { clearTimeout(timer); reject(e); },
-    );
-  });
-}
+// Lives in its own module so `$lib/i18n` can recognise `TimeoutError` without
+// importing this file, which imports `$lib/i18n` itself.
+export { TimeoutError, withTimeout } from './timeout';
 
 /**
  * Copy text to the clipboard.
@@ -269,7 +362,82 @@ export function shortPubkey(id: string): string {
   return id.slice(0, 8) + '\u2026';
 }
 
-/** Roster / chat label: append a short id when the nickname is shared in-room. */
+/**
+ * Single characters that render like a Latin letter, folded to that letter.
+ * Cyrillic and Greek homoglyphs plus a few Latin variants; case is kept on the
+ * left because an uppercase Greek eta is an "H" while its lowercase is not.
+ */
+const CONFUSABLE_CHARS: Record<string, string> = {
+  // Cyrillic
+  'а': 'a', 'А': 'a', 'В': 'b', 'в': 'b', 'с': 'c', 'С': 'c', 'ԁ': 'd', 'е': 'e', 'Е': 'e',
+  'һ': 'h', 'Н': 'h', 'н': 'h', 'і': 'i', 'І': 'i', 'ј': 'j', 'Ј': 'j', 'К': 'k', 'к': 'k',
+  'М': 'm', 'м': 'm', 'о': 'o', 'О': 'o', 'р': 'p', 'Р': 'p', 'ԛ': 'q', 'Ԛ': 'q', 'ѕ': 's',
+  'Ѕ': 's', 'Т': 't', 'т': 't', 'у': 'y', 'У': 'y', 'Ү': 'y', 'ү': 'y', 'ԝ': 'w', 'Ԝ': 'w',
+  'х': 'x', 'Х': 'x', 'ӏ': 'l', 'Ӏ': 'l',
+  // Greek
+  'α': 'a', 'Α': 'a', 'Β': 'b', 'Ε': 'e', 'Ζ': 'z', 'Η': 'h', 'ι': 'i', 'Ι': 'i', 'κ': 'k',
+  'Κ': 'k', 'Μ': 'm', 'Ν': 'n', 'ν': 'v', 'ο': 'o', 'Ο': 'o', 'ρ': 'p', 'Ρ': 'p', 'τ': 't',
+  'Τ': 't', 'υ': 'u', 'Υ': 'y', 'χ': 'x', 'Χ': 'x', 'γ': 'y',
+  // Latin variants
+  'ı': 'i', 'ɩ': 'i', 'ǀ': 'l', 'ʟ': 'l',
+};
+
+// eslint-disable-next-line no-misleading-character-class
+const COMBINING_DIACRITIC_RE = /[\u0300-\u036F\u1AB0-\u1AFF\u1DC0-\u1DFF\u20D0-\u20FF]/u;
+const LOOKALIKE_SCRIPT_RE = /[\p{Script=Latin}\p{Script=Greek}\p{Script=Cyrillic}]/u;
+
+const skeletonCache = new Map<string, string>();
+const SKELETON_CACHE_MAX = 4096;
+
+/**
+ * What a name looks like rather than what it spells, for spotting two names a
+ * reader cannot tell apart: `AIice` and `Alice`, `rnallory` and `mallory`, a
+ * Cyrillic `а` standing in for a Latin one.
+ *
+ * Deliberately over-eager: it is only ever used to decide that a label needs a
+ * key fragment next to it, and a false collision costs eight hex digits.
+ */
+export function confusableSkeleton(name: string): string {
+  const cached = skeletonCache.get(name);
+  if (cached !== undefined) return cached;
+  let folded = '';
+  let onLookalikeBase = false;
+  for (const ch of name.normalize('NFKD').replace(/\p{Cf}/gu, '')) {
+    // Only accents on Latin/Greek/Cyrillic letters are decoration. Elsewhere a
+    // mark is the letter — a Devanagari vowel sign, a Thai vowel, kana dakuten —
+    // and dropping it would call "राम" and "रमा" the same name.
+    if (COMBINING_DIACRITIC_RE.test(ch)) {
+      if (!onLookalikeBase) folded += ch;
+      continue;
+    }
+    onLookalikeBase = LOOKALIKE_SCRIPT_RE.test(ch);
+    folded += CONFUSABLE_CHARS[ch] ?? ch;
+  }
+  const skeleton = folded
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[il1|!]/g, 'l')
+    .replace(/0/g, 'o')
+    .replace(/rn/g, 'm')
+    .replace(/vv/g, 'w');
+  if (skeletonCache.size >= SKELETON_CACHE_MAX) skeletonCache.clear();
+  skeletonCache.set(name, skeleton);
+  return skeleton;
+}
+
+/** True when a name mixes Latin, Cyrillic and Greek letters — the usual shape
+ *  of a homoglyph spoof, and nearly never of a real name. */
+export function mixesLookalikeScripts(name: string): boolean {
+  let scripts = 0;
+  if (/\p{Script=Latin}/u.test(name)) scripts += 1;
+  if (/\p{Script=Cyrillic}/u.test(name)) scripts += 1;
+  if (/\p{Script=Greek}/u.test(name)) scripts += 1;
+  return scripts > 1;
+}
+
+/** Roster / chat label: append a short id when the nickname is shared in-room,
+ *  or only looks the same as another member's. */
 export function disambiguatedMemberName(
   nickname: string | undefined | null,
   pubkey: string,
@@ -277,10 +445,11 @@ export function disambiguatedMemberName(
 ): string {
   const nick = (nickname ?? '').trim();
   if (!nick) return shortPubkey(pubkey);
-  const lower = nick.toLowerCase();
+  const key = confusableSkeleton(nick);
   let hits = 0;
   for (const other of roomNicknames) {
-    if ((other ?? '').trim().toLowerCase() === lower) {
+    const name = (other ?? '').trim();
+    if (name && confusableSkeleton(name) === key) {
       hits += 1;
       if (hits > 1) {
         return `${nick} (${shortPubkey(pubkey)})`;
@@ -303,6 +472,7 @@ export interface MessageSegment {
  * certain to refuse.
  */
 const LINK_MAX_LEN = 2048;
+const LINK_SCAN_MAX = LINK_MAX_LEN + 64;
 
 /** Explicit scheme only. `www.` and bare hostnames are deliberately not
  *  matched: guessing a scheme for a string somebody typed in a room means
@@ -325,6 +495,10 @@ const BIDI_CONTROL_RE = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
 function trimTrailingPunctuation(url: string): string {
   let end = url.length;
   const closers: Record<string, string> = { ')': '(', ']': '[', '}': '{' };
+  // Closers minus openers per bracket pair, counted once on the first trailing
+  // bracket and then kept current as closers are trimmed. Recounting per
+  // character made a link ending in thousands of `)` quadratic.
+  let excess: Record<string, number> | null = null;
   while (end > 0) {
     const ch = url[end - 1];
     if ('.,;:!?"\u2019\u201d'.includes(ch)) {
@@ -333,14 +507,20 @@ function trimTrailingPunctuation(url: string): string {
     }
     const opener = closers[ch];
     if (opener) {
-      const slice = url.slice(0, end);
-      let opens = 0;
-      let closes = 0;
-      for (const c of slice) {
-        if (c === opener) opens += 1;
-        else if (c === ch) closes += 1;
+      if (excess === null) {
+        excess = { ')': 0, ']': 0, '}': 0 };
+        for (let i = 0; i < end; i++) {
+          const c = url[i];
+          if (c === '(') excess[')'] -= 1;
+          else if (c === ')') excess[')'] += 1;
+          else if (c === '[') excess[']'] -= 1;
+          else if (c === ']') excess[']'] += 1;
+          else if (c === '{') excess['}'] -= 1;
+          else if (c === '}') excess['}'] += 1;
+        }
       }
-      if (closes > opens) {
+      if (excess[ch] > 0) {
+        excess[ch] -= 1;
         end -= 1;
         continue;
       }
@@ -364,6 +544,11 @@ export function linkifyMessage(text: string): MessageSegment[] {
   let cursor = 0;
   LINK_RE.lastIndex = 0;
   for (let match = LINK_RE.exec(text); match !== null; match = LINK_RE.exec(text)) {
+    // Refused before trimming, so an oversized run costs one regex match and
+    // nothing more. The bound is looser than `LINK_MAX_LEN` because the raw
+    // match still carries the sentence punctuation trimming gives back; the
+    // `usable` test below is the one that decides.
+    if (match[0].length > LINK_SCAN_MAX) continue;
     const raw = trimTrailingPunctuation(match[0]);
     // Everything trimmed off goes back to the following text run, so no
     // character is ever dropped from what the sender wrote.

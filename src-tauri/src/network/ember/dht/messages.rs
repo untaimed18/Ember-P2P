@@ -208,19 +208,21 @@ fn encode_value_constraints(buf: &mut Vec<u8>, constraints: &ValueConstraints) {
     if let Some(max) = constraints.max_size {
         push(VALUE_EXT_TAG_MAX_SIZE, &max.to_le_bytes());
     }
+    // Text too long for its cap is left out rather than cut short: a prefix is a
+    // different type or extension, and a responder would filter on it and drop
+    // every record the searcher wanted. Omitted, the searcher's own emit filter
+    // still applies it.
     if let Some(file_type) = &constraints.file_type {
         let bytes = file_type.as_bytes();
-        push(
-            VALUE_EXT_TAG_FILE_TYPE,
-            &bytes[..bytes.len().min(MAX_VALUE_FILE_TYPE_BYTES)],
-        );
+        if bytes.len() <= MAX_VALUE_FILE_TYPE_BYTES {
+            push(VALUE_EXT_TAG_FILE_TYPE, bytes);
+        }
     }
     if let Some(extension) = &constraints.file_extension {
         let bytes = extension.as_bytes();
-        push(
-            VALUE_EXT_TAG_FILE_EXTENSION,
-            &bytes[..bytes.len().min(MAX_VALUE_FILE_EXTENSION_BYTES)],
-        );
+        if bytes.len() <= MAX_VALUE_FILE_EXTENSION_BYTES {
+            push(VALUE_EXT_TAG_FILE_EXTENSION, bytes);
+        }
     }
     if !constraints.extra_keys.is_empty() {
         let mut keys: Vec<u8> = Vec::with_capacity(constraints.extra_keys.len() * 16);
@@ -243,10 +245,13 @@ fn encode_value_constraints(buf: &mut Vec<u8>, constraints: &ValueConstraints) {
 
 /// Read the optional block trailing a `FIND_VALUE` payload.
 ///
-/// Lenient by design: anything unrecognised, truncated or mis-tagged yields no
-/// constraints, which makes us answer unfiltered — exactly what a peer that has
-/// never heard of the block does, and always a correct answer. Failing the frame
-/// instead would turn a future sender's additions into a refusal.
+/// Lenient by design, and never an error. A missing magic or a block length
+/// that overruns the payload yields no constraints; an entry that overruns the
+/// block ends the scan and keeps what was decoded before it; an unknown tag, or
+/// a known one whose value is malformed, is skipped. Anything left out makes us
+/// answer less filtered — what a peer that has never heard of the block does,
+/// and always a correct answer. Failing the frame instead would turn a future
+/// sender's additions into a refusal.
 fn decode_value_constraints(rest: &[u8]) -> ValueConstraints {
     let mut out = ValueConstraints::default();
     if rest.len() < 4 || u16::from_le_bytes([rest[0], rest[1]]) != VALUE_EXT_MAGIC {
@@ -302,7 +307,10 @@ fn decode_value_constraints(rest: &[u8]) -> ValueConstraints {
                 }
             }
             VALUE_EXT_TAG_EXTRA_KEYS => {
-                for chunk in value.chunks_exact(16).take(MAX_FIND_VALUE_EXTRA_KEYS) {
+                // Across every entry, not per entry: the tag may repeat, and each
+                // repeat would otherwise buy another fifteen keys of intersection.
+                let room = MAX_FIND_VALUE_EXTRA_KEYS.saturating_sub(out.extra_keys.len());
+                for chunk in value.chunks_exact(16).take(room) {
                     if let Ok(key) = <[u8; 16]>::try_from(chunk) {
                         out.extra_keys.push(key);
                     }
@@ -462,6 +470,15 @@ const ADDR_IPV6: u8 = 0x06;
 /// from 14 contacts to 17, which is most of a hop on a sparse table.
 /// `a_found_node_carries_more_contacts_than_v2_could` pins the count.
 pub const CONTACT_WIRE_LEN_IPV4: usize = 1 + 4 + 2 + 32 + 32;
+
+/// IPv4 contacts one unfragmented contact list carries: what
+/// [`encode_contact_list`] keeps before its byte budget trims the tail.
+///
+/// Below [`MAX_CONTACTS_PER_RESPONSE`], so a responder choosing contacts has to
+/// choose this many: anything past it is dropped by the encoder silently,
+/// whatever it was.
+pub const MAX_CONTACTS_PER_DATAGRAM: usize = (MAX_UNFRAGMENTED_PAYLOAD - 1) / CONTACT_WIRE_LEN_IPV4;
+const _: () = assert!(MAX_CONTACTS_PER_DATAGRAM <= MAX_CONTACTS_PER_RESPONSE);
 
 /// The most a contact list can legitimately occupy: the declared count cap at
 /// the IPv6 contact size, plus the count byte.
@@ -1704,6 +1721,32 @@ fn decode_socket_addr(data: &[u8]) -> anyhow::Result<(SocketAddr, usize)> {
 
 // ── Payload decoding ──
 
+/// Decode one message type's payload.
+///
+/// Every decoder refuses a payload *shorter* than the fields it declares — a
+/// count the buffer cannot satisfy is a framing error, never a prefix to keep.
+/// What follows the last field is a per-frame rule, and this is where it is
+/// stated:
+///
+/// - **Extensible — surplus bytes are ignored.** `PING` and `PONG` (the version
+///   block), `FIND_NODE`, `FIND_VALUE` (the constraint block),
+///   `FOUND_NODE` / `ANNOUNCE_PEER` / `PEER_LIST`, `FOUND_VALUE`,
+///   `STORE_RECORD` / `PROXY_STORE`, `BUDDY_ENDORSE_REQ`, and the three store
+///   acks. A later build may append fields to these without moving
+///   [`EMBER_DHT_VERSION`], because every build still in the field reads its
+///   own fields at fixed offsets and stops there. That is how the version and
+///   constraint blocks were added.
+/// - **Exact — surplus bytes refuse the frame.** `STORE_BATCH`, where a surplus
+///   means the declared count is wrong, and the fixed-length `CALLBACK_REQ`,
+///   `CALLBACK` and `BUDDY_ENDORSE`. Extending one of these needs a new message
+///   type.
+///
+/// `CHANNEL_MSG` and `CHANNEL_RELAY` carry an opaque body and have no fields
+/// for a surplus to follow.
+///
+/// Ignoring a surplus is not a way to smuggle anything past us: the frame
+/// signature covers the whole payload, so the bytes are the sender's own, and
+/// nothing reads bytes this build does not understand.
 fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
     match msg_type {
         MSG_PING => Ok(DhtPayload::Ping {
@@ -1904,9 +1947,10 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
             let mut offset = FOUND_VALUE_HEADER_LEN;
             for _ in 0..record_count {
                 // A declared record count that the buffer can't satisfy is a
-                // framing error, not a partial list to be silently accepted —
-                // reject the whole frame so a peer can't smuggle a truncated
-                // payload that we'd misinterpret.
+                // framing error, not a partial list to be silently accepted, so
+                // the whole frame is refused. Bytes *past* the last declared
+                // record are the opposite case and are ignored, leaving room for
+                // an additive trailer — see `decode_payload`.
                 if offset + 2 > data.len() {
                     anyhow::bail!("FOUND_VALUE truncated (declared {record_count} records)");
                 }
@@ -2775,6 +2819,10 @@ mod tests {
             "a contact list must not fragment"
         );
         assert_eq!(carried, 17, "the byte budget fits 17 contacts at 71 bytes");
+        assert_eq!(
+            carried, MAX_CONTACTS_PER_DATAGRAM,
+            "responders size their selection by this, so it must match the encoder"
+        );
 
         // What the same budget bought while every contact restated its ID.
         const V2_CONTACT_WIRE_LEN_IPV4: usize = CONTACT_WIRE_LEN_IPV4 + 16;
@@ -3124,6 +3172,71 @@ mod tests {
                 ),
                 other => panic!("expected FindValue, got {other:?}"),
             }
+        }
+    }
+
+    /// Text past its cap is left out of the block rather than cut to a prefix.
+    /// A seventeen-byte extension truncated to sixteen names a different
+    /// extension, and the responder would refuse every record the searcher was
+    /// looking for.
+    #[test]
+    fn an_overlong_text_constraint_is_omitted_not_truncated() {
+        let (_, id) = test_keypair();
+        let fits = "a".repeat(MAX_VALUE_FILE_EXTENSION_BYTES);
+        let overlong = "a".repeat(MAX_VALUE_FILE_EXTENSION_BYTES + 1);
+        let decode = |constraints: ValueConstraints| {
+            let ask = build_find_value(id, 1, vec![[0xA1; 16]], 0, constraints);
+            match decode_payload(MSG_FIND_VALUE, &encode_payload(&ask.payload)).unwrap() {
+                DhtPayload::FindValue { constraints, .. } => constraints,
+                other => panic!("expected FindValue, got {other:?}"),
+            }
+        };
+
+        let got = decode(ValueConstraints {
+            file_extension: Some(overlong),
+            min_size: Some(1024),
+            ..Default::default()
+        });
+        assert_eq!(got.file_extension, None, "a prefix is a different extension");
+        assert_eq!(got.min_size, Some(1024), "the rest of the block still goes");
+
+        let got = decode(ValueConstraints {
+            file_extension: Some(fits.clone()),
+            ..Default::default()
+        });
+        assert_eq!(got.file_extension, Some(fits), "one at the cap still fits");
+
+        let got = decode(ValueConstraints {
+            file_type: Some("t".repeat(MAX_VALUE_FILE_TYPE_BYTES + 1)),
+            ..Default::default()
+        });
+        assert!(got.is_empty(), "the same holds for the file type");
+    }
+
+    /// The extra-keys tag may repeat, and the cap is on the keys, not on each
+    /// entry — or every repeat would buy fifteen more keys of intersection.
+    #[test]
+    fn repeated_extra_key_entries_share_one_cap() {
+        let (_, id) = test_keypair();
+        let base = encode_payload(
+            &build_find_value(id, 1, vec![[0xA1; 16]], 0, ValueConstraints::default()).payload,
+        );
+        let entry: Vec<u8> = std::iter::once(VALUE_EXT_TAG_EXTRA_KEYS)
+            .chain(std::iter::once((MAX_FIND_VALUE_EXTRA_KEYS * 16) as u8))
+            .chain((0..MAX_FIND_VALUE_EXTRA_KEYS as u8).flat_map(|i| [i; 16]))
+            .collect();
+        let tlv: Vec<u8> = entry.iter().chain(entry.iter()).copied().collect();
+        let mut payload = base;
+        payload.extend_from_slice(&VALUE_EXT_MAGIC.to_le_bytes());
+        payload.extend_from_slice(&(tlv.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&tlv);
+
+        match decode_payload(MSG_FIND_VALUE, &payload).unwrap() {
+            DhtPayload::FindValue { constraints, .. } => {
+                assert_eq!(constraints.extra_keys.len(), MAX_FIND_VALUE_EXTRA_KEYS);
+                assert_eq!(constraints.extra_keys[0], [0u8; 16]);
+            }
+            other => panic!("expected FindValue, got {other:?}"),
         }
     }
 

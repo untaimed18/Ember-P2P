@@ -210,8 +210,8 @@ pub struct Transfer {
     /// Upload: how long client waited in queue before the slot was granted,
     /// in **seconds** (eMule: GetWaitTime). A fixed snapshot taken once at
     /// grant time, not a live counter — unlike `upload_time` below, this is
-    /// never updated again for the life of the row. The frontend multiplies
-    /// by 1000 before formatting; keep this doc's unit in sync with
+    /// never updated again for the life of the row. The frontend formats it
+    /// as seconds; keep this doc's unit in sync with
     /// `UploadEventKind::Started::wait_seconds`, which is where the value
     /// actually comes from.
     #[serde(default)]
@@ -306,6 +306,12 @@ pub struct Transfer {
     /// claims a check that actually ran.
     #[serde(default)]
     pub ember_verified: bool,
+    /// Downloads only: the friend this file came from restricts it to
+    /// friends, so our copy is never advertised or served on the open network
+    /// (server offers, KAD, Ember, EPX, source exchange) and is shared
+    /// friends-only once complete. Only ever set, never cleared.
+    #[serde(default)]
+    pub friends_only: bool,
 }
 
 fn default_priority() -> String {
@@ -582,6 +588,9 @@ pub struct SourceAskOutcome {
     pub ember: bool,
     /// The connected eD2K server, asked over TCP.
     pub server: bool,
+    /// `server` is false because that server was asked for this file within
+    /// the last 15 minutes (eMule's `SERVERREASKTIME`), not for want of one.
+    pub server_recent: bool,
     /// The other eligible servers, asked over UDP.
     pub server_udp: bool,
 }
@@ -809,11 +818,12 @@ pub struct EmberDiagnostics {
     /// replication is falling behind, which a republish count cannot show.
     #[serde(default)]
     pub ember_dht_republish_backlog: u32,
-    /// Seconds since any Ember DHT frame arrived, or zero if none ever has.
-    /// The one number that separates "still joining" from "joined and quiet"
-    /// from "stuck", none of which the other counters distinguish.
+    /// Seconds since any Ember DHT frame arrived, or `None` if none ever has
+    /// (zero is a frame this second). The one number that separates "still
+    /// joining" from "joined and quiet" from "stuck", none of which the other
+    /// counters distinguish.
     #[serde(default)]
-    pub ember_dht_seconds_since_inbound: u32,
+    pub ember_dht_seconds_since_inbound: Option<u32>,
     /// Ember DHT `PING` frames the dev panel sent this session.
     ///
     /// Only the debug harness increments this, not the three automatic probe
@@ -908,8 +918,9 @@ pub struct EmberDiagnostics {
     /// `FIND_VALUE` queries we received and answered this session.
     #[serde(default)]
     pub ember_dht_find_values_received: u32,
-    /// Keyword/source publishes currently in flight (gauge, not a
-    /// counter).
+    /// Publishes currently in flight (gauge, not a counter): single-record
+    /// publish operations plus `STORE_BATCH` frames awaiting an ack. Not a
+    /// record count — one batch carries many records.
     #[serde(default)]
     pub ember_dht_active_publishes: u32,
     /// Bucket-refresh lookups launched by the maintenance loop this
@@ -1019,6 +1030,11 @@ pub struct EmberDiagnostics {
     /// in source records (STUN / HighID / KAD have not produced one yet).
     #[serde(default)]
     pub ember_dht_udp_unreachable: bool,
+    /// Whether the source publisher has evaluated the three reachability
+    /// flags above since diagnostics were last reset. Until then all three read
+    /// false, which says nothing about reachability.
+    #[serde(default)]
+    pub ember_dht_reachability_known: bool,
     /// Buddy PROXY_STORE requests we sent this session (firewalled publisher).
     #[serde(default)]
     pub ember_dht_buddy_publishes: u32,
@@ -1248,6 +1264,12 @@ pub struct EmberDiagnostics {
     /// here too, since no word could find it.
     #[serde(default)]
     pub ember_dht_keyword_key_off_name: u32,
+    /// Inbound records of a type this build does not know that were stored.
+    /// Not a refusal — refusing would make every new record type a wire break —
+    /// but such a record escapes every type-specific rule, and it is not
+    /// replicated onward.
+    #[serde(default)]
+    pub ember_dht_unknown_record_types: u32,
     /// Completed FIND_VALUE searches this session (hits, misses, and timeouts).
     /// Denominator for the search-quality averages below.
     #[serde(default)]
@@ -1261,7 +1283,8 @@ pub struct EmberDiagnostics {
     /// Sum of verified records gathered across those searches.
     #[serde(default)]
     pub ember_dht_search_records_sum: u64,
-    /// Highest verified-contact count seen today (UTC), persisted across restart.
+    /// Highest verified-contact count seen today (local calendar day),
+    /// persisted across restart.
     #[serde(default)]
     pub ember_dht_verified_highwater_today: u32,
     /// Highest verified-contact count ever recorded on this node.
@@ -1450,12 +1473,14 @@ pub struct AppSettings {
     /// `ed2k::multi_source::listener_reserve`.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
-    /// Most new TCP connections the upload listener will accept in any
-    /// five-second window (eMule: `MaxConnectionsPerFiveSeconds`, default 20
-    /// via `MAXCONPER5SEC`). `0` disables the gate.
+    /// Most new client connections one five-second window may count before we
+    /// stop opening more (eMule: `MaxConnectionsPerFiveSeconds`, default 20 via
+    /// `MAXCONPER5SEC`). `0` disables the gate.
     ///
     /// Bounds the *rate* of socket creation rather than the count, which is
     /// what keeps consumer routers and NAT tables from choking on a burst.
+    /// Accepted connections count toward it but are never refused by it, as in
+    /// eMule: by the time we could refuse one it has already crossed the router.
     #[serde(default = "default_max_connections_per_five_secs")]
     pub max_connections_per_five_secs: u32,
     /// Add new downloads in paused state (eMule: addnewfilespaused)
@@ -1572,6 +1597,16 @@ pub struct AppSettings {
     /// against the friends list by its derived Ember hash.
     #[serde(default = "default_channel_file_offers")]
     pub channel_file_offers: String,
+    /// Files a friend sends in chat at or under this many megabytes are
+    /// fetched without asking; larger ones wait for an explicit accept. Zero
+    /// asks every time.
+    ///
+    /// What messaging apps do, and it is a threshold rather than on/off because
+    /// "small" is a judgement about someone's disk and connection. Only friends
+    /// can send attachments at all, and `friend_chat_disabled` refuses them
+    /// outright, so this never makes a stranger's file land on disk.
+    #[serde(default = "default_chat_attachment_auto_accept_mb")]
+    pub chat_attachment_auto_accept_mb: u64,
     /// Rendezvous server URL for friend discovery
     #[serde(default = "default_rendezvous_url")]
     pub rendezvous_url: String,
@@ -1659,6 +1694,12 @@ pub struct AppSettings {
     /// separately from folder defaults because an explicit action must win.
     #[serde(default)]
     pub pending_file_priorities: std::collections::HashMap<String, String>,
+    /// Folders shared by dropping specific files: later newly-seen files in
+    /// that folder stay unshared until chosen. Keys are normalized folder
+    /// paths; values are the normalized file paths that should be shared.
+    /// Backend-owned (see `BACKEND_OWNED_SETTINGS_FIELDS`).
+    #[serde(default)]
+    pub pending_folder_allowlists: std::collections::HashMap<String, Vec<String>>,
     /// Resume keys for bounded shared-folder discovery pages. Each normalized
     /// folder path advances only after its page has been committed, so folders
     /// larger than the in-memory scan budget are eventually indexed in full.
@@ -1710,6 +1751,11 @@ pub struct AppSettings {
     /// Somebody asked to be friends.
     #[serde(default = "default_true")]
     pub notify_friend_request: bool,
+    /// Somebody viewed our shared files: an ed2k client's "View Files", or a
+    /// friend browsing over Ember. Only answered browses notify; refusals go
+    /// to the server log alone.
+    #[serde(default = "default_true")]
+    pub notify_shares_browsed: bool,
     /// A message arrived in a joined channel.
     ///
     /// The only one of these that defaults **off**: a room is a group
@@ -1994,9 +2040,10 @@ pub struct KnownClient {
     /// "Verified" | "Failed" | "Unknown" | "BadGuy" | "Needed"
     pub ident_state: String,
     /// Best-known peer IPv4/IPv6 string for display, or `None` when unknown.
-    /// Prefer SecIdent `ident_ip` when present; otherwise may be filled from
-    /// the friends table (`last_ip`) for Ember friends that have no verified
-    /// credit IP yet — that path is observed/friend-seen, not SecIdent.
+    /// Prefer SecIdent `ident_ip` when present; otherwise the address of our
+    /// last session with the peer (`CreditRecord::seen_ip`), and failing that
+    /// the friends table (`last_ip`) for Ember friends. Only the first is
+    /// SecIdent-proven.
     pub last_known_ip: Option<String>,
     /// ISO 3166-1 alpha-2, geoip-resolved from `last_known_ip`.
     pub country_code: Option<String>,
@@ -2064,6 +2111,15 @@ pub const CHANNEL_FILE_OFFERS_NOBODY: &str = "nobody";
 fn default_channel_file_offers() -> String {
     CHANNEL_FILE_OFFERS_EVERYONE.to_string()
 }
+
+fn default_chat_attachment_auto_accept_mb() -> u64 {
+    crate::network::ember::attach::ATTACH_AUTO_ACCEPT_DEFAULT_MB
+}
+
+/// Highest auto-accept ceiling the settings page may store, in megabytes.
+/// Matches the attachment size cap, past which the value means nothing.
+pub const CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB: u64 =
+    crate::network::ember::attach::ATTACH_MAX_BYTES / (1024 * 1024);
 
 /// Default rendezvous server URL.
 ///
@@ -2212,6 +2268,7 @@ impl Default for AppSettings {
             folder_priorities: std::collections::HashMap::new(),
             pending_share_states: std::collections::HashMap::new(),
             pending_file_priorities: std::collections::HashMap::new(),
+            pending_folder_allowlists: std::collections::HashMap::new(),
             shared_folder_scan_cursors: std::collections::HashMap::new(),
             nodes_dat_path: String::new(),
             upnp_enabled: false,
@@ -2262,6 +2319,7 @@ impl Default for AppSettings {
             friend_browse_disabled: false,
             friend_session_encryption: true,
             channel_file_offers: default_channel_file_offers(),
+            chat_attachment_auto_accept_mb: default_chat_attachment_auto_accept_mb(),
             max_friends: default_max_friends(),
             rendezvous_url: default_rendezvous_url(),
             ember_native_enabled: true,
@@ -2281,6 +2339,7 @@ impl Default for AppSettings {
             notify_friend_online: true,
             notify_friend_message: true,
             notify_friend_request: true,
+            notify_shares_browsed: true,
             // See the field docs: a room is chatty enough that this is the one
             // notification a user has to ask for.
             notify_channel_message: false,

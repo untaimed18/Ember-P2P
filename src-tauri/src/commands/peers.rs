@@ -5,6 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx};
+use crate::network::ember::crypto::INTRO_SECRET_LEN;
 #[cfg(debug_assertions)]
 use crate::network::ember::dht::publish::SignedRecord;
 use crate::network::{
@@ -165,32 +166,97 @@ fn parse_16_byte_hash(
     Ok(hash)
 }
 
-fn parse_friend_code(value: &str) -> Result<(String, [u8; 16], Option<[u8; 32]>), String> {
-    let trimmed = value.trim();
-    if let Some(rest) = trimmed
-        .strip_prefix("ember2:")
-        .or_else(|| trimmed.strip_prefix("EMBER2:"))
+/// A friend code in any accepted form, reduced to what `add_friend` needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedFriendCode {
+    /// Lowercase hex Friend ID.
+    pub canonical: String,
+    pub hash: [u8; 16],
+    pub pubkey: Option<[u8; 32]>,
+    /// Only an `ember3:` code carries one. Without it the only intro lookup
+    /// left is the legacy pubkey-only one, which current builds no longer
+    /// answer.
+    pub intro_secret: Option<[u8; INTRO_SECRET_LEN]>,
+}
+
+/// `ember3:<Friend ID>:<public key>:<intro secret>`, all lowercase hex.
+pub(crate) fn format_friend_code(
+    hash: &[u8; 16],
+    pubkey: &[u8; 32],
+    intro_secret: &[u8; INTRO_SECRET_LEN],
+) -> String {
+    format!(
+        "ember3:{}:{}:{}",
+        hex::encode(hash),
+        hex::encode(pubkey),
+        hex::encode(intro_secret)
+    )
+}
+
+/// Strip `prefix` in any case, as the deep-link handler detects it: `Ember2:`
+/// was once routed here as a friend code and then refused as a malformed ID.
+fn strip_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
+}
+
+fn invalid_friend_code() -> String {
+    coded("peers_user_hash_invalid", "Friend code has an invalid format")
+}
+
+/// Parse the `<hash>:<pubkey>` body shared by `ember2:` and `ember3:` and
+/// check the key BLAKE3-binds to the hash.
+fn parse_bound_identity(hash_hex: &str, pubkey_hex: &str) -> Result<(String, [u8; 16], [u8; 32]), String> {
+    let hash_hex = hash_hex.to_ascii_lowercase();
+    let hash = parse_user_hash(&hash_hex)?;
+    let mut pubkey = [0u8; 32];
+    if hex::decode_to_slice(pubkey_hex, &mut pubkey).is_err()
+        || !crate::network::ember::crypto::verify_ember_hash_binding(&pubkey, &hash)
     {
-        let mut fields = rest.split(':');
-        let hash_hex = fields.next().unwrap_or_default().to_ascii_lowercase();
-        let pubkey_hex = fields.next().unwrap_or_default();
-        if fields.next().is_some() {
-            return Err(coded(
-                "peers_user_hash_invalid",
-                "Friend code has an invalid format",
-            ));
-        }
-        let hash = parse_user_hash(&hash_hex)?;
-        let mut pubkey = [0u8; 32];
-        if hex::decode_to_slice(pubkey_hex, &mut pubkey).is_err()
-            || !crate::network::ember::crypto::verify_ember_hash_binding(&pubkey, &hash)
+        return Err(coded(
+            "peers_user_hash_invalid",
+            "Friend code public key does not match its Friend ID",
+        ));
+    }
+    Ok((hash_hex, hash, pubkey))
+}
+
+pub(crate) fn parse_friend_code(value: &str) -> Result<ParsedFriendCode, String> {
+    let trimmed = value.trim();
+    if let Some(rest) = strip_prefix_ignore_case(trimmed, "ember3:") {
+        let fields: Vec<&str> = rest.split(':').collect();
+        let [hash_hex, pubkey_hex, secret_hex] = fields.as_slice() else {
+            return Err(invalid_friend_code());
+        };
+        let (canonical, hash, pubkey) = parse_bound_identity(hash_hex, pubkey_hex)?;
+        let mut intro_secret = [0u8; INTRO_SECRET_LEN];
+        if secret_hex.len() != INTRO_SECRET_LEN * 2
+            || hex::decode_to_slice(secret_hex, &mut intro_secret).is_err()
+            || intro_secret == [0u8; INTRO_SECRET_LEN]
         {
-            return Err(coded(
-                "peers_user_hash_invalid",
-                "Friend code public key does not match its Friend ID",
-            ));
+            return Err(invalid_friend_code());
         }
-        return Ok((hash_hex, hash, Some(pubkey)));
+        return Ok(ParsedFriendCode {
+            canonical,
+            hash,
+            pubkey: Some(pubkey),
+            intro_secret: Some(intro_secret),
+        });
+    }
+    if let Some(rest) = strip_prefix_ignore_case(trimmed, "ember2:") {
+        let fields: Vec<&str> = rest.split(':').collect();
+        let [hash_hex, pubkey_hex] = fields.as_slice() else {
+            return Err(invalid_friend_code());
+        };
+        let (canonical, hash, pubkey) = parse_bound_identity(hash_hex, pubkey_hex)?;
+        return Ok(ParsedFriendCode {
+            canonical,
+            hash,
+            pubkey: Some(pubkey),
+            intro_secret: None,
+        });
     }
     let canonical = trimmed.to_ascii_lowercase();
     // A bare Ed25519 key, which is what "Copy member ID" in a room puts on the
@@ -205,7 +271,12 @@ fn parse_friend_code(value: &str) -> Result<(String, [u8; 16], Option<[u8; 32]>)
             .ok()
             .and_then(|()| crate::network::ember::crypto::node_id_from_ed25519_bytes(&pubkey));
         return match hash {
-            Some(hash) => Ok((hex::encode(hash), hash, Some(pubkey))),
+            Some(hash) => Ok(ParsedFriendCode {
+                canonical: hex::encode(hash),
+                hash,
+                pubkey: Some(pubkey),
+                intro_secret: None,
+            }),
             None => Err(coded(
                 "peers_user_hash_invalid",
                 "That is not a valid Ember public key",
@@ -213,7 +284,12 @@ fn parse_friend_code(value: &str) -> Result<(String, [u8; 16], Option<[u8; 32]>)
         };
     }
     let hash = parse_user_hash(&canonical)?;
-    Ok((canonical, hash, None))
+    Ok(ParsedFriendCode {
+        canonical,
+        hash,
+        pubkey: None,
+        intro_secret: None,
+    })
 }
 
 #[derive(serde::Serialize)]
@@ -256,7 +332,12 @@ pub async fn add_friend(
     user_hash_hex: String,
     nickname: Option<String>,
 ) -> Result<(), String> {
-    let (canonical, hash, friend_pubkey) = parse_friend_code(&user_hash_hex)?;
+    let ParsedFriendCode {
+        canonical,
+        hash,
+        pubkey: friend_pubkey,
+        intro_secret,
+    } = parse_friend_code(&user_hash_hex)?;
     // L20: strip bidi/zero-width/control formatters from
     // user-supplied nicknames before they're written to the DB.
     // The friends list uses `<bdi>` to neutralise visual
@@ -383,6 +464,25 @@ pub async fn add_friend(
         }
     }
 
+    // Registered before the lookup below is queued, which is the first thing
+    // that needs it. The in-memory copy is what lookups read; the row only
+    // carries it across restarts, so a failed write is not worth failing the
+    // add over. Not kept when this add made us mutual with a key in hand:
+    // they already register pairwise presence for us (see
+    // `friends::register_presence` for the same rule on later promotions).
+    if let Some(secret) = intro_secret.filter(|_| !(became_mutual && friend_pubkey.is_some())) {
+        crate::network::friend_intro::remember_friend_intro_secret(hash, secret);
+        let db = state.db.clone();
+        let db_hash = canonical.clone();
+        match tokio::task::spawn_blocking(move || db.set_friend_intro_secret(&db_hash, &secret))
+            .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!("Failed to persist friend intro secret: {e}"),
+            Err(e) => tracing::warn!("Friend intro secret task failed: {e}"),
+        }
+    }
+
     // Friend is already persisted to the DB above; the network task
     // only needs the hash to start the auto-connect search. If the
     // command channel is briefly saturated we'd rather log a warning
@@ -403,6 +503,12 @@ pub async fn add_friend(
         tracing::warn!(
             "Friend added to DB, but auto-connect search was not enqueued (channel full): {e}"
         );
+    }
+    // A code without their intro secret cannot find a current build on the
+    // rendezvous until they add us back, which is the case for every member
+    // added from a room. Ask them through a room we share instead.
+    if let (Some(pubkey), None, false) = (friend_pubkey, intro_secret, became_mutual) {
+        crate::commands::channels::send_room_friend_request(&state, pubkey, true).await;
     }
 
     Ok(())
@@ -447,6 +553,7 @@ pub async fn remove_friend(
 /// they write; the access being withdrawn is identical.
 async fn tear_down_friend(state: &AppState, hash: [u8; 16]) -> Result<(), String> {
     state.friend_hashes.write().await.remove(&hash);
+    crate::network::friend_intro::forget_friend_intro_secret(&hash);
     // Drop the mutual grant in the same breath, so browse and friends-only
     // serving stop immediately rather than at the next restart.
     state.mutual_friend_hashes.write().await.remove(&hash);
@@ -616,10 +723,45 @@ pub async fn get_friends(state: tauri::State<'_, AppState>) -> Result<Vec<Friend
 
 #[tauri::command]
 pub fn get_my_ember_hash(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    Ok(format!(
-        "ember2:{}:{}",
-        hex::encode(state.identity.ember_hash),
-        hex::encode(state.identity.ed25519_public_key)
+    let intro_secret = crate::network::friend_intro::own_intro_secret()
+        .unwrap_or(state.identity.intro_secret);
+    Ok(format_friend_code(
+        &state.identity.ember_hash,
+        &state.identity.ed25519_public_key,
+        &intro_secret,
+    ))
+}
+
+/// Mint a new intro secret, so every friend code shared so far stops
+/// locating us. Returns the new code.
+#[tauri::command]
+pub async fn reset_friend_code(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
+    let secret = tokio::task::spawn_blocking(move || {
+        crate::storage::identity::NodeIdentity::rotate_intro_secret(&data_dir)
+    })
+    .await
+    .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+    .map_err(|e| {
+        coded_ctx(
+            "peers_friend_code_reset_failed",
+            "Failed to reset your friend code",
+            e,
+        )
+    })?;
+    crate::network::friend_intro::set_own_intro_secret(secret);
+    // Replace the advertised intro now rather than at the next heartbeat. The
+    // old one still expires on its own within the server's entry TTL.
+    let _ = state
+        .network_tx
+        .try_send(NetworkCommand::ForceRendezvousRegister);
+    Ok(format_friend_code(
+        &state.identity.ember_hash,
+        &state.identity.ed25519_public_key,
+        &secret,
     ))
 }
 
@@ -1149,19 +1291,39 @@ pub async fn reject_friend_request(
     // hash is rejected before it reaches the database. The DB path
     // uses bound parameters and is safe today, but consistency makes
     // the contract obvious and protects against future refactors.
-    parse_user_hash(&sender_hash)?;
+    let hash = parse_user_hash(&sender_hash)?;
     let canonical = sender_hash.to_lowercase();
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.remove_friend_request(&canonical))
-        .await
-        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
-        .map_err(|e| {
-            coded_ctx(
-                "peers_failed_reject_friend_request",
-                "Failed to reject friend request",
-                e,
-            )
-        })
+    // Deletes the request and copies its address into the decline queue in one
+    // transaction, for the reason the withdrawal queue exists: the request row
+    // holds the only address we have for somebody who is not a friend, so it
+    // has to be taken at the moment of removal or the courier has nowhere to
+    // dial. `false` means we have no usable address — the rejection still
+    // stands locally, it simply cannot be delivered.
+    let owes_decline = tokio::task::spawn_blocking(move || {
+        db.reject_and_queue_friend_decline(&canonical)
+    })
+    .await
+    .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+    .map_err(|e| {
+        coded_ctx(
+            "peers_failed_reject_friend_request",
+            "Failed to reject friend request",
+            e,
+        )
+    })?;
+
+    // Dropping this on a full channel is safe: the queued row is what
+    // guarantees delivery, and the retry sweep picks it up.
+    if owes_decline {
+        if let Err(e) = state
+            .network_tx
+            .try_send(NetworkCommand::DeclineFriendRequest { ember_hash: hash })
+        {
+            tracing::debug!("Friend-request decline deferred to the retry sweep (channel full): {e}");
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2638,7 +2800,10 @@ pub async fn ember_dht_run_maintenance(
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use super::{chat_failure_is_permanent, parse_friend_code, require_public_ember_peer_ip_for_mode};
+    use super::{
+        chat_failure_is_permanent, format_friend_code, parse_friend_code,
+        require_public_ember_peer_ip_for_mode, INTRO_SECRET_LEN,
+    };
 
     /// "Copy member ID" in a room yields a bare Ed25519 key. Add Friend has to
     /// take the same string back, or the two halves of one identity disagree
@@ -2650,21 +2815,108 @@ mod tests {
         let expected = crate::network::ember::crypto::node_id_from_ed25519_bytes(&pubkey)
             .expect("a generated key is on the curve");
 
-        let (canonical, hash, parsed_pubkey) =
+        let bare =
             parse_friend_code(&hex::encode(pubkey)).expect("a bare member key is a friend code");
-        assert_eq!(hash, expected);
-        assert_eq!(canonical, hex::encode(expected));
+        assert_eq!(bare.hash, expected);
+        assert_eq!(bare.canonical, hex::encode(expected));
         assert_eq!(
-            parsed_pubkey,
+            bare.pubkey,
             Some(pubkey),
             "the key must come through, not just the hash it derives"
         );
+        assert_eq!(bare.intro_secret, None);
 
         // Same identity written the long way round must land on the same row.
-        let (viacode, code_hash, code_pubkey) =
+        let via_code =
             parse_friend_code(&format!("ember2:{}:{}", hex::encode(expected), hex::encode(pubkey)))
                 .expect("the ember2 form still parses");
-        assert_eq!((viacode, code_hash, code_pubkey), (canonical, hash, parsed_pubkey));
+        assert_eq!(via_code, bare);
+    }
+
+    #[test]
+    fn the_ember2_prefix_is_accepted_in_any_case() {
+        let key = crate::network::ember::crypto::signing_key_from_bytes(&[7u8; 32]);
+        let pubkey = key.verifying_key().to_bytes();
+        let hash = crate::network::ember::crypto::node_id_from_ed25519_bytes(&pubkey)
+            .expect("a generated key is on the curve");
+        let body = format!("{}:{}", hex::encode(hash), hex::encode(pubkey));
+        for prefix in ["ember2:", "EMBER2:", "Ember2:", "eMbEr2:"] {
+            let parsed = parse_friend_code(&format!("{prefix}{body}"))
+                .unwrap_or_else(|e| panic!("{prefix} was refused: {e}"));
+            assert_eq!((parsed.hash, parsed.pubkey), (hash, Some(pubkey)));
+        }
+        assert!(parse_friend_code("Ember2:").is_err());
+        assert!(parse_friend_code("émber2:").is_err());
+    }
+
+    fn sample_identity(seed: u8) -> ([u8; 16], [u8; 32]) {
+        let key = crate::network::ember::crypto::signing_key_from_bytes(&[seed; 32]);
+        let pubkey = key.verifying_key().to_bytes();
+        let hash = crate::network::ember::crypto::node_id_from_ed25519_bytes(&pubkey)
+            .expect("a generated key is on the curve");
+        (hash, pubkey)
+    }
+
+    #[test]
+    fn an_ember3_code_round_trips_with_its_intro_secret() {
+        let (hash, pubkey) = sample_identity(9);
+        let secret = [0xA5u8; INTRO_SECRET_LEN];
+        let code = format_friend_code(&hash, &pubkey, &secret);
+        assert!(code.starts_with("ember3:"));
+        assert_eq!(code.len(), "ember3:".len() + 32 + 1 + 64 + 1 + INTRO_SECRET_LEN * 2);
+
+        let parsed = parse_friend_code(&code).expect("a v3 code parses");
+        assert_eq!(parsed.canonical, hex::encode(hash));
+        assert_eq!(parsed.hash, hash);
+        assert_eq!(parsed.pubkey, Some(pubkey));
+        assert_eq!(parsed.intro_secret, Some(secret));
+
+        let shouted = format!("  EMBER3:{}  ", code["ember3:".len()..].to_ascii_uppercase());
+        assert_eq!(parse_friend_code(&shouted).expect("any case, padded"), parsed);
+
+        // The v2 and bare forms of the same identity land on the same row,
+        // just without the secret.
+        let v2 = parse_friend_code(&format!("ember2:{}:{}", hex::encode(hash), hex::encode(pubkey)))
+            .unwrap();
+        assert_eq!((v2.canonical.as_str(), v2.intro_secret), (parsed.canonical.as_str(), None));
+        assert_eq!(parse_friend_code(&hex::encode(hash)).unwrap().canonical, parsed.canonical);
+        assert_eq!(parse_friend_code(&hex::encode(pubkey)).unwrap().canonical, parsed.canonical);
+    }
+
+    #[test]
+    fn an_ember3_code_keeps_the_hash_binding_check() {
+        let (hash, _) = sample_identity(9);
+        let (_, other_pubkey) = sample_identity(10);
+        let secret = [0xA5u8; INTRO_SECRET_LEN];
+        let err = parse_friend_code(&format_friend_code(&hash, &other_pubkey, &secret))
+            .expect_err("a key that does not bind to the hash is refused");
+        assert!(err.contains("does not match"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn malformed_ember3_codes_are_refused() {
+        let (hash, pubkey) = sample_identity(9);
+        let h = hex::encode(hash);
+        let k = hex::encode(pubkey);
+        let s = "a5".repeat(INTRO_SECRET_LEN);
+        for bad in [
+            "ember3:".to_string(),
+            format!("ember3:{h}"),
+            format!("ember3:{h}:{k}"),
+            format!("ember3:{h}:{k}:"),
+            format!("ember3:{h}:{k}:{s}:"),
+            format!("ember3:{h}:{k}:{s}:extra"),
+            format!("ember3:{h}:{k}:{}", &s[..s.len() - 2]),
+            format!("ember3:{h}:{k}:{s}00"),
+            format!("ember3:{h}:{k}:{}", "zz".repeat(INTRO_SECRET_LEN)),
+            format!("ember3:{h}:{k}:{}", "00".repeat(INTRO_SECRET_LEN)),
+            format!("ember3:{}:{k}:{s}", &h[..30]),
+            format!("ember3:{h}:{}:{s}", &k[..62]),
+            format!("ember2:{h}:{k}:{s}"),
+            format!("ember4:{h}:{k}:{s}"),
+        ] {
+            assert!(parse_friend_code(&bad).is_err(), "{bad} should be refused");
+        }
     }
 
     /// The bare-key branch is keyed on length, so the shapes either side of it

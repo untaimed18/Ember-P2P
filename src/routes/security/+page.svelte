@@ -15,9 +15,11 @@
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import { passiveScroll } from '$lib/actions/passiveScroll';
+  import { formatNumber } from '$lib/utils';
   import { onMount, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { plural } from '$lib/plural';
   import { getSettings } from '$lib/api/settings';
   import { setAppSettings } from '$lib/stores/settings';
   import { networkStats } from '$lib/stores/network';
@@ -261,6 +263,22 @@
     return translateError(e, m.error_operation_failed());
   }
 
+  function rangeCountText(count: number): string {
+    return plural(count, {
+      one: m.security_range_count_one,
+      few: () => m.security_range_count_few({ count: formatNumber(count) }),
+      other: () => m.security_ranges_count({ count: formatNumber(count) }),
+    });
+  }
+
+  function hitsCountText(count: number): string {
+    return plural(count, {
+      one: m.security_hits_count_one,
+      few: () => m.security_hits_count_few({ count: formatNumber(count) }),
+      other: () => m.security_hits_count({ count: formatNumber(count) }),
+    });
+  }
+
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
   function flash(msg: string) {
     error = null;
@@ -446,10 +464,11 @@
     confirmRemoveOpen = true;
   }
 
+  // `pendingRemoveEntry` is deliberately not cleared: the dialog still renders
+  // its message during the outro. The next `handleRemoveRange` overwrites it.
   async function confirmRemoveRange() {
     if (!pendingRemoveEntry) return;
     const entry = pendingRemoveEntry;
-    pendingRemoveEntry = null;
     error = null;
     try {
       await removeIpFilterRange(entry.start_ip, entry.end_ip);
@@ -493,7 +512,10 @@
 </script>
 
 <div class="page-header">
-  <h2>{m.security_title()}</h2>
+  <div>
+    <h2>{m.security_title()}</h2>
+    <p class="page-subtitle">{m.security_page_subtitle()}</p>
+  </div>
   <div class="header-actions">
     <button onclick={handleDownload} disabled={downloading}>
       {downloading ? m.security_downloading() : m.security_download_ipfilter()}
@@ -513,7 +535,7 @@
       aria-expanded={showUrlForm}
       aria-controls="ipfilter-url-form"
     >
-      {showUrlForm ? m.security_cancel_url() : m.security_from_url()}
+      {showUrlForm ? m.common_cancel() : m.security_from_url()}
     </button>
     <button class="ghost" onclick={() => void loadStats({ offset: listOffset })} disabled={loading}>{m.common_refresh()}</button>
   </div>
@@ -538,17 +560,17 @@
 
 <div class="security-content">
   {#if $networkStats.secident_status === 'broken'}
-    <div class="banner error-banner" role="alert">
+    <div class="error-banner" role="alert">
       <span>{m.secident_key_unreadable()}</span>
     </div>
   {/if}
   {#if error}
-    <div class="banner error-banner" role="alert">
+    <div class="error-banner" role="alert">
       <span>{error}</span>
       <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
     </div>
   {:else if successMsg}
-    <div class="banner success-banner" role="status">
+    <div class="success-banner" role="status">
       <span>{successMsg}</span>
     </div>
   {/if}
@@ -556,7 +578,7 @@
   {#if loading && !stats}
     <div class="empty-state">
       <div class="spinner lg"></div>
-      <p>{m.security_loading()}</p>
+      <p class="empty-title">{m.security_loading()}</p>
     </div>
   {:else if stats}
     <!-- Controls bar: toggles + stats inline -->
@@ -577,17 +599,21 @@
         </button>
       </div>
       <div class="controls-right">
-        <span class="inline-stat">{m.security_ranges_count({ count: stats.range_count.toLocaleString() })}</span>
+        <span class="inline-stat">
+          {rangeCountText(stats.range_count)}
+        </span>
         <span class="inline-sep">&middot;</span>
         <!-- Red only when there is something to be red about. A permanent
              danger-coloured "0 hits" trains the eye to ignore the one place
              on the page that reports blocks actually happening. -->
-        <span class="inline-stat" class:hits-stat={stats.total_hits > 0}>{m.security_hits_count({ count: stats.total_hits.toLocaleString() })}</span>
+        <span class="inline-stat" class:hits-stat={stats.total_hits > 0}>
+          {hitsCountText(stats.total_hits)}
+        </span>
       </div>
     </div>
 
     {#if stats.enabled && !stats.ranges_ready}
-      <div class="banner error-banner" role="alert">
+      <div class="error-banner" role="alert">
         <span>{m.security_filter_fail_closed_banner()}</span>
       </div>
     {/if}
@@ -639,9 +665,11 @@
         {/if}
       </div>
       <span class="result-count">
-        {matchedCount === 1
-          ? m.security_range_count_one()
-          : m.security_range_count_other({ count: matchedCount.toLocaleString() })}
+        {plural(matchedCount, {
+          one: m.security_range_count_one,
+          few: () => m.security_range_count_few({ count: formatNumber(matchedCount) }),
+          other: () => m.security_range_count_other({ count: formatNumber(matchedCount) }),
+        })}
       </span>
     </div>
 
@@ -650,8 +678,8 @@
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
           <path d="M12 2l7 4v6c0 4.4-3 8.5-7 10-4-1.5-7-5.6-7-10V6l7-4z"></path>
         </svg>
-        <p>{m.security_empty_no_ranges()}</p>
-        <p class="sub">{m.security_empty_no_ranges_sub()}</p>
+        <p class="empty-title">{m.security_empty_no_ranges()}</p>
+        <p class="empty-sub">{m.security_empty_no_ranges_sub()}</p>
       </div>
     {:else if matchedCount === 0}
       <div class="empty-state">
@@ -659,8 +687,9 @@
           <circle cx="11" cy="11" r="8"></circle>
           <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
         </svg>
-        <p>{m.security_empty_no_matches()}</p>
-        <p class="sub">{m.security_empty_no_matches_sub()}</p>
+        <p class="empty-title">{m.security_empty_no_matches()}</p>
+        <p class="empty-sub">{m.security_empty_no_matches_sub()}</p>
+        <button type="button" class="ghost empty-action" onclick={() => { searchQuery = ''; }}>{m.common_clear_filters()}</button>
       </div>
     {:else}
       <div
@@ -725,9 +754,9 @@
                     <!-- Reserve the "danger" red for ranges that are
                          actually doing meaningful blocking; otherwise
                          every populated table reads as alarming. -->
-                    <span class="hit-count hit-count-high">{entry.hits.toLocaleString()}</span>
+                    <span class="hit-count hit-count-high">{formatNumber(entry.hits)}</span>
                   {:else}
-                    <span class="hit-count">{entry.hits.toLocaleString()}</span>
+                    <span class="hit-count">{formatNumber(entry.hits)}</span>
                   {/if}
                 </td>
                 <td class="actions-cell">
@@ -753,8 +782,8 @@
          Without this the page is an error banner over an empty body, and the
          only way back was to restart the app. -->
     <div class="empty-state">
-      <p>{m.security_load_failed()}</p>
-      <button onclick={() => void loadStats()} disabled={loading}>
+      <p class="empty-title">{m.security_load_failed()}</p>
+      <button type="button" class="empty-action" onclick={() => void loadStats()} disabled={loading}>
         {loading ? m.common_loading() : m.common_retry()}
       </button>
     </div>
@@ -770,7 +799,6 @@
   confirmLabel={m.common_remove()}
   danger={true}
   onconfirm={confirmRemoveRange}
-  oncancel={() => { pendingRemoveEntry = null; }}
 />
 
 <style>
@@ -778,21 +806,6 @@
     display: flex;
     align-items: center;
     gap: 8px;
-  }
-
-  /* Visually-hidden label for the URL input; the placeholder
-     doubles as the visible cue while the label keeps the
-     accessibility tree honest for screen readers. */
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
   }
 
   /* Collapsible "Fetch from URL" row. Sits directly under the
@@ -816,7 +829,7 @@
     background: var(--bg-primary);
     color: var(--text-primary);
     font-family: inherit;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
   .ipfilter-url-form input[type='url']:focus {
     border-color: var(--accent);
@@ -827,13 +840,6 @@
   }
 
   /* --- Banners --- */
-  .banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 8px 16px;
-    font-size: 12px;
-  }
   /* --- Controls bar (combines toggles + inline stats) --- */
   .controls-bar {
     display: flex;
@@ -855,7 +861,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     white-space: nowrap;
   }
@@ -864,7 +870,7 @@
   .hits-stat { color: var(--danger); font-weight: 600; }
 
   .add-range-btn {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 4px 10px;
   }
 
@@ -890,7 +896,7 @@
     min-width: 140px;
   }
   .add-field-label {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     font-weight: 600;
     text-transform: uppercase;
@@ -899,15 +905,15 @@
   .ip-input {
     width: 156px;
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
   .desc-input {
     width: 100%;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
   .range-sep {
     color: var(--text-muted);
-    font-size: 14px;
+    font-size: var(--font-size-base);
     flex-shrink: 0;
     align-self: end;
     padding-bottom: 6px;
@@ -935,8 +941,8 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-pill);
     padding: 0 8px;
-    background: var(--bg-input, var(--bg-primary));
-    transition: border-color 0.15s, box-shadow 0.15s;
+    background: var(--bg-input);
+    transition: border-color var(--transition-normal), box-shadow var(--transition-normal);
   }
   .search-wrap:focus-within {
     border-color: var(--accent);
@@ -954,7 +960,7 @@
     border: none;
     background: transparent;
     padding: 6px 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: inherit;
     outline: none;
     box-shadow: none;
@@ -978,7 +984,7 @@
     background: var(--bg-hover);
   }
   .result-count {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
@@ -1011,7 +1017,7 @@
   .ip-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     table-layout: fixed;
   }
   .ip-table thead {
@@ -1024,7 +1030,7 @@
     text-align: left;
     white-space: nowrap;
     font-weight: 600;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     background: var(--bg-surface);
     border-bottom: 1px solid var(--border);
     user-select: none;
@@ -1049,7 +1055,10 @@
   }
   .col-range { width: 36%; }
   .col-desc { width: auto; }
+  /* `.ip-table th` left-aligns every header and outranks a bare column class. */
+  .ip-table th.col-hits,
   .col-hits { width: 80px; text-align: right; }
+  .ip-table th.col-actions,
   .col-actions { width: 44px; text-align: center; }
 
   .ip-table td {
@@ -1062,10 +1071,10 @@
     box-sizing: border-box;
   }
   .ip-table tbody tr {
-    transition: background-color 0.1s;
+    transition: background-color var(--transition-fast);
   }
   .ip-table tbody tr.row-alt td {
-    background: color-mix(in srgb, var(--bg-secondary) 90%, var(--bg-primary));
+    background: var(--table-row-alt);
   }
   .ip-table tbody tr:hover td {
     background: var(--bg-hover);
@@ -1087,7 +1096,7 @@
 
   .ip-cell {
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
   }
@@ -1097,7 +1106,7 @@
   .range-arrow {
     color: var(--text-muted);
     margin: 0 4px;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
   }
   .desc-cell {
     overflow: hidden;
@@ -1108,7 +1117,7 @@
   .hits-cell {
     text-align: right;
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-variant-numeric: tabular-nums;
   }
   .hit-count {
@@ -1141,7 +1150,7 @@
     cursor: pointer;
     line-height: 1;
     opacity: 0.7;
-    transition: opacity 0.15s, background 0.12s, border-color 0.12s, color 0.12s;
+    transition: opacity var(--transition-normal), background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
   }
   .btn-remove:hover {
     color: var(--on-danger);
@@ -1153,12 +1162,5 @@
   .ip-table tbody tr:focus-within .btn-remove,
   .btn-remove:focus-visible {
     opacity: 1;
-  }
-
-  /* --- Empty state --- */
-  .sub {
-    font-size: 12px;
-    color: var(--text-muted);
-    margin-top: 2px;
   }
 </style>

@@ -7,11 +7,18 @@ use crate::network::kad::{dht_common, ip_filter};
 
 use super::{scale, EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE};
 
+/// How far past `now` a stamp may sit before
+/// [`RoutingTable::clamp_future_timestamps`] treats it as left behind by a
+/// backwards clock step rather than ordinary jitter.
+const CLOCK_STEP_SLACK_SECS: i64 = 60;
+
 /// A single routing-table bucket with a replacement cache.
 struct Bucket {
     contacts: VecDeque<EmberContact>,
     /// Replacement cache: contacts that couldn't be added because the bucket was full.
-    /// When a bucket contact is evicted (failed liveness), the newest cache entry replaces it.
+    /// When a bucket contact is evicted (failed liveness), the best eligible cache entry
+    /// replaces it — verified before unverified, then newest; see
+    /// [`RoutingTable::best_promotable_cached`].
     replacement_cache: VecDeque<EmberContact>,
     /// Timestamp of last activity in this bucket (for adaptive refresh).
     last_activity: i64,
@@ -47,6 +54,66 @@ impl Bucket {
 
     fn oldest_contact(&self) -> Option<&EmberContact> {
         self.contacts.front()
+    }
+}
+
+/// What the per-frame paths ask of the bucket residents, kept current so they
+/// do not walk the table.
+///
+/// Covers `Bucket::contacts` only, never a replacement cache. Every path that
+/// moves a contact into or out of a bucket, or changes a resident's address or
+/// verified state, has to report it here.
+#[derive(Default)]
+struct ResidentIndex {
+    /// Residents that are [`EmberContact::is_verified`].
+    verified: usize,
+    /// Residents by address. Several node IDs can claim one address, in no
+    /// particular order.
+    by_addr: HashMap<SocketAddr, Vec<EmberNodeId>>,
+}
+
+impl ResidentIndex {
+    fn insert(&mut self, contact: &EmberContact) {
+        if contact.is_verified() {
+            self.verified += 1;
+        }
+        self.by_addr
+            .entry(contact.addr)
+            .or_default()
+            .push(contact.node_id);
+    }
+
+    fn remove(&mut self, contact: &EmberContact) {
+        if contact.is_verified() {
+            self.verified = self.verified.saturating_sub(1);
+        }
+        self.unlink(contact.node_id, contact.addr);
+    }
+
+    fn restamp(&mut self, was_verified: bool, is_verified: bool) {
+        match (was_verified, is_verified) {
+            (false, true) => self.verified += 1,
+            (true, false) => self.verified = self.verified.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    fn readdress(&mut self, node_id: EmberNodeId, from: SocketAddr, to: SocketAddr) {
+        if from != to {
+            self.unlink(node_id, from);
+            self.by_addr.entry(to).or_default().push(node_id);
+        }
+    }
+
+    fn unlink(&mut self, node_id: EmberNodeId, addr: SocketAddr) {
+        if let Some(ids) = self.by_addr.get_mut(&addr) {
+            if let Some(i) = ids.iter().position(|id| *id == node_id) {
+                ids.swap_remove(i);
+            }
+            if ids.is_empty() {
+                self.by_addr.remove(&addr);
+            }
+        }
     }
 }
 
@@ -88,6 +155,23 @@ fn judgeable_ip(addr: &SocketAddr) -> Option<Ipv4Addr> {
     }
 }
 
+/// Cut `entries` — `(distance, scan position, contact)` — down to the `count`
+/// nearest, nearest first.
+///
+/// The scan position breaks distance ties, so the result is exactly a stable
+/// sort by distance followed by `take(count)`, without sorting what is dropped.
+fn keep_nearest<T>(entries: &mut Vec<([u8; 16], usize, T)>, count: usize) {
+    if count == 0 {
+        entries.clear();
+        return;
+    }
+    if entries.len() > count {
+        entries.select_nth_unstable_by_key(count - 1, |e| (e.0, e.1));
+        entries.truncate(count);
+    }
+    entries.sort_unstable_by_key(|e| (e.0, e.1));
+}
+
 /// Ember DHT routing table: 128 buckets indexed by XOR distance bit position.
 pub struct RoutingTable {
     local_id: EmberNodeId,
@@ -109,6 +193,7 @@ pub struct RoutingTable {
     /// hovering near a boundary from demoting and re-admitting the same
     /// contacts forever.
     enforced_scale: scale::NetworkScale,
+    residents: ResidentIndex,
 }
 
 impl RoutingTable {
@@ -124,6 +209,7 @@ impl RoutingTable {
             global_ip_count: HashMap::new(),
             ip_gate: dht_common::IpAdmissionGate::new(block_private_ips),
             enforced_scale: scale::NetworkScale::Bootstrap,
+            residents: ResidentIndex::default(),
         }
     }
 
@@ -183,11 +269,17 @@ impl RoutingTable {
     /// and every lookup frontier. An adversary present while we knew almost
     /// nobody could hold a quarter of the bucket that matters most, permanently.
     ///
-    /// Demoted rather than dropped. The cache is where a contact the caps turn
-    /// away already waits, `promote_cached_contacts` brings it back if a slot
-    /// frees up, and the distinction between "we cannot route through this peer
-    /// right now" and "stop remembering this peer" is one the rest of this
-    /// subsystem is careful about — see [`super::peer_cache`].
+    /// Demoted rather than dropped, as far as the cache has room. The cache is
+    /// where a contact the caps turn away already waits, `promote_cached_contacts`
+    /// brings it back if a slot frees up, and the distinction between "we cannot
+    /// route through this peer right now" and "stop remembering this peer" is
+    /// one the rest of this subsystem is careful about — see
+    /// [`super::peer_cache`]. A full cache still applies its own eviction rules,
+    /// and a demotee is over quota by construction: it may take the place of a
+    /// lead or of another over-quota entry, but never of a proven, promotable
+    /// one, so a crowded bucket can shed some of its demotees outright. Keeping
+    /// them would cost the cache the promotable entries it exists to hold, for
+    /// contacts the current quotas refuse anyway.
     ///
     /// Acting is deliberately later than admitting. The tier is read from
     /// four-fifths of the verified count, so `Small` admission starts at 10
@@ -216,7 +308,8 @@ impl RoutingTable {
     /// enough to widen the band has a `target` at or under the tier it widens
     /// to.
     ///
-    /// Returns how many contacts were demoted.
+    /// Returns how many demoted contacts a replacement cache still holds once
+    /// the pass is done; the rest were dropped.
     pub fn enforce_scale_quotas(&mut self) -> usize {
         let verified = self.verified_len();
         let floor = scale::NetworkScale::from_contacts(verified.saturating_mul(5) / 4);
@@ -285,7 +378,7 @@ impl RoutingTable {
             *per_ip.entry(ip).or_insert(0) += 1;
         }
 
-        let mut demoted = 0usize;
+        let mut moved: Vec<(usize, EmberNodeId)> = Vec::new();
         for (idx, node_id) in doomed {
             let Some(pos) = self.buckets[idx].find(&node_id) else {
                 continue;
@@ -293,13 +386,22 @@ impl RoutingTable {
             let contact = self.buckets[idx].contacts.remove(pos).unwrap();
             self.release_subnet(contact.subnet_key());
             self.release_ip(contact.addr.ip());
+            self.residents.remove(&contact);
             self.add_to_cache(idx, contact, target);
-            demoted += 1;
+            moved.push((idx, node_id));
         }
-        if demoted > 0 {
+        // Counted once every demotee is in, not as each goes in: a later one
+        // from the same bucket can evict an earlier one from a full cache.
+        let demoted = moved
+            .iter()
+            .filter(|(idx, id)| self.buckets[*idx].find_in_cache(id).is_some())
+            .count();
+        let dropped = moved.len() - demoted;
+        if !moved.is_empty() {
             info!(
                 "Ember DHT: limits tightened to {target:?}; demoted {demoted} over-quota \
-                 contact(s) to their replacement caches"
+                 contact(s) to their replacement caches and dropped {dropped} a full cache \
+                 could not keep"
             );
         }
         demoted
@@ -363,12 +465,17 @@ impl RoutingTable {
     /// Unverified contacts are deliberately exempt: they have no meaningful
     /// `last_seen` to age, and they are leads we may not have tried yet.
     /// Their pressure is handled by the replacement-cache rules instead.
+    ///
+    /// Runs [`Self::clamp_future_timestamps`] first, so this is also where the
+    /// table recovers from the clock stepping backwards. An `i64::MAX` age
+    /// purges nothing and does only that.
     pub fn remove_stale(
         &mut self,
         now: i64,
         max_age_secs: i64,
         in_use: &HashSet<EmberNodeId>,
     ) -> usize {
+        self.clamp_future_timestamps(now);
         let doomed: Vec<EmberNodeId> = self
             .buckets
             .iter()
@@ -408,6 +515,53 @@ impl RoutingTable {
             );
         }
         removed
+    }
+
+    /// Pull every contact `last_seen` and bucket `last_activity` stamped more
+    /// than [`CLOCK_STEP_SLACK_SECS`] after `now` back to `now`. Returns how
+    /// many timestamps moved.
+    ///
+    /// Every stamp here comes from our own clock, so one from the future means
+    /// the clock stepped backwards since it was taken. Each age test reads
+    /// `now - stamp`, which for such a stamp stays negative until the clock
+    /// catches up again — possibly days: the contact is never due a liveness
+    /// ping, never old enough to purge, and a bucket-pressure probe's
+    /// `seen < sent` fault test never holds, while the bucket is never due a
+    /// refresh. Pulling it back to `now` claims nothing it had not already
+    /// claimed, and puts it back on the normal schedule. Leads (`0`) are
+    /// untouched and stay leads.
+    pub fn clamp_future_timestamps(&mut self, now: i64) -> usize {
+        let limit = now.saturating_add(CLOCK_STEP_SLACK_SECS);
+        let mut clamped = 0usize;
+        for bucket in &mut self.buckets {
+            if bucket.last_activity > limit {
+                bucket.last_activity = now;
+                clamped += 1;
+            }
+            let resident_len = bucket.contacts.len();
+            for (i, c) in bucket
+                .contacts
+                .iter_mut()
+                .chain(bucket.replacement_cache.iter_mut())
+                .enumerate()
+            {
+                if c.last_seen > limit {
+                    let was_verified = c.is_verified();
+                    c.last_seen = now;
+                    if i < resident_len {
+                        self.residents.restamp(was_verified, c.is_verified());
+                    }
+                    clamped += 1;
+                }
+            }
+        }
+        if clamped > 0 {
+            info!(
+                "Ember DHT: pulled {clamped} future-dated timestamp(s) back to now; the clock \
+                 has stepped backwards"
+            );
+        }
+        clamped
     }
 
     /// Drop contacts the current IP policy would no longer admit. Run after
@@ -461,18 +615,11 @@ impl RoutingTable {
         let mut promoted = 0;
         let now = chrono::Utc::now().timestamp();
         for idx in 0..self.buckets.len() {
-            // `scale()` walks the whole table, so do not pay for it on the
-            // 128 buckets that have nothing parked — which is all of them in
-            // steady state.
             if self.buckets[idx].replacement_cache.is_empty() {
                 continue;
             }
-            // Read once per bucket rather than once per promotion. This is a
-            // full 128-bucket walk, and paying it per promotion mattered
-            // precisely when it hurt most: right after `evict_filtered_contacts`
-            // fires on an `ipfilter.dat` load, many buckets have parked leads
-            // and free slots at once, so a single call could mean thousands of
-            // whole-table walks on the task that also drains the UDP socket.
+            // Read once per bucket rather than once per promotion, so a
+            // bucket's whole batch is judged under one tier.
             // The tier can only tighten as verified contacts are promoted, and
             // only refuses admissions, so at worst one bucket's batch is
             // admitted a tier late — bounded, and re-evaluated on the next call.
@@ -493,6 +640,7 @@ impl RoutingTable {
                     .entry(contact.subnet_key())
                     .or_insert(0) += 1;
                 *self.global_ip_count.entry(contact.addr.ip()).or_insert(0) += 1;
+                self.residents.insert(&contact);
                 self.buckets[idx].contacts.push_back(contact);
                 promoted += 1;
                 filled = true;
@@ -552,11 +700,8 @@ impl RoutingTable {
         }
 
         // Diversity limits scale with how much of the network we can see, so
-        // read them once before borrowing a bucket. Carried into
-        // `add_to_cache` rather than recomputed there: `scale()` walks all 128
-        // buckets, and `merge_gossip_contacts` runs this whole path once per
-        // contact in a FOUND_NODE — most of which land in the cache on a warm
-        // table, so recomputing doubled the walks for a frame.
+        // read them once before borrowing a bucket and carry them into
+        // `add_to_cache`.
         //
         // The enforced tier floors this so a pruned table cannot re-admit
         // through the front door what `enforce_scale_quotas` just demoted —
@@ -637,11 +782,29 @@ impl RoutingTable {
                 || self.global_ip_count.get(&ip).copied().unwrap_or(0) >= max_per_ip
         };
         if contact.is_verified() && would_be_refused {
+            // Same address first, then same /24, then — only in a full bucket —
+            // any lead. When the cap that binds is the newcomer's own address or
+            // /24, only a lead sharing it frees room under that cap; taking the
+            // first lead of another /24 fails the checks below and parks the
+            // proven newcomer while a squatter that could have made way for it
+            // keeps its slot.
             let pos = {
                 let bucket = &self.buckets[bucket_idx];
-                bucket.contacts.iter().position(|c| {
-                    !c.is_verified() && (c.subnet_key() == subnet || bucket.is_full())
-                })
+                let lead_where = |pred: &dyn Fn(&EmberContact) -> bool| {
+                    bucket
+                        .contacts
+                        .iter()
+                        .position(|c| !c.is_verified() && pred(c))
+                };
+                lead_where(&|c| c.addr.ip() == ip)
+                    .or_else(|| lead_where(&|c| c.subnet_key() == subnet))
+                    .or_else(|| {
+                        if bucket.is_full() {
+                            lead_where(&|_| true)
+                        } else {
+                            None
+                        }
+                    })
             };
             if let Some(pos) = pos {
                 let evicted_ip = self.buckets[bucket_idx].contacts[pos].addr.ip();
@@ -653,7 +816,7 @@ impl RoutingTable {
                 // be consulted — that is the case this fast path was written
                 // for. Taking a slot from a different /24 raises our count, and
                 // this branch returned `Added` without ever reaching the checks
-                // below. Because the `|| bucket.is_full()` disjunct above
+                // below. Because the full-bucket fallback above
                 // matches *any* unverified resident, and a contact counts as
                 // verified after one signed frame, a single /24 running one
                 // keypair per host could take every slot in a full bucket —
@@ -670,6 +833,8 @@ impl RoutingTable {
                     bucket
                         .replacement_cache
                         .retain(|c| c.node_id != contact.node_id);
+                    self.residents.remove(&evicted);
+                    self.residents.insert(&contact);
                     bucket.contacts.push_back(contact);
                     bucket.last_activity = chrono::Utc::now().timestamp();
                     self.release_subnet(evicted.subnet_key());
@@ -728,6 +893,7 @@ impl RoutingTable {
             bucket
                 .replacement_cache
                 .retain(|c| c.node_id != contact.node_id);
+            self.residents.insert(&contact);
             bucket.contacts.push_back(contact);
             bucket.last_activity = chrono::Utc::now().timestamp();
             *self.global_subnet_count.entry(subnet).or_insert(0) += 1;
@@ -749,6 +915,8 @@ impl RoutingTable {
                 bucket
                     .replacement_cache
                     .retain(|c| c.node_id != contact.node_id);
+                self.residents.remove(&evicted);
+                self.residents.insert(&contact);
                 bucket.contacts.push_back(contact);
                 bucket.last_activity = chrono::Utc::now().timestamp();
                 self.release_subnet(evicted.subnet_key());
@@ -817,6 +985,7 @@ impl RoutingTable {
 
         let subnet = contact.subnet_key();
         let ip = contact.addr.ip();
+        let (old_addr, was_verified) = (existing.addr, existing.is_verified());
         if contact.addr != existing.addr {
             if !admit_new_addr {
                 // Refused move: keep the entry exactly as it stands. It used to
@@ -872,6 +1041,8 @@ impl RoutingTable {
         existing.ed25519_pub = contact.ed25519_pub;
         existing.last_seen = contact.last_seen;
         existing.failed_queries = 0;
+        self.residents.readdress(existing.node_id, old_addr, existing.addr);
+        self.residents.restamp(was_verified, existing.is_verified());
         let bucket = &mut self.buckets[bucket_idx];
         bucket.contacts.push_back(existing);
         bucket.last_activity = contact.last_seen;
@@ -947,11 +1118,12 @@ impl RoutingTable {
     /// Returns whether a **replacement was promoted** — *not* whether the
     /// contact was evicted. `false` covers three different outcomes: the id was
     /// not in the table at all, or it was removed and nothing in the cache was
-    /// eligible to take the slot, or the bucket index was out of range. Only
-    /// the first leaves the table unchanged.
+    /// eligible to take the slot, or the bucket index was out of range. The
+    /// first and the last leave the table unchanged; only the middle one
+    /// removed anything.
     ///
     /// The distinction matters because reading `false` as "the contact is still
-    /// there" is wrong in two of the three cases. The sole production caller
+    /// there" is wrong in all three cases. The sole production caller
     /// uses it to pick a log line, so nothing depends on it today; it is spelled
     /// out here because the signature invites exactly that misreading.
     pub fn evict_and_replace(&mut self, dead_id: &EmberNodeId) -> bool {
@@ -973,6 +1145,7 @@ impl RoutingTable {
         let removed = bucket.contacts.remove(pos).unwrap();
         self.release_subnet(removed.subnet_key());
         self.release_ip(removed.addr.ip());
+        self.residents.remove(&removed);
 
         // Promote the best replacement-cache entry that still satisfies the
         // diversity limits. Blindly promoting the newest entry (the original
@@ -999,6 +1172,7 @@ impl RoutingTable {
                     "Evicted dead contact {}, replaced with {}",
                     removed.node_id, replacement.node_id
                 );
+                self.residents.insert(&replacement);
                 self.buckets[bucket_idx].contacts.push_back(replacement);
                 // Same reason `promote_cached_contacts` stamps it: a bucket
                 // whose contents just changed is not idle, and leaving it at
@@ -1035,6 +1209,7 @@ impl RoutingTable {
         let removed = bucket.contacts.remove(pos).unwrap();
         self.release_subnet(removed.subnet_key());
         self.release_ip(removed.addr.ip());
+        self.residents.remove(&removed);
         true
     }
 
@@ -1059,7 +1234,16 @@ impl RoutingTable {
     }
 
     /// Mark a contact as having responded successfully (reset fail count, update timestamp).
-    pub fn mark_alive(&mut self, node_id: &EmberNodeId) {
+    ///
+    /// Only when the entry is the one that answered: the same `addr` and
+    /// `noise_pub` the response arrived on. A node ID alone says nothing about
+    /// which endpoint is alive, and [`Self::add_contact`] deliberately leaves an
+    /// entry untouched when it refuses the session's endpoint (a pinned key, a
+    /// refused move, a diversity cap on the new address). Refreshing it here
+    /// anyway would keep an endpoint nobody has answered from alive and mortal
+    /// only on paper — and stamp an unverified lead verified, so the pin then
+    /// refuses the real peer.
+    pub fn mark_alive(&mut self, node_id: &EmberNodeId, addr: SocketAddr, noise_pub: &[u8; 32]) {
         let bucket_idx = match self.local_id.bucket_index(node_id) {
             Some(idx) => idx,
             None => return,
@@ -1069,7 +1253,11 @@ impl RoutingTable {
         }
 
         let bucket = &mut self.buckets[bucket_idx];
-        if let Some(pos) = bucket.find(node_id) {
+        let answered = bucket.find(node_id).filter(|&pos| {
+            let held = &bucket.contacts[pos];
+            held.addr == addr && held.noise_pub == *noise_pub
+        });
+        if let Some(pos) = answered {
             // Move the contact to the back of the deque so it becomes the
             // most-recently-seen entry. Kademlia's liveness rule relies on the
             // front being the least-recently-seen (the one we ping when the
@@ -1077,8 +1265,10 @@ impl RoutingTable {
             // could still be picked as the "oldest" eviction candidate.
             let mut contact = bucket.contacts.remove(pos).unwrap();
             let now = chrono::Utc::now().timestamp();
+            let was_verified = contact.is_verified();
             contact.last_seen = now;
             contact.failed_queries = 0;
+            self.residents.restamp(was_verified, contact.is_verified());
             bucket.contacts.push_back(contact);
             bucket.last_activity = now;
         }
@@ -1119,6 +1309,39 @@ impl RoutingTable {
         // identity happened to be filed first. A verified entry is one we have
         // exchanged signed frames with at that address, so it is the one the
         // datagram actually belongs to.
+        //
+        // Within each rank the first in table order wins: lowest bucket, then
+        // position in it.
+        let found = self
+            .residents
+            .by_addr
+            .get(&addr)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| {
+                let idx = self.local_id.bucket_index(id)?;
+                let bucket = self.buckets.get(idx)?;
+                let pos = bucket.find(id)?;
+                let contact = &bucket.contacts[pos];
+                Some(((!contact.is_verified(), idx, pos), contact))
+            })
+            .min_by_key(|(rank, _)| *rank)
+            .map(|(_, contact)| contact);
+        #[cfg(test)]
+        assert!(
+            std::ptr::eq(
+                found.map_or(std::ptr::null(), |c| c as *const EmberContact),
+                self.contact_at_by_scan(addr)
+                    .map_or(std::ptr::null(), |c| c as *const EmberContact),
+            ),
+            "the address index disagrees with a table scan for {addr}"
+        );
+        found
+    }
+
+    /// [`Self::contact_at`] by walking every bucket, which the index must match.
+    #[cfg(test)]
+    fn contact_at_by_scan(&self, addr: SocketAddr) -> Option<&EmberContact> {
         let mut fallback = None;
         for contact in self.buckets.iter().flat_map(|b| b.contacts.iter()) {
             if contact.addr != addr {
@@ -1134,11 +1357,38 @@ impl RoutingTable {
 
     /// How many contacts we have actually heard from.
     pub fn verified_len(&self) -> usize {
+        #[cfg(test)]
+        assert_eq!(
+            self.residents.verified,
+            self.verified_len_by_scan(),
+            "the verified count drifted from the table"
+        );
+        self.residents.verified
+    }
+
+    /// [`Self::verified_len`] by walking every bucket, which the count must match.
+    #[cfg(test)]
+    fn verified_len_by_scan(&self) -> usize {
         self.buckets
             .iter()
             .flat_map(|b| b.contacts.iter())
             .filter(|c| c.is_verified())
             .count()
+    }
+
+    /// Panics unless the resident index describes exactly the bucket contents.
+    #[cfg(test)]
+    fn assert_residents_indexed(&self) {
+        assert_eq!(self.residents.verified, self.verified_len_by_scan());
+        let mut expected: HashMap<SocketAddr, Vec<EmberNodeId>> = HashMap::new();
+        for c in self.buckets.iter().flat_map(|b| b.contacts.iter()) {
+            expected.entry(c.addr).or_default().push(c.node_id);
+        }
+        let mut indexed = self.residents.by_addr.clone();
+        for ids in expected.values_mut().chain(indexed.values_mut()) {
+            ids.sort_unstable_by_key(|id| id.0);
+        }
+        assert_eq!(indexed, expected, "the address index drifted from the table");
     }
 
     /// Rough size of the whole network, from the density of the neighbourhood
@@ -1227,15 +1477,15 @@ impl RoutingTable {
         if count == 0 {
             return Vec::new();
         }
-        let mut verified: Vec<(EmberNodeId, &EmberContact)> = Vec::new();
-        let mut leads: Vec<(EmberNodeId, &EmberContact)> = Vec::new();
+        let mut verified: Vec<([u8; 16], usize, &EmberContact)> = Vec::new();
+        let mut leads: Vec<([u8; 16], usize, &EmberContact)> = Vec::new();
         for bucket in &self.buckets {
             for contact in &bucket.contacts {
-                let entry = (target.distance(&contact.node_id), contact);
+                let dist = target.distance(&contact.node_id).0;
                 if contact.is_verified() {
-                    verified.push(entry);
+                    verified.push((dist, verified.len(), contact));
                 } else {
-                    leads.push(entry);
+                    leads.push((dist, leads.len(), contact));
                 }
             }
         }
@@ -1251,20 +1501,11 @@ impl RoutingTable {
         // `store_proximity_ok` on the storer side is strictly distance-based. A
         // non-zero `failed_queries` is normal mid-refresh anyway (see
         // `remove_stale`), and three strikes evicts outright.
-        verified.sort_by_key(|a| a.0 .0);
-        let mut out: Vec<EmberContact> = verified
-            .into_iter()
-            .take(count)
-            .map(|(_, c)| c.clone())
-            .collect();
+        keep_nearest(&mut verified, count);
+        let mut out: Vec<EmberContact> = verified.into_iter().map(|(_, _, c)| c.clone()).collect();
         if out.len() < count {
-            leads.sort_by_key(|a| a.0 .0);
-            out.extend(
-                leads
-                    .into_iter()
-                    .take(count - out.len())
-                    .map(|(_, c)| c.clone()),
-            );
+            keep_nearest(&mut leads, count - out.len());
+            out.extend(leads.into_iter().map(|(_, _, c)| c.clone()));
         }
         out
     }
@@ -1284,23 +1525,20 @@ impl RoutingTable {
     /// [`Self::find_closest_prefer_verified`] instead.
     pub fn find_closest(&self, target: &EmberNodeId, count: usize) -> Vec<EmberContact> {
         let verified_only = self.verified_len() > 0;
-        let mut all: Vec<(EmberNodeId, &EmberContact)> = Vec::new();
+        let mut all: Vec<([u8; 16], usize, &EmberContact)> = Vec::new();
 
         for bucket in &self.buckets {
             for contact in &bucket.contacts {
                 if verified_only && !contact.is_verified() {
                     continue;
                 }
-                let dist = target.distance(&contact.node_id);
-                all.push((dist, contact));
+                let dist = target.distance(&contact.node_id).0;
+                all.push((dist, all.len(), contact));
             }
         }
 
-        all.sort_by_key(|a| a.0 .0);
-        all.into_iter()
-            .take(count)
-            .map(|(_, c)| c.clone())
-            .collect()
+        keep_nearest(&mut all, count);
+        all.into_iter().map(|(_, _, c)| c.clone()).collect()
     }
 
     /// The distance of the `k`th closest contact to `target`, or `None` when
@@ -1309,25 +1547,20 @@ impl RoutingTable {
     /// Exactly the number [`Self::find_closest`] puts last in a `k`-long result,
     /// under the same verified-only rule — the proximity gate reads nothing else
     /// out of that call, and a `STORE_BATCH` asks it once per record. Going
-    /// through `find_closest` therefore cost a table scan, a full sort and `k`
+    /// through `find_closest` would cost a table scan, a selection and `k`
     /// [`EmberContact`] clones per record, up to sixty-four times for one
     /// datagram, for a value the caller compares and drops.
     ///
     /// A bounded max-heap of `k` distances answers the same question in one pass
     /// with no clone and no sort: the largest of the `k` smallest is the root
     /// once every contact has been offered. Contacts at equal distance can swap
-    /// places against the stable sort `find_closest` uses, which is invisible
-    /// here because only the distance leaves this function.
+    /// places against the scan-order tie-break `find_closest` uses, which is
+    /// invisible here because only the distance leaves this function.
     pub fn kth_closest_distance(&self, target: &EmberNodeId, k: usize) -> Option<EmberNodeId> {
         if k == 0 {
             return None;
         }
-        // `verified_len() > 0` with the count dropped: the gate is a boolean and
-        // the first verified contact settles it.
-        let verified_only = self
-            .buckets
-            .iter()
-            .any(|b| b.contacts.iter().any(|c| c.is_verified()));
+        let verified_only = self.verified_len() > 0;
 
         let mut furthest: BinaryHeap<[u8; 16]> = BinaryHeap::with_capacity(k);
         for bucket in &self.buckets {
@@ -1561,12 +1794,14 @@ impl RoutingTable {
             // IP-saturated entry is exactly as unpromotable as a subnet-saturated
             // one and was being treated as worth keeping.
             let bucket = &self.buckets[bucket_idx];
-            let ineligible = bucket.replacement_cache.iter().position(|c| {
+            let unpromotable = |c: &EmberContact| {
                 let s = c.subnet_key();
                 bucket.subnet_count(s) >= max_subnet_bucket
                     || self.global_subnet_count.get(&s).copied().unwrap_or(0) >= max_subnet_global
                     || self.global_ip_count.get(&c.addr.ip()).copied().unwrap_or(0) >= max_per_ip
-            });
+            };
+            let ineligible = bucket.replacement_cache.iter().position(unpromotable);
+            let newcomer_unpromotable = unpromotable(&contact);
             let bucket = &mut self.buckets[bucket_idx];
             match ineligible {
                 Some(pos) => {
@@ -1589,6 +1824,22 @@ impl RoutingTable {
                         Some(pos) => {
                             bucket.replacement_cache.remove(pos);
                         }
+                        // Every entry here is promotable and proven, so there is
+                        // no one a lead outranks — and preferring proven entries
+                        // means nothing if the last resort is to drop one for a
+                        // contact nobody has ever reached. Refuse the lead
+                        // instead. This is the state a healthy bucket's cache
+                        // reaches (`enforce_scale_quotas` demotes proven
+                        // contacts into it, and promotion drains leads first),
+                        // so it is the ordinary case rather than a corner: a
+                        // `FOUND_NODE` flood aimed at one bucket could still
+                        // recycle the whole cache through this arm and own the
+                        // backfill for every later eviction.
+                        None if !contact.is_verified() => return,
+                        // Likewise a contact the caps would refuse to promote —
+                        // a demotee from `enforce_scale_quotas` is one by
+                        // construction — must not displace one they would not.
+                        None if newcomer_unpromotable => return,
                         None => {
                             bucket.replacement_cache.pop_front();
                         }
@@ -1755,6 +2006,69 @@ mod tests {
             rt.enforce_scale_quotas(),
             0,
             "a tier already enforced does not re-run"
+        );
+    }
+
+    /// A full cache keeps its promotable entries ahead of a demotee, which is
+    /// over quota by construction, so a cache full of proven, promotable peers
+    /// turns every demotee away. The count has to say what is still held, not
+    /// what was moved.
+    #[test]
+    fn the_demotion_count_is_what_a_full_cache_actually_kept() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+
+        let crowded: Vec<EmberContact> = (1..=5u8)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[0] = 0x80;
+                id[1] = i;
+                contact_with(id, Ipv4Addr::new(80, 7, 7, i))
+            })
+            .collect();
+        for c in &crowded {
+            assert!(matches!(rt.add_contact(c.clone()), AddResult::Added));
+        }
+        let bucket = local.bucket_index(&crowded[0].node_id).expect("a bucket");
+        grow_verified(&mut rt, 15);
+
+        // Fill the same bucket, then its cache, with proven peers that share
+        // nothing — every cache entry is promotable.
+        let mut n = 0u8;
+        while rt.buckets[bucket].replacement_cache.len() < K_BUCKET_SIZE {
+            let mut id = [0u8; 16];
+            id[0] = 0x80;
+            id[1] = 0x40 + n;
+            rt.add_contact(contact_with(id, Ipv4Addr::new(90, n, 1, 1)));
+            n += 1;
+        }
+        assert!(rt.buckets[bucket].is_full());
+        assert_eq!(rt.scale(), scale::NetworkScale::Established);
+        let promotable: Vec<EmberNodeId> = rt.buckets[bucket]
+            .replacement_cache
+            .iter()
+            .map(|c| c.node_id)
+            .collect();
+
+        let demoted = rt.enforce_scale_quotas();
+        let excess = crowded.len()
+            - scale::NetworkScale::Established.max_contacts_per_subnet_per_bucket();
+        let held = crowded
+            .iter()
+            .filter(|c| rt.buckets[bucket].find_in_cache(&c.node_id).is_some())
+            .count();
+        let gone = crowded
+            .iter()
+            .filter(|c| rt.get_contact(&c.node_id).is_none())
+            .count();
+        assert_eq!(demoted, held, "the count is what the cache still holds");
+        assert_eq!(held + gone, excess);
+        assert!(gone > 0, "the fixture has to make the cache drop one");
+        assert!(
+            promotable
+                .iter()
+                .all(|id| rt.buckets[bucket].find_in_cache(id).is_some()),
+            "no promotable entry is given up for a demotee"
         );
     }
 
@@ -2167,6 +2481,44 @@ mod tests {
         );
     }
 
+    /// The same rule at the point where it used to run out.
+    ///
+    /// Preferring unverified entries as eviction victims does nothing once there
+    /// are none: the last resort was "drop the oldest", so on a cache where every
+    /// entry is proven a lead still took one of their slots. That is not a corner
+    /// case — `enforce_scale_quotas` demotes proven contacts into these caches and
+    /// promotion drains the leads first, so a healthy bucket arrives there — and
+    /// it handed a `FOUND_NODE` flood the whole cache one frame at a time, which
+    /// is the backfill for every later eviction.
+    #[test]
+    fn a_cache_of_proven_entries_refuses_a_lead() {
+        let mut rt = table_with_one_full_bucket();
+        for i in 0..K_BUCKET_SIZE as u8 {
+            rt.add_contact(contact_at(0x94 + i, 81, i, 1, 1));
+        }
+        assert_eq!(
+            rt.cached_len(),
+            K_BUCKET_SIZE,
+            "the cache is full, and every entry in it has answered us"
+        );
+
+        let mut lead = contact_at(0xE8, 82, 1, 1, 1);
+        lead.last_seen = 0;
+        rt.add_contact(lead.clone());
+
+        assert!(
+            rt.get_contact(&lead.node_id).is_none(),
+            "a contact nobody has reached must not displace one we have"
+        );
+        assert_eq!(rt.cached_len(), K_BUCKET_SIZE);
+        for i in 0..K_BUCKET_SIZE as u8 {
+            assert!(
+                rt.get_contact(&make_id(0x94 + i)).is_some(),
+                "firsthand observation {i} was flushed by gossip"
+            );
+        }
+    }
+
     /// Preferring proven cache entries is only safe if one that has since gone
     /// silent can leave, or a dead entry would hold a slot against fresh leads
     /// and win promotion forever. `remove_stale` sweeps the cache for that.
@@ -2221,7 +2573,8 @@ mod tests {
         }
         // Refresh the current oldest (0x80); it must no longer be the eviction
         // candidate once it moves to the back of the LRU deque.
-        rt.mark_alive(&make_id(0x80));
+        let oldest = contact_at(0x80, 80, 0x80, 1, 1);
+        rt.mark_alive(&oldest.node_id, oldest.addr, &oldest.noise_pub);
         // The next add overflows the bucket — the ping target is the new oldest.
         match rt.add_contact(contact_at(0x80 + K_BUCKET_SIZE as u8, 80, 200, 1, 1)) {
             AddResult::PingOldest { node_id, .. } => assert_eq!(node_id, make_id(0x81)),
@@ -2405,14 +2758,43 @@ mod tests {
     fn mark_alive_resets_failures() {
         let local = make_id(0);
         let mut rt = RoutingTable::new(local, false);
-        rt.add_contact(make_contact(1, 4662));
+        let held = make_contact(1, 4662);
+        rt.add_contact(held.clone());
 
         rt.mark_failed(&make_id(1));
         rt.mark_failed(&make_id(1));
-        rt.mark_alive(&make_id(1));
+        rt.mark_alive(&held.node_id, held.addr, &held.noise_pub);
 
         let c = rt.get_contact(&make_id(1)).unwrap();
         assert_eq!(c.failed_queries, 0);
+    }
+
+    /// A response proves the endpoint it arrived on is alive, not whatever the
+    /// table files under that node ID. `add_contact` leaves an entry alone when
+    /// it refuses the session's endpoint, and refreshing it here regardless kept
+    /// an address nobody answered from alive, and stamped a gossiped lead
+    /// verified so the Noise-key pin then refused the real peer.
+    #[test]
+    fn mark_alive_ignores_a_response_from_another_endpoint() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let mut lead = make_contact(1, 4662);
+        lead.last_seen = 0;
+        rt.add_contact(lead.clone());
+        rt.mark_failed(&lead.node_id);
+
+        let elsewhere = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(81, 2, 3, 4)), 4662);
+        rt.mark_alive(&lead.node_id, elsewhere, &lead.noise_pub);
+        rt.mark_alive(&lead.node_id, lead.addr, &[0xEE; 32]);
+
+        let held = rt.get_contact(&lead.node_id).unwrap();
+        assert!(!held.is_verified(), "a different address must not verify the lead");
+        assert_eq!(held.failed_queries, 1, "nor clear its strikes");
+
+        rt.mark_alive(&lead.node_id, lead.addr, &lead.noise_pub);
+        let held = rt.get_contact(&lead.node_id).unwrap();
+        assert!(held.is_verified(), "the endpoint it holds answering does");
+        assert_eq!(held.failed_queries, 0);
     }
 
     /// Gossip is the only way most contacts arrive, and a peer can put any
@@ -2638,6 +3020,56 @@ mod tests {
         );
     }
 
+    /// A clock that steps backwards leaves stamps in the future, and every age
+    /// test reads those as younger than now until the clock catches up — so
+    /// the contact is never pinged, purged or faulted, and its bucket is never
+    /// refreshed.
+    #[test]
+    fn a_backwards_clock_step_does_not_make_contacts_immortal() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let now = 1_700_000_000i64;
+        let ahead = now + 3 * 86_400;
+
+        let mut dated = make_contact(1, 4672);
+        dated.last_seen = ahead;
+        let mut recent = make_contact(2, 4672);
+        recent.last_seen = now - 10;
+        let mut jitter = make_contact(4, 4672);
+        jitter.last_seen = now + CLOCK_STEP_SLACK_SECS;
+        let lead = gossip_contact(3);
+        for c in [dated.clone(), recent.clone(), jitter.clone(), lead.clone()] {
+            assert!(matches!(rt.add_contact(c), AddResult::Added));
+        }
+        // A second observation is what stamps the bucket with the contact's time.
+        rt.add_contact(dated.clone());
+        let idx = local.bucket_index(&dated.node_id).expect("a bucket");
+        assert_eq!(rt.buckets[idx].last_activity, ahead);
+
+        assert_eq!(rt.remove_stale(now, 7200, &HashSet::new()), 0);
+        assert_eq!(rt.get_contact(&dated.node_id).unwrap().last_seen, now);
+        assert_eq!(rt.buckets[idx].last_activity, now);
+        assert_eq!(
+            rt.get_contact(&recent.node_id).unwrap().last_seen,
+            now - 10,
+            "a stamp in the past is left alone"
+        );
+        assert_eq!(
+            rt.get_contact(&jitter.node_id).unwrap().last_seen,
+            now + CLOCK_STEP_SLACK_SECS,
+            "and so is one within the slack"
+        );
+        assert!(
+            !rt.get_contact(&lead.node_id).unwrap().is_verified(),
+            "a lead stays a lead"
+        );
+
+        // From there it ages like any other contact.
+        assert_eq!(rt.remove_stale(now + 7200, 7200, &HashSet::new()), 2);
+        assert!(rt.get_contact(&dated.node_id).is_none());
+        assert!(rt.get_contact(&recent.node_id).is_none());
+    }
+
     /// The purge runs on the first maintenance tick, before any contact has
     /// been probed. Contacts restored from `nodes_ember.dat` must survive it,
     /// or a restart after the stale threshold leaves the node with nothing to
@@ -2693,7 +3125,11 @@ mod tests {
         assert_eq!(rt.total_contacts(), saved.len());
 
         // Once one answers, it counts as proven and ages normally from there.
-        rt.mark_alive(&saved[0].contact.node_id);
+        rt.mark_alive(
+            &saved[0].contact.node_id,
+            saved[0].contact.addr,
+            &saved[0].contact.noise_pub,
+        );
         assert!(rt
             .get_contact(&saved[0].contact.node_id)
             .unwrap()
@@ -2782,6 +3218,90 @@ mod tests {
             "the lead keeps its slot"
         );
         assert!(rt.buckets[bucket_idx].find(&live.node_id).is_some());
+    }
+
+    /// When the newcomer's own /24 is what the cap binds on, only a lead in that
+    /// /24 can make room. Displacing the first lead of any /24 fails the subnet
+    /// check and parks the proven peer while a same-/24 squatter keeps its slot.
+    #[test]
+    fn a_verified_peer_displaces_a_lead_in_its_own_subnet_when_that_cap_binds() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let cap = scale::NetworkScale::Bootstrap.max_contacts_per_subnet_per_bucket();
+
+        let mut first = contact_at(0x80, 80, 0, 1, 1);
+        first.last_seen = 0;
+        assert!(matches!(rt.add_contact(first.clone()), AddResult::Added));
+        for k in 0..cap as u8 {
+            let mut c = contact_at(0x81 + k, 80, 1, 1, k + 1);
+            c.last_seen = 0;
+            assert!(matches!(rt.add_contact(c), AddResult::Added));
+        }
+        let mut id = 0x81 + cap as u8;
+        while rt.total_contacts() < K_BUCKET_SIZE {
+            let mut c = contact_at(id, 80, id, 1, 1);
+            c.last_seen = 0;
+            assert!(matches!(rt.add_contact(c), AddResult::Added));
+            id += 1;
+        }
+
+        let live = contact_at(id, 80, 1, 1, 200);
+        assert!(
+            matches!(rt.add_contact(live.clone()), AddResult::Added),
+            "a lead in the newcomer's /24 can make room under the cap that binds"
+        );
+        let bucket_idx = local.bucket_index(&live.node_id).expect("a bucket");
+        let bucket = &rt.buckets[bucket_idx];
+        assert!(bucket.find(&live.node_id).is_some());
+        assert!(
+            bucket.find(&first.node_id).is_some(),
+            "the lead of another /24 is not the one to go"
+        );
+        assert_eq!(bucket.subnet_count(live.subnet_key()), cap);
+    }
+
+    /// The per-address cap is the tightest: only a lead at the newcomer's own
+    /// address frees room under it, so that lead goes before one merely sharing
+    /// the /24.
+    #[test]
+    fn a_verified_peer_displaces_a_lead_at_its_own_address_when_that_cap_binds() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let max_per_ip = scale::NetworkScale::Bootstrap.max_contacts_per_ip();
+
+        let mut other_subnet = contact_at(0x80, 80, 0, 1, 1);
+        other_subnet.last_seen = 0;
+        let mut same_subnet = contact_at(0x81, 80, 1, 1, 2);
+        same_subnet.last_seen = 0;
+        let mut same_ip = contact_at(0x82, 80, 1, 1, 9);
+        same_ip.last_seen = 0;
+        for c in [other_subnet.clone(), same_subnet.clone(), same_ip.clone()] {
+            assert!(matches!(rt.add_contact(c), AddResult::Added));
+        }
+        let mut id = 0x83u8;
+        while rt.total_contacts() < K_BUCKET_SIZE {
+            let mut c = contact_at(id, 80, id, 1, 1);
+            c.last_seen = 0;
+            assert!(matches!(rt.add_contact(c), AddResult::Added));
+            id += 1;
+        }
+        // Take the address to its cap from other buckets, verified but too few
+        // to leave the Bootstrap tier.
+        for bit in 0..(max_per_ip - 1) as u8 {
+            let elsewhere = contact_at(0x40 >> bit, 80, 1, 1, 9);
+            assert!(matches!(rt.add_contact(elsewhere), AddResult::Added));
+        }
+        assert_eq!(rt.scale(), scale::NetworkScale::Bootstrap);
+
+        let live = contact_at(id, 80, 1, 1, 9);
+        assert!(
+            matches!(rt.add_contact(live.clone()), AddResult::Added),
+            "the lead at the newcomer's address can make room under the per-IP cap"
+        );
+        assert!(rt.get_contact(&live.node_id).is_some());
+        assert!(rt.get_contact(&same_ip.node_id).is_none());
+        assert!(rt.get_contact(&same_subnet.node_id).is_some());
+        assert!(rt.get_contact(&other_subnet.node_id).is_some());
     }
 
     /// A move we refuse must leave the entry alone. Pairing the old address
@@ -3345,5 +3865,263 @@ mod tests {
         assert_eq!(rt.evict_filtered_contacts(), 1);
         assert!(rt.get_contact(&make_id(1)).is_none());
         assert!(rt.get_contact(&make_id(2)).is_some());
+    }
+
+    /// Deterministic xorshift, so a failing sequence replays exactly.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Ids spread over the eight furthest buckets, fifty per bucket, so buckets
+    /// fill and spill into their replacement caches.
+    fn fuzz_id(n: u64) -> EmberNodeId {
+        let mut id = [0u8; 16];
+        id[0] = 1 << (n % 8);
+        id[1] = (n / 8) as u8;
+        id[2] = 0x5A;
+        EmberNodeId(id)
+    }
+
+    /// A small address pool, so node ids collide on addresses and /24s and
+    /// some addresses are private.
+    fn fuzz_addrs() -> Vec<SocketAddr> {
+        let mut addrs = Vec::new();
+        for a in 0..96u8 {
+            let ip = if a.is_multiple_of(17) {
+                Ipv4Addr::new(192, 168, 1, a)
+            } else {
+                Ipv4Addr::new(80 + a % 5, (a / 5) % 8, 1, a)
+            };
+            for port in [4672, 4673] {
+                addrs.push(SocketAddr::new(IpAddr::V4(ip), port));
+            }
+        }
+        addrs
+    }
+
+    fn fuzz_contact(rng: &mut Rng, addrs: &[SocketAddr], now: i64) -> EmberContact {
+        let n = rng.below(400);
+        let last_seen = match rng.below(20) {
+            0..=7 => 0,
+            8 => now + 100_000,
+            _ => now - rng.below(120) as i64,
+        };
+        let noise = (n as u8) ^ u8::from(rng.below(6) == 0);
+        EmberContact {
+            node_id: fuzz_id(n),
+            addr: addrs[rng.below(addrs.len() as u64) as usize],
+            noise_pub: [noise; 32],
+            ed25519_pub: [n as u8; 32],
+            last_seen,
+            failed_queries: 0,
+        }
+    }
+
+    /// The verified count and the address index are maintained by hand on every
+    /// path that touches a bucket, so drive every such path in a long random
+    /// sequence and compare both against a recount after each step.
+    /// `verified_len` and `contact_at` also check themselves against a scan in
+    /// test builds, which covers every other test in the crate.
+    #[test]
+    fn the_resident_index_matches_a_recount_after_every_mutation() {
+        let addrs = fuzz_addrs();
+        for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 7] {
+            let mut rng = Rng(seed);
+            let mut rt = RoutingTable::new(make_id(0), false);
+            let mut block_private = false;
+            let mut max_verified = 0;
+            let mut saw_shared_addr = false;
+            let mut saw_cache = false;
+            for step in 0..4000 {
+                let now = chrono::Utc::now().timestamp();
+                let residents = rt.all_contacts();
+                let pick = |rng: &mut Rng| -> Option<EmberContact> {
+                    (!residents.is_empty())
+                        .then(|| residents[rng.below(residents.len() as u64) as usize].clone())
+                };
+                match rng.below(100) {
+                    0..=44 => {
+                        rt.add_contact(fuzz_contact(&mut rng, &addrs, now));
+                    }
+                    45..=54 => {
+                        if let Some(c) = pick(&mut rng) {
+                            let addr = if rng.below(4) == 0 {
+                                addrs[rng.below(addrs.len() as u64) as usize]
+                            } else {
+                                c.addr
+                            };
+                            rt.mark_alive(&c.node_id, addr, &c.noise_pub);
+                        }
+                    }
+                    55..=59 => {
+                        if let Some(c) = pick(&mut rng) {
+                            if rt.mark_failed(&c.node_id) {
+                                rt.evict_and_replace(&c.node_id);
+                            }
+                        }
+                    }
+                    60..=64 => {
+                        rt.evict_and_replace(&fuzz_id(rng.below(400)));
+                    }
+                    65..=69 => {
+                        rt.remove_contact(&fuzz_id(rng.below(400)));
+                    }
+                    70..=74 => {
+                        let age = [60, 600, 3600, i64::MAX][rng.below(4) as usize];
+                        let in_use: HashSet<EmberNodeId> =
+                            residents.iter().take(3).map(|c| c.node_id).collect();
+                        rt.remove_stale(now, age, &in_use);
+                    }
+                    75..=77 => {
+                        // Now and then a clock that reads before the epoch,
+                        // which un-verifies whatever it pulls back.
+                        let at = if rng.below(10) == 0 { -100 } else { now };
+                        rt.clamp_future_timestamps(at);
+                    }
+                    78..=82 => {
+                        rt.enforce_scale_quotas();
+                    }
+                    83..=87 => {
+                        rt.promote_cached_contacts();
+                    }
+                    88..=90 => {
+                        block_private = !block_private;
+                        rt.set_block_private_ips(block_private);
+                    }
+                    _ => {
+                        let batch = (0..3)
+                            .map(|_| fuzz_contact(&mut rng, &addrs, now))
+                            .collect();
+                        rt.load_contacts(batch);
+                    }
+                }
+
+                rt.assert_residents_indexed();
+                if step % 8 == 0 {
+                    for addr in &addrs {
+                        let claimants = rt.residents.by_addr.get(addr).map_or(0, Vec::len);
+                        let found = rt.contact_at(*addr);
+                        saw_shared_addr |= claimants > 1 && found.is_some();
+                    }
+                }
+                max_verified = max_verified.max(rt.verified_len());
+                saw_cache |= rt.cached_len() > 0;
+            }
+            assert!(
+                max_verified >= 40,
+                "the sequence has to build a real table, reached {max_verified}"
+            );
+            assert!(saw_shared_addr, "and has to put several ids on one address");
+            assert!(saw_cache, "and has to spill into the replacement caches");
+        }
+    }
+
+    /// Several node ids claiming one address: the verified one wins, and among
+    /// equals the first in bucket order does, however the index stores them.
+    #[test]
+    fn contact_at_keeps_its_winner_among_several_claimants() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let shared = SocketAddr::from(([80, 7, 7, 7], 4672));
+        fn claimant(rt: &mut RoutingTable, addr: SocketAddr, first: u8, last_seen: i64) -> EmberNodeId {
+            let mut id = [0u8; 16];
+            id[0] = first;
+            let c = EmberContact {
+                node_id: EmberNodeId(id),
+                addr,
+                noise_pub: [first; 32],
+                ed25519_pub: [first; 32],
+                last_seen,
+                failed_queries: 0,
+            };
+            assert!(matches!(rt.add_contact(c), AddResult::Added));
+            EmberNodeId(id)
+        }
+        let far_lead = claimant(&mut rt, shared, 0x80, 0);
+        let near_lead = claimant(&mut rt, shared, 0x01, 0);
+        assert_eq!(rt.contact_at(shared).unwrap().node_id, near_lead);
+
+        let far_verified = claimant(&mut rt, shared, 0x40, chrono::Utc::now().timestamp());
+        assert_eq!(rt.contact_at(shared).unwrap().node_id, far_verified);
+
+        assert!(rt.remove_contact(&far_verified));
+        assert_eq!(rt.contact_at(shared).unwrap().node_id, near_lead);
+        assert!(rt.remove_contact(&near_lead));
+        assert_eq!(rt.contact_at(shared).unwrap().node_id, far_lead);
+        assert!(rt.remove_contact(&far_lead));
+        assert!(rt.contact_at(shared).is_none());
+        rt.assert_residents_indexed();
+    }
+
+    /// `find_closest` and `find_closest_prefer_verified` select rather than
+    /// sort the whole table; the answer has to be exactly what a stable sort
+    /// by distance gives.
+    #[test]
+    fn bounded_selection_matches_a_full_stable_sort() {
+        fn by_sort(mut v: Vec<(EmberNodeId, EmberContact)>, count: usize) -> Vec<EmberNodeId> {
+            v.sort_by_key(|a| a.0 .0);
+            v.into_iter().take(count).map(|(_, c)| c.node_id).collect()
+        }
+        let ids = |v: Vec<EmberContact>| v.into_iter().map(|c| c.node_id).collect::<Vec<_>>();
+
+        let addrs = fuzz_addrs();
+        for (seed, lead_only) in [(11u64, false), (12, false), (13, true)] {
+            let mut rng = Rng(seed);
+            let mut rt = RoutingTable::new(make_id(0), false);
+            let now = chrono::Utc::now().timestamp();
+            for _ in 0..600 {
+                let mut c = fuzz_contact(&mut rng, &addrs, now);
+                if lead_only {
+                    c.last_seen = 0;
+                }
+                rt.add_contact(c);
+            }
+            let all = rt.all_contacts();
+            assert!(all.len() > K_BUCKET_SIZE);
+            assert_eq!(rt.verified_len() == 0, lead_only);
+
+            for _ in 0..24 {
+                let mut raw = [0u8; 16];
+                for b in raw.iter_mut() {
+                    *b = rng.next() as u8;
+                }
+                let target = EmberNodeId(raw);
+                let tagged = |keep: &dyn Fn(&EmberContact) -> bool| {
+                    all.iter()
+                        .filter(|c| keep(c))
+                        .map(|c| (target.distance(&c.node_id), c.clone()))
+                        .collect::<Vec<_>>()
+                };
+                let verified_only = rt.verified_len() > 0;
+                for count in (0..=K_BUCKET_SIZE + 2).chain([all.len() - 1, all.len() + 5]) {
+                    assert_eq!(
+                        ids(rt.find_closest(&target, count)),
+                        by_sort(tagged(&|c| !verified_only || c.is_verified()), count),
+                        "find_closest, count {count}"
+                    );
+                    let mut expected = by_sort(tagged(&|c| c.is_verified()), count);
+                    if expected.len() < count {
+                        let room = count - expected.len();
+                        expected.extend(by_sort(tagged(&|c| !c.is_verified()), room));
+                    }
+                    assert_eq!(
+                        ids(rt.find_closest_prefer_verified(&target, count)),
+                        expected,
+                        "find_closest_prefer_verified, count {count}"
+                    );
+                }
+            }
+        }
     }
 }

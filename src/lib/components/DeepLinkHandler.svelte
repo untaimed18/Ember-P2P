@@ -36,7 +36,10 @@
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { cancelIncomingCollection, presentIncomingCollection } from '$lib/stores/collection';
   import { toastSuccess, toastError } from '$lib/stores/toast';
-  import { translateError } from '$lib/i18n';
+  import { codedErrorOf, translateError } from '$lib/i18n';
+  import { serverMetDownloadedText } from '$lib/commandReplies';
+  import { plural } from '$lib/plural';
+  import { formatBytes, formatNumber } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
 
   type ConfirmDecision = 'accept' | 'reject' | 'defer';
@@ -65,24 +68,11 @@
     }
   }
 
-  function formatSize(bytes: number): string {
-    if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
-    if (bytes < 1024) return `${bytes} B`;
-    const units = ['KiB', 'MiB', 'GiB', 'TiB'];
-    let value = bytes;
-    let unit = -1;
-    do {
-      value /= 1024;
-      unit++;
-    } while (value >= 1024 && unit < units.length - 1);
-    return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[unit]}`;
-  }
-
   function deepLinkConfirmationMessage(preview: DeepLinkPreview): string {
     if (preview.kind === 'file') {
       const lines = [
         preview.name ?? '',
-        formatSize(preview.size ?? 0),
+        formatBytes(preview.size ?? 0),
         preview.hash ?? '',
       ];
       if (preview.ember) {
@@ -95,16 +85,30 @@
     if (preview.kind === 'channel') {
       return `${preview.name ?? m.nav_channels()}\n${preview.hash ?? ''}`;
     }
+    if (preview.kind === 'friend') {
+      return m.deeplink_friend_confirm({ hash: preview.hash ?? '' });
+    }
     return preview.name ?? '';
+  }
+
+  function deepLinkConfirmLabel(preview: DeepLinkPreview): string {
+    switch (preview.kind) {
+      case 'file': return m.search_ctx_download();
+      case 'server': return m.servers_connect();
+      case 'serverList': return m.deeplink_confirm_update_server_list();
+      default: return m.deeplink_confirm_open();
+    }
   }
 
   let confirmOpen = $state(false);
   let confirmMessage = $state('');
+  let confirmLabel = $state('');
   let confirmResolver: ((decision: ConfirmDecision) => void) | null = null;
 
   function requestConfirmation(preview: DeepLinkPreview): Promise<ConfirmDecision> {
     if (destroyed) return Promise.resolve('defer');
     confirmMessage = deepLinkConfirmationMessage(preview);
+    confirmLabel = deepLinkConfirmLabel(preview);
     confirmOpen = true;
     return new Promise((resolve) => {
       confirmResolver = resolve;
@@ -188,16 +192,16 @@
           );
           return 'fail';
         }
-        // Add to the list, but don't let a duplicate-add error block the
-        // connect — a link pointing at an already-known server should still
-        // connect rather than surface a confusing failure.
+        // A link to a server that is already listed should still connect.
         try {
           await addServer(ip, port, '');
-        } catch (e) {
-          console.warn('Deep link: add server failed (continuing to connect):', e);
+        } catch (e: unknown) {
+          const code = codedErrorOf(e)?.code;
+          if (code === 'server_add_declined') return 'done';
+          if (code !== 'server_already_listed') throw e;
         }
-        const msg = await connectToServer(ip, port);
-        if (!destroyed) toastSuccess(msg);
+        await connectToServer(ip, port);
+        if (!destroyed) toastSuccess(m.servers_connecting_to({ address: `${ip}:${port}` }));
       } else if (preview.kind === 'serverList') {
         const segs = ed2kSegments(payload); // ['serverlist', url]
         const url = preview.endpoint || segs[1] || '';
@@ -207,8 +211,16 @@
           toastError(m.security_url_must_be_https());
           return 'fail';
         }
-        const msg = await downloadServerMet(url);
-        if (!destroyed) toastSuccess(msg);
+        let reply: string;
+        try {
+          reply = await downloadServerMet(url);
+        } catch (e: unknown) {
+          // Declining the native prompt is the user's answer, like
+          // `server_add_declined` above, not a failure to park for Review.
+          if (codedErrorOf(e)?.code === 'server_met_declined') return 'done';
+          throw e;
+        }
+        if (!destroyed) toastSuccess(serverMetDownloadedText(reply));
       } else if (preview.kind === 'collection') {
         // The native side resolves this durable queue id to the OS-delivered
         // path. Never return the raw path to an unrestricted path-taking IPC
@@ -228,11 +240,21 @@
         }
         await presented;
         if (!destroyed) {
-          toastSuccess(m.library_collection_loaded({ name: coll.name, count: coll.files.length }));
+          const count = formatNumber(coll.files.length);
+          toastSuccess(plural(coll.files.length, {
+            one: () => m.library_collection_loaded_one({ name: coll.name }),
+            few: () => m.library_collection_loaded_few({ name: coll.name, count }),
+            other: () => m.library_collection_loaded({ name: coll.name, count }),
+          }));
         }
       } else if (preview.kind === 'channel') {
         await goto(`/channels?join=${encodeURIComponent(payload)}`);
         if (get(page).url.pathname !== '/channels') {
+          return 'defer';
+        }
+      } else if (preview.kind === 'friend') {
+        await goto(`/friends?add=${encodeURIComponent(payload)}`);
+        if (get(page).url.pathname !== '/friends') {
           return 'defer';
         }
       }
@@ -396,7 +418,7 @@
   bind:open={confirmOpen}
   title={m.deeplink_confirm_title()}
   message={confirmMessage}
-  confirmLabel={m.deeplink_confirm_open()}
+  confirmLabel={confirmLabel || m.deeplink_confirm_open()}
   cancelLabel={m.deeplink_confirm_ignore()}
   isolateMessage={true}
   onconfirm={() => resolveConfirmation('accept')}
@@ -407,9 +429,11 @@
 {#if deferredCount > 0}
   <div class="deferred-link-notice" role="status" aria-live="polite">
     <span>
-      {deferredCount === 1
-        ? m.deeplink_pending_one()
-        : m.deeplink_pending_other({ count: deferredCount })}
+      {plural(deferredCount, {
+        one: m.deeplink_pending_one,
+        few: () => m.deeplink_pending_few({ count: deferredCount }),
+        other: () => m.deeplink_pending_other({ count: deferredCount }),
+      })}
     </span>
     <button
       type="button"
@@ -437,7 +461,7 @@
     background: var(--bg-secondary);
     color: var(--text-primary);
     box-shadow: var(--shadow-md);
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
 
   .deferred-link-notice span {

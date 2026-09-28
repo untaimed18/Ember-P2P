@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -78,15 +79,62 @@ fn sanitize_comment_field(text: &str, max_chars: usize, max_bytes: usize) -> Str
     )
 }
 
+/// Distinct `(file, publisher)` notes one source IP may hold in the store.
+/// KAD `PublishNotesReq` names its publisher in a wire field, so without this
+/// one host could mint a fresh publisher per packet and cycle every honest
+/// note out of a file.
+const MAX_KAD_NOTES_PER_SOURCE_IP: usize = 32;
+/// Source IPs tracked for that budget; the least recently seen is forgotten.
+const MAX_KAD_NOTE_SOURCE_IPS: usize = 4096;
+
+#[derive(Default)]
+struct KadNoteSource {
+    last_seen: u64,
+    notes: HashSet<(String, String)>,
+}
+
 pub struct CommentManager {
     /// file_hash_hex -> comment info
     comments: HashMap<String, FileCommentInfo>,
+    /// Last peer-comment activity per file, for evicting the least recently
+    /// seen file when the store is full. Each file's `peer_comments` is kept
+    /// in the same order (oldest first).
+    file_seen: HashMap<String, u64>,
+    clock: u64,
+    kad_note_sources: HashMap<Ipv4Addr, KadNoteSource>,
 }
 
 impl CommentManager {
     pub fn new() -> Self {
         Self {
             comments: HashMap::new(),
+            file_seen: HashMap::new(),
+            clock: 0,
+            kad_note_sources: HashMap::new(),
+        }
+    }
+
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    /// Drop the least recently seen file that holds only peer comments. Our
+    /// own rating and comment are the user's data and are never evicted.
+    fn evict_least_recent_file(&mut self) -> bool {
+        let victim = self
+            .comments
+            .iter()
+            .filter(|(_, info)| info.our_rating == RATING_NOT_RATED && info.our_comment.is_empty())
+            .min_by_key(|(hash, _)| self.file_seen.get(*hash).copied().unwrap_or(0))
+            .map(|(hash, _)| hash.clone());
+        match victim {
+            Some(hash) => {
+                self.comments.remove(&hash);
+                self.file_seen.remove(&hash);
+                true
+            }
+            None => false,
         }
     }
 
@@ -105,9 +153,59 @@ impl CommentManager {
         comment: String,
         origin: u8,
     ) {
-        if !self.comments.contains_key(file_hash) && self.comments.len() >= MAX_COMMENT_FILES {
-            return;
+        self.record_peer_comment(file_hash, user_name, rating, comment, origin);
+    }
+
+    /// Record a KAD note received from `source_ip`, subject to that IP's
+    /// [`MAX_KAD_NOTES_PER_SOURCE_IP`] budget. Returns whether it was stored.
+    pub fn add_kad_note(
+        &mut self,
+        file_hash: &str,
+        source_ip: Ipv4Addr,
+        publisher: String,
+        rating: u8,
+        comment: String,
+    ) -> bool {
+        let key = (file_hash.to_string(), publisher.clone());
+        if let Some(source) = self.kad_note_sources.get(&source_ip) {
+            if !source.notes.contains(&key) && source.notes.len() >= MAX_KAD_NOTES_PER_SOURCE_IP {
+                return false;
+            }
         }
+        if !self.record_peer_comment(file_hash, publisher, rating, comment, 1) {
+            return false;
+        }
+        let now = self.tick();
+        if !self.kad_note_sources.contains_key(&source_ip)
+            && self.kad_note_sources.len() >= MAX_KAD_NOTE_SOURCE_IPS
+        {
+            if let Some(oldest) = self
+                .kad_note_sources
+                .iter()
+                .min_by_key(|(_, source)| source.last_seen)
+                .map(|(ip, _)| *ip)
+            {
+                self.kad_note_sources.remove(&oldest);
+            }
+        }
+        let source = self.kad_note_sources.entry(source_ip).or_default();
+        source.last_seen = now;
+        source.notes.insert(key);
+        true
+    }
+
+    /// Returns whether the comment was stored. A full store evicts the least
+    /// recently seen file, and a full file its least recently seen comment,
+    /// rather than refusing: refusing froze whatever arrived first — including
+    /// unsolicited junk — in place for the rest of the session.
+    fn record_peer_comment(
+        &mut self,
+        file_hash: &str,
+        user_name: String,
+        rating: u8,
+        comment: String,
+        origin: u8,
+    ) -> bool {
         let user_name =
             sanitize_comment_field(&user_name, MAX_COMMENT_USER_CHARS, MAX_COMMENT_USER_BYTES);
         let comment = sanitize_comment_field(&comment, MAX_COMMENT_CHARS, MAX_COMMENT_BYTES);
@@ -117,8 +215,16 @@ impl CommentManager {
         // votes entirely, so they never reached `average_rating` or
         // `fake_rating_stats`. Bail only when the packet carried nothing at all.
         if user_name.is_empty() && comment.is_empty() && rating == RATING_NOT_RATED {
-            return;
+            return false;
         }
+        if !self.comments.contains_key(file_hash)
+            && self.comments.len() >= MAX_COMMENT_FILES
+            && !self.evict_least_recent_file()
+        {
+            return false;
+        }
+        let now = self.tick();
+        self.file_seen.insert(file_hash.to_string(), now);
         let entry = self.comments.entry(file_hash.to_string()).or_default();
         // An empty `user_name` names nobody, so it cannot serve as the dedup
         // key: every anonymous vote would collapse onto a single `""` row, so
@@ -131,17 +237,19 @@ impl CommentManager {
         } else {
             entry
                 .peer_comments
-                .iter_mut()
-                .find(|c| c.user_name == user_name)
+                .iter()
+                .position(|c| c.user_name == user_name)
         };
-        if let Some(existing) = existing {
-            existing.rating = rating;
-            existing.comment = comment;
-            existing.origin = origin;
-            return;
+        if let Some(pos) = existing {
+            let mut updated = entry.peer_comments.remove(pos);
+            updated.rating = rating;
+            updated.comment = comment;
+            updated.origin = origin;
+            entry.peer_comments.push(updated);
+            return true;
         }
         if entry.peer_comments.len() >= MAX_COMMENTS_PER_FILE {
-            return;
+            entry.peer_comments.remove(0);
         }
         entry.peer_comments.push(FileComment {
             user_name,
@@ -149,6 +257,7 @@ impl CommentManager {
             comment,
             origin,
         });
+        true
     }
 
     pub fn get_comments(&self, file_hash: &str) -> Option<&FileCommentInfo> {
@@ -359,6 +468,66 @@ mod tests {
             cm.get_comments("cc").unwrap().peer_comments[0].comment.len(),
             MAX_COMMENT_CHARS,
             "a plain-ASCII comment must still keep its full character allowance"
+        );
+    }
+
+    #[test]
+    fn full_file_evicts_its_least_recently_seen_comment() {
+        let mut cm = CommentManager::new();
+        for i in 0..MAX_COMMENTS_PER_FILE {
+            cm.add_peer_comment("aa", format!("u{i}"), RATING_GOOD, String::new(), 1);
+        }
+        // Refreshing u0 makes u1 the oldest.
+        cm.add_peer_comment("aa", "u0".into(), RATING_FAIR, String::new(), 1);
+        cm.add_peer_comment("aa", "late".into(), RATING_FAKE, String::new(), 1);
+        let names: Vec<&str> = cm
+            .get_comments("aa")
+            .unwrap()
+            .peer_comments
+            .iter()
+            .map(|c| c.user_name.as_str())
+            .collect();
+        assert_eq!(names.len(), MAX_COMMENTS_PER_FILE);
+        assert!(names.contains(&"late"), "a new comment must not be refused when full");
+        assert!(names.contains(&"u0"), "a refreshed comment is recent again");
+        assert!(!names.contains(&"u1"), "the least recently seen comment goes first");
+    }
+
+    #[test]
+    fn full_store_evicts_least_recent_file_but_never_our_own_comment() {
+        let mut cm = CommentManager::new();
+        cm.set_our_comment("ours", RATING_FAKE, "mine".into());
+        for i in 0..MAX_COMMENT_FILES - 1 {
+            cm.add_peer_comment(&format!("f{i}"), "p".into(), RATING_GOOD, String::new(), 1);
+        }
+        cm.add_peer_comment("f0", "q".into(), RATING_GOOD, String::new(), 1);
+        assert!(cm.record_peer_comment("new", "p".into(), RATING_GOOD, String::new(), 1));
+        assert!(cm.get_comments("new").is_some());
+        assert!(cm.get_comments("f0").is_some(), "recently touched file survives");
+        assert!(cm.get_comments("f1").is_none(), "least recently seen file is evicted");
+        assert_eq!(cm.get_our_comment("ours"), (RATING_FAKE, "mine"));
+    }
+
+    #[test]
+    fn kad_notes_are_capped_per_source_ip() {
+        let mut cm = CommentManager::new();
+        let spammer = Ipv4Addr::new(203, 0, 113, 7);
+        for i in 0..MAX_KAD_NOTES_PER_SOURCE_IP {
+            assert!(cm.add_kad_note("aa", spammer, format!("id{i}"), RATING_FAKE, String::new()));
+        }
+        assert!(
+            !cm.add_kad_note("aa", spammer, "fresh-id".into(), RATING_FAKE, String::new()),
+            "a new wire publisher id must not buy another slot"
+        );
+        assert!(
+            cm.add_kad_note("aa", spammer, "id0".into(), RATING_GOOD, String::new()),
+            "updating a note the IP already holds stays allowed"
+        );
+        let other = Ipv4Addr::new(198, 51, 100, 1);
+        assert!(cm.add_kad_note("aa", other, "honest".into(), RATING_GOOD, String::new()));
+        assert_eq!(
+            cm.get_comments("aa").unwrap().peer_comments.len(),
+            MAX_KAD_NOTES_PER_SOURCE_IP + 1
         );
     }
 

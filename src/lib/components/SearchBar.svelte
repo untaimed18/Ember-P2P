@@ -130,6 +130,7 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    if (e.isComposing || e.keyCode === 229) return;
     if (showRecent && recent.length > 0) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
@@ -187,10 +188,11 @@
     // list — drop any highlight (possibly left behind by mouse hover) so
     // Delete can't unexpectedly remove a saved search.
     activeIndex = -1;
+    showRecent = !!recentKey && historyEnabled && recent.length > 0 && value === '';
   }
 
   function handleFocus() {
-    if (recentKey && historyEnabled && recent.length > 0) {
+    if (recentKey && historyEnabled && recent.length > 0 && value === '') {
       showRecent = true;
     }
   }
@@ -267,7 +269,16 @@
       />
     {/if}
     {#if value}
-      <button type="button" class="clear-btn" onclick={() => (value = '')} aria-label={m.search_bar_clear()}>
+      <button
+        type="button"
+        class="clear-btn"
+        onclick={() => {
+          value = '';
+          inputEl?.focus();
+        }}
+        title={m.search_bar_clear()}
+        aria-label={m.search_bar_clear()}
+      >
         <IconX size={11} />
       </button>
     {/if}
@@ -352,7 +363,7 @@
       var(--bg-input)
     );
     box-shadow: var(--shadow-sm);
-    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    transition: border-color var(--transition-normal) ease, box-shadow var(--transition-normal) ease;
   }
 
   .search-bar:focus-within {
@@ -369,7 +380,7 @@
     border-radius: 50%;
     background: var(--accent-fill);
     color: var(--text-accent);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 700;
     flex-shrink: 0;
   }
@@ -379,7 +390,7 @@
     border: none;
     background: none;
     padding: 10px 0;
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-weight: 500;
     color: var(--text-primary);
     min-width: 0;
@@ -422,10 +433,10 @@
     left: 0;
     right: 0;
     z-index: 9999;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-md);
+    background: var(--ctx-surface);
+    border: 1px solid var(--ctx-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--ctx-shadow);
     overflow: hidden;
     max-height: 280px;
     overflow-y: auto;
@@ -436,7 +447,7 @@
     justify-content: space-between;
     align-items: center;
     padding: 6px 12px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     text-transform: uppercase;
     letter-spacing: 0.5px;
     color: var(--text-muted);
@@ -448,7 +459,7 @@
     background: none;
     border: none;
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     text-transform: none;
     letter-spacing: normal;
     cursor: pointer;
@@ -471,7 +482,7 @@
     border: none;
     background: transparent;
     color: var(--text-primary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     text-align: left;
     cursor: pointer;
   }

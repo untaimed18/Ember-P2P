@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import * as m from '$lib/paraglide/messages';
 import { withTimeout } from '$lib/utils';
 import type { FileInfo, MediaMetadata } from '$lib/types';
 
@@ -8,14 +9,111 @@ export interface SharedFolderPick {
   /** Folders this selection newly shared; a scan is running for each. */
   added: string[];
   /** Folders the user picked that were already shared. Reported separately
-   *  because the picker is the OS dialog and cannot mark them in the tree, so
-   *  this is the user's only indication. */
+   *  because the system-dialog fallback cannot mark them in the tree. */
   already_shared: string[];
+  /** Files shared into a folder that was already on the list. */
+  files_shared?: string[];
+  /** Coded errors for the part of the selection that did not land while the
+   *  rest did. A selection that shares nothing rejects instead. */
+  failed?: string[];
 }
 
 /** Open the backend-owned native picker and add every selected folder. */
 export async function addSharedFolder(): Promise<SharedFolderPick> {
-  return invoke('pick_shared_folder');
+  return invoke('pick_shared_folder', { title: m.picker_shared_folders() });
+}
+
+export type ShareBrowserKind =
+  | 'this_pc'
+  | 'home'
+  | 'desktop'
+  | 'documents'
+  | 'downloads'
+  | 'music'
+  | 'pictures'
+  | 'videos'
+  | 'drive'
+  | 'folder'
+  | 'file';
+
+/** `inherited`: inside a folder shared whole, so shared with it.
+ *  `overlap`: inside a partly shared folder and not among what it offers.
+ *  `contains_shared`: holds a folder that is already shared. */
+export type ShareBrowserStatus =
+  | 'shareable'
+  | 'partial'
+  | 'already'
+  | 'inherited'
+  | 'overlap'
+  | 'contains_shared'
+  | 'blocked';
+
+export interface ShareBrowserEntry {
+  id: number;
+  name: string;
+  path: string;
+  kind: ShareBrowserKind;
+  letter?: string | null;
+  parent_id: number | null;
+  share_status: ShareBrowserStatus;
+  /** Byte length. Present for files. */
+  size?: number | null;
+  /** Files currently offered from a partly shared folder. */
+  shared_count?: number | null;
+}
+
+export interface ShareBrowserView {
+  session_id: number;
+  current: ShareBrowserEntry;
+  children: ShareBrowserEntry[];
+  /** `children` is the first page of a location with more folders and files
+   *  than the backend lists in one call. */
+  truncated: boolean;
+}
+
+export async function openShareBrowser(): Promise<ShareBrowserView> {
+  return invoke('open_share_browser');
+}
+
+export async function listShareBrowserChildren(
+  sessionId: number,
+  entryId: number,
+): Promise<ShareBrowserView> {
+  return invoke('list_share_browser_children', { sessionId, entryId });
+}
+
+export async function navigateShareBrowser(
+  sessionId: number,
+  path: string,
+): Promise<ShareBrowserView> {
+  return invoke('navigate_share_browser', { sessionId, path });
+}
+
+export async function shareBrowserSelection(
+  sessionId: number,
+  entryIds: number[],
+): Promise<SharedFolderPick> {
+  return invoke('share_browser_selection', { sessionId, entryIds });
+}
+
+export interface ShareBrowserMeasure {
+  files: number;
+  bytes: number;
+  /** False when counting stopped early; `files` and `bytes` are lower bounds. */
+  complete: boolean;
+}
+
+/** Count the files, and their bytes, under the given folder entries, by the
+ *  rules the scan will use. Starting a count stops the previous one. */
+export async function measureShareBrowserEntries(
+  sessionId: number,
+  entryIds: number[],
+): Promise<ShareBrowserMeasure> {
+  return invoke('measure_share_browser_entries', { sessionId, entryIds });
+}
+
+export async function closeShareBrowser(sessionId: number): Promise<void> {
+  return invoke('close_share_browser', { sessionId });
 }
 
 /** Approve the folders a dropped file asked about.
@@ -24,8 +122,11 @@ export async function addSharedFolder(): Promise<SharedFolderPick> {
  *  leave the backend, because a dropped path is authorization by virtue of the
  *  OS handing it to the native window, and routing it through the renderer
  *  would throw that away. Returns how many folders were shared. */
-export async function confirmDroppedFolders(token: number): Promise<number> {
-  return invoke('confirm_dropped_folders', { token });
+export async function confirmDroppedFolders(
+  token: number,
+  onlyDroppedFiles?: boolean,
+): Promise<number> {
+  return invoke('confirm_dropped_folders', { token, onlyDroppedFiles: onlyDroppedFiles ?? null });
 }
 
 /** Discard a dropped-file prompt the user declined. */
@@ -41,6 +142,16 @@ export async function getSharedFiles(): Promise<FileInfo[]> {
   return invoke('get_shared_files');
 }
 
+/** `files` is `null` when the library still matches `etag`. */
+export interface SharedFilesSnapshot {
+  etag: string;
+  files: FileInfo[] | null;
+}
+
+export async function getSharedFilesIfChanged(etag: string | null): Promise<SharedFilesSnapshot> {
+  return invoke('get_shared_files_if_changed', { etag });
+}
+
 /**
  * Count and total size of files the user is actively sharing (the `shared`
  * flag is set), not the total number of files in the library. Lightweight
@@ -50,8 +161,26 @@ export async function getSharedFileCount(): Promise<{ count: number; total_bytes
   return invoke('get_shared_file_count');
 }
 
+/** Which of `hashes` are in the library (shared or not), lowercased. At most
+ *  5,000 per call. */
+export async function libraryHasHashes(hashes: string[]): Promise<string[]> {
+  return invoke('library_has_hashes', { hashes });
+}
+
 export async function getSharedFolders(): Promise<string[]> {
   return invoke('get_shared_folders');
+}
+
+/** Shared folders that are on disk but not approved, so none of their files
+ *  can be uploaded. Offline folders are not included. */
+export async function getUnapprovedSharedFolders(): Promise<string[]> {
+  return invoke('get_unapproved_shared_folders');
+}
+
+/** Ask the user, in a native dialog, to re-approve a shared folder Ember no
+ *  longer recognises. Resolves to whether it is approved afterwards. */
+export async function reapproveSharedFolder(path: string): Promise<boolean> {
+  return invoke('reapprove_shared_folder', { path });
 }
 
 export async function getFolderPriorities(): Promise<Record<string, string>> {

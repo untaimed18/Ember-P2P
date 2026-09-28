@@ -1,5 +1,7 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import * as m from '$lib/paraglide/messages';
+  import { speedUnitLabel } from '$lib/utils';
 
   type Unit = 'B/s' | 'KB/s' | 'MB/s';
 
@@ -49,6 +51,8 @@
   // wizard) was swallowed — leaving the box showing an abandoned value that
   // no longer matched the setting underneath it.
   let lastSyncedValue = -1;
+  let inputEl: HTMLInputElement | undefined = $state(undefined);
+  let unlimitedEl: HTMLDivElement | undefined = $state(undefined);
   const inputId = $derived(
     [
       'speed-input',
@@ -104,7 +108,9 @@
       value = 0;
     } else {
       displayValue = raw;
-      value = Math.round(num * multipliers[unit]);
+      // 0 means Unlimited, so a positive rate that rounds to 0 B/s must not
+      // silently remove the cap.
+      value = Math.max(1, Math.round(num * multipliers[unit]));
     }
     lastSyncedValue = value;
   }
@@ -131,19 +137,25 @@
     // `lastSyncedValue === value`), leaving the numeric input showing the
     // stale/empty `displayValue` while the bound value is actually 512 KB/s.
     syncFromBytes(value);
+    // The control that was just activated is swapped out of the DOM, which
+    // would otherwise drop focus to the body.
+    void tick().then(() => (value === 0 ? unlimitedEl : inputEl)?.focus());
   }
 </script>
 
 {#if label}
-  <label class="speed-label" for={inputId}>{label}</label>
+  <!-- No `for` while unlimited: the number input it names is not rendered,
+       and the button that replaces it carries the label in its own name. -->
+  <label class="speed-label" for={showUnlimited ? undefined : inputId}>{label}</label>
 {/if}
 <div class="speed-input" class:unlimited={showUnlimited}>
   {#if showUnlimited}
     <div
+      bind:this={unlimitedEl}
       class="unlimited-display"
       role="button"
       tabindex="0"
-      aria-label={label ? `${label}: ${m.speed_input_unlimited()}` : m.speed_input_unlimited_aria()}
+      aria-label={label ? `${label}: ${m.speed_input_unlimited_aria()}` : m.speed_input_unlimited_aria()}
       onclick={toggleUnlimited}
       onkeydown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
@@ -157,6 +169,7 @@
     </div>
   {:else}
     <input
+      bind:this={inputEl}
       id={inputId}
       type="number"
       min="0"
@@ -170,9 +183,9 @@
       aria-label={label || undefined}
     />
     <select value={unit} onchange={handleUnitChange} class="speed-unit" aria-label={m.speed_input_unit_label()}>
-      <option value="B/s">B/s</option>
-      <option value="KB/s">KB/s</option>
-      <option value="MB/s">MB/s</option>
+      <option value="B/s">{speedUnitLabel(0)}</option>
+      <option value="KB/s">{speedUnitLabel(1)}</option>
+      <option value="MB/s">{speedUnitLabel(2)}</option>
     </select>
     <button type="button" class="unlimited-btn" onclick={toggleUnlimited} title={m.speed_input_set_unlimited()} aria-label={m.speed_input_set_unlimited()}>
       &infin;
@@ -183,7 +196,7 @@
 <style>
   .speed-label {
     display: block;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-secondary);
     margin-bottom: 6px;
   }
@@ -195,7 +208,7 @@
     border-radius: var(--radius-md);
     overflow: hidden;
     background: var(--bg-input);
-    transition: border-color 0.15s;
+    transition: border-color var(--transition-normal);
   }
 
   .speed-input:focus-within {
@@ -209,7 +222,7 @@
     background: transparent;
     color: var(--text-primary);
     padding: 7px 10px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     outline: none;
     box-shadow: none;
     min-width: 0;
@@ -230,7 +243,7 @@
     background-color: var(--bg-surface);
     color: var(--text-secondary);
     padding: 0 24px 0 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     cursor: pointer;
     outline: none;
@@ -251,11 +264,11 @@
     border-left: 1px solid var(--border);
     background: var(--bg-surface);
     color: var(--text-muted);
-    font-size: 16px;
+    font-size: var(--font-size-lg);
     cursor: pointer;
     padding: 0;
     border-radius: 0;
-    transition: color 0.15s, background 0.15s;
+    transition: color var(--transition-normal), background var(--transition-normal);
   }
 
   .unlimited-btn:hover {
@@ -273,13 +286,13 @@
   }
 
   .unlimited-text {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-muted);
   }
 
   .unlimited-hint {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     opacity: 0.6;
   }

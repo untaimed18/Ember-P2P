@@ -752,7 +752,14 @@ impl RoutingZone {
         }
     }
 
-    /// Remove stale/expired contacts from all bins. Returns IPs removed.
+    /// Remove dead contacts that are also stale or expired from all bins.
+    /// Returns IPs removed.
+    ///
+    /// Staleness alone is not enough, as in eMule, which only drops a contact
+    /// the small timer's probes have aged to dead: every contact goes stale
+    /// across a sleep of an hour or two (both clocks here are wall time), and
+    /// removing them all on the first tick after resume emptied the table
+    /// before a single probe could run.
     fn remove_stale(
         &mut self,
         now: i64,
@@ -762,7 +769,9 @@ impl RoutingZone {
         if let Some(bin) = &mut self.bin {
             let before = bin.len();
             bin.contacts.retain(|c| {
-                if dht_common::is_stale(now, c.last_seen, max_age_secs) || c.is_expired() {
+                if c.is_dead()
+                    && (dht_common::is_stale(now, c.last_seen, max_age_secs) || c.is_expired())
+                {
                     ips_removed.push(c.ip);
                     false
                 } else {
@@ -1319,6 +1328,18 @@ impl RoutingTable {
             }
         }
         false
+    }
+
+    /// Verify `id` only when its stored address is `sender_ip`. A valid
+    /// receiver key proves the sender owns the IP it sent from, not the
+    /// address of whatever contact id it claims.
+    pub fn mark_verified_from(&mut self, id: &KadId, sender_ip: Ipv4Addr) -> bool {
+        if self.get_contact(id).is_some_and(|c| c.ip == sender_ip) {
+            self.mark_verified(id);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn mark_verified(&mut self, id: &KadId) {
@@ -1943,6 +1964,29 @@ mod find_closest_tests {
             closest.iter().any(|c| c.id == unverified.id),
             "cold start may seed from unverified contacts"
         );
+    }
+
+    #[test]
+    fn kad_mark_verified_from_mismatched_ip_stays_unverified() {
+        let mut rt = RoutingTable::new(KadId([0xFF; 16]), false);
+        let mut victim = contact(0x03, 3);
+        victim.verified = false;
+        assert!(rt.insert(victim.clone()));
+
+        let attacker_ip = Ipv4Addr::new(9, 9, 9, 9);
+        assert!(!rt.mark_verified_from(&victim.id, attacker_ip));
+        assert!(!rt.get_contact(&victim.id).unwrap().verified);
+        assert_eq!(rt.verified_len(), 0);
+
+        assert!(rt.mark_verified_from(&victim.id, victim.ip));
+        assert!(rt.get_contact(&victim.id).unwrap().verified);
+    }
+
+    #[test]
+    fn kad_mark_verified_from_unknown_contact_is_noop() {
+        let mut rt = RoutingTable::new(KadId([0xFF; 16]), false);
+        assert!(!rt.mark_verified_from(&KadId([0x04; 16]), Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(rt.len(), 0);
     }
 
     #[test]

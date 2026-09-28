@@ -1,17 +1,21 @@
 <script lang="ts">
-  import { getFriends, addFriend, removeFriend, blockFriend, unblockFriend, getBlockedFriends, isChatLocked, updateFriendNickname, getMyEmberHash, acceptFriendRequest, rejectFriendRequest, retryFriendSearch, type FriendInfo, type FriendRequestInfo, type BlockedInfo } from '$lib/api/friends';
+  import { getFriends, addFriend, removeFriend, blockFriend, unblockFriend, getBlockedFriends, isChatLocked, updateFriendNickname, getMyEmberHash, resetFriendCode, acceptFriendRequest, rejectFriendRequest, retryFriendSearch, type FriendInfo, type FriendRequestInfo, type BlockedInfo } from '$lib/api/friends';
+  import { carriesIntroSecret, friendHashFromCode, isAcceptedFriendInput } from '$lib/friendCode';
   import { getNetworkStats, kadRecheckFirewall } from '$lib/api/kad';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import BrowseFriendDialog from '$lib/components/BrowseFriendDialog.svelte';
   import { openChat as openChatTab, removeChatForFriend, renameTab as renameChatTab, retainChatTabs } from '$lib/stores/chatTabs';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
+  import { goto } from '$app/navigation';
+  import { page } from '$app/stores';
   import { listen } from '@tauri-apps/api/event';
   import { fade, fly } from 'svelte/transition';
   import { flip } from 'svelte/animate';
   import { toastError, toastWarning } from '$lib/stores/toast';
-  import { copyToClipboard, formatBytes } from '$lib/utils';
+  import { copyToClipboard, formatBytes, formatCalendarDate } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { plural } from '$lib/plural';
   import {
     onlineFriends as onlineFriendsStore,
     unreadCounts as unreadCountsStore,
@@ -27,14 +31,18 @@
     clearFileOffer,
     clearFileOffersForFriend,
     rememberFriendName,
-    rememberFriendNames,
+    friendNames as friendNamesStore,
+    friendsList as friendsListStore,
+    beginFriendsListFetch,
+    commitFriendsList,
+    acceptIncomingFileOffer,
   } from '$lib/stores/friends';
   import { appSettings } from '$lib/stores/settings';
   import { networkStats } from '$lib/stores/network';
   import { menuKeydown } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
 
-  let friends: FriendInfo[] = $state([]);
+  let friends: FriendInfo[] = $derived($friendsListStore);
   let chatDisabled = $derived($appSettings?.friend_chat_disabled === true);
   let loading = $state(true);
   let error: string | null = $state(null);
@@ -48,6 +56,12 @@
   let myHash = $state('');
   let myHashCopied = $state(false);
   let myHashCopyTimer: ReturnType<typeof setTimeout> | undefined;
+  let confirmResetCodeOpen = $state(false);
+  let resettingCode = $state(false);
+  /** Mutual friends we hold no key for and no longer publish the legacy intro
+   *  for, from the latest presence registration. Only a current Friend Code
+   *  lets them find us. */
+  let legacyStrandedFriends = $state(new Set<string>());
 
   let showAddForm = $state(false);
   let newHash = $state('');
@@ -121,24 +135,7 @@
     if (acceptingOffer) return;
     acceptingOffer = key;
     try {
-      const { startDownload } = await import('$lib/api/transfers');
-      // Seed the friend's last-known address when we have one; the backend
-      // falls back to rendezvous lookup and normal source discovery otherwise.
-      const f = friends.find(x => x.user_hash === offer.user_hash);
-      const ip = f?.last_ip?.trim() ?? '';
-      const port = f?.last_port ?? 0;
-      const res = await startDownload(
-        offer.file_hash,
-        offer.file_name,
-        offer.file_size,
-        ip && port > 0 ? ip : '',
-        ip && port > 0 ? port : 0,
-        undefined,
-        offer.ember_file_hash,
-        undefined,
-        offer.user_hash,
-      );
-      clearFileOffer(offer.user_hash, offer.file_hash);
+      const res = await acceptIncomingFileOffer(offer);
       // The backend reports an offer we already hold as `already_queued`
       // rather than an error, so saying "downloading" would claim something
       // new started when nothing did.
@@ -232,12 +229,9 @@
     // Delegate to the global multi-conversation dock. It opens the
     // dock if not already visible, adds (or focuses) a tab for this
     // friend, and lets the user keep chatting while navigating to
-    // other pages. `clearUnread` is also called inside
-    // `ChatConversation` on mount, but firing it here too keeps the
-    // friend-card badge from briefly flashing the stale count
-    // between click and tab-mount.
+    // other pages. Unread is cleared only after mark-as-read succeeds,
+    // so a failed IPC cannot hide a badge for messages that are still unread.
     openChatTab(f.user_hash, f.nickname || f.user_hash.slice(0, 8) + '\u2026');
-    clearUnread(f.user_hash);
   }
 
   function openBrowse(f: FriendInfo) {
@@ -259,7 +253,7 @@
     if (diff < 60) return m.friends_just_now();
     if (diff < 3600) return m.friends_minutes_ago({ minutes: Math.floor(diff / 60) });
     if (diff < 86400) return m.friends_hours_ago({ hours: Math.floor(diff / 3600) });
-    return new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    return formatCalendarDate(ts, { month: 'short', day: 'numeric' });
   }
 
   function friendPresence(f: FriendInfo): 'online' | 'offline' {
@@ -329,8 +323,12 @@
     try {
       await rejectFriendRequest(req.sender_hash);
       friendRequestsStore.update(reqs => reqs.filter(r => r.sender_hash !== req.sender_hash));
+      flash(m.friends_rejected_local());
+      await reloadFriendRequests();
+      await loadFriends();
     } catch (e: unknown) {
       error = toErr(e);
+      await reloadFriendRequests();
     } finally {
       endFriendRequestMutation();
       processingRequests.delete(req.sender_hash);
@@ -392,11 +390,30 @@
     } catch (e) {
       if (destroyed) return;
       recheckError = translateError(e, m.error_operation_failed());
+      recheckingFirewall = false;
+      return;
     }
     if (destroyed) return;
     clearTimeout(recheckTimer);
     recheckTimer = setTimeout(() => { recheckingFirewall = false; }, 5000);
   }
+
+  $effect(() => {
+    const addParam = $page.url.searchParams.get('add');
+    if (!addParam) return;
+    showAddForm = true;
+    newHash = addParam;
+    addError = null;
+    untrack(() => {
+      const next = new URL($page.url);
+      next.searchParams.delete('add');
+      void goto(`${next.pathname}${next.search}${next.hash}`, {
+        replaceState: true,
+        keepFocus: true,
+        noScroll: true,
+      }).catch(() => {});
+    });
+  });
 
   onMount(() => {
     destroyed = false;
@@ -405,7 +422,10 @@
     loadMyHash();
     isChatLocked()
       .then(v => { if (!destroyed) chatLocked = v; })
-      .catch((e) => console.warn('friends: failed to read chat lock state:', e));
+      .catch((e) => {
+        console.warn('friends: failed to read chat lock state:', e);
+        if (!destroyed) chatLocked = true;
+      });
     getNetworkStats()
       .then(s => { if (!destroyed) isFirewalled = s.firewalled; })
       .catch((e) => { console.warn('friends: initial getNetworkStats failed:', e); });
@@ -418,13 +438,9 @@
     // — we rely on the `onlineFriendsStore` subscription above to drive
     // `onlineFriends`, and the effect below takes care of the toast-clear
     // side effect. This avoids double event handling when the page is open.
-    listen<{ user_hash: string }>('ember:friend-confirmed', () => {
-      if (destroyed) return;
-      // Background rediscovery sweeps fire this every few minutes; that is not
-      // a reason to clear an error the user is currently reading.
-      loadFriends(false);
-    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
-      .catch((e) => console.error('friends: failed to register ember:friend-confirmed listener', e));
+    // 'ember:friend-confirmed' is likewise left to the store, whose debounced
+    // refresh writes the same `friendsList` this page renders from; a reload
+    // here per event doubled the `get_friends` calls of every rediscovery sweep.
 
     listen<{ firewalled: boolean }>('firewall-status', (event) => {
       if (destroyed) return;
@@ -434,7 +450,17 @@
     }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
       .catch((e) => console.error('friends: failed to register firewall-status listener', e));
 
-    listen<{ user_hash: string; reason?: string }>('ember:friend-search-failed', (event) => {
+    listen<{ intro_ok?: boolean; legacy_stranded_friends?: unknown }>('ember:friend-discoverable', (event) => {
+      if (destroyed) return;
+      // A failed registration carries no presence detail; keep the last answer.
+      if (typeof event.payload?.intro_ok !== 'boolean') return;
+      const raw = event.payload.legacy_stranded_friends;
+      const hashes = Array.isArray(raw) ? raw.map(validFriendHash).filter((h): h is string => h !== null) : [];
+      legacyStrandedFriends = new Set(hashes);
+    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
+      .catch((e) => console.error('friends: failed to register ember:friend-discoverable listener', e));
+
+    listen<{ user_hash: string; reason?: string; legacy_code?: boolean }>('ember:friend-search-failed', (event) => {
       if (destroyed) return;
       const hash = validFriendHash(event.payload?.user_hash);
       if (!hash) return;
@@ -451,6 +477,14 @@
           break;
         case 'secure_v2_required':
           msg = m.error_secure_friend_v2_required();
+          break;
+        case 'not_found':
+          // Someone added from an older code or a bare ID, who has not added
+          // us back, can only be found if they still run an old build. An
+          // established friend going unfound is just offline.
+          msg = event.payload?.legacy_code === true && f && !f.mutual
+            ? m.friends_search_needs_new_code({ name })
+            : null;
           break;
         default:
           msg = null;
@@ -511,22 +545,28 @@
    *  wipe a failure message the user is still reading. */
   async function loadFriends(clearError = true) {
     if (destroyed) return;
-    // Guard against overlapping loads (mount + 'ember:friend-confirmed' event,
-    // or rapid events) resolving out of order and clobbering newer data with a
+    // Guard against overlapping loads (mount plus a mutation's reload, or
+    // rapid mutations) resolving out of order and clobbering newer data with a
     // stale snapshot. Only the most recent invocation commits its result.
     const seq = ++loadFriendsSeq;
+    // The list itself now lives in the shared store, which the Transfers table
+    // and the confirm-event refresh also write. `loadFriendsSeq` only orders
+    // this page's own loads, so take a store ticket too and let the newest
+    // fetch win whichever surface started it.
+    const ticket = beginFriendsListFetch();
     loading = true;
     if (clearError) error = null;
     try {
       const list = await getFriends();
       if (destroyed || seq !== loadFriendsSeq) return;
-      friends = list;
       friendsLoaded = true;
-      retainChatTabs(list.map((f) => f.user_hash));
-      // Keep the store's name cache current for surfaces that only hold a hash
-      // — desktop notifications in particular, which have to name a friend from
-      // an event payload that carries none.
-      rememberFriendNames(list);
+      // `commitFriendsList` refreshes the store's name cache on the way in, so
+      // surfaces holding only a hash — desktop notifications in particular —
+      // can still name a friend. Skip the tab reconcile when a newer list has
+      // already landed, or this one would close a tab against stale rows.
+      if (commitFriendsList(ticket, list)) {
+        retainChatTabs(list.map((f) => f.user_hash));
+      }
     } catch (e: unknown) {
       if (destroyed || seq !== loadFriendsSeq) return;
       error = toErr(e);
@@ -610,46 +650,63 @@
     }
   }
 
-  function friendHashFromCode(value: string): string | null {
-    const trimmed = value.trim();
-    if (/^[0-9a-fA-F]{32}$/.test(trimmed)) return trimmed.toLowerCase();
-    const match = /^ember2:([0-9a-fA-F]{32}):([0-9a-fA-F]{64})$/i.exec(trimmed);
-    return match?.[1]?.toLowerCase() ?? null;
-  }
-
-  function isValidHash(h: string): boolean {
-    return friendHashFromCode(h) !== null;
-  }
-
+  // A bare public key's Friend ID is a BLAKE3 digest only the backend derives,
+  // so the self/duplicate/blocked checks for that form are left to
+  // `add_friend`, which reports each as a coded error.
   async function handleAdd() {
     if (adding) return;
     addError = null;
     const hash = newHash.trim();
     const nick = newNickname.trim();
     if (!hash) { addError = m.friends_validation_hash_required(); return; }
-    if (!isValidHash(hash)) { addError = m.friends_validation_hash_format(); return; }
+    if (!isAcceptedFriendInput(hash)) { addError = m.friends_validation_hash_format(); return; }
     const canonicalHash = friendHashFromCode(hash);
-    if (myHash && canonicalHash === friendHashFromCode(myHash)) {
-      addError = m.friends_validation_self_add();
-      return;
-    }
-    if (friends.some((f) => f.user_hash.toLowerCase() === canonicalHash)) {
-      addError = m.friends_validation_already_friend();
-      return;
-    }
-    if (blocked.some((b) => b.user_hash.toLowerCase() === canonicalHash)) {
-      addError = m.friends_validation_blocked();
-      return;
+    // A current code for someone already listed is how a one-sided add made
+    // from an older code becomes findable, so it goes through as an update.
+    let updatedFriend: FriendInfo | undefined;
+    if (canonicalHash !== null) {
+      if (myHash && canonicalHash === friendHashFromCode(myHash)) {
+        addError = m.friends_validation_self_add();
+        return;
+      }
+      const existing = friends.find((f) => f.user_hash.toLowerCase() === canonicalHash);
+      if (existing && !carriesIntroSecret(hash)) {
+        addError = m.friends_validation_already_friend();
+        return;
+      }
+      updatedFriend = existing;
+      if (blocked.some((b) => b.user_hash.toLowerCase() === canonicalHash)) {
+        addError = m.friends_validation_blocked();
+        return;
+      }
     }
     adding = true;
     try {
+      const before = new Set(friends.map((f) => f.user_hash.toLowerCase()));
+      // For a public key, re-adding an existing friend is an upsert rather than
+      // an error, so the only way to tell it apart is whether a row appeared.
       await addFriend(hash, nick || undefined);
-      flash(m.friends_added({ name: nick || (canonicalHash ?? hash).slice(0, 8) + '\u2026' }));
+      if (updatedFriend) {
+        failedSearchToastsShown.delete(updatedFriend.user_hash.toLowerCase());
+        flash(m.friends_code_updated({
+          name: nick || updatedFriend.nickname || updatedFriend.user_hash.slice(0, 8) + '\u2026',
+        }));
+      } else if (canonicalHash) {
+        flash(m.friends_added({ name: nick || canonicalHash.slice(0, 8) + '\u2026' }));
+      }
       newHash = '';
       newNickname = '';
       showAddForm = false;
       await reloadFriendRequests();
       await loadFriends();
+      // `flash` clears `error`, so skip it when the reload failed rather than
+      // hide that failure behind a name the stale list cannot supply anyway.
+      if (!canonicalHash && !error) {
+        const added = friends.find((f) => !before.has(f.user_hash.toLowerCase()));
+        flash(added
+          ? m.friends_added({ name: nick || added.user_hash.slice(0, 8) + '\u2026' })
+          : m.friends_validation_already_friend());
+      }
     } catch (e: unknown) {
       addError = toErr(e);
     } finally {
@@ -711,12 +768,25 @@
     const nick = editNickname.trim();
     try {
       await updateFriendNickname(hash, nick);
-      const idx = friends.findIndex((f) => f.user_hash === hash);
-      if (idx !== -1) friends[idx] = { ...friends[idx], nickname: nick };
+      friendsListStore.update((list) =>
+        list.map((f) => (f.user_hash === hash ? { ...f, nickname: nick } : f)),
+      );
       // Push the rename through to any open chat tab so the strip
       // and the conversation header don't keep the old nickname.
       renameChatTab(hash, nick || hash.slice(0, 8) + '\u2026');
-      rememberFriendName(hash, nick);
+      if (nick) {
+        rememberFriendName(hash, nick);
+      } else {
+        // `rememberFriendName` ignores an empty name, so a cleared nickname
+        // would keep labelling the dock and toasts from the cache.
+        const key = hash.toLowerCase();
+        friendNamesStore.update((names) => {
+          if (!names.has(key)) return names;
+          const next = new Map(names);
+          next.delete(key);
+          return next;
+        });
+      }
       // Blur-to-save means the user may already be renaming a different friend
       // by the time this resolves; only close the editor if it is still ours.
       if (editingHash === hash) editingHash = null;
@@ -752,7 +822,7 @@
 
   function formatDate(ts: number): string {
     if (!ts) return '';
-    return new Date(ts * 1000).toLocaleDateString(undefined, {
+    return formatCalendarDate(ts, {
       year: 'numeric', month: 'short', day: 'numeric',
     });
   }
@@ -799,6 +869,24 @@
     copyTimer = setTimeout(() => (copiedHash = null), 1500);
   }
 
+  async function handleResetCode() {
+    confirmResetCodeOpen = false;
+    if (resettingCode) return;
+    resettingCode = true;
+    try {
+      const code = await resetFriendCode();
+      if (destroyed) return;
+      myHash = code;
+      myHashError = false;
+      myHashCopied = false;
+      flash(m.friends_reset_code_done());
+    } catch (e: unknown) {
+      if (!destroyed) error = toErr(e);
+    } finally {
+      resettingCode = false;
+    }
+  }
+
   async function copyMyHash() {
     if (!(await copyToClipboard(myHash))) {
       toastError(m.kad_clipboard_unavailable());
@@ -823,6 +911,15 @@
   confirmLabel={removeDialog.mutual ? m.common_remove() : m.friends_withdraw_title()}
   danger={true}
   onconfirm={handleRemove}
+/>
+
+<ConfirmDialog
+  bind:open={confirmResetCodeOpen}
+  title={m.friends_reset_code_confirm_title()}
+  message={m.friends_reset_code_confirm_message()}
+  confirmLabel={m.friends_reset_code()}
+  danger={true}
+  onconfirm={handleResetCode}
 />
 
 <ConfirmDialog
@@ -946,20 +1043,28 @@
           {/if}
         </div>
       </div>
-      <button type="button" class="my-id-copy" class:copied={myHashCopied} onclick={copyMyHash}>
-        {#if myHashCopied}
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="3 8 7 12 13 4"/>
-          </svg>
-          {m.common_copied()}
-        {:else}
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="5" y="5" width="9" height="9" rx="1.5"/>
-            <path d="M3 11V3a1.5 1.5 0 011.5-1.5H11"/>
-          </svg>
-          {m.common_copy()}
-        {/if}
-      </button>
+      <div class="my-id-actions">
+        <button type="button" class="my-id-copy" class:copied={myHashCopied} onclick={copyMyHash}>
+          {#if myHashCopied}
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="3 8 7 12 13 4"/>
+            </svg>
+            {m.common_copied()}
+          {:else}
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="5" y="5" width="9" height="9" rx="1.5"/>
+              <path d="M3 11V3a1.5 1.5 0 011.5-1.5H11"/>
+            </svg>
+            {m.common_copy()}
+          {/if}
+        </button>
+        <button
+          type="button"
+          class="ghost my-id-reset"
+          onclick={() => { confirmResetCodeOpen = true; }}
+          disabled={resettingCode}
+        >{m.friends_reset_code()}</button>
+      </div>
     </div>
   {:else if myHashError}
     <!-- Hiding the card outright made a transient failure look like the app
@@ -1120,7 +1225,7 @@
             type="text"
             class="search-input"
             bind:value={searchQuery}
-            placeholder={m.common_search() + '…'}
+            placeholder={m.common_search_placeholder()}
             aria-label={m.common_search()}
             onkeydown={(e) => {
               if (e.key !== 'Escape' || !searchQuery) return;
@@ -1135,9 +1240,11 @@
         </div>
       {/if}
       <span class="inline-stat">
-        {friends.length === 1
-          ? m.friends_online_count_one({ online: onlineFriendCount })
-          : m.friends_online_count_other({ online: onlineFriendCount, total: friends.length })}
+        {plural(friends.length, {
+          one: () => m.friends_online_count_one({ online: onlineFriendCount }),
+          few: () => m.friends_online_count_few({ online: onlineFriendCount, total: friends.length }),
+          other: () => m.friends_online_count_other({ online: onlineFriendCount, total: friends.length }),
+        })}
       </span>
     </div>
   </div>
@@ -1149,7 +1256,7 @@
           type="text"
           bind:value={newHash}
           placeholder={m.friends_hash_placeholder()}
-          maxlength="128"
+          maxlength="192"
           spellcheck="false"
           autocomplete="off"
           class="hash-input"
@@ -1178,9 +1285,11 @@
   {#if searchQuery.trim() && friends.length > 0}
     <div class="result-count-row">
       <span class="result-count">
-        {filtered.length === 1
-          ? m.friends_match_count_one()
-          : m.friends_match_count_other({ count: filtered.length })}
+        {plural(filtered.length, {
+          one: m.friends_match_count_one,
+          few: () => m.friends_match_count_few({ count: filtered.length }),
+          other: () => m.friends_match_count_other({ count: filtered.length }),
+        })}
       </span>
     </div>
   {/if}
@@ -1229,7 +1338,8 @@
     <!--
       Compact friend row. Presence is stated once (the avatar dot) because the
       section headers above already group online vs offline, and unread is
-      stated once as a dot on Chat with the count in the status line. Reference
+      counted on the Chat button, the same pill the room list and the dock
+      use, whatever the status line is busy saying. Reference
       data (Friend ID, last address, added date) and the secondary actions live
       in the overflow menu so the resting card is name + status + Chat.
     -->
@@ -1283,7 +1393,7 @@
                 <!-- Icon only: the encryption guarantee is identical for every
                      mutual online friend, so spelling it out on each card was
                      pure repetition. Wording stays in the tooltip. -->
-                <span class="lock-glyph" title={m.friends_encrypted_chat_title()} aria-label={m.friends_encrypted_chat()}>
+                <span class="lock-glyph" role="img" title={m.friends_encrypted_chat_title()} aria-label={m.friends_encrypted_chat()}>
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
                     <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
@@ -1300,7 +1410,11 @@
               <span class="status-pending">{m.friends_status_waiting_accept()}</span>
             {:else if unread > 0}
               <span class="status-unread">
-                {unread === 1 ? m.friends_unread_one() : m.friends_unread_other({ count: unread })}
+                {plural(unread, {
+                  one: m.friends_unread_one,
+                  few: () => m.friends_unread_few({ count: unread }),
+                  other: () => m.friends_unread_other({ count: unread }),
+                })}
               </span>
             {:else if presence === 'online'}
               <span class="status-online">{m.friends_status_online()}</span>
@@ -1310,6 +1424,9 @@
               {m.friends_status_added({ when: formatDate(f.added_at) })}
             {/if}
           </span>
+          {#if f.mutual && !isOnline && legacyStrandedFriends.has(f.user_hash.toLowerCase())}
+            <span class="card-legacy-hint">{m.friends_legacy_stranded_hint()}</span>
+          {/if}
         </div>
 
         <div class="card-controls">
@@ -1319,14 +1436,23 @@
             onclick={() => openChat(f)}
             disabled={chatDisabled}
             title={chatDisabled
-              ? m.settings_friend_chat_disabled()
+              ? m.chat_dock_chat_disabled()
               : isOnline ? m.friends_encrypted_chat_title() : m.friends_action_chat()}
           >
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <path d="M2 3h12v8H5l-3 3z"/>
             </svg>
             <span class="chat-btn-label">{m.friends_action_chat()}</span>
-            {#if unread > 0}<span class="unread-dot" aria-hidden="true"></span>{/if}
+            {#if unread > 0}
+              <span class="count-pill" aria-hidden="true">{unread > 99 ? '99+' : unread}</span>
+              <span class="sr-only">
+                {plural(unread, {
+                  one: m.friends_unread_one,
+                  few: () => m.friends_unread_few({ count: unread }),
+                  other: () => m.friends_unread_other({ count: unread }),
+                })}
+              </span>
+            {/if}
           </button>
 
           <details class="card-more">
@@ -1488,14 +1614,16 @@
     display: none;
   }
 
+  /* Inset card banner; keep in step with Channels' and Ember's. */
   .banner {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 8px 16px;
+    gap: 12px;
+    padding: 10px 14px;
     border-radius: var(--radius-md);
     margin-bottom: 0;
-    font-size: 12px;
+    font-size: var(--font-size-md);
   }
 
   .error-banner {
@@ -1555,7 +1683,7 @@
   }
 
   .my-id-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -1564,7 +1692,7 @@
 
   .my-id-hash {
     font-family: var(--font-mono);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     letter-spacing: 0.4px;
     user-select: all;
@@ -1572,7 +1700,7 @@
   }
 
   .my-id-hint {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     margin-top: 2px;
   }
@@ -1584,7 +1712,7 @@
     margin-top: 4px;
     padding: 2px 8px;
     border-radius: var(--radius-pill);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
   }
 
@@ -1612,7 +1740,7 @@
     border-radius: var(--radius-md);
     background: transparent;
     color: var(--accent);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -1641,6 +1769,20 @@
     height: 13px;
   }
 
+  .my-id-actions {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .my-id-reset {
+    font-size: var(--font-size-xs);
+    padding: 4px 10px;
+    white-space: nowrap;
+  }
+
   /* --- How Friends work --- */
   .how-panel {
     padding: 12px 16px;
@@ -1651,7 +1793,7 @@
   }
 
   .how-title {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-primary);
     margin-bottom: 6px;
@@ -1663,7 +1805,7 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
     color: var(--text-secondary);
   }
@@ -1700,7 +1842,7 @@
 
   .add-btn {
     font-weight: 600;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .add-btn.primary {
@@ -1719,7 +1861,7 @@
   }
 
   .inline-stat {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     font-weight: 500;
     white-space: nowrap;
@@ -1748,7 +1890,7 @@
     border-radius: var(--radius-md);
     background: var(--bg-input);
     color: var(--text-primary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-family: inherit;
   }
 
@@ -1770,7 +1912,7 @@
   }
 
   .field-error {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--danger);
     margin-top: 8px;
     padding-left: 2px;
@@ -1799,7 +1941,7 @@
     border-radius: var(--radius-pill);
     background: var(--bg-input);
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-family: inherit;
   }
 
@@ -1836,7 +1978,7 @@
   }
 
   .result-count {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
 
@@ -1871,8 +2013,8 @@
   }
 
   .card-avatar {
-    width: 34px;
-    height: 34px;
+    width: var(--avatar-size);
+    height: var(--avatar-size);
     flex-shrink: 0;
     border-radius: 50%;
     background: var(--accent-dim);
@@ -1914,11 +2056,17 @@
   }
 
   .card-substatus {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .card-legacy-hint {
+    font-size: var(--font-size-xs);
+    color: var(--warning);
+    line-height: 1.35;
   }
 
   .status-online {
@@ -1936,7 +2084,7 @@
     background: none;
     color: var(--text-primary);
     font-weight: 600;
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-family: inherit;
     padding: 2px 4px;
     margin: -2px -4px;
@@ -1963,7 +2111,7 @@
     border-radius: var(--radius-sm);
     background: var(--bg-input);
     color: var(--text-primary);
-    font-size: 14px;
+    font-size: var(--font-size-base);
     font-family: inherit;
     font-weight: 600;
   }
@@ -1995,7 +2143,7 @@
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--accent) 12%, transparent);
     color: var(--accent);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -2016,15 +2164,6 @@
   .chat-btn svg {
     width: 13px;
     height: 13px;
-    flex-shrink: 0;
-  }
-
-  /* Unread is a presence cue here; the count is in the status line. */
-  .unread-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--accent);
     flex-shrink: 0;
   }
 
@@ -2067,17 +2206,17 @@
     z-index: 9999;
     min-width: 190px;
     padding: 4px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    box-shadow: var(--shadow-md);
+    background: var(--ctx-surface);
+    border: 1px solid var(--ctx-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--ctx-shadow);
     display: flex;
     flex-direction: column;
   }
 
   .card-more-menu button {
     text-align: left;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-family: inherit;
     padding: 6px 10px;
     border: none;
@@ -2104,7 +2243,7 @@
 
   .menu-item-sub {
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     letter-spacing: 0.2px;
     color: var(--text-muted);
   }
@@ -2126,7 +2265,7 @@
   }
 
   .card-more-fact {
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
   }
 
@@ -2155,25 +2294,11 @@
     height: 32px;
   }
 
-  .empty-title {
-    font-size: 15px;
-    font-weight: 600;
-    color: var(--text-secondary);
-    margin: 0 0 6px;
-  }
-
+  /* Title, supporting line and action come from app.css; only the width cap
+     is Friends' own. */
   .empty-sub {
-    font-size: 12px;
-    color: var(--text-muted);
     max-width: 360px;
     margin: 0 auto;
-    line-height: 1.5;
-  }
-
-  .empty-action {
-    margin-top: 16px;
-    font-size: 12px;
-    padding: 7px 20px;
   }
 
   /* --- Online status --- */
@@ -2230,7 +2355,7 @@
   }
 
   .section-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -2359,7 +2484,7 @@
   }
 
   .requests-title {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -2368,7 +2493,7 @@
 
   .requests-explainer {
     padding: 8px 16px 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     line-height: 1.45;
   }
@@ -2382,7 +2507,7 @@
     border-radius: var(--radius-pill);
     background: var(--accent);
     color: var(--on-accent);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     padding: 0 5px;
     line-height: 1;
@@ -2430,7 +2555,7 @@
   }
 
   .request-name {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
     overflow: hidden;
@@ -2443,7 +2568,7 @@
 
   .request-hash {
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     letter-spacing: 0.3px;
   }
@@ -2457,7 +2582,7 @@
   .request-badge {
     display: inline-flex;
     align-items: center;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.4px;
@@ -2488,7 +2613,7 @@
     border-radius: var(--radius-md);
     background: var(--accent);
     color: var(--on-accent);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -2505,7 +2630,7 @@
     border-radius: var(--radius-md);
     background: transparent;
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -2523,7 +2648,7 @@
     border-radius: var(--radius-md);
     background: transparent;
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -2557,7 +2682,7 @@
     border: none;
     background: transparent;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -2588,7 +2713,7 @@
     border-radius: var(--radius-pill);
     background: var(--bg-tertiary);
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     padding: 0 5px;
     line-height: 1;
@@ -2620,7 +2745,7 @@
   }
 
   .blocked-name {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-secondary);
     overflow: hidden;
@@ -2630,13 +2755,13 @@
 
   .blocked-hash {
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
   }
 
   .blocked-hint {
     margin: 8px 2px 0;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
   }
 
@@ -2699,7 +2824,7 @@
   }
 
   .firewall-text {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.5;
   }
 
@@ -2713,7 +2838,7 @@
     border-radius: var(--radius-md);
     background: transparent;
     color: var(--warning);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -2724,7 +2849,7 @@
 
   .firewall-recheck-error {
     margin-left: 10px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--danger);
     align-self: center;
     flex-basis: 100%;

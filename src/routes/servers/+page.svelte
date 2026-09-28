@@ -13,14 +13,23 @@
     clearServerLogHistory,
   } from '$lib/api/server';
   import type { ServerInfo, ServerPriority } from '$lib/types';
-  import { onMount, untrack } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import { fade } from 'svelte/transition';
   import { flip } from 'svelte/animate';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
-  import { copyToClipboard, formatCompactCount } from '$lib/utils';
+  import { serverMetDownloadedText } from '$lib/commandReplies';
+  import { plural } from '$lib/plural';
+  import {
+    copyToClipboard,
+    formatClockTime,
+    formatCompactCount,
+    formatNumber,
+    withTimeout,
+  } from '$lib/utils';
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
+  import { menuKeydown } from '$lib/a11y';
   import { toastError } from '$lib/stores/toast';
   import { serverLog, appendServerLog, clearServerLog } from '$lib/stores/serverLog';
   import IconX from '$lib/components/IconX.svelte';
@@ -104,6 +113,9 @@
 
   // Context menu
   let ctxMenu: { x: number; y: number; server: ServerInfo } | null = $state(null);
+  let ctxMenuEl: HTMLDivElement | undefined = $state(undefined);
+  /** The row a keyboard-opened menu came from, so Escape can hand focus back. */
+  let ctxReturnFocus: HTMLElement | null = null;
 
   let connecting = $state(false);
   // Monotonic id bumped whenever the user cancels/disconnects. A connect
@@ -197,18 +209,6 @@
     };
   });
 
-  function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<T>((_, reject) => {
-      timer = setTimeout(() => reject(new Error('timeout')), ms);
-    });
-    // Clear the watchdog once either side settles so the loser timer doesn't
-    // linger (and can't reject after the real promise already resolved).
-    return Promise.race([promise, timeout]).finally(() => {
-      if (timer) clearTimeout(timer);
-    });
-  }
-
   async function refresh() {
     if (!mounted) return;
     if (refreshInProgress) {
@@ -219,8 +219,8 @@
     pendingRefresh = false;
     try {
       const [list, connected] = await Promise.allSettled([
-        withTimeout(getServerList(), 4000),
-        withTimeout(getConnectedServer(), 4000),
+        withTimeout(getServerList(), 'get_server_list', 4000),
+        withTimeout(getConnectedServer(), 'get_connected_server', 4000),
       ]);
       if (!mounted) return;
       let hadFailure = false;
@@ -234,9 +234,12 @@
       } else {
         hadFailure = true;
       }
+      // Only clear the error this poll raised: validation, connect and
+      // remove failures also live in `error`, and the 5 s poll would
+      // otherwise wipe them before they were read.
       if (hadFailure) {
         error = m.servers_refresh_failed();
-      } else {
+      } else if (error === m.servers_refresh_failed()) {
         error = null;
       }
     } catch (e: unknown) {
@@ -268,7 +271,7 @@
   }
 
   function formatLogTime(at: number): string {
-    return new Date(at).toLocaleTimeString();
+    return formatClockTime(at / 1000);
   }
 
   async function handleConnect(server?: ServerInfo) {
@@ -319,7 +322,8 @@
     connecting = false;
     const prev = connectedServer;
     try {
-      const msg = await disconnectServer();
+      await disconnectServer();
+      const msg = m.servers_disconnected();
       log(msg);
       flash(msg);
       await refresh();
@@ -380,7 +384,8 @@
     error = null;
     addingServer = true;
     try {
-      const msg = await addServer(ip, port, name);
+      await addServer(ip, port, name);
+      const msg = m.servers_added({ address: `${ip}:${port}` });
       log(msg);
       flash(msg);
       newIp = '';
@@ -402,7 +407,8 @@
   async function doRemoveServer(server: ServerInfo) {
     error = null;
     try {
-      const msg = await removeServer(server.ip, server.port);
+      await removeServer(server.ip, server.port);
+      const msg = m.servers_removed_one();
       log(msg);
       flash(msg);
       const key = serverKey(server);
@@ -512,7 +518,10 @@
     selectedServer = null;
     selectedServers = new Set();
     lastClickedKey = null;
-    const msg = removed === 1 ? m.servers_removed_one() : m.servers_removed_other({ count: removed });
+    const msg = plural(removed, {
+      one: m.servers_removed_one,
+      other: () => m.servers_removed_other({ count: removed }),
+    });
     log(msg);
     if (failedCount > 0) {
       error = m.servers_removed_with_failures({ message: msg, failed: failedCount });
@@ -533,9 +542,9 @@
     updatingMet = true;
     log(m.servers_log_downloading_met({ url }));
     try {
-      const result = await downloadServerMet(url);
-      flash(result);
-      log(result);
+      const msg = serverMetDownloadedText(await downloadServerMet(url));
+      flash(msg);
+      log(msg);
       await refresh();
     } catch (e: unknown) {
       const msg = toErrorMsg(e);
@@ -554,7 +563,7 @@
     handleConnect(server);
   }
 
-  function selectServer(server: ServerInfo, e: MouseEvent) {
+  function selectServer(server: ServerInfo, e: MouseEvent | KeyboardEvent) {
     const key = serverKey(server);
     if (e.ctrlKey || e.metaKey) {
       const next = new Set(selectedServers);
@@ -602,6 +611,7 @@
 
   function handleContextMenu(e: MouseEvent, server: ServerInfo) {
     e.preventDefault();
+    ctxReturnFocus = null;
     const key = serverKey(server);
     if (!selectedServers.has(key)) {
       selectedServers = new Set([key]);
@@ -611,13 +621,44 @@
     ctxMenu = { x: e.clientX, y: e.clientY, server };
   }
 
+  function handleRowKeydown(e: KeyboardEvent, server: ServerInfo) {
+    // Leave the row's own buttons (the ✕) their native keyboard behavior.
+    if (e.target !== e.currentTarget) return;
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      void handleConnect(server);
+    } else if (e.key === ' ') {
+      e.preventDefault();
+      selectServer(server, e);
+    } else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
+      e.preventDefault();
+      e.stopPropagation();
+      const row = e.currentTarget as HTMLElement;
+      const rect = row.getBoundingClientRect();
+      handleContextMenu(
+        new MouseEvent('contextmenu', {
+          clientX: rect.left + Math.min(24, rect.width / 2),
+          clientY: rect.top + Math.min(16, rect.height / 2),
+        }),
+        server,
+      );
+      // The menu is rendered at the end of the page, so without this a
+      // keyboard user would have to Tab through everything to reach it.
+      ctxReturnFocus = row;
+      void tick().then(() => ctxMenuEl?.querySelector<HTMLButtonElement>('.ctx-item')?.focus());
+    }
+  }
+
   function closeContextMenu() {
     ctxMenu = null;
+    ctxReturnFocus = null;
   }
 
   async function ctxAction(action: string) {
     const target = ctxMenu?.server;
+    const returnTo = ctxReturnFocus;
     closeContextMenu();
+    if (returnTo?.isConnected) returnTo.focus();
     if (action === 'connect' && target) {
       await handleConnect(target);
     } else if (action === 'disconnect') {
@@ -670,7 +711,10 @@
     selectedServers = new Set();
     selectedServer = null;
     lastClickedKey = null;
-    const removedMsg = count === 1 ? m.servers_removed_one() : m.servers_removed_other({ count });
+    const removedMsg = plural(count, {
+      one: m.servers_removed_one,
+      other: () => m.servers_removed_other({ count }),
+    });
     log(removedMsg);
     // Mirror doRemoveAll: surface failures instead of flashing a success
     // toast when some (or all) removals were rejected.
@@ -695,7 +739,7 @@
   }
 
   function sortIndicator(col: string): string {
-    if (sortCol !== col) return '';
+    if (sortCol !== col) return ' \u00A0';
     return sortAsc ? ' \u25B2' : ' \u25BC';
   }
 
@@ -820,7 +864,7 @@
 
   async function handleManualRefresh() {
     await refresh();
-    if (!error) flash(m.servers_list_refreshed());
+    if (error !== m.servers_refresh_failed()) flash(m.servers_list_refreshed());
   }
 
   $effect(() => {
@@ -843,7 +887,9 @@
 <svelte:document onclick={closeContextMenu} onkeydown={(e) => {
   if (e.key !== 'Escape') return;
   if (ctxMenu) {
+    const returnTo = ctxReturnFocus;
     closeContextMenu();
+    if (returnTo && document.contains(returnTo)) returnTo.focus();
     e.preventDefault();
     e.stopPropagation();
   } else if (e.target instanceof HTMLInputElement && e.target.classList.contains('server-filter-input') && serverFilter) {
@@ -854,7 +900,10 @@
 }} />
 
 <div class="page-header">
-  <h2>{m.nav_ed2k_servers()}</h2>
+  <div>
+    <h2>{m.nav_ed2k_servers()}</h2>
+    <p class="page-subtitle">{m.servers_page_subtitle()}</p>
+  </div>
   <div class="header-actions">
     <button class="ghost" onclick={handleManualRefresh} disabled={loading}>{m.common_refresh()}</button>
     {#if selectionCount > 1}
@@ -874,12 +923,12 @@
 
 <div class="page-content servers-page">
   {#if error}
-    <div class="banner error-banner" role="alert">
+    <div class="error-banner" role="alert">
       <span>{error}</span>
       <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
     </div>
   {:else if successMsg}
-    <div class="banner success-banner" role="status">
+    <div class="success-banner" role="status">
       <span>{successMsg}</span>
     </div>
   {/if}
@@ -887,7 +936,8 @@
   <div class="stats-row">
     <div class="stat-card">
       <div class="label">{m.servers_stat_in_list()}</div>
-      <div class="value">{servers.length.toLocaleString()}</div>
+      <div class="value">{formatNumber(servers.length)}</div>
+      <div class="sub">{m.servers_stat_users_files({ users: formatCount(totalListedUsers), files: formatCount(totalListedFiles) })}</div>
     </div>
     <div class="stat-card">
       <div class="label">{m.servers_stat_connected()}</div>
@@ -898,12 +948,11 @@
     </div>
     <div class="stat-card">
       <div class="label">{m.servers_stat_selected()}</div>
-      <div class="value">{selectionCount.toLocaleString()}</div>
+      <div class="value">{formatNumber(selectionCount)}</div>
     </div>
     <div class="stat-card">
       <div class="label">{m.servers_stat_high_failure()}</div>
-      <div class="value">{failedServerCount.toLocaleString()}</div>
-      <div class="sub">{m.servers_stat_users_files({ users: formatCount(totalListedUsers), files: formatCount(totalListedFiles) })}</div>
+      <div class="value">{formatNumber(failedServerCount)}</div>
     </div>
   </div>
 
@@ -951,8 +1000,8 @@
               <line x1="10" y1="6.5" x2="16" y2="6.5"></line>
               <line x1="10" y1="17.5" x2="16" y2="17.5"></line>
             </svg>
-            <p>{m.servers_empty_no_servers()}</p>
-            <p class="sub">{m.servers_empty_no_servers_sub()}</p>
+            <p class="empty-title">{m.servers_empty_no_servers()}</p>
+            <p class="empty-sub">{m.servers_empty_no_servers_sub()}</p>
           </div>
         {:else if filteredServers.length === 0}
           <div class="empty-state compact">
@@ -962,12 +1011,12 @@
               <line x1="11" y1="8" x2="11" y2="14"></line>
               <line x1="8" y1="11" x2="14" y2="11"></line>
             </svg>
-            <p>{m.servers_empty_no_matches()}</p>
-            <p class="sub">{m.servers_empty_no_matches_sub()}</p>
+            <p class="empty-title">{m.servers_empty_no_matches()}</p>
+            <p class="empty-sub">{m.servers_empty_no_matches_sub()}</p>
             <!-- The filter box is up in the toolbar, out of the eyeline of
                  someone reading an empty table, so put the way out here too —
                  the same move the KAD and Library empty states already make. -->
-            <button class="ghost btn-sm" onclick={() => (serverFilter = '')}>{m.common_clear_filters()}</button>
+            <button type="button" class="ghost empty-action" onclick={() => (serverFilter = '')}>{m.common_clear_filters()}</button>
           </div>
         {:else}
           <table class="server-table">
@@ -1012,13 +1061,16 @@
                   class:connected={isConnected(server)}
                   class:selected={isSelected(server)}
                   class:failed-server={server.fail_count >= 3}
+                  tabindex="0"
+                  aria-selected={isSelected(server)}
                   onclick={(e: MouseEvent) => selectServer(server, e)}
                   ondblclick={() => handleDoubleClick(server)}
                   oncontextmenu={(e: MouseEvent) => handleContextMenu(e, server)}
+                  onkeydown={(e) => handleRowKeydown(e, server)}
                   in:fade={{ duration: 150 }}
                   animate:flip={{ duration: 180 }}
                 >
-                  <td class="name-cell">
+                  <td class="name-cell" title={server.name || m.servers_unnamed()}>
                     <span class="server-icon" class:connected-icon={isConnected(server)}>S</span>
                     <bdi dir="auto">{server.name || m.servers_unnamed()}</bdi>
                   </td>
@@ -1044,7 +1096,7 @@
                        else. -->
                   <td>{server.is_static ? m.common_yes() : m.common_no()}</td>
                   <td>
-                    <button type="button" class="server-remove" onclick={(e: MouseEvent) => { e.stopPropagation(); handleRemoveServer(server); }} title={m.common_remove()} aria-label={m.common_remove()}><IconX size={12} /></button>
+                    <button type="button" class="server-remove" onclick={(e: MouseEvent) => { e.stopPropagation(); handleRemoveServer(server); }} title={m.common_remove()} aria-label={m.servers_remove_aria({ name: server.name || `${server.ip}:${server.port}` })}><IconX size={12} /></button>
                   </td>
                 </tr>
               {/each}
@@ -1138,9 +1190,9 @@
                 {#if connectedServer.client_id}
                   <span class="mono">{connectedServer.client_id}</span>
                   {#if connectedServer.is_low_id}
-                    <span class="badge lowid">{m.servers_lowid()}</span>
+                    <span class="badge sm lowid">{m.servers_lowid()}</span>
                   {:else}
-                    <span class="badge highid">{m.servers_highid()}</span>
+                    <span class="badge sm highid">{m.servers_highid()}</span>
                   {/if}
                 {:else}
                   <span class="muted">{m.servers_pending()}</span>
@@ -1150,15 +1202,15 @@
             <div class="info-row">
               <span class="info-label">{m.servers_col_users()}</span>
               <span class="info-value">
-                {connectedServer.user_count.toLocaleString()}
+                {formatNumber(connectedServer.user_count)}
                 {#if connectedServer.max_users > 0}
-                  <span class="muted">/ {connectedServer.max_users.toLocaleString()}</span>
+                  <span class="muted">/ {formatNumber(connectedServer.max_users)}</span>
                 {/if}
               </span>
             </div>
             <div class="info-row">
               <span class="info-label">{m.servers_col_files()}</span>
-              <span class="info-value">{connectedServer.file_count.toLocaleString()}</span>
+              <span class="info-value">{formatNumber(connectedServer.file_count)}</span>
             </div>
             {@const perUserLimit = perUserFileLimit(connectedServer)}
             {#if perUserLimit > 0}
@@ -1168,9 +1220,9 @@
               <div class="info-row">
                 <span class="info-label">{m.servers_col_max_files()}</span>
                 <span class="info-value">
-                  {perUserLimit.toLocaleString()}
+                  {formatNumber(perUserLimit)}
                   {#if connectedServer.hard_files > perUserLimit}
-                    <span class="muted">({m.servers_hard_limit({ count: connectedServer.hard_files.toLocaleString() })})</span>
+                    <span class="muted">({m.servers_hard_limit({ count: formatNumber(connectedServer.hard_files) })})</span>
                   {/if}
                 </span>
               </div>
@@ -1178,7 +1230,7 @@
           {:else if connecting}
             <div class="info-row">
               <span class="info-label">{m.servers_info_status()}</span>
-              <span class="badge connecting"><span class="connect-spinner"></span> {m.servers_status_connecting()}</span>
+              <span class="badge connecting"><span class="spinner xs current"></span> {m.servers_status_connecting()}</span>
             </div>
             <div class="info-row muted">
               <span>{m.servers_establishing()}</span>
@@ -1220,7 +1272,14 @@
 </div>
 
 {#if ctxMenu}
-  <div class="ctx-menu" role="menu" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
+  <div
+    class="ctx-menu"
+    role="menu"
+    tabindex="-1"
+    bind:this={ctxMenuEl}
+    onkeydown={(e) => menuKeydown(e, e.currentTarget)}
+    use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}
+  >
     <div class="ctx-header" role="presentation">
       <bdi dir="auto">{ctxMenu.server.name || `${ctxMenu.server.ip}:${ctxMenu.server.port}`}</bdi>
     </div>
@@ -1238,13 +1297,13 @@
     <div class="ctx-sep" role="separator"></div>
     <div class="ctx-header" role="presentation">{m.servers_col_priority()}</div>
     <button class="ctx-item" role="menuitemradio" aria-checked={ctxMenu.server.priority === 'high'} onclick={() => ctxAction('priority_high')}>
-      {ctxMenu.server.priority === 'high' ? '\u2713 ' : ''}{m.servers_priority_high()}
+      {m.servers_priority_high()}
     </button>
     <button class="ctx-item" role="menuitemradio" aria-checked={ctxMenu.server.priority === 'normal'} onclick={() => ctxAction('priority_normal')}>
-      {ctxMenu.server.priority === 'normal' ? '\u2713 ' : ''}{m.servers_priority_normal()}
+      {m.servers_priority_normal()}
     </button>
     <button class="ctx-item" role="menuitemradio" aria-checked={ctxMenu.server.priority === 'low'} onclick={() => ctxAction('priority_low')}>
-      {ctxMenu.server.priority === 'low' ? '\u2713 ' : ''}{m.servers_priority_low()}
+      {m.servers_priority_low()}
     </button>
     <div class="ctx-sep" role="separator"></div>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_ip')}>{m.servers_copy_ip_port()}</button>
@@ -1269,7 +1328,10 @@
 <ConfirmDialog
   bind:open={confirmRemoveOpen}
   title={m.servers_confirm_remove_title()}
-  message={m.servers_confirm_remove_message({ count: pendingRemoveServers.length })}
+  message={plural(pendingRemoveServers.length, {
+    one: m.servers_confirm_remove_message_one,
+    other: () => m.servers_confirm_remove_message_other({ count: pendingRemoveServers.length }),
+  })}
   confirmLabel={m.common_remove()}
   danger={true}
   onconfirm={confirmPendingRemoval}
@@ -1281,14 +1343,6 @@
     display: flex;
     gap: 8px;
     align-items: center;
-  }
-
-  .banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 8px 20px;
-    font-size: 13px;
   }
 
   .server-layout {
@@ -1325,7 +1379,7 @@
 
   .toolbar-label {
     padding: 8px 16px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-secondary);
   }
@@ -1339,7 +1393,7 @@
 
   .btn-sm {
     padding: 3px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .toolbar-count {
@@ -1354,9 +1408,9 @@
     min-width: 240px;
     border: 1px solid var(--border);
     border-radius: var(--radius-pill);
-    background: var(--bg-input, var(--bg-surface));
+    background: var(--bg-input);
     overflow: hidden;
-    transition: border-color 0.15s ease;
+    transition: border-color var(--transition-normal) ease;
   }
 
   .server-filter-wrap:focus-within {
@@ -1369,7 +1423,7 @@
     border: none;
     outline: none;
     background: transparent;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 6px 8px;
     color: var(--text-primary);
     box-shadow: none;
@@ -1425,12 +1479,12 @@
   .server-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .server-table th {
     padding: 6px 10px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     position: sticky;
     top: 0;
     z-index: 1;
@@ -1440,7 +1494,7 @@
 
   .server-table td {
     padding: 5px 10px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     cursor: default;
     /* Global app.css adds td border-bottom; keep only the header row line */
     border-bottom: none;
@@ -1463,7 +1517,7 @@
   }
 
   .server-table tbody tr {
-    transition: background 0.1s;
+    transition: background var(--transition-fast);
   }
 
   .server-table tbody tr:hover {
@@ -1471,11 +1525,16 @@
   }
 
   .server-table tbody tr:nth-child(even):not(.selected):not(.connected) {
-    background: color-mix(in srgb, var(--bg-secondary) 84%, var(--bg-primary));
+    background: var(--table-row-alt);
   }
 
   .server-table tbody tr.selected {
-    background: var(--accent-fill);
+    background: var(--table-row-selected);
+  }
+
+  .server-table tbody tr:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
 
   .server-table tbody tr.connected td {
@@ -1513,7 +1572,7 @@
     border-radius: var(--radius-sm);
     background: var(--bg-tertiary);
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     flex-shrink: 0;
   }
@@ -1525,7 +1584,7 @@
 
   .ip-cell {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
     white-space: nowrap;
   }
@@ -1580,7 +1639,7 @@
   }
 
   .side-title {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -1601,13 +1660,13 @@
   }
 
   .form-field label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     font-weight: 500;
   }
 
   .form-field input {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 7px 10px;
   }
 
@@ -1621,7 +1680,7 @@
 
   .add-btn {
     align-self: flex-end;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 5px 16px;
   }
 
@@ -1639,7 +1698,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     padding: 2px 0;
   }
 
@@ -1662,7 +1721,7 @@
 
   .info-value.mono {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
   }
 
   /* Bottom log area */
@@ -1688,7 +1747,7 @@
     overflow-y: auto;
     padding: 8px 16px;
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     background: var(--bg-primary);
     min-height: 0;
   }
@@ -1712,81 +1771,19 @@
     margin-right: 8px;
   }
 
-  .empty-state.compact {
-    padding: 40px 16px;
-  }
-
-  .empty-state.compact p {
-    font-size: 13px;
-  }
-
-  .sub {
-    font-size: 12px;
-    color: var(--text-muted);
-  }
-
   /* Context menu styling is shared app-wide — see `.ctx-menu` in app.css. */
 
-  .connect-spinner {
-    display: inline-block;
-    width: 10px;
-    height: 10px;
-    border: 2px solid var(--border);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    vertical-align: middle;
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
-
+  /* Colors come from the shared `.badge` recipes in app.css, so a connection
+     state reads the same here as on the KAD page. */
   .badge {
-    display: inline-flex;
-    align-items: center;
     gap: 5px;
-    padding: 2px 8px;
-    border-radius: var(--radius-pill);
-    font-size: 11px;
-    font-weight: 600;
-  }
-
-  .badge.connected {
-    background: color-mix(in srgb, var(--success) 15%, transparent);
-    color: var(--success);
-  }
-
-  .badge.connecting {
-    background: color-mix(in srgb, var(--accent) 15%, transparent);
-    color: var(--accent);
-  }
-
-  .badge.disconnected {
-    background: color-mix(in srgb, var(--text-muted) 18%, transparent);
-    border-color: color-mix(in srgb, var(--text-muted) 32%, transparent);
-    color: var(--text-secondary);
-  }
-
-  .badge.lowid {
-    background: color-mix(in srgb, var(--danger) 15%, transparent);
-    color: var(--danger);
-    font-size: 10px;
-    padding: 1px 6px;
-  }
-
-  .badge.highid {
-    background: color-mix(in srgb, var(--success) 15%, transparent);
-    color: var(--success);
-    font-size: 10px;
-    padding: 1px 6px;
   }
 
   .servers-page {
     display: flex;
     flex-direction: column;
     gap: 12px;
-    padding: 12px 16px 14px;
+    padding: var(--workspace-padding);
     overflow: auto;
   }
 
@@ -1794,25 +1791,6 @@
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 10px;
-  }
-
-  .stats-row .stat-card {
-    min-width: 0;
-    padding: 12px 14px;
-  }
-
-  .stats-row .stat-card .value {
-    font-size: 20px;
-    line-height: 1.15;
-  }
-
-  .stats-row .stat-card {
-    border: 1px solid color-mix(in srgb, var(--border) 85%, transparent);
-    background: linear-gradient(
-      180deg,
-      color-mix(in srgb, var(--bg-surface) 86%, transparent),
-      color-mix(in srgb, var(--bg-secondary) 92%, transparent)
-    );
   }
 
   .stats-row .stat-card .sub {
@@ -1843,7 +1821,7 @@
   }
 
   .form-field label {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .form-field input {
@@ -1867,7 +1845,7 @@
 
   @media (max-width: 980px) {
     .servers-page {
-      padding: 10px 12px 12px;
+      padding: 10px;
     }
 
     .server-upper {
@@ -1905,7 +1883,7 @@
     }
   }
 
-  @media (max-width: 720px) {
+  @media (max-width: 760px) {
     .page-header {
       align-items: flex-start;
       gap: 10px;

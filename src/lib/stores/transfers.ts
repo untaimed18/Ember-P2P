@@ -1,8 +1,24 @@
 import { get, writable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
-import type { Transfer } from '$lib/types';
-import { getTransfers } from '$lib/api/transfers';
+import type { RuntimeStatus, Transfer } from '$lib/types';
+import { getTransfersSince } from '$lib/api/transfers';
+import { getRuntimeStatus } from '$lib/api/system';
+import {
+  IDLE_STATUSES,
+  LIVE_SOURCE_EVENT_GRACE_MS,
+  PendingRowOps,
+  applyRowPatches,
+  applySnapshotDelta,
+  applyStatusEvent,
+  isTerminal,
+  narrowStatus,
+  reconcileRows,
+  type RowEventContext,
+  type SnapshotState,
+  type SourcesEventPayload,
+  type StatusEventPayload,
+} from './transferRows';
 import { formatBytes, withTimeout } from '$lib/utils';
 import { notify, shouldNotify } from '$lib/notifications';
 import { transferFailureReasonText } from '$lib/i18n';
@@ -78,36 +94,7 @@ function isMoreAdvancedStatus(eventStatus: string, apiStatus: string): boolean {
   return (STATUS_PRIORITY[eventStatus] ?? 0) > (STATUS_PRIORITY[apiStatus] ?? 0);
 }
 
-/**
- * Reconcile the speed shown after merging an event row with a fresh API
- * snapshot. Idle/terminal rows always read 0. Otherwise take the larger of the
- * two sources: the event speed can decay to 0 between progress events while the
- * API snapshot (read live from the transfer manager) still carries a positive
- * rate — and vice-versa — so the higher value is the freshest truth.
- */
-/** Statuses that are definitionally not moving bytes, so their displayed rate
- *  must read zero rather than whatever the last progress event left behind.
- *
- *  `insufficient` and `noneneeded` belong here and were missing from all three
- *  of the lists that model this. The backend does its part — `refresh_health`
- *  zeroes `transfer.speed` and emits `transfer-speed-decay` — but the row was
- *  absent from `SPEED_DECAY_APPLIES` so the decay was dropped, and `mergeSpeed`
- *  then re-maxed the stale value against the poll's 0 forever. A download that
- *  filled the disk went on showing its last rate indefinitely, counted itself
- *  into the "Active" chip via `displaySpeed(t) > 0`, and rendered a
- *  counting-down ETA for a transfer that had stopped.
- *
- *  Deliberately excludes `searching` / `verifying` / `hashing` / `completing`:
- *  those are in `SPEED_DECAY_APPLIES` so the backend fades their rate towards
- *  zero, and the row is meant to show that fade. */
-export const IDLE_STATUSES: ReadonlySet<Transfer['status']> = new Set<Transfer['status']>([
-  'completed',
-  'failed',
-  'stopped',
-  'paused',
-  'insufficient',
-  'noneneeded',
-]);
+export { IDLE_STATUSES };
 
 /**
  * Reconcile the three health-detail fields, letting an explicit backend clear
@@ -140,7 +127,45 @@ function mergeHealthDetail(
   };
 }
 
-function mergeSpeed(status: string, apiSpeed: number, eventSpeed: number): number {
+/**
+ * Prefer the API health snapshot, except when a live progress tick has already
+ * moved bytes past that snapshot while marking the row healthy. The 3 s poll
+ * otherwise paints Stalled or Idle over a transfer that is still receiving data.
+ */
+function mergeHealth(
+  apiItem: Transfer,
+  eventItem: Transfer,
+): Pick<Transfer, 'health' | 'health_reason' | 'health_code' | 'stalled_since'> {
+  const apiHealth = apiItem.health ?? eventItem.health;
+  // Wire bytes only. `completed_size` is the on-disk figure, and it *rewinds*
+  // when a failed part is re-opened — the same comparison `mergeProgressCounters`
+  // reads as a rewind below. Testing it here made a genuinely degraded download
+  // flash healthy for one poll on the tick that discarded a corrupt part, with
+  // the two halves of this merge disagreeing about the same number. `transferred`
+  // is cumulative and never goes backwards, and the backend updates it before it
+  // emits, so this stays a real "the snapshot was already in flight" check.
+  const eventAhead = (eventItem.transferred || 0) > (apiItem.transferred || 0);
+  // Same race as Stalled: a 3 s poll can still carry Idle/Degraded after a
+  // progress tick already moved bytes and painted the row healthy.
+  if (
+    (apiHealth === 'stalled' || apiHealth === 'degraded') &&
+    eventItem.health === 'healthy' &&
+    eventAhead
+  ) {
+    return {
+      health: 'healthy',
+      health_reason: undefined,
+      health_code: undefined,
+      stalled_since: undefined,
+    };
+  }
+  return {
+    health: apiHealth,
+    ...mergeHealthDetail(apiItem, eventItem),
+  };
+}
+
+function mergeSpeed(status: string, apiSpeed: number): number {
   if (IDLE_STATUSES.has(status as Transfer['status'])) {
     return 0;
   }
@@ -150,7 +175,13 @@ function mergeSpeed(status: string, apiSpeed: number, eventSpeed: number): numbe
   // value outranked the cap-clamped snapshot, and nothing could ever lower it.
   // A 0 here is a reading, not a gap — the backend zeroes the field on idle
   // decay, and `liveSpeed` is what decides whether to smooth over it.
-  return apiSpeed ?? eventSpeed ?? 0;
+  //
+  // There is deliberately no fall-back to the stored event row's speed. This
+  // read `apiSpeed ?? eventSpeed ?? 0` and took an event parameter to feed it,
+  // but `Transfer['speed']` is a required `number` and the Rust snapshot always
+  // serializes it, so neither `??` could ever fire — the parameter was dead, and
+  // reading the signature suggested a fall-back that does not exist.
+  return apiSpeed;
 }
 
 function countServedPartBits(hex: string | undefined, partCount: number): number {
@@ -232,61 +263,8 @@ function mergeProgressCounters(
   };
 }
 
-/** Known backend Transfer statuses. Used to runtime-narrow event payloads
- *  before casting to `Transfer['status']`, so an unexpected backend string
- *  can never silently widen TypeScript's view of truth (D31). */
-const KNOWN_STATUSES = new Set<Transfer['status']>([
-  'searching',
-  'queued',
-  'active',
-  'paused',
-  'stopped',
-  'hashing',
-  'insufficient',
-  'noneneeded',
-  'failed',
-  'verifying',
-  'completing',
-  'completed',
-]);
-
-function narrowStatus(raw: string | undefined): Transfer['status'] | undefined {
-  if (!raw) return undefined;
-  return (KNOWN_STATUSES as Set<string>).has(raw) ? (raw as Transfer['status']) : undefined;
-}
-
-/** Terminal statuses that must not be downgraded by later events. D30:
- *  once a transfer is `completed`, a late `transfer-failed` must not flip
- *  it back to `failed`, and vice versa. */
-const TERMINAL_STATUSES = new Set<Transfer['status']>(['completed', 'failed']);
-
-function isTerminal(s: Transfer['status']): boolean {
-  return TERMINAL_STATUSES.has(s);
-}
-
-/** Statuses for which `transfer-speed-decay` should actually update `speed`.
- *  Paused / stopped / completed / failed rows are intentionally frozen so
- *  the UI can show the last-known speed (or zero) without the decay ticker
- *  stomping it. D5. */
-const SPEED_DECAY_APPLIES: ReadonlySet<Transfer['status']> = new Set<Transfer['status']>([
-  'active',
-  'searching',
-  'queued',
-  'verifying',
-  'completing',
-  'hashing',
-  // Accept the decay for these two as well. The backend zeroes their speed and
-  // emits the event; dropping it left the stored row carrying a stale rate.
-  // `IDLE_STATUSES` makes the *displayed* value 0 regardless, but the stored
-  // field feeds other readers, so let the authoritative 0 land.
-  'insufficient',
-  'noneneeded',
-]);
-
-/** Statuses that should NOT accept `transfer-progress` payloads. Hoisted to
- *  module scope (was rebuilt inside `flushProgress` on every frame) and
- *  stored as a Set so the per-row membership check in the flush loop is
- *  O(1) instead of a linear scan. */
+/** Statuses that should NOT accept `transfer-progress` payloads. Module
+ *  scope and a Set, so the per-row check in the flush is O(1). */
 const PROGRESS_SKIP_STATUSES: ReadonlySet<Transfer['status']> = new Set<Transfer['status']>([
   'paused',
   'stopped',
@@ -300,37 +278,7 @@ const PROGRESS_SKIP_STATUSES: ReadonlySet<Transfer['status']> = new Set<Transfer
   'noneneeded',
 ]);
 
-/** Mirror `TransferManager::update_status`: entering these states clears
- *  runtime health on the backend, but `transfer-status` events often omit
- *  `health`, leaving the UI stuck on a stale `degraded` bar colour. */
-const HEALTH_RESET_STATUSES: ReadonlySet<Transfer['status']> = new Set<Transfer['status']>([
-  'active',
-  'verifying',
-  'completing',
-  'completed',
-]);
-
-interface TransferEventPayload {
-  id: string;
-  error?: string;
-  failure_reason?: string;
-  /** Stable discriminator for the failure; see `Transfer['failure_code']`.
-   *  Travels with `failure_reason`/`error` so the row can be localized. */
-  failure_code?: string;
-  failure_kind?: Transfer['failure_kind'];
-  failure_stage?: string;
-  health?: Transfer['health'];
-  health_reason?: string;
-  health_code?: string;
-  stalled_since?: number;
-  sources?: number;
-  active_sources?: number;
-  queued_sources?: number;
-  peer_id?: string;
-  /** Set on `transfer-complete` when this completion actually re-checked
-   *  the Ember BLAKE3 pin. Absent/false means no pin was known, or the
-   *  event predates that field. */
-  ember_verified?: boolean;
+interface TransferEventPayload extends StatusEventPayload {
   /** Backend tags upload-direction terminal events so the store can
    *  vanish the row on completion (matches eMule UX where finished
    *  upload sessions disappear from the active list). Falls back to
@@ -340,13 +288,23 @@ interface TransferEventPayload {
 
 export const transfers = writable<Transfer[]>([]);
 
+/** The upload cap in force (`RuntimeStatus.effective_upload_speed`, bytes/s,
+ *  0 = unlimited), or `null` until the backend has published one. Differs from
+ *  `AppSettings.max_upload_speed` while a schedule rule or USS is in charge. */
+export const effectiveUploadSpeed = writable<number | null>(null);
+
+function publishedUploadSpeed(status: Partial<RuntimeStatus> | null | undefined): number | null {
+  const speed = status?.effective_upload_speed;
+  return typeof speed === 'number' && Number.isFinite(speed) ? speed : null;
+}
+
 let initialized = false;
 let unlisteners: UnlistenFn[] = [];
 let pollInterval: ReturnType<typeof setInterval> | null = null;
 let pollConsumers = 0;
 // Bumped by `cleanupTransferStore`; see the matching comment in
 // `stores/network.ts` for why `initTransferStore` re-checks this after its
-// async listener registration and the trailing `getTransfers()` call.
+// async listener registration and the trailing snapshot fetch.
 let storeEpoch = 0;
 
 // Pending progress payloads per transfer id. We keep the newest payload
@@ -403,7 +361,10 @@ const reversibleStateEnteredAt = new Map<string, number>();
  */
 const reversibleStateLeftAt = new Map<string, number>();
 const sourceCountsUpdatedAt = new Map<string, number>();
-const LIVE_SOURCE_EVENT_GRACE_MS = 6_000;
+
+function eventContext(now: number): RowEventContext {
+  return { now, reversibleStateEnteredAt, reversibleStateLeftAt, sourceCountsUpdatedAt };
+}
 function markUploadRemoved(id: string) {
   recentlyRemovedUploads.set(id, Date.now() + REMOVED_UPLOAD_TTL_MS);
 }
@@ -450,100 +411,155 @@ export function wasRecentlyRemovedDownload(id: string, now: number = Date.now())
   return true;
 }
 
+/** The list last published, tracked so a flush can tell whether it produced a
+ *  different one. A writable notifies on every `set` of an object — the same
+ *  reference included — so an unchanged list must not be set at all. */
+let publishedTransfers: Transfer[] = [];
+transfers.subscribe((list) => {
+  publishedTransfers = list;
+});
+
+function commitTransfers(next: Transfer[]) {
+  if (next !== publishedTransfers) transfers.set(next);
+}
+
+/** Row events waiting for the next flush. Status, health, speed-decay and
+ *  source events all land here rather than each rewriting the list, so a
+ *  burst costs one publish per frame. */
+const pendingRowOps = new PendingRowOps();
+/** Status events are not folded, so a long enough run of them is flushed
+ *  early rather than left to grow. */
+const MAX_PENDING_ROW_OPS = 5_000;
+
+function afterRowOpQueued() {
+  if (pendingRowOps.size > MAX_PENDING_ROW_OPS) flushPendingTransfers();
+  else scheduleProgressFlush();
+}
+
+/** Flush delay while the window is hidden: nothing is painted, so there is no
+ *  frame to wait for and no reason to wake every 32 ms. */
+const HIDDEN_FLUSH_MS = 500;
+/** Backstop behind a frame request. A frame requested just as the window hid
+ *  is paused by the browser, and until it runs nothing else schedules a flush
+ *  — events would queue for as long as the window stayed hidden. */
+const FRAME_FALLBACK_MS = 1_000;
+
 function scheduleProgressFlush() {
   if (progressFlushScheduled) return;
   progressFlushScheduled = true;
+  const run = () => {
+    flushRaf = null;
+    flushTimeout = null;
+    flushPendingTransfers();
+  };
   if (
     typeof requestAnimationFrame === 'function' &&
     typeof document !== 'undefined' &&
     document.visibilityState === 'visible'
   ) {
-    flushRaf = requestAnimationFrame(() => {
-      flushRaf = null;
-      flushProgress();
-    });
+    flushRaf = requestAnimationFrame(run);
+    flushTimeout = setTimeout(run, FRAME_FALLBACK_MS);
   } else {
-    flushTimeout = setTimeout(() => {
-      flushTimeout = null;
-      flushProgress();
-    }, 32);
+    flushTimeout = setTimeout(run, HIDDEN_FLUSH_MS);
   }
 }
 
-function flushProgress() {
-  progressFlushScheduled = false;
-  if (pendingProgress.size === 0) return;
-  const now = Date.now();
-  const batch = Array.from(pendingProgress.entries());
-  const retained = new Map<string, PendingProgress>();
-  transfers.update((list) => {
-    let changed = false;
-    // Build a one-shot id -> index lookup. The old code did
-    // `list.findIndex(...)` per pending payload, making the flush
-    // O(P * N) where P = payloads queued this frame and N = total
-    // transfers. With ~100 transfers and a burst of ~100 payloads coalesced
-    // into one frame that's ~10k scans per 16 ms frame. O(P + N) via a Map
-    // is roughly an order of magnitude cheaper.
-    const indexById = new Map<string, number>();
-    for (let i = 0; i < list.length; i++) {
-      indexById.set(list[i].id, i);
-    }
-    for (const [id, entry] of batch) {
-      const p = entry.payload;
-      const idx = indexById.get(id);
-      if (idx === undefined) {
-        // No matching row yet. Keep the latest payload and re-try on the
-        // next frame unless the race window has clearly expired.
-        if (now - entry.firstSeen < ORPHAN_PROGRESS_TTL_MS) {
-          retained.set(id, entry);
-        }
-        continue;
-      }
-      const existing = list[idx];
-      if (PROGRESS_SKIP_STATUSES.has(existing.status)) continue;
-      if (existing.direction !== 'upload' && progressRewindHold.has(id)) continue;
-      const isUpload = existing.direction === 'upload';
-      const rawTransferred = isUpload ? (p.uploaded ?? p.downloaded ?? 0) : (p.downloaded ?? 0);
-      const transferred = Math.max(rawTransferred, existing.transferred || 0);
-      // Uploads: `completed_size` is unique coverage, not session wire bytes.
-      // Merging it with `transferred` pinned the bar at 100% whenever
-      // re-requests reached file size while the parts bitmap was still sparse.
-      // Never derived from `transferred` for either direction. `transferred` is
-      // cumulative wire bytes and counts anything downloaded or sent twice, so on
-      // a download that re-fetched a corrupt part it exceeds the file size —
-      // seeding Completed from it drove the bar and the remaining byte count past
-      // 100%. Uploads had the same bug and were fixed the same way; downloads only
-      // became exposed once they started reporting real wire bytes.
-      const completedSize = isUpload
-        ? (p.completed_size != null ? p.completed_size : existing.completed_size || 0)
-        : Math.max(p.completed_size ?? 0, existing.completed_size || 0);
-      const bytesMoved = transferred > (existing.transferred || 0);
-      const clearStaleHealth = bytesMoved || existing.health === 'stalled';
-      list[idx] = {
-        ...existing,
-        transferred,
-        completed_size: completedSize,
-        progress: isUpload ? p.progress : Math.max(p.progress, existing.progress || 0),
-        speed: p.speed,
-        status: existing.status === 'searching' || existing.status === 'queued' ? existing.status : 'active',
-        health: clearStaleHealth ? 'healthy' : existing.health,
-        health_reason: clearStaleHealth ? undefined : existing.health_reason,
-        health_code: clearStaleHealth ? undefined : existing.health_code,
-        stalled_since: clearStaleHealth ? undefined : existing.stalled_since,
-        ...(p.upload_time != null ? { upload_time: p.upload_time } : {}),
-        ...(p.up_part_status != null ? { up_part_status: p.up_part_status } : {}),
-        ...(p.up_part_count != null ? { up_part_count: p.up_part_count } : {}),
-        ...(p.up_peer_part_status != null ? { up_peer_part_status: p.up_peer_part_status } : {}),
-      };
-      changed = true;
-    }
-    return changed ? [...list] : list;
-  });
-  pendingProgress.clear();
-  if (retained.size > 0) {
-    for (const [id, entry] of retained) pendingProgress.set(id, entry);
-    scheduleProgressFlush();
+/** On hiding, a pending frame will not run: flush now instead. */
+function onStoreVisibilityChange() {
+  if (typeof document === 'undefined' || document.visibilityState === 'visible') return;
+  if (flushRaf !== null) flushPendingTransfers();
+}
+
+function cancelScheduledFlush() {
+  if (flushRaf !== null) {
+    cancelAnimationFrame(flushRaf);
+    flushRaf = null;
   }
+  if (flushTimeout !== null) {
+    clearTimeout(flushTimeout);
+    flushTimeout = null;
+  }
+  progressFlushScheduled = false;
+}
+
+/**
+ * Apply every queued row event, then the coalesced progress payloads, and
+ * publish once. Also run synchronously ahead of anything that reads or
+ * rewrites the list outside the batch — membership events and the poll merge —
+ * so those still see events in the order they arrived.
+ */
+function flushPendingTransfers() {
+  cancelScheduledFlush();
+  if (pendingRowOps.size === 0 && pendingProgress.size === 0) return;
+  let list = applyRowPatches(publishedTransfers, pendingRowOps.drain(eventContext));
+  if (pendingProgress.size > 0) {
+    const now = Date.now();
+    const batch = Array.from(pendingProgress.entries());
+    pendingProgress.clear();
+    const matched = new Set<string>();
+    list = applyRowPatches(
+      list,
+      batch.map(([id, entry]) => [id, (row: Transfer) => {
+        matched.add(id);
+        return applyProgress(row, entry.payload);
+      }] as const),
+    );
+    let retained = false;
+    for (const [id, entry] of batch) {
+      // No matching row yet. Keep the latest payload and re-try on the next
+      // frame unless the race window has clearly expired.
+      if (!matched.has(id) && now - entry.firstSeen < ORPHAN_PROGRESS_TTL_MS) {
+        pendingProgress.set(id, entry);
+        retained = true;
+      }
+    }
+    if (retained) scheduleProgressFlush();
+  }
+  commitTransfers(list);
+}
+
+function applyProgress(existing: Transfer, p: ProgressPayload): Transfer {
+  const id = existing.id;
+  if (PROGRESS_SKIP_STATUSES.has(existing.status)) return existing;
+  if (existing.direction !== 'upload' && progressRewindHold.has(id)) return existing;
+  const isUpload = existing.direction === 'upload';
+  const rawTransferred = isUpload ? (p.uploaded ?? p.downloaded ?? 0) : (p.downloaded ?? 0);
+  const transferred = Math.max(rawTransferred, existing.transferred || 0);
+  // Uploads: `completed_size` is unique coverage, not session wire bytes.
+  // Merging it with `transferred` pinned the bar at 100% whenever
+  // re-requests reached file size while the parts bitmap was still sparse.
+  // Never derived from `transferred` for either direction. `transferred` is
+  // cumulative wire bytes and counts anything downloaded or sent twice, so on
+  // a download that re-fetched a corrupt part it exceeds the file size —
+  // seeding Completed from it drove the bar and the remaining byte count past
+  // 100%. Uploads had the same bug and were fixed the same way; downloads only
+  // became exposed once they started reporting real wire bytes.
+  const completedSize = isUpload
+    ? (p.completed_size != null ? p.completed_size : existing.completed_size || 0)
+    : Math.max(p.completed_size ?? 0, existing.completed_size || 0);
+  const bytesMoved = transferred > (existing.transferred || 0);
+  const completedMoved = !isUpload && completedSize > (existing.completed_size || 0);
+  // Only recover from a stale stall when this payload actually moved
+  // bytes. Clearing on `health === 'stalled'` alone fought the 3 s poll:
+  // a progress tick painted the row healthy, the next snapshot painted
+  // it red again, and the bar flashed Stalled every few seconds.
+  const clearStaleHealth = bytesMoved || completedMoved;
+  return {
+    ...existing,
+    transferred,
+    completed_size: completedSize,
+    progress: isUpload ? p.progress : Math.max(p.progress, existing.progress || 0),
+    speed: p.speed,
+    status: existing.status === 'searching' || existing.status === 'queued' ? existing.status : 'active',
+    health: clearStaleHealth ? 'healthy' : existing.health,
+    health_reason: clearStaleHealth ? undefined : existing.health_reason,
+    health_code: clearStaleHealth ? undefined : existing.health_code,
+    stalled_since: clearStaleHealth ? undefined : existing.stalled_since,
+    ...(p.upload_time != null ? { upload_time: p.upload_time } : {}),
+    ...(p.up_part_status != null ? { up_part_status: p.up_part_status } : {}),
+    ...(p.up_part_count != null ? { up_part_count: p.up_part_count } : {}),
+    ...(p.up_peer_part_status != null ? { up_peer_part_status: p.up_peer_part_status } : {}),
+  };
 }
 
 /**
@@ -653,31 +669,21 @@ export async function initTransferStore() {
       const narrowed = narrowStatus(event.payload?.status);
       if (!narrowed) return;
       const t = { ...event.payload, status: narrowed };
-      transfers.update((list) => {
-        const idx = list.findIndex((x) => x.id === t.id);
-        if (idx >= 0) {
-          const existing = list[idx];
-          const next = {
-            ...existing,
-            ember_hash: t.ember_hash ?? existing.ember_hash,
-            user_hash: t.user_hash ?? existing.user_hash,
-            client_software: t.client_software || existing.client_software,
-            peer_name: t.peer_name || existing.peer_name,
-          };
-          if (
-            next.ember_hash === existing.ember_hash
-            && next.user_hash === existing.user_hash
-            && next.client_software === existing.client_software
-            && next.peer_name === existing.peer_name
-          ) {
-            return list;
-          }
-          const copy = list.slice();
-          copy[idx] = next;
-          return copy;
-        }
-        return [...list, t];
-      });
+      flushPendingTransfers();
+      const list = publishedTransfers;
+      if (!list.some((x) => x.id === t.id)) {
+        commitTransfers([...list, t]);
+        return;
+      }
+      commitTransfers(
+        applyRowPatches(list, [[t.id, (existing: Transfer) => ({
+          ...existing,
+          ember_hash: t.ember_hash ?? existing.ember_hash,
+          user_hash: t.user_hash ?? existing.user_hash,
+          client_software: t.client_software || existing.client_software,
+          peer_name: t.peer_name || existing.peer_name,
+        })]]),
+      );
     });
     await safeListen<ProgressPayload>('transfer-progress', (event) => {
       // NB: deliberately does NOT markEventUpdate() — see note there. Progress
@@ -692,7 +698,8 @@ export async function initTransferStore() {
     });
     await safeListen<TransferEventPayload>('transfer-complete', (event) => {
       markEventUpdate();
-      const { id, direction, ember_verified } = event.payload;
+      flushPendingTransfers();
+      const { id, direction } = event.payload;
       // Read the row before the update rather than inside it: a store updater
       // must stay a pure function of its input, and the download branch below
       // is unreachable for uploads (they return early), so there is nowhere
@@ -703,7 +710,8 @@ export async function initTransferStore() {
       // event status already wins on its own, but there's no reason to keep it).
       reversibleStateEnteredAt.delete(id);
       reversibleStateLeftAt.delete(id);
-      transfers.update((list) => {
+      {
+        const list = publishedTransfers;
         // Find the row (if any) so we can decide whether to drop it
         // outright (uploads) or simply mark it completed (downloads).
         const existing = list.find((t) => t.id === id);
@@ -718,10 +726,10 @@ export async function initTransferStore() {
           // `progressRewindHold` in particular would otherwise keep an entry
           // for an id that can never come back.
           forgetTransfer(id);
-          return list.filter((t) => t.id !== id);
+          commitTransfers(applyRowPatches(list, [[id, () => null]]));
+          return;
         }
-        return list.map((t) => {
-          if (t.id !== id) return t;
+        commitTransfers(applyRowPatches(list, [[id, (t: Transfer) => {
           // D30: never flip a row already in a terminal state (e.g. late
           // `transfer-complete` after a `transfer-failed`).
           if (isTerminal(t.status) && t.status !== 'completed') return t;
@@ -745,18 +753,19 @@ export async function initTransferStore() {
             // columns on a finished row.
             transferred: Math.max(t.transferred || 0, t.total_size),
             completed_size: t.total_size,
-            ember_verified: ember_verified === true || t.ember_verified,
           };
-        });
-      });
+        }]]));
+      }
     });
     await safeListen<TransferEventPayload>('transfer-failed', (event) => {
       markEventUpdate();
+      flushPendingTransfers();
       const { id, error, failure_code, failure_kind, failure_stage, direction } = event.payload;
       notifyDownloadFailed(id, direction, error, failure_code);
       reversibleStateEnteredAt.delete(id);
       reversibleStateLeftAt.delete(id);
-      transfers.update((list) => {
+      {
+        const list = publishedTransfers;
         const existing = list.find((t) => t.id === id);
         const isUpload = direction === 'upload' || existing?.direction === 'upload';
         if (isUpload) {
@@ -768,16 +777,17 @@ export async function initTransferStore() {
           // See the `transfer-complete` upload path: removal means every
           // per-id map drops the row, not just the queued progress.
           forgetTransfer(id);
-          return list.filter((t) => t.id !== id);
+          commitTransfers(applyRowPatches(list, [[id, () => null]]));
+          return;
         }
         // User cancel must not paint the row red in Completed/Failed —
         // cancel already removes the download; treat the event as removal.
         if (failure_code === 'cancelled') {
           forgetTransfer(id);
-          return list.filter((t) => t.id !== id);
+          commitTransfers(applyRowPatches(list, [[id, () => null]]));
+          return;
         }
-        return list.map((t) => {
-          if (t.id !== id) return t;
+        commitTransfers(applyRowPatches(list, [[id, (t: Transfer) => {
           // D30: don't downgrade a completed row to failed if a stray
           // late-arriving failure event shows up. Treat `failed` -> `failed`
           // as idempotent so kind/stage metadata can still refresh.
@@ -791,216 +801,56 @@ export async function initTransferStore() {
             failure_kind,
             failure_stage,
           };
-        });
-      });
+        }]]));
+      }
     });
-    await safeListen<TransferEventPayload & { status?: string }>(
-      'transfer-status',
-      (event) => {
-        markEventUpdate();
-        const {
-          id,
-          status,
-          peer_id,
-          sources,
-          active_sources,
-          queued_sources,
-          error,
-          failure_reason,
-          failure_code,
-          failure_kind,
-          failure_stage,
-          health,
-          health_reason,
-          health_code,
-          stalled_since,
-        } = event.payload;
-        // A cancel that did not originate on this page arrives here rather than
-        // on `transfer-failed`, whose handler has the matching branch. Without
-        // it the row landed in Completed/Failed as a red "Cancelled" entry — the
-        // exact outcome that handler's comment says user cancels must avoid.
-        if (failure_code === 'cancelled') {
-          forgetTransfer(id);
-          transfers.update((list) => list.filter((t) => t.id !== id));
-          return;
-        }
-        transfers.update((list) =>
-          list.map((t) => {
-            if (t.id !== id) return t;
-            const updated = { ...t };
-            // D31: runtime-narrow the status string so an unexpected
-            // backend value can't widen the UI's type view.
-            const narrowed = narrowStatus(status);
-            if (narrowed) {
-              // D30: reject downgrades from a terminal state via a
-              // transfer-status event too. Completed/failed are sticky
-              // until an explicit reset (remove / cancel).
-              if (!(isTerminal(t.status) && t.status !== narrowed)) {
-                updated.status = narrowed;
-                if (narrowed === 'paused' || narrowed === 'stopped' || narrowed === 'insufficient') {
-                  reversibleStateEnteredAt.set(id, Date.now());
-                  reversibleStateLeftAt.delete(id);
-                } else {
-                  const wasReversible =
-                    t.status === 'paused' || t.status === 'stopped' || t.status === 'insufficient';
-                  if (wasReversible) {
-                    reversibleStateLeftAt.set(id, Date.now());
-                  }
-                  reversibleStateEnteredAt.delete(id);
-                }
-              }
-            }
-            // Paused / stopped rows are not transferring — zero the speed in the
-            // same tick the status flips so an instantly-applied pause/stop
-            // event doesn't leave a stale rate on screen until the next poll
-            // (the speed-decay ticker deliberately skips these states, so
-            // nothing else would clear it).
-            if ((narrowed === 'paused' || narrowed === 'stopped') && updated.status === narrowed) {
-              updated.speed = 0;
-              updated.active_sources = 0;
-              updated.queued_sources = 0;
-            }
-            // Clear stale failure_* once the transfer leaves Failed / resumes
-            // into a live or reversible state without new failure fields.
-            if (
-              narrowed &&
-              (narrowed === 'searching' ||
-                narrowed === 'queued' ||
-                narrowed === 'active' ||
-                narrowed === 'paused' ||
-                narrowed === 'stopped' ||
-                narrowed === 'hashing' ||
-                narrowed === 'verifying' ||
-                narrowed === 'completing') &&
-              failure_reason === undefined &&
-              failure_code === undefined &&
-              failure_kind === undefined &&
-              failure_stage === undefined &&
-              error === undefined
-            ) {
-              delete updated.failure_reason;
-              delete updated.failure_code;
-              delete updated.failure_kind;
-              delete updated.failure_stage;
-            }
-            if (peer_id) {
-              updated.peer_id = peer_id;
-            }
-            if (sources !== undefined) updated.sources = sources;
-            if (active_sources !== undefined || queued_sources !== undefined) {
-              const nextActive = active_sources ?? t.active_sources ?? 0;
-              const nextQueued = queued_sources ?? t.queued_sources ?? 0;
-              const liveIncoming = nextActive + nextQueued;
-              const liveCurrent = (t.active_sources || 0) + (t.queued_sources || 0);
-              const statusChanged = narrowed != null && t.status !== narrowed;
-              if (liveIncoming > 0 || liveCurrent === 0 || statusChanged) {
-                if (active_sources !== undefined) updated.active_sources = active_sources;
-                if (queued_sources !== undefined) updated.queued_sources = queued_sources;
-                if (liveIncoming > 0) sourceCountsUpdatedAt.set(id, Date.now());
-                else sourceCountsUpdatedAt.delete(id);
-              }
-            }
-            if (failure_reason !== undefined) updated.failure_reason = failure_reason;
-            else if (error !== undefined) updated.failure_reason = error;
-            if (failure_code !== undefined) updated.failure_code = failure_code;
-            if (failure_kind !== undefined) updated.failure_kind = failure_kind;
-            if (failure_stage !== undefined) updated.failure_stage = failure_stage;
-            if (health !== undefined) updated.health = health;
-            if (health_reason !== undefined) updated.health_reason = health_reason;
-            if (health_code !== undefined) updated.health_code = health_code;
-            if (stalled_since !== undefined) updated.stalled_since = stalled_since;
-            // Backend clears runtime health on these transitions but usually
-            // omits `health` from the event — drop stale `degraded` so the
-            // progress bar returns to accent blue when downloading resumes.
-            if (
-              narrowed &&
-              HEALTH_RESET_STATUSES.has(narrowed) &&
-              health === undefined &&
-              t.status !== narrowed
-            ) {
-              updated.health = 'healthy';
-              updated.health_reason = undefined;
-              updated.health_code = undefined;
-              updated.stalled_since = undefined;
-            }
-            return updated;
-          })
-        );
-      },
-    );
-    await safeListen<TransferEventPayload>('transfer-health', (event) => {
+    const onStatus = (payload: StatusEventPayload, receivedAt: number) => {
+      const { id, failure_code } = payload;
+      // A cancel that did not originate on this page arrives here rather than
+      // on `transfer-failed`, whose handler has the matching branch. Without
+      // it the row landed in Completed/Failed as a red "Cancelled" entry — the
+      // exact outcome that handler's comment says user cancels must avoid.
+      if (failure_code === 'cancelled') {
+        forgetTransfer(id);
+        pendingRowOps.status(id, () => null);
+      } else {
+        pendingRowOps.status(id, (t) => applyStatusEvent(t, payload, eventContext(receivedAt)));
+      }
+      afterRowOpQueued();
+    };
+    await safeListen<StatusEventPayload>('transfer-status', (event) => {
+      markEventUpdate();
+      onStatus(event.payload, Date.now());
+    });
+    // Batch commands (Pause/Resume All, selection pause/resume) send one of
+    // these instead of a `transfer-status` per row.
+    await safeListen<{ items: StatusEventPayload[] }>('transfer-status-batch', (event) => {
+      const items = event.payload?.items;
+      if (!Array.isArray(items) || items.length === 0) return;
+      markEventUpdate();
+      const receivedAt = Date.now();
+      for (const item of items) onStatus(item, receivedAt);
+    });
+    await safeListen<StatusEventPayload>('transfer-health', (event) => {
       // Sub-row update (health/stall colour) — not a status transition, so it
       // must not defer the reconciling poll.
-      const { id, error, failure_reason, failure_code, failure_kind, failure_stage, health, health_reason, health_code, stalled_since } = event.payload;
-      transfers.update((list) =>
-        list.map((t) =>
-          t.id === id
-            ? {
-                ...t,
-                failure_reason: failure_reason ?? error ?? t.failure_reason,
-                failure_code: failure_code ?? t.failure_code,
-                failure_kind: failure_kind ?? t.failure_kind,
-                failure_stage: failure_stage ?? t.failure_stage,
-                health: health ?? t.health,
-                // Only let the event's reason/stalled fields take effect when it
-                // actually carries a new `health` value (in which case they are
-                // authoritative for that state, including clearing them for a
-                // 'healthy' transition). When `health` is omitted, preserve the
-                // existing values instead of clobbering them to undefined.
-                health_reason: health !== undefined ? health_reason : t.health_reason,
-                health_code: health !== undefined ? health_code : t.health_code,
-                stalled_since: health !== undefined ? stalled_since : t.stalled_since,
-              }
-            : t
-        )
-      );
+      pendingRowOps.health(event.payload);
+      afterRowOpQueued();
     });
     await safeListen<{ id: string; speed: number }>('transfer-speed-decay', (event) => {
       // Sub-row update (speed → 0 on idle) — must not defer the reconciling poll.
-      const { id, speed } = event.payload;
-      transfers.update((list) =>
-        list.map((t) => {
-          if (t.id !== id) return t;
-          // D5: only apply decay-driven speed updates to rows that are
-          // actually transferring. Paused / stopped / completed / failed
-          // rows keep their last-known speed (or zero) so the row doesn't
-          // flicker as the decay ticker fires.
-          if (!SPEED_DECAY_APPLIES.has(t.status)) return t;
-          return { ...t, speed };
-        })
-      );
+      pendingRowOps.speed(event.payload.id, event.payload.speed);
+      afterRowOpQueued();
     });
-    await safeListen<{ id: string; sources: number; active_sources: number; queued_sources: number }>(
-      'transfer-sources',
-      (event) => {
-        // Sub-row update (source counts) — must not defer the reconciling poll.
-        const { id, sources, active_sources, queued_sources } = event.payload;
-        transfers.update((list) =>
-          list.map((t) => {
-            if (t.id !== id) return t;
-            const prevLive = (t.active_sources || 0) + (t.queued_sources || 0);
-            const newLive = active_sources + queued_sources;
-            // Discovery refreshes often send an updated total with 0/0
-            // live counts; don't stomp live counters the multi-source
-            // worker is still reporting.
-            const now = Date.now();
-            const lastLiveUpdate = sourceCountsUpdatedAt.get(id) ?? 0;
-            const preserveLive =
-              newLive === 0 &&
-              prevLive > 0 &&
-              now - lastLiveUpdate < LIVE_SOURCE_EVENT_GRACE_MS;
-            if (newLive > 0) sourceCountsUpdatedAt.set(id, now);
-            else if (!preserveLive) sourceCountsUpdatedAt.delete(id);
-            return {
-              ...t,
-              sources,
-              active_sources: preserveLive ? t.active_sources : active_sources,
-              queued_sources: preserveLive ? t.queued_sources : queued_sources,
-            };
-          })
-        );
-      },
-    );
+    await safeListen<SourcesEventPayload>('transfer-sources', (event) => {
+      // Sub-row update (source counts) — must not defer the reconciling poll.
+      pendingRowOps.sources(event.payload, Date.now());
+      afterRowOpQueued();
+    });
+    await safeListen<RuntimeStatus>('ember:runtime-status', (event) => {
+      const speed = publishedUploadSpeed(event.payload);
+      if (speed !== null) effectiveUploadSpeed.set(speed);
+    });
   } catch (e) {
     initialized = false;
     // Registration is sequential, so a failure part-way through leaves the
@@ -1023,50 +873,25 @@ export async function initTransferStore() {
     return;
   }
   unlisteners.push(...registered);
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', onStoreVisibilityChange);
+    unlisteners.push(() => document.removeEventListener('visibilitychange', onStoreVisibilityChange));
+  }
 
   try {
-    const all = await getTransfers();
-    if (myEpoch !== storeEpoch) return;
-    transfers.update((current) => {
-      const currentById = new Map(current.map((t) => [t.id, t]));
-      const merged = all.map((apiItem) => {
-        const eventItem = currentById.get(apiItem.id);
-        if (eventItem) {
-          const preferEvent = isMoreAdvancedStatus(eventItem.status, apiItem.status);
-          const status = preferEvent ? eventItem.status : apiItem.status;
-          return snapCompletedDownload({
-            ...apiItem,
-            status,
-            speed: mergeSpeed(status, apiItem.speed, eventItem.speed),
-            ...mergeProgressCounters(apiItem, eventItem),
-            // Prefer API health: events often omit/stale-carry `health`, and a
-            // prior `degraded` on the event row would otherwise stick forever.
-            health: apiItem.health ?? eventItem.health,
-            ...mergeHealthDetail(apiItem, eventItem),
-            failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
-            failure_code: eventItem.failure_code ?? apiItem.failure_code,
-            failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
-            failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
-            sources: apiItem.sources ?? eventItem.sources ?? 0,
-            active_sources: Math.max(apiItem.active_sources ?? 0, eventItem.active_sources ?? 0),
-            queued_sources: Math.max(apiItem.queued_sources ?? 0, eventItem.queued_sources ?? 0),
-          });
-        }
-        return snapCompletedDownload(apiItem);
-      });
-      // One id `Set` built up front rather than a linear `merged.some(...)`
-      // per row, mirroring the poll merge below.
-      const mergedIds = new Set(merged.map((t) => t.id));
-      for (const t of current) {
-        if (!mergedIds.has(t.id)) {
-          merged.push(t);
-          mergedIds.add(t.id);
-        }
-      }
-      return merged;
-    });
+    await syncFromBackend(Date.now());
   } catch {
     // Backend not ready yet
+  }
+
+  try {
+    const seeded = publishedUploadSpeed(await getRuntimeStatus());
+    if (myEpoch !== storeEpoch) return;
+    // The event only fires on change, so it can have landed while this was in
+    // flight; it is the newer figure.
+    effectiveUploadSpeed.update((current) => current ?? seeded);
+  } catch {
+    // Backend not ready yet; the manual setting stands in until an event.
   }
 }
 
@@ -1106,6 +931,186 @@ function snapCompletedDownload(t: Transfer): Transfer {
  */
 const missingFromApiSince = new Map<string, number>();
 const ZOMBIE_GRACE_MS = 12_000;
+
+/** The poll's copy of the backend's rows, kept current from
+ *  `get_transfers_since` deltas so a tick ships only what changed. */
+let backendSnapshot: SnapshotState<Transfer> = { epoch: null, revision: 0, rows: new Map() };
+/**
+ * Row objects the last reconcile produced or confirmed. A listed row missing
+ * from here was rewritten since — by an event or by the page — and is merged
+ * against the backend's copy even when the backend reports no change for it,
+ * which is what a full snapshot used to do for every row on every tick.
+ */
+let reconciledRows = new WeakSet<Transfer>();
+/** Ids a reconcile skipped while the UI had them removed; see
+ *  `ReconcileOptions.resurfaced`. */
+const resurfacedIds = new Set<string>();
+let syncInFlight: Promise<void> | null = null;
+
+/** Fetch what changed and merge it into the store. Concurrent callers share
+ *  the request in flight. */
+function syncFromBackend(pollStartedAt: number): Promise<void> {
+  if (!syncInFlight) {
+    syncInFlight = runSync(pollStartedAt).finally(() => {
+      syncInFlight = null;
+    });
+  }
+  return syncInFlight;
+}
+
+async function runSync(pollStartedAt: number): Promise<void> {
+  const epoch = storeEpoch;
+  // The deadline lives here rather than in the API wrapper: at a 3 s cadence
+  // an answer older than one tick has nothing left to reconcile, which is far
+  // tighter than would be right for a one-off caller. A lost answer costs
+  // nothing — the next request asks from the same revision.
+  const delta = await withTimeout(
+    getTransfersSince(backendSnapshot.epoch, backendSnapshot.revision),
+    'get_transfers_since',
+    4000,
+  );
+  if (epoch !== storeEpoch) return;
+  const changed = applySnapshotDelta(backendSnapshot, delta);
+  if (changed === undefined) return;
+  flushPendingTransfers();
+  const now = Date.now();
+  pruneRemovedUploads(now);
+  pruneRemovedDownloads(now);
+  const sticky = new Set<string>();
+  const next = reconcileRows(publishedTransfers, backendSnapshot.rows, {
+    changed,
+    needsMerge: (row) => !reconciledRows.has(row),
+    merge: (apiItem, eventItem) => {
+      const merged = mergePolledRow(apiItem, eventItem, now, pollStartedAt);
+      if (merged.sticky) sticky.add(apiItem.id);
+      return merged.row;
+    },
+    fresh: snapCompletedDownload,
+    // Upload/download rows removed within the last ~10 s. Without this, a
+    // snapshot fetched just before a `transfer-complete` / optimistic cancel
+    // would resurrect the just-vanished row for a poll cycle.
+    suppressed: (id) => wasRecentlyRemoved(id, now) || wasRecentlyRemovedDownload(id, now),
+    keepMissing: (row) => keepRowMissingFromBackend(row, now),
+    resurfaced: resurfacedIds,
+  });
+  for (const id of missingFromApiSince.keys()) {
+    if (backendSnapshot.rows.has(id)) missingFromApiSince.delete(id);
+  }
+  for (const row of next) {
+    if (!sticky.has(row.id)) reconciledRows.add(row);
+  }
+  commitTransfers(next);
+}
+
+/**
+ * Merge one backend row with the listed one. `sticky` marks a merge that
+ * leaned on a time-limited preference for the event side, so the row is
+ * merged again next tick even if the backend has nothing new for it.
+ */
+function mergePolledRow(
+  apiItem: Transfer,
+  eventItem: Transfer,
+  now: number,
+  pollStartedAt: number,
+): { row: Transfer; sticky: boolean } {
+  // This specific snapshot was already in flight when the row most recently
+  // entered paused/stopped/insufficient — it necessarily predates that
+  // transition, so it must not be allowed to downgrade the row back to
+  // whatever it showed before. `isMoreAdvancedStatus` otherwise always defers
+  // to the API for these reversible states, on the (usually correct, but not
+  // here) assumption that the snapshot is at least as fresh as the event.
+  const enteredReversibleAt = reversibleStateEnteredAt.get(apiItem.id);
+  const snapshotPredatesReversibleEntry =
+    enteredReversibleAt != null && enteredReversibleAt > pollStartedAt;
+  // Symmetric leave protection: a resume event that landed after this poll
+  // started must win over an API snapshot still showing
+  // paused/stopped/insufficient.
+  const leftReversibleAt = reversibleStateLeftAt.get(apiItem.id);
+  const apiStillReversible =
+    apiItem.status === 'paused' ||
+    apiItem.status === 'stopped' ||
+    apiItem.status === 'insufficient';
+  const snapshotPredatesReversibleLeave =
+    leftReversibleAt != null && leftReversibleAt > pollStartedAt && apiStillReversible;
+  const preferEvent =
+    snapshotPredatesReversibleEntry ||
+    snapshotPredatesReversibleLeave ||
+    isMoreAdvancedStatus(eventItem.status, apiItem.status);
+  const status = preferEvent ? eventItem.status : apiItem.status;
+  const apiActive = apiItem.active_sources ?? 0;
+  const apiQueued = apiItem.queued_sources ?? 0;
+  const eventActive = eventItem.active_sources ?? 0;
+  const eventQueued = eventItem.queued_sources ?? 0;
+  const preserveFreshEventCounts =
+    apiActive + apiQueued === 0 &&
+    eventActive + eventQueued > 0 &&
+    now - (sourceCountsUpdatedAt.get(apiItem.id) ?? 0) < LIVE_SOURCE_EVENT_GRACE_MS;
+  if (apiActive + apiQueued > 0) {
+    sourceCountsUpdatedAt.set(apiItem.id, now);
+  } else if (!preserveFreshEventCounts) {
+    sourceCountsUpdatedAt.delete(apiItem.id);
+  }
+  const row = snapCompletedDownload({
+    ...apiItem,
+    status,
+    ...mergeProgressCounters(apiItem, eventItem),
+    speed: mergeSpeed(status, apiItem.speed),
+    ...mergeHealth(apiItem, eventItem),
+    failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
+    failure_code: eventItem.failure_code ?? apiItem.failure_code,
+    failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
+    failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
+    sources: apiItem.sources ?? eventItem.sources ?? 0,
+    active_sources:
+      status === 'paused' || status === 'stopped'
+        ? 0
+        : preserveFreshEventCounts
+          ? eventActive
+          : apiActive,
+    queued_sources:
+      status === 'paused' || status === 'stopped'
+        ? 0
+        : preserveFreshEventCounts
+          ? eventQueued
+          : apiQueued,
+  });
+  return {
+    row,
+    sticky:
+      snapshotPredatesReversibleEntry || snapshotPredatesReversibleLeave || preserveFreshEventCounts,
+  };
+}
+
+const MISSING_TERMINAL_STATUSES: ReadonlySet<Transfer['status']> = new Set<Transfer['status']>([
+  'completed',
+  'failed',
+  'stopped',
+]);
+
+/** A listed row the backend does not report: keep it or let it go. */
+function keepRowMissingFromBackend(t: Transfer, now: number): boolean {
+  if (MISSING_TERMINAL_STATUSES.has(t.status)) {
+    // A permanent drop, and the busiest one — every completed or failed
+    // download eventually stops being reported. Clear the whole per-id
+    // side-map set, not just the missing-timer, or the maps `forgetTransfer`
+    // exists to bound leak on the common path.
+    forgetTransfer(t.id);
+    return false;
+  }
+  // Non-terminal row the backend doesn't include. Keep it briefly to absorb a
+  // poll/event race, but drop it once the backend has consistently omitted it
+  // for the grace window — otherwise an event-only row whose transfer the
+  // backend dropped would linger forever as a stuck "active" zombie.
+  const firstMissing = missingFromApiSince.get(t.id) ?? now;
+  if (now - firstMissing <= ZOMBIE_GRACE_MS) {
+    missingFromApiSince.set(t.id, firstMissing);
+    return true;
+  }
+  // Dropping the row for good: this is the last pass that can see the id, so
+  // the timer has to go here or it survives until `cleanupTransferStore`.
+  forgetTransfer(t.id);
+  return false;
+}
 
 /**
  * Drop every per-id bookkeeping entry for a transfer that has left the store.
@@ -1153,17 +1158,15 @@ export function cleanupTransferStore() {
   lastApiCompleted.clear();
   progressRewindHold.clear();
   announcedTerminal.clear();
+  effectiveUploadSpeed.set(null);
   // Cancel any flush queued for the next frame/tick so it can't run against a
   // store we've just reset (or a subsequently re-initialised one).
-  if (flushRaf !== null) {
-    cancelAnimationFrame(flushRaf);
-    flushRaf = null;
-  }
-  if (flushTimeout !== null) {
-    clearTimeout(flushTimeout);
-    flushTimeout = null;
-  }
-  progressFlushScheduled = false;
+  cancelScheduledFlush();
+  pendingRowOps.clear();
+  backendSnapshot = { epoch: null, revision: 0, rows: new Map() };
+  reconciledRows = new WeakSet();
+  resurfacedIds.clear();
+  syncInFlight = null;
   initialized = false;
   transfers.set([]);
 }
@@ -1220,10 +1223,8 @@ export function startTransferPoll() {
 
   attachPollVisibilityListener();
 
-  let busy = false;
-
   const poll = async () => {
-    if (busy) return;
+    if (syncInFlight) return;
     // Skip the IPC entirely when the window is hidden. Every tick here
     // costs a Rust-side `list_transfers()` + the full merge-and-broadcast
     // below; while the tab is in the background there's no subscriber
@@ -1242,147 +1243,14 @@ export function startTransferPoll() {
     // gate shut — the poll still reconciles status every ~3 s.
     if (!pollPumpOnNextVisible && Date.now() - lastEventUpdate < 2000) return;
     pollPumpOnNextVisible = false;
-    busy = true;
-    const epoch = storeEpoch;
-    // Captured before the IPC call so the merge below can tell whether THIS
-    // poll's snapshot was already in flight when a pause/stop/insufficient
-    // transition landed (see `reversibleStateEnteredAt`), not just whether
-    // the poll resolved before or after — it always resolves after.
-    const pollStartedAt = Date.now();
     try {
-      // The deadline lives here rather than in the API wrapper: at a 3 s
-      // cadence a snapshot older than one tick has nothing left to reconcile,
-      // which is far tighter than would be right for a one-off caller.
-      const all = await withTimeout(getTransfers(), 'get_transfers', 4000);
-      if (epoch !== storeEpoch) return;
-      transfers.update((current) => {
-        const now = Date.now();
-        pruneRemovedUploads(now);
-        pruneRemovedDownloads(now);
-        const currentById = new Map(current.map((t) => [t.id, t]));
-        const apiIds = new Set(all.map((t) => t.id));
-        const merged = all
-          // Skip API items for upload/download rows we removed within the
-          // last ~10 s. Without this, a poll that fetched its snapshot just
-          // before a `transfer-complete` / optimistic cancel would resurrect
-          // the just-vanished row for a single poll cycle.
-          .filter(
-            (apiItem) =>
-              !wasRecentlyRemoved(apiItem.id, now) &&
-              !wasRecentlyRemovedDownload(apiItem.id, now),
-          )
-          .map((apiItem) => {
-            const eventItem = currentById.get(apiItem.id);
-            if (!eventItem) return apiItem;
-            // This specific `getTransfers()` snapshot was already in flight
-            // when the row most recently entered paused/stopped/insufficient
-            // — it necessarily predates that transition, so it must not be
-            // allowed to downgrade the row back to whatever it showed
-            // before. `isMoreAdvancedStatus` otherwise always defers to the
-            // API for these reversible states, on the (usually correct, but
-            // not here) assumption that the snapshot is at least as fresh as
-            // the event.
-            const enteredReversibleAt = reversibleStateEnteredAt.get(apiItem.id);
-            const snapshotPredatesReversibleEntry =
-              enteredReversibleAt != null && enteredReversibleAt > pollStartedAt;
-            // Symmetric leave protection: a resume event that landed after
-            // this poll started must win over an API snapshot still showing
-            // paused/stopped/insufficient.
-            const leftReversibleAt = reversibleStateLeftAt.get(apiItem.id);
-            const apiStillReversible =
-              apiItem.status === 'paused' ||
-              apiItem.status === 'stopped' ||
-              apiItem.status === 'insufficient';
-            const snapshotPredatesReversibleLeave =
-              leftReversibleAt != null &&
-              leftReversibleAt > pollStartedAt &&
-              apiStillReversible;
-            const preferEvent =
-              snapshotPredatesReversibleEntry ||
-              snapshotPredatesReversibleLeave ||
-              isMoreAdvancedStatus(eventItem.status, apiItem.status);
-            const status = preferEvent ? eventItem.status : apiItem.status;
-            const apiActive = apiItem.active_sources ?? 0;
-            const apiQueued = apiItem.queued_sources ?? 0;
-            const eventActive = eventItem.active_sources ?? 0;
-            const eventQueued = eventItem.queued_sources ?? 0;
-            const preserveFreshEventCounts =
-              apiActive + apiQueued === 0 &&
-              eventActive + eventQueued > 0 &&
-              now - (sourceCountsUpdatedAt.get(apiItem.id) ?? 0) <
-                LIVE_SOURCE_EVENT_GRACE_MS;
-            if (apiActive + apiQueued > 0) {
-              sourceCountsUpdatedAt.set(apiItem.id, now);
-            } else if (!preserveFreshEventCounts) {
-              sourceCountsUpdatedAt.delete(apiItem.id);
-            }
-            return {
-              ...apiItem,
-              status,
-              ...mergeProgressCounters(apiItem, eventItem),
-              speed: mergeSpeed(status, apiItem.speed, eventItem.speed),
-              // Prefer API health over a possibly-stale event value.
-              health: apiItem.health ?? eventItem.health,
-              ...mergeHealthDetail(apiItem, eventItem),
-              failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
-              failure_code: eventItem.failure_code ?? apiItem.failure_code,
-              failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
-              failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
-              sources: apiItem.sources ?? eventItem.sources ?? 0,
-              active_sources:
-                status === 'paused' || status === 'stopped'
-                  ? 0
-                  : preserveFreshEventCounts
-                    ? eventActive
-                    : apiActive,
-              queued_sources:
-                status === 'paused' || status === 'stopped'
-                  ? 0
-                  : preserveFreshEventCounts
-                    ? eventQueued
-                    : apiQueued,
-            };
-          })
-          .map(snapCompletedDownload);
-        const terminalStatuses: Transfer['status'][] = ['completed', 'failed', 'stopped'];
-        const mergedIds = new Set(merged.map((t) => t.id));
-        for (const t of current) {
-          if (mergedIds.has(t.id) || apiIds.has(t.id)) {
-            // Still known to the backend (or intentionally dropped by the
-            // recently-removed filter) — clear any "missing" timer.
-            missingFromApiSince.delete(t.id);
-            continue;
-          }
-          if (terminalStatuses.includes(t.status)) {
-            // Also a permanent drop, and the busiest one — every completed or
-            // failed download eventually stops being reported. Clear the whole
-            // per-id side-map set, not just the missing-timer, or the maps
-            // `forgetTransfer` exists to bound leak on the common path.
-            forgetTransfer(t.id);
-            continue;
-          }
-          // Non-terminal row the backend snapshot doesn't include. Keep it
-          // briefly to absorb a poll/event race, but drop it once the backend
-          // has consistently omitted it for the grace window — otherwise an
-          // event-only row whose transfer the backend dropped would linger
-          // forever as a stuck "active" zombie.
-          const firstMissing = missingFromApiSince.get(t.id) ?? now;
-          if (now - firstMissing <= ZOMBIE_GRACE_MS) {
-            missingFromApiSince.set(t.id, firstMissing);
-            merged.push(t);
-          } else {
-            // Dropping the row for good. This is the last pass that can see
-            // the id — it won't be in `current` next poll — so the timer has
-            // to go here or it survives until `cleanupTransferStore`.
-            forgetTransfer(t.id);
-          }
-        }
-        return merged;
-      });
+      // Captured before the IPC call so the merge can tell whether THIS
+      // poll's snapshot was already in flight when a pause/stop/insufficient
+      // transition landed (see `reversibleStateEnteredAt`), not just whether
+      // the poll resolved before or after — it always resolves after.
+      await syncFromBackend(Date.now());
     } catch {
       // Ignore timeouts and errors
-    } finally {
-      busy = false;
     }
   };
 

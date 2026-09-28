@@ -197,19 +197,7 @@
   .parts-fill {
     position: absolute;
     inset: 0;
-    transition: background 0.3s ease;
-  }
-
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
+    transition: background var(--transition-slow) ease;
   }
 
   @media (prefers-reduced-motion: reduce) {

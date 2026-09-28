@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import * as m from '$lib/paraglide/messages';
 
 export interface FriendInfo {
   user_hash: string;
@@ -109,8 +110,15 @@ export async function updateFriendNickname(userHashHex: string, nickname: string
   return invoke('update_friend_nickname', { userHashHex, nickname });
 }
 
+/** Our current `ember3:` Friend Code. */
 export async function getMyEmberHash(): Promise<string> {
   return invoke('get_my_ember_hash');
+}
+
+/** Mint a new intro secret, invalidating every Friend Code shared so far.
+ *  Resolves with the new code. */
+export async function resetFriendCode(): Promise<string> {
+  return invoke('reset_friend_code');
 }
 
 /**
@@ -161,6 +169,133 @@ export interface IncomingFileOffer {
   file_name: string;
   file_size: number;
   ember_file_hash?: string;
+  /** The sender restricts this file to friends; our copy will be friends-only. */
+  friends_only?: boolean;
+}
+
+/** Where a chat attachment is. See `network/chat_attach.rs` for who moves it. */
+export type ChatAttachmentStatus =
+  | 'offered'
+  | 'awaiting'
+  | 'accepted'
+  | 'active'
+  | 'complete'
+  | 'declined'
+  | 'too_large'
+  | 'busy'
+  | 'not_allowed'
+  | 'cancelled'
+  | 'unreachable'
+  | 'source_gone'
+  | 'failed'
+  | 'expired';
+
+/** One file sent in chat, in either direction. Also the `ember:attach-update`
+ *  payload, so an event and a listed row can be merged by `xfer_id`. */
+export interface ChatAttachment {
+  xfer_id: string;
+  user_hash: string;
+  direction: 'sent' | 'received';
+  name: string;
+  size: number;
+  transferred: number;
+  status: ChatAttachmentStatus;
+  created_at: number;
+  /** A received file that finished and can be opened. */
+  has_file: boolean;
+  /** A program, shortcut or script, or one named like a document. */
+  risky: boolean;
+}
+
+/** Statuses a transfer never leaves. */
+export const CHAT_ATTACHMENT_TERMINAL: ReadonlySet<ChatAttachmentStatus> = new Set([
+  'complete',
+  'declined',
+  'too_large',
+  'busy',
+  'not_allowed',
+  'cancelled',
+  'unreachable',
+  'source_gone',
+  'failed',
+  'expired',
+]);
+
+/**
+ * Fold an update into the attachment already shown. A row that has ended keeps
+ * its ending: a list snapshot or a progress tick taken before it ended can
+ * arrive after it, and nothing moves a transfer out of a terminal status.
+ * Progress ticks carry no new status, so one that crosses a snapshot in flight
+ * must not drag the bar backwards either.
+ */
+export function mergeChatAttachment(prev: ChatAttachment, next: ChatAttachment): ChatAttachment {
+  if (CHAT_ATTACHMENT_TERMINAL.has(prev.status) && !CHAT_ATTACHMENT_TERMINAL.has(next.status)) {
+    return prev;
+  }
+  if (prev.status === 'active' && next.status === 'active') {
+    return { ...next, transferred: Math.max(prev.transferred, next.transferred) };
+  }
+  return next;
+}
+
+/** Pick a file and offer it to a friend. `null` when the picker was closed. */
+export async function pickAndSendChatAttachment(
+  userHashHex: string,
+): Promise<ChatAttachment | null> {
+  return invoke('pick_and_send_chat_attachment', { userHashHex, title: m.picker_file_to_send() });
+}
+
+export async function respondChatAttachment(xferId: string, accept: boolean): Promise<void> {
+  return invoke('respond_chat_attachment', { xferId, accept });
+}
+
+export async function cancelChatAttachment(xferId: string): Promise<void> {
+  return invoke('cancel_chat_attachment', { xferId });
+}
+
+export async function listChatAttachments(userHashHex: string): Promise<ChatAttachment[]> {
+  return invoke('list_chat_attachments', { userHashHex });
+}
+
+/** Open a received file, or with `reveal` show it in its folder. */
+export async function openChatAttachment(xferId: string, reveal: boolean): Promise<void> {
+  return invoke('open_chat_attachment', { xferId, reveal });
+}
+
+export async function openChatFilesFolder(): Promise<void> {
+  return invoke('open_chat_files_folder');
+}
+
+/** Narrow an `ember:attach-update` payload before it touches any state. */
+export function parseChatAttachment(raw: unknown): ChatAttachment | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const hex = (v: unknown, len: number) =>
+    typeof v === 'string' && v.length === len && /^[0-9a-f]+$/.test(v) ? v : null;
+  const xfer_id = hex(r.xfer_id, 32);
+  const user_hash = hex(r.user_hash, 32);
+  if (!xfer_id || !user_hash) return null;
+  if (r.direction !== 'sent' && r.direction !== 'received') return null;
+  const statuses: ChatAttachmentStatus[] = [
+    'offered', 'awaiting', 'accepted', 'active', 'complete', 'declined',
+    'too_large', 'busy', 'not_allowed', 'cancelled', 'unreachable', 'source_gone', 'failed',
+    'expired',
+  ];
+  const status = statuses.find((s) => s === r.status);
+  if (!status) return null;
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0);
+  return {
+    xfer_id,
+    user_hash,
+    direction: r.direction,
+    name: typeof r.name === 'string' ? r.name.slice(0, 255) : '',
+    size: num(r.size),
+    transferred: num(r.transferred),
+    status,
+    created_at: num(r.created_at),
+    has_file: r.has_file === true,
+    risky: r.risky === true,
+  };
 }
 
 export async function retryFriendSearch(userHashHex: string): Promise<void> {
@@ -212,4 +347,6 @@ export interface BrowseFileEntry {
   aich_hash?: string;
   /** Optional 64-char hex BLAKE3 digest when the peer includes it. */
   ember_file_hash?: string;
+  /** Set when the friend restricts this file; a download of it stays friends-only. */
+  friends_only?: boolean;
 }

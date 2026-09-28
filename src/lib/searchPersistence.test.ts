@@ -93,6 +93,37 @@ describe('forPersist', () => {
 
     expect(stripped.results).toHaveLength(PERSIST_MAX_RESULTS);
   });
+
+  it('keeps the best-sourced rows rather than the first ones stored', () => {
+    // Arrival order is packet order. Keeping the head of the array threw away
+    // the rows the user was most likely looking at.
+    const overflowing = tab('a', 0);
+    overflowing.results = [
+      ...Array.from({ length: PERSIST_MAX_RESULTS }, (_, i) => {
+        const r = result(`weak-${i}`);
+        r.availability = 1;
+        return r;
+      }),
+      Object.assign(result('well-sourced'), { availability: 500 }),
+    ];
+
+    const stripped = forPersist(overflowing);
+
+    expect(stripped.results).toHaveLength(PERSIST_MAX_RESULTS);
+    expect(stripped.results.some((r) => r.file.hash === 'well-sourced')).toBe(true);
+  });
+
+  it('drops a spam row before an unsourced honest one', () => {
+    const overflowing = tab('a', 0);
+    overflowing.results = [
+      Object.assign(result('spam'), { availability: 900, is_spam: true }),
+      Object.assign(result('honest'), { availability: 0 }),
+    ];
+
+    const stripped = forPersist(overflowing, 1);
+
+    expect(stripped.results.map((r) => r.file.hash)).toEqual(['honest']);
+  });
 });
 
 describe('buildPersistPayload', () => {

@@ -269,6 +269,21 @@ pub fn connection_node_id(connection: &quinn::Connection) -> Option<[u8; 16]> {
         .and_then(|cert| cert_node_id(cert.as_ref()))
 }
 
+/// The peer's Ed25519 public key, from the certificate the handshake proved
+/// possession of.
+///
+/// [`connection_node_id`] answers "who is this" and is what authorization
+/// compares; this answers "which key", which is what a pairwise derivation
+/// needs. A node id is `BLAKE3(pub)[..16]` and therefore one-way, so a caller
+/// that has to do Diffie-Hellman with the peer cannot get there from the id.
+pub fn connection_ed25519_pubkey(connection: &quinn::Connection) -> Option<[u8; 32]> {
+    let identity = connection.peer_identity()?;
+    let certificates = identity.downcast::<Vec<CertificateDer<'static>>>().ok()?;
+    certificates
+        .first()
+        .and_then(|cert| extract_ember_ed25519_pubkey(cert.as_ref()))
+}
+
 /// Certificate verifier for QUIC connections to Ember peers.
 ///
 /// Behaviour:

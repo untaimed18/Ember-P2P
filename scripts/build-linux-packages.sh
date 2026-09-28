@@ -118,7 +118,12 @@ fi
 
 cd "$build_root"
 
-if [[ ! -d node_modules ]]; then
+# Also after a sync that changed package.json or the lockfile, not only on the
+# first build. The work tree keeps its node_modules between runs, so a new
+# dependency — or a postinstall step such as copying the flag icons — would
+# otherwise never reach it, and the build would ship without it.
+installed_marker="node_modules/.package-lock.json"
+if [[ ! -f "$installed_marker" || package.json -nt "$installed_marker" || package-lock.json -nt "$installed_marker" ]]; then
   echo "==> installing frontend dependencies"
   npm ci
 fi

@@ -958,8 +958,9 @@ footer.doc-end {
 <p class="caption">
   27 = transport overhead (magic + type + nonce + tag). 120 = frame overhead
   (22-byte header + 32-byte public key + 2-byte length + 64-byte signature).
-  <code>FOUND_VALUE</code> record blobs then have 1253 − 16 − 2 = 1235 bytes after
-  the key and count — about five typical keyword records per reply.
+  <code>FOUND_VALUE</code> record blobs then have 1253 − 22 = 1231 bytes after
+  its 22-byte header (key, <code>next_position</code>, <code>total_available</code>,
+  count) — about five typical keyword records per reply.
 </p>
 
 <!-- ══════════════════════════════════════════════ 5 ══════════════════════════════════════════════ -->
@@ -1316,7 +1317,7 @@ footer.doc-end {
 <div class="wire">
   <div class="cap">FOUND_VALUE payload — wire version 3 onward</div>
   key             16 B    the key this reply is for<br>
-  next_position   u16 LE  where a follow-up should resume, or 0 when exhausted<br>
+  next_position   u16 LE  where a follow-up should resume; ≥ total_available when exhausted<br>
   total_available u16 LE  matching records the responder holds under the key<br>
   record_count    u16 LE  ≤ 300<br>
   for each: len   u16 LE + blob (record body ‖ 64-byte publisher signature)
@@ -1327,7 +1328,13 @@ footer.doc-end {
   locally. On a miss the responder sends <code>FOUND_NODE</code> with closer
   contacts, as in classic Kademlia. A declared count the buffer cannot satisfy
   is a framing error — the whole frame is refused, so a peer cannot smuggle a
-  truncated payload.
+  truncated payload. Bytes after the last declared record are ignored, which
+  leaves room for an additive trailer.
+</p>
+<p>
+  Exhaustion is <code>next_position ≥ total_available</code>, never a zero: a
+  page that reaches the end of the key reports <code>next_position</code> equal
+  to <code>total_available</code>, and a searcher stops paging there.
 </p>
 <p>
   <strong>Paging is the searcher’s, not the responder’s.</strong> Version 2 had
@@ -1578,9 +1585,9 @@ footer.doc-end {
 </p>
 <ul class="flow">
   <li>Seed the shortlist from the routing table (verified contacts preferred). Local store may pre-fill FIND_VALUE results, capped at half the result budget so a well-stocked node cannot finish the search from itself alone.</li>
-  <li>Query up to α pending contacts. A node may be asked twice in one search (one loss is not proof it is gone); a third miss marks it failed.</li>
-  <li>On FOUND_NODE, merge closer contacts. On FOUND_VALUE, verify blobs and merge records. Those two outcomes are independent: treating “no closer node” as “query not accepted” used to stall every value lookup until timeout.</li>
-  <li>FIND_NODE converges after α consecutive responses that bring nothing closer, but only once at least k/2 nodes have answered. FIND_VALUE does <em>not</em> use this rule: every extra node is another chance at a record the closer ones did not hold. The walk continues until the shortlist is exhausted, the 300-result budget is full, or 60 seconds elapse.</li>
+  <li>Query up to α pending contacts. A node may be asked twice in one search (one loss is not proof it is gone); a second miss marks it failed. A lead we have never heard from whose Noise handshake never completed gets one attempt: that is no evidence anything lives at the address.</li>
+  <li>On FOUND_NODE, merge closer contacts — at most ⌈k/α⌉ = 4 shortlist entries per responder, the closest it named, since the IDs it returns are its to invent. Seeds from our own table and pinned session peers are exempt. On FOUND_VALUE, verify blobs and merge records, taking at most 5 keyword records per file from any one responder. Those two outcomes are independent: treating “no closer node” as “query not accepted” used to stall every value lookup until timeout.</li>
+  <li>FIND_NODE converges once the k closest entries that have not failed have all answered, α consecutive responses have brought nothing closer, and at least k/2 nodes have answered. FIND_VALUE does <em>not</em> use this rule: every extra node is another chance at a record the closer ones did not hold. The walk continues until the shortlist is exhausted, the 300-result budget is full, or 60 seconds elapse.</li>
 </ul>
 
 <table class="data">
@@ -1638,7 +1645,7 @@ footer.doc-end {
 
 <h3>8.4 Serving window and paging</h3>
 <p>
-  A peer answers a keyword query with whatever fits the 1235-byte record budget:
+  A peer answers a keyword query with whatever fits the 1231-byte record budget:
   about five records for a bare keyword record, four for one carrying media, two
   in the worst case. Through wire version 2 packing filled from the front of
   insertion order, so the oldest five were the only ones a node would ever
@@ -2014,6 +2021,7 @@ footer.doc-end {
     <tr><td>known.met tag 0xE4</td><td>Last successful Ember source-publish per file</td></tr>
     <tr><td>known.met tag 0xE5</td><td>Last successful Ember keyword-publish per file</td></tr>
     <tr><td>ember_dht_highwater.json</td><td>Daily and all-time high-water of verified contacts</td></tr>
+    <tr><td>ember_source_address.json</td><td>External address our source records carry, and since when; source-publish stamps older than that do not hold a file back from republishing</td></tr>
   </tbody>
 </table>
 
@@ -2164,9 +2172,9 @@ footer.doc-end {
     <tr><td>FRAME_OVERHEAD</td><td>120</td><td>dht/messages.rs</td></tr>
     <tr><td>TRANSPORT_OVERHEAD</td><td>27</td><td>dht/messages.rs</td></tr>
     <tr><td>MAX_UNFRAGMENTED_PAYLOAD</td><td>1253</td><td>dht/messages.rs</td></tr>
-    <tr><td>MAX_FOUND_VALUE_RECORD_BYTES</td><td>1235</td><td>dht/messages.rs</td></tr>
-    <tr><td>MAX_STORE_RECORD_BYTES</td><td>1169</td><td>dht/messages.rs — FOUND_VALUE singleton pack budget (1235 − 2 − 64)</td></tr>
-    <tr><td>MAX_FOUND_VALUE_BLOB_BYTES</td><td>1233</td><td>dht/messages.rs — body + 64-byte signature</td></tr>
+    <tr><td>MAX_FOUND_VALUE_RECORD_BYTES</td><td>1231</td><td>dht/messages.rs</td></tr>
+    <tr><td>MAX_STORE_RECORD_BYTES</td><td>1165</td><td>dht/messages.rs — FOUND_VALUE singleton pack budget (1231 − 2 − 64)</td></tr>
+    <tr><td>MAX_FOUND_VALUE_BLOB_BYTES</td><td>1229</td><td>dht/messages.rs — body + 64-byte signature</td></tr>
     <tr><td>MAX_FIND_VALUE_KEYS</td><td>8</td><td>dht/messages.rs</td></tr>
     <tr><td>MAX_FIND_VALUE_EXTRA_KEYS</td><td>15 (constraint block)</td><td>dht/messages.rs</td></tr>
     <tr><td>MAX_FIND_VALUE_KEYS_TOTAL</td><td>23</td><td>dht/messages.rs</td></tr>

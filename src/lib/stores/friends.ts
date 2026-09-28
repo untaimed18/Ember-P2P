@@ -1,19 +1,21 @@
 import { writable, get } from 'svelte/store';
-import { listen } from '@tauri-apps/api/event';
+import { emit, listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
-import { isAppVisible } from '$lib/utils';
+import { confusableSkeleton, isAppVisible, mixesLookalikeScripts } from '$lib/utils';
 import {
   getFriendRequests,
   getFriends,
   getOnlineFriends,
   getUnreadMessageCounts,
   isFriendDiscoverable,
+  parseChatAttachment,
   type FriendInfo,
   type FriendRequestInfo,
   type IncomingFileOffer,
 } from '$lib/api/friends';
-import { toastError, toastSuccess } from '$lib/stores/toast';
+import { toast, toastError, toastSuccess } from '$lib/stores/toast';
 import { notify, shouldNotify } from '$lib/notifications';
+import { chatWindowShows, isChatWindow } from '$lib/windowRole';
 import * as m from '$lib/paraglide/messages';
 
 export const onlineFriends = writable<Set<string>>(new Set());
@@ -29,6 +31,12 @@ export const onlineFriends = writable<Set<string>>(new Set());
 export const friendNames = writable<Map<string, string>>(new Map());
 export const unreadCounts = writable<Map<string, number>>(new Map());
 export const friendRequests = writable<FriendRequestInfo[]>([]);
+/**
+ * Shared friend list so the dock picker, channel "Add friend", and the
+ * Friends page all see the same rows. Seeded during init and refreshed
+ * whenever a confirmation event or the Friends page reloads the table.
+ */
+export const friendsList = writable<FriendInfo[]>([]);
 export const searchingFriends = writable<Set<string>>(new Set());
 export const isDiscoverable = writable(false);
 let friendsSeedFailedToast = false;
@@ -83,9 +91,63 @@ function safeEventText(raw: unknown, max = 4096): string {
  * chose one, and "someone you added is online" is worse than eight hex digits.
  */
 export function friendDisplayName(friendHash: string): string {
+  return friendLabel(friendHash, undefined, get(friendNames));
+}
+
+let skeletonCountsFor: Map<string, string> | null = null;
+let skeletonCounts = new Map<string, number>();
+
+/** How many friends' names fold to each skeleton. Cached per map: the store
+ *  only ever replaces the map, so identity is the change signal. */
+function friendSkeletonCounts(names: Map<string, string>): Map<string, number> {
+  if (names !== skeletonCountsFor) {
+    skeletonCountsFor = names;
+    skeletonCounts = new Map();
+    for (const name of names.values()) {
+      const key = confusableSkeleton(name);
+      skeletonCounts.set(key, (skeletonCounts.get(key) ?? 0) + 1);
+    }
+  }
+  return skeletonCounts;
+}
+
+/**
+ * Whether a friend's name alone does not say which friend it is: another
+ * friend's name looks the same once lookalike characters are folded, or the
+ * name mixes Latin, Cyrillic and Greek letters the way a spoof does.
+ */
+export function friendNameIsAmbiguous(
+  friendHash: string,
+  name: string,
+  names: Map<string, string>,
+): boolean {
+  if (mixesLookalikeScripts(name)) return true;
+  const key = confusableSkeleton(name);
+  let others = friendSkeletonCounts(names).get(key) ?? 0;
+  const own = names.get(friendHash.toLowerCase());
+  if (own !== undefined && confusableSkeleton(own) === key) others -= 1;
+  return others > 0;
+}
+
+/**
+ * Display label for a friend: the name, with a short hash beside it when the
+ * name is ambiguous (see {@link friendNameIsAmbiguous}), or the short hash
+ * alone when there is no name.
+ *
+ * `nickname` overrides the cached name for callers that hold a fresher one;
+ * `names` is passed in so a component can supply `$friendNames` and re-render
+ * when the cache changes.
+ */
+export function friendLabel(
+  friendHash: string,
+  nickname: string | null | undefined,
+  names: Map<string, string>,
+): string {
   const hash = friendHash.toLowerCase();
-  const known = get(friendNames).get(hash);
-  return known && known.trim() ? known : `${hash.slice(0, 8)}\u2026`;
+  const short = `${hash.slice(0, 8)}\u2026`;
+  const name = (nickname ?? '').trim() || (names.get(hash) ?? '').trim();
+  if (!name) return short;
+  return friendNameIsAmbiguous(hash, name, names) ? `${name} (${short})` : name;
 }
 
 /** Record (or refresh) one friend's nickname. */
@@ -115,6 +177,78 @@ export function rememberFriendNames(friends: FriendInfo[]): void {
     }
     return changed ? next : names;
   });
+}
+
+/**
+ * Tickets ordering the `get_friends` fetches that land in {@link friendsList}.
+ *
+ * Three surfaces load this list — the Friends page, the Transfers known-peers
+ * table, and the confirm-event refresh below — and only the page had an
+ * ordering guard, which it applied to its own state rather than to the shared
+ * store. Without one here, a slow fetch can land on top of a newer one and
+ * put back a row the user just removed or blocked.
+ */
+let friendsFetchTicket = 0;
+let friendsFetchLanded = 0;
+
+/** Take a ticket before awaiting `getFriends`, then hand it to
+ *  {@link commitFriendsList} with the result. */
+export function beginFriendsListFetch(): number {
+  return ++friendsFetchTicket;
+}
+
+function writeFriendsList(friends: FriendInfo[]): void {
+  friendsList.set(friends);
+  rememberFriendNames(friends);
+}
+
+/** Authoritative write for the shared list and the name cache together.
+ *  Supersedes any fetch still in flight. */
+export function setFriendsList(friends: FriendInfo[]): void {
+  friendsFetchLanded = ++friendsFetchTicket;
+  writeFriendsList(friends);
+}
+
+/** Publish a fetch's result unless a newer one already landed. Returns
+ *  whether it was taken, so a caller can skip side effects (closing chat
+ *  tabs, say) it would otherwise base on a superseded list. */
+export function commitFriendsList(ticket: number, friends: FriendInfo[]): boolean {
+  if (ticket < friendsFetchLanded) return false;
+  friendsFetchLanded = ticket;
+  writeFriendsList(friends);
+  return true;
+}
+
+export async function refreshFriendsList(): Promise<void> {
+  const epoch = storeEpoch;
+  const ticket = beginFriendsListFetch();
+  try {
+    const friends = await getFriends();
+    if (epoch !== storeEpoch) return;
+    commitFriendsList(ticket, friends);
+  } catch (e) {
+    console.warn('friends: refresh list failed', e);
+  }
+}
+
+/**
+ * Coalesces a burst of confirmations into one `get_friends`.
+ *
+ * `ember:friend-confirmed` is not just the moment a friendship completes:
+ * every rediscovery sweep re-emits it for each friend that already has a live
+ * session, so a refresh per event meant one IPC round trip per friend per
+ * sweep — doubled while the Friends page is open, since it reloads on the
+ * same event. Same trailing debounce, and for the same reason, as
+ * `scheduleFriendRequestRefetch`.
+ */
+let friendsListRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleFriendsListRefresh() {
+  if (friendsListRefreshTimer !== null) return;
+  friendsListRefreshTimer = setTimeout(() => {
+    friendsListRefreshTimer = null;
+    void refreshFriendsList();
+  }, 250);
 }
 
 function clearSearchTimer(hash: string) {
@@ -150,6 +284,10 @@ function armSearchTimer(hash: string) {
 // `unreadCounts` because the chat-message listener fires regardless
 // of which UI surface is mounted.
 export const activeChatHash = writable<string | null>(null);
+
+/** Chat-attachment moments already announced, as `xfer_id:moment`. Bounded,
+ *  oldest first out; a stale entry costs at most one repeated notification. */
+const announcedAttachments = new Set<string>();
 
 // Dedup window for inbound `ember:chat-message` events. The backend can deliver
 // the same logical message twice in quick succession (the download- and
@@ -274,7 +412,8 @@ export async function initFriendsStore() {
         // separately marks the message read on the backend.
         // A mounted conversation in a hidden/minimized window is NOT being
         // read, so it must still raise a badge.
-        const beingRead = isAppVisible() && get(activeChatHash) === hash;
+        const beingRead =
+          (isAppVisible() && get(activeChatHash) === hash) || chatWindowShows(hash);
         if (!beingRead) {
           unreadCounts.update((m) => {
             const next = new Map(m);
@@ -303,6 +442,19 @@ export async function initFriendsStore() {
       }),
     );
     registered.push(
+      await listen<{ user_hash: string }>(UNREAD_CLEARED_EVENT, (event) => {
+        const hash = validFriendHash(event.payload?.user_hash);
+        if (hash) dropUnread(hash);
+      }),
+    );
+    registered.push(
+      await listen<{ user_hash: string; file_hash: string }>(FILE_OFFER_CLEARED_EVENT, (event) => {
+        const user_hash = validFriendHash(event.payload?.user_hash);
+        const file_hash = validFriendHash(event.payload?.file_hash);
+        if (user_hash && file_hash) dropFileOffer(user_hash, file_hash);
+      }),
+    );
+    registered.push(
       await listen<IncomingFileOffer>('ember:file-offer', (event) => {
         const user_hash = validFriendHash(event.payload?.user_hash);
         const file_hash = validFriendHash(event.payload?.file_hash);
@@ -328,6 +480,37 @@ export async function initFriendsStore() {
             file_name,
           );
         }
+      }),
+    );
+    registered.push(
+      await listen('ember:attach-update', (event) => {
+        const a = parseChatAttachment(event.payload);
+        if (!a || a.direction !== 'received') return;
+        // Two moments are worth interrupting for, and only when the user is not
+        // already looking at that conversation: a file waiting for an answer,
+        // and one that arrived by itself under the auto-accept ceiling.
+        // Progress ticks repeat the same status many times a second, so each
+        // (transfer, moment) pair is announced once.
+        const moment = a.status === 'awaiting' ? 'offer' : a.status === 'complete' ? 'done' : null;
+        if (!moment) return;
+        const key = `${a.xfer_id}:${moment}`;
+        if (announcedAttachments.has(key)) return;
+        announcedAttachments.add(key);
+        if (announcedAttachments.size > 500) {
+          const oldest = announcedAttachments.values().next().value;
+          if (oldest !== undefined) announcedAttachments.delete(oldest);
+        }
+        if (get(activeChatHash) === a.user_hash && isAppVisible()) return;
+        if (chatWindowShows(a.user_hash)) return;
+        if (!shouldNotify('friend_message')) return;
+        const name = friendDisplayName(a.user_hash);
+        void notify(
+          'friend_message',
+          moment === 'offer'
+            ? m.chat_attach_notify_offer({ name })
+            : m.chat_attach_notify_received({ name }),
+          safeEventText(a.name, 256),
+        );
       }),
     );
     registered.push(
@@ -368,7 +551,11 @@ export async function initFriendsStore() {
               verified:
                 (idx >= 0 && cur[idx].verified) || verified === true,
             };
-            if (idx === -1) return [...cur, newRow];
+            // Front, not back. `get_friend_requests` returns `received_at DESC`,
+            // so appending put a just-arrived request at the bottom of the list
+            // and the debounced refetch then moved it to the top a quarter of a
+            // second later — with `animate:flip` on the cards, visibly.
+            if (idx === -1) return [newRow, ...cur];
             const next = cur.slice();
             // Preserve the original received_at on update so the
             // sort order (most-recent-first) stays stable across
@@ -385,7 +572,9 @@ export async function initFriendsStore() {
           scheduleFriendRequestRefetch();
 
           if (!alreadyPending && shouldNotify('friend_request')) {
-            const name = nickname.trim() || `${sender_hash.slice(0, 8)}\u2026`;
+            // A stranger named like an existing friend is exactly the case the
+            // short hash is for.
+            const name = friendLabel(sender_hash, nickname, get(friendNames));
             void notify(
               'friend_request',
               m.notify_friend_request_title(),
@@ -401,6 +590,29 @@ export async function initFriendsStore() {
         if (!hash) return;
         searchingFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
         clearSearchTimer(hash);
+        scheduleFriendsListRefresh();
+      }),
+    );
+    registered.push(
+      await listen<{ user_hash: string }>('ember:friend-request-declined', (event) => {
+        const hash = validFriendHash(event.payload?.user_hash);
+        if (!hash) return;
+        // The backend has already dropped the one-sided row, so this is the
+        // sentence that closes it: the card said "waiting for them to accept"
+        // and would otherwise have said so for good.
+        const name = friendDisplayName(hash);
+        clearUnread(hash);
+        clearFriendSearch(hash);
+        clearFileOffersForFriend(hash);
+        scheduleFriendsListRefresh();
+        // Imported here rather than at the top: `chatTabs` reads `unreadCounts`
+        // from this module, so a static import would close a cycle between the
+        // two for the sake of one call.
+        void import('$lib/stores/chatTabs')
+          .then(({ removeChatForFriend }) => removeChatForFriend(hash))
+          .catch((e) => console.warn('friends: could not close the declined chat tab', e));
+        // Both windows hear the event; the main one says it, once.
+        if (!isChatWindow()) toast(m.friends_request_declined({ name }));
       }),
     );
     registered.push(
@@ -425,8 +637,9 @@ export async function initFriendsStore() {
         scheduleFriendRequestRefetch();
         const nickname = safeEventText(event.payload?.nickname, 128);
         rememberFriendName(hash, nickname);
-        const name = nickname || `${hash.slice(0, 8)}\u2026`;
-        toastSuccess(m.friends_auto_confirmed({ name }));
+        const name = friendLabel(hash, nickname, get(friendNames));
+        if (!isChatWindow()) toastSuccess(m.friends_auto_confirmed({ name }));
+        scheduleFriendsListRefresh();
       }),
     );
     registered.push(
@@ -544,24 +757,37 @@ export async function initFriendsStore() {
 
   // Names, so a notification raised before the user has opened /friends can
   // still say who it is about. Last of the seeds because nothing blocks on it:
-  // `friendDisplayName` degrades to a short hash until this lands.
+  // `friendDisplayName` degrades to a short hash until this lands. Ticketed
+  // like every other fetch: this one sits behind a long chain of awaits, so a
+  // page that loaded the list meanwhile must not be rolled back to it.
+  const seedTicket = beginFriendsListFetch();
   try {
     const friends = await getFriends();
     if (myEpoch !== storeEpoch) return;
-    rememberFriendNames(friends);
+    commitFriendsList(seedTicket, friends);
   } catch (e) {
     noteFriendsSeedFailure('getFriends', e);
   }
 }
 
-export function clearUnread(friendHash: string) {
+/** Frontend-only: a window cleared a friend's unread count. The other window
+ *  counts the same messages from the same events, and cannot see the read. */
+const UNREAD_CLEARED_EVENT = 'ember-ui:unread-cleared';
+
+function dropUnread(friendHash: string) {
   const hash = friendHash.toLowerCase();
   unreadCounts.update((m) => {
+    if (!m.has(hash) && !m.has(friendHash)) return m;
     const next = new Map(m);
     next.delete(hash);
     next.delete(friendHash);
     return next;
   });
+}
+
+export function clearUnread(friendHash: string) {
+  dropUnread(friendHash);
+  void emit(UNREAD_CLEARED_EVENT, { user_hash: friendHash.toLowerCase() }).catch(() => {});
 }
 
 /**
@@ -571,10 +797,13 @@ export function clearUnread(friendHash: string) {
  * the TTL timer doesn't fire later against stale state).
  */
 export function clearFriendSearch(friendHash: string) {
+  const hash = friendHash.toLowerCase();
+  clearSearchTimer(hash);
   clearSearchTimer(friendHash);
   searchingFriends.update((s) => {
-    if (!s.has(friendHash)) return s;
+    if (!s.has(hash) && !s.has(friendHash)) return s;
     const next = new Set(s);
+    next.delete(hash);
     next.delete(friendHash);
     return next;
   });
@@ -595,8 +824,23 @@ export function cleanupFriendsStore() {
     clearTimeout(friendRequestRefetchTimer);
     friendRequestRefetchTimer = null;
   }
+  if (friendsListRefreshTimer !== null) {
+    clearTimeout(friendsListRefreshTimer);
+    friendsListRefreshTimer = null;
+  }
+  // Retire every ticket outstanding at teardown without rewinding the
+  // counter. Resetting both to zero would hand the next session ticket
+  // numbers a fetch from the previous one is still holding, and the page
+  // callers commit against their own `destroyed`/`mounted` flag rather than
+  // `storeEpoch` — so a remount is exactly when a stale list could land.
+  friendsFetchLanded = friendsFetchTicket;
   friendRequestsGen++;
   friendRequestMutationInFlight = 0;
+  // Re-armed for the next init. Latched for the lifetime of the module, the
+  // "already said so" memo meant a second cycle that failed again — Ember turned
+  // off and on, a dev remount — loaded nothing and said nothing, leaving an empty
+  // friends list looking like an empty friends list.
+  friendsSeedFailedToast = false;
   // L19: tear down any outstanding search-TTL timers; otherwise
   // a re-init would re-arm them on top of stale state.
   for (const t of searchTimers.values()) clearTimeout(t);
@@ -606,6 +850,7 @@ export function cleanupFriendsStore() {
   friendNames.set(new Map());
   unreadCounts.set(new Map());
   friendRequests.set([]);
+  friendsList.set([]);
   searchingFriends.set(new Set());
   isDiscoverable.set(false);
   discoverabilityFailed.set(false);
@@ -613,11 +858,51 @@ export function cleanupFriendsStore() {
   activeChatHash.set(null);
 }
 
-/** Drop an offer once the user has accepted or dismissed it. */
-export function clearFileOffer(userHash: string, fileHash: string) {
-  fileOffers.update((offers) =>
-    offers.filter((o) => !(o.user_hash === userHash && o.file_hash === fileHash)),
+/** Accept an unsolicited friend file offer through the normal download path. */
+export async function acceptIncomingFileOffer(offer: IncomingFileOffer) {
+  const { startDownload } = await import('$lib/api/transfers');
+  const friend = get(friendsList).find(
+    (row) => row.user_hash.toLowerCase() === offer.user_hash.toLowerCase(),
   );
+  const ip = friend?.last_ip?.trim() ?? '';
+  const port = friend?.last_port ?? 0;
+  const res = await startDownload(
+    offer.file_hash,
+    offer.file_name,
+    offer.file_size,
+    ip && port > 0 ? ip : '',
+    ip && port > 0 ? port : 0,
+    undefined,
+    offer.ember_file_hash,
+    undefined,
+    offer.user_hash,
+  );
+  clearFileOffer(offer.user_hash, offer.file_hash);
+  return res;
+}
+
+/** Frontend-only: a window accepted or dismissed a file offer. Both windows
+ *  collect offers from the same event, so the other one has to be told. */
+const FILE_OFFER_CLEARED_EVENT = 'ember-ui:file-offer-cleared';
+
+function dropFileOffer(userHash: string, fileHash: string) {
+  const user = userHash.toLowerCase();
+  const file = fileHash.toLowerCase();
+  fileOffers.update((offers) => {
+    const next = offers.filter(
+      (o) => !(o.user_hash.toLowerCase() === user && o.file_hash.toLowerCase() === file),
+    );
+    return next.length === offers.length ? offers : next;
+  });
+}
+
+/** Drop an offer once the user has accepted or dismissed it, in every window. */
+export function clearFileOffer(userHash: string, fileHash: string) {
+  dropFileOffer(userHash, fileHash);
+  void emit(FILE_OFFER_CLEARED_EVENT, {
+    user_hash: userHash.toLowerCase(),
+    file_hash: fileHash.toLowerCase(),
+  }).catch(() => {});
 }
 
 /** Drop every pending offer from an identity that was removed or blocked. */

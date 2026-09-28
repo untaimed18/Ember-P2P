@@ -16,9 +16,11 @@
     type IpFilterDownloadResult,
   } from '$lib/api/settings';
   import type { WebService } from '$lib/types';
+  import { openChatFilesFolder } from '$lib/api/friends';
   import {
     CHANNEL_USERNAME_MAX,
     isValidChannelUsername,
+    openChannelFilesFolder,
     sanitizeChannelUsernameInput,
   } from '$lib/api/channels';
   import { setAppSettings, appSettings } from '$lib/stores/settings';
@@ -26,8 +28,8 @@
     channels as channelsStore,
     hiddenChannels,
     ignoredMembers,
-    mutedChannels,
-    toggleChannelMute,
+    channelNotifyLevels,
+    setChannelNotifyLevel,
     toggleMemberIgnore,
     unhideChannel,
   } from '$lib/stores/channels';
@@ -39,6 +41,8 @@
     setAntileechPatterns,
     setAntileechEnabled,
     resetAntileechToDefaults,
+    setBlockPrivateIps,
+    setIpFilterEnabled,
   } from '$lib/api/security';
   import type { AntiLeechSnapshot } from '$lib/types';
   import { invoke } from '@tauri-apps/api/core';
@@ -58,7 +62,7 @@
     type PendingRestoreStatus,
     type RestoreSummary,
   } from '$lib/api/backup';
-  import { formatSize, formatSpeed, shortPubkey } from '$lib/utils';
+  import { formatDateTime, formatSize, formatSpeed, shortPubkey } from '$lib/utils';
   import { getRuntimeStatus } from '$lib/api/system';
   import {
     MAX_RULE_LABEL_CHARS,
@@ -96,9 +100,11 @@
     type Locale,
   } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
+  import { plural } from '$lib/plural';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import SpeedInput from '$lib/components/SpeedInput.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import EmuleImport from '$lib/components/EmuleImport.svelte';
   import {
     updater,
     checkForUpdates,
@@ -127,11 +133,11 @@
       ? m.settings_nodes_downloaded_applied({
           parsed: result.parsedCount,
           applied: result.appliedCount,
-          bytes: result.byteCount,
+          bytes: formatSize(result.byteCount),
         })
       : m.settings_nodes_downloaded_deferred({
           parsed: result.parsedCount,
-          bytes: result.byteCount,
+          bytes: formatSize(result.byteCount),
         });
   }
 
@@ -140,17 +146,17 @@
       case 'applied':
         return m.settings_ipfilter_downloaded_applied({
             entries: result.entryCount,
-            bytes: result.byteCount,
+            bytes: formatSize(result.byteCount),
           });
       case 'failed':
         return m.settings_ipfilter_downloaded_failed({
             entries: result.entryCount,
-            bytes: result.byteCount,
+            bytes: formatSize(result.byteCount),
           });
       default:
         return m.settings_ipfilter_downloaded_deferred({
             entries: result.entryCount,
-            bytes: result.byteCount,
+            bytes: formatSize(result.byteCount),
           });
     }
   }
@@ -266,16 +272,16 @@
   let backupPassphraseConfirm = $state('');
   let backupBusy = $state(false);
   let backupMessage: string | null = $state(null);
-  let backupIsError = $state(false);
+  let backupMessageKind: 'progress' | 'success' | 'error' = $state('progress');
   let restorePassphrase = $state('');
   let restoreSource: string | null = $state(null);
   let restorePreview: BackupPreview | null = $state(null);
   let restoreStaged: RestoreSummary | null = $state(null);
   let pendingRestore: PendingRestoreStatus | null = $state(null);
 
-  function showBackupMsg(msg: string, isError: boolean) {
+  function showBackupMsg(msg: string, kind: 'progress' | 'success' | 'error') {
     backupMessage = msg;
-    backupIsError = isError;
+    backupMessageKind = kind;
   }
 
   async function refreshPendingRestore() {
@@ -305,9 +311,9 @@
       await discardPendingRestore();
       pendingRestore = null;
       restoreStaged = null;
-      showBackupMsg(m.settings_backup_pending_discarded(), false);
+      showBackupMsg(m.settings_backup_pending_discarded(), 'success');
     } catch (e) {
-      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), 'error');
     } finally {
       backupBusy = false;
     }
@@ -324,18 +330,18 @@
     try {
       await clearPickedBackup();
     } catch (e) {
-      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), 'error');
     }
   }
 
   async function handleExportBackup() {
     if (backupBusy) return;
     if (backupPassphrase !== backupPassphraseConfirm) {
-      showBackupMsg(m.settings_backup_passphrase_mismatch(), true);
+      showBackupMsg(m.settings_backup_passphrase_mismatch(), 'error');
       return;
     }
     backupBusy = true;
-    showBackupMsg(m.settings_backup_exporting(), false);
+    showBackupMsg(m.settings_backup_exporting(), 'progress');
     try {
       const summary = await exportBackup(backupPassphrase);
       if (!summary) {
@@ -350,10 +356,10 @@
           size: formatSize(summary.bytes),
           path: summary.path,
         }),
-        false,
+        'success',
       );
     } catch (e) {
-      showBackupMsg(translateError(e, m.settings_backup_export_failed()), true);
+      showBackupMsg(translateError(e, m.settings_backup_export_failed()), 'error');
     } finally {
       backupBusy = false;
     }
@@ -368,7 +374,7 @@
         backupMessage = null;
       }
     } catch (e) {
-      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), 'error');
     }
   }
 
@@ -377,16 +383,16 @@
   async function handlePreviewBackup() {
     if (backupBusy || !restoreSource) return;
     backupBusy = true;
-    showBackupMsg(m.settings_backup_reading(), false);
+    showBackupMsg(m.settings_backup_reading(), 'progress');
     try {
       restorePreview = await previewBackup(restorePassphrase);
       backupMessage = null;
       if (restorePreview.schema_too_new) {
-        showBackupMsg(m.settings_backup_schema_too_new(), true);
+        showBackupMsg(m.settings_backup_schema_too_new(), 'error');
       }
     } catch (e) {
       restorePreview = null;
-      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), 'error');
     } finally {
       backupBusy = false;
     }
@@ -395,7 +401,7 @@
   async function handleImportBackup() {
     if (backupBusy || !restoreSource) return;
     backupBusy = true;
-    showBackupMsg(m.settings_backup_restoring(), false);
+    showBackupMsg(m.settings_backup_restoring(), 'progress');
     try {
       restoreStaged = await importBackup(restorePassphrase);
       resetLocalRestoreFields();
@@ -406,7 +412,7 @@
       await refreshPendingRestore();
       showRestoreRestartPrompt = true;
     } catch (e) {
-      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), true);
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), 'error');
     } finally {
       backupBusy = false;
     }
@@ -566,6 +572,16 @@
     return settings?.bandwidth_schedule.find((r) => r.id === id);
   }
 
+  /** Accessible name for one of a rule's controls. Every rule has the same set,
+   *  so the action alone would name a dozen buttons identically. */
+  function ruleControlLabel(action: string, rule: BandwidthScheduleRule, index: number): string {
+    return m.schedule_rule_control_aria({
+      action,
+      rule: rule.label.trim() || m.schedule_unnamed_rule(),
+      position: index + 1,
+    });
+  }
+
   function setRuleDays(id: string, weekday: number) {
     const rule = ruleById(id);
     if (rule) rule.days = toggleDay(rule.days, weekday);
@@ -653,7 +669,7 @@
   let spamStatsLoading = $state(false);
   let spamStatsError: string | null = $state(null);
   let spamResetting = $state(false);
-  type SettingsSection = 'general' | 'notifications' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'webservices' | 'backup' | 'about';
+  type SettingsSection = 'general' | 'notifications' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'webservices' | 'import' | 'backup' | 'about';
 
   /// Sidebar order, and the order the cards are declared in below.
   ///
@@ -678,6 +694,7 @@
     'security',
     'friends',
     'channels',
+    'import',
     'backup',
     'about',
   ];
@@ -705,6 +722,12 @@
   }
 
   let activeSection: SettingsSection = $state(initialSection());
+  /// The import card scans eMule's folder when it mounts, so it waits until
+  /// the section is first opened rather than running on every Settings visit.
+  let importOpened = $state(false);
+  $effect(() => {
+    if (activeSection === 'import') importOpened = true;
+  });
 
   /**
    * Free-text filter across every control on the page.
@@ -836,6 +859,7 @@
       case 'channels': return m.settings_section_channels();
       case 'search': return m.settings_section_search();
       case 'webservices': return m.webservices_title();
+      case 'import': return m.settings_section_import();
       case 'backup': return m.settings_section_backup();
       case 'about': return m.settings_section_about();
     }
@@ -1107,7 +1131,7 @@
       'max_connections', 'max_connections_per_five_secs',
       'download_queue_wait_secs', 'multisource_retry_rounds',
       'download_part_retry_rounds', 'max_download_file_size_gib',
-      'search_timeout_secs', 'max_friends',
+      'search_timeout_secs', 'max_friends', 'chat_attachment_auto_accept_mb',
     ] as const;
     const numericValues = s as unknown as Record<string, unknown>;
     for (const key of numericFields) {
@@ -1153,6 +1177,8 @@
     s.max_download_file_size_gib = ci(s.max_download_file_size_gib, 1, 593, 593);
     s.search_timeout_secs = ci(s.search_timeout_secs, 30, 600, 120);
     s.max_friends = ci(s.max_friends, 1, 500, 100);
+    // 0 is "always ask", not an empty box; the ceiling is the attachment cap.
+    s.chat_attachment_auto_accept_mb = cn(s.chat_attachment_auto_accept_mb, 2048, 25);
     return { error: null, adjusted };
   }
 
@@ -1336,7 +1362,7 @@
   }
 
   async function handleSave() {
-    if (!settings || saving) return;
+    if (!settings || saving || scheduleHasError) return;
     const antileechDirtyAtSave = antileechDraftDirty;
     const validation = validateSettings(settings);
     if (validation.error) {
@@ -1567,6 +1593,9 @@
     return name || shortPubkey(channelId);
   }
 
+  /** Rooms turned down from "All messages", with the level each is at. */
+  let quietRooms = $derived(Object.entries($channelNotifyLevels));
+
   function handleResetSpamData() {
     spamResetConfirmOpen = true;
   }
@@ -1618,6 +1647,18 @@
       const msg = translateError(e, m.settings_folder_picker_generic_error());
       showSaveMsg(m.settings_folder_picker_failed({ error: msg }), true, 5000);
     }
+  }
+
+  /** The two subfolders the backend creates under the download folder
+   *  (`Downloads` and `Temp`), joined with the folder's own separator so a
+   *  Windows path does not end in a forward slash. */
+  function folderLayoutHint(folder: string): string {
+    const sep = folder.includes('\\') ? '\\' : '/';
+    const base = folder.replace(/[\\/]+$/, '');
+    return m.settings_folder_layout_hint({
+      downloads: `${base}${sep}Downloads`,
+      temp: `${base}${sep}Temp`,
+    });
   }
 
   function showIpFilterDownloadOutcome(result: IpFilterDownloadResult) {
@@ -1782,7 +1823,10 @@
       } else {
         webServiceMessage = {
           kind: 'ok',
-          text: added === 1 ? m.webservices_imported_one() : m.webservices_imported_other({ count: added }),
+          text: plural(added, {
+            one: m.webservices_imported_one,
+            other: () => m.webservices_imported_other({ count: added }),
+          }),
         };
       }
     } catch (e: unknown) {
@@ -1888,17 +1932,19 @@
         const rejected = String(result.compile_errors.length);
         antileechMessage = {
           kind: 'warn',
-          text: savedCount === 1
-            ? m.settings_antileech_saved_rejected_one({ rejected })
-            : m.settings_antileech_saved_rejected_other({ count: savedCount, rejected }),
+          text: plural(savedCount, {
+            one: () => m.settings_antileech_saved_rejected_one({ rejected }),
+            other: () => m.settings_antileech_saved_rejected_other({ count: savedCount, rejected }),
+          }),
         };
       } else {
         const savedCount = result.snapshot.pattern_count;
         antileechMessage = {
           kind: 'ok',
-          text: savedCount === 1
-            ? m.settings_antileech_saved_one()
-            : m.settings_antileech_saved_other({ count: savedCount }),
+          text: plural(savedCount, {
+            one: m.settings_antileech_saved_one,
+            other: () => m.settings_antileech_saved_other({ count: savedCount }),
+          }),
         };
         trackedTimeout(() => (antileechMessage = null), 4000);
       }
@@ -1910,6 +1956,38 @@
     } finally {
       antileechSaving = false;
     }
+  }
+
+  /**
+   * The IP filter and private-range switches apply the moment they flip, as
+   * the same switches on the Security page do. Queued so a quick on-off-on
+   * reaches the backend in the order it was clicked.
+   */
+  let ipToggleQueue: Promise<void> = Promise.resolve();
+  function applyIpToggleLive(field: 'ip_filter_enabled' | 'block_private_ips', next: boolean) {
+    ipToggleQueue = ipToggleQueue.then(async () => {
+      try {
+        if (field === 'ip_filter_enabled') await setIpFilterEnabled(next);
+        else await setBlockPrivateIps(next);
+        if (unmounted) return;
+        // Already on disk, so it is not an unsaved change. Patch only this
+        // field so other genuinely-unsaved edits stay flagged.
+        if (originalSettings) {
+          try {
+            const base = JSON.parse(originalSettings) as AppSettings;
+            base[field] = next;
+            originalSettings = JSON.stringify(base);
+          } catch { /* malformed baseline; leave as-is */ }
+        }
+        const persisted = await getSettings().catch(() => null);
+        if (persisted) setAppSettings(persisted);
+        showSaveMsg(m.settings_saved_automatically(), false, 2000);
+      } catch (e: unknown) {
+        if (unmounted) return;
+        if (settings) settings[field] = !next;
+        showSaveMsg(translateError(e, m.settings_save_failed()), true, 6000);
+      }
+    });
   }
 
   async function handleAntileechToggle(checked: boolean, gen: number) {
@@ -1975,9 +2053,10 @@
       antileechDraft = snap.patterns.join('\n');
       antileechMessage = {
         kind: 'ok',
-        text: snap.pattern_count === 1
-          ? m.settings_antileech_restored_one()
-          : m.settings_antileech_restored_other({ count: snap.pattern_count }),
+        text: plural(snap.pattern_count, {
+          one: m.settings_antileech_restored_one,
+          other: () => m.settings_antileech_restored_other({ count: snap.pattern_count }),
+        }),
       };
       trackedTimeout(() => (antileechMessage = null), 4000);
     } catch (e: unknown) {
@@ -2050,10 +2129,16 @@
 
   /** Strips as you type, so the field can only ever hold a legal handle. A
    *  named function rather than an inline handler: inside the template the
-   *  callback outlives the `{#if settings}` narrowing around it. */
-  function setChannelUsername(raw: string) {
+   *  callback outlives the `{#if settings}` narrowing around it.
+   *
+   *  The box is one-way bound, and when the stripped text equals what is
+   *  already stored Svelte has nothing to re-render, so the rejected
+   *  characters would stay on screen — hence the direct write-back. */
+  function setChannelUsername(input: HTMLInputElement) {
     if (!settings) return;
-    settings.channel_username = sanitizeChannelUsernameInput(raw);
+    const clean = sanitizeChannelUsernameInput(input.value);
+    settings.channel_username = clean;
+    if (input.value !== clean) input.value = clean;
   }
 
   function handleRadioGroupKey(
@@ -2157,7 +2242,7 @@
     </button>
     <button class="save-btn" onclick={handleSave} disabled={saving || !settings || !hasUnsavedChanges || scheduleHasError}>
       {#if saving}
-        <span class="spinner"></span> {m.settings_saving()}
+        <span class="spinner sm current"></span> {m.settings_saving()}
       {:else}
         {m.settings_save_changes()}
       {/if}
@@ -2168,8 +2253,8 @@
 <div class="page-content" bind:this={pageContentEl}>
   {#if loadError}
     <div class="empty-state">
-      <p style="color: var(--danger)">{loadError}</p>
-      <button onclick={() => { loadError = null; location.reload(); }}>{m.layout_retry()}</button>
+      <p class="empty-title" role="alert">{loadError}</p>
+      <button type="button" class="empty-action" onclick={() => { loadError = null; location.reload(); }}>{m.layout_retry()}</button>
     </div>
   {:else if !settings}
     <div class="empty-state">
@@ -2272,6 +2357,12 @@
                   <line x1="2.5" y1="10" x2="17.5" y2="10"/>
                   <path d="M10 2.5c2.2 2 3.4 4.7 3.4 7.5s-1.2 5.5-3.4 7.5c-2.2-2-3.4-4.7-3.4-7.5S7.8 4.5 10 2.5z"/>
                 </svg>
+              {:else if section === 'import'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3 12.5v3c0 .6.4 1 1 1h12c.6 0 1-.4 1-1v-3"/>
+                  <line x1="10" y1="3" x2="10" y2="12"/>
+                  <polyline points="6.5,8.5 10,12 13.5,8.5"/>
+                </svg>
               {:else if section === 'backup'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <rect x="2.5" y="4" width="15" height="4" rx="1"/>
@@ -2292,11 +2383,12 @@
         </div>
         {:else}
           <p class="settings-filter-status" role="status">
-            {filterMatchCount === 1
-              ? m.settings_filter_one_result()
-              : m.settings_filter_results({ count: filterMatchCount })}
+            {plural(filterMatchCount, {
+              one: m.settings_filter_one_result,
+              other: () => m.settings_filter_results({ count: filterMatchCount }),
+            })}
           </p>
-          <button class="ghost btn-sm settings-filter-clear" onclick={() => (settingsFilter = '')}>
+          <button type="button" class="ghost settings-filter-clear" onclick={() => (settingsFilter = '')}>
             {m.common_clear_filters()}
           </button>
         {/if}
@@ -2673,6 +2765,17 @@
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">
+              <span class="toggle-title">{m.settings_notify_shares_browsed()}</span>
+              <span class="hint">{m.settings_notify_shares_browsed_hint()}</span>
+            </div>
+            <ToggleSwitch
+              bind:checked={settings.notify_shares_browsed}
+              disabled={!settings.notifications_enabled}
+              ariaLabel={m.settings_notify_shares_browsed()}
+            />
+          </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
               <span class="toggle-title">{m.settings_notify_channel_message()}</span>
               <span class="hint">{m.settings_notify_channel_message_hint()}</span>
             </div>
@@ -2720,7 +2823,7 @@
                 <input id="download-folder" value={settings.download_folder} readonly />
                 <button class="folder-btn" onclick={pickDownloadFolder}>{m.settings_browse()}</button>
               </div>
-              <span class="field-hint">{m.settings_folder_layout_hint({ folder: settings.download_folder })}</span>
+              <span class="hint">{folderLayoutHint(settings.download_folder)}</span>
             </div>
           </div>
 
@@ -2763,7 +2866,7 @@
 
             <div class="field">
               <label for="max-dl-gib">{m.settings_max_file_size_label()}</label>
-              <input id="max-dl-gib" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} />
+              <input id="max-dl-gib" class="compact-number" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} />
               <span class="hint">{m.settings_max_file_size_hint()}</span>
             </div>
           </div>
@@ -2824,7 +2927,7 @@
                   <button class="folder-btn" onclick={() => (settings && (settings.preview_player = ''))}>{m.common_clear()}</button>
                 {/if}
               </div>
-              <span class="field-hint">{m.settings_preview_player_hint()}</span>
+              <span class="hint">{m.settings_preview_player_hint()}</span>
             </div>
           </div>
 
@@ -2832,7 +2935,7 @@
             <h4 class="subsection-title">{m.settings_group_history()}</h4>
             <div class="field">
               <span class="toggle-title">{m.settings_download_history()}</span>
-              <span class="field-hint">
+              <span class="hint">
                 {m.settings_download_history_hint()}
               </span>
               <div class="history-grid">
@@ -2865,10 +2968,10 @@
                 </div>
               </div>
               {#if historyStatsError}
-                <span class="hint" style="color: var(--danger);">{historyStatsError}</span>
+                <span class="hint hint-error" role="alert">{historyStatsError}</span>
               {/if}
               {#if historyClearMsg}
-                <span class="hint">{historyClearMsg}</span>
+                <span class="hint" role="status">{historyClearMsg}</span>
               {/if}
             </div>
           </div>
@@ -2919,6 +3022,7 @@
                     <button
                       class="action-btn ghost webservice-remove"
                       onclick={() => removeWebService(index)}
+                      aria-label={m.settings_webservice_remove_aria({ name: service.name })}
                     >{m.webservices_remove()}</button>
                   </li>
                 {/each}
@@ -3018,7 +3122,7 @@
             {#if spamStatsLoading}
               <span class="hint">{m.settings_spam_loading()}</span>
             {:else if spamStatsError}
-              <span class="hint" style="color: var(--danger)">{spamStatsError}</span>
+              <span class="hint hint-error" role="alert">{spamStatsError}</span>
             {:else if spamStats}
               <div class="spam-stats-grid">
                 <div class="spam-stat"><span>{m.settings_spam_stat_hashes()}</span><strong>{spamStats.spam_hashes}</strong></div>
@@ -3037,15 +3141,16 @@
           <div class="divider"></div>
           <div class="field">
             <label for="search-timeout-secs">{m.settings_search_timeout_label()}</label>
-            <span class="hint">{m.settings_search_timeout_hint()}</span>
             <input
               id="search-timeout-secs"
+              class="compact-number"
               type="number"
               min="30"
               max="600"
               step="1"
               bind:value={settings.search_timeout_secs}
             />
+            <span class="hint">{m.settings_search_timeout_hint()}</span>
           </div>
           <div class="field">
             <label for="filename-cleanups">{m.settings_filename_cleanups_label()}</label>
@@ -3160,7 +3265,7 @@
                   <div class="schedule-rule-head">
                     <ToggleSwitch
                       bind:checked={rule.enabled}
-                      ariaLabel={m.schedule_rule_enabled_aria()}
+                      ariaLabel={ruleControlLabel(m.schedule_rule_enabled_aria(), rule, index)}
                     />
                     <input
                       class="schedule-name"
@@ -3179,7 +3284,7 @@
                         class="icon-btn"
                         onclick={() => moveScheduleRule(index, -1)}
                         disabled={index === 0}
-                        aria-label={m.schedule_move_up()}
+                        aria-label={ruleControlLabel(m.schedule_move_up(), rule, index)}
                         title={m.schedule_move_up()}
                       >&#9650;</button>
                       <button
@@ -3187,20 +3292,20 @@
                         class="icon-btn"
                         onclick={() => moveScheduleRule(index, 1)}
                         disabled={index === settings.bandwidth_schedule.length - 1}
-                        aria-label={m.schedule_move_down()}
+                        aria-label={ruleControlLabel(m.schedule_move_down(), rule, index)}
                         title={m.schedule_move_down()}
                       >&#9660;</button>
                       <button
                         type="button"
                         class="icon-btn danger"
                         onclick={() => removeScheduleRule(rule.id)}
-                        aria-label={m.schedule_remove_rule()}
+                        aria-label={ruleControlLabel(m.schedule_remove_rule(), rule, index)}
                         title={m.schedule_remove_rule()}
                       >&times;</button>
                     </div>
                   </div>
 
-                  <div class="schedule-days" role="group" aria-label={m.schedule_days_label()}>
+                  <div class="schedule-days" role="group" aria-label={ruleControlLabel(m.schedule_days_label(), rule, index)}>
                     {#each weekdayLabels as dayLabel, weekday (weekday)}
                       <button
                         type="button"
@@ -3292,6 +3397,10 @@
                   <span>{m.settings_speed_recommended_upload()}</span>
                   <span class="speed-value">{formatSpeed(speedResult.recommended_upload_limit)}</span>
                 </div>
+                <div class="speed-row recommended">
+                  <span>{m.settings_speed_recommended_download()}</span>
+                  <span class="speed-value">{formatSpeed(speedResult.recommended_download_limit)}</span>
+                </div>
                 <button class="apply-btn" onclick={applyRecommended}>{m.settings_apply_recommended()}</button>
               </div>
             {/if}
@@ -3323,19 +3432,22 @@
         <div class="card-body">
           <div class="field-row">
             <div class="field half">
+              <!-- The badge is hidden from the label's accessible name, which
+                   would otherwise read "TCP port Restart required", and
+                   announced as the input's description instead. -->
               <label for="tcp-port">
                 {m.settings_tcp_port()}
-                <span class="restart-badge">{m.settings_restart_badge()}</span>
+                <span class="restart-badge" id="tcp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
               </label>
-              <input id="tcp-port" type="number" min="1" max="65535" bind:value={settings.tcp_port} />
+              <input id="tcp-port" type="number" min="1" max="65535" aria-describedby="tcp-port-restart" bind:value={settings.tcp_port} />
               <span class="hint">{m.settings_tcp_port_hint()}</span>
             </div>
             <div class="field half">
               <label for="udp-port">
                 {m.settings_udp_port()}
-                <span class="restart-badge">{m.settings_restart_badge()}</span>
+                <span class="restart-badge" id="udp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
               </label>
-              <input id="udp-port" type="number" min="1" max="65535" bind:value={settings.udp_port} />
+              <input id="udp-port" type="number" min="1" max="65535" aria-describedby="udp-port-restart" bind:value={settings.udp_port} />
               <span class="hint">{m.settings_udp_port_hint()}</span>
             </div>
           </div>
@@ -3492,8 +3604,13 @@
             <div class="toggle-info">
               <span class="toggle-title">{m.settings_ip_filter_label()}</span>
               <span class="hint">{m.settings_ip_filter_hint()}</span>
+              <span class="hint hint-live">{m.settings_applies_immediately()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.ip_filter_enabled} ariaLabel={m.settings_ip_filter_label()} />
+            <ToggleSwitch
+              bind:checked={settings.ip_filter_enabled}
+              ariaLabel={m.settings_ip_filter_label()}
+              onchange={(v) => applyIpToggleLive('ip_filter_enabled', v)}
+            />
           </div>
           {#if settings.ip_filter_enabled}
             <div class="field nested">
@@ -3521,8 +3638,13 @@
             <div class="toggle-info">
               <span class="toggle-title">{m.settings_block_private_label()}</span>
               <span class="hint">{m.settings_block_private_hint()}</span>
+              <span class="hint hint-live">{m.settings_applies_immediately()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.block_private_ips} ariaLabel={m.settings_block_private_label()} />
+            <ToggleSwitch
+              bind:checked={settings.block_private_ips}
+              ariaLabel={m.settings_block_private_label()}
+              onchange={(v) => applyIpToggleLive('block_private_ips', v)}
+            />
           </div>
 
           <div class="field toggle-row">
@@ -3648,10 +3770,48 @@
             <ToggleSwitch bind:checked={settings.friend_browse_disabled} ariaLabel={m.settings_friend_browse_disabled()} onchange={() => void applyFriendTogglesLive()} />
           </div>
 
+          <div class="field">
+            <label for="chat-attach-auto">{m.settings_chat_attach_auto_label()}</label>
+            <div class="chat-attach-row">
+              <div class="unit-input">
+                <input
+                  id="chat-attach-auto"
+                  type="number"
+                  min="0"
+                  max="2048"
+                  inputmode="numeric"
+                  aria-describedby="chat-attach-auto-unit chat-attach-auto-hint"
+                  bind:value={settings.chat_attachment_auto_accept_mb}
+                />
+                <span id="chat-attach-auto-unit" class="unit-input-suffix">{m.settings_chat_attach_auto_unit()}</span>
+              </div>
+              <button type="button" class="action-btn chat-files-btn" onclick={() => void openChatFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+                </svg>
+                {m.settings_chat_attach_open_folder()}
+              </button>
+            </div>
+            <span id="chat-attach-auto-hint" class="hint">{m.settings_chat_attach_auto_hint()}</span>
+          </div>
+
+          <div class="field">
+            <label for="max-friends">{m.settings_max_friends()}</label>
+            <input
+              id="max-friends"
+              class="compact-number"
+              type="number"
+              min="1"
+              max="500"
+              bind:value={settings.max_friends}
+            />
+            <span class="hint">{m.settings_max_friends_hint()}</span>
+          </div>
+
           <!-- Friend session encryption stays forced on (see handleSave /
-               applyFriendTogglesLive). Max friends + rendezvous URL remain
-               in AppSettings for config.json only — not everyday controls.
-               Channel file offers moved to the Channels section. -->
+               applyFriendTogglesLive). Rendezvous URL remains in AppSettings
+               for config.json only. Channel file offers live in the Channels
+               section. -->
 
         </div>
       </section>
@@ -3687,7 +3847,7 @@
               autocomplete="username"
               autocapitalize="off"
               placeholder={m.settings_channel_username_placeholder()}
-              oninput={(e) => setChannelUsername(e.currentTarget.value)}
+              oninput={(e) => setChannelUsername(e.currentTarget)}
             />
             <span class="hint">{m.settings_channel_username_hint()}</span>
           </div>
@@ -3696,15 +3856,23 @@
 
           <div class="field">
             <label for="channel-file-offers">{m.settings_channel_file_offers()}</label>
-            <select
-              id="channel-file-offers"
-              bind:value={settings.channel_file_offers}
-              onchange={() => void applyFriendTogglesLive()}
-            >
-              <option value="everyone">{m.settings_channel_file_offers_everyone()}</option>
-              <option value="friends">{m.settings_channel_file_offers_friends()}</option>
-              <option value="nobody">{m.settings_channel_file_offers_nobody()}</option>
-            </select>
+            <div class="chat-attach-row channel-offers-row">
+              <select
+                id="channel-file-offers"
+                bind:value={settings.channel_file_offers}
+                onchange={() => void applyFriendTogglesLive()}
+              >
+                <option value="everyone">{m.settings_channel_file_offers_everyone()}</option>
+                <option value="friends">{m.settings_channel_file_offers_friends()}</option>
+                <option value="nobody">{m.settings_channel_file_offers_nobody()}</option>
+              </select>
+              <button type="button" class="action-btn chat-files-btn" onclick={() => void openChannelFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+                </svg>
+                {m.settings_channel_files_open_folder()}
+              </button>
+            </div>
             <span class="hint">{m.settings_channel_file_offers_hint()}</span>
             <!--
               This select persists on change (`applyFriendTogglesLive`) while
@@ -3733,26 +3901,29 @@
                 <span class="hint">{m.settings_channels_muted_rooms_hint()}</span>
               </div>
               <div class="channels-pref-action">
-                <span class="channels-pref-count">{$mutedChannels.length}</span>
+                <span class="channels-pref-count">{quietRooms.length}</span>
                 <button
                   type="button"
                   class="ghost"
-                  disabled={$mutedChannels.length === 0}
+                  disabled={quietRooms.length === 0}
                   onclick={() => { mutedClearConfirmOpen = true; }}
                 >{m.settings_channels_clear()}</button>
               </div>
             </div>
-            {#if $mutedChannels.length > 0}
+            {#if quietRooms.length > 0}
               <ul class="ignored-list">
-                {#each $mutedChannels as channelId (channelId)}
+                {#each quietRooms as [channelId, level] (channelId)}
                   <li>
                     <span class="ignored-name">
                       <bdi dir="auto">{channelLabel(channelId)}</bdi>
+                      <span class="ignored-scope">{level === 'mentions'
+                        ? m.channels_notify_mentions()
+                        : m.channels_notify_none()}</span>
                     </span>
                     <button
                       type="button"
                       class="ghost"
-                      onclick={() => toggleChannelMute(channelId)}
+                      onclick={() => setChannelNotifyLevel(channelId, 'all')}
                     >{m.channels_unmute()}</button>
                   </li>
                 {/each}
@@ -3782,6 +3953,14 @@
                   <li>
                     <span class="ignored-name">
                       <bdi dir="auto">{entry.name.trim() || shortPubkey(entry.pubkey)}</bdi>
+                      <!-- Named rooms rather than a bare count: this list is
+                           the only place a scope set inside a room the user
+                           has since left can still be read or undone. -->
+                      {#if entry.rooms}
+                        <span class="ignored-scope">{m.settings_channels_ignored_in({
+                          rooms: entry.rooms.map(channelLabel).join(', '),
+                        })}</span>
+                      {/if}
                     </span>
                     <button
                       type="button"
@@ -3830,6 +4009,32 @@
         </div>
       </section>
 
+      <!-- Import from eMule -->
+      <section class="card" class:hidden={!filtering && activeSection !== 'import'} id={panelId('import')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('import')}>
+        <div class="card-header">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 12.5v3c0 .6.4 1 1 1h12c.6 0 1-.4 1-1v-3"/>
+              <line x1="10" y1="3" x2="10" y2="12"/>
+              <polyline points="6.5,8.5 10,12 13.5,8.5"/>
+            </svg>
+          </span>
+          <div>
+            <h3>{m.settings_section_import()}</h3>
+            <p class="card-desc">{m.settings_import_desc()}</p>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="field">
+            {#if importOpened}
+              <EmuleImport mode="settings" onrestart={performRestart} />
+            {:else}
+              <span class="hint">{m.settings_import_hint()}</span>
+            {/if}
+          </div>
+        </div>
+      </section>
+
       <!-- Backup & Restore -->
       <section class="card" class:hidden={!filtering && activeSection !== 'backup'} id={panelId('backup')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('backup')}>
         <div class="card-header">
@@ -3853,7 +4058,7 @@
                 {m.settings_backup_pending_message({
                   files: pendingRestore.files,
                   version: pendingRestore.app_version,
-                  when: new Date(pendingRestore.staged_at * 1000).toLocaleString(),
+                  when: formatDateTime(pendingRestore.staged_at),
                 })}
               </span>
               <div class="action-row">
@@ -3952,7 +4157,7 @@
               <div class="backup-preview">
                 <div class="spam-stat">
                   <span>{m.settings_backup_preview_created()}</span>
-                  <strong>{new Date(restorePreview.created_at * 1000).toLocaleString()}</strong>
+                  <strong>{formatDateTime(restorePreview.created_at)}</strong>
                 </div>
                 <div class="spam-stat">
                   <span>{m.settings_backup_preview_version()}</span>
@@ -3976,7 +4181,10 @@
           </div>
 
           {#if backupMessage}
-            <span class="hint" style={backupIsError ? 'color: var(--danger)' : 'color: var(--success)'}>
+            <span
+              class={backupMessageKind === 'progress' ? 'hint' : `feedback ${backupMessageKind}`}
+              role={backupMessageKind === 'error' ? 'alert' : 'status'}
+            >
               {backupMessage}
             </span>
           {/if}
@@ -4239,7 +4447,7 @@
   message={m.settings_channels_clear_muted_message()}
   confirmLabel={m.settings_channels_clear()}
   danger={true}
-  onconfirm={() => { mutedChannels.set([]); showSaveMsg(m.settings_channels_cleared(), false, 2000); }}
+  onconfirm={() => { channelNotifyLevels.set({}); showSaveMsg(m.settings_channels_cleared(), false, 2000); }}
 />
 
 <ConfirmDialog
@@ -4287,7 +4495,7 @@
 {#if restarting}
   <div class="restart-overlay" role="status" aria-label={m.settings_restarting_aria()}>
     <div class="restart-card">
-      <div class="restart-spinner"></div>
+      <div class="spinner lg"></div>
       <h2 class="restart-title">{m.settings_restarting_title()}</h2>
       <p class="restart-sub">{m.settings_restarting_sub()}</p>
     </div>
@@ -4317,12 +4525,12 @@
     gap: 6px;
     padding: 7px 20px;
     font-weight: 600;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     border-radius: var(--radius-md);
   }
 
   .unsaved-indicator {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--warning);
     font-weight: 500;
     animation: pulse 2s ease-in-out infinite;
@@ -4333,22 +4541,8 @@
     50% { opacity: 0.5; }
   }
 
-  .spinner {
-    display: inline-block;
-    width: 14px;
-    height: 14px;
-    border: 2px solid color-mix(in srgb, currentColor 30%, transparent);
-    border-top-color: currentColor;
-    border-radius: 50%;
-    animation: spin 0.6s linear infinite;
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
-
   .save-status {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--success);
     padding: 4px 12px;
@@ -4385,7 +4579,7 @@
   }
 
   .settings-nav-title {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     text-transform: uppercase;
     letter-spacing: 0.4px;
     color: var(--text-muted);
@@ -4405,7 +4599,7 @@
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-secondary);
-    font-size: 13px;
+    font-size: var(--font-size-md);
     text-align: left;
     cursor: pointer;
   }
@@ -4415,11 +4609,17 @@
     color: var(--text-primary);
   }
 
+  /* Same active and focus language as the sidebar's nav items. */
   .settings-nav-item.active {
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
-    color: var(--text-primary);
+    background: var(--accent-fill);
+    color: var(--accent);
     font-weight: 600;
+  }
+
+  .settings-nav-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    background: var(--bg-hover);
   }
 
   .settings-nav-icon {
@@ -4509,7 +4709,7 @@
 
   .settings-filter-status {
     margin: 0 8px 8px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
   }
 
@@ -4532,7 +4732,7 @@
   /* Names the run of fields under it. */
   .subsection-title {
     margin: 0;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 700;
     letter-spacing: 0.06em;
     text-transform: uppercase;
@@ -4583,7 +4783,7 @@
   }
 
   .card-icon {
-    font-size: 20px;
+    font-size: var(--font-size-2xl);
     width: 36px;
     height: 36px;
     display: flex;
@@ -4601,7 +4801,7 @@
   }
 
   .card-header h3 {
-    font-size: 15px;
+    font-size: var(--font-size-base);
     font-weight: 600;
     color: var(--text-primary);
     margin: 0;
@@ -4609,7 +4809,7 @@
   }
 
   .card-desc {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     margin: 0;
     line-height: 1.3;
@@ -4638,7 +4838,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-secondary);
     margin-bottom: 0;
     font-weight: 500;
@@ -4663,11 +4863,21 @@
   }
 
   .hint {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     margin-top: 0;
     display: block;
     line-height: 1.5;
+  }
+
+  .hint.hint-error {
+    color: var(--badge-danger-text);
+  }
+
+  /* Counts and sizes want a few digits, not the whole card; specific enough
+     to beat the `.field input[type='number']` full-width rule above. */
+  .field input[type='number'].compact-number {
+    width: 120px;
   }
 
   /* Marks a control that persists on change rather than on Save. */
@@ -4680,7 +4890,7 @@
   /* ── Restart badge ─────────────────────────────── */
   .restart-badge {
     display: inline-block;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.3px;
@@ -4712,7 +4922,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 500;
     color: var(--text-primary);
     line-height: 1.4;
@@ -4724,7 +4934,7 @@
 
   .always-on-badge {
     flex-shrink: 0;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-secondary);
     white-space: nowrap;
@@ -4751,7 +4961,7 @@
     border-radius: var(--radius-sm);
     overflow: hidden;
     background: var(--bg-input);
-    transition: border-color 0.15s;
+    transition: border-color var(--transition-normal);
   }
 
   .folder-input:focus-within {
@@ -4764,20 +4974,13 @@
     border: none;
     background: transparent;
     padding: 7px 10px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     outline: none;
     box-shadow: none;
     min-width: 0;
   }
 
-  .field-hint {
-    display: block;
-    font-size: 11px;
-    color: var(--text-muted);
-    margin-top: 0;
-    line-height: 1.5;
-  }
 
   .folder-btn {
     border: none;
@@ -4786,10 +4989,10 @@
     background: var(--bg-surface);
     color: var(--text-secondary);
     padding: 0 14px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     cursor: pointer;
-    transition: background 0.15s, color 0.15s;
+    transition: background var(--transition-normal), color var(--transition-normal);
     white-space: nowrap;
   }
 
@@ -4807,14 +5010,14 @@
   }
 
   .action-btn {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     padding: 6px 14px;
     background: var(--bg-surface);
     color: var(--text-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    transition: background 0.15s, color 0.15s, border-color 0.15s;
+    transition: background var(--transition-normal), color var(--transition-normal), border-color var(--transition-normal);
   }
 
   .action-btn:hover {
@@ -4875,7 +5078,7 @@
 
   .about-wordmark {
     margin: 0 0 3px;
-    font-size: 18px;
+    font-size: var(--font-size-xl);
     font-weight: 700;
     letter-spacing: 1.5px;
     color: var(--accent);
@@ -4884,7 +5087,7 @@
 
   .about-tagline {
     margin: 0 0 8px;
-    font-size: 10px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     letter-spacing: 0.9px;
     text-transform: uppercase;
@@ -4896,7 +5099,7 @@
     display: inline-block;
     margin: 0;
     padding: 2px 8px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     color: var(--badge-accent-text);
     background: color-mix(in srgb, var(--accent) 14%, transparent);
@@ -4907,14 +5110,14 @@
 
   .about-description {
     margin: 0 0 6px;
-    font-size: 13px;
+    font-size: var(--font-size-md);
     line-height: 1.45;
     color: var(--text-secondary);
   }
 
   .about-license {
     margin: 0 0 12px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
 
@@ -4925,7 +5128,7 @@
     border-radius: var(--radius-md);
     background: color-mix(in srgb, var(--warning) 9%, transparent);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
   }
 
@@ -4937,7 +5140,7 @@
   }
 
   .channels-pref-count {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     font-variant-numeric: tabular-nums;
     color: var(--text-secondary);
@@ -4966,11 +5169,20 @@
   }
 
   .ignored-name {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .ignored-scope {
+    display: block;
+    margin-top: 2px;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .about-actions {
@@ -5026,20 +5238,20 @@
   }
 
   .about-action-title {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
   }
 
   .about-action-desc {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1.45;
     color: var(--text-secondary);
   }
 
   .about-action-path {
     margin-top: 2px;
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     user-select: text;
     overflow-wrap: anywhere;
@@ -5117,7 +5329,7 @@
   }
 
   .feedback {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
   }
 
@@ -5132,15 +5344,15 @@
     gap: 8px;
   }
   .antileech-label {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
   .antileech-textarea {
     width: 100%;
     min-height: 180px;
     padding: 8px 10px;
-    font-family: var(--font-mono, ui-monospace, 'Cascadia Code', Consolas, monospace);
-    font-size: 12px;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-sm);
     line-height: 1.4;
     color: var(--text-primary);
     background: var(--bg-secondary);
@@ -5197,7 +5409,7 @@
     flex: 1;
   }
   .webservice-name {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -5208,8 +5420,8 @@
      `title`. Monospaced to match the Address field it was typed into, which
      is also what makes a `#hashid` placeholder legible as a placeholder. */
   .webservice-url {
-    font-family: var(--font-mono, monospace);
-    font-size: 11px;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -5248,8 +5460,8 @@
     min-width: 220px;
   }
   .webservice-field input {
-    font-family: var(--font-mono, monospace);
-    font-size: 12px;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-sm);
     padding: 6px 8px;
     color: var(--text-primary);
     background: var(--bg-secondary);
@@ -5269,7 +5481,7 @@
     margin-top: 6px;
   }
   .antileech-path {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     margin-left: auto;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -5282,7 +5494,7 @@
     background: var(--bg-secondary);
     border: 1px solid var(--danger);
     border-radius: var(--radius-sm);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
   .antileech-errors-title {
     color: var(--danger);
@@ -5294,7 +5506,7 @@
     padding-left: 18px;
   }
   .antileech-errors code {
-    font-family: var(--font-mono, ui-monospace, monospace);
+    font-family: var(--font-mono);
     color: var(--text-primary);
   }
   .action-btn.ghost {
@@ -5318,7 +5530,7 @@
     border-radius: var(--radius-md);
     background: transparent;
     cursor: pointer;
-    transition: border-color 0.2s, box-shadow 0.2s;
+    transition: border-color var(--transition-normal), box-shadow var(--transition-normal);
     overflow: hidden;
     width: 120px;
   }
@@ -5396,7 +5608,7 @@
     border-radius: 50%;
     background: var(--accent);
     color: var(--on-accent);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -5404,7 +5616,7 @@
   }
 
   .swatch-label {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
     color: var(--text-secondary);
     padding: 6px 0 8px;
@@ -5431,7 +5643,7 @@
     color: var(--text-primary);
     text-align: left;
     cursor: pointer;
-    transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+    transition: border-color var(--transition-normal) ease, background var(--transition-normal) ease, box-shadow var(--transition-normal) ease, transform var(--transition-normal) ease;
   }
 
   .behavior-card:hover {
@@ -5442,7 +5654,7 @@
   .behavior-card:focus-visible {
     outline: none;
     border-color: var(--accent);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent);
+    box-shadow: 0 0 0 3px var(--accent-halo);
   }
 
   .behavior-card.selected {
@@ -5495,14 +5707,14 @@
   }
 
   .behavior-title {
-    font-size: 13px;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
     line-height: 1.25;
   }
 
   .behavior-desc {
-    font-size: 11.5px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     line-height: 1.35;
   }
@@ -5516,7 +5728,7 @@
     border-radius: 50%;
     background: var(--accent);
     color: var(--on-accent);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 700;
     display: flex;
     align-items: center;
@@ -5524,9 +5736,14 @@
     box-shadow: var(--shadow-sm);
   }
 
-  @media (max-width: 640px) {
+  @media (max-width: 760px) {
     .behavior-picker {
       grid-template-columns: 1fr;
+    }
+
+    /* Paired fields (ports, limits) stack rather than squeeze side by side. */
+    .field-row {
+      flex-direction: column;
     }
   }
 
@@ -5545,7 +5762,7 @@
 
   .speed-test-btn {
     padding: 4px 12px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
     background: var(--bg-tertiary);
@@ -5567,7 +5784,7 @@
     padding: 8px 12px;
     background: var(--bg-tertiary);
     border-radius: var(--radius-md);
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
 
   .speed-row {
@@ -5585,6 +5802,12 @@
     font-weight: 600;
   }
 
+  .speed-row.recommended + .speed-row.recommended {
+    border-top: none;
+    margin-top: 0;
+    padding-top: 2px;
+  }
+
   .speed-value {
     font-weight: 600;
     color: var(--text-primary);
@@ -5594,7 +5817,7 @@
     margin-top: 8px;
     width: 100%;
     padding: 6px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     border-radius: var(--radius-sm);
     border: none;
@@ -5611,7 +5834,7 @@
     display: block;
     margin-top: 6px;
     color: var(--danger);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   /* Shared "this is happening right now" marker: the sleep inhibitor being
@@ -5620,10 +5843,10 @@
     align-self: flex-start;
     margin-top: 4px;
     padding: 1px 7px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: color-mix(in srgb, var(--accent) 16%, transparent);
     color: var(--accent);
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     white-space: nowrap;
   }
@@ -5638,7 +5861,7 @@
     border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--accent) 8%, transparent);
-    font-size: 13px;
+    font-size: var(--font-size-md);
   }
 
   .live-dot {
@@ -5671,7 +5894,7 @@
   .schedule-empty {
     margin: 0;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .schedule-rule {
@@ -5718,9 +5941,9 @@
     padding: 0;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    background: var(--bg-elevated, var(--bg-surface));
+    background: var(--bg-surface);
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     line-height: 1;
     cursor: pointer;
   }
@@ -5752,7 +5975,7 @@
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     cursor: pointer;
   }
 
@@ -5774,7 +5997,7 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
   }
 
@@ -5785,7 +6008,7 @@
   .schedule-overnight {
     padding-bottom: 6px;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .schedule-limits {
@@ -5796,7 +6019,7 @@
 
   .schedule-error {
     color: var(--danger);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
   }
 
   .schedule-add {
@@ -5805,8 +6028,8 @@
     border: 1px dashed var(--border);
     border-radius: var(--radius-sm);
     background: transparent;
-    color: var(--text-secondary, var(--text-muted));
-    font-size: 13px;
+    color: var(--text-secondary);
+    font-size: var(--font-size-md);
     cursor: pointer;
   }
 
@@ -5838,12 +6061,12 @@
   }
 
   .spam-stat span {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
   }
 
   .spam-stat strong {
-    font-size: 15px;
+    font-size: var(--font-size-lg);
     color: var(--text-primary);
   }
 
@@ -5923,7 +6146,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--font-mono, monospace);
+    font-family: var(--font-mono);
     max-width: 68ch;
   }
 
@@ -5953,14 +6176,14 @@
   }
 
   .history-stat-label {
-    font-size: 11px;
+    font-size: var(--font-size-xs);
     font-weight: 500;
     color: var(--text-muted);
     letter-spacing: 0.01em;
   }
 
   .history-stat-value {
-    font-size: 24px;
+    font-size: var(--font-size-3xl);
     font-weight: 700;
     line-height: 1.1;
     color: var(--text-primary);
@@ -5968,7 +6191,7 @@
   }
 
   .history-stat-value.is-loading {
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 500;
     color: var(--text-muted);
   }
@@ -5982,11 +6205,11 @@
     border-radius: 0;
     background: color-mix(in srgb, var(--bg-primary) 55%, transparent);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     cursor: pointer;
     text-align: left;
-    transition: background 0.15s, color 0.15s;
+    transition: background var(--transition-normal), color var(--transition-normal);
   }
 
   .history-clear-btn:hover {
@@ -6033,7 +6256,7 @@
     .settings-nav-item {
       width: auto;
       padding: 7px 10px;
-      font-size: 12px;
+      font-size: var(--font-size-sm);
       flex-shrink: 0;
     }
   }
@@ -6056,15 +6279,6 @@
     gap: 16px;
   }
 
-  .restart-spinner {
-    width: 40px;
-    height: 40px;
-    border: 4px solid color-mix(in srgb, var(--border-light) 45%, transparent);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: spin 0.7s linear infinite;
-  }
-
   .restart-title {
     font-size: 22px;
     font-weight: 700;
@@ -6073,8 +6287,72 @@
   }
 
   .restart-sub {
-    font-size: 14px;
+    font-size: var(--font-size-base);
     color: var(--text-muted);
     margin: 0;
+  }
+
+  .chat-attach-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  /* A number with its unit attached, styled like `.folder-input`. */
+  .unit-input {
+    display: inline-flex;
+    align-items: stretch;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    background: var(--bg-input);
+    transition: border-color var(--transition-normal);
+  }
+
+  .unit-input:focus-within {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-halo);
+  }
+
+  /* Specific enough to beat `.field input[type='number'] { width: 100% }`. */
+  .field .unit-input input[type='number'] {
+    width: 96px;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    padding: 7px 10px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .unit-input-suffix {
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    border-left: 1px solid var(--border);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+  }
+
+  .chat-files-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .chat-files-btn svg {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+  }
+
+  .channel-offers-row select {
+    flex: 1;
+    min-width: 200px;
   }
 </style>
