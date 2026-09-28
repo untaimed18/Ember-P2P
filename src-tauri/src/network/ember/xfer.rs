@@ -448,7 +448,8 @@ pub struct RecvState {
     /// it ends: it writes through its own handle onto the same file cursor, so
     /// the two must never write at once.
     streaming: bool,
-    /// Verified bytes the stream has written.
+    /// Bytes the stream has brought in, for the progress bar. Not all of them
+    /// have verified; what a fallback resumes from is reported separately.
     streamed: u64,
     /// Every chunk a stream wrote was checked against the offered root, so
     /// completion need not read the whole file back to hash it.
@@ -534,19 +535,19 @@ impl RecvState {
         self.updated_at = Instant::now();
     }
 
-    /// Verified bytes a running stream has written, for the progress bar and
-    /// the stall timer.
-    pub fn note_streamed(&mut self, verified: u64) {
-        if verified > self.streamed {
-            self.streamed = verified.min(self.size);
+    /// Bytes a running stream has brought in, for the progress bar and the
+    /// stall timer.
+    pub fn note_streamed(&mut self, arrived: u64) {
+        if arrived > self.streamed {
+            self.streamed = arrived.min(self.size);
             self.updated_at = Instant::now();
         }
     }
 
-    /// A stream is still running. It reports progress only per 256 KiB chunk,
-    /// which on a slow or capped link can take longer than the stall window;
-    /// the stream enforces its own silence timeouts, so while its task lives
-    /// the transfer is not stalled.
+    /// A stream is still running. It can go quiet for longer than the stall
+    /// window without being stuck — the sender hashing a large file before its
+    /// first byte, or a link capped to a trickle — and it enforces its own
+    /// silence timeouts, so while its task lives the transfer is not stalled.
     pub fn note_stream_alive(&mut self) {
         if self.streaming {
             self.updated_at = Instant::now();

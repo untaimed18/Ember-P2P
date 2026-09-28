@@ -38,7 +38,9 @@ use super::ember::attach::{
     self, AttachCancel, AttachOffer, AttachReply, AttachStreamStatus, ATTACH_GRANT_TTL_SECS,
     ATTACH_OFFER_TTL_SECS,
 };
+use super::ed2k::secure_stream::SecureStreamParts;
 use super::ember::attach_stream::{self, FetchError};
+use super::ember::attach_tcp;
 use super::NetworkState;
 use crate::commands::errors::{coded, coded_ctx};
 use crate::storage::database::{ChatAttachmentRow, Database};
@@ -1174,6 +1176,40 @@ async fn fetch_to_chat_files(ctx: &FetchCtx) -> Result<bool, ReceiveFailure> {
     .map_err(ReceiveFailure::Disk)
 }
 
+/// One QUIC dial to the sender, pinned: the certificate it presents must hash
+/// to the friend we accepted from, so nobody else can answer it.
+async fn dial_quic(
+    ctx: &FetchCtx,
+    cert: &[u8],
+    key: &[u8],
+    attempt: u32,
+) -> Result<quinn::Connection, ReceiveFailure> {
+    let dialled = tokio::time::timeout(
+        DIAL_TIMEOUT,
+        super::ember::quic::connect_pinned(&ctx.endpoint, ctx.dial, "ember", Some((cert, key, ctx.friend))),
+    )
+    .await;
+    match dialled {
+        Ok(Ok(conn)) => Ok(conn),
+        Ok(Err(e)) => {
+            info!(
+                "Chat attachment: dial {}/{FETCH_ATTEMPTS} to {} failed: {e}",
+                attempt + 1,
+                ctx.dial
+            );
+            Err(ReceiveFailure::Unreachable(e.to_string()))
+        }
+        Err(_) => {
+            info!(
+                "Chat attachment: dial {}/{FETCH_ATTEMPTS} to {} timed out",
+                attempt + 1,
+                ctx.dial
+            );
+            Err(ReceiveFailure::Unreachable("the connection timed out".into()))
+        }
+    }
+}
+
 async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<(), ReceiveFailure> {
     let capability = attach::derive_attach_capability(&ctx.seed, &ctx.peer_pubkey, &ctx.xfer_id)
         .ok_or_else(|| ReceiveFailure::Unreachable("the friend's key is not usable".into()))?;
@@ -1188,52 +1224,36 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(1u64 << attempt.min(3))).await;
         }
-        let dialled = tokio::time::timeout(
-            DIAL_TIMEOUT,
-            super::ember::quic::connect_pinned(
-                &ctx.endpoint,
-                ctx.dial,
-                "ember",
-                // Pinned: the certificate the sender presents must hash to the
-                // friend we accepted from, so nobody else can answer this dial.
-                Some((&cert, &key, ctx.friend)),
-            ),
-        )
-        .await;
-        let conn = match dialled {
-            Ok(Ok(conn)) => Some(conn),
-            Ok(Err(e)) => {
-                info!(
-                    "Chat attachment: dial {}/{FETCH_ATTEMPTS} to {} failed: {e}",
-                    attempt + 1,
-                    ctx.dial
-                );
-                last = ReceiveFailure::Unreachable(e.to_string());
-                None
-            }
-            Err(_) => {
-                info!(
-                    "Chat attachment: dial {}/{FETCH_ATTEMPTS} to {} timed out",
-                    attempt + 1,
-                    ctx.dial
-                );
-                last = ReceiveFailure::Unreachable("the connection timed out".into());
-                None
+        let quic = dial_quic(ctx, &cert, &key, attempt);
+        // QUIC listens on a UDP port of its own, which a setup forwarding only
+        // the eD2K ports never opens. The friend's TCP listener is dialled
+        // beside the first QUIC dial once that has had a head start, rather
+        // than after it has timed out, and only once: after that the remaining
+        // retries are QUIC's.
+        let dialled = if !connected && !tcp_tried && !ctx.tcp_dials.is_empty() {
+            tcp_tried = true;
+            attach_tcp::dial_quic_or_tcp(quic, || dial_friend_tcp(ctx, &ctx.tcp_dials)).await
+        } else {
+            match quic.await {
+                Ok(conn) => attach_tcp::Dialled::Quic(conn),
+                Err(failure) => attach_tcp::Dialled::Neither(failure),
             }
         };
-        let Some(conn) = conn else {
-            // QUIC listens on a UDP port of its own, which a setup forwarding
-            // only the eD2K ports never opens. Try the friend's TCP listener
-            // once, straight after the first miss, before spending the
-            // remaining QUIC retries.
-            if !connected && !tcp_tried {
-                tcp_tried = true;
-                if let Some(done) = receive_over_tcp(ctx, part, &capability, &mut status_waited).await
+        let conn = match dialled {
+            attach_tcp::Dialled::Quic(conn) => conn,
+            attach_tcp::Dialled::Tcp((addr, parts)) => {
+                if let Some(done) =
+                    receive_over_tcp(ctx, part, &capability, &mut status_waited, addr, parts).await
                 {
                     return done;
                 }
+                last = ReceiveFailure::Unreachable("the TCP fallback kept dropping".into());
+                continue;
             }
-            continue;
+            attach_tcp::Dialled::Neither(failure) => {
+                last = failure;
+                continue;
+            }
         };
         connected = true;
         let (mut send, mut recv) = match conn.open_bi().await {
@@ -1256,10 +1276,10 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
             ctx.size,
             &ctx.root,
             handle,
-            |done, _| {
+            |progress| {
                 if last_emit.is_none_or(|at| at.elapsed() >= PROGRESS_INTERVAL) {
                     last_emit = Some(Instant::now());
-                    emit_progress(&ctx.app, &ctx.db, &ctx.row, done);
+                    emit_progress(&ctx.app, &ctx.db, &ctx.row, progress.received);
                 }
             },
             status_wait,
@@ -1310,45 +1330,52 @@ fn friend_tcp_candidates(
     out
 }
 
-/// The fallback when QUIC cannot connect: the friend's upload listener, over
-/// the secure stream a friend session uses. `None` when no candidate connects
-/// either, so the caller can go on trying QUIC; otherwise how the receive
-/// ended.
+/// The friend's upload listener at the first of `targets` that answers, over
+/// the secure stream a friend session uses.
+async fn dial_friend_tcp(
+    ctx: &FetchCtx,
+    targets: &[SocketAddr],
+) -> Option<(SocketAddr, SecureStreamParts)> {
+    let our_hash = super::ember::crypto::node_id_from_ed25519_bytes(&ctx.our_pubkey)?;
+    for &addr in targets {
+        match attach_tcp::dial_secure(addr, our_hash, ctx.our_pubkey, ctx.seed, ctx.friend).await {
+            Ok(connected) => {
+                info!("Chat attachment: reached the sender over TCP at {addr}");
+                return Some((addr, connected));
+            }
+            Err(e) => info!("Chat attachment: TCP dial to {addr} failed: {e}"),
+        }
+    }
+    None
+}
+
+/// The fallback when QUIC cannot connect: the friend's upload listener at
+/// `reached`, starting on the stream `parts` already dialled there. `None` when
+/// it only ever failed the way a network does, so the caller can go on trying
+/// QUIC; otherwise how the receive ended.
 async fn receive_over_tcp(
     ctx: &FetchCtx,
     part: &std::fs::File,
     capability: &[u8; 32],
     status_waited: &mut Duration,
+    reached: SocketAddr,
+    parts: SecureStreamParts,
 ) -> Option<Result<(), ReceiveFailure>> {
-    use super::ember::attach_tcp;
-    let our_hash = super::ember::crypto::node_id_from_ed25519_bytes(&ctx.our_pubkey)?;
-    let mut reached: Option<SocketAddr> = None;
+    let mut connected = Some(parts);
     let mut last = ReceiveFailure::Unreachable("no TCP attempt was made".into());
     for attempt in 0..FETCH_ATTEMPTS {
-        if attempt > 0 {
-            tokio::time::sleep(Duration::from_secs(1u64 << attempt.min(3))).await;
-        }
-        // Every candidate until one answers; after that, only that one.
-        let targets = match reached {
-            Some(addr) => vec![addr],
-            None => ctx.tcp_dials.clone(),
-        };
-        let mut parts = None;
-        for addr in targets {
-            match attach_tcp::dial_secure(addr, our_hash, ctx.our_pubkey, ctx.seed, ctx.friend).await {
-                Ok(connected) => {
-                    info!("Chat attachment: reached the sender over TCP at {addr}");
-                    reached = Some(addr);
-                    parts = Some(connected);
-                    break;
+        let mut parts = match connected.take() {
+            Some(parts) => parts,
+            None => {
+                tokio::time::sleep(Duration::from_secs(1u64 << attempt.min(3))).await;
+                match dial_friend_tcp(ctx, &[reached]).await {
+                    Some((_, parts)) => parts,
+                    None => {
+                        last = ReceiveFailure::Unreachable("the TCP redial failed".into());
+                        continue;
+                    }
                 }
-                Err(e) => info!("Chat attachment: TCP dial to {addr} failed: {e}"),
             }
-        }
-        let Some(mut parts) = parts else {
-            reached?;
-            last = ReceiveFailure::Unreachable("the TCP redial failed".into());
-            continue;
         };
         let handle = match part.try_clone() {
             Ok(handle) => handle,
@@ -1363,10 +1390,10 @@ async fn receive_over_tcp(
             ctx.size,
             &ctx.root,
             handle,
-            |done, _| {
+            |progress| {
                 if last_emit.is_none_or(|at| at.elapsed() >= PROGRESS_INTERVAL) {
                     last_emit = Some(Instant::now());
-                    emit_progress(&ctx.app, &ctx.db, &ctx.row, done);
+                    emit_progress(&ctx.app, &ctx.db, &ctx.row, progress.received);
                 }
             },
             next_status_wait(*status_waited),

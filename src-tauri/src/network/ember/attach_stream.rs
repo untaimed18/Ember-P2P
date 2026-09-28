@@ -295,7 +295,14 @@ const ATTACH_SEND_SLICE: usize = 16 * 1024;
 /// take longer than [`ATTACH_IO_TIMEOUT`] to arrive, and a timeout over the
 /// whole chunk would abandon a transfer that was moving the entire time. Any
 /// progress resets it; only a stream that stops delivering anything times out.
-async fn read_full<R>(recv: &mut R, buf: &mut [u8]) -> Result<(), FetchError>
+///
+/// `on_read` is told how much of `buf` is filled after every read, so a
+/// progress bar can move while a chunk is still arriving.
+async fn read_full<R>(
+    recv: &mut R,
+    buf: &mut [u8],
+    mut on_read: impl FnMut(usize),
+) -> Result<(), FetchError>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -308,8 +315,21 @@ where
             )));
         }
         filled += n;
+        on_read(filled);
     }
     Ok(())
+}
+
+/// How far a fetch has got, in absolute file positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchProgress {
+    /// Bytes that have arrived, the chunk still being read included. For a
+    /// progress bar only: nothing has checked the tail of it yet.
+    pub received: u64,
+    /// Bytes in whole chunks that verified and were written. The only figure
+    /// a resume may start from.
+    pub verified: u64,
+    pub size: u64,
 }
 
 /// Why a fetch stopped, sorted by what the caller should do about it.
@@ -380,8 +400,9 @@ pub struct FetchOutcome {
 /// what the connection was.
 ///
 /// `on_progress` is told the transfer id once it is known and authorized, then
-/// the absolute byte position after each chunk — absolute rather than "sent this
-/// call", so a resumed stream reports where the file actually is. Returning
+/// the absolute byte position after each slice handed to the stream — absolute
+/// rather than "sent this call", so a resumed stream reports where the file
+/// actually is. It is called every 16 KiB, so it must be cheap. Returning
 /// false stops the stream there: the grant was checked when it opened, and
 /// this is how a caller withdraws it from a stream already running.
 ///
@@ -553,7 +574,8 @@ where
             .ok_or_else(|| anyhow::anyhow!("chunk index past the end"))?;
         handle.read_exact(&mut buf[..len]).await?;
         // Sliced so a low cap paces the stream smoothly rather than parking for
-        // a whole chunk's worth of tokens and then bursting it.
+        // a whole chunk's worth of tokens and then bursting it, and reported
+        // per slice so the sender's bar moves at the same pace.
         for slice in buf[..len].chunks(ATTACH_SEND_SLICE) {
             if let Some(limiter) = limiter {
                 if !limiter.acquire_upload(slice.len() as u64).await {
@@ -563,11 +585,11 @@ where
                 }
             }
             tokio::time::timeout(ATTACH_IO_TIMEOUT, send.write_all(slice)).await??;
-        }
-        sent += len as u64;
-        position += len as u64;
-        if !on_progress(&request.xfer_id, position, size) {
-            anyhow::bail!("attachment grant withdrawn mid-stream");
+            sent += slice.len() as u64;
+            position += slice.len() as u64;
+            if !on_progress(&request.xfer_id, position, size) {
+                anyhow::bail!("attachment grant withdrawn mid-stream");
+            }
         }
     }
     tokio::time::timeout(ATTACH_IO_TIMEOUT, send.flush()).await??;
@@ -592,9 +614,10 @@ where
 /// the room transfer's receive path was closed against. Open it read/write and
 /// not truncated: whatever whole chunks are already in it are the resume point.
 ///
-/// `on_progress` is called with the running total so a caller can drive a
-/// progress bar; it is called per chunk, so a caller that emits an event from it
-/// should throttle.
+/// `on_progress` is called after every read from the stream, with the bytes
+/// that have arrived and the bytes that have verified; see [`FetchProgress`].
+/// That is many times a chunk, so a caller that emits an event from it should
+/// throttle.
 ///
 /// Resumes from whatever is already in `part`, rounded down to a whole verified
 /// chunk — a partial chunk is discarded rather than trusted, because nothing has
@@ -624,7 +647,7 @@ pub async fn fetch_attachment_waiting<R, W, P>(
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
-    P: FnMut(u64, u64),
+    P: FnMut(FetchProgress),
 {
     fetch_stream_waiting(
         super::attach::ATTACH_STREAM_MSG_TYPE,
@@ -660,7 +683,7 @@ pub async fn fetch_stream_waiting<R, W, P>(
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
-    P: FnMut(u64, u64),
+    P: FnMut(FetchProgress),
 {
     let chunk_count = attach_chunk_count(size)
         .ok_or_else(|| FetchError::Corrupt("attachment size out of range".into()))?;
@@ -703,7 +726,7 @@ where
         .ok_or_else(|| FetchError::Corrupt("attachment size out of range".into()))?;
     let mut info_bytes = vec![0u8; info_len];
     info_bytes[0] = AttachStreamStatus::Ok.to_byte();
-    read_full(recv, &mut info_bytes[1..]).await?;
+    read_full(recv, &mut info_bytes[1..], |_| {}).await?;
     let info = decode_attach_file_info(&info_bytes)
         .map_err(|s| FetchError::Corrupt(format!("attachment header refused: {s:?}")))?;
 
@@ -735,7 +758,14 @@ where
         let len = info
             .chunk_len(index)
             .ok_or_else(|| FetchError::Corrupt("chunk index past the end".into()))?;
-        read_full(recv, &mut buf[..len]).await?;
+        read_full(recv, &mut buf[..len], |filled| {
+            on_progress(FetchProgress {
+                received: total + filled as u64,
+                verified: total,
+                size,
+            })
+        })
+        .await?;
 
         // Per chunk, so a bad one costs this chunk rather than the whole file.
         // The room transfer could only check its root at the end, which meant
@@ -749,7 +779,11 @@ where
         part.write_all(&buf[..len]).await?;
         written += len as u64;
         total += len as u64;
-        on_progress(total, size);
+        on_progress(FetchProgress {
+            received: total,
+            verified: total,
+            size,
+        });
     }
     part.flush().await?;
     // Durable before the caller is told it may move the file into place: a
@@ -784,7 +818,7 @@ mod tests {
     where
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
-        P: FnMut(u64, u64),
+        P: FnMut(FetchProgress),
     {
         fetch_attachment_waiting(
             recv,
@@ -857,7 +891,7 @@ mod tests {
             size,
             &root,
             open_part(&part),
-            |_, _| {},
+            |_| {},
         )
         .await;
         let _ = server.await;
@@ -1107,7 +1141,7 @@ mod tests {
                 size,
                 &root,
                 open_part(part),
-                |_, _| {},
+                |_| {},
             )
             .await
             .map_err(anyhow::Error::from)
@@ -1169,7 +1203,7 @@ mod tests {
             size,
             root,
             open_part(part),
-            |_, _| {},
+            |_| {},
         )
         .await
         .map_err(anyhow::Error::from)
@@ -1259,7 +1293,7 @@ mod tests {
             size,
             &root,
             open_part(&part),
-            |_, _| {},
+            |_| {},
         )
         .await
         .expect("fetch");
@@ -1312,7 +1346,7 @@ mod tests {
             size,
             &root,
             open_part(&part),
-            |_, _| {},
+            |_| {},
             ATTACH_STATUS_TIMEOUT,
             &mut std::time::Duration::default(),
         )
@@ -1375,6 +1409,90 @@ mod tests {
         let _ = std::fs::remove_file(&part);
     }
 
+    /// Both bars move while a chunk is still crossing, and the figure a resume
+    /// may start from only ever lands on a chunk that verified.
+    #[tokio::test]
+    async fn progress_moves_within_a_chunk_but_verified_stays_on_chunk_boundaries() {
+        let data: Vec<u8> = (0..ATTACH_CHUNK_SIZE * 2 + 999).map(|i| (i % 229) as u8).collect();
+        let source = temp_path("src-progress");
+        std::fs::write(&source, &data).expect("write");
+        let root = HashTree::from_data(&data).root_hash;
+        let size = data.len() as u64;
+        let (xfer_id, cap) = ([24u8; 16], [25u8; 32]);
+
+        // A narrow pipe toward the receiver, so a chunk arrives in many reads.
+        let (mut client_w, mut server_r) = tokio::io::duplex(1 << 16);
+        let (mut server_w, mut client_r) = tokio::io::duplex(8 * 1024);
+        let served = source.clone();
+        let positions = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = positions.clone();
+        let server = tokio::spawn(async move {
+            let mut prefix = [0u8; 7];
+            server_r.read_exact(&mut prefix).await?;
+            serve_attachment(
+                &mut server_r,
+                &mut server_w,
+                &prefix,
+                |_| Some((served.clone(), size, root, cap)),
+                move |_, position, _| {
+                    noted.lock().unwrap().push(position);
+                    true
+                },
+                None,
+            )
+            .await
+        });
+        let part = temp_path("part-progress");
+        let mut seen = Vec::new();
+        let outcome = fetch_attachment(
+            &mut client_r,
+            &mut client_w,
+            &xfer_id,
+            &cap,
+            size,
+            &root,
+            open_part(&part),
+            |progress| seen.push(progress),
+        )
+        .await
+        .expect("fetch");
+        assert!(outcome.complete);
+        server.await.expect("join").expect("serve");
+
+        assert!(
+            seen.iter().any(|p| p.received > p.verified),
+            "nothing was reported from inside a chunk"
+        );
+        for p in &seen {
+            assert!(p.verified <= p.received && p.received <= size, "{p:?}");
+            assert!(
+                p.verified % ATTACH_CHUNK_SIZE as u64 == 0 || p.verified == size,
+                "verified off a chunk boundary: {p:?}"
+            );
+        }
+        assert!(seen
+            .windows(2)
+            .all(|w| w[0].received <= w[1].received && w[0].verified <= w[1].verified));
+        assert_eq!(
+            seen.last(),
+            Some(&FetchProgress {
+                received: size,
+                verified: size,
+                size
+            })
+        );
+
+        let positions = positions.lock().unwrap().clone();
+        assert!(
+            positions.iter().any(|p| p % ATTACH_CHUNK_SIZE as u64 != 0),
+            "the sender reported only whole chunks: {positions:?}"
+        );
+        assert_eq!(positions.last(), Some(&size));
+
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&part);
+    }
+
     #[tokio::test]
     async fn a_single_chunk_file_works() {
         let data = b"a short attachment".to_vec();
@@ -1424,7 +1542,7 @@ mod tests {
             1,
             &[0u8; 32],
             open_part(&part),
-            |_, _| {},
+            |_| {},
             ATTACH_STATUS_TIMEOUT,
             &mut waited,
         )
@@ -1519,7 +1637,7 @@ mod tests {
             size,
             &root,
             open_part(&part),
-            |_, _| {},
+            |_| {},
         )
         .await;
         assert!(
@@ -1632,7 +1750,7 @@ mod tests {
             18,
             &offered_root,
             open_part(&part),
-            |_, _| {},
+            |_| {},
         )
         .await
         .expect_err("a swapped file must not transfer");

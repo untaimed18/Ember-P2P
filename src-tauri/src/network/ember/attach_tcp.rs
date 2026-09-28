@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::attach_stream::{FetchError, FetchOutcome};
+use super::attach_stream::{FetchError, FetchOutcome, FetchProgress};
 use crate::network::ed2k::secure_stream::{self, SecureStreamParts};
 
 /// The byte a recipient writes once every chunk has arrived and verified.
@@ -32,6 +32,77 @@ const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the sender waits after the last chunk for the recipient to say it
 /// has everything.
 const TCP_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a QUIC dial runs alone before the TCP fallback is dialled beside
+/// it. A reachable QUIC port answers within a round trip, and a punched one
+/// within a handshake retransmit or two. A port nothing forwards never
+/// answers, and waiting out the whole dial timeout for it held every file
+/// from such a sender back by that long before its first byte.
+pub const TCP_HEAD_START: Duration = Duration::from_secs(3);
+
+/// Which carrier [`dial_quic_or_tcp`] connected.
+pub enum Dialled<Q, T, E> {
+    Quic(Q),
+    Tcp(T),
+    /// Neither connected; the QUIC dial's failure.
+    Neither(E),
+}
+
+/// Dial QUIC, and once it has had [`TCP_HEAD_START`] without connecting,
+/// dial TCP beside it. The first to connect is used and the other is dropped
+/// mid-dial, before either has sent a request, so the sender never serves the
+/// file twice. A QUIC dial that fails inside the head start starts TCP at once.
+pub async fn dial_quic_or_tcp<Q, T, E, FQ, FT>(
+    quic: FQ,
+    tcp: impl FnOnce() -> FT,
+) -> Dialled<Q, T, E>
+where
+    FQ: std::future::Future<Output = Result<Q, E>>,
+    FT: std::future::Future<Output = Option<T>>,
+{
+    dial_quic_or_tcp_after(TCP_HEAD_START, quic, tcp).await
+}
+
+async fn dial_quic_or_tcp_after<Q, T, E, FQ, FT>(
+    head_start: Duration,
+    quic: FQ,
+    tcp: impl FnOnce() -> FT,
+) -> Dialled<Q, T, E>
+where
+    FQ: std::future::Future<Output = Result<Q, E>>,
+    FT: std::future::Future<Output = Option<T>>,
+{
+    tokio::pin!(quic);
+    let early = tokio::select! {
+        dialled = &mut quic => Some(dialled),
+        () = tokio::time::sleep(head_start) => None,
+    };
+    let mut quic_failed = match early {
+        Some(Ok(conn)) => return Dialled::Quic(conn),
+        Some(Err(e)) => Some(e),
+        None => None,
+    };
+    let tcp = tcp();
+    tokio::pin!(tcp);
+    let mut tcp_failed = false;
+    loop {
+        tokio::select! {
+            dialled = &mut quic, if quic_failed.is_none() => match dialled {
+                Ok(conn) => return Dialled::Quic(conn),
+                Err(e) => quic_failed = Some(e),
+            },
+            dialled = &mut tcp, if !tcp_failed => match dialled {
+                Some(parts) => return Dialled::Tcp(parts),
+                None => tcp_failed = true,
+            },
+        }
+        if tcp_failed {
+            if let Some(e) = quic_failed.take() {
+                return Dialled::Neither(e);
+            }
+        }
+    }
+}
 
 /// Connect to `addr` and run the secure-stream handshake, requiring the peer
 /// to prove it is `peer_hash`.
@@ -74,7 +145,7 @@ pub async fn fetch_over_tcp<P>(
     status_waited: &mut Duration,
 ) -> Result<FetchOutcome, FetchError>
 where
-    P: FnMut(u64, u64),
+    P: FnMut(FetchProgress),
 {
     let outcome = super::attach_stream::fetch_stream_waiting(
         stream_type,
@@ -207,7 +278,7 @@ mod tests {
             size,
             &root,
             part,
-            |_, _| {},
+            |_| {},
             Duration::from_secs(30),
             &mut Duration::default(),
         )
@@ -218,6 +289,82 @@ mod tests {
         assert!(server.await.expect("server task"), "the sender heard the file arrived");
         let _ = std::fs::remove_file(&source);
         let _ = std::fs::remove_file(&part_path);
+    }
+
+    const HEAD_START: Duration = Duration::from_millis(100);
+
+    /// A QUIC port that answers inside the head start is used, and TCP is
+    /// never dialled.
+    #[tokio::test]
+    async fn a_quic_dial_that_answers_in_time_never_dials_tcp() {
+        let tcp_dialled = std::sync::atomic::AtomicBool::new(false);
+        let won = dial_quic_or_tcp_after(HEAD_START, async { Ok::<_, ()>("quic") }, || async {
+            tcp_dialled.store(true, std::sync::atomic::Ordering::Relaxed);
+            Some("tcp")
+        })
+        .await;
+        assert!(matches!(won, Dialled::Quic("quic")));
+        assert!(!tcp_dialled.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// A QUIC port nothing answers on costs the head start, not the whole
+    /// dial timeout.
+    #[tokio::test]
+    async fn a_silent_quic_port_hands_over_to_tcp_after_the_head_start() {
+        let started = std::time::Instant::now();
+        let won = dial_quic_or_tcp_after(
+            HEAD_START,
+            std::future::pending::<Result<&str, ()>>(),
+            || async { Some("tcp") },
+        )
+        .await;
+        assert!(matches!(won, Dialled::Tcp("tcp")));
+        let took = started.elapsed();
+        assert!(took >= HEAD_START && took < HEAD_START * 20, "took {took:?}");
+    }
+
+    /// A QUIC dial that fails outright does not wait out the head start.
+    #[tokio::test]
+    async fn a_failed_quic_dial_starts_tcp_at_once() {
+        let started = std::time::Instant::now();
+        let won = dial_quic_or_tcp_after(
+            Duration::from_secs(30),
+            async { Err::<&str, _>("refused") },
+            || async { Some("tcp") },
+        )
+        .await;
+        assert!(matches!(won, Dialled::Tcp("tcp")));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// TCP starting does not end the QUIC dial: a slow QUIC answer still
+    /// wins over a TCP port that refused.
+    #[tokio::test]
+    async fn a_slow_quic_dial_still_wins_after_tcp_missed() {
+        let won = dial_quic_or_tcp_after(
+            HEAD_START,
+            async {
+                tokio::time::sleep(HEAD_START * 3).await;
+                Ok::<_, ()>("quic")
+            },
+            || async { None::<&str> },
+        )
+        .await;
+        assert!(matches!(won, Dialled::Quic("quic")));
+    }
+
+    #[tokio::test]
+    async fn neither_connecting_reports_the_quic_failure() {
+        let won = dial_quic_or_tcp_after(
+            HEAD_START,
+            async {
+                tokio::time::sleep(HEAD_START * 2).await;
+                Err::<&str, _>("timed out")
+            },
+            || async { None::<&str> },
+        )
+        .await;
+        assert!(matches!(won, Dialled::Neither("timed out")));
     }
 
     /// The dialer's claim about who it is reaching is checked: a listener that

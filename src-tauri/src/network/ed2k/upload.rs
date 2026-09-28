@@ -577,8 +577,23 @@ enum ConnInit {
         writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
         secure_peer: Option<super::secure_stream::SecurePeerIdentity>,
         relayed: bool,
+        /// A duplicate handle on the TCP socket underneath, when there is one,
+        /// so a file stream can widen the send buffer the listener capped for
+        /// eD2K. Dropped as soon as the stream has said what it is: while it
+        /// is held, closing the stream's own halves does not close the socket.
+        socket: Option<socket2::Socket>,
     },
 }
+
+/// Kernel send buffer for a chat attachment or room transfer served from the
+/// upload listener, in place of the 256 KiB it caps eD2K sockets to.
+///
+/// The eD2K cap keeps the upload counter close to what the peer has received.
+/// A file stream needs no such thing — the recipient says when it has every
+/// byte — and at 256 KiB its throughput stops at the buffer over the round
+/// trip: 2.5 MB/s at 100 ms. This covers 40 MB/s there. Linux holds any request
+/// to `net.core.wmem_max`, so there it helps only as far as that allows.
+const FILE_STREAM_SEND_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// Request handed from the network task to the upload listener for a
 /// pre-established stream (Ember QUIC hole-punch, peer relay, or
@@ -5686,6 +5701,7 @@ impl UploadHandler {
                 writer,
                 secure_peer: None,
                 relayed,
+                socket: None,
             },
             Some(
                 tokio::time::Instant::now()
@@ -6332,6 +6348,7 @@ impl UploadHandler {
                 writer: boxed_writer,
                 secure_peer: preauthenticated_peer,
                 relayed,
+                socket,
             } => {
                 let (mut rd, mut wr, first_inner_byte) = if let Some(peer) = preauthenticated_peer {
                     secure_v2_peer = Some(peer);
@@ -6359,6 +6376,9 @@ impl UploadHandler {
                     if first == crate::network::ember::attach::ATTACH_STREAM_MSG_TYPE
                         || first == crate::network::ember::attach::ROOM_XFER_STREAM_MSG_TYPE
                     {
+                        if let Some(socket) = socket {
+                            let _ = socket.set_send_buffer_size(FILE_STREAM_SEND_BUFFER_BYTES);
+                        }
                         return self
                             .serve_file_stream(
                                 first,
@@ -6370,6 +6390,7 @@ impl UploadHandler {
                             )
                             .await;
                     }
+                    drop(socket);
                     (
                         StreamReader::Boxed(boxed_reader),
                         StreamWriter::Boxed(boxed_writer),
@@ -6547,6 +6568,10 @@ impl UploadHandler {
                         Ok(true)
                     );
                 if is_ember_preamble {
+                    // Taken before the halves vanish into the secure layer.
+                    let socket = socket2::SockRef::from(raw_reader.get_ref().as_ref())
+                        .try_clone()
+                        .ok();
                     let secure = tokio::time::timeout_at(
                         preauth_deadline.expect("inbound TCP has a pre-auth deadline"),
                         super::secure_stream::accept_after_first(
@@ -6567,6 +6592,7 @@ impl UploadHandler {
                             writer: secure.writer,
                             secure_peer: Some(secure.peer),
                             relayed: false,
+                            socket,
                         },
                         preauth_deadline,
                     ))
