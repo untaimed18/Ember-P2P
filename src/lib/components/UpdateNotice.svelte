@@ -17,15 +17,22 @@
     dismissNotice,
   } from '$lib/stores/updater';
   import IconX from '$lib/components/IconX.svelte';
+  import { silentUpdate, silentUpdateHandlesIt } from '$lib/stores/silentUpdate';
 
   let showNotes = $state(false);
+
+  // An update silent updates are about to install needs no offer — until it
+  // has waited a week without a quiet moment, when the notice comes back once
+  // to say so.
+  const silentWaiting = $derived(silentUpdateHandlesIt($silentUpdate));
+  const silentWaitingLong = $derived(silentWaiting && $silentUpdate?.waitingLong === true);
 
   // Every phase that renders a dismiss control must honour `dismissed`;
   // `ready` and `error` both show "Later" and an ×, so leaving them
   // unconditionally visible made those buttons inert.
   const visible = $derived(
     (!$updater.dismissed &&
-      ($updater.phase === 'available' ||
+      (($updater.phase === 'available' && (!silentWaiting || silentWaitingLong)) ||
         $updater.phase === 'ready' ||
         $updater.phase === 'stalled' ||
         ($updater.phase === 'error' && $updater.version !== null))) ||
@@ -106,6 +113,9 @@
         {m.updater_error_body({ detail: $updater.error ?? '' })}
       {:else}
         {m.updater_available_body({ version: $updater.version ?? '' })}
+        {#if silentWaitingLong}
+          {' '}{m.silent_update_waiting_note()}
+        {/if}
       {/if}
     </p>
 

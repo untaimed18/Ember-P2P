@@ -42,7 +42,7 @@ use futures::FutureExt;
 use tauri::Emitter;
 
 use std::sync::Arc;
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 use tokio::sync::{mpsc, RwLock};
@@ -111,6 +111,23 @@ fn repair_legacy_data_acls(data_dir: &std::path::Path) {
         if let Err(error) = security::atomic_write(&marker, b"2\n", true) {
             eprintln!("Failed to persist Ember ACL repair marker: {error}");
         }
+    }
+}
+
+/// The tray icon's menu. `cancel` is the silent-update countdown's "Cancel
+/// update" entry, shown above the others while the countdown runs.
+pub(crate) fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(
+    manager: &M,
+    cancel: Option<&MenuItem<R>>,
+) -> tauri::Result<Menu<R>> {
+    let show_item = MenuItem::with_id(manager, "tray_show", "Show Ember", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(manager, "tray_quit", "Quit Ember", true, None::<&str>)?;
+    match cancel {
+        Some(cancel) => {
+            let separator = PredefinedMenuItem::separator(manager)?;
+            Menu::with_items(manager, &[cancel, &separator, &show_item, &quit_item])
+        }
+        None => Menu::with_items(manager, &[&show_item, &quit_item]),
     }
 }
 
@@ -629,6 +646,7 @@ pub fn run() {
             // Before the network task starts and before the window is shown:
             // both come back the way an update restart left them.
             let resume_window = auto_update::resume::begin_launch(&app_handle, &data_dir);
+            auto_update::silent::note_launch_outcome(&app_handle);
             // An eMule import staged last session. Here because it rewrites
             // what the identity, the approved roots, the credit store and the
             // network all read below, and none of them can take a change once
@@ -1011,21 +1029,7 @@ pub fn run() {
             // window would orphan the process. The menu also exposes an
             // explicit Quit entry that routes through `app.exit(0)` so the
             // existing `RunEvent::Exit` shutdown sequence still runs.
-            let show_item = MenuItem::with_id(
-                app,
-                "tray_show",
-                "Show Ember",
-                true,
-                None::<&str>,
-            )?;
-            let quit_item = MenuItem::with_id(
-                app,
-                "tray_quit",
-                "Quit Ember",
-                true,
-                None::<&str>,
-            )?;
-            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let tray_menu = build_tray_menu(app, None)?;
 
             let tray_icon = app
                 .default_window_icon()
@@ -1049,6 +1053,7 @@ pub fn run() {
                             let _ = window.set_focus();
                         }
                     }
+                    auto_update::silent::TRAY_CANCEL_ID => auto_update::silent::postpone(),
                     "tray_quit" => {
                         if let Some(state) = app.try_state::<AppState>() {
                             state
@@ -1109,6 +1114,7 @@ pub fn run() {
                 tray_available,
                 settings.launch_maximized,
             );
+            auto_update::silent::spawn(app_handle.clone());
 
             let index_clone = local_index.clone();
             let shared_folders = settings.shared_folders.clone();
@@ -2276,6 +2282,13 @@ pub fn run() {
             commands::updater::secure_updater_run_saved_installer,
             auto_update::resume::submit_resume_ui_snapshot,
             auto_update::resume::take_update_resume_ui,
+            auto_update::silent::get_silent_update_status,
+            auto_update::silent::silent_update_now,
+            auto_update::silent::silent_update_postpone,
+            auto_update::silent::silent_update_skip,
+            auto_update::silent::silent_update_resume,
+            auto_update::silent::note_user_activity,
+            auto_update::silent::take_update_outcome,
                     ]
                 };
             }
@@ -2305,6 +2318,11 @@ pub fn run() {
             }
         })
         .on_window_event(|window, event| {
+            // Someone came back to an Ember window: a silent update waits for
+            // them to be away again.
+            if let tauri::WindowEvent::Focused(true) = event {
+                auto_update::silent::note_user_activity_now();
+            }
             // Title-bar X handler. Decides whether to fully exit, hide to
             // the system tray, or hand off to the frontend dialog based on
             // the user's saved `close_to_tray_behavior`. Only the main

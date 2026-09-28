@@ -349,6 +349,11 @@ pub enum NetworkCommand {
     GetEd2kServerIntent {
         tx: oneshot::Sender<Option<(String, u16)>>,
     },
+    /// How many Ember Transfers (room and friend file hand-offs) are sending,
+    /// receiving or verifying right now — work a silent update must not cut off.
+    GetEmberTransferActivity {
+        tx: oneshot::Sender<usize>,
+    },
     UpdateSettings {
         settings: AppSettings,
     },

@@ -27,6 +27,40 @@ pub struct UpdateRecord {
     /// roughly weekly rather than on every poll after one offline evening.
     #[serde(default)]
     pub last_check_at: Option<i64>,
+    /// "Not now" on the silent-update countdown: no silent install before this
+    /// (Unix seconds).
+    #[serde(default)]
+    pub postponed_until: Option<i64>,
+    /// "Skip this version": never installed silently. The ordinary notice still
+    /// offers it.
+    #[serde(default)]
+    pub skipped_version: Option<String>,
+    /// A version whose silent install did not produce it. Never tried silently
+    /// again, so one bad release cannot become a restart loop.
+    #[serde(default)]
+    pub failed_version: Option<String>,
+    /// The last update that installed itself, for Settings → About.
+    #[serde(default)]
+    pub last_success: Option<LastSuccess>,
+    /// When the staged version first became ready to install silently, so a
+    /// machine that is never idle is told after a week instead of never.
+    #[serde(default)]
+    pub ready_since: Option<ReadySince>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastSuccess {
+    pub from: String,
+    pub to: String,
+    /// Unix seconds.
+    pub at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadySince {
+    pub version: String,
+    /// Unix seconds.
+    pub at: i64,
 }
 
 fn record_path(dir: &Path) -> PathBuf {
@@ -67,14 +101,26 @@ pub fn update(dir: &Path, change: impl FnOnce(&mut UpdateRecord)) {
     }
 }
 
+/// Apply `change` to the record in the data folder.
+pub fn update_stored(change: impl FnOnce(&mut UpdateRecord)) {
+    match crate::storage::paths::ensure_data_dir() {
+        Ok(dir) => update(&dir, change),
+        Err(error) => tracing::warn!("Could not resolve the data folder for {RECORD_FILE}: {error}"),
+    }
+}
+
+/// The record in the data folder, or a fresh one if it cannot be read.
+pub fn load_stored() -> UpdateRecord {
+    crate::storage::paths::ensure_data_dir()
+        .map(|dir| load(&dir))
+        .unwrap_or_default()
+}
+
 /// Stamp an update check as having been attempted now.
 pub fn note_check_attempt() {
-    match crate::storage::paths::ensure_data_dir() {
-        Ok(dir) => update(&dir, |record| {
-            record.last_check_at = Some(chrono::Utc::now().timestamp());
-        }),
-        Err(error) => tracing::warn!("Could not resolve the data folder to stamp an update check: {error}"),
-    }
+    update_stored(|record| {
+        record.last_check_at = Some(chrono::Utc::now().timestamp());
+    });
 }
 
 /// Seconds between automatic checks for a `update_check_frequency` value.

@@ -1820,6 +1820,61 @@ pub(crate) async fn run_check(
     }
 }
 
+/// The verified update waiting to be installed, if any, and whether it is
+/// already staged: what the silent-update scheduler plans around.
+///
+/// Never waits: the outer `None` means a check or a preparation holds the
+/// update right now, and the caller should look again later rather than stall
+/// behind a download.
+pub(crate) fn try_pending_update_state(service: &UpdaterService) -> Option<Option<(String, bool)>> {
+    let pending = service.pending.try_lock().ok()?;
+    Some(
+        pending
+            .as_ref()
+            .map(|update| (update.info.version.clone(), update.prepared.is_some())),
+    )
+}
+
+/// Download, verify and stage the pending update in the background, with no
+/// progress UI. `Ok(None)` when nothing is pending or it has fallen below the
+/// signed floor since it was checked.
+pub(crate) async fn prepare_pending_update(
+    app: &AppHandle,
+    service: &UpdaterService,
+) -> Result<Option<String>, String> {
+    let _operation = service.operation.lock().await;
+    let mut pending = service.pending.lock().await;
+    let Some(update) = pending.as_mut() else {
+        return Ok(None);
+    };
+    if !pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)
+        .map_err(|error| public_failure(UpdaterOperation::Install, error))?
+    {
+        pending.take();
+        return Ok(None);
+    }
+    let config = embedded_updater_config()
+        .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
+    prepare_locked(app, update, &config.public_key, &|_| {})
+        .await
+        .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
+    Ok(Some(update.info.version.clone()))
+}
+
+/// Install the update [`prepare_pending_update`] staged, for the silent path.
+/// Does not return on Windows when it succeeds.
+pub(crate) async fn install_prepared_update(
+    app: &AppHandle,
+    service: &UpdaterService,
+    reason: crate::auto_update::resume::ResumeReason,
+) -> Result<(), String> {
+    let _operation = service.operation.lock().await;
+    let mut pending = service.pending.lock().await;
+    let config = embedded_updater_config()
+        .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
+    install_locked(app, &mut pending, &config.public_key, reason).await
+}
+
 #[tauri::command]
 pub async fn secure_updater_install(
     app: AppHandle,

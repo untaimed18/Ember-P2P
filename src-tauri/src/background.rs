@@ -228,6 +228,14 @@ async fn count_working_transfers(state: &AppState) -> usize {
 /// the user is reading. `↓`/`↑` and `MB/s` need no translation; "3 downloads"
 /// would.
 fn tray_tooltip(state: &AppState, working: usize) -> String {
+    // A silent update about to install says so, with the time left, since the
+    // tray may be the only part of Ember on screen.
+    if let Some(secs) = crate::auto_update::silent::countdown_remaining_secs() {
+        return format!(
+            "Ember\n\u{27F3} {}",
+            crate::auto_update::silent::format_countdown(secs)
+        );
+    }
     let down = state.bandwidth_limiter.smoothed_download_speed();
     let up = state.bandwidth_limiter.smoothed_upload_speed();
     if working == 0 && down == 0 && up == 0 {

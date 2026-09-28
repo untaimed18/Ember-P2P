@@ -7,6 +7,7 @@
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { clearAllToasts, toastError } from '$lib/stores/toast';
   import { initChatWindowSide } from '$lib/chatPopout';
+  import { startUserActivityReporting } from '$lib/userActivity';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
 
@@ -25,6 +26,8 @@
     initTheme();
     let mounted = true;
     let teardown: (() => void) | null = null;
+    // Chatting here is using Ember: a silent update waits until nobody is.
+    const stopActivityReporting = startUserActivityReporting();
 
     const onUnhandledRejection = (event: PromiseRejectionEvent) => {
       console.error('Unhandled promise rejection:', event.reason);
@@ -49,6 +52,7 @@
     return () => {
       mounted = false;
       window.removeEventListener('unhandledrejection', onUnhandledRejection);
+      stopActivityReporting();
       teardown?.();
       cleanupTheme();
       cleanupFriendsStore();

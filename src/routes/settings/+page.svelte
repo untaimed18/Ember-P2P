@@ -112,10 +112,73 @@
     restartToUpdate,
     runStagedInstaller,
   } from '$lib/stores/updater';
+  import { silentUpdate, silentUpdateResume } from '$lib/stores/silentUpdate';
+  import { toastError } from '$lib/stores/toast';
   import { networkStats } from '$lib/stores/network';
 
   const appVersion = import.meta.env.VITE_APP_VERSION;
   const appLicense = import.meta.env.VITE_APP_LICENSE;
+
+  // Silent updates. `supported` is the backend's answer for this install;
+  // the status line describes what the saved setting is doing right now.
+  const silentSupported = $derived($silentUpdate?.supported ?? false);
+  const silentUnsupportedHint = $derived.by(() => {
+    switch ($silentUpdate?.unsupportedReason) {
+      case 'deb':
+        return m.settings_silent_update_unsupported_deb();
+      case 'msi':
+        return m.settings_silent_update_unsupported_msi();
+      default:
+        return m.settings_silent_update_unsupported_other();
+    }
+  });
+  const silentStatusText = $derived.by(() => {
+    const s = $silentUpdate;
+    if (!s || !s.supported) return '';
+    const version = s.version ?? '';
+    const lastSuccess = s.lastSuccess
+      ? m.silent_update_status_last_success({
+          version: s.lastSuccess.to,
+          date: formatDateTime(Math.floor(s.lastSuccess.at / 1000), {
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+          }),
+        })
+      : '';
+    if (!s.enabled) return lastSuccess;
+    switch (s.phase) {
+      case 'preparing':
+        return m.silent_update_status_preparing({ version });
+      case 'waiting':
+        return m.silent_update_status_waiting({ version });
+      case 'postponed':
+        return m.silent_update_status_postponed({
+          version,
+          time: formatDateTime(Math.floor((s.postponedUntil ?? 0) / 1000), {
+            weekday: 'short',
+            hour: 'numeric',
+            minute: '2-digit',
+          }),
+        });
+      case 'held':
+        return m.silent_update_status_held({ version });
+      case 'countdown':
+        return m.silent_update_status_countdown({ version });
+      case 'installing':
+        return m.silent_update_status_installing({ version });
+      default:
+        return lastSuccess;
+    }
+  });
+
+  async function resumeSilentUpdate() {
+    try {
+      await silentUpdateResume();
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    }
+  }
 
   function updateSettingsOutcomeMessage(result: UpdateSettingsResult): string {
     switch (result.outcome) {
@@ -4283,7 +4346,14 @@
               <span class="toggle-title">{m.settings_auto_check_updates_label()}</span>
               <span class="hint">{m.settings_auto_check_updates_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.auto_check_updates} ariaLabel={m.settings_auto_check_updates_label()} />
+            <ToggleSwitch
+              bind:checked={settings.auto_check_updates}
+              ariaLabel={m.settings_auto_check_updates_label()}
+              onchange={(on) => {
+                // Silent updates install what these checks find.
+                if (!on && settings) settings.silent_update_enabled = false;
+              }}
+            />
           </div>
           <div class="field" class:about-frequency-disabled={!settings.auto_check_updates}>
             <label for="update-check-frequency">{m.settings_update_check_frequency_label()}</label>
@@ -4297,6 +4367,32 @@
               <option value="weekly">{m.settings_update_frequency_weekly()}</option>
               <option value="monthly">{m.settings_update_frequency_monthly()}</option>
             </select>
+          </div>
+          <div class="field toggle-row" class:about-frequency-disabled={!silentSupported}>
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_silent_update_label()}</span>
+              <span class="hint">
+                {silentSupported ? m.settings_silent_update_hint() : silentUnsupportedHint}
+              </span>
+              {#if silentSupported && silentStatusText}
+                <span class="hint silent-update-status">
+                  {silentStatusText}
+                  {#if $silentUpdate?.enabled && $silentUpdate.phase === 'postponed'}
+                    <button type="button" class="silent-update-resume" onclick={() => void resumeSilentUpdate()}>
+                      {m.silent_update_resume_btn()}
+                    </button>
+                  {/if}
+                </span>
+              {/if}
+            </div>
+            <ToggleSwitch
+              bind:checked={settings.silent_update_enabled}
+              disabled={!silentSupported}
+              ariaLabel={m.settings_silent_update_label()}
+              onchange={(on) => {
+                if (on && settings) settings.auto_check_updates = true;
+              }}
+            />
           </div>
 
           <div class="divider"></div>
@@ -5272,6 +5368,27 @@
 
   .about-frequency-disabled {
     opacity: 0.55;
+  }
+
+  .silent-update-status {
+    display: block;
+    margin-top: 4px;
+    color: var(--text-primary);
+  }
+
+  .silent-update-resume {
+    border: none;
+    background: transparent;
+    padding: 0;
+    margin-left: 6px;
+    color: var(--accent);
+    font-size: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .silent-update-resume:hover {
+    text-decoration: underline;
   }
 
   .about-update-panel {

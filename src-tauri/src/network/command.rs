@@ -5182,6 +5182,15 @@ async fn handle_command_inner(
             let _ = tx.send(connected_server_info(state));
         }
 
+        NetworkCommand::GetEmberTransferActivity { tx } => {
+            let _ = tx.send(
+                state.xfer_send.len()
+                    + state.xfer_recv.len()
+                    + state.xfer_streams.len()
+                    + state.xfer_finish_in_flight,
+            );
+        }
+
         NetworkCommand::GetEd2kServerIntent { tx } => {
             let wanted = state.server_connected
                 || state.pending_server_connect.is_some()

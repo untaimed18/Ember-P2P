@@ -10,6 +10,9 @@
   import ChatDock from '$lib/components/ChatDock.svelte';
   import ErrorBoundary from '$lib/components/ErrorBoundary.svelte';
   import UpdateNotice from '$lib/components/UpdateNotice.svelte';
+  import SilentUpdateCountdown from '$lib/components/SilentUpdateCountdown.svelte';
+  import { initSilentUpdate, reportUpdateOutcome } from '$lib/stores/silentUpdate';
+  import { startUserActivityReporting } from '$lib/userActivity';
 
   import { initNetworkStore, cleanupNetworkStore, startStatsPoll } from '$lib/stores/network';
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
@@ -289,6 +292,8 @@
     let handoffCheckTimer: number | undefined;
     let unlistenUpdateCheck: UnlistenFn | null = null;
     let unlistenUpdateResume: UnlistenFn | null = null;
+    let unlistenSilentUpdate: UnlistenFn | null = null;
+    const stopActivityReporting = startUserActivityReporting();
     let unlistenClose: UnlistenFn | null = null;
     let unlistenConfigCorrupt: UnlistenFn | null = null;
     let unlistenDbCorrupt: UnlistenFn | null = null;
@@ -453,6 +458,12 @@
       .then((fn) => { if (mounted) unlistenUpdateResume = fn; else fn(); })
       .catch((e) => console.error('Failed to register update-resume listener:', e));
 
+    // Silent updates: the countdown dialog, the desktop warning and the
+    // Settings card all read this.
+    initSilentUpdate()
+      .then((fn) => { if (mounted) unlistenSilentUpdate = fn; else fn(); })
+      .catch((e) => console.error('Failed to register silent-update listener:', e));
+
     // Downloads re-queue on their own once the folder is fixed, so without this
     // the only sign of a folder Ember cannot write is rows that never start.
     listen('download-folder-unavailable', () => {
@@ -605,8 +616,10 @@
           releaseSplashWhenReady();
 
           // Coming back from an update restart: the page and search tabs the
-          // session had. Nothing to do on an ordinary launch.
+          // session had, and — for a silent update — whether it landed.
+          // Nothing to do on an ordinary launch.
           void applyUpdateResume();
+          void reportUpdateOutcome();
 
           // Did the last install actually happen? A
           // hand-off to the installer ends this process, so if the installer
@@ -651,6 +664,8 @@
       if (handoffCheckTimer !== undefined) window.clearTimeout(handoffCheckTimer);
       if (unlistenUpdateCheck) unlistenUpdateCheck();
       if (unlistenUpdateResume) unlistenUpdateResume();
+      if (unlistenSilentUpdate) unlistenSilentUpdate();
+      stopActivityReporting();
       if (stopPoll) stopPoll();
       if (stopTransferPoll) stopTransferPoll();
       cleanupTheme();
@@ -736,6 +751,7 @@
   {#if initialized && !initError && !showWizard}
     <!-- Non-blocking auto-update banner, driven by the shared updater store. -->
     <UpdateNotice />
+    <SilentUpdateCountdown />
     <!-- Headless: routes OS-delivered ed2k:// links and .emulecollection
     files into the app once the shell is ready (settings loaded, no wizard). -->
     <DeepLinkHandler />

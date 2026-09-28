@@ -8,3 +8,4 @@
 pub mod record;
 pub mod resume;
 pub mod scheduler;
+pub mod silent;

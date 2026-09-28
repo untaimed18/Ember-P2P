@@ -776,6 +776,13 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    // Silent updates act on what the automatic checks find, so without those
+    // checks there is nothing for them to install.
+    if settings.silent_update_enabled && !settings.auto_check_updates {
+        settings.silent_update_enabled = false;
+        changed = true;
+    }
+
     if settings.tcp_port == 0 {
         settings.tcp_port = DEFAULT_TCP_PORT;
         changed = true;
@@ -1321,6 +1328,11 @@ pub async fn update_settings(
     settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
     settings.channel_file_offers = settings.channel_file_offers.trim().to_ascii_lowercase();
     settings.update_check_frequency = settings.update_check_frequency.trim().to_ascii_lowercase();
+    // Silent updates act on what the automatic checks find; the Settings page
+    // switches the two together, and this holds the rule for any other caller.
+    if !settings.auto_check_updates {
+        settings.silent_update_enabled = false;
+    }
     // Web services are URL templates the user curates, so they are normalised
     // here rather than trusted: each is checked for a http/https scheme, a host
     // and no embedded credentials, duplicates by URL are dropped, and the list

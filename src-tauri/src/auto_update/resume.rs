@@ -186,6 +186,18 @@ pub struct ResumeService {
     maximize_on_show: AtomicBool,
 }
 
+impl ResumeService {
+    /// How the update this launch resumed from turned out, if it was one.
+    pub fn outcome(&self) -> Option<UpdateOutcome> {
+        self.outcome.lock().clone()
+    }
+
+    /// The same, handed over once.
+    pub fn take_outcome(&self) -> Option<UpdateOutcome> {
+        self.outcome.lock().take()
+    }
+}
+
 /// The server a resumed launch should reconnect to, taken once by the network
 /// task as it starts.
 static RESUME_SERVER: parking_lot::Mutex<Option<(String, u16)>> = parking_lot::Mutex::new(None);

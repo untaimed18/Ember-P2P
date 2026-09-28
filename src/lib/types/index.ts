@@ -1010,6 +1010,10 @@ export interface AppSettings {
   auto_check_updates: boolean;
   /** How often the automatic background update check may run. */
   update_check_frequency: 'daily' | 'weekly' | 'monthly';
+  /** Install updates without asking, once nothing is transferring and the user
+   *  is away, after a one-minute warning. Only on together with
+   *  `auto_check_updates`. */
+  silent_update_enabled: boolean;
 
   /** Master switch for desktop notifications. Off silences every category
    *  below, and the backend re-checks it so a stale renderer cannot notify

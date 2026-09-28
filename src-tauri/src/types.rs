@@ -1720,6 +1720,13 @@ pub struct AppSettings {
     /// scheduler reads it.
     #[serde(default = "default_update_check_frequency")]
     pub update_check_frequency: String,
+    /// Install updates without asking: wait until nothing is transferring and
+    /// the user is away, warn for a minute, then update and reopen the way the
+    /// session was left (`auto_update::silent`). Off by default, and only ever
+    /// on together with `auto_check_updates`, since it acts on what those checks
+    /// find.
+    #[serde(default)]
+    pub silent_update_enabled: bool,
 
     /// Master switch for desktop notifications. Off means Ember never asks the
     /// OS to show anything, whatever the per-event switches below say.
@@ -2331,6 +2338,7 @@ impl Default for AppSettings {
             launch_maximized: false,
             auto_check_updates: true,
             update_check_frequency: default_update_check_frequency(),
+            silent_update_enabled: false,
             notifications_enabled: true,
             notifications_only_when_unfocused: true,
             notify_download_complete: true,

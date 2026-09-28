@@ -44,7 +44,8 @@ export type NotifyCategory =
   | 'friend_message'
   | 'friend_request'
   | 'shares_browsed'
-  | 'channel_message';
+  | 'channel_message'
+  | 'silent_update';
 
 const CATEGORY_SETTING: Record<NotifyCategory, keyof AppSettings> = {
   download_complete: 'notify_download_complete',
@@ -57,6 +58,10 @@ const CATEGORY_SETTING: Record<NotifyCategory, keyof AppSettings> = {
   friend_request: 'notify_friend_request',
   shares_browsed: 'notify_shares_browsed',
   channel_message: 'notify_channel_message',
+  // The one-minute warning before a silent update has no switch of its own:
+  // the user turned silent updates on, and the warning is how they get to
+  // cancel one. Only the master switch silences it.
+  silent_update: 'notifications_enabled',
 };
 
 /** Identical notifications inside this window collapse into one. */

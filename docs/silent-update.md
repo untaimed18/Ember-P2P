@@ -176,25 +176,36 @@ hidden window in front of whatever they are doing.
     left it. Your downloads carry on where they stopped."
   - Buttons: **Update now** and **Not now** (postpone 24 h), plus a
     **Skip this version** link.
-- **Window hidden or minimized:** one OS notification through the existing
-  notification plugin: "Ember will update in 1 minute. Open Ember or use the tray
-  icon to cancel." Clicking it shows the window with the dialog. The
-  notification is its own "Updates" category under the master
-  `notifications_enabled` switch. The "only when unfocused" filter does not
-  apply to it.
+- **Window hidden, minimized or unfocused:** one OS notification through the
+  existing notification path (`src/lib/notifications.ts`, category
+  `silent_update`): "Ember will update in 1 minute. Open Ember or use its tray
+  icon to cancel." It follows only the master `notifications_enabled` switch.
+  The notification plugin reports no clicks on desktop, so opening Ember from
+  the tray or the taskbar is what brings up the dialog.
 - **Always:** the tray menu gains a **Cancel update (0:45)** item above
-  **Show** / **Quit**, and the tray tooltip reads "Ember — updating in 0:45". The
-  tray is the one surface that works in every case, including notifications
-  turned off.
+  **Show** / **Quit**, and the tray tooltip reads "Ember ⟳ 0:45" (a symbol and
+  the time, like the rest of the tooltip, which the backend composes without
+  knowing the user's language). The tray is the one surface that works in every
+  case, including notifications turned off.
 
-The countdown aborts by itself if any idle condition breaks, such as a transfer
-starting to move bytes or the user touching Ember. It returns to
-`WaitingForQuiet` without counting as a postpone. If the dialog was showing, it
-closes and a toast says "Update postponed — Ember is busy again."
+The countdown aborts by itself if a transfer starts moving bytes, or local work
+such as hashing starts. It returns to `WaitingForQuiet` without counting as a
+postpone, and a toast says "Update postponed: Ember is busy again." Input does
+*not* abort it: the dialog is how a user who is there answers it, and clicking
+it is input.
 
-**Not now** postpones for 24 hours. **Skip this version** stops silent installs
-of that version; the normal "update available" notice still shows it, and the
-next newer release is handled normally.
+**Not now** (or Escape) postpones for 24 hours. **Skip this version** stops
+silent installs of that version; the normal "update available" notice still
+shows it, and the next newer release is handled normally. While silent updates
+are going to install an update, the corner "update available" notice stays
+hidden; it comes back when the update is postponed or held, or after a week of
+waiting.
+
+The driver is `src-tauri/src/auto_update/silent.rs`; the dialog is
+`src/lib/components/SilentUpdateCountdown.svelte` and the store
+`src/lib/stores/silentUpdate.ts`. Input is reported from every Ember window by
+`src/lib/userActivity.ts` (at most every 30 seconds), and any window gaining
+focus counts as input too.
 
 ### Returning to the same state
 
