@@ -53,6 +53,7 @@
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import ChatWindowShell from '$lib/components/ChatWindowShell.svelte';
   import { initChatPopoutMain } from '$lib/chatPopout';
+  import { applyUpdateResume, initUpdateResume } from '$lib/updateResume';
   import { isChatWindow } from '$lib/windowRole';
 
   /** This document is the popped-out chat window, which draws the chat and
@@ -287,6 +288,7 @@
     let hideTimer: number | undefined;
     let handoffCheckTimer: number | undefined;
     let unlistenUpdateCheck: UnlistenFn | null = null;
+    let unlistenUpdateResume: UnlistenFn | null = null;
     let unlistenClose: UnlistenFn | null = null;
     let unlistenConfigCorrupt: UnlistenFn | null = null;
     let unlistenDbCorrupt: UnlistenFn | null = null;
@@ -445,6 +447,12 @@
       .then((fn) => { if (mounted) unlistenUpdateCheck = fn; else fn(); })
       .catch((e) => console.error('Failed to register updater-check-result listener:', e));
 
+    // An update restart asks for the page and search tabs just before it shuts
+    // Ember down, so the launch after it can put them back.
+    initUpdateResume()
+      .then((fn) => { if (mounted) unlistenUpdateResume = fn; else fn(); })
+      .catch((e) => console.error('Failed to register update-resume listener:', e));
+
     // Downloads re-queue on their own once the folder is fixed, so without this
     // the only sign of a folder Ember cannot write is rows that never start.
     listen('download-folder-unavailable', () => {
@@ -596,6 +604,10 @@
 
           releaseSplashWhenReady();
 
+          // Coming back from an update restart: the page and search tabs the
+          // session had. Nothing to do on an ordinary launch.
+          void applyUpdateResume();
+
           // Did the last install actually happen? A
           // hand-off to the installer ends this process, so if the installer
           // never ran there was nobody left to say so and the user just saw
@@ -638,6 +650,7 @@
       if (hideTimer !== undefined) window.clearTimeout(hideTimer);
       if (handoffCheckTimer !== undefined) window.clearTimeout(handoffCheckTimer);
       if (unlistenUpdateCheck) unlistenUpdateCheck();
+      if (unlistenUpdateResume) unlistenUpdateResume();
       if (stopPoll) stopPoll();
       if (stopTransferPoll) stopTransferPoll();
       cleanupTheme();

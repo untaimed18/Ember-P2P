@@ -1585,7 +1585,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // until server.met bootstrap finishes). Starting the TCP login before the
     // upload listener / command loop are up made splash IPC wait and raced
     // the server's HighID port-test against a not-yet-listening socket.
-    let mut pending_auto_connect_server = settings.auto_connect_server;
+    // A restart for an update goes back to the server the user was on, whether
+    // or not auto-connect is set: they were connected a minute ago.
+    let mut resume_server = crate::auto_update::resume::take_resume_server();
+    let mut pending_auto_connect_server = settings.auto_connect_server || resume_server.is_some();
     // After a successful login, OP_OFFERFILES is queued into pending_offer_files
     // (declared with other deferred startup state) and drained one chunk/turn.
 
@@ -2536,10 +2539,21 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             && state.server_connection.is_none()
         {
             pending_auto_connect_server = false;
-            match ed2k::server_list::ServerList::resolve_auto_connect_target(
-                &state.data_dir,
-                &state.server_list,
-            ) {
+            // Only a server still in the user's own list: the resume file is
+            // untrusted, and this is the one value in it that makes Ember dial.
+            let resumed = resume_server.take().filter(|(ip, port)| {
+                state
+                    .server_list
+                    .servers()
+                    .iter()
+                    .any(|s| &s.ip == ip && s.port == *port)
+            });
+            match resumed.or_else(|| {
+                ed2k::server_list::ServerList::resolve_auto_connect_target(
+                    &state.data_dir,
+                    &state.server_list,
+                )
+            }) {
                 Some((server_ip, server_port)) => {
                     initiate_server_connect(
                         &mut state,

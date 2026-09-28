@@ -129,6 +129,34 @@ const persistedSearch = parsePersistedSearch(readPersistedSearch());
 export const searchTabs = writable<SearchTab[]>(persistedSearch.tabs);
 export const activeSearchTabId = writable<string | null>(persistedSearch.activeId);
 
+/**
+ * The tabs to carry across an update restart, in the same shape a reload keeps.
+ *
+ * Needed because session storage does not survive the process ending, which is
+ * exactly what an update does. `null` when there is nothing worth carrying.
+ */
+export function searchResumeSnapshot(): string | null {
+  const tabs = get(searchTabs);
+  if (tabs.length === 0) return null;
+  try {
+    return JSON.stringify(buildPersistPayload(tabs, get(activeSearchTabId)));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Put back the tabs an update restart carried over, through the same validation
+ * a reload's restore uses. Tabs that already exist win: they are newer.
+ */
+export function restoreSearchFromResume(raw: string): void {
+  if (get(searchTabs).length > 0) return;
+  const restored = parsePersistedSearch(raw);
+  if (restored.tabs.length === 0) return;
+  searchTabs.set(restored.tabs);
+  activeSearchTabId.set(restored.activeId);
+}
+
 if (typeof window !== 'undefined') {
   // `pagehide` covers the reload and the window going away; the hidden branch
   // of `visibilitychange` is the backstop for paths that do not fire it.

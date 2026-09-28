@@ -225,11 +225,16 @@ deletes it, and applies it.
 On launch it is applied like this:
 
 - **Window.** `tauri.conf.json` gets `"visible": false` on the main window, so
-  every launch starts hidden and `setup` decides what to show. On a normal launch
-  it shows the window, as happens now. From a resume file it:
-  - restores the bounds, clamped to a monitor that still exists;
-  - maximizes the window if it was maximized;
-  - then shows it, minimizes it, or leaves it hidden in the tray.
+  every launch starts hidden and `setup` decides what to show
+  (`auto_update::resume::show_main_window`, called once the tray exists). On a
+  normal launch it shows the window, as happens now. From a resume file it:
+  - restores the bounds, unless the title bar would land on a monitor that is no
+    longer attached, in which case the window opens centred;
+  - maximizes the window if it was maximized — for a window going back to the
+    tray, the first time it is shown, since maximizing a hidden window shows it
+    on some platforms;
+  - then shows it, minimizes it, or leaves it hidden in the tray. Without a tray
+    icon it is always shown, since a hidden window could never be reached.
 
   This is also the point where `launch_maximized` is applied (`lib.rs`), so both
   go through one path. Without this, every silent update would pop Ember onto
@@ -238,23 +243,29 @@ On launch it is applied like this:
 - **Server.** If `ed2k.connected` was true, the network task starts with
   `pending_auto_connect_server` set and that server as its explicit target,
   whatever `auto_connect_server` says (`network/mod.rs`, the deferred
-  auto-connect block). If that server refuses, Ember reports it the way a
-  failed auto-connect is reported today and does not hop to another server; the
-  user chose that one. A connection that was still in progress at shutdown counts
-  as connected, because that was the user's intent. KAD, the Ember Network,
+  auto-connect block), provided that server is still in the user's own server
+  list. If that server refuses, Ember reports it the way a failed auto-connect
+  is reported today and does not hop to another server; the user chose that
+  one. A connection that was still in progress at shutdown, or waiting out an
+  auto-reconnect backoff, counts as connected, because that was the user's
+  intent (`NetworkCommand::GetEd2kServerIntent`). KAD, the Ember Network,
   friends and channels already reconnect by themselves.
 - **Page and search tabs.** The frontend fetches both through a new
   `take_update_resume_ui` command at boot. It navigates to the route if it is on
   an allowlist of top-level app routes, and hydrates the search store through the
   same validation `searchPersistence.ts` applies to `sessionStorage`. Searches
   that were still running come back with their results, not re-run.
-- **Chat window.** If it was popped out, it is reopened popped out at its old
-  bounds. Chat tabs already persist in `localStorage`.
+- **Chat window.** If it was popped out and the main window comes back visible,
+  it is reopened popped out at its old bounds. Chat tabs already persist in
+  `localStorage`.
 
-The search payload is collected at the start of `Installing`: the backend emits
-an event and waits up to 3 seconds for the frontend to answer with its current
-tabs. If a throttled webview does not answer, the tabs are skipped rather than
-holding up the update.
+The page and search tabs are collected just before the shutdown, for manual and
+silent installs alike (`install_locked` in `commands/updater.rs`): the backend
+emits `ember:resume-ui-request` and waits up to 3 seconds for the frontend to
+answer with its current page and tabs (`src/lib/updateResume.ts`). If a
+throttled webview does not answer, they are skipped rather than holding up the
+update. Because the file is written for manual installs too, pressing
+**Install** also comes back the way the user left Ember.
 
 **Upload waiting queue.** This lives only in memory today (`UploadQueueRef` in
 `network/ed2k/upload.rs`), so every restart drops everyone waiting on this user.

@@ -1586,6 +1586,7 @@ async fn install_locked(
     app: &AppHandle,
     pending: &mut Option<PendingUpdate>,
     public_key: &str,
+    reason: crate::auto_update::resume::ResumeReason,
 ) -> Result<(), String> {
     let Some(update) = pending.as_mut() else {
         return Err(coded(
@@ -1634,6 +1635,9 @@ async fn install_locked(
             tracing::warn!("Could not record the update hand-off: {error:#}");
         }
     }
+    // While the window, the server connection and the frontend are all still
+    // live: after the shutdown below there is nothing left to ask.
+    crate::auto_update::resume::write_before_install(app, reason, &update.info.version).await;
 
     // `Update::install` never comes back on Windows: it hands the bundle to the
     // NSIS/MSI installer and then calls `std::process::exit(0)`. The plugin's
@@ -1847,7 +1851,13 @@ pub async fn secure_updater_install(
     prepare_locked(&app, update, &config.public_key, &report)
         .await
         .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
-    install_locked(&app, &mut pending, &config.public_key).await
+    install_locked(
+        &app,
+        &mut pending,
+        &config.public_key,
+        crate::auto_update::resume::ResumeReason::Manual,
+    )
+    .await
 }
 
 /// Whether the last hand-off to an installer failed to produce the new version.

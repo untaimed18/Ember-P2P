@@ -343,6 +343,12 @@ pub enum NetworkCommand {
     GetConnectedServerSnapshot {
         tx: oneshot::Sender<Option<ServerInfo>>,
     },
+    /// The eD2K server the user means to be on: connected, connecting, or
+    /// waiting out an auto-reconnect backoff. `None` once they disconnected or
+    /// were never connected. What an update restart reconnects to.
+    GetEd2kServerIntent {
+        tx: oneshot::Sender<Option<(String, u16)>>,
+    },
     UpdateSettings {
         settings: AppSettings,
     },

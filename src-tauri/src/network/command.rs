@@ -5182,6 +5182,17 @@ async fn handle_command_inner(
             let _ = tx.send(connected_server_info(state));
         }
 
+        NetworkCommand::GetEd2kServerIntent { tx } => {
+            let wanted = state.server_connected
+                || state.pending_server_connect.is_some()
+                || state.server_auto_reconnect;
+            let _ = tx.send(
+                wanted
+                    .then(|| state.preferred_ed2k_server.clone())
+                    .flatten(),
+            );
+        }
+
         NetworkCommand::SetUploadPriorities {
             file_hashes,
             priority,

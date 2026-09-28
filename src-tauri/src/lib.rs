@@ -521,6 +521,7 @@ pub fn run() {
     );
     builder
         .manage(commands::updater::UpdaterService::default())
+        .manage(auto_update::resume::ResumeService::default())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -625,6 +626,9 @@ pub fn run() {
             })?;
             let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
             std::fs::create_dir_all(&data_dir)?;
+            // Before the network task starts and before the window is shown:
+            // both come back the way an update restart left them.
+            let resume_window = auto_update::resume::begin_launch(&app_handle, &data_dir);
             // An eMule import staged last session. Here because it rewrites
             // what the identity, the approved roots, the credit store and the
             // network all read below, and none of them can take a change once
@@ -740,19 +744,6 @@ pub fn run() {
                     policy_scope,
                 )
             });
-
-            // Honour the "launch maximized" preference. The window is
-            // created at its configured size (per `tauri.conf.json`); we
-            // maximize it here, once at startup, when the user has opted in.
-            // It's intentionally a launch-time preference — toggling it in
-            // Settings only changes how the *next* launch opens.
-            if settings.launch_maximized {
-                if let Some(window) = app.get_webview_window("main") {
-                    if let Err(e) = window.maximize() {
-                        tracing::warn!("Failed to apply launch-maximized preference: {e}");
-                    }
-                }
-            }
 
             let spam_data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
             let spam_filter = Arc::new(RwLock::new(
@@ -1089,6 +1080,7 @@ pub fn run() {
                     }
                 })
                 .build(app);
+            let tray_available = tray_result.is_ok();
             if let Err(e) = tray_result {
                 // No session bus / AppIndicator host (WSL, some live sessions,
                 // GNOME without the extension). Failing `setup` here would
@@ -1104,6 +1096,19 @@ pub fn run() {
                     return Err(e.into());
                 }
             }
+
+            // The window is created hidden (`tauri.conf.json`) and shown here,
+            // once the tray exists, so a session an update restart left in the
+            // tray comes back there instead of flashing onto the desktop. The
+            // "launch maximized" preference is applied here too: it is a
+            // launch-time preference, so toggling it in Settings only changes
+            // how the *next* launch opens.
+            auto_update::resume::show_main_window(
+                &app_handle,
+                resume_window.as_ref(),
+                tray_available,
+                settings.launch_maximized,
+            );
 
             let index_clone = local_index.clone();
             let shared_folders = settings.shared_folders.clone();
@@ -2269,6 +2274,8 @@ pub fn run() {
             commands::updater::secure_updater_install,
             commands::updater::secure_updater_handoff_status,
             commands::updater::secure_updater_run_saved_installer,
+            auto_update::resume::submit_resume_ui_snapshot,
+            auto_update::resume::take_update_resume_ui,
                     ]
                 };
             }
@@ -2326,6 +2333,11 @@ pub fn run() {
                 return;
             }
             if window.label() != "main" {
+                return;
+            }
+
+            if let tauri::WindowEvent::Focused(true) = event {
+                auto_update::resume::on_main_window_focused(window);
                 return;
             }
 

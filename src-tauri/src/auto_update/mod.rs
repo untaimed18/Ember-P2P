@@ -6,4 +6,5 @@
 //! installed. See `docs/silent-update.md` for the design.
 
 pub mod record;
+pub mod resume;
 pub mod scheduler;
