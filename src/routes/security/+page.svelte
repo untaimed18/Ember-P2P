@@ -557,17 +557,17 @@
 
 <div class="security-content">
   {#if $networkStats.secident_status === 'broken'}
-    <div class="banner error-banner" role="alert">
+    <div class="error-banner" role="alert">
       <span>{m.secident_key_unreadable()}</span>
     </div>
   {/if}
   {#if error}
-    <div class="banner error-banner" role="alert">
+    <div class="error-banner" role="alert">
       <span>{error}</span>
       <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
     </div>
   {:else if successMsg}
-    <div class="banner success-banner" role="status">
+    <div class="success-banner" role="status">
       <span>{successMsg}</span>
     </div>
   {/if}
@@ -610,7 +610,7 @@
     </div>
 
     {#if stats.enabled && !stats.ranges_ready}
-      <div class="banner error-banner" role="alert">
+      <div class="error-banner" role="alert">
         <span>{m.security_filter_fail_closed_banner()}</span>
       </div>
     {/if}
@@ -836,13 +836,6 @@
   }
 
   /* --- Banners --- */
-  .banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 8px 16px;
-    font-size: var(--font-size-sm);
-  }
   /* --- Controls bar (combines toggles + inline stats) --- */
   .controls-bar {
     display: flex;

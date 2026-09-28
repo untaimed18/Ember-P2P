@@ -1001,7 +1001,7 @@
               </div>
               {#if bulkDownloading}
                 <div class="browse-selection" role="status">
-                  <span class="dl-spinner" aria-hidden="true"></span>
+                  <span class="spinner xs" aria-hidden="true"></span>
                   <span class="browse-selection-summary">
                     {m.browse_bulk_progress({ done: formatNumber(bulkDone), total: formatNumber(bulkTotal) })}
                   </span>
@@ -1207,7 +1207,7 @@
                             aria-label={downloadingHashes.has(file.hash) ? m.browse_downloading() : m.browse_download_file({ name: file.name })}
                           >
                             {#if downloadingHashes.has(file.hash)}
-                              <span class="dl-spinner" aria-hidden="true"></span>
+                              <span class="spinner xs" aria-hidden="true"></span>
                               <span>{m.browse_downloading()}</span>
                             {:else}
                               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1831,16 +1831,6 @@
   .dl-btn svg {
     width: 14px;
     height: 14px;
-    flex-shrink: 0;
-  }
-
-  .dl-spinner {
-    width: 12px;
-    height: 12px;
-    border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: browse-spin 0.7s linear infinite;
     flex-shrink: 0;
   }
 

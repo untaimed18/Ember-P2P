@@ -2242,7 +2242,7 @@
     </button>
     <button class="save-btn" onclick={handleSave} disabled={saving || !settings || !hasUnsavedChanges || scheduleHasError}>
       {#if saving}
-        <span class="spinner"></span> {m.settings_saving()}
+        <span class="spinner sm current"></span> {m.settings_saving()}
       {:else}
         {m.settings_save_changes()}
       {/if}
@@ -4495,7 +4495,7 @@
 {#if restarting}
   <div class="restart-overlay" role="status" aria-label={m.settings_restarting_aria()}>
     <div class="restart-card">
-      <div class="restart-spinner"></div>
+      <div class="spinner lg"></div>
       <h2 class="restart-title">{m.settings_restarting_title()}</h2>
       <p class="restart-sub">{m.settings_restarting_sub()}</p>
     </div>
@@ -4539,20 +4539,6 @@
   @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.5; }
-  }
-
-  .spinner {
-    display: inline-block;
-    width: 14px;
-    height: 14px;
-    border: 2px solid color-mix(in srgb, currentColor 30%, transparent);
-    border-top-color: currentColor;
-    border-radius: 50%;
-    animation: spin 0.6s linear infinite;
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
   }
 
   .save-status {
@@ -6285,15 +6271,6 @@
     flex-direction: column;
     align-items: center;
     gap: 16px;
-  }
-
-  .restart-spinner {
-    width: 40px;
-    height: 40px;
-    border: 4px solid color-mix(in srgb, var(--border-light) 45%, transparent);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: spin 0.7s linear infinite;
   }
 
   .restart-title {

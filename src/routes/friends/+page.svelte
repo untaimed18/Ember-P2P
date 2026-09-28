@@ -1604,14 +1604,16 @@
     display: none;
   }
 
+  /* Inset card banner; keep in step with Channels' and Ember's. */
   .banner {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 8px 16px;
+    gap: 12px;
+    padding: 10px 14px;
     border-radius: var(--radius-md);
     margin-bottom: 0;
-    font-size: var(--font-size-sm);
+    font-size: var(--font-size-md);
   }
 
   .error-banner {

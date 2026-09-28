@@ -3482,7 +3482,7 @@
             {/if}
           </span>
           {#if tab.isSearching}
-            <span class="search-tab-spinner" aria-hidden="true"></span>
+            <span class="spinner xs" aria-hidden="true"></span>
           {/if}
         </button>
         <div class="search-tab-actions">
@@ -4142,7 +4142,7 @@
                   aria-label={m.search_action_download_aria({ name: displayName(result) })}
                 >
                   {#if downloadPending[rKey]}
-                    <span class="row-dl-spinner" aria-hidden="true"></span>
+                    <span class="spinner xs" aria-hidden="true"></span>
                   {:else}
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <line x1="8" y1="2.5" x2="8" y2="11"/>
@@ -4629,22 +4629,6 @@
     color: var(--text-accent);
     border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
     background: var(--accent-fill);
-  }
-
-  .search-tab-spinner {
-    width: 11px;
-    height: 11px;
-    border: 2px solid var(--border);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    flex-shrink: 0;
-    animation: search-tab-spin 0.7s linear infinite;
-  }
-
-  @keyframes search-tab-spin {
-    to {
-      transform: rotate(360deg);
-    }
   }
 
   .search-tab-actions {
@@ -5293,18 +5277,6 @@
     cursor: default;
     opacity: 0.6;
   }
-  .row-dl-spinner {
-    width: 12px;
-    height: 12px;
-    border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: row-dl-spin 0.7s linear infinite;
-  }
-  @keyframes row-dl-spin { to { transform: rotate(360deg); } }
-  @media (prefers-reduced-motion: reduce) {
-    .row-dl-spinner { animation: none; }
-  }
 
   .history-badge {
     display: inline-block;
@@ -5477,14 +5449,6 @@
 
   .search-readiness-muted {
     color: var(--text-secondary);
-  }
-
-  .search-error-banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 10px 20px;
-    font-size: var(--font-size-md);
   }
 
   /* --- File details modal --- */

@@ -821,8 +821,19 @@ tr:hover td {
 
 /*
  * Strip banners under page headers. Tinted fill + soft edge, matching
- * the badge/toast recipe, so errors don't read as a hard red rule.
+ * the badge/toast recipe, so errors don't read as a hard red rule. The layout
+ * is shared too: a page that restates the padding is how Transfers, Search
+ * and Library came to disagree about it.
  */
+:is(.error-banner, .search-error-banner, .success-banner, .info-banner, .warning-banner) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
+  padding: 8px 20px;
+  font-size: var(--font-size-md);
+}
 .error-banner,
 .search-error-banner {
   background: color-mix(in srgb, var(--danger) 9%, var(--bg-secondary));
@@ -982,6 +993,14 @@ h4 { font-size: var(--font-size-base); font-weight: 600; color: var(--text-prima
 }
 .spinner.lg { width: 32px; height: 32px; border-width: 3px; }
 .spinner.sm { width: 14px; height: 14px; border-width: 2px; }
+/* Inline with a line of small text, a table cell or a badge. */
+.spinner.xs { width: 11px; height: 11px; border-width: 2px; vertical-align: -1px; flex-shrink: 0; }
+/* Inside a button or a tinted badge: takes the text colour, which the accent
+   would vanish into on a primary button. */
+.spinner.current {
+  border-color: color-mix(in srgb, currentColor 30%, transparent);
+  border-top-color: currentColor;
+}
 
 /* Skeleton shimmer utility */
 @keyframes shimmer {

@@ -885,7 +885,7 @@
       aria-busy={connectPending}
     >
       {#if connectPending}
-        <span class="spinner-inline" aria-hidden="true"></span>
+        <span class="spinner xs current" aria-hidden="true"></span>
       {/if}
       {getConnectButtonLabel()}
     </button>
@@ -972,7 +972,7 @@
               aria-busy={connectPending}
             >
               {#if connectPending}
-                <span class="spinner-inline" aria-hidden="true"></span>
+                <span class="spinner xs current" aria-hidden="true"></span>
               {/if}
               {getConnectButtonLabel()}
             </button>
@@ -1136,7 +1136,7 @@
             title={rechecking ? m.kad_firewall_in_progress() : m.kad_firewall_recheck_title()}
           >
             {#if rechecking}
-              <span class="spinner-inline" aria-hidden="true"></span> {m.kad_rechecking()}
+              <span class="spinner xs current" aria-hidden="true"></span> {m.kad_rechecking()}
             {:else}
               {m.kad_recheck_firewall()}
             {/if}
@@ -1295,7 +1295,7 @@
               || (bootstrapMode === 'clients' && contacts.length === 0)}
           >
             {#if bootstrapPending}
-              <span class="spinner-inline" aria-hidden="true"></span> {m.kad_working()}
+              <span class="spinner xs current" aria-hidden="true"></span> {m.kad_working()}
             {:else}
               {m.kad_bootstrap_action()}
             {/if}
@@ -1328,7 +1328,7 @@
             aria-busy={connectPending}
           >
             {#if connectPending}
-              <span class="spinner-inline" aria-hidden="true"></span>
+              <span class="spinner xs current" aria-hidden="true"></span>
             {/if}
             {getConnectButtonLabel()}
           </button>
@@ -1468,14 +1468,6 @@
   }
 
   .error-banner,
-  .warning-banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 8px 20px;
-    font-size: var(--font-size-md);
-  }
 
   .kad-layout {
     flex: 1;
@@ -1573,19 +1565,6 @@
     justify-content: center;
     margin-top: 10px;
   }
-
-  .spinner-inline {
-    display: inline-block;
-    width: 10px;
-    height: 10px;
-    border: 2px solid var(--text-muted);
-    border-top-color: transparent;
-    border-radius: 50%;
-    animation: spinner-rotate 0.9s linear infinite;
-    vertical-align: -1px;
-    margin-right: 4px;
-  }
-  @keyframes spinner-rotate { to { transform: rotate(360deg); } }
 
   /* --- Modal --- */
   .modal-overlay {

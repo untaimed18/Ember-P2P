@@ -3836,10 +3836,11 @@
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    padding: 10px 12px;
+    padding: 10px 14px;
     border-radius: var(--radius-md);
     background: var(--bg-surface);
     border: 1px solid var(--border);
+    font-size: var(--font-size-md);
   }
 
   .error-banner {

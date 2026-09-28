@@ -3100,7 +3100,7 @@
     <span class="header-divider" aria-hidden="true"></span>
     <button class="ghost" onclick={handleOpenCollection} disabled={collectionLoading}>
       {#if collectionLoading}
-        <span class="spinner-inline" aria-hidden="true"></span> {m.library_opening()}
+        <span class="spinner xs current" aria-hidden="true"></span> {m.library_opening()}
       {:else}
         {m.library_open_collection()}
       {/if}
@@ -3171,7 +3171,7 @@
       }
     >
       {#if missingScanInFlight}
-        <span class="scan-spinner" aria-hidden="true"></span>
+        <span class="spinner xs" aria-hidden="true"></span>
         {m.library_missing()}
       {:else}
         {m.library_missing()}{missingTotalCount > 0 ? ` (${formatNumber(missingTotalCount)})` : ''}
@@ -3271,7 +3271,7 @@
     {#if collectionsOpen}
       <div class="collection-files">
         {#if collectionLoading}
-          <div class="coll-loading"><span class="scan-spinner"></span> {m.library_loading_collection()}</div>
+          <div class="coll-loading"><span class="spinner xs"></span> {m.library_loading_collection()}</div>
         {:else if loadedCollection}
           {#if loadedCollection.files.length > displayedLoadedCollectionFiles.length}
             <div class="coll-pick-note">
@@ -3733,7 +3733,7 @@
   <div class="file-list-area">
     {#if stoppingHashing || scanning || hashProgress}
       <div class="scan-banner">
-        <span class="scan-spinner"></span>
+        <span class="spinner xs"></span>
         <span class="scan-text">
           {#if stoppingHashing}
             {m.library_stopping_hashing()}
@@ -4517,14 +4517,6 @@
     background: var(--border);
   }
 
-  .error-banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 8px 20px;
-    font-size: var(--font-size-md);
-  }
-
   .scan-banner {
     display: flex;
     align-items: center;
@@ -4593,19 +4585,6 @@
   .stop-btn:hover { opacity: 0.85; }
   .resume-btn { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
   .resume-btn:hover { opacity: 0.85; }
-
-  .scan-spinner {
-    width: 12px;
-    height: 12px;
-    border: 2px solid var(--border);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
 
   .shared-layout {
     display: flex;
@@ -5543,20 +5522,6 @@
   .bulk-prio-btn:hover:not(:disabled) {
     background: var(--accent);
     color: var(--on-accent);
-  }
-  .spinner-inline {
-    display: inline-block;
-    width: 10px;
-    height: 10px;
-    border: 2px solid var(--text-muted);
-    border-top-color: transparent;
-    border-radius: 50%;
-    animation: spinner-rotate 0.9s linear infinite;
-    vertical-align: -1px;
-    margin-right: 4px;
-  }
-  @keyframes spinner-rotate {
-    to { transform: rotate(360deg); }
   }
 
   .tb-btn.tb-danger {

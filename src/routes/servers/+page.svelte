@@ -920,12 +920,12 @@
 
 <div class="page-content servers-page">
   {#if error}
-    <div class="banner error-banner" role="alert">
+    <div class="error-banner" role="alert">
       <span>{error}</span>
       <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
     </div>
   {:else if successMsg}
-    <div class="banner success-banner" role="status">
+    <div class="success-banner" role="status">
       <span>{successMsg}</span>
     </div>
   {/if}
@@ -1227,7 +1227,7 @@
           {:else if connecting}
             <div class="info-row">
               <span class="info-label">{m.servers_info_status()}</span>
-              <span class="badge connecting"><span class="connect-spinner"></span> {m.servers_status_connecting()}</span>
+              <span class="badge connecting"><span class="spinner xs current"></span> {m.servers_status_connecting()}</span>
             </div>
             <div class="info-row muted">
               <span>{m.servers_establishing()}</span>
@@ -1340,14 +1340,6 @@
     display: flex;
     gap: 8px;
     align-items: center;
-  }
-
-  .banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 8px 20px;
-    font-size: var(--font-size-md);
   }
 
   .server-layout {
@@ -1781,21 +1773,6 @@
   }
 
   /* Context menu styling is shared app-wide — see `.ctx-menu` in app.css. */
-
-  .connect-spinner {
-    display: inline-block;
-    width: 10px;
-    height: 10px;
-    border: 2px solid var(--border);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    vertical-align: middle;
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
 
   /* Colors come from the shared `.badge` recipes in app.css, so a connection
      state reads the same here as on the KAD page. */

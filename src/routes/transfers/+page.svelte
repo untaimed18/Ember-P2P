@@ -7605,23 +7605,6 @@
   }
 
   /* --- Error banner --- */
-  .error-banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 6px 16px;
-    font-size: var(--font-size-sm);
-    flex-shrink: 0;
-  }
-
-  .info-banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 6px 16px;
-    font-size: var(--font-size-sm);
-    flex-shrink: 0;
-  }
 
   /* Context menu styling is shared app-wide — see `.ctx-menu` in app.css. */
 

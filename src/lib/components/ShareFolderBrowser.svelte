@@ -812,7 +812,7 @@
             {/if}
             {#if counting}
               <span class="summary-counting">
-                <span class="summary-spinner" aria-hidden="true"></span>
+                <span class="spinner xs current" aria-hidden="true"></span>
                 {m.library_explorer_summary_counting()}
               </span>
             {:else if shareSummary.folders > 0}
@@ -1156,17 +1156,6 @@
     font-size: var(--font-size-sm);
     font-weight: 400;
     color: var(--text-muted);
-  }
-  .summary-spinner {
-    width: 10px;
-    height: 10px;
-    border: 1.5px solid currentColor;
-    border-right-color: transparent;
-    border-radius: 50%;
-    animation: summary-spin 0.8s linear infinite;
-  }
-  @keyframes summary-spin {
-    to { transform: rotate(360deg); }
   }
   .summary-hint {
     margin-left: 4px;

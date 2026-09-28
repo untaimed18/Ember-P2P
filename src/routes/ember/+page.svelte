@@ -479,7 +479,7 @@
       <div class="hero-text">
         <div class="status-label">
           {statusLabel}
-          {#if joining}<span class="spinner" aria-hidden="true"></span>{/if}
+          {#if joining}<span class="spinner sm" aria-hidden="true"></span>{/if}
         </div>
         {#if statusHint}<p class="hint">{statusHint}</p>{/if}
       </div>
@@ -1368,22 +1368,7 @@
     cursor: default;
   }
 
-  .spinner {
-    width: 13px;
-    height: 13px;
-    border-radius: 50%;
-    border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
-    border-top-color: var(--accent);
-    animation: spin 0.8s linear infinite;
-    flex-shrink: 0;
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
-
   @media (prefers-reduced-motion: reduce) {
-    .spinner { animation: none; }
     .chevron,
     .hero,
     .hero-glow,

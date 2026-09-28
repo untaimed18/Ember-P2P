@@ -784,7 +784,7 @@
               <p class="dl-heading">{m.wizard_setup_progress_heading()}</p>
               <div class="dl-item">
                 {#if dlNodesStatus === 'pending'}
-                  <span class="spinner xs" aria-hidden="true"></span>
+                  <span class="spinner sm" aria-hidden="true"></span>
                 {:else if dlNodesStatus === 'ok'}
                   <svg class="dl-icon ok" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6.5 12.5l-4-4 1.4-1.4 2.6 2.6 5.6-5.6 1.4 1.4z"/></svg>
                 {:else if dlNodesStatus === 'error' || dlNodesStatus === 'failed' || dlNodesStatus === 'deferred'}
@@ -803,7 +803,7 @@
               </div>
               <div class="dl-item">
                 {#if dlIpStatus === 'pending'}
-                  <span class="spinner xs" aria-hidden="true"></span>
+                  <span class="spinner sm" aria-hidden="true"></span>
                 {:else if dlIpStatus === 'ok'}
                   <svg class="dl-icon ok" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6.5 12.5l-4-4 1.4-1.4 2.6 2.6 5.6-5.6 1.4 1.4z"/></svg>
                 {:else if dlIpStatus === 'error' || dlIpStatus === 'failed' || dlIpStatus === 'deferred'}
@@ -823,7 +823,7 @@
               {#if emuleSelection}
                 <div class="dl-item">
                   {#if importStatus === 'pending'}
-                    <span class="spinner xs" aria-hidden="true"></span>
+                    <span class="spinner sm" aria-hidden="true"></span>
                   {:else if importStatus === 'ok'}
                     <svg class="dl-icon ok" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6.5 12.5l-4-4 1.4-1.4 2.6 2.6 5.6-5.6 1.4 1.4z"/></svg>
                   {:else}
@@ -1604,13 +1604,6 @@
   .dl-warn {
     font-size: var(--font-size-sm);
     color: var(--text-muted);
-  }
-
-  .spinner.xs {
-    width: 14px;
-    height: 14px;
-    border-width: 2px;
-    flex-shrink: 0;
   }
 
   /* Animations */
