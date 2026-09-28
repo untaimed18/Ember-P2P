@@ -636,7 +636,7 @@
     >
       <div class="modal-header">
         <span id="share-explorer-title" class="modal-title">{m.library_add_folder_title()}</span>
-        <button type="button" class="modal-close" onclick={closeDialog} aria-label={m.common_close()} disabled={sharing}>
+        <button type="button" class="icon-close" onclick={closeDialog} aria-label={m.common_close()} disabled={sharing}>
           <IconX size={15} />
         </button>
       </div>
@@ -872,28 +872,10 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 12px 16px;
+    padding: 14px 20px;
     border-bottom: 1px solid var(--border);
   }
-  .modal-title { font-weight: 600; font-size: var(--font-size-base); }
-  .modal-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    cursor: pointer;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: var(--text-secondary);
-  }
-  .modal-close:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-  }
+  .modal-title { font-weight: 600; font-size: var(--font-size-lg); }
   .toolbar {
     display: flex;
     align-items: center;

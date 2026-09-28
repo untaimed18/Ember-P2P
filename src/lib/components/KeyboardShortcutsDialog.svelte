@@ -33,7 +33,7 @@
       const active = typeof document !== 'undefined' ? document.activeElement : null;
       if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
       requestAnimationFrame(() => {
-        (panelEl?.querySelector<HTMLButtonElement>('.shortcut-close') ?? panelEl)?.focus();
+        (panelEl?.querySelector<HTMLButtonElement>('.icon-close') ?? panelEl)?.focus();
       });
     }
     return () => {
@@ -201,7 +201,7 @@
     >
       <div class="shortcut-header">
         <h3 id="kbd-shortcut-title">{m.shortcuts_dialog_title()}</h3>
-        <button type="button" class="shortcut-close" title={m.common_close()} aria-label={m.common_close()} onclick={() => (open = false)}><IconX size={16} /></button>
+        <button type="button" class="icon-close" title={m.common_close()} aria-label={m.common_close()} onclick={() => (open = false)}><IconX size={16} /></button>
       </div>
       <div class="shortcut-body">
         {#each groups as group, gi (gi)}
@@ -239,10 +239,6 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    backdrop-filter: blur(2px);
-  }
-  :global([data-theme="dark"]) .shortcut-overlay {
-    backdrop-filter: blur(6px) saturate(1.15);
   }
 
   .shortcut-panel {
@@ -269,28 +265,6 @@
     margin: 0;
     font-size: var(--font-size-lg);
     font-weight: 600;
-  }
-
-  .shortcut-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    background: none;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    color: var(--text-secondary);
-    cursor: pointer;
-    line-height: 1;
-    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
-  }
-
-  .shortcut-close:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
   }
 
   .shortcut-body {

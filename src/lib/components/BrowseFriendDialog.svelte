@@ -895,7 +895,7 @@
               <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><polyline points="13.5 2.5 13.5 5.5 10.5 5.5"/>
             </svg>
           </button>
-          <button type="button" class="browse-close" onclick={onclose} title={m.common_close()} aria-label={m.common_close()}>
+          <button type="button" class="icon-close" onclick={onclose} title={m.common_close()} aria-label={m.common_close()}>
             <IconX size={16} />
           </button>
         </div>
@@ -1239,11 +1239,6 @@
     animation: browse-fade-in 0.15s ease;
   }
 
-  :global([data-theme='dark']) .browse-overlay {
-    backdrop-filter: blur(6px) saturate(1.15);
-    -webkit-backdrop-filter: blur(6px) saturate(1.15);
-  }
-
   .browse-modal {
     position: fixed;
     top: 50%;
@@ -1252,7 +1247,7 @@
     width: 820px;
     max-width: 94vw;
     max-height: 80vh;
-    background: var(--bg-primary);
+    background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     z-index: 10001;
@@ -1302,29 +1297,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  .browse-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    flex-shrink: 0;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    line-height: 1;
-    font-weight: 500;
-  }
-
-  .browse-close:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
   }
 
   .browse-header-actions {
@@ -1709,7 +1681,7 @@
     padding: 8px 10px;
     border-bottom: 1px solid var(--border);
     font-weight: 600;
-    background: var(--bg-primary);
+    background: var(--bg-secondary);
   }
 
   .browse-table td {

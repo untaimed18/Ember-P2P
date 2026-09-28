@@ -6339,7 +6339,7 @@
         <span id="dl-file-details-title" class="modal-title">{m.transfers_file_details_title()}</span>
         <button
           type="button"
-          class="modal-close"
+          class="icon-close"
           bind:this={fileDetailsCloseBtn}
           title={m.common_close()}
           aria-label={m.common_close()}
@@ -6492,7 +6492,7 @@
         <span id="dl-rename-title" class="modal-title">{m.transfers_rename_title()}</span>
         <button
           type="button"
-          class="modal-close"
+          class="icon-close"
           title={m.common_close()}
           aria-label={m.common_close()}
           disabled={renameDialog.busy}
@@ -6570,30 +6570,7 @@
 
   .modal-title {
     font-weight: 600;
-    font-size: var(--font-size-base);
-  }
-
-  .modal-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    flex-shrink: 0;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    line-height: 1;
-    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
-  }
-
-  .modal-close:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    font-size: var(--font-size-lg);
   }
 
   .modal-body {

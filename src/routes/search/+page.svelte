@@ -4315,7 +4315,7 @@
         >
         <div class="modal-header">
           <span id="file-details-title" class="modal-title">{m.search_file_details()}</span>
-          <button type="button" class="modal-close" bind:this={detailsCloseBtn} title={m.search_close_details_aria()} aria-label={m.search_close_details_aria()} onclick={closeFileDetails}>
+          <button type="button" class="icon-close" bind:this={detailsCloseBtn} title={m.search_close_details_aria()} aria-label={m.search_close_details_aria()} onclick={closeFileDetails}>
             <IconX size={15} />
           </button>
         </div>
@@ -5527,30 +5527,7 @@
 
   .modal-title {
     font-weight: 600;
-    font-size: var(--font-size-base);
-  }
-
-  .modal-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    flex-shrink: 0;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    line-height: 1;
-    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
-  }
-
-  .modal-close:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    font-size: var(--font-size-lg);
   }
 
   .modal-body {

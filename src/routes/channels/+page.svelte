@@ -3466,7 +3466,7 @@
           <span id="room-settings-title" class="modal-title">{m.channels_room_settings()}</span>
           <span class="room-settings-room" title={selected.name}><bdi dir="auto">{selected.name}</bdi></span>
         </div>
-        <button type="button" class="modal-close" onclick={closeRoomSettings} title={m.common_close()} aria-label={m.common_close()}>
+        <button type="button" class="icon-close" onclick={closeRoomSettings} title={m.common_close()} aria-label={m.common_close()}>
           <IconX size={15} />
         </button>
       </div>
@@ -4704,7 +4704,7 @@
 
   .modal-title {
     font-weight: 600;
-    font-size: var(--font-size-base);
+    font-size: var(--font-size-lg);
   }
 
   .room-settings-room {
@@ -4713,27 +4713,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  .modal-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    cursor: pointer;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: var(--text-secondary);
-  }
-
-  .modal-close:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
   }
 
   .room-settings-body {

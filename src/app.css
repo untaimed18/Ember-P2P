@@ -1263,6 +1263,39 @@ button.ctx-backdrop:active {
   -webkit-backdrop-filter: blur(10px) saturate(1.1);
 }
 
+/*
+ * Header close for dialogs, drawers and detail panels: a quiet 28px square
+ * that turns danger-tinted on hover. The icon inside is the caller's. Element-
+ * qualified so it outranks the generic and dark-theme `button` rules.
+ */
+button.icon-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-secondary);
+  font-weight: 500;
+  line-height: 1;
+  transition:
+    background var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
+}
+button.icon-close:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+button.icon-close:active:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 20%, transparent);
+}
+
 /* Confirm dialog overlay */
 .confirm-overlay {
   position: fixed;
@@ -1294,14 +1327,20 @@ button.ctx-backdrop:active {
  */
 [data-theme="dark"] :is(.confirm-overlay, .about-overlay, .share-overlay, .dnd-overlay) {
   background: var(--overlay-bg);
-  backdrop-filter: blur(6px) saturate(1.15);
-  -webkit-backdrop-filter: blur(6px) saturate(1.15);
 }
-[data-theme="dark"] .policy-reset-backdrop {
-  backdrop-filter: blur(6px) saturate(1.15);
-  -webkit-backdrop-filter: blur(6px) saturate(1.15);
-}
-[data-theme="dark"] :is(.modal-overlay) {
+/* Every modal backdrop in the app, so a new dialog frosts by joining this
+   list rather than restating the filter. Light mode stays unblurred. */
+[data-theme="dark"] :is(
+  .confirm-overlay,
+  .about-overlay,
+  .share-overlay,
+  .dnd-overlay,
+  .modal-overlay,
+  .close-overlay,
+  .shortcut-overlay,
+  .browse-overlay,
+  .policy-reset-backdrop
+) {
   backdrop-filter: blur(6px) saturate(1.15);
   -webkit-backdrop-filter: blur(6px) saturate(1.15);
 }

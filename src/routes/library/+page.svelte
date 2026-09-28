@@ -3333,7 +3333,7 @@
     <div class="modal-content create-coll-modal" bind:this={createCollectionModal}>
       <div class="modal-header">
         <span id="create-coll-title" class="modal-title">{m.library_create_collection()}</span>
-        <button type="button" class="modal-close" onclick={closeCreateDialog} disabled={creatingCollection} aria-label={m.common_close()}><IconX size={15} /></button>
+        <button type="button" class="icon-close" onclick={closeCreateDialog} disabled={creatingCollection} aria-label={m.common_close()}><IconX size={15} /></button>
       </div>
       <div class="modal-body">
         <div class="form-row">
@@ -3938,7 +3938,7 @@
             {/if}
           </span>
         </div>
-        <button type="button" class="drawer-close" onclick={() => requestSelectPath(null)} title={m.library_close_details()} aria-label={m.library_close_details()}>
+        <button type="button" class="icon-close drawer-close" onclick={() => requestSelectPath(null)} title={m.library_close_details()} aria-label={m.library_close_details()}>
           <IconX size={15} />
         </button>
       </div>
@@ -5154,29 +5154,7 @@
     color: var(--warning);
   }
   .drawer-close {
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    cursor: pointer;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: var(--text-secondary);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
     margin-top: 1px;
-    line-height: 1;
-    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
-  }
-  .drawer-close:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-  }
-  .drawer-close:active {
-    background: color-mix(in srgb, var(--danger) 20%, transparent);
   }
   .drawer-body {
     flex: 1;
@@ -6092,26 +6070,7 @@
     padding: 12px 16px;
     border-bottom: 1px solid var(--border);
   }
-  .modal-title { font-weight: 600; font-size: var(--font-size-base); }
-  .modal-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    cursor: pointer;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: var(--text-secondary);
-    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
-  }
-  .modal-close:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-  }
+  .modal-title { font-weight: 600; font-size: var(--font-size-lg); }
   .modal-body { padding: 16px; overflow-y: auto; flex: 1; }
   .modal-footer {
     display: flex;

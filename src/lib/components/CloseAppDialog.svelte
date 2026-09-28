@@ -141,7 +141,7 @@
       </label>
       <div class="dialog-actions">
         <button class="ghost" onclick={handleCancel} disabled={actionTaken}>{m.common_cancel()}</button>
-        <button class="exit-btn" onclick={handleExit} disabled={actionTaken}>{m.close_dialog_exit()}</button>
+        <button class="secondary exit-btn" onclick={handleExit} disabled={actionTaken}>{m.close_dialog_exit()}</button>
         <button bind:this={trayBtn} class="primary" onclick={handleHide} disabled={actionTaken}>
           {m.close_dialog_minimize()}
         </button>
@@ -162,13 +162,6 @@
     background: var(--overlay-bg);
     padding: 20px;
   }
-
-  /* Frosted backdrop in dark mode, matching ConfirmDialog/AboutDialog. */
-  :global([data-theme='dark']) .close-overlay {
-    backdrop-filter: blur(6px) saturate(1.15);
-    -webkit-backdrop-filter: blur(6px) saturate(1.15);
-  }
-
   .close-dialog {
     width: min(440px, 100%);
     background: var(--bg-secondary);
@@ -207,13 +200,6 @@
     user-select: none;
   }
 
-  .remember-row input[type='checkbox'] {
-    width: 14px;
-    height: 14px;
-    accent-color: var(--accent);
-    cursor: pointer;
-  }
-
   .dialog-actions {
     display: flex;
     align-items: center;
@@ -223,44 +209,10 @@
     margin-top: 4px;
   }
 
-  .dialog-actions button {
-    padding: 7px 14px;
-    font-size: var(--font-size-md);
-    font-weight: 600;
-    border-radius: var(--radius-md);
-    cursor: pointer;
-  }
-
-  .dialog-actions .ghost {
-    background: transparent;
-    color: var(--text-secondary);
-    border: 1px solid var(--border);
-  }
-
-  .dialog-actions .ghost:hover {
-    color: var(--text-primary);
-    background: var(--bg-hover);
-  }
-
-  .dialog-actions .exit-btn {
-    background: transparent;
-    color: var(--text-primary);
-    border: 1px solid var(--border);
-  }
-
-  .dialog-actions .exit-btn:hover {
-    background: var(--bg-hover);
+  /* Leaving is the one choice here that loses something, so it warns on
+     hover without shouting at rest. */
+  .dialog-actions .exit-btn:hover:not(:disabled) {
     border-color: color-mix(in srgb, var(--danger) 50%, var(--border));
     color: var(--danger);
-  }
-
-  .dialog-actions .primary {
-    background: var(--accent);
-    color: var(--on-accent);
-    border: 1px solid var(--accent);
-  }
-
-  .dialog-actions .primary:hover {
-    opacity: 0.9;
   }
 </style>

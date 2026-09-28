@@ -1200,7 +1200,7 @@
       <div class="modal-content bootstrap-modal">
         <div class="modal-header">
           <h3 id="kad-bootstrap-title">{m.kad_bootstrap_modal_title()}</h3>
-          <button type="button" class="modal-close" aria-label={m.common_close()} disabled={bootstrapPending} onclick={closeBootstrap}><IconX size={16} /></button>
+          <button type="button" class="icon-close" aria-label={m.common_close()} disabled={bootstrapPending} onclick={closeBootstrap}><IconX size={16} /></button>
         </div>
         <div class="modal-body">
           <!--
@@ -1616,26 +1616,6 @@
     border-bottom: 1px solid var(--border);
   }
   .modal-header h3 { margin: 0; font-size: var(--font-size-lg); font-weight: 600; }
-  .modal-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    flex-shrink: 0;
-    cursor: pointer;
-    border: 1px solid transparent;
-    background: none;
-    color: var(--text-secondary);
-    border-radius: var(--radius-sm);
-    line-height: 1;
-  }
-  .modal-close:hover {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-  }
   .modal-body { padding: 16px 20px; overflow-y: auto; flex: 1; }
   .modal-footer {
     display: flex;

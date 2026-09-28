@@ -119,7 +119,7 @@
         <button type="button" class="about-website" onclick={() => void openWebsite()}>
           {m.about_dialog_website()}
         </button>
-        <button type="button" class="about-close" onclick={close}>{m.common_close()}</button>
+        <button type="button" class="primary about-close" onclick={close}>{m.common_close()}</button>
       </div>
     </div>
   </div>
@@ -240,26 +240,5 @@
     outline: 2px solid var(--accent);
     outline-offset: 2px;
     border-radius: var(--radius-sm);
-  }
-
-  .about-close {
-    padding: 8px 18px;
-    font-size: var(--font-size-md);
-    font-weight: 600;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border);
-    background: var(--accent);
-    color: var(--on-accent);
-    cursor: pointer;
-    transition: opacity var(--transition-normal), filter var(--transition-normal);
-  }
-
-  .about-close:hover {
-    filter: brightness(1.06);
-  }
-
-  .about-close:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
   }
 </style>

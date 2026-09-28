@@ -262,7 +262,7 @@
       {/if}
 
       <div class="share-actions">
-        <button type="button" class="share-close" onclick={close}>{m.common_close()}</button>
+        <button type="button" class="primary share-close" onclick={close}>{m.common_close()}</button>
       </div>
     </div>
   </div>
@@ -397,8 +397,7 @@
   }
 
   .share-copy:focus-visible,
-  .share-target:focus-visible,
-  .share-close:focus-visible {
+  .share-target:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
@@ -478,22 +477,5 @@
     display: flex;
     justify-content: flex-end;
     margin-top: 16px;
-  }
-
-  .share-close {
-    padding: 8px 18px;
-    font-size: var(--font-size-md);
-    font-weight: 600;
-    font-family: inherit;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border);
-    background: var(--accent);
-    color: var(--on-accent);
-    cursor: pointer;
-    transition: opacity var(--transition-normal), filter var(--transition-normal);
-  }
-
-  .share-close:hover {
-    filter: brightness(1.06);
   }
 </style>
