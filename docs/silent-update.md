@@ -1,7 +1,11 @@
 # Silent updates
 
-Design and implementation plan for letting Ember update itself while nobody is
-using it, then reopen exactly as the user left it.
+Design for letting Ember update itself while nobody is using it, then reopen
+exactly as the user left it.
+
+**Status:** implemented for 1.7.1, in the seven steps under
+[Implementation order](#implementation-order). What still needs a real install
+and a published release to confirm is in `docs/release-checklist-1.7.1.md`.
 
 ## What the user gets
 
@@ -27,9 +31,8 @@ never forces a restart while bytes are moving, and never ends up closed and not
 running.
 
 The cases this is built for are the people who leave Ember in the tray for
-weeks. Today they never learn about an update at all, because Ember only checks
-once, a few seconds after launch (`src/routes/+layout.svelte`, deferred check
-gated by `isUpdateCheckDue`).
+weeks. Before this, they never learned about an update at all, because Ember
+only checked once, a few seconds after launch, from a webview timer.
 
 ## Scope
 
@@ -38,12 +41,16 @@ Linux AppImage.
 
 **Not supported, and shown as such in Settings:**
 
-- **Linux `.deb`.** The update is installed with `dpkg -i` behind a `pkexec`
-  password prompt (`save_handoff` comment in
+- **Linux `.deb`** (and `.rpm`). The update is installed with `dpkg -i` behind a
+  `pkexec` password prompt (`write_handoff_record` comment in
   `src-tauri/src/commands/updater.rs`). Nobody is there to type it. The switch is
-  disabled with the hint "Updates to the .deb package need your password, so they
-  cannot run silently. Ember will tell you when an update is available."
+  disabled with a hint that says so and that Ember will tell the user when an
+  update is available.
 - **MSI installs.** Per-machine MSI installs need elevation (UAC).
+
+Which of these applies is read from the bundle marker Tauri writes into each
+package (`tauri::utils::platform::bundle_type`, in `auto_update::silent::support`).
+Development builds are never supported.
 
 **Not in the first version:** installing on quit, preferred update hours, and a
 separate "download but don't install" mode. None of them is needed for the
@@ -58,22 +65,25 @@ renders state that the backend emits and sends the user's choices back.
 
 ### States
 
-A new backend module, `src-tauri/src/auto_update/` (scheduler, idle predicate,
-resume file, watchdog), owns one state machine:
+The backend module `src-tauri/src/auto_update/` (`scheduler`, `silent`,
+`resume`, `watchdog`, `record`) owns one state machine, driven once a second by
+`silent.rs` (`Phase`):
 
 | State | Meaning | Leaves when |
 |-------|---------|-------------|
 | `Off` | Setting off, or platform unsupported | Setting turned on |
 | `Idle` | No update known | Periodic check finds one → `Preparing` |
-| `Preparing` | Downloading and verifying the artifact | Verified and staged → `WaitingForQuiet`; failure → `Idle` with backoff |
-| `WaitingForQuiet` | Update ready; waiting for the idle conditions | Conditions hold continuously for the quiet period → `Countdown` |
-| `Countdown` | 60-second warning on screen | Timer ends or "Update now" → `Installing`; Cancel → `Postponed`; activity → `WaitingForQuiet` |
-| `Postponed` | User cancelled | 24 h pass → `WaitingForQuiet` |
+| `Preparing` | Downloading and verifying the artifact | Verified and staged → `Waiting`; failure → retried after an hour |
+| `Waiting` | Update ready; waiting for the idle conditions | Conditions hold continuously for the quiet period → `Countdown` |
+| `Countdown` | 60-second warning on screen | Timer ends or "Update now" → `Installing`; Not now → `Postponed`; Skip → `Held`; a transfer moving → `Waiting` |
+| `Postponed` | User said "Not now" | 24 h pass → `Waiting` |
+| `Held` | Version skipped, or its silent install failed once | A newer release |
 | `Installing` | Resume file written, shutdown running, installer handed off | Process exits (success path), or failure → relaunch current version |
 
 Ember persists the scheduler's own record in `silent-update-state.json` in the
 data directory. The record holds `last_check_at`, `postponed_until`,
-`skipped_version`, `failed_version`, and `last_success { from, to, at }`. Like
+`skipped_version`, `failed_version`, `ready_since { version, at }` (for the
+week-long-wait notice) and `last_success { from, to, at }`. Like
 `update-handoff.json`, the file is untrusted: it can only postpone or suppress
 an update, never pick what gets installed.
 
@@ -101,19 +111,25 @@ silent updates off.
 
 ### Prepare, then install
 
-`secure_updater_install` currently downloads and installs in one call. It is
-split into two steps:
+`secure_updater_install` used to download and install in one call. It is split
+into two steps (`commands/updater.rs`):
 
-1. **`prepare_update`** downloads the artifact, verifies it against the signed
+1. **`prepare_locked`** downloads the artifact, verifies it against the signed
    manifest (same key, same rollback floor, same security epoch), and stages it
-   on disk. On Windows this is the existing `updates/` staging directory and
-   `update-handoff.json` record, so the recovery path already built for stalled
-   installs keeps working unchanged. Holding a 100 MB bundle in memory for days
-   while waiting for idle is not acceptable, so the bytes live on disk.
-2. **`install_prepared`** re-reads the staged bytes, re-checks their hash and
-   signature against the manifest, and re-checks the persisted security floor.
-   Only then does it write the resume file, run the graceful shutdown and hand
-   off to the installer.
+   on disk in the `updates/` staging directory, on every platform. A copy
+   already staged for the same signed artifact, possibly by an earlier session,
+   is reused once it re-verifies. Holding a 100 MB bundle in memory for days
+   while waiting for idle is not acceptable, so the bytes live on disk; only if
+   staging fails are they kept in memory, so an update the user asked for is
+   not refused.
+2. **`install_locked`** re-checks the persisted security floor, re-reads the
+   staged bytes and re-checks their size, hash and signature. Only then does it
+   write the Windows `update-handoff.json` record (so the recovery path already
+   built for stalled installs keeps working unchanged), write the resume file,
+   run the graceful shutdown, start the watchdog and hand off to the installer.
+
+The silent path reaches these through `prepare_pending_update` and
+`install_prepared_update`.
 
 The manual **Install** button calls both steps back to back, so its behaviour
 does not change. Silent mode runs step 1 as soon as an update is found and step
@@ -189,7 +205,7 @@ hidden window in front of whatever they are doing.
   case, including notifications turned off.
 
 The countdown aborts by itself if a transfer starts moving bytes, or local work
-such as hashing starts. It returns to `WaitingForQuiet` without counting as a
+such as hashing starts. It returns to `Waiting` without counting as a
 postpone, and a toast says "Update postponed: Ember is busy again." Input does
 *not* abort it: the dialog is how a user who is there answers it, and clicking
 it is input.
@@ -209,7 +225,7 @@ focus counts as input too.
 
 ### Returning to the same state
 
-Just before shutdown, while the state is still live, `install_prepared` writes
+Just before shutdown, while the state is still live, `install_locked` writes
 `update-resume.json` to the data directory. The next launch reads it once,
 deletes it, and applies it.
 
@@ -393,12 +409,12 @@ a crash while applying it cannot loop.
 ### Quiet installer on Windows
 
 `installMode: "passive"` shows a small NSIS progress window for the few seconds
-the install takes. For the silent path, `install_prepared` passes the quiet flag
-(`/S`) through the updater builder's `installer_args`. The Tauri NSIS template
-relaunches on `/R` in both passive and silent mode. **To verify on a test VM
-before relying on it:** that NSIS honours `/S` alongside the `/P` the configured
-mode already adds. If it does not, keep passive for this path; a brief progress
-bar is acceptable. The manual Install button keeps the progress window either way.
+the install takes, and the silent path uses it unchanged for now: the Tauri
+NSIS template relaunches on `/R` in both passive and silent mode, but whether it
+honours a quiet `/S` alongside the `/P` the configured mode already adds has not
+been verified on a test VM. A brief progress bar with nobody at the keyboard is
+harmless; a flag that stopped the relaunch would not be. Passing `/S` through the
+updater builder's `installer_args` is the change to make once it is confirmed.
 
 ## Settings
 
@@ -440,13 +456,15 @@ launches only the executable path it resolved itself.
 
 ## Implementation order
 
-Each phase ships on its own and is useful without the next one.
+Each phase ships on its own and is useful without the next one. All seven are
+done; each was its own commit.
 
 1. **Periodic backend update check.** Scheduler skeleton, `last_check_at` in the
    state file, the launch-time check moved into the backend. Everyone with
    auto-check on starts hearing about updates while Ember stays running.
-2. **Prepare / install split.** `prepare_update` and `install_prepared`; the
-   manual Install button calls both. No behaviour change yet.
+2. **Prepare / install split.** `prepare_locked` and `install_locked` in
+   `commands/updater.rs`; the manual Install button calls both. No behaviour
+   change yet.
 3. **Resume state.** `update-resume.json` write and consume, hidden-by-default
    window with `setup` deciding visibility, server reconnect override, route,
    search tabs and chat window. The manual **Restart to update** path writes the
@@ -457,9 +475,10 @@ Each phase ships on its own and is useful without the next one.
    notification, tray item and tooltip, postpone and skip.
 6. **Failure safety.** Watchdog, `instance.lock`, self-restart on install error,
    `failed_version`.
-7. **Release.** Settings copy in all locales, a section in `docs/index.html`, and
-   the checklist items below added to the release checklist. Ship with the
-   switch off by default.
+7. **Release.** Settings copy in all locales (shipped with step 5, since the
+   locale tests require every key everywhere), the Updates text, feature list
+   and FAQ in `docs/index.html`, and `docs/release-checklist-1.7.1.md`. Ships
+   with the switch off by default.
 
 ## Testing
 
