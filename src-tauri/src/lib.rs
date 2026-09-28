@@ -22,6 +22,7 @@
 #![allow(clippy::type_complexity)]
 
 mod app_state;
+mod auto_update;
 mod background;
 mod bandwidth;
 mod commands;
@@ -956,6 +957,7 @@ pub fn run() {
                 background::apply_effective_limits(&app_handle, &state, &settings);
             }
             background::spawn(app_handle.clone());
+            auto_update::scheduler::spawn(app_handle.clone());
 
             // Non-silent recovery notice: if config.json was corrupt at load,
             // tell the user (their settings were reset to defaults; the original

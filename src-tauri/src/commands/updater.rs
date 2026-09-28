@@ -152,6 +152,23 @@ pub struct SecureUpdateCheckResult {
     signature_missing: bool,
 }
 
+impl SecureUpdateCheckResult {
+    /// A check that could not produce a result at all, reported in-band the way
+    /// every other failure is.
+    pub(crate) fn failed(error: String) -> Self {
+        Self {
+            update: None,
+            pending_retained: false,
+            error: Some(error),
+            signature_missing: false,
+        }
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", content = "data")]
 pub enum UpdateProgress {
@@ -1485,8 +1502,20 @@ pub async fn secure_updater_check(
     app: AppHandle,
     service: State<'_, UpdaterService>,
 ) -> Result<SecureUpdateCheckResult, String> {
+    run_check(&app, &service).await
+}
+
+/// One update check, from the Check button or the backend scheduler alike.
+///
+/// Every attempt is stamped for the scheduler's cadence whatever its outcome,
+/// so a manual check also postpones the next automatic one.
+pub(crate) async fn run_check(
+    app: &AppHandle,
+    service: &UpdaterService,
+) -> Result<SecureUpdateCheckResult, String> {
     let _operation = service.operation.lock().await;
-    match secure_check(&app).await {
+    crate::auto_update::record::note_check_attempt();
+    match secure_check(app).await {
         Ok(Some((info, pending))) => {
             *service.pending.lock().await = Some(pending);
             Ok(SecureUpdateCheckResult {

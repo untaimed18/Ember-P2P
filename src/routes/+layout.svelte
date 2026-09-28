@@ -31,7 +31,11 @@
     takePendingEmberDefaultOnNotice,
     takePendingRestoreFailedNotice,
   } from '$lib/api/settings';
-  import { checkForUpdates, checkUpdateHandoff, isUpdateCheckDue } from '$lib/stores/updater';
+  import {
+    applyBackgroundCheckResult,
+    checkUpdateHandoff,
+    type SecureUpdateCheckResult,
+  } from '$lib/stores/updater';
   import {
     acknowledgeSecurityPolicyReset,
     getSecurityPolicyState,
@@ -281,8 +285,8 @@
     let mounted = true;
     let revealTimer: number | undefined;
     let hideTimer: number | undefined;
-    let updateCheckTimer: number | undefined;
     let handoffCheckTimer: number | undefined;
+    let unlistenUpdateCheck: UnlistenFn | null = null;
     let unlistenClose: UnlistenFn | null = null;
     let unlistenConfigCorrupt: UnlistenFn | null = null;
     let unlistenDbCorrupt: UnlistenFn | null = null;
@@ -430,6 +434,16 @@
     })
       .then((fn) => { if (mounted) unlistenFoldersFailed = fn; else fn(); })
       .catch((e) => console.error('Failed to register shared-folders-add-failed listener:', e));
+
+    // Automatic update checks run in the backend on the user's
+    // daily/weekly/monthly cadence, at launch and for as long as Ember stays
+    // open (release builds only). Their results are applied exactly as a
+    // silent check's would be, and surface non-blockingly via <UpdateNotice />.
+    listen<SecureUpdateCheckResult>('ember:updater-check-result', (event) => {
+      if (mounted) void applyBackgroundCheckResult(event.payload);
+    })
+      .then((fn) => { if (mounted) unlistenUpdateCheck = fn; else fn(); })
+      .catch((e) => console.error('Failed to register updater-check-result listener:', e));
 
     // Downloads re-queue on their own once the folder is fixed, so without this
     // the only sign of a folder Ember cannot write is rows that never start.
@@ -582,36 +596,17 @@
 
           releaseSplashWhenReady();
 
-          // Silent background update check, deferred so it never competes
-          // with first paint or store init. Production only: in a dev build
-          // the running version is the dev version and the GitHub manifest
-          // would spuriously report an "update". Gated on the user's
-          // auto-update preference and on `isUpdateCheckDue` so the chosen
-          // daily/weekly/monthly cadence is honored across launches, not
-          // just "once per app start" (falls back to the pre-setting
-          // always-on/daily behavior if settings failed to load). Any
-          // failure (offline, unreachable manifest) is swallowed by the
-          // store's silent mode, and a result surfaces non-blockingly via
-          // <UpdateNotice />.
-          const autoCheckEnabled = settings?.auto_check_updates ?? true;
-          const checkFrequency = settings?.update_check_frequency ?? 'daily';
-          if (!import.meta.env.DEV && autoCheckEnabled && isUpdateCheckDue(checkFrequency)) {
-            updateCheckTimer = window.setTimeout(() => {
-              if (mounted) void checkForUpdates({ silent: true });
-            }, 4000);
-          }
-          // Before any of that: did the last install actually happen? A
+          // Did the last install actually happen? A
           // hand-off to the installer ends this process, so if the installer
           // never ran there was nobody left to say so and the user just saw
           // Ember close. This is the first opportunity to tell them. Runs
           // regardless of the auto-check preference and of the cadence — it
           // reports on something they already asked for — and it resolves to
-          // nothing in the normal case where the update landed. Running first
-          // is only so the notice appears promptly. Two things in the store stop
-          // the check above from overwriting the result, because ordering these
-          // timers cannot: an in-flight guard, for the case where this call
-          // overruns the 2.5 s gap and the check starts before there is anything
-          // to capture, and `takeStagedSnapshot`, for every check after that.
+          // nothing in the normal case where the update landed. Two things in
+          // the store stop the backend's first automatic check from
+          // overwriting the result, because ordering the two cannot: an
+          // in-flight guard that holds a result arriving while this call runs,
+          // and `takeStagedSnapshot`, for every check after that.
           if (!import.meta.env.DEV) {
             handoffCheckTimer = window.setTimeout(() => {
               if (mounted) void checkUpdateHandoff();
@@ -641,8 +636,8 @@
       window.removeEventListener('unhandledrejection', onUnhandledRejection);
       if (revealTimer !== undefined) window.clearTimeout(revealTimer);
       if (hideTimer !== undefined) window.clearTimeout(hideTimer);
-      if (updateCheckTimer !== undefined) window.clearTimeout(updateCheckTimer);
       if (handoffCheckTimer !== undefined) window.clearTimeout(handoffCheckTimer);
+      if (unlistenUpdateCheck) unlistenUpdateCheck();
       if (stopPoll) stopPoll();
       if (stopTransferPoll) stopTransferPoll();
       cleanupTheme();

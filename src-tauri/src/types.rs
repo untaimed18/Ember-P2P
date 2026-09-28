@@ -1705,9 +1705,9 @@ pub struct AppSettings {
     /// larger than the in-memory scan budget are eventually indexed in full.
     #[serde(default)]
     pub shared_folder_scan_cursors: std::collections::HashMap<String, String>,
-    /// Automatically check for Ember updates in the background shortly
-    /// after launch (subject to `update_check_frequency`). This only gates
-    /// the *silent* startup check — the "Check for Updates" button in
+    /// Automatically check for Ember updates in the background, at launch and
+    /// while Ember keeps running (subject to `update_check_frequency`). This
+    /// only gates the *automatic* check — the "Check for Updates" button in
     /// Settings → About always works regardless of this setting. Defaults
     /// to `true` to preserve Ember's original always-check-on-launch
     /// behavior for existing users upgrading into this setting.
@@ -1715,10 +1715,9 @@ pub struct AppSettings {
     pub auto_check_updates: bool,
     /// How often the automatic background check gated by `auto_check_updates`
     /// may run: `"daily"`, `"weekly"`, or `"monthly"`. This is only the
-    /// user's preference — the actual "was it long enough ago?" bookkeeping
-    /// (last-checked timestamp) is tracked on the frontend
-    /// (`src/lib/stores/updater.ts`), since the whole update-check flow
-    /// already lives there with no backend involvement.
+    /// user's preference — the "was it long enough ago?" bookkeeping lives in
+    /// `silent-update-state.json` (`auto_update::record`), where the backend
+    /// scheduler reads it.
     #[serde(default = "default_update_check_frequency")]
     pub update_check_frequency: String,
 
