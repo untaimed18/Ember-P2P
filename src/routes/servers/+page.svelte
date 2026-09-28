@@ -1013,7 +1013,7 @@
             <!-- The filter box is up in the toolbar, out of the eyeline of
                  someone reading an empty table, so put the way out here too —
                  the same move the KAD and Library empty states already make. -->
-            <button class="ghost btn-sm" onclick={() => (serverFilter = '')}>{m.common_clear_filters()}</button>
+            <button type="button" class="ghost empty-action" onclick={() => (serverFilter = '')}>{m.common_clear_filters()}</button>
           </div>
         {:else}
           <table class="server-table">
@@ -1788,25 +1788,6 @@
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 10px;
-  }
-
-  .stats-row .stat-card {
-    min-width: 0;
-    padding: 12px 14px;
-  }
-
-  .stats-row .stat-card .value {
-    font-size: var(--font-size-2xl);
-    line-height: 1.15;
-  }
-
-  .stats-row .stat-card {
-    border: 1px solid color-mix(in srgb, var(--border) 85%, transparent);
-    background: linear-gradient(
-      180deg,
-      color-mix(in srgb, var(--bg-surface) 86%, transparent),
-      color-mix(in srgb, var(--bg-secondary) 92%, transparent)
-    );
   }
 
   .stats-row .stat-card .sub {

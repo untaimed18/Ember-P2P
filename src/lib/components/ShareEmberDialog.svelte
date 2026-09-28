@@ -339,7 +339,7 @@
   .share-url {
     flex: 1;
     min-width: 0;
-    font-family: var(--font-mono, ui-monospace, monospace);
+    font-family: var(--font-mono);
     font-size: var(--font-size-sm);
     color: var(--text-secondary);
     background: var(--bg-tertiary);

@@ -7404,7 +7404,7 @@
   }
   /* Monospace cell — used for raw user-hash columns where alignment
      across rows matters more than narrow rendering. */
-  .mono { font-family: var(--font-mono, ui-monospace, 'Cascadia Code', Consolas, monospace); font-size: var(--font-size-xs); }
+  .mono { font-family: var(--font-mono); font-size: var(--font-size-xs); }
   .failure-hint {
     font-size: var(--font-size-2xs);
     color: var(--danger);

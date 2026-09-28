@@ -4609,11 +4609,17 @@
     color: var(--text-primary);
   }
 
+  /* Same active and focus language as the sidebar's nav items. */
   .settings-nav-item.active {
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
-    color: var(--text-primary);
+    background: var(--accent-fill);
+    color: var(--accent);
     font-weight: 600;
+  }
+
+  .settings-nav-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    background: var(--bg-hover);
   }
 
   .settings-nav-icon {
@@ -5345,7 +5351,7 @@
     width: 100%;
     min-height: 180px;
     padding: 8px 10px;
-    font-family: var(--font-mono, ui-monospace, 'Cascadia Code', Consolas, monospace);
+    font-family: var(--font-mono);
     font-size: var(--font-size-sm);
     line-height: 1.4;
     color: var(--text-primary);
@@ -5414,7 +5420,7 @@
      `title`. Monospaced to match the Address field it was typed into, which
      is also what makes a `#hashid` placeholder legible as a placeholder. */
   .webservice-url {
-    font-family: var(--font-mono, monospace);
+    font-family: var(--font-mono);
     font-size: var(--font-size-xs);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -5454,7 +5460,7 @@
     min-width: 220px;
   }
   .webservice-field input {
-    font-family: var(--font-mono, monospace);
+    font-family: var(--font-mono);
     font-size: var(--font-size-sm);
     padding: 6px 8px;
     color: var(--text-primary);
@@ -5500,7 +5506,7 @@
     padding-left: 18px;
   }
   .antileech-errors code {
-    font-family: var(--font-mono, ui-monospace, monospace);
+    font-family: var(--font-mono);
     color: var(--text-primary);
   }
   .action-btn.ghost {
@@ -6140,7 +6146,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--font-mono, monospace);
+    font-family: var(--font-mono);
     max-width: 68ch;
   }
 

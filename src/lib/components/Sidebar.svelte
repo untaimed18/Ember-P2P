@@ -235,6 +235,11 @@
   let awaitingChannelOfferCount = $derived($awaitingChannelOffers);
   let channelInboxCount = $derived(totalUnreadChannels + awaitingChannelOfferCount);
 
+  /** Every nav count caps the same way; the exact figure is in each title. */
+  function navCount(n: number): string {
+    return n > 99 ? '99+' : String(n);
+  }
+
   function channelInboxTitle(unread: number, offers: number): string {
     const parts: string[] = [];
     if (unread > 0) {
@@ -490,32 +495,32 @@
             <span class="nav-transfer-counts">
               {#if activeDownloadCount > 0}
                 <span class="tc-chip tc-down" title={downloadsTitle(activeDownloadCount)}>
-                  <span class="tc-arrow" aria-hidden="true">↓</span>{activeDownloadCount}
+                  <span class="tc-arrow" aria-hidden="true">↓</span>{navCount(activeDownloadCount)}
                 </span>
               {/if}
               {#if activeUploadCount > 0}
                 <span class="tc-chip tc-up" title={uploadsTitle(activeUploadCount)}>
-                  <span class="tc-arrow" aria-hidden="true">↑</span>{activeUploadCount}
+                  <span class="tc-arrow" aria-hidden="true">↑</span>{navCount(activeUploadCount)}
                 </span>
               {/if}
             </span>
             <span
               class="nav-badge nav-badge-collapsed"
               title={transfersTitle(activeDownloadCount, activeUploadCount)}
-            >{activeTransferCount}</span>
+            >{navCount(activeTransferCount)}</span>
           {/if}
           {#if item.id === 'friends' && pendingFriendInboxCount > 0}
             <span
               class="nav-badge nav-badge-attention"
               title={friendInboxTitle(pendingFriendRequestCount, pendingFileOfferCount)}
-            >{pendingFriendInboxCount}</span>
+            >{navCount(pendingFriendInboxCount)}</span>
           {/if}
           {#if item.id === 'channels' && channelInboxCount > 0}
             <span
               class="nav-badge"
               class:nav-badge-attention={awaitingChannelOfferCount > 0}
               title={channelInboxTitle(totalUnreadChannels, awaitingChannelOfferCount)}
-            >{channelInboxCount > 99 ? '99+' : channelInboxCount}</span>
+            >{navCount(channelInboxCount)}</span>
           {/if}
         </a>
       </li>

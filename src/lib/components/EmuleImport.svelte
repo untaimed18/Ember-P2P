@@ -767,7 +767,7 @@
     color: var(--danger);
   }
   .mono {
-    font-family: var(--font-mono, monospace);
+    font-family: var(--font-mono);
     word-break: break-all;
   }
 

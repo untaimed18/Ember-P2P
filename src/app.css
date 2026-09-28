@@ -964,24 +964,31 @@ tr:hover td {
   --scroll-shadow: rgba(0, 0, 0, 0.34);
 }
 
+/*
+ * Overview tile: the frame every page's headline numbers sit in (Servers,
+ * Ember, Statistics). Pages arrange what is inside it — centred, with an
+ * icon — but not the frame or the size of the number.
+ */
 .stat-card {
-  background: var(--bg-surface);
+  min-width: 0;
+  background: var(--bg-secondary);
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 16px;
+  border-radius: var(--radius-lg);
+  padding: 14px 16px;
   box-shadow: var(--shadow-sm);
 }
 
 .stat-card .label {
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-xs);
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
 
 .stat-card .value {
-  font-size: var(--font-size-3xl);
+  font-size: var(--font-size-2xl);
   font-weight: 700;
+  line-height: 1.15;
   color: var(--text-primary);
   margin-top: 4px;
   font-variant-numeric: tabular-nums;
@@ -991,6 +998,61 @@ tr:hover td {
   font-size: var(--font-size-sm);
   color: var(--text-secondary);
   margin-top: 2px;
+}
+
+/*
+ * Network status tiles: a small uppercase label over its value, laid out in
+ * groups divided by a hairline. Shared by `NetworkStatusTiles` and the KAD
+ * panel that sits beside it, which has to read as one block. The parent sets
+ * `container-type: inline-size` so the groups can collapse with it.
+ */
+.stat-group {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+}
+.stat-group-grid {
+  grid-template-columns: repeat(4, 1fr);
+  gap: 2px 8px;
+}
+@container (max-width: 330px) {
+  .stat-group-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@container (max-width: 220px) {
+  .stat-group,
+  .stat-group-grid { grid-template-columns: 1fr; }
+}
+.stat-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 0;
+  min-width: 0;
+}
+.stat-tile .stat-label {
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: var(--font-size-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stat-tile .stat-value {
+  color: var(--text-primary);
+  font-weight: 600;
+  font-size: var(--font-size-md);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Badges sit at their natural width rather than stretching across the tile. */
+.stat-tile .badge {
+  align-self: flex-start;
 }
 
 /* Heading scale */

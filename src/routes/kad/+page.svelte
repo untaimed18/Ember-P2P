@@ -1713,14 +1713,8 @@
     container-type: inline-size;
   }
 
-  .stat-group {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 2px 12px;
-    padding: 6px 0;
-    border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
-  }
-
+  /* Tiles, groups and their collapse come from app.css, shared with the
+     `NetworkStatusTiles` block this panel ends in. */
   .stat-group:first-of-type {
     padding-top: 0;
   }
@@ -1749,74 +1743,19 @@
     white-space: nowrap;
   }
 
-  .stat-group-grid {
-    grid-template-columns: repeat(4, 1fr);
-    gap: 2px 8px;
-  }
-
-  .stat-tile {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    padding: 6px 0;
-    min-width: 0;
-  }
-
   .tile-wide {
     grid-column: span 1;
   }
 
-  /* At narrow panel widths, collapse the 4-up numeric group to 2-up
-     and the 2-up groups stay 2-up (labels are short enough). Below
-     ~220px everything stacks single column. */
-  @container (max-width: 330px) {
-    .stat-group-grid {
-      grid-template-columns: repeat(2, 1fr);
-    }
-  }
-
-  @container (max-width: 220px) {
-    .stat-group,
-    .stat-group-grid {
-      grid-template-columns: 1fr;
-    }
-  }
-
-  .stat-label {
-    color: var(--text-muted);
-    font-weight: 500;
-    font-size: var(--font-size-2xs);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .stat-value {
-    color: var(--text-primary);
-    font-weight: 600;
-    font-size: var(--font-size-md);
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
   /* Numeric readouts get the larger "stat card" treatment so peer
      counts read at a glance. Tabular numerals keep digits aligned
-     across rows. */
-  .stat-numeric {
+     across rows. Qualified so it outranks the shared `.stat-tile .stat-value`
+     whatever order the stylesheets load in. */
+  .stat-tile .stat-numeric {
     font-size: var(--font-size-xl);
     font-weight: 700;
     font-variant-numeric: tabular-nums;
     letter-spacing: -0.3px;
-  }
-
-  /* Badges inside tiles shouldn't stretch — they sit at their natural
-     width so the tile column stays flexible. */
-  .stat-tile .badge {
-    align-self: flex-start;
   }
 
   .kad-lower {

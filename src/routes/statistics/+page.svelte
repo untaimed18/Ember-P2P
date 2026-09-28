@@ -236,7 +236,7 @@
 
     <!-- Hero cards -->
     <div class="hero-row">
-      <div class="hero-card">
+      <div class="stat-card hero-card">
         <div class="hero-icon down-icon" aria-hidden="true">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
             <line x1="10" y1="3" x2="10" y2="15"/>
@@ -244,11 +244,11 @@
           </svg>
         </div>
         <div class="hero-body">
-          <span class="hero-value">{formatRate(stats.session_down_rate)}</span>
-          <span class="hero-label">{m.stats_download_rate()}</span>
+          <span class="value">{formatRate(stats.session_down_rate)}</span>
+          <span class="label">{m.stats_download_rate()}</span>
         </div>
       </div>
-      <div class="hero-card">
+      <div class="stat-card hero-card">
         <div class="hero-icon up-icon" aria-hidden="true">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
             <line x1="10" y1="17" x2="10" y2="5"/>
@@ -256,11 +256,11 @@
           </svg>
         </div>
         <div class="hero-body">
-          <span class="hero-value">{formatRate(stats.session_up_rate)}</span>
-          <span class="hero-label">{m.stats_upload_rate()}</span>
+          <span class="value">{formatRate(stats.session_up_rate)}</span>
+          <span class="label">{m.stats_upload_rate()}</span>
         </div>
       </div>
-      <div class="hero-card">
+      <div class="stat-card hero-card">
         <div class="hero-icon time-icon" aria-hidden="true">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="10" cy="11" r="6.5"/>
@@ -270,11 +270,11 @@
           </svg>
         </div>
         <div class="hero-body">
-          <span class="hero-value">{formatElapsed(sessionTime)}</span>
-          <span class="hero-label">{m.stats_session_time()}</span>
+          <span class="value">{formatElapsed(sessionTime)}</span>
+          <span class="label">{m.stats_session_time()}</span>
         </div>
       </div>
-      <div class="hero-card">
+      <div class="stat-card hero-card">
         <div class="hero-icon ratio-icon" aria-hidden="true">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
             <line x1="6" y1="3.5" x2="6" y2="15"/>
@@ -284,8 +284,8 @@
           </svg>
         </div>
         <div class="hero-body">
-          <span class="hero-value" class:ratio-good={sessionRatio !== null && sessionRatio >= 1} class:ratio-low={sessionRatio !== null && sessionRatio < 1}>{sessionRatioLabel}</span>
-          <span class="hero-label">{m.stats_session_upload_ratio()}</span>
+          <span class="value" class:ratio-good={sessionRatio !== null && sessionRatio >= 1} class:ratio-low={sessionRatio !== null && sessionRatio < 1}>{sessionRatioLabel}</span>
+          <span class="label">{m.stats_session_upload_ratio()}</span>
         </div>
       </div>
     </div>
@@ -504,18 +504,12 @@
   @media (max-width: 900px) {
     .hero-row { grid-template-columns: repeat(2, 1fr); }
   }
+  /* The shared `.stat-card`, with an icon beside the number. */
   .hero-card {
     display: flex;
     align-items: center;
     gap: 14px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    padding: 16px 18px;
-    box-shadow: var(--shadow-sm);
-    transition: box-shadow var(--transition-normal);
   }
-  .hero-card:hover { box-shadow: var(--shadow-md); }
   .hero-icon {
     width: 42px;
     height: 42px;
@@ -534,17 +528,12 @@
   .time-icon  { background: color-mix(in srgb, var(--success) 14%, transparent); color: var(--success); }
   .ratio-icon { background: color-mix(in srgb, var(--stat-ratio) 14%, transparent); color: var(--stat-ratio); }
   .hero-body { display: flex; flex-direction: column; min-width: 0; }
-  .hero-value {
-    font-size: var(--font-size-xl);
-    font-weight: 700;
-    color: var(--text-primary);
-    font-variant-numeric: tabular-nums;
+  .hero-card .value {
+    margin-top: 0;
     white-space: nowrap;
   }
-  .hero-label {
-    font-size: var(--font-size-xs);
-    color: var(--text-muted);
-    margin-top: 1px;
+  .hero-card .label {
+    margin-top: 2px;
   }
 
   /* ---- Section cards ---- */

@@ -3802,7 +3802,7 @@
           <line x1="8" y1="11" x2="14" y2="11"></line>
         </svg>
         <p class="empty-title">{m.library_empty_no_matches()}</p>
-        <p class="empty-sub"><button class="link-btn" onclick={clearLibraryFilters}>{m.common_clear_filters()}</button></p>
+        <button type="button" class="ghost empty-action" onclick={clearLibraryFilters}>{m.common_clear_filters()}</button>
       </div>
     {:else if sortedFiles.length === 0 && !initialLoadDone}
       <!-- Ahead of the "nothing shared yet" pitch: until a load has actually
@@ -5553,7 +5553,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--font-mono, monospace);
+    font-family: var(--font-mono);
     font-size: var(--font-size-xs);
     line-height: 20px;
     color: var(--text-secondary);

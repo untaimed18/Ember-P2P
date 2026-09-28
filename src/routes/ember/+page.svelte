@@ -523,25 +523,25 @@
 
   {#if isActive}
     <section class="stat-grid" aria-label={m.ember_overview_aria()}>
-      <div class="stat" title={peerCount > verifiedCount ? m.ember_overview_peers_of_hint({ verified: verifiedCount, total: peerCount }) : undefined}>
-        <div class="stat-value">
+      <div class="stat-card stat" title={peerCount > verifiedCount ? m.ember_overview_peers_of_hint({ verified: verifiedCount, total: peerCount }) : undefined}>
+        <div class="value">
           {#if peerCount > verifiedCount}
             {m.ember_overview_peers_of({ verified: verifiedCount, total: peerCount })}
           {:else}
             {verifiedCount}
           {/if}
         </div>
-        <div class="stat-label">{m.ember_overview_peers()}</div>
+        <div class="label">{m.ember_overview_peers()}</div>
       </div>
-      <div class="stat" title={publishedTotal > 0 ? m.ember_overview_published_of_hint({ published: publishedCount, total: publishedTotal }) : undefined}>
-        <div class="stat-value">
+      <div class="stat-card stat" title={publishedTotal > 0 ? m.ember_overview_published_of_hint({ published: publishedCount, total: publishedTotal }) : undefined}>
+        <div class="value">
           {#if publishedTotal > 0}
             {m.ember_overview_published_of({ published: publishedCount, total: publishedTotal })}
           {:else}
             {publishedCount}
           {/if}
         </div>
-        <div class="stat-label">{m.ember_overview_published()}</div>
+        <div class="label">{m.ember_overview_published()}</div>
       </div>
     </section>
 
@@ -939,32 +939,24 @@
     gap: 12px;
   }
 
+  /* The shared `.stat-card`, centred with the number above its label and in
+     the Ember colour. */
   .stat {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    padding: 18px 16px;
     text-align: center;
     transition: border-color var(--transition-normal) ease;
   }
 
   .stat:hover {
-    border-color: color-mix(in srgb, var(--ember-color, #c2185b) 22%, var(--border));
+    border-color: color-mix(in srgb, var(--ember-color) 22%, var(--border));
   }
 
-  .stat-value {
-    font-size: 28px;
-    font-weight: 700;
-    color: var(--ember-color, #c2185b);
-    line-height: 1.1;
-    font-variant-numeric: tabular-nums;
+  .stat .value {
+    margin-top: 0;
+    color: var(--ember-color);
   }
 
-  .stat-label {
+  .stat .label {
     margin-top: 6px;
-    font-size: var(--font-size-sm);
-    font-weight: 500;
-    color: var(--text-muted);
   }
 
   /* --- Health checklist --- */
@@ -1249,7 +1241,7 @@
   }
 
   .pubkey {
-    font-family: var(--font-mono, ui-monospace, monospace);
+    font-family: var(--font-mono);
     font-size: var(--font-size-sm);
     color: var(--text-secondary);
     overflow-wrap: anywhere;

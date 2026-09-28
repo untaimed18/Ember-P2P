@@ -106,72 +106,10 @@
     container-type: inline-size;
   }
 
-  /*
-   * Each tile stacks its label above its value so long values (badges, IP
-   * addresses, "Not Mapped") get the full tile width and never truncate.
-   * Group separators replace per-row dashed borders so the block reads
-   * calmer and more scannable.
-   */
-  .stat-group {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 2px 12px;
-    padding: 6px 0;
-    border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
-  }
-
+  /* Tiles, groups and their collapse come from app.css. */
   .stat-group:last-of-type {
     padding-bottom: 0;
     border-bottom: none;
-  }
-
-  .stat-group-grid {
-    grid-template-columns: repeat(4, 1fr);
-    gap: 2px 8px;
-  }
-
-  .stat-tile {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    padding: 6px 0;
-    min-width: 0;
-  }
-
-  /* At narrow widths, collapse the 4-up group to 2-up (the 2-up group stays
-     as-is, its labels are short enough). Below ~220px everything stacks. */
-  @container (max-width: 330px) {
-    .stat-group-grid {
-      grid-template-columns: repeat(2, 1fr);
-    }
-  }
-
-  @container (max-width: 220px) {
-    .stat-group,
-    .stat-group-grid {
-      grid-template-columns: 1fr;
-    }
-  }
-
-  .stat-label {
-    color: var(--text-muted);
-    font-weight: 500;
-    font-size: var(--font-size-2xs);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .stat-value {
-    color: var(--text-primary);
-    font-weight: 600;
-    font-size: var(--font-size-md);
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
   .stat-ip {
@@ -198,10 +136,4 @@
   }
 
   .stat-link:hover { color: var(--accent-hover); }
-
-  /* Badges inside tiles shouldn't stretch — they sit at their natural width
-     so the tile column stays flexible. */
-  .stat-tile .badge {
-    align-self: flex-start;
-  }
 </style>

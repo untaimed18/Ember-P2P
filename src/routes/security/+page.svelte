@@ -575,7 +575,7 @@
   {#if loading && !stats}
     <div class="empty-state">
       <div class="spinner lg"></div>
-      <p>{m.security_loading()}</p>
+      <p class="empty-title">{m.security_loading()}</p>
     </div>
   {:else if stats}
     <!-- Controls bar: toggles + stats inline -->
@@ -686,6 +686,7 @@
         </svg>
         <p class="empty-title">{m.security_empty_no_matches()}</p>
         <p class="empty-sub">{m.security_empty_no_matches_sub()}</p>
+        <button type="button" class="ghost empty-action" onclick={() => { searchQuery = ''; }}>{m.common_clear_filters()}</button>
       </div>
     {:else}
       <div
