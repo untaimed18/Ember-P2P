@@ -320,6 +320,13 @@ pub(crate) async fn run_graceful_shutdown(
     state.db.mark_clean_shutdown();
 }
 
+/// Run as the update watchdog if this process was started as one
+/// (`auto_update::watchdog`). Returns whether it was, in which case the process
+/// should exit rather than start Ember.
+pub fn run_update_watchdog_if_requested() -> bool {
+    auto_update::watchdog::run_if_requested()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Give async tasks a larger worker-thread stack than tokio's 2 MiB default.
@@ -645,6 +652,10 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             // Before the network task starts and before the window is shown:
             // both come back the way an update restart left them.
+            // Held for the life of the process, so an update watchdog can tell
+            // a running Ember from one that never came back.
+            auto_update::watchdog::hold_instance_lock(&data_dir);
+            auto_update::watchdog::schedule_cleanup(&data_dir);
             let resume_window = auto_update::resume::begin_launch(&app_handle, &data_dir);
             auto_update::silent::note_launch_outcome(&app_handle);
             // An eMule import staged last session. Here because it rewrites

@@ -360,23 +360,28 @@ passes `/P /R /UPDATE /ARGS …`. So before handing off, Ember starts a
 **watchdog**:
 
 - A copy of the current executable is written to
-  `updates/ember-update-watchdog.exe` and started with
-  `--update-watchdog --parent-pid <pid>`. `main.rs` checks for that flag
+  `update-watchdog/ember-update-watchdog.exe` in the data folder and started,
+  detached, with `--update-watchdog --data-dir <dir> --launch <installed exe>`
+  (`src-tauri/src/auto_update/watchdog.rs`). `main.rs` checks for that flag
   before building Tauri, so watchdog mode starts no webview, no single-instance
-  registration and no network.
+  registration and no network. It keeps a short log in
+  `update-watchdog.log`.
 - It runs **outside the install directory and under a different file name**.
   Running from the installed `ember.exe` would lock the file the installer must
-  replace, and the installer's running-app check would kill it by name.
-- It waits for the parent to exit, then waits up to 5 minutes for Ember to be
-  running again. It judges that by trying the exclusive lock on
-  `instance.lock`, a new lock Ember holds for its lifetime. It does not look up
-  processes by name, and it does not launch a second copy that would trip the
-  single-instance plugin, whose handler *shows* the window.
+  replace, and the installer's running-app check would kill it by path.
+- It waits up to 3 minutes for Ember to exit, then up to 5 minutes for Ember to
+  be running again. It judges both by probing `instance.lock`, an exclusive lock
+  every Ember takes at startup (retrying briefly, so the probe can never make it
+  give up) and holds for its lifetime. It does not look up processes by name,
+  and it does not launch a second copy that would trip the single-instance
+  plugin, whose handler *shows* the window. It is only started by a process
+  that holds the lock, so it can never mistake the Ember that started it for a
+  relaunch.
 - If Ember is not running by the deadline, it launches the installed executable
-  itself. It uses only the path it resolved at spawn time and reads none from a
-  file. That Ember finds the resume file, restores the session, and reports the
-  failed update. The watchdog then exits. Ember deletes the watchdog copy on its
-  next launch.
+  itself, using only the path it was given at spawn time. That Ember finds the
+  resume file, restores the session, and reports the failed update. The
+  watchdog then exits. The next Ember deletes the watchdog's copy a minute after
+  it starts.
 
 On the AppImage, the install runs in-process and returns a result, so no
 watchdog is needed.

@@ -1669,6 +1669,10 @@ async fn install_locked(
         );
     }
 
+    // On Windows this process ends inside `install`, and the installer only
+    // relaunches Ember when it succeeds. The watchdog is what brings Ember back
+    // when it does not.
+    crate::auto_update::watchdog::spawn_for_install();
     if let Err(error) = update.update.install(&artifact) {
         tracing::warn!("Secure updater install failed: {error}");
         // Distinct from `public_failure`: the teardown above already stopped
