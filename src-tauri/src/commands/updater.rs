@@ -40,7 +40,7 @@ const ARTIFACT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const CURRENT_SECURITY_EPOCH: u64 = 1;
 const STATE_FILE: &str = "updater-security-state.json";
 /// Records that we handed a verified installer to the OS and expected not to
-/// come back. See [`save_handoff`].
+/// come back. See [`write_handoff_record`].
 const HANDOFF_FILE: &str = "update-handoff.json";
 /// Where the verified installer is kept so a failed hand-off leaves something
 /// the user can still run.
@@ -108,6 +108,10 @@ struct PendingUpdate {
     /// later recovery can keep them — see [`UpdateHandoff::manifest`].
     manifest: String,
     manifest_signature: String,
+    /// Where [`prepare_locked`] left the verified artifact. Staged bytes are
+    /// re-verified before anything installs them, since they may sit for days
+    /// waiting for a quiet moment.
+    prepared: Option<PreparedArtifact>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -797,16 +801,40 @@ fn pending_dir(app: &AppHandle) -> Result<PathBuf> {
         .join(PENDING_DIR))
 }
 
-/// The installer's name on disk, built from values we control rather than from
-/// anything the marker file says, so the path can only ever land inside
+/// The staged artifact's name on disk, built from values we control rather than
+/// from anything the marker file says, so the path can only ever land inside
 /// [`PENDING_DIR`].
 fn installer_name(version: &str, kind: &str) -> String {
     let safe_version: String = version
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
         .collect();
-    let safe_kind = if kind == "msi" { "msi" } else { "exe" };
+    let safe_kind = match kind {
+        "msi" => "msi",
+        "exe" => "exe",
+        _ => "bin",
+    };
     format!("Ember_{safe_version}_update.{safe_kind}")
+}
+
+/// The version a staged artifact's file name claims, for housekeeping only.
+fn staged_version_from_name(name: &str) -> Option<&str> {
+    name.strip_prefix("Ember_")?
+        .rsplit_once('.')?
+        .0
+        .strip_suffix("_update")
+}
+
+/// What a staged artifact is called on this platform. Windows keeps the
+/// installer's own extension because hand-off recovery runs it directly;
+/// elsewhere the bytes only ever go back through the updater plugin, so the
+/// name carries no meaning.
+fn staged_kind(url: &Url) -> &'static str {
+    if cfg!(windows) {
+        installer_kind(url)
+    } else {
+        "bin"
+    }
 }
 
 /// `exe` unless the signed URL clearly names an MSI.
@@ -828,19 +856,62 @@ fn read_handoff(path: &Path) -> Result<Option<UpdateHandoff>> {
     }
 }
 
-/// Persist the verified installer and the record of handing it over.
+/// Where a verified update is kept between preparing and installing it.
+enum PreparedArtifact {
+    /// On disk in [`PENDING_DIR`]. The normal case, and the only one hand-off
+    /// recovery can use.
+    Staged(PathBuf),
+    /// Staging failed (a full disk, an antivirus holding the folder). An update
+    /// the user asked for is not refused over a missing safety net, so the
+    /// verified bytes are kept here instead.
+    InMemory(Vec<u8>),
+}
+
+/// Write verified artifact bytes to `path` in the staging directory, replacing
+/// whatever an earlier preparation left there.
+fn stage_artifact(path: &Path, artifact: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .context("the update staging path has no directory")?;
+    std::fs::create_dir_all(dir).context("failed to create the update staging directory")?;
+
+    // Only ever one staged artifact: whatever a previous attempt left behind is
+    // either already installed or superseded by this one.
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.path() != path {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    crate::security::atomic_write(path, artifact, true)
+        .context("failed to stage the verified update")
+}
+
+/// Read a staged artifact back and check it against the signed size, hash and
+/// signature it was staged under.
+///
+/// The bytes may have sat on disk for days waiting for a quiet moment, so they
+/// are treated exactly like bytes off the network: nothing is installed on the
+/// strength of having written it earlier.
+fn read_verified_staged(path: &Path, platform: &SignedPlatform, public_key: &str) -> Result<Vec<u8>> {
+    let bytes = std::fs::read(path).context("the staged update is no longer present")?;
+    if bytes.len() as u64 != platform.size {
+        bail!("the staged update is not its signed size");
+    }
+    if hex::encode(Sha256::digest(&bytes)) != platform.sha256 {
+        bail!("the staged update no longer matches its signed hash");
+    }
+    verify_minisign(&bytes, platform.signature.as_bytes(), public_key)?;
+    Ok(bytes)
+}
+
+/// Record that the staged installer is about to be handed to the OS.
 ///
 /// Best-effort by design: the caller carries on installing if this fails, since
-/// a missing safety net is not a reason to refuse an update the user asked for.
-fn save_handoff(
-    app: &AppHandle,
-    platform: &SignedPlatform,
-    version: &str,
-    security_epoch: u64,
-    manifest: &str,
-    manifest_signature: &str,
-    artifact: &[u8],
-) -> Result<()> {
+/// a missing safety net is not a reason to refuse an update.
+fn write_handoff_record(app: &AppHandle, update: &PendingUpdate) -> Result<()> {
     // Windows only, because the dead end being recovered from is a Windows one.
     // There `Update::install` hands the bundle to NSIS/MSI and then calls
     // `exit(0)`, so a refusal to run the freshly written installer is
@@ -848,52 +919,76 @@ fn save_handoff(
     // installs in-process instead — `dpkg -i` behind a pkexec prompt for the
     // `.deb`, an in-place rewrite for the AppImage — and returns a `Result` the
     // caller already turns into a visible error, so there is nothing silent to
-    // recover from and no reason to keep a second copy of a 100 MB bundle.
+    // recover from.
     //
-    // Staging there would also have nothing coherent to offer: re-running a
+    // A record there would also have nothing coherent to offer: re-running a
     // staged AppImage just runs the new version out of the data folder without
     // installing anything, and leaves the old one in place. Refusing at the top
-    // is what keeps `installer_kind` and `installer_name` total as well — they
-    // only ever name an `exe` or an `msi` because only Windows reaches them.
+    // is what keeps `installer_kind` total as well — a record only ever names an
+    // `exe` or an `msi` because only Windows writes one.
     //
     // `cfg!` rather than `#[cfg]` so the body below stays type-checked
     // everywhere this compiles.
     if !cfg!(windows) {
         tracing::debug!(
-            "Not staging a hand-off record: an install failure is reported directly on this platform"
+            "Not writing a hand-off record: an install failure is reported directly on this platform"
         );
         return Ok(());
     }
-    let kind = installer_kind(&platform.url);
-    let dir = pending_dir(app)?;
-    std::fs::create_dir_all(&dir).context("failed to create the update staging directory")?;
-
-    // Only ever one saved installer: whatever a previous attempt left behind is
-    // either already installed or superseded by this one.
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-
-    let path = dir.join(installer_name(version, kind));
-    crate::security::atomic_write(&path, artifact, true)
-        .context("failed to stage the verified installer")?;
-
     let record = UpdateHandoff {
-        version: version.to_string(),
-        security_epoch,
+        version: update.info.version.clone(),
+        security_epoch: update.info.security_epoch,
         from_version: app.package_info().version.to_string(),
-        kind: kind.to_string(),
-        sha256: platform.sha256.clone(),
-        signature: platform.signature.clone(),
-        manifest: manifest.to_string(),
-        manifest_signature: manifest_signature.to_string(),
+        kind: installer_kind(&update.platform.url).to_string(),
+        sha256: update.platform.sha256.clone(),
+        signature: update.platform.signature.clone(),
+        manifest: update.manifest.clone(),
+        manifest_signature: update.manifest_signature.clone(),
         attempted_at: chrono::Utc::now().timestamp(),
     };
     let bytes = serde_json::to_vec(&record).context("failed to serialize the hand-off record")?;
     crate::security::atomic_write(&handoff_path(app)?, &bytes, true)
         .context("failed to persist the hand-off record")
+}
+
+/// Delete everything staged. For an install that has already happened in
+/// process, where the copy has done its job.
+fn discard_staged(app: &AppHandle) {
+    if let Ok(dir) = pending_dir(app) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Remove artifacts a preparation staged and never installed, once they are no
+/// longer newer than the running build.
+///
+/// Only reached when there is no hand-off record, so nothing here is a failed
+/// install anyone needs to hear about. The version comes from the file name,
+/// which is untrusted, but it is only ever used to decide what to delete: the
+/// worst a rewritten name can do is cost a re-download or keep one stale file.
+fn sweep_stale_staged(app: &AppHandle) {
+    if let Ok(dir) = pending_dir(app) {
+        sweep_stale_staged_in(&dir, &app.package_info().version.to_string());
+    }
+}
+
+fn sweep_stale_staged_in(dir: &Path, running: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let newer = name
+            .to_str()
+            .and_then(staged_version_from_name)
+            .and_then(|version| Version::parse(version).ok())
+            .is_some_and(|staged| {
+                staged_claim_is_an_upgrade(CURRENT_SECURITY_EPOCH, &staged, running)
+            });
+        if !newer {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Forget a hand-off and delete the installer it refers to.
@@ -1376,14 +1471,19 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
             info,
             manifest: manifest_text,
             manifest_signature,
+            prepared: None,
         },
     )))
 }
 
+/// Progress sink for an artifact download: the frontend's channel for a manual
+/// install, or nothing for one prepared in the background.
+type ProgressSink<'a> = &'a (dyn Fn(UpdateProgress) + Sync);
+
 async fn download_artifact(
     platform: &SignedPlatform,
     public_key: &str,
-    on_event: &Channel<UpdateProgress>,
+    on_event: ProgressSink<'_>,
 ) -> Result<Vec<u8>> {
     validate_url(&platform.url, NetworkPolicy::PRODUCTION)?;
     let expected_size = usize::try_from(platform.size)
@@ -1406,7 +1506,7 @@ async fn download_artifact(
         bail!("updater artifact Content-Length differed from signed size");
     }
 
-    let _ = on_event.send(UpdateProgress::Started {
+    on_event(UpdateProgress::Started {
         content_length: platform.size,
     });
     let mut artifact = Vec::with_capacity(expected_size.min(16 * 1024 * 1024));
@@ -1422,7 +1522,7 @@ async fn download_artifact(
         }
         hasher.update(&chunk);
         artifact.extend_from_slice(&chunk);
-        let _ = on_event.send(UpdateProgress::Progress {
+        on_event(UpdateProgress::Progress {
             chunk_length: chunk.len() as u64,
         });
     }
@@ -1434,8 +1534,152 @@ async fn download_artifact(
         bail!("updater artifact SHA-256 did not match signed metadata");
     }
     verify_minisign(&artifact, platform.signature.as_bytes(), public_key)?;
-    let _ = on_event.send(UpdateProgress::Finished);
+    on_event(UpdateProgress::Finished);
     Ok(artifact)
+}
+
+/// Download, verify and stage the pending update, so that installing it later
+/// needs no network and the downtime is only shutdown, install and relaunch.
+///
+/// A copy already staged for the same signed artifact — by an earlier
+/// preparation, possibly in an earlier session — is reused once it re-verifies.
+async fn prepare_locked(
+    app: &AppHandle,
+    update: &mut PendingUpdate,
+    public_key: &str,
+    on_event: ProgressSink<'_>,
+) -> Result<()> {
+    let path = pending_dir(app)?.join(installer_name(
+        &update.info.version,
+        staged_kind(&update.platform.url),
+    ));
+    if read_verified_staged(&path, &update.platform, public_key).is_ok() {
+        // Reported the way a download would be, so a progress UI moves on.
+        on_event(UpdateProgress::Started {
+            content_length: update.platform.size,
+        });
+        on_event(UpdateProgress::Progress {
+            chunk_length: update.platform.size,
+        });
+        on_event(UpdateProgress::Finished);
+        update.prepared = Some(PreparedArtifact::Staged(path));
+        return Ok(());
+    }
+
+    let artifact = download_artifact(&update.platform, public_key, on_event).await?;
+    update.prepared = Some(match stage_artifact(&path, &artifact) {
+        Ok(()) => PreparedArtifact::Staged(path),
+        Err(error) => {
+            tracing::warn!("Could not stage the verified update; keeping it in memory: {error:#}");
+            PreparedArtifact::InMemory(artifact)
+        }
+    });
+    Ok(())
+}
+
+/// Hand the prepared update to the installer.
+///
+/// On Windows a successful install does not return: the plugin launches the
+/// installer and exits the process. Elsewhere it installs in process and
+/// returns, and the caller is expected to restart.
+async fn install_locked(
+    app: &AppHandle,
+    pending: &mut Option<PendingUpdate>,
+    public_key: &str,
+) -> Result<(), String> {
+    let Some(update) = pending.as_mut() else {
+        return Err(coded(
+            "updater_no_pending_update",
+            "No verified update is ready to install.",
+        ));
+    };
+    // Re-read here: another process may have observed a newer signed floor
+    // while this one was downloading or waiting for a quiet moment.
+    if !pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)
+        .map_err(|error| public_failure(UpdaterOperation::Install, error))?
+    {
+        pending.take();
+        return Err(coded(
+            "updater_superseded_while_downloading",
+            "A newer signed update was observed while downloading. Check for updates again.",
+        ));
+    }
+    let artifact = match update.prepared.as_ref() {
+        Some(PreparedArtifact::Staged(path)) => {
+            match read_verified_staged(path, &update.platform, public_key) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    // Gone or altered since it was staged. Forget it so the next
+                    // attempt downloads a fresh copy rather than failing the same
+                    // way.
+                    update.prepared = None;
+                    return Err(public_failure(UpdaterOperation::Install, error));
+                }
+            }
+        }
+        Some(PreparedArtifact::InMemory(bytes)) => bytes.clone(),
+        None => {
+            return Err(coded(
+                "updater_no_pending_update",
+                "No verified update is ready to install.",
+            ))
+        }
+    };
+    // Record the attempt before handing the bytes over. `install` does not come
+    // back on success, so this is the only chance to leave behind anything a
+    // later launch could act on. Only with a staged copy, which is what the
+    // recovery would run.
+    if matches!(update.prepared, Some(PreparedArtifact::Staged(_))) {
+        if let Err(error) = write_handoff_record(app, update) {
+            tracing::warn!("Could not record the update hand-off: {error:#}");
+        }
+    }
+
+    // `Update::install` never comes back on Windows: it hands the bundle to the
+    // NSIS/MSI installer and then calls `std::process::exit(0)`. The plugin's
+    // own `on_before_exit` hook is `AppHandle::cleanup_before_exit`, which only
+    // clears tray icons/resource tables and hides windows — `RunEvent::Exit` is
+    // never dispatched, so without this every installed update would abandon
+    // the .part.met gap maps, nodes.dat, the known.met checkpoint that exists
+    // precisely so AICH doesn't rehash from scratch, sources.met, server.met,
+    // reputation and stats at their last periodic save, and would skip graceful
+    // ed2k-server / rendezvous deregistration.
+    //
+    // Done here rather than by overriding `on_before_exit`, because that hook
+    // runs synchronously on a runtime worker inside `install`: bridging back to
+    // async from there means blocking that worker while another thread drives
+    // the shutdown, and on a single-worker runtime that starves the very
+    // network task we would be waiting on. Awaiting from the command yields the
+    // worker instead. `run_graceful_shutdown` is internally bounded and safe to
+    // run again from a later `RunEvent::Exit`; the outer timeout is the
+    // backstop for a lock inside it that never becomes available.
+    if timeout(
+        crate::SHUTDOWN_WAIT + Duration::from_secs(15),
+        crate::run_graceful_shutdown(app, crate::SHUTDOWN_WAIT),
+    )
+    .await
+    .is_err()
+    {
+        tracing::error!(
+            "Graceful shutdown did not complete before the update install deadline; proceeding with a possibly truncated flush"
+        );
+    }
+
+    if let Err(error) = update.update.install(&artifact) {
+        tracing::warn!("Secure updater install failed: {error}");
+        // Distinct from `public_failure`: the teardown above already stopped
+        // Ember's network services, so this process is no longer transferring
+        // even though the window is still up.
+        return Err(coded(
+            "updater_install_failed_services_stopped",
+            "Secure update install failed. Ember stopped its network services for the update; restart Ember to resume transfers.",
+        ));
+    }
+    // Only reached where the install ran in process: the new version is in
+    // place, so the staged copy has done its job.
+    discard_staged(app);
+    pending.take();
+    Ok(())
 }
 
 /// Which updater operation a failure is being reported for.
@@ -1580,7 +1824,7 @@ pub async fn secure_updater_install(
 ) -> Result<(), String> {
     let _operation = service.operation.lock().await;
     let mut pending = service.pending.lock().await;
-    let Some(update) = pending.as_ref() else {
+    let Some(update) = pending.as_mut() else {
         return Err(coded(
             "updater_no_pending_update",
             "No verified update is ready to install.",
@@ -1597,78 +1841,13 @@ pub async fn secure_updater_install(
     }
     let config = embedded_updater_config()
         .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
-    let artifact = download_artifact(&update.platform, &config.public_key, &on_event)
+    let report = |event: UpdateProgress| {
+        let _ = on_event.send(event);
+    };
+    prepare_locked(&app, update, &config.public_key, &report)
         .await
         .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
-    // Record the attempt and keep the verified bytes before handing them over.
-    // `install` does not come back on success, so this is the only chance to
-    // leave behind anything that a later launch could act on. A failure here is
-    // logged and ignored: losing the safety net is not a reason to refuse the
-    // update itself.
-    if let Err(error) = save_handoff(
-        &app,
-        &update.platform,
-        &update.info.version,
-        update.info.security_epoch,
-        &update.manifest,
-        &update.manifest_signature,
-        &artifact,
-    ) {
-        tracing::warn!("Could not stage the update hand-off record: {error:#}");
-    }
-    // Re-read after the long download as well. Another process may have
-    // observed a newer signed floor while this process was downloading.
-    if !pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)
-        .map_err(|error| public_failure(UpdaterOperation::Install, error))?
-    {
-        pending.take();
-        return Err(coded(
-            "updater_superseded_while_downloading",
-            "A newer signed update was observed while downloading. Check for updates again.",
-        ));
-    }
-    // `Update::install` never comes back on Windows: it hands the bundle to the
-    // NSIS/MSI installer and then calls `std::process::exit(0)`. The plugin's
-    // own `on_before_exit` hook is `AppHandle::cleanup_before_exit`, which only
-    // clears tray icons/resource tables and hides windows — `RunEvent::Exit` is
-    // never dispatched, so without this every installed update would abandon
-    // the .part.met gap maps, nodes.dat, the known.met checkpoint that exists
-    // precisely so AICH doesn't rehash from scratch, sources.met, server.met,
-    // reputation and stats at their last periodic save, and would skip graceful
-    // ed2k-server / rendezvous deregistration.
-    //
-    // Done here rather than by overriding `on_before_exit`, because that hook
-    // runs synchronously on a runtime worker inside `install`: bridging back to
-    // async from there means blocking that worker while another thread drives
-    // the shutdown, and on a single-worker runtime that starves the very
-    // network task we would be waiting on. Awaiting from the command yields the
-    // worker instead. `run_graceful_shutdown` is internally bounded and safe to
-    // run again from a later `RunEvent::Exit`; the outer timeout is the
-    // backstop for a lock inside it that never becomes available.
-    if timeout(
-        crate::SHUTDOWN_WAIT + Duration::from_secs(15),
-        crate::run_graceful_shutdown(&app, crate::SHUTDOWN_WAIT),
-    )
-    .await
-    .is_err()
-    {
-        tracing::error!(
-            "Graceful shutdown did not complete before the update install deadline; proceeding with a possibly truncated flush"
-        );
-    }
-
-    if let Err(error) = update.update.install(&artifact) {
-        tracing::warn!("Secure updater install failed: {error}");
-        // Distinct from `public_failure`: the teardown above already stopped
-        // Ember's network services, so this process is no longer transferring
-        // even though the window is still up.
-        return Err(coded(
-            "updater_install_failed_services_stopped",
-            "Secure update install failed. Ember stopped its network services for the update; restart Ember to resume transfers.",
-        ));
-    }
-    pending.take();
-    Ok(())
+    install_locked(&app, &mut pending, &config.public_key).await
 }
 
 /// Whether the last hand-off to an installer failed to produce the new version.
@@ -1695,7 +1874,13 @@ pub async fn secure_updater_handoff_status(
         handoff_path(&app).map_err(|error| public_failure(UpdaterOperation::HandoffCheck, error))?;
     let record = match read_handoff(&path) {
         Ok(Some(record)) => record,
-        Ok(None) => return Ok(None),
+        Ok(None) => {
+            // Nothing was handed over. Whatever is staged was prepared and never
+            // installed; keep it only while it is still an upgrade, so the next
+            // preparation can reuse it instead of downloading again.
+            sweep_stale_staged(&app);
+            return Ok(None);
+        }
         Err(error) => {
             // An unreadable marker is not worth surfacing, and keeping it would
             // make every launch retry the same parse.
@@ -1988,6 +2173,100 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
     fn signed_payload_verification_rejects_tampering() {
         verify_minisign(b"test", TEST_SIGNATURE.as_bytes(), TEST_PUBLIC_KEY).unwrap();
         assert!(verify_minisign(b"tampered", TEST_SIGNATURE.as_bytes(), TEST_PUBLIC_KEY).is_err());
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let unique = format!(
+            "ember-updater-{}-{}-{name}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A platform entry whose signed artifact is the bytes `test`.
+    fn platform_for_test_payload() -> SignedPlatform {
+        SignedPlatform {
+            target: "windows-x86_64".to_string(),
+            url: Url::parse("https://example.com/Ember_9.9.9_x64-setup.exe").unwrap(),
+            signature: TEST_SIGNATURE.to_string(),
+            sha256: hex::encode(Sha256::digest(b"test")),
+            size: 4,
+        }
+    }
+
+    #[test]
+    fn staged_names_stay_inside_the_staging_folder_and_parse_back() {
+        assert_eq!(installer_name("1.8.0", "exe"), "Ember_1.8.0_update.exe");
+        assert_eq!(installer_name("1.8.0", "msi"), "Ember_1.8.0_update.msi");
+        assert_eq!(installer_name("1.8.0", "bin"), "Ember_1.8.0_update.bin");
+        assert_eq!(installer_name("../../1.8.0", "sh"), "Ember_....1.8.0_update.bin");
+        assert_eq!(staged_version_from_name("Ember_1.8.0_update.exe"), Some("1.8.0"));
+        assert_eq!(staged_version_from_name("Ember_1.8.0-rc.1_update.bin"), Some("1.8.0-rc.1"));
+        assert_eq!(staged_version_from_name("ember-update-watchdog.exe"), None);
+    }
+
+    /// Staged bytes can sit for days before they are installed, so they are
+    /// re-verified from disk exactly as a download would be.
+    #[test]
+    fn a_staged_update_is_reverified_before_use() {
+        let dir = scratch_dir("reverify");
+        let path = dir.join(installer_name("9.9.9", "exe"));
+        let platform = platform_for_test_payload();
+
+        stage_artifact(&path, b"test").unwrap();
+        assert_eq!(read_verified_staged(&path, &platform, TEST_PUBLIC_KEY).unwrap(), b"test");
+
+        std::fs::write(&path, b"tset").unwrap();
+        assert!(read_verified_staged(&path, &platform, TEST_PUBLIC_KEY).is_err(), "tampered");
+
+        std::fs::write(&path, b"test!").unwrap();
+        assert!(read_verified_staged(&path, &platform, TEST_PUBLIC_KEY).is_err(), "wrong size");
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_verified_staged(&path, &platform, TEST_PUBLIC_KEY).is_err(), "missing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_replaces_whatever_an_earlier_preparation_left() {
+        let dir = scratch_dir("replace");
+        let old = dir.join(installer_name("9.9.8", "exe"));
+        std::fs::write(&old, b"old").unwrap();
+        let new = dir.join(installer_name("9.9.9", "exe"));
+
+        stage_artifact(&new, b"test").unwrap();
+        assert!(!old.exists());
+        assert_eq!(std::fs::read(&new).unwrap(), b"test");
+
+        // Re-staging the same file keeps it rather than deleting it first.
+        stage_artifact(&new, b"test").unwrap();
+        assert!(new.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sweep_keeps_only_staged_upgrades() {
+        let dir = scratch_dir("sweep");
+        let newer = dir.join(installer_name("1.8.0", "exe"));
+        let same = dir.join(installer_name("1.7.1", "exe"));
+        let older = dir.join(installer_name("1.6.0", "bin"));
+        let foreign = dir.join("something-else.tmp");
+        for path in [&newer, &same, &older, &foreign] {
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        sweep_stale_staged_in(&dir, "1.7.1");
+        assert!(newer.exists());
+        assert!(!same.exists());
+        assert!(!older.exists());
+        assert!(!foreign.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A staged installer with the version its own signed manifest declares.
