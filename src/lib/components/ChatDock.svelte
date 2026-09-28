@@ -1157,7 +1157,7 @@
     padding: 7px 10px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    background: var(--bg-secondary);
+    background: var(--bg-input);
     color: var(--text-primary);
     font: inherit;
     font-size: var(--font-size-md);
@@ -1166,6 +1166,7 @@
   .dock-search-input:focus {
     outline: none;
     border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
   .dock-list {

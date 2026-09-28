@@ -3623,8 +3623,6 @@
      bubbles and the compose field have something to sit on. */
   .conversation.channel {
     background: var(--bg-tertiary);
-    --reaction-gold: #ffd34a;
-    --reaction-heart: #ff4f5c;
   }
 
   :global([data-theme="dark"]) .conversation.channel {
@@ -3793,10 +3791,19 @@
     background: color-mix(in srgb, var(--accent) 45%, transparent);
   }
 
+  /* One bubble shape for friends and rooms: the corner, the tighter corner
+     where a message meets its neighbour in the same run, and the tail at the
+     end of a run. */
+  .conversation {
+    --bubble-radius: var(--radius-lg);
+    --bubble-run-radius: 6px;
+    --bubble-tail-radius: 4px;
+  }
+
   .conv-bubble {
     max-width: 80%;
     padding: 8px 12px;
-    border-radius: var(--radius-lg);
+    border-radius: var(--bubble-radius);
     font-size: var(--font-size-md);
     line-height: 1.4;
     word-wrap: break-word;
@@ -3831,13 +3838,13 @@
     width: 100%;
     padding: 24px 12px 8px;
     line-height: 1.4;
-    border-radius: var(--radius-md);
     box-shadow: none;
   }
 
+  /* The sender's name chip sits in this corner, so it stays tight. */
   .conversation.channel .conv-msg.received .conv-bubble,
   .conversation.channel .conv-msg.sent .conv-bubble {
-    border-top-left-radius: 8px;
+    border-top-left-radius: var(--radius-md);
   }
 
   /* Consecutive messages from one author read as a single block: the gap only
@@ -3905,15 +3912,15 @@
   }
 
   .conv-bubble.sent:not(.starts-run) {
-    border-top-right-radius: 6px;
+    border-top-right-radius: var(--bubble-run-radius);
   }
 
   .conv-bubble.sent:not(.ends-run) {
-    border-bottom-right-radius: 6px;
+    border-bottom-right-radius: var(--bubble-run-radius);
   }
 
   .conv-bubble.sent.ends-run {
-    border-bottom-right-radius: 4px;
+    border-bottom-right-radius: var(--bubble-tail-radius);
   }
 
   .conv-bubble.received {
@@ -3921,16 +3928,8 @@
     color: var(--text-primary);
   }
 
-  .conversation.channel .conv-bubble.sent {
-    background:
-      linear-gradient(
-        165deg,
-        color-mix(in srgb, #fff 14%, var(--accent)) 0%,
-        var(--accent) 46%
-      );
-    box-shadow: 0 1px 3px color-mix(in srgb, var(--accent) 28%, transparent);
-  }
-
+  /* A room's transcript is a well a step darker than the page, where the
+     tertiary fill would disappear, so a received line lifts off it instead. */
   .conversation.channel .conv-bubble.received {
     background: color-mix(in srgb, var(--bg-secondary) 88%, var(--bg-surface));
     border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
@@ -3940,40 +3939,16 @@
     background: var(--bg-tertiary);
   }
 
-  .conversation.channel .conv-bubble.sent:not(.starts-run) {
-    border-top-right-radius: 4px;
-  }
-
-  .conversation.channel .conv-bubble.sent:not(.ends-run) {
-    border-bottom-right-radius: 4px;
-  }
-
-  .conversation.channel .conv-bubble.sent.ends-run {
-    border-bottom-right-radius: 8px;
-  }
-
-  .conversation.channel .conv-bubble.received:not(.starts-run) {
-    border-top-left-radius: 8px;
-  }
-
-  .conversation.channel .conv-bubble.received:not(.ends-run) {
-    border-bottom-left-radius: 4px;
-  }
-
-  .conversation.channel .conv-bubble.received.ends-run {
-    border-bottom-left-radius: 8px;
-  }
-
   .conv-bubble.received:not(.starts-run) {
-    border-top-left-radius: 6px;
+    border-top-left-radius: var(--bubble-run-radius);
   }
 
   .conv-bubble.received:not(.ends-run) {
-    border-bottom-left-radius: 6px;
+    border-bottom-left-radius: var(--bubble-run-radius);
   }
 
   .conv-bubble.received.ends-run {
-    border-bottom-left-radius: 4px;
+    border-bottom-left-radius: var(--bubble-tail-radius);
   }
 
   /* Marks the message a search hit jumped to. A ring rather than a background
@@ -4746,17 +4721,17 @@
 
   .conversation.channel .reaction-btn {
     background:
-      linear-gradient(180deg, color-mix(in srgb, #fff 22%, transparent), transparent 58%);
+      linear-gradient(180deg, color-mix(in srgb, var(--reaction-gloss) 22%, transparent), transparent 58%);
     color: var(--reaction-gold);
     border-color: color-mix(in srgb, var(--reaction-gold) 20%, transparent);
-    box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 28%, transparent);
+    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--reaction-gloss) 28%, transparent);
   }
 
   .conversation.channel .reaction-btn svg {
     fill: var(--reaction-gold);
     stroke: color-mix(in srgb, var(--reaction-gold) 62%, #8a5600);
     filter:
-      drop-shadow(0 0.5px 0 color-mix(in srgb, #fff 78%, transparent))
+      drop-shadow(0 0.5px 0 color-mix(in srgb, var(--reaction-gloss) 78%, transparent))
       drop-shadow(0 1px 1.1px color-mix(in srgb, #000 26%, transparent));
   }
 
@@ -4767,11 +4742,11 @@
   .conversation.channel .reaction-btn:hover:not([aria-disabled='true']):not(.static) {
     color: var(--reaction-gold);
     background:
-      linear-gradient(180deg, color-mix(in srgb, #fff 42%, transparent), transparent 48%),
+      linear-gradient(180deg, color-mix(in srgb, var(--reaction-gloss) 42%, transparent), transparent 48%),
       color-mix(in srgb, var(--reaction-gold) 20%, transparent);
     border-color: color-mix(in srgb, var(--reaction-gold) 48%, transparent);
     box-shadow:
-      inset 0 1px 0 color-mix(in srgb, #fff 55%, transparent),
+      inset 0 1px 0 color-mix(in srgb, var(--reaction-gloss) 55%, transparent),
       0 1px 3px color-mix(in srgb, var(--reaction-gold) 28%, transparent);
   }
 
@@ -4792,11 +4767,11 @@
   .conversation.channel .reaction-btn.active {
     color: var(--reaction-gold);
     background:
-      linear-gradient(180deg, color-mix(in srgb, #fff 36%, transparent), transparent 46%),
+      linear-gradient(180deg, color-mix(in srgb, var(--reaction-gloss) 36%, transparent), transparent 46%),
       color-mix(in srgb, var(--reaction-gold) 24%, transparent);
     border-color: color-mix(in srgb, var(--reaction-gold) 55%, transparent);
     box-shadow:
-      inset 0 1px 0 color-mix(in srgb, #fff 50%, transparent),
+      inset 0 1px 0 color-mix(in srgb, var(--reaction-gloss) 50%, transparent),
       0 1px 4px color-mix(in srgb, var(--reaction-gold) 32%, transparent);
   }
 
@@ -4813,22 +4788,22 @@
   .conversation.channel .reaction-btn.heart:hover:not([aria-disabled='true']):not(.static) {
     color: var(--reaction-heart);
     background:
-      linear-gradient(180deg, color-mix(in srgb, #fff 42%, transparent), transparent 48%),
+      linear-gradient(180deg, color-mix(in srgb, var(--reaction-gloss) 42%, transparent), transparent 48%),
       color-mix(in srgb, var(--reaction-heart) 20%, transparent);
     border-color: color-mix(in srgb, var(--reaction-heart) 48%, transparent);
     box-shadow:
-      inset 0 1px 0 color-mix(in srgb, #fff 55%, transparent),
+      inset 0 1px 0 color-mix(in srgb, var(--reaction-gloss) 55%, transparent),
       0 1px 3px color-mix(in srgb, var(--reaction-heart) 28%, transparent);
   }
 
   .conversation.channel .reaction-btn.heart.active {
     color: var(--reaction-heart);
     background:
-      linear-gradient(180deg, color-mix(in srgb, #fff 36%, transparent), transparent 46%),
+      linear-gradient(180deg, color-mix(in srgb, var(--reaction-gloss) 36%, transparent), transparent 46%),
       color-mix(in srgb, var(--reaction-heart) 24%, transparent);
     border-color: color-mix(in srgb, var(--reaction-heart) 55%, transparent);
     box-shadow:
-      inset 0 1px 0 color-mix(in srgb, #fff 50%, transparent),
+      inset 0 1px 0 color-mix(in srgb, var(--reaction-gloss) 50%, transparent),
       0 1px 4px color-mix(in srgb, var(--reaction-heart) 32%, transparent);
   }
 
@@ -5328,6 +5303,7 @@
 
   .conv-input:focus {
     border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
   .conv-input:disabled {

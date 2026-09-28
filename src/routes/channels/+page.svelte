@@ -4897,14 +4897,16 @@
     padding: 0 8px 8px;
   }
 
+  /* Same card as a friend chat's file attachment: corners, padding, lift. */
   .xfer-card {
     display: flex;
     flex-direction: column;
     gap: 7px;
-    padding: 10px;
+    padding: 12px;
     border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-lg);
     background: var(--bg-secondary);
+    box-shadow: var(--shadow-sm);
     flex-shrink: 0;
   }
 

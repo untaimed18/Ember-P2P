@@ -256,13 +256,13 @@
     width: min(320px, 100%);
     padding: 12px;
     border: 1px solid var(--border);
-    border-radius: var(--radius-lg, 12px);
+    border-radius: var(--radius-lg);
     background: var(--bg-secondary);
     color: var(--text-primary);
     display: flex;
     flex-direction: column;
     gap: 9px;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+    box-shadow: var(--shadow-sm);
   }
 
   .attach.sent {
@@ -299,14 +299,14 @@
     display: grid;
     place-items: center;
     background: var(--success);
-    color: #fff;
+    color: var(--on-success);
     box-shadow: 0 0 0 2px var(--bg-secondary);
   }
 
-  .attach.sent .attach-dir { background: var(--accent); }
-  .attach.done .attach-dir { background: var(--success); }
-  .attach.problem .attach-dir { background: var(--text-muted); }
-  .attach.failed .attach-dir { background: var(--danger); }
+  .attach.sent .attach-dir { background: var(--accent); color: var(--on-accent); }
+  .attach.done .attach-dir { background: var(--success); color: var(--on-success); }
+  .attach.problem .attach-dir { background: var(--text-muted); color: var(--bg-secondary); }
+  .attach.failed .attach-dir { background: var(--danger); color: var(--on-danger); }
 
   .attach-dir svg {
     width: 10px;
@@ -347,11 +347,12 @@
     line-height: 16px;
   }
 
+  /* Same track as a Channels transfer card's. */
   .attach-bar {
     position: relative;
     height: 6px;
     border-radius: var(--radius-pill);
-    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    background: color-mix(in srgb, var(--text-muted) 22%, transparent);
     overflow: hidden;
   }
 

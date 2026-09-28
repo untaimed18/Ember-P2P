@@ -75,6 +75,11 @@
   --priority-auto: #7cb342;
   --stat-ratio: #9c27b0;
   --ember-dht-color: #00838f;
+  /* Room reaction chips: a star and a heart, and the glossy highlight across
+     a chip that has been reacted to. */
+  --reaction-gold: #ffd34a;
+  --reaction-heart: #ff4f5c;
+  --reaction-gloss: #ffffff;
 
   --border: #dadce0;
   --border-light: #c4c9d4;
@@ -237,6 +242,11 @@
   --priority-auto: #9ccc65;
   --stat-ratio: #c792d9;
   --ember-dht-color: #4db6ac;
+  /* Softer on the dark canvas, where the light theme's gold and full-white
+     gloss glare. */
+  --reaction-gold: #e7c35c;
+  --reaction-heart: #ec6b76;
+  --reaction-gloss: rgba(255, 255, 255, 0.4);
 
   /* Borders are barely there — 4–5% lighter than the bg they sit against. */
   --border: #2a3038;
