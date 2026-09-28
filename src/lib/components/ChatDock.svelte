@@ -892,19 +892,19 @@
       {#if activeTab}
         <ChatConversation friendHash={activeTab.hash} friendName={activeTab.name} />
       {:else}
-        <div class="dock-empty-state">
-          <div class="empty-illustration" aria-hidden="true">
-            <svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <div class="empty-state dock-empty-state">
+          <div class="icon" aria-hidden="true">
+            <svg viewBox="0 0 64 64" width="48" height="48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 18a6 6 0 016-6h28a6 6 0 016 6v18a6 6 0 01-6 6H30l-10 10v-10h-2a6 6 0 01-6-6V18z"/>
               <line x1="22" y1="26" x2="40" y2="26"/>
               <line x1="22" y1="32" x2="36" y2="32"/>
             </svg>
           </div>
           <p class="empty-title">{m.chat_dock_empty_title()}</p>
-          <p class="empty-hint">
+          <p class="empty-sub">
             {$friendsList.length ? m.chat_dock_empty_hint() : m.chat_dock_no_friends()}
           </p>
-          <button type="button" class="secondary empty-cta" onclick={handleNewChat}>
+          <button type="button" class="secondary empty-action" onclick={handleNewChat}>
             {$friendsList.length ? m.chat_dock_pick_friend() : m.chat_dock_empty_cta()}
           </button>
         </div>
@@ -1338,44 +1338,13 @@
     color: var(--text-secondary);
   }
 
+  /* Fills the dock under its header; the rest is the shared empty state. */
   .dock-empty-state {
     flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
     padding: 32px;
-    text-align: center;
-    gap: 12px;
-    color: var(--text-muted);
   }
 
-  .empty-illustration {
-    color: var(--text-muted);
-    opacity: 0.55;
-  }
-
-  .empty-illustration svg {
-    width: 64px;
-    height: 64px;
-  }
-
-  .empty-title {
-    margin: 4px 0 0;
-    font-size: var(--font-size-base);
-    font-weight: 600;
-    color: var(--text-primary);
-  }
-
-  .empty-hint {
-    margin: 0;
-    font-size: var(--font-size-md);
-    line-height: 1.5;
+  .dock-empty-state .empty-sub {
     max-width: 280px;
-  }
-
-  .empty-cta {
-    margin-top: 8px;
-    font-size: var(--font-size-md);
   }
 </style>

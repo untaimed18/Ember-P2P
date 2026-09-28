@@ -4970,25 +4970,25 @@
           {/if}
           {#if allDownloads.length === 0}
             <tr class="empty-row"><td colspan={dlColCount} class="empty-cell">
-              <div class="empty-cell-body">
-                <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+              <div class="empty-state compact">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                   <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
                   <polyline points="7 10 12 15 17 10"></polyline>
                   <line x1="12" y1="15" x2="12" y2="3"></line>
                 </svg>
-                <p class="empty-cell-title">{m.transfers_empty_no_downloads()}</p>
-                <p class="empty-cell-sub"><a href="/search">{m.transfers_empty_start_search_prefix()}</a>{m.transfers_empty_start_search_suffix()}</p>
+                <p class="empty-title">{m.transfers_empty_no_downloads()}</p>
+                <p class="empty-sub"><a href="/search">{m.transfers_empty_start_search_prefix()}</a>{m.transfers_empty_start_search_suffix()}</p>
               </div>
             </td></tr>
           {:else if filteredActiveDownloads.length === 0 && filteredCompletedDownloads.length === 0}
             <tr class="empty-row"><td colspan={dlColCount} class="empty-cell">
-              <div class="empty-cell-body">
-                <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+              <div class="empty-state compact">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                   <circle cx="11" cy="11" r="8"></circle>
                   <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                 </svg>
-                <p class="empty-cell-title">{m.transfers_empty_no_matches()}</p>
-                <button class="empty-cell-action" type="button" onclick={() => (transferFilter = '')}>{m.transfers_known_clear_filter()}</button>
+                <p class="empty-title">{m.transfers_empty_no_matches()}</p>
+                <button class="secondary empty-action" type="button" onclick={() => (transferFilter = '')}>{m.transfers_known_clear_filter()}</button>
               </div>
             </td></tr>
           {/if}
@@ -5310,25 +5310,25 @@
             -->
             {#if activeUploads.length === 0}
               <tr class="empty-row"><td colspan={ulColCount} class="empty-cell">
-                <div class="empty-cell-body">
-                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                <div class="empty-state compact">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                     <path d="M3 15v4a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-4"></path>
                     <polyline points="17 8 12 3 7 8"></polyline>
                     <line x1="12" y1="3" x2="12" y2="15"></line>
                   </svg>
-                  <p class="empty-cell-title">{m.transfers_empty_no_uploads()}</p>
-                  <p class="empty-cell-sub">{m.transfers_empty_no_uploads_sub()}</p>
+                  <p class="empty-title">{m.transfers_empty_no_uploads()}</p>
+                  <p class="empty-sub">{m.transfers_empty_no_uploads_sub()}</p>
                 </div>
               </td></tr>
             {:else if filteredActiveUploads.length === 0}
               <tr class="empty-row"><td colspan={ulColCount} class="empty-cell">
-                <div class="empty-cell-body">
-                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                <div class="empty-state compact">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                     <circle cx="11" cy="11" r="8"></circle>
                     <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                   </svg>
-                  <p class="empty-cell-title">{m.transfers_empty_no_upload_matches()}</p>
-                  <button class="empty-cell-action" type="button" onclick={() => (transferFilter = '')}>{m.transfers_known_clear_filter()}</button>
+                  <p class="empty-title">{m.transfers_empty_no_upload_matches()}</p>
+                  <button class="secondary empty-action" type="button" onclick={() => (transferFilter = '')}>{m.transfers_known_clear_filter()}</button>
                 </div>
               </td></tr>
             {/if}
@@ -5425,23 +5425,23 @@
             {#if uploadQueueClients.length === 0}
               <tr class="empty-row"><td colspan={queueColCount} class="empty-cell">
                 {#if uploadQueueLoadFailed}
-                  <div class="empty-cell-body">
-                    <p class="empty-cell-title">{m.transfers_load_unavailable()}</p>
-                    <p class="empty-cell-sub">{m.transfers_load_retrying()}</p>
+                  <div class="empty-state compact">
+                    <p class="empty-title">{m.transfers_load_unavailable()}</p>
+                    <p class="empty-sub">{m.transfers_load_retrying()}</p>
                   </div>
                 {:else if uploadQueueLoaded}
-                  <div class="empty-cell-body">
-                    <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                  <div class="empty-state compact">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                       <circle cx="12" cy="12" r="10"></circle>
                       <polyline points="12 6 12 12 16 14"></polyline>
                     </svg>
-                    <p class="empty-cell-title">{m.transfers_empty_no_queue()}</p>
-                    <p class="empty-cell-sub">{m.transfers_empty_no_queue_sub()}</p>
+                    <p class="empty-title">{m.transfers_empty_no_queue()}</p>
+                    <p class="empty-sub">{m.transfers_empty_no_queue_sub()}</p>
                   </div>
                 {:else}
-                  <div class="empty-cell-body">
+                  <div class="empty-state compact">
                     <div class="spinner"></div>
-                    <p class="empty-cell-sub">{m.transfers_loading_short()}</p>
+                    <p class="empty-sub">{m.transfers_loading_short()}</p>
                   </div>
                 {/if}
               </td></tr>
@@ -5650,38 +5650,38 @@
             {#if filteredKnownClients.length === 0}
               <tr class="empty-row"><td colspan={knownColCount} class="empty-cell">
                 {#if !knownClientsLoaded}
-                  <div class="empty-cell-body">
+                  <div class="empty-state compact">
                     <div class="spinner"></div>
-                    <p class="empty-cell-sub">{m.transfers_loading_short()}</p>
+                    <p class="empty-sub">{m.transfers_loading_short()}</p>
                   </div>
                 {:else if knownClientsLoadFailed && knownLedger.length === 0}
-                  <div class="empty-cell-body">
-                    <p class="empty-cell-title">{m.transfers_load_unavailable()}</p>
-                    <p class="empty-cell-sub">{m.transfers_load_retrying()}</p>
+                  <div class="empty-state compact">
+                    <p class="empty-title">{m.transfers_load_unavailable()}</p>
+                    <p class="empty-sub">{m.transfers_load_retrying()}</p>
                   </div>
                 {:else if knownLedger.length === 0}
-                  <div class="empty-cell-body">
-                    <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                  <div class="empty-state compact">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                       <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
                       <circle cx="12" cy="7" r="4"></circle>
                     </svg>
                     {#if showingEmberKnown}
-                      <p class="empty-cell-title">{m.transfers_empty_no_ember()}</p>
-                      <p class="empty-cell-sub">{m.transfers_empty_no_ember_sub()}</p>
+                      <p class="empty-title">{m.transfers_empty_no_ember()}</p>
+                      <p class="empty-sub">{m.transfers_empty_no_ember_sub()}</p>
                     {:else}
-                      <p class="empty-cell-title">{m.transfers_empty_no_credit()}</p>
-                      <p class="empty-cell-sub">{m.transfers_empty_no_credit_sub()}</p>
+                      <p class="empty-title">{m.transfers_empty_no_credit()}</p>
+                      <p class="empty-sub">{m.transfers_empty_no_credit_sub()}</p>
                     {/if}
                   </div>
                 {:else}
-                  <div class="empty-cell-body">
-                    <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                  <div class="empty-state compact">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                       <circle cx="11" cy="11" r="7"/>
                       <line x1="16" y1="16" x2="20" y2="20"/>
                     </svg>
-                    <p class="empty-cell-title">{m.transfers_known_no_matches()}</p>
-                    <p class="empty-cell-sub">{m.transfers_known_no_matches_sub({ query: knownFilter })}</p>
-                    <button class="empty-cell-action" type="button" onclick={() => (knownFilter = '')}>{m.transfers_known_clear_filter()}</button>
+                    <p class="empty-title">{m.transfers_known_no_matches()}</p>
+                    <p class="empty-sub">{m.transfers_known_no_matches_sub({ query: knownFilter })}</p>
+                    <button class="secondary empty-action" type="button" onclick={() => (knownFilter = '')}>{m.transfers_known_clear_filter()}</button>
                   </div>
                 {/if}
               </td></tr>
@@ -5773,62 +5773,62 @@
               {/each}
               {#if clientSources.length === 0}
                 <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
-                  <div class="empty-cell-body">
-                    <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                  <div class="empty-state compact">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                       <circle cx="12" cy="12" r="10"></circle>
                       <line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line>
                     </svg>
-                    <p class="empty-cell-title">{m.transfers_empty_all_sources_failed()}</p>
-                    <p class="empty-cell-sub">{m.transfers_empty_all_sources_failed_sub()}</p>
+                    <p class="empty-title">{m.transfers_empty_all_sources_failed()}</p>
+                    <p class="empty-sub">{m.transfers_empty_all_sources_failed_sub()}</p>
                   </div>
                 </td></tr>
               {/if}
             {:else if loadingSources && expandedTransferId}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
-                <div class="empty-cell-body">
+                <div class="empty-state compact">
                   <div class="spinner"></div>
-                  <p class="empty-cell-sub">{m.transfers_loading_sources_dots()}</p>
+                  <p class="empty-sub">{m.transfers_loading_sources_dots()}</p>
                 </div>
               </td></tr>
             {:else if selectedDownloadIds.length > 1}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
-                <div class="empty-cell-body">
-                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                <div class="empty-state compact">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                     <circle cx="9" cy="7" r="4"></circle>
                     <path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"></path>
                     <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
                     <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
                   </svg>
-                  <p class="empty-cell-title">{m.transfers_empty_multiple_selected()}</p>
-                  <p class="empty-cell-sub">{m.transfers_empty_multiple_selected_sub()}</p>
+                  <p class="empty-title">{m.transfers_empty_multiple_selected()}</p>
+                  <p class="empty-sub">{m.transfers_empty_multiple_selected_sub()}</p>
                 </div>
               </td></tr>
             {:else if selectedDownloadIds.length === 1 && !activeDownloads.some((d) => d.id === selectedDownloadIds[0])}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
-                <div class="empty-cell-body">
-                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                <div class="empty-state compact">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                     <circle cx="9" cy="7" r="4"></circle>
                     <path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"></path>
                     <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
                     <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
                   </svg>
-                  <p class="empty-cell-title">{m.transfers_empty_finished_dl()}</p>
-                  <p class="empty-cell-sub">{m.transfers_empty_finished_dl_sub()}</p>
+                  <p class="empty-title">{m.transfers_empty_finished_dl()}</p>
+                  <p class="empty-sub">{m.transfers_empty_finished_dl_sub()}</p>
                 </div>
               </td></tr>
             {:else if expandedClientsParent && sourceLoadError}
               {@const parent = expandedClientsParent}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
-                <div class="empty-cell-body">
-                  <p class="empty-cell-title">{sourceLoadError}</p>
-                  <button class="empty-cell-action" type="button" onclick={() => reloadSourceDetail(parent)}>{m.common_retry()}</button>
+                <div class="empty-state compact">
+                  <p class="empty-title">{sourceLoadError}</p>
+                  <button class="secondary empty-action" type="button" onclick={() => reloadSourceDetail(parent)}>{m.common_retry()}</button>
                 </div>
               </td></tr>
             {:else if expandedClientsParent}
               {@const parent = expandedClientsParent}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
-                <div class="empty-cell-body">
-                  <p class="empty-cell-title">
+                <div class="empty-state compact">
+                  <p class="empty-title">
                     {parent.sources > 0
                       ? plural(parent.sources, {
                         one: m.transfers_connecting_sources_one,
@@ -5836,33 +5836,33 @@
                       })
                       : m.transfers_no_source_details()}
                   </p>
-                  <button class="empty-cell-action" type="button" onclick={() => findSourcesInline(parent)}>{m.transfers_find_sources()}</button>
+                  <button class="secondary empty-action" type="button" onclick={() => findSourcesInline(parent)}>{m.transfers_find_sources()}</button>
                 </div>
               </td></tr>
             {:else if activeDownloads.length === 0}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
-                <div class="empty-cell-body">
-                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                <div class="empty-state compact">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                     <circle cx="9" cy="7" r="4"></circle>
                     <path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"></path>
                     <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
                     <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
                   </svg>
-                  <p class="empty-cell-title">{m.transfers_empty_no_active_dl()}</p>
-                  <p class="empty-cell-sub">{m.transfers_empty_no_active_dl_sub()}</p>
+                  <p class="empty-title">{m.transfers_empty_no_active_dl()}</p>
+                  <p class="empty-sub">{m.transfers_empty_no_active_dl_sub()}</p>
                 </div>
               </td></tr>
             {:else}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
-                <div class="empty-cell-body">
-                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                <div class="empty-state compact">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                     <circle cx="9" cy="7" r="4"></circle>
                     <path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"></path>
                     <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
                     <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
                   </svg>
-                  <p class="empty-cell-title">{m.transfers_empty_select_dl()}</p>
-                  <p class="empty-cell-sub">{m.transfers_empty_select_dl_sub()}</p>
+                  <p class="empty-title">{m.transfers_empty_select_dl()}</p>
+                  <p class="empty-sub">{m.transfers_empty_select_dl_sub()}</p>
                 </div>
               </td></tr>
             {/if}
@@ -7285,64 +7285,15 @@
     color: var(--text-muted);
     font-size: var(--font-size-xs);
   }
-  .empty-cell {
-    text-align: center;
-    padding: 30px 16px !important;
-    color: var(--text-muted);
-    font-size: var(--font-size-md);
-  }
+  /* The row only hosts a shared `.empty-state compact`, which carries its own
+     padding and type; the cell must not add a second layer of either. */
   .empty-row td.empty-cell {
-    padding: 40px 16px !important;
+    padding: 0 !important;
+    white-space: normal;
     background: transparent;
   }
   .empty-row:hover td.empty-cell {
     background: transparent;
-  }
-  .empty-cell-body {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 8px;
-    color: var(--text-muted);
-  }
-  .empty-cell-icon {
-    color: var(--text-muted);
-    opacity: 0.65;
-  }
-  .empty-cell-title {
-    font-size: var(--font-size-base);
-    font-weight: 500;
-    color: var(--text-secondary);
-    margin: 0;
-  }
-  .empty-cell-action {
-    margin-top: 4px;
-    padding: 4px 12px;
-    font-size: var(--font-size-sm);
-    font-weight: 500;
-    color: var(--text-secondary);
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
-  }
-  .empty-cell-action:hover {
-    background: var(--bg-hover);
-    color: var(--accent);
-    border-color: var(--accent);
-  }
-  .empty-cell-sub {
-    font-size: var(--font-size-sm);
-    color: var(--text-muted);
-    margin: 0;
-  }
-  .empty-cell-sub a {
-    color: var(--accent);
-    text-decoration: none;
-  }
-  .empty-cell-sub a:hover {
-    text-decoration: underline;
   }
   .selection-footer {
     display: flex;

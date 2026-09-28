@@ -2081,10 +2081,6 @@
     opacity: 0.6;
   }
 
-  .empty-state.compact {
-    padding: 34px 16px;
-  }
-
   /* Local badge variants. Follow the same tinted-chip recipe as the
      global badges in app.css so the KAD page matches in both themes. */
   .badge.stopping {

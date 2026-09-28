@@ -4165,9 +4165,22 @@
     {#if filteredResults.length === 0 && visibleResults.length > 0}
       <div class="empty-state">
         {#if hasActiveFilters}
+          <div class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3z"/>
+            </svg>
+          </div>
           <p class="empty-title">{m.search_no_results_filters()}</p>
           <button type="button" class="ghost empty-action" onclick={clearFilters}>{m.common_clear_filters()}</button>
         {:else}
+          <div class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
+              <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
+              <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/>
+              <line x1="1" y1="1" x2="23" y2="23"/>
+            </svg>
+          </div>
           <p class="empty-title">{allHiddenSpamLabel}</p>
           <button type="button" class="ghost empty-action" onclick={() => (hideSpam = false)}>{m.search_show_spam()}</button>
         {/if}

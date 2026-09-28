@@ -1768,10 +1768,6 @@
     margin-right: 8px;
   }
 
-  .empty-state.compact {
-    padding: 40px 16px;
-  }
-
   /* Context menu styling is shared app-wide — see `.ctx-menu` in app.css. */
 
   /* Colors come from the shared `.badge` recipes in app.css, so a connection

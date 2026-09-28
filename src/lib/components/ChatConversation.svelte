@@ -2966,20 +2966,20 @@
         <button class="conv-load-retry" onclick={retryLoad} type="button">{m.common_retry()}</button>
       </div>
     {:else if messages.length === 0 && attachmentPlacement.count === 0}
-      <div class="conv-empty">
+      <div class="empty-state compact">
         {#if chatLocked}
-          {m.friends_chat_locked_title()}
+          <p class="empty-title">{m.friends_chat_locked_title()}</p>
         {:else if chatDisabled}
-          {m.chat_empty_disabled()}
+          <p class="empty-title">{m.chat_empty_disabled()}</p>
         {:else if isChannel}
-          <p class="conv-empty-title">
+          <p class="empty-title">
             {youAreBanned || youAreKeyBehind || announceOnly
               ? m.channels_empty_chat_readonly()
               : m.channels_empty_chat()}
           </p>
-          <p class="conv-empty-hint">{m.channels_empty_chat_hint()}</p>
+          <p class="empty-sub">{m.channels_empty_chat_hint()}</p>
         {:else}
-          {m.chat_say_hello()}
+          <p class="empty-title">{m.chat_say_hello()}</p>
         {/if}
       </div>
     {:else}
@@ -3659,31 +3659,14 @@
     gap: 6px;
   }
 
-  .conv-loading,
-  .conv-empty {
-    text-align: center;
-    color: var(--text-muted);
-    padding: 24px;
-    font-size: var(--font-size-md);
-  }
-
   .conv-loading {
     display: flex;
     align-items: center;
     justify-content: center;
     gap: 8px;
-  }
-
-  .conv-empty-title,
-  .conv-empty-hint {
-    margin: 0;
-  }
-
-  .conv-empty-hint {
-    margin-top: 8px;
-    font-size: var(--font-size-sm);
-    line-height: 1.45;
-    opacity: 0.85;
+    padding: 24px;
+    color: var(--text-muted);
+    font-size: var(--font-size-md);
   }
 
   .conv-load-error {

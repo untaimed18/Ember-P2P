@@ -768,6 +768,11 @@ tr:hover td {
   gap: 12px;
 }
 
+/* Inside a table, a side pane or anywhere the full 60px would crowd it. */
+.empty-state.compact {
+  padding: 40px 16px;
+}
+
 .empty-state .icon {
   font-size: 48px;
   opacity: 0.45;

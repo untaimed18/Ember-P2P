@@ -3811,11 +3811,11 @@
            their shares are gone. -->
       <div class="empty-state">
         {#if firstLoadSlow}
-          <p>{m.library_load_timeout()}</p>
+          <p class="empty-title">{m.library_load_timeout()}</p>
           <button type="button" class="empty-action" onclick={() => { error = null; void refresh(true); }}>{m.common_retry()}</button>
         {:else}
           <div class="spinner lg"></div>
-          <p>{m.common_loading()}</p>
+          <p class="empty-title">{m.common_loading()}</p>
         {/if}
       </div>
     {:else if sortedFiles.length === 0 && !scanning}
@@ -3832,7 +3832,7 @@
     {:else if sortedFiles.length === 0 && scanning}
       <div class="empty-state">
         <div class="spinner lg"></div>
-        <p>{m.library_waiting_scan()}</p>
+        <p class="empty-title">{m.library_waiting_scan()}</p>
       </div>
     {:else}
       <LibraryVirtualTable
@@ -5210,14 +5210,9 @@
     text-transform: uppercase;
     letter-spacing: 0.35px;
   }
+  /* Fills the table area; everything else comes from app.css. */
   .empty-state {
     flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    color: var(--text-muted);
-    padding: 40px;
   }
   .status-bar {
     padding: 6px 12px;
