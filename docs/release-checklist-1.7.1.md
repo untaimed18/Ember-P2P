@@ -130,3 +130,20 @@ git diff v1.7.0 -- messages/en.json
       `transfers_ctx_category_new`); a long category name stays on one chip.
 - [ ] German uses the formal *Sie*; the countdown title fits the dialog in every
       language.
+
+## 8. Transfers, Statistics and Servers
+
+- [ ] **Add links** on Transfers opens with the clipboard's eD2K links already
+      in the box, counts them as you edit, and queues them.
+- [ ] Statistics shows the rate graph filling in; the 1 hour view gains a point
+      a minute and keeps its history across a sleep.
+- [ ] Make a category from a download's Category menu with several rows
+      selected: all of them get it, and its chip appears. Its chip narrows the
+      list, and Stop All then stops only those. Removing it in Edit categories
+      leaves them uncategorized.
+- [ ] Import a large server.met (1,000+ servers): the Servers list scrolls
+      smoothly to the last server, the stripes stay even, and sorting and the
+      filter still work.
+- [ ] On a busy install, the Queue and Known Peers tabs scroll through every row
+      (Known Peers no longer stops at 1,000), and Trust badges fill in for rows
+      scrolled into view.

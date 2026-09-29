@@ -33,6 +33,7 @@
   import { toastError } from '$lib/stores/toast';
   import { serverLog, appendServerLog, clearServerLog } from '$lib/stores/serverLog';
   import IconX from '$lib/components/IconX.svelte';
+  import { TableWindow } from '$lib/tableWindow.svelte';
 
   let servers: ServerInfo[] = $state([]);
   let connectedServer: ServerInfo | null = $state(null);
@@ -810,6 +811,16 @@
     });
   });
 
+  // A server.met from one of the big lists runs to thousands of entries, each a
+  // row of a dozen cells; only the ones near the viewport are mounted. Lists
+  // this short or shorter render whole and keep their row animations.
+  const serverWindow = new TableWindow(() => filteredServers.length, {
+    minRows: 150,
+    rowHeight: 30,
+    rowSelector: 'tr.server-row',
+  });
+  let windowedServers = $derived(serverWindow.slice(filteredServers));
+
   function formatCount(n: number): string {
     if (n === 0) return '\u2014';
     return formatCompactCount(n);
@@ -984,7 +995,7 @@
         </div>
       </div>
 
-      <div class="server-table-wrap">
+      <div class="server-table-wrap" bind:this={serverWindow.scroller}>
         {#if loading && servers.length === 0}
           <div class="empty-state compact">
             <div class="spinner lg"></div>
@@ -1055,9 +1066,14 @@
                 <th>{m.servers_col_actions()}</th>
               </tr>
             </thead>
-            <tbody>
-              {#each filteredServers as server (`${server.ip}:${server.port}`)}
+            <tbody bind:this={serverWindow.body}>
+              {#if serverWindow.topPad > 0}
+                <tr class="row-spacer" aria-hidden="true" style="height: {serverWindow.topPad}px;"><td colspan="11"></td></tr>
+              {/if}
+              {#each windowedServers as server, i (`${server.ip}:${server.port}`)}
                 <tr
+                  class="server-row"
+                  class:row-alt={((serverWindow.start + i) & 1) === 1}
                   class:connected={isConnected(server)}
                   class:selected={isSelected(server)}
                   class:failed-server={server.fail_count >= 3}
@@ -1067,8 +1083,8 @@
                   ondblclick={() => handleDoubleClick(server)}
                   oncontextmenu={(e: MouseEvent) => handleContextMenu(e, server)}
                   onkeydown={(e) => handleRowKeydown(e, server)}
-                  in:fade={{ duration: 150 }}
-                  animate:flip={{ duration: 180 }}
+                  in:fade={{ duration: serverWindow.active ? 0 : 150 }}
+                  animate:flip={{ duration: serverWindow.active ? 0 : 180 }}
                 >
                   <td class="name-cell" title={server.name || m.servers_unnamed()}>
                     <span class="server-icon" class:connected-icon={isConnected(server)}>S</span>
@@ -1100,6 +1116,9 @@
                   </td>
                 </tr>
               {/each}
+              {#if serverWindow.bottomPad > 0}
+                <tr class="row-spacer" aria-hidden="true" style="height: {serverWindow.bottomPad}px;"><td colspan="11"></td></tr>
+              {/if}
             </tbody>
           </table>
         {/if}
@@ -1524,8 +1543,20 @@
     background: var(--bg-hover);
   }
 
-  .server-table tbody tr:nth-child(even):not(.selected):not(.connected) {
+  /* From the list index, not `nth-child`: windowed rows change which child
+     they are as the table scrolls. */
+  .server-table tbody tr.row-alt:not(.selected):not(.connected) {
     background: var(--table-row-alt);
+  }
+
+  .server-table tbody tr.row-spacer,
+  .server-table tbody tr.row-spacer:hover {
+    background: transparent;
+  }
+
+  .server-table tbody tr.row-spacer td {
+    padding: 0;
+    border: 0;
   }
 
   .server-table tbody tr.selected {

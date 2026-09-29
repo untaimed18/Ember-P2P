@@ -54,6 +54,7 @@
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import IconX from '$lib/components/IconX.svelte';
+  import { TableWindow } from '$lib/tableWindow.svelte';
 
   function countryFlagSrc(code: string | undefined): string | null {
     if (!code || code.length !== 2) return null;
@@ -1235,12 +1236,8 @@
       // Force-refresh Trust badges so manual bans / score changes appear
       // without leaving the tab.
       //
-      // Every displayed row, every poll: `getPeerReputationBatch` is one
-      // command for the whole page, so the cost no longer scales with the row
-      // count and there is nothing left to ration. The rotating window this
-      // replaces existed only to bound a per-row fan-out, and its side effect
-      // was that rows outside the current slice sat on "—" with a "Fetching…"
-      // tooltip for up to eighty seconds.
+      // Every mounted row, every poll, in one `getPeerReputationBatch` command.
+      // Rows scrolled into view between polls are fetched as they appear.
       if (refreshBadges) {
         const hashes = displayedKnownClients.map((k) => k.user_hash);
         if (hashes.length > 0) {
@@ -1396,7 +1393,6 @@
   // copied), last IP, country code, the peer's Hello name, its client
   // software, or — when the row is a friend — the friend nickname. Empty
   // filter passes through everything.
-  const KNOWN_CLIENT_DISPLAY_LIMIT = 1000;
   let filteredKnownClients = $derived.by(() => {
     const q = knownFilter.trim().toLowerCase();
     if (!q) return sortedKnownClients;
@@ -1414,9 +1410,33 @@
       return false;
     });
   });
-  let displayedKnownClients = $derived.by(() =>
-    filteredKnownClients.slice(0, KNOWN_CLIENT_DISPLAY_LIMIT)
-  );
+  // The upload queue and the known-peers ledger run to thousands of rows, so
+  // only those near the viewport are mounted. The whole ledger is reachable;
+  // it used to stop at its first 1,000 rows.
+  let bottomPaneEl: HTMLDivElement | undefined = $state(undefined);
+  const queueWindow = new TableWindow(() => sortedUploadQueueClients.length, {
+    minRows: 150,
+    rowHeight: 28,
+    rowSelector: 'tr.queue-row',
+  });
+  const knownWindow = new TableWindow(() => filteredKnownClients.length, {
+    minRows: 150,
+    rowHeight: 30,
+    rowSelector: 'tr.client-row',
+  });
+  $effect(() => {
+    queueWindow.scroller = bottomPaneEl;
+    knownWindow.scroller = bottomPaneEl;
+  });
+  let displayedKnownClients = $derived(knownWindow.slice(filteredKnownClients));
+  // Trust badges for rows scrolled into view; the poll refreshes the rest.
+  $effect(() => {
+    if (!knownLedgerActive) return;
+    const hashes = displayedKnownClients.map((k) => k.user_hash);
+    untrack(() => {
+      if (hashes.length > 0) void refreshReputations(hashes);
+    });
+  });
 
   // Top-line stats for the active known-peers tab. Computed off the
   // unfiltered split (eD2K or Ember) so totals match that tab's ledger
@@ -1716,6 +1736,7 @@
     });
     return sorted;
   });
+  let windowedQueueClients = $derived(queueWindow.slice(sortedUploadQueueClients));
 
   // --- Sorting ---
   type DlSortField = 'file_name' | 'total_size' | 'transferred' | 'completed_size' | 'speed' | 'progress' | 'sources' | 'priority' | 'status' | 'remaining' | 'last_seen_complete' | 'last_received' | 'category' | 'started_at';
@@ -5351,6 +5372,7 @@
     <div
       class="pane-content scroll-shadows"
       id="bottom-pane-content"
+      bind:this={bottomPaneEl}
       oncontextmenu={onUploadsPaneCtx}
       role="tabpanel"
       tabindex={-1}
@@ -5567,9 +5589,12 @@
               {/each}
             </tr>
           </thead>
-          <tbody>
-            {#each sortedUploadQueueClients as q (q.user_hash + ':' + q.peer_ip + ':' + q.peer_port + ':' + q.file_hash)}
-              <tr class="ul-row">
+          <tbody bind:this={queueWindow.body}>
+            {#if queueWindow.topPad > 0}
+              <tr class="vpad-row" aria-hidden="true" style="height: {queueWindow.topPad}px;"><td colspan={queueColCount}></td></tr>
+            {/if}
+            {#each windowedQueueClients as q, i (q.user_hash + ':' + q.peer_ip + ':' + q.peer_port + ':' + q.file_hash)}
+              <tr class="ul-row queue-row win-row" class:row-alt={((queueWindow.start + i) & 1) === 1}>
                 {#each visibleQueueColumns as column (column.key)}
                   {#if column.key === 'country'}
                     <td class="flag-cell" title={q.country_code ?? ''}>{#if countryFlagSrc(q.country_code ?? undefined)}<img src={countryFlagSrc(q.country_code ?? undefined)} alt={q.country_code ?? ''} class="flag-img" />{/if}</td>
@@ -5602,6 +5627,9 @@
                 {/each}
               </tr>
             {/each}
+            {#if queueWindow.bottomPad > 0}
+              <tr class="vpad-row" aria-hidden="true" style="height: {queueWindow.bottomPad}px;"><td colspan={queueColCount}></td></tr>
+            {/if}
             {#if uploadQueueClients.length === 0}
               <tr class="empty-row"><td colspan={queueColCount} class="empty-cell">
                 {#if uploadQueueLoadFailed}
@@ -5686,11 +5714,7 @@
               <span class="known-stat" title={m.transfers_known_total_down_title()}>
                 &darr; <strong>{formatSize(knownStats.totalDown)}</strong>
               </span>
-              {#if displayedKnownClients.length < filteredKnownClients.length}
-                <span class="known-stat known-stat-match" aria-live="polite">
-                  {m.transfers_known_showing_label()} <strong>{displayedKnownClients.length}</strong> / <strong>{filteredKnownClients.length}</strong>
-                </span>
-              {:else if knownFilter && filteredKnownClients.length !== knownStats.total}
+              {#if knownFilter && filteredKnownClients.length !== knownStats.total}
                 <span class="known-stat known-stat-match" aria-live="polite">
                   {m.transfers_known_showing_label()} <strong>{filteredKnownClients.length}</strong>
                 </span>
@@ -5745,14 +5769,18 @@
               {/each}
             </tr>
           </thead>
-          <tbody>
-            {#each displayedKnownClients as kc (kc.user_hash)}
+          <tbody bind:this={knownWindow.body}>
+            {#if knownWindow.topPad > 0}
+              <tr class="vpad-row" aria-hidden="true" style="height: {knownWindow.topPad}px;"><td colspan={knownColCount}></td></tr>
+            {/if}
+            {#each displayedKnownClients as kc, i (kc.user_hash)}
               {@const emberKey = kc.ember_hash?.toLowerCase()}
               {@const isFriend = kc.is_friend || (!!emberKey && friendHashSet.has(emberKey))}
               {@const friendNick = (emberKey ? friendNickById[emberKey] : undefined) || (kc.nickname || undefined)}
               {@const shownHash = showingEmberKnown ? (kc.ember_hash || kc.user_hash) : kc.user_hash}
               <tr
-                class="client-row"
+                class="client-row win-row"
+                class:row-alt={((knownWindow.start + i) & 1) === 1}
                 class:client-row-friend={isFriend}
                 oncontextmenu={(e) => onKnownCtx(e, kc)}
               >
@@ -5827,6 +5855,9 @@
                 {/each}
               </tr>
             {/each}
+            {#if knownWindow.bottomPad > 0}
+              <tr class="vpad-row" aria-hidden="true" style="height: {knownWindow.bottomPad}px;"><td colspan={knownColCount}></td></tr>
+            {/if}
             {#if filteredKnownClients.length === 0}
               <tr class="empty-row"><td colspan={knownColCount} class="empty-cell">
                 {#if !knownClientsLoaded}
@@ -7345,12 +7376,13 @@
     text-overflow: ellipsis;
     border-bottom: 1px solid var(--table-row-divider);
   }
-  .transfer-table tbody tr:nth-child(even of :not(.source-child-row):not(.section-divider-row):not(.src-failed-summary):not(.dl-row):not(.vpad-row)) {
+  .transfer-table tbody tr:nth-child(even of :not(.source-child-row):not(.section-divider-row):not(.src-failed-summary):not(.dl-row):not(.vpad-row):not(.win-row)) {
     background: var(--table-row-alt);
   }
-  /* Download rows are windowed, so which of them is an even child changes
-     as the table scrolls; they carry their stripe from their list index. */
-  .transfer-table tbody tr.dl-row.row-alt {
+  /* Windowed rows change which child they are as the table scrolls, so they
+     carry their stripe from their list index. */
+  .transfer-table tbody tr.dl-row.row-alt,
+  .transfer-table tbody tr.win-row.row-alt {
     background: var(--table-row-alt);
   }
   .transfer-table tbody tr.vpad-row,

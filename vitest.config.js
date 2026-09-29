@@ -1,6 +1,7 @@
 // @ts-nocheck
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
+import { svelte } from "@sveltejs/vite-plugin-svelte";
 
 /**
  * Unit tests for the plain TypeScript under `src/lib`.
@@ -15,17 +16,36 @@ import { defineConfig } from "vitest/config";
  * transitively through `$lib/i18n`, so `npm run test:unit` compiles the
  * messages before running.
  *
- * Component tests would need a DOM environment and `@sveltejs/vite-plugin-svelte`
- * here; the scope today is the pure logic that had no coverage at all.
+ * Tests of rune modules (`*.svelte.test.ts`) run as their own project: the
+ * Svelte plugin compiles their runes, and they are transformed for the client,
+ * with Svelte's client runtime, because compiled for the server an effect
+ * never runs. Component tests would still need a DOM environment.
  */
+const alias = {
+  $lib: fileURLToPath(new URL("./src/lib", import.meta.url)),
+};
+
 export default defineConfig({
-  resolve: {
-    alias: {
-      $lib: fileURLToPath(new URL("./src/lib", import.meta.url)),
-    },
-  },
   test: {
-    include: ["src/**/*.test.ts"],
-    environment: "node",
+    projects: [
+      {
+        resolve: { alias },
+        test: {
+          name: "unit",
+          include: ["src/**/*.test.ts"],
+          exclude: ["src/**/*.svelte.test.ts"],
+          environment: "node",
+        },
+      },
+      {
+        plugins: [svelte()],
+        resolve: { alias, conditions: ["browser"] },
+        test: {
+          name: "runes",
+          include: ["src/**/*.svelte.test.ts"],
+          environment: "./scripts/vitest-client-environment.js",
+        },
+      },
+    ],
   },
 });
