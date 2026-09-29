@@ -50,6 +50,9 @@ export type SearchTab = {
   isSearching: boolean;
   progress: { nodes_contacted: number; results_so_far: number; phase: string } | null;
   error: string | null;
+  /** Results dropped because the tab reached its cap, least available first.
+   *  Shown, so a broad search does not look as if it lost hits for no reason. */
+  shed?: number;
 };
 
 /**
@@ -539,12 +542,15 @@ function mergeIntoTab(tab: SearchTab, incoming: SearchResult[]): SearchTab {
       results[at] = mergeResult(results[at], result);
     }
   }
+  let shed = tab.shed ?? 0;
   if (results.length > MAX_TAB_RESULTS) {
+    const before = results.length;
     shedWeakestRows(results, TAB_RESULTS_LOW_WATER);
+    shed += before - results.length;
     index.clear();
     for (let i = 0; i < results.length; i++) index.set(resultKey(results[i]), i);
   }
-  return { ...tab, results, resultIndex: index };
+  return { ...tab, results, resultIndex: index, shed };
 }
 
 function updateTabByRequestId(
@@ -722,7 +728,8 @@ function trimIdleTab(tab: SearchTab, activeId: string | null): SearchTab {
   shedWeakestRows(results, IDLE_TAB_RESULTS);
   const resultIndex = new Map<string, number>();
   for (let i = 0; i < results.length; i++) resultIndex.set(resultKey(results[i]), i);
-  return { ...tab, results, resultIndex };
+  const shed = (tab.shed ?? 0) + (tab.results.length - results.length);
+  return { ...tab, results, resultIndex, shed };
 }
 
 function trimIdleTabs(tabs: SearchTab[], activeId: string | null): SearchTab[] {

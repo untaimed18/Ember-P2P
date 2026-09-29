@@ -1207,7 +1207,15 @@ pub fn run() {
                             startup_cursor_updates.insert(folder, result.next_cursor);
                             all_discovered.extend(result.files);
                         }
-                        Err(e) => tracing::error!("discover_directory panicked for folder: {e}"),
+                        Err(e) => {
+                            tracing::error!("discover_directory panicked for folder: {e}");
+                            // The rest of the library still loads; this folder
+                            // is simply missing from it, and the user is told.
+                            let _ = startup_app.emit(
+                                "shared-folder-scan-failed",
+                                serde_json::json!({ "folder": folder }),
+                            );
+                        }
                     }
                 }
 

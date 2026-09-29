@@ -3817,6 +3817,12 @@
         {#if extensionOnlyHintExt}
           <p class="results-extension-hint">{m.search_extension_keyword_hint({ ext: extensionOnlyHintExt })}</p>
         {/if}
+        {#if (activeTab?.shed ?? 0) > 0}
+          <!-- A tab keeps a bounded number of rows and drops the least
+               available first. Without saying so, a broad search looked as
+               if it had lost hits. -->
+          <p class="results-extension-hint">{m.search_results_shed({ count: formatNumber(activeTab?.shed ?? 0) })}</p>
+        {/if}
       </div>
       <div class="results-info-actions">
         <details class="column-menu" bind:open={showColumnMenu}>

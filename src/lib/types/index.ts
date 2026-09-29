@@ -311,6 +311,8 @@ export interface NetworkStats {
   ember_peers: number;
   epx_sources_received: number;
   server_status?: string;
+  /** While on an eD2K server: whether it gave us a LowID; null otherwise. */
+  ed2k_low_id?: boolean | null;
   stun_keepalive_active?: boolean;
   public_udp_port?: number;
   public_tcp_port?: number;

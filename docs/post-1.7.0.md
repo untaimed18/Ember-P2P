@@ -91,13 +91,15 @@ how long each responder has been a verified contact.
 
 ## Friend chat attachments
 
-### 7. Refuse non-friend dials earlier (low)
+### 7. Refuse non-friend dials earlier (low) — done in 1.7.1
 
-Any Ember user can complete the QUIC or Noise handshake and open a chat
-attachment stream (type `0x07`) before being refused. They get nothing, but the
-handshake costs CPU. Close the connection as soon as the proven identity is not
-a friend, before reading the stream. Room transfer streams (`0x08`) cannot use
-this check, since room members are not friends; their grant check stays as is.
+A chat attachment stream (type `0x07`) from a non-friend is now refused as soon
+as its type is known: the QUIC accept path closes the connection after the
+7-byte header, using the friend check the handshake already made, and the TCP
+fallback refuses on the first byte. The handshake itself still has to complete,
+since that is what proves who the peer is. Room transfer streams (`0x08`)
+cannot use this check, since room members are not friends; their grant check
+stays as is.
 
 ### 8. Shorter re-fetch window after delivery (info)
 

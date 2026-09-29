@@ -9,6 +9,76 @@ use super::*;
 /// turn of the loop.
 const OFFER_RETRY_AFTER_REFUSAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// The downloads worth offering to a server as partial files: those allowed
+/// to advertise, not already in the offer, and with a `.part` on disk.
+///
+/// Whether the `.part` exists is a file-system call per download, and on a
+/// Temp folder on a slow or network drive that adds up. The candidates are
+/// collected under the transfer-manager lock and checked after it is
+/// released, on the blocking pool, so neither the network loop nor any
+/// transfer-status writer waits on the disk.
+pub(in crate::network) async fn partial_download_offers(
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    settings: &AppSettings,
+    known_files: &KnownFileList,
+    restricted: &HashSet<String>,
+    seen_offer_hashes: &mut HashSet<String>,
+) -> Vec<ed2k::server::OfferFile> {
+    let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
+    let candidates: Vec<(PathBuf, ed2k::server::OfferFile)> = {
+        let mgr = transfer_manager.read().await;
+        let mut candidates = Vec::new();
+        for transfer in mgr.active.values().chain(mgr.queue.iter()) {
+            if transfer.direction != TransferDirection::Download {
+                continue;
+            }
+            if matches!(
+                transfer.status,
+                TransferStatus::Completed | TransferStatus::Failed
+            ) {
+                continue;
+            }
+            if !transfer_may_advertise_partial(known_files, restricted, transfer) {
+                continue;
+            }
+            if transfer.file_hash.is_empty()
+                || !seen_offer_hashes.insert(transfer.file_hash.clone())
+            {
+                continue;
+            }
+            let hash_bytes = match hex::decode(&transfer.file_hash) {
+                Ok(bytes) if bytes.len() >= 16 => bytes,
+                _ => continue,
+            };
+            let mut h = [0u8; 16];
+            h.copy_from_slice(&hash_bytes[..16]);
+            candidates.push((
+                temp_dir.join(format!("{}.part", transfer.id)),
+                ed2k::server::OfferFile {
+                    hash: h,
+                    name: transfer.file_name.clone(),
+                    size: transfer.total_size,
+                    is_complete: false,
+                    file_type: ed2k::server::offer_file_type(&transfer.file_name),
+                },
+            ));
+        }
+        candidates
+    };
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .filter(|(part_path, _)| part_path.exists())
+            .map(|(_, offer)| offer)
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn drain_offer_files(
     state: &mut NetworkState,
@@ -64,46 +134,16 @@ pub(in crate::network) async fn drain_offer_files(
                     .collect();
                 (offer_files, restricted)
             };
-            let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
-            {
-                let mgr = transfer_manager.read().await;
-                for transfer in mgr.active.values().chain(mgr.queue.iter()) {
-                    if transfer.direction != TransferDirection::Download {
-                        continue;
-                    }
-                    if matches!(
-                        transfer.status,
-                        TransferStatus::Completed | TransferStatus::Failed
-                    ) {
-                        continue;
-                    }
-                    if !transfer_may_advertise_partial(known_files, &restricted, transfer) {
-                        continue;
-                    }
-                    if transfer.file_hash.is_empty()
-                        || !seen_offer_hashes.insert(transfer.file_hash.clone())
-                    {
-                        continue;
-                    }
-                    let hash_bytes = match hex::decode(&transfer.file_hash) {
-                        Ok(bytes) if bytes.len() >= 16 => bytes,
-                        _ => continue,
-                    };
-                    let part_path = temp_dir.join(format!("{}.part", transfer.id));
-                    if !part_path.exists() {
-                        continue;
-                    }
-                    let mut h = [0u8; 16];
-                    h.copy_from_slice(&hash_bytes[..16]);
-                    offer_files.push(ed2k::server::OfferFile {
-                        hash: h,
-                        name: transfer.file_name.clone(),
-                        size: transfer.total_size,
-                        is_complete: false,
-                        file_type: ed2k::server::offer_file_type(&transfer.file_name),
-                    });
-                }
-            }
+            offer_files.extend(
+                partial_download_offers(
+                    transfer_manager,
+                    settings,
+                    known_files,
+                    &restricted,
+                    &mut seen_offer_hashes,
+                )
+                .await,
+            );
             let signature = offer_files_signature(&offer_files);
             // Files that left the list are not unpublished, because eD2K has
             // no message for it: an empty OP_OFFERFILES is eMule's keep-alive

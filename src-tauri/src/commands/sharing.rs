@@ -1971,6 +1971,19 @@ pub(crate) async fn queue_hash_top_up(app: tauri::AppHandle, files: &[FileInfo])
 /// Stop the background pass. Nothing is lost: a file whose root or digest was
 /// never computed is simply still missing one, and the next launch finds it
 /// again.
+/// A folder scan ended before it could index anything. Logged only, this left
+/// the Library showing a scan that never finished, with no word of why.
+pub(crate) fn report_scan_failure(app: &tauri::AppHandle, folder: Option<&str>) {
+    let _ = app.emit(
+        "file-hash-progress",
+        serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }),
+    );
+    let _ = app.emit(
+        "shared-folder-scan-failed",
+        serde_json::json!({ "folder": folder }),
+    );
+}
+
 /// Whether the background digest pass is reading files right now. A lock held
 /// by someone else counts as running: it is only held to start, stop or feed
 /// the pass, so guessing "idle" is the direction that interrupts it.
@@ -3359,6 +3372,7 @@ pub(crate) async fn add_shared_folder_approved(
             Err(e) => {
                 tracing::error!("Discovery failed for {path}: {e}");
                 remove_cancel_flag_if_current(&cancel_flags, &cancel_key, &cancel_flag).await;
+                report_scan_failure(&app, Some(&path));
                 return;
             }
         };
@@ -5795,6 +5809,7 @@ async fn reload_shared_files_page(
             Err(e) => {
                 tracing::error!("Reload discovery failed: {e}");
                 remove_cancel_flag_if_current(&cancel_flags, &reload_key, &cancel_flag).await;
+                report_scan_failure(&app, None);
                 return;
             }
         };

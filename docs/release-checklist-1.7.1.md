@@ -105,8 +105,9 @@ try that version silently again.
 
 ## 7. Translation review
 
-1.7.1 adds 24 strings and changes one (`settings_auto_check_updates_hint`), in
-all eight non-English locales. List them with:
+1.7.1 adds 32 strings and changes three (`settings_auto_check_updates_hint`,
+`settings_skip_compress_video` and its hint), in all eight non-English locales.
+List them with:
 
 ```
 git diff v1.7.0 -- messages/en.json
@@ -115,5 +116,11 @@ git diff v1.7.0 -- messages/en.json
 - [ ] Silent updates in Settings > About, the countdown dialog, its
       notification, and the done/failed toasts (`settings_silent_update_*`,
       `silent_update_*`).
+- [ ] The new Settings copy: Hourly, Max sources per file, and the reworded
+      video-compression switch (`settings_update_frequency_hourly`,
+      `settings_max_sources_*`, `settings_skip_compress_video*`).
+- [ ] The Search "results dropped" line, the folder-scan failure toasts and the
+      Ctrl+V shortcut row (`search_results_shed`, `library_scan_failed*`,
+      `shortcuts_transfers_paste_links`).
 - [ ] German uses the formal *Sie*; the countdown title fits the dialog in every
       language.

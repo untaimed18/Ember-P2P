@@ -680,6 +680,11 @@ pub struct NetworkStats {
     /// Current eD2K server connection status: "connected", "connecting", or "disconnected"
     #[serde(default)]
     pub server_status: String,
+    /// While connected to an eD2K server: whether it gave us a LowID. `None`
+    /// when not connected. Tracks the server's own ID changes (a port test that
+    /// promotes us to HighID mid-session).
+    #[serde(default)]
+    pub ed2k_low_id: Option<bool>,
     /// STUN/NATMAP-style keep-alive is actively refreshing mappings this session.
     #[serde(default)]
     pub stun_keepalive_active: bool,
@@ -1346,6 +1351,7 @@ impl Default for NetworkStats {
             ember_peers: 0,
             epx_sources_received: 0,
             server_status: String::from("disconnected"),
+            ed2k_low_id: None,
             stun_keepalive_active: false,
             public_udp_port: 0,
             public_tcp_port: 0,

@@ -300,6 +300,7 @@
     let unlistenPolicyReset: UnlistenFn | null = null;
     let unlistenFoldersAdded: UnlistenFn | null = null;
     let unlistenFoldersFailed: UnlistenFn | null = null;
+    let unlistenScanFailed: UnlistenFn | null = null;
     let unlistenDropPending: UnlistenFn | null = null;
     let unlistenDropRejected: UnlistenFn | null = null;
     let unlistenDownloadFolder: UnlistenFn | null = null;
@@ -441,6 +442,16 @@
     })
       .then((fn) => { if (mounted) unlistenFoldersFailed = fn; else fn(); })
       .catch((e) => console.error('Failed to register shared-folders-add-failed listener:', e));
+
+    // A folder scan that failed outright used to be logged and nothing else, so
+    // the Library just looked idle with files missing.
+    listen<{ folder?: string | null }>('shared-folder-scan-failed', (event) => {
+      if (!mounted) return;
+      const folder = event.payload?.folder;
+      toastWarning(folder ? m.library_scan_failed_folder({ folder }) : m.library_scan_failed());
+    })
+      .then((fn) => { if (mounted) unlistenScanFailed = fn; else fn(); })
+      .catch((e) => console.error('Failed to register shared-folder-scan-failed listener:', e));
 
     // Automatic update checks run in the backend on the user's
     // hourly/daily/weekly/monthly cadence, at launch and for as long as Ember stays
@@ -682,6 +693,7 @@
       if (unlistenPolicyReset) unlistenPolicyReset();
       if (unlistenFoldersAdded) unlistenFoldersAdded();
       if (unlistenFoldersFailed) unlistenFoldersFailed();
+      if (unlistenScanFailed) unlistenScanFailed();
       if (unlistenDropPending) unlistenDropPending();
       if (unlistenDropRejected) unlistenDropRejected();
       if (unlistenDownloadFolder) unlistenDownloadFolder();

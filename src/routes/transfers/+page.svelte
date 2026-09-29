@@ -4531,6 +4531,13 @@
   }
   // File Details is modal: the list behind it keeps its selection.
   if (fileDetailsId) return;
+  // Paste eD2K links, as in eMule. Only outside a text field (guarded above),
+  // where a native paste has nowhere to go anyway, and on an empty list too.
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'v') {
+    e.preventDefault();
+    void pasteLinksFromClipboard();
+    return;
+  }
   if (filteredSelectableDownloads.length === 0) return;
   const currentId = selectedDownloadIds[selectedDownloadIds.length - 1];
   const idx = currentId ? filteredSelectableDownloads.findIndex((t) => t.id === currentId) : -1;

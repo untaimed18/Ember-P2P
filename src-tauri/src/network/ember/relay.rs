@@ -2305,6 +2305,15 @@ pub async fn run_quic_accept_loop(
                 // BLAKE3(ed25519_pub)[..16] — the same sixteen bytes a friend is
                 // known by. The grant is then looked up for *that* peer, so a
                 // friend cannot spend another friend's transfer.
+                // Only friends are ever granted a chat attachment, and the
+                // handshake already said whether this is one. A stranger is
+                // closed here, before the request is read or any grant looked
+                // up for them.
+                if !known_friend {
+                    debug!("QUIC accept: attachment stream from {remote} refused: not a friend");
+                    conn.close(0u32.into(), b"attachments are for friends");
+                    return;
+                }
                 let Some(ctx) = attach_serve else {
                     debug!("QUIC accept: attachment stream from {remote} but attachments are off");
                     return;

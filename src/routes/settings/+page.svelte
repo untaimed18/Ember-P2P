@@ -2929,19 +2929,28 @@
               </div>
             </div>
 
-            <div class="field">
-              <label for="max-dl-gib">{m.settings_max_file_size_label()}</label>
-              <input id="max-dl-gib" class="compact-number" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} />
-              <span class="hint">{m.settings_max_file_size_hint()}</span>
+            <!-- eMule's `MaxSourcesPerFile` is a knob its users tune for rare
+                 files, so it sits here beside the other limits. Applied live
+                 to the source manager on save. -->
+            <div class="field-row">
+              <div class="field half">
+                <label for="max-sources">{m.settings_max_sources_label()}</label>
+                <input id="max-sources" type="number" min="1" max="2000" bind:value={settings.max_sources_per_file} />
+                <span class="hint">{m.settings_max_sources_hint()}</span>
+              </div>
+              <div class="field half">
+                <label for="max-dl-gib">{m.settings_max_file_size_label()}</label>
+                <input id="max-dl-gib" class="compact-number" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} />
+                <span class="hint">{m.settings_max_file_size_hint()}</span>
+              </div>
             </div>
           </div>
 
-          <!-- The remaining protocol budget / retry knobs (max_sources,
-               queue wait, retry rounds) stay in AppSettings for config.json
-               and backend clamps, but are intentionally not exposed here.
-               `max_connections` used to be in that list; it is above now,
-               because it governs upload-queue capacity and eMule has always
-               exposed it. -->
+          <!-- The remaining protocol budget / retry knobs (queue wait, retry
+               rounds) stay in AppSettings for config.json and backend clamps,
+               but are intentionally not exposed here. `max_connections` and
+               `max_sources_per_file` used to be in that list; they are above
+               now, because eMule has always exposed both. -->
 
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_behavior()}</h4>

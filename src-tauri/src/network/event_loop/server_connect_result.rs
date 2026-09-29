@@ -301,46 +301,16 @@ pub(in crate::network) async fn on_server_connect_result(
                         .collect();
                     (offer_files, restricted)
                 };
-                let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
-                {
-                    let mgr = transfer_manager.read().await;
-                    for transfer in mgr.active.values().chain(mgr.queue.iter()) {
-                        if transfer.direction != TransferDirection::Download {
-                            continue;
-                        }
-                        if matches!(
-                            transfer.status,
-                            TransferStatus::Completed | TransferStatus::Failed
-                        ) {
-                            continue;
-                        }
-                        if !transfer_may_advertise_partial(known_files, &restricted, transfer) {
-                            continue;
-                        }
-                        if transfer.file_hash.is_empty()
-                            || !seen_offer_hashes.insert(transfer.file_hash.clone())
-                        {
-                            continue;
-                        }
-                        let hash_bytes = match hex::decode(&transfer.file_hash) {
-                            Ok(bytes) if bytes.len() >= 16 => bytes,
-                            _ => continue,
-                        };
-                        let part_path = temp_dir.join(format!("{}.part", transfer.id));
-                        if !part_path.exists() {
-                            continue;
-                        }
-                        let mut h = [0u8; 16];
-                        h.copy_from_slice(&hash_bytes[..16]);
-                        offer_files.push(ed2k::server::OfferFile {
-                            hash: h,
-                            name: transfer.file_name.clone(),
-                            size: transfer.total_size,
-                            is_complete: false,
-                            file_type: ed2k::server::offer_file_type(&transfer.file_name),
-                        });
-                    }
-                }
+                offer_files.extend(
+                    super::offer_files::partial_download_offers(
+                        transfer_manager,
+                        settings,
+                        known_files,
+                        &restricted,
+                        &mut seen_offer_hashes,
+                    )
+                    .await,
+                );
                 if offer_files.is_empty() {
                     warn!("No files to offer to server after login — check shared folders");
                     *pending_offer_files = None;

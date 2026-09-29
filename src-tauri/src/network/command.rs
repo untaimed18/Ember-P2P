@@ -2283,6 +2283,7 @@ async fn handle_command_inner(
             let (ember_contacts, ember_verified) = ember_dht_ui_contact_counts(state);
             state.stats.ember_dht_contacts = ember_contacts;
             state.stats.ember_dht_verified_contacts = ember_verified;
+            state.stats.ed2k_low_id = state.server_connected.then_some(state.low_id);
             let _ = tx.send(state.stats.clone());
         }
 

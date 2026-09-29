@@ -4746,6 +4746,15 @@ impl UploadHandler {
         let Some(serve) = self.file_stream_serve.clone() else {
             return Ok(());
         };
+        // Only friends are ever granted a chat attachment, and the secure
+        // stream has already proven who this is. Refuse a stranger before
+        // reading another byte from them.
+        if first == attach::ATTACH_STREAM_MSG_TYPE
+            && !self.friend_hashes.read().await.contains(&peer.ember_hash)
+        {
+            debug!("Refusing a chat attachment stream from a non-friend");
+            return Ok(());
+        }
         let mut header = [0u8; 7];
         header[0] = first;
         if !matches!(
