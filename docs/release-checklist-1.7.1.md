@@ -105,7 +105,7 @@ try that version silently again.
 
 ## 7. Translation review
 
-1.7.1 adds 32 strings and changes three (`settings_auto_check_updates_hint`,
+1.7.1 adds 49 strings and changes three (`settings_auto_check_updates_hint`,
 `settings_skip_compress_video` and its hint), in all eight non-English locales.
 List them with:
 
@@ -122,5 +122,8 @@ git diff v1.7.0 -- messages/en.json
 - [ ] The Search "results dropped" line, the folder-scan failure toasts and the
       Ctrl+V shortcut row (`search_results_shed`, `library_scan_failed*`,
       `shortcuts_transfers_paste_links`).
+- [ ] The Add links dialog on Transfers and the transfer-rate graph on
+      Statistics (`transfers_add_links_*`, `stats_graph_*`); the axis labels
+      fit beside the legend at the narrowest window width.
 - [ ] German uses the formal *Sie*; the countdown title fits the dialog in every
       language.

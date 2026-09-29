@@ -12,6 +12,7 @@
     withTimeout,
   } from '$lib/utils';
   import { onMount } from 'svelte';
+  import RateGraph from '$lib/components/RateGraph.svelte';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
 
@@ -292,6 +293,8 @@
         </div>
       </div>
     </div>
+
+    <RateGraph history={stats.rate_history} />
 
     <!-- Transfer summary -->
     <div class="section-row">

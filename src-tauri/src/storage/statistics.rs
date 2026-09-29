@@ -46,6 +46,36 @@ pub struct TransferStats {
     /// Ember-native transport Ping/Pong on that same channel. Ember
     /// UDP EPX is counted under `overhead_epx`, not here.
     pub overhead_ember_dht: u64,
+
+    /// Payload rates over the last few minutes and the last hour, for the
+    /// Statistics page's graph.
+    #[serde(default)]
+    pub rate_history: RateHistory,
+}
+
+/// Minutes of one-minute averages kept for the graph.
+const MAX_MINUTE_HISTORY: usize = 60;
+
+/// Recent transfer rates, oldest first. Each sample is `[down, up]` in bytes
+/// per second.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct RateHistory {
+    /// Unix seconds of the newest sample in `recent`.
+    pub recent_end: i64,
+    /// One sample per stats tick (about a second), the last five minutes.
+    pub recent: Vec<[u64; 2]>,
+    /// One average per completed minute, the last hour. Minutes the process
+    /// did not see (a sleep) are zeros, so the axis stays true to the clock.
+    pub minutes: Vec<[u64; 2]>,
+}
+
+/// The minute being averaged for [`RateHistory::minutes`].
+#[derive(Debug, Default)]
+struct MinuteAccumulator {
+    minute: i64,
+    down: u64,
+    up: u64,
+    samples: u64,
 }
 
 /// Lock-free counters that the ed2k upload / transfer / multi_source
@@ -98,6 +128,8 @@ pub struct StatsManager {
     pub stats: TransferStats,
     down_rate_history: VecDeque<(i64, u64)>,
     up_rate_history: VecDeque<(i64, u64)>,
+    minute_history: VecDeque<[u64; 2]>,
+    minute_acc: MinuteAccumulator,
     last_down_snapshot: u64,
     last_up_snapshot: u64,
     pub session_down_counter: Arc<AtomicU64>,
@@ -126,6 +158,8 @@ impl StatsManager {
             },
             down_rate_history: VecDeque::with_capacity(MAX_RATE_HISTORY),
             up_rate_history: VecDeque::with_capacity(MAX_RATE_HISTORY),
+            minute_history: VecDeque::with_capacity(MAX_MINUTE_HISTORY),
+            minute_acc: MinuteAccumulator::default(),
             last_down_snapshot: 0,
             last_up_snapshot: 0,
             session_down_counter: Arc::new(AtomicU64::new(0)),
@@ -334,6 +368,42 @@ impl StatsManager {
 
         self.stats.session_down_rate = Self::windowed_rate(&self.down_rate_history, now);
         self.stats.session_up_rate = Self::windowed_rate(&self.up_rate_history, now);
+
+        self.fold_into_minutes(now, down_delta, up_delta);
+        self.stats.rate_history = RateHistory {
+            recent_end: now,
+            recent: self
+                .down_rate_history
+                .iter()
+                .zip(self.up_rate_history.iter())
+                .map(|((_, down), (_, up))| [*down, *up])
+                .collect(),
+            minutes: self.minute_history.iter().copied().collect(),
+        };
+    }
+
+    /// Add one tick's bytes to the minute being averaged, closing it — and any
+    /// minutes skipped since, as zeros — once the clock has moved past it.
+    fn fold_into_minutes(&mut self, now: i64, down: u64, up: u64) {
+        let minute = now.div_euclid(60);
+        let acc = &mut self.minute_acc;
+        if acc.samples > 0 && minute != acc.minute {
+            let average = [acc.down / acc.samples, acc.up / acc.samples];
+            self.minute_history.push_back(average);
+            // A clock that jumped backwards has nothing to fill.
+            let skipped = (minute - acc.minute - 1).clamp(0, MAX_MINUTE_HISTORY as i64);
+            for _ in 0..skipped {
+                self.minute_history.push_back([0, 0]);
+            }
+            while self.minute_history.len() > MAX_MINUTE_HISTORY {
+                self.minute_history.pop_front();
+            }
+            *acc = MinuteAccumulator::default();
+        }
+        acc.minute = minute;
+        acc.down = acc.down.saturating_add(down);
+        acc.up = acc.up.saturating_add(up);
+        acc.samples += 1;
     }
 
     /// Moving-average rate (bytes/sec) over the most recent samples of
@@ -500,6 +570,46 @@ mod tests {
             "expected 100 B/s from two samples, got {} (priming delta leaked in?)",
             mgr.stats.session_down_rate
         );
+    }
+
+    #[test]
+    fn the_graph_history_averages_each_minute_and_keeps_an_hour() {
+        let mut mgr = StatsManager::new();
+        // Minute 0: 60 ticks of 120 B down, 30 B up.
+        let start: i64 = 1_790_000_040;
+        assert_eq!(start % 60, 0, "the test starts on a minute boundary");
+        for i in 0..60 {
+            mgr.session_down_counter.store((i as u64 + 1) * 120, Ordering::Relaxed);
+            mgr.session_up_counter.store((i as u64 + 1) * 30, Ordering::Relaxed);
+            mgr.record_rate(start + i);
+        }
+        assert!(mgr.stats.rate_history.minutes.is_empty(), "the minute is still open");
+        assert_eq!(mgr.stats.rate_history.recent.len(), 60);
+        assert_eq!(mgr.stats.rate_history.recent_end, start + 59);
+
+        // The next tick closes it.
+        mgr.session_down_counter.store(61 * 120, Ordering::Relaxed);
+        mgr.session_up_counter.store(61 * 30, Ordering::Relaxed);
+        mgr.record_rate(start + 60);
+        assert_eq!(mgr.stats.rate_history.minutes, vec![[120, 30]]);
+
+        // Asleep for three minutes: those read as zeros, not as missing.
+        mgr.record_rate(start + 60 + 4 * 60);
+        assert_eq!(
+            mgr.stats.rate_history.minutes,
+            vec![[120, 30], [120, 30], [0, 0], [0, 0], [0, 0]]
+        );
+
+        // An hour cap, however long the gap.
+        mgr.record_rate(start + 10 * 3600);
+        assert_eq!(mgr.stats.rate_history.minutes.len(), MAX_MINUTE_HISTORY);
+        assert_eq!(mgr.stats.rate_history.recent.len(), 63);
+
+        // A clock stepping back does not invent minutes.
+        let before = mgr.stats.rate_history.minutes.len();
+        mgr.record_rate(start);
+        mgr.record_rate(start + 1);
+        assert_eq!(mgr.stats.rate_history.minutes.len(), MAX_MINUTE_HISTORY.min(before + 1));
     }
 
     /// Upload path shares the same helper; verify it is wired up too.
