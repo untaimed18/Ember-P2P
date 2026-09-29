@@ -2,6 +2,7 @@
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import PartsBar from '$lib/components/PartsBar.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import AddLinksDialog from '$lib/components/AddLinksDialog.svelte';
   import { transfers, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
@@ -3310,7 +3311,23 @@
     }));
   }
 
-  // The single entry point for every Paste-link affordance (header button,
+  /** The Add eD2K Links dialog: the header button opens it; Ctrl+V and the
+   *  pane and row menus still paste straight from the clipboard. */
+  let addLinksOpen = $state(false);
+
+  async function queueLinksFromDialog(text: string) {
+    if (pasteLinkBusy) return;
+    pasteLinkBusy = true;
+    try {
+      await queuePastedLinks(text);
+    } catch (e: unknown) {
+      transferError = toErrorMsg(e);
+    } finally {
+      pasteLinkBusy = false;
+    }
+  }
+
+  // The single entry point for every one-step Paste-link affordance (Ctrl+V,
   // pane menu, row context menu). Re-entrancy is guarded here rather than at
   // the call sites so a second paste cannot start a concurrent batch of up to
   // 256 downloads alongside the first and double-count the same links.
@@ -4567,9 +4584,9 @@
   <div class="header-actions">
     <button
       class="ghost paste-link-btn"
-      onclick={pasteLinksFromClipboard}
+      onclick={() => (addLinksOpen = true)}
       disabled={pasteLinkBusy}
-      title={m.transfers_paste_link_title()}
+      title={m.transfers_add_links_button_title()}
     >
       <span class="paste-link-icon" aria-hidden="true">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -4579,10 +4596,12 @@
           <line x1="6.5" y1="10" x2="9.5" y2="10"/>
         </svg>
       </span>
-      {pasteLinkBusy ? m.transfers_pasting() : m.transfers_paste_link()}
+      {pasteLinkBusy ? m.transfers_pasting() : m.transfers_add_links_button()}
     </button>
   </div>
 </div>
+
+<AddLinksDialog bind:open={addLinksOpen} busy={pasteLinkBusy} maxLength={MAX_PASTE_LEN} onsubmit={queueLinksFromDialog} />
 
 {#if transferError}
   <div class="error-banner" role="alert">
