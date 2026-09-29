@@ -247,6 +247,9 @@ const XX_UNVALIDATED_MSG2_BURST: u32 = 64;
 /// covers the one legitimate spike there is: coming online and being dialled
 /// by everyone who already held our contact.
 ///
+/// XX message 1 draws on the same bucket once it reaches the Noise responder,
+/// cookie or no cookie: it is the same work.
+///
 /// Unlike the XX budget, a token is spent on every initiation we look at,
 /// including one that turns out to be malformed. That is deliberate but it is
 /// not free: the work being rationed *is* the read that decides whether the
@@ -325,7 +328,14 @@ struct NoiseSession {
     /// Bitmap of accepted nonces in `[recv_high - 63, recv_high]`; bit `i`
     /// represents `recv_high - i`.
     recv_window: u64,
+    /// Which handshake produced this session. Unique for the life of the
+    /// process, so a payload held back by one handshake is released only by a
+    /// frame read under that handshake's keys; see [`DeferredIkPayload`].
+    generation: u64,
 }
+
+/// Source of [`NoiseSession::generation`].
+static NEXT_SESSION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl NoiseSession {
     fn new(
@@ -335,6 +345,7 @@ impl NoiseSession {
     ) -> Self {
         let now = Instant::now();
         Self {
+            generation: NEXT_SESSION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             transport,
             remote_noise_pub,
             last_activity: now,
@@ -533,6 +544,8 @@ pub enum IncomingResult {
         from: SocketAddr,
         remote_noise_pub: [u8; 32],
         payload: Vec<u8>,
+        /// [`NoiseSession::generation`] of the session that read it.
+        generation: u64,
     },
     /// Handshake progressed; one or more response packets need to be sent.
     ///
@@ -796,6 +809,17 @@ struct DeferredIkPayload {
     /// forged initiation borrow a genuine peer's identity binding.
     remote_noise_pub: [u8; 32],
     stored: Instant,
+    /// The session the carrying handshake produced. Only a frame read under
+    /// its keys releases the payload.
+    ///
+    /// Any frame from this address and key used to, on whichever session read
+    /// it. Past the replay window a captured `IK_INIT` is processed again: the
+    /// session it builds is only staged beside the live one, but it re-armed
+    /// the payload, and the peer's next ordinary frame released it a second
+    /// time — every thirty seconds, for as long as the attacker kept replaying
+    /// one packet. The staged session's keys come from our fresh ephemeral, so
+    /// a replayer never produces the frame that would release its payload.
+    generation: u64,
 }
 
 /// A handshake initiation we have already processed.
@@ -860,13 +884,13 @@ impl EmberTransport {
         }
     }
 
-    /// Whether we may run the Noise responder for one fresh IK initiation,
-    /// charging it if so.
+    /// Whether we may run the Noise responder for one fresh IK initiation or
+    /// XX message 1, charging it if so. See [`IK_HANDSHAKE_PER_SEC`].
     ///
     /// Charged on take, unlike [`Self::xx_msg2_budget_available`] and its
     /// separate spend: there the token pays for a packet that may still not be
     /// sent, here it pays for the crypto we are about to do either way.
-    fn take_ik_handshake_token(&mut self) -> bool {
+    fn take_handshake_token(&mut self) -> bool {
         let now = Instant::now();
         let elapsed = now.duration_since(self.ik_refilled_at);
         let earned = (elapsed.as_millis() as u64 * u64::from(IK_HANDSHAKE_PER_SEC)) / 1000;
@@ -1718,8 +1742,10 @@ impl EmberTransport {
         // deferral only as a payload that arrives one round trip late.
         let released = match &result {
             IncomingResult::Message {
-                remote_noise_pub, ..
-            } => self.take_deferred_ik(from, remote_noise_pub),
+                remote_noise_pub,
+                generation,
+                ..
+            } => self.take_deferred_ik(from, remote_noise_pub, *generation),
             _ => None,
         };
 
@@ -1767,8 +1793,9 @@ impl EmberTransport {
         // request embedded in IK_INIT, which a search retries once and a
         // one-shot `STORE_RECORD` or `ExchangeRequest` never recovers.
         // Releasing on a non-probe frame weakens nothing: `take_deferred_ik`
-        // only fires on a frame that authenticated under keys derived from
-        // our IK_RESP, which is the same proof the `Pong` carried.
+        // only fires on a frame read by the session this handshake produced,
+        // under keys derived from our IK_RESP, which is the same proof the
+        // `Pong` carried.
         //
         // The probe answer itself is ours to swallow — surfacing it would
         // look like an unsolicited reply to the caller's pending-ping
@@ -1948,7 +1975,7 @@ impl EmberTransport {
         // why this one sits so far above honest traffic. A retransmit was
         // already answered from the replay cache without reaching here, so a
         // drop costs a peer one attempt, not a handshake.
-        if !self.take_ik_handshake_token() {
+        if !self.take_handshake_token() {
             trace!("Dropping IK init from {from}: over the handshake budget");
             self.forget_handshake(&handshake_digest);
             return IncomingResult::Rejected;
@@ -2080,6 +2107,7 @@ impl EmberTransport {
                     payload: payload_buf[..payload_len].to_vec(),
                     remote_noise_pub,
                     stored: Instant::now(),
+                    generation: session.generation,
                 },
             );
             let probe = EmberControlMessage::Ping { nonce: probe_nonce }.encode();
@@ -2144,15 +2172,24 @@ impl EmberTransport {
         &mut self,
         from: SocketAddr,
         remote_noise_pub: &[u8; 32],
+        generation: u64,
     ) -> Option<DeferredIkPayload> {
         // Logged rather than silently returning `None`: a dropped deferral means
         // a peer's first-contact request is gone, and for a one-shot publish or
         // exchange there is no retry to make it look like anything but a peer
         // that never asked.
-        let Some(entry) = self.deferred_ik.remove(&(from, *remote_noise_pub)) else {
+        let slot = (from, *remote_noise_pub);
+        let Some(held) = self.deferred_ik.get(&slot) else {
             trace!("No deferred IK payload for {from}: evicted, expired, or never held one");
             return None;
         };
+        // Held for another session at this address and key: the one its
+        // handshake staged, which only its own frames can promote. Left in
+        // place for that, or for the TTL sweep.
+        if held.generation != generation {
+            return None;
+        }
+        let entry = self.deferred_ik.remove(&slot)?;
         // The key already pins the claimant, so this only drops one that has sat
         // here past its TTL. The static-key comparison stays as a belt-and-braces
         // check against a future caller keying it differently.
@@ -2567,6 +2604,16 @@ impl EmberTransport {
                 };
             }
         };
+        // The cookie waives the reflection limit above, not this one: a proven
+        // address still costs a keypair and two X25519 per msg1, and the cookie
+        // is reusable for its whole lifetime, so without this a host at its
+        // own address could stream fresh ephemerals at the network task
+        // unmetered. Same bucket as IK, since it is the same CPU.
+        if !self.take_handshake_token() {
+            trace!("Dropping XX msg1 from {from}: over the handshake budget");
+            self.forget_handshake(&handshake_digest);
+            return IncomingResult::Rejected;
+        }
         let params = match NOISE_PATTERN_XX.parse::<snow::params::NoiseParams>() {
             Ok(p) => p,
             Err(_) => return IncomingResult::Rejected,
@@ -2955,6 +3002,7 @@ impl EmberTransport {
                         from,
                         remote_noise_pub: session.remote_noise_pub,
                         payload: payload_buf[..len].to_vec(),
+                        generation: session.generation,
                     };
                 }
                 Err(_) => continue,
@@ -2989,6 +3037,7 @@ impl EmberTransport {
                     promoted.last_inbound = now;
                     promoted.addr_validated = true;
                     let remote_noise_pub = promoted.remote_noise_pub;
+                    let generation = promoted.generation;
                     debug!(
                         "Ember transport: promoting re-handshaked session for {from} after it decrypted a frame"
                     );
@@ -3001,6 +3050,7 @@ impl EmberTransport {
                         from,
                         remote_noise_pub,
                         payload: payload_buf[..len].to_vec(),
+                        generation,
                     };
                 }
                 Err(_) => continue,
@@ -3229,17 +3279,18 @@ mod tests {
             OutgoingResult::Ready { packet } => packet,
             other => panic!("expected Ready, got {}", variant_name(&other)),
         };
-        // Delivered, therefore the incumbent session survived. Asserting on the
-        // exact payload list would be wrong: the replayed init re-armed its own
-        // embedded payload as a deferred one, and any authenticated frame
-        // releases that, so Alice's original first message rides along a second
-        // time. Duplicate delivery of an already-authenticated payload is
-        // harmless here (the DHT's own replay collapse covers it) and is not
-        // what this test is about.
+        // Delivered, therefore the incumbent session survived — and delivered
+        // alone. The replayed init re-armed its embedded payload, but for the
+        // session it staged, which only the genuine peer's new keys could
+        // promote; a frame on the live session does not release it. It used
+        // to, so one captured init re-delivered Alice's first message every
+        // time the replay window lapsed, and nothing above the transport
+        // collapses a repeated CHANNEL_MSG, CALLBACK_REQ or EPX frame.
         let delivered = bob.dispatch_incoming(&after, alice_addr).app_payloads;
-        assert!(
-            delivered.contains(&b"after".to_vec()),
-            "a replayed init must not wedge the live session; got {delivered:?}"
+        assert_eq!(
+            delivered,
+            vec![b"after".to_vec()],
+            "a replayed init must neither wedge the live session nor re-deliver its payload"
         );
     }
 
@@ -3961,7 +4012,7 @@ mod tests {
         // initiations: that loop takes long enough to earn tokens back while
         // it runs, so where it landed would be a matter of how fast the
         // machine is.
-        while bob.take_ik_handshake_token() {}
+        while bob.take_handshake_token() {}
 
         assert!(
             matches!(
@@ -4348,6 +4399,17 @@ mod tests {
                 incoming_variant_name(&other)
             ),
         };
+        // A cookie waives the reflection budget, not the CPU one: with the
+        // handshake bucket empty, even a proven msg1 is refused.
+        let (tokens, refilled) = (bob.ik_tokens, bob.ik_refilled_at);
+        bob.ik_tokens = 0;
+        bob.ik_refilled_at = Instant::now();
+        assert!(matches!(
+            bob.process_incoming(&proven, alice_addr),
+            IncomingResult::Rejected
+        ));
+        bob.ik_tokens = tokens.max(1);
+        bob.ik_refilled_at = refilled;
         let msg2 = match bob.process_incoming(&proven, alice_addr) {
             IncomingResult::HandshakeResponse { packets, .. } => {
                 let packet = packets.into_iter().next().expect("msg2");
