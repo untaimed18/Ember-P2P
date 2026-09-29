@@ -214,6 +214,9 @@ pub struct SendState {
     /// When the stall timer fired on a transfer that had sent everything, and
     /// the recipient was asked how it ended. See [`SendState::stall_verdict`].
     asked_at: Option<Instant>,
+    /// The plain offer, held back until the recipient has had time to say it
+    /// read the sealed one; see `channel::XFER_SEEN_PLAIN_VERSION`.
+    plain_offer: Option<(Instant, Vec<u8>)>,
 }
 
 /// How long a sender that has sent everything waits, once its stall timer
@@ -259,7 +262,28 @@ impl SendState {
             streamed: 0,
             reporter: ProgressReporter::default(),
             asked_at: None,
+            plain_offer: None,
         }
+    }
+
+    /// Send `frame` at `due` unless the recipient shows first that it read the
+    /// sealed offer.
+    pub fn hold_plain_offer(&mut self, frame: Vec<u8>, due: Instant) {
+        self.plain_offer = Some((due, frame));
+    }
+
+    /// The recipient answered something about this transfer, so it has the
+    /// sealed offer and the plain one would only be a duplicate.
+    pub fn offer_was_read(&mut self) {
+        self.plain_offer = None;
+    }
+
+    /// The held plain offer, once it is due. Handed out once.
+    pub fn take_due_plain_offer(&mut self, now: Instant) -> Option<Vec<u8>> {
+        if self.plain_offer.as_ref().is_some_and(|(due, _)| now >= *due) {
+            return self.plain_offer.take().map(|(_, frame)| frame);
+        }
+        None
     }
 
     /// What to do now that [`Self::is_stalled`] holds.
@@ -888,6 +912,23 @@ mod tests {
             file,
         );
         (state, TempDir(dir))
+    }
+
+    #[test]
+    fn the_plain_offer_goes_out_once_and_only_if_nothing_was_heard() {
+        let t0 = Instant::now();
+        let due = t0 + Duration::from_secs(10);
+        let mut send = SendState::new([1u8; 16], [2u8; 32], [3u8; 32], "x.bin".into(), 5, PathBuf::from("x.bin"));
+        assert!(send.take_due_plain_offer(t0).is_none(), "nothing held");
+
+        send.hold_plain_offer(b"plain".to_vec(), due);
+        assert!(send.take_due_plain_offer(t0 + Duration::from_secs(9)).is_none());
+        assert_eq!(send.take_due_plain_offer(due).as_deref(), Some(&b"plain"[..]));
+        assert!(send.take_due_plain_offer(due + Duration::from_secs(1)).is_none(), "sent once");
+
+        send.hold_plain_offer(b"plain".to_vec(), due);
+        send.offer_was_read();
+        assert!(send.take_due_plain_offer(due).is_none());
     }
 
     /// A lost "done" is repeated twice unasked, and again when the sender

@@ -147,3 +147,14 @@ git diff v1.7.0 -- messages/en.json
 - [ ] On a busy install, the Queue and Known Peers tabs scroll through every row
       (Known Peers no longer stops at 1,000), and Trust badges fill in for rows
       scrolled into view.
+- [ ] Share part of a folder (Library explorer, "Include subfolders" off): only
+      those files are hashed and listed. Sharing the rest later picks it up
+      without a manual reload.
+
+## 9. Room transfers across versions
+
+- [ ] 1.7.1 to 1.7.1: the prompt appears at once, and one prompt only.
+- [ ] 1.7.1 to 1.7.0: the prompt appears at once; after 10 seconds no second
+      prompt appears, whether the first is still open, accepted or finished.
+- [ ] 1.7.1 to 1.6.x: the prompt appears after about 10 seconds and the transfer
+      completes.

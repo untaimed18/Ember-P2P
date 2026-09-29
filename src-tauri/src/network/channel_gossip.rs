@@ -858,6 +858,13 @@ pub(super) async fn handle_inbound_channel_gossip(
             &sender,
             chrono::Utc::now().timestamp(),
         );
+        // Anything the recipient says about a transfer we offered — "seen", a
+        // reply, a block request — means it read the sealed offer.
+        if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
+            if send.peer == sender {
+                send.offer_was_read();
+            }
+        }
         if answer_finished_xfer(socket, state, db, xfer_id, sender).await {
             return;
         }
@@ -867,8 +874,9 @@ pub(super) async fn handle_inbound_channel_gossip(
             ember::channel::decode_xfer_block_request(body)
         {
             apply_xfer_block_request(state, xfer_id, sender, offset, count);
-        } else if let Some(offer) = ember::channel::decode_xfer_offer(body)
-            .or_else(|| ember::channel::decode_xfer_offer_sealed(&key, body))
+        } else if let Some((offer, sealed)) = ember::channel::decode_xfer_offer(body)
+            .map(|offer| (offer, false))
+            .or_else(|| ember::channel::decode_xfer_offer_sealed(&key, body).map(|offer| (offer, true)))
         {
             // The pairwise key already names the sender; under a retired key
             // they must also be somebody the roster holds, since that is what
@@ -876,10 +884,17 @@ pub(super) async fn handle_inbound_channel_gossip(
             if opened == ember::channel::OpenedUnder::Current
                 || channel_member_on_roster(state, db, gossip.channel_id, &sender)
             {
-                apply_xfer_offer(socket, state, db, app_handle, &ch, &gossip, offer, key).await;
+                apply_xfer_offer(socket, state, db, app_handle, &ch, &gossip, offer, key, sealed)
+                    .await;
             } else {
                 debug!("Ember Transfer: ignored an offer in {channel_id_hex} under a retired key");
             }
+        } else if ember::channel::decode_xfer_seen(body).is_some() {
+            // Acted on above, like everything else the recipient says.
+            debug!(
+                "Ember Transfer: the recipient of {} read its sealed offer",
+                hex::encode(xfer_id)
+            );
         } else if let Some((_, _, _, reply)) = ember::channel::decode_xfer_reply(body) {
             apply_xfer_reply(state, app_handle, xfer_id, sender, reply).await;
         } else if let Some((_, _, _, reason)) = ember::channel::decode_xfer_cancel(body) {

@@ -3202,22 +3202,28 @@ async fn handle_command_inner(
                 let _ = tx.send(Err(coded("channels_member_invalid", "Invalid member key")));
                 return;
             };
-            state.xfer_send.insert(
+            let offer = ember::channel::XferOffer {
+                sender: state.local_ed25519_pubkey,
+                target: peer,
                 xfer_id,
-                ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path.clone()),
+                size,
+                root,
+                name: name.clone(),
+            };
+            // Sealed first, so the members it is forwarded through cannot read
+            // the file's name and size. A recipient on v1.6.x cannot read it
+            // either, so the plain offer follows unless the recipient says it
+            // has the sealed one first.
+            let mut send =
+                ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path.clone());
+            send.hold_plain_offer(
+                ember::channel::encode_xfer_offer(&key, &offer),
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs(ember::channel::XFER_PLAIN_OFFER_FALLBACK_SECS),
             );
-            let plain = ember::channel::encode_xfer_offer(
-                &key,
-                &ember::channel::XferOffer {
-                    sender: state.local_ed25519_pubkey,
-                    target: peer,
-                    xfer_id,
-                    size,
-                    root,
-                    name: name.clone(),
-                },
-            );
-            let sent = send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+            state.xfer_send.insert(xfer_id, send);
+            let sealed = ember::channel::encode_xfer_offer_sealed(&key, &offer);
+            let sent = send_xfer_frame(socket, state, db, channel_id, peer, &sealed).await;
             if !sent {
                 state.xfer_send.remove(&xfer_id);
                 let _ = tx.send(Err(coded(
@@ -3238,8 +3244,8 @@ async fn handle_command_inner(
                 "offered",
             );
             let _ = tx.send(Ok(()));
-            // After the offer, so a recipient on an older build has the
-            // offer it understands before a frame it will drop.
+            // After the offer, so the recipient has the offer before the port
+            // it belongs to.
             offer_xfer_stream(socket, state, db, channel_id, peer, xfer_id, key, path, size, root)
                 .await;
         }

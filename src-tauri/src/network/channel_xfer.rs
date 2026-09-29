@@ -1148,6 +1148,7 @@ pub(super) async fn apply_xfer_offer(
     gossip: &ember::channel::ChannelGossip,
     offer: ember::channel::XferOffer,
     key: [u8; 32],
+    sealed: bool,
 ) {
     let sender_hex = hex::encode(offer.sender);
     if channel_member_banned(state, db, gossip.channel_id, &offer.sender) {
@@ -1163,6 +1164,17 @@ pub(super) async fn apply_xfer_offer(
     if !channel_author_gossip_ok(state, gossip.channel_id, &offer.sender) {
         forget_channel_gossip(state, &gossip.msg_id);
         return;
+    }
+    // At once, and ahead of the checks below: the sender only needs to know it
+    // need not send the plain offer, whatever becomes of this one.
+    if sealed {
+        let seen = ember::channel::encode_xfer_seen(
+            &key,
+            &state.local_ed25519_pubkey,
+            &offer.sender,
+            &offer.xfer_id,
+        );
+        send_xfer_frame(socket, state, db, gossip.channel_id, offer.sender, &seen).await;
     }
     let name = crate::security::sanitize_filename(&offer.name);
     if name.is_empty() {
@@ -1792,6 +1804,20 @@ pub(super) async fn drive_channel_transfers(
     }
     let now = std::time::Instant::now();
     let me = state.local_ed25519_pubkey;
+
+    // Sealed offers nobody said they could read: the recipient may be on
+    // v1.6.x, so it gets the plain one too.
+    let plain_offers: Vec<([u8; 16], [u8; 32], Vec<u8>)> = state
+        .xfer_send
+        .values_mut()
+        .filter_map(|send| {
+            send.take_due_plain_offer(now)
+                .map(|frame| (send.channel_id, send.peer, frame))
+        })
+        .collect();
+    for (channel_id, peer, frame) in plain_offers {
+        send_xfer_frame(socket, state, db, channel_id, peer, &frame).await;
+    }
 
     // Offers nobody answered. Dropping them keeps a stale dialog from
     // accepting into a transfer the other side has long forgotten.

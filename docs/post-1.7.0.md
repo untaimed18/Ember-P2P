@@ -5,7 +5,15 @@ Ordered by priority within each section.
 
 ## Room transfers (Ember Transfer)
 
-### 1. Send encrypted offers
+### 1. Send encrypted offers — done in 1.7.1, with the fallback
+
+**Done in 1.7.1:** Senders send the sealed offer and hold the plain one back.
+The recipient answers a sealed offer at once with an "offer seen" frame
+(`XFER_SEEN_PLAIN_VERSION` 28). Anything the recipient says about the transfer
+cancels the plain offer; with nothing heard in `XFER_PLAIN_OFFER_FALLBACK_SECS`
+(10 s) it goes out too, which a 1.7.0 recipient ignores as a repeat and a 1.6
+recipient prompts on. What remains is the second option below: stop sending the
+plain offer once 1.6 members are rare.
 
 **Why:** An offer carries the file name and size. It is encrypted only with the
 room's content key, so when it travels through other members (no direct session
