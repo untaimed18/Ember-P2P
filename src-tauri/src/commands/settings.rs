@@ -104,6 +104,7 @@ const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     "pending_share_states",
     "pending_file_priorities",
     "pending_folder_allowlists",
+    "withheld_folder_files",
     "shared_folder_scan_cursors",
     // Historical one-shot marker; the overlay is now always on, but the
     // renderer still must not clear it (it would re-run the migration).
@@ -668,6 +669,9 @@ fn prune_removed_shared_folder_state(
         .retain(|path, _| !is_under_removed_root(path));
     settings
         .pending_folder_allowlists
+        .retain(|folder, _| !is_under_removed_root(folder));
+    settings
+        .withheld_folder_files
         .retain(|folder, _| !is_under_removed_root(folder));
     settings
         .shared_folder_scan_cursors

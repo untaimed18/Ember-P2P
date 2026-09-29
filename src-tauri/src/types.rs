@@ -1711,6 +1711,13 @@ pub struct AppSettings {
     /// Backend-owned (see `BACKEND_OWNED_SETTINGS_FIELDS`).
     #[serde(default)]
     pub pending_folder_allowlists: std::collections::HashMap<String, Vec<String>>,
+    /// Files of a partly shared folder that the user unshared, keyed like
+    /// `pending_folder_allowlists`. Discovery walks only what a folder's
+    /// allowlist names, so these are walked too and stay in the Library as
+    /// unshared files instead of disappearing, while the allowlist no longer
+    /// offers them. Backend-owned (see `BACKEND_OWNED_SETTINGS_FIELDS`).
+    #[serde(default)]
+    pub withheld_folder_files: std::collections::HashMap<String, Vec<String>>,
     /// Resume keys for bounded shared-folder discovery pages. Each normalized
     /// folder path advances only after its page has been committed, so folders
     /// larger than the in-memory scan budget are eventually indexed in full.
@@ -2286,6 +2293,7 @@ impl Default for AppSettings {
             pending_share_states: std::collections::HashMap::new(),
             pending_file_priorities: std::collections::HashMap::new(),
             pending_folder_allowlists: std::collections::HashMap::new(),
+            withheld_folder_files: std::collections::HashMap::new(),
             shared_folder_scan_cursors: std::collections::HashMap::new(),
             nodes_dat_path: String::new(),
             upnp_enabled: false,

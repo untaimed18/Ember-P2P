@@ -1137,7 +1137,10 @@ pub fn run() {
 
             let index_clone = local_index.clone();
             let shared_folders = settings.shared_folders.clone();
-            let startup_allowlists = settings.pending_folder_allowlists.clone();
+            let startup_allowlists = sharing::indexer::discovery_lists(
+                &settings.pending_folder_allowlists,
+                &settings.withheld_folder_files,
+            );
             let startup_scanning = scanning_count.clone();
             let startup_scan_coordination = scan_coordination.clone();
             let csf = cached_shared_files.clone();

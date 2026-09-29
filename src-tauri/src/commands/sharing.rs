@@ -2630,12 +2630,29 @@ async fn edit_folder_allowlists<F>(state: &AppState, edit: F) -> Result<(), Stri
 where
     F: FnOnce(&mut std::collections::HashMap<String, Vec<String>>) -> bool,
 {
+    edit_folder_lists(state, |allowlists, _| edit(allowlists)).await
+}
+
+/// [`edit_folder_allowlists`], with the withheld files beside the allowlists.
+/// The withheld files are tidied against the edited allowlists either way.
+async fn edit_folder_lists<F>(state: &AppState, edit: F) -> Result<(), String>
+where
+    F: FnOnce(
+        &mut std::collections::HashMap<String, Vec<String>>,
+        &mut std::collections::HashMap<String, Vec<String>>,
+    ) -> bool,
+{
     let _settings_save_guard = state.settings_save_lock.lock().await;
     let mut settings = {
         let config = state.config.read().await;
         config.settings.clone()
     };
-    if !edit(&mut settings.pending_folder_allowlists) {
+    let edited = edit(
+        &mut settings.pending_folder_allowlists,
+        &mut settings.withheld_folder_files,
+    );
+    let tidied = tidy_withheld(&settings.pending_folder_allowlists, &mut settings.withheld_folder_files);
+    if !edited && !tidied {
         return Ok(());
     }
     settings.settings_revision = settings.settings_revision.saturating_add(1);
@@ -2654,6 +2671,38 @@ where
     .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
     state.config.write().await.settings = settings;
     Ok(())
+}
+
+/// Keep only the withheld files that still mean something: those in a folder
+/// that has an allowlist, and that the allowlist does not offer (a file shared
+/// again, or taken in by a folder entry, is walked as part of the list).
+/// Returns whether anything went.
+fn tidy_withheld(
+    allowlists: &std::collections::HashMap<String, Vec<String>>,
+    withheld: &mut std::collections::HashMap<String, Vec<String>>,
+) -> bool {
+    let mut changed = false;
+    withheld.retain(|folder, files| {
+        let Some(list) = allowlists.get(folder) else {
+            changed = true;
+            return false;
+        };
+        let allowed = list.iter().cloned().collect::<HashSet<_>>();
+        let before = files.len();
+        let mut seen = HashSet::new();
+        files.retain(|file| {
+            crate::security::path_within_dir(file, folder)
+                && !allowlist_permits(&allowed, file)
+                && seen.insert(file.clone())
+        });
+        changed |= files.len() != before;
+        if files.is_empty() {
+            changed = true;
+            return false;
+        }
+        true
+    });
+    changed
 }
 
 /// Sweep pending share/priority intents whose files are now hashed. A pending
@@ -3194,6 +3243,9 @@ pub(crate) async fn add_shared_folder_approved(
                 &canonical_str,
                 limit.as_ref(),
             );
+            new_settings
+                .withheld_folder_files
+                .retain(|listed, _| !crate::security::path_within_dir(listed, &canonical_str));
             new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
             Ok(config
                 .prepare_save_settings(&new_settings)
@@ -3264,6 +3316,10 @@ pub(crate) async fn add_shared_folder_approved(
             &canonical_str,
             limit.as_ref(),
         );
+        config
+            .settings
+            .withheld_folder_files
+            .retain(|listed, _| !crate::security::path_within_dir(listed, &canonical_str));
         config.settings.settings_revision = config.settings.settings_revision.saturating_add(1);
     }
     drop(settings_save_guard);
@@ -3362,7 +3418,10 @@ pub(crate) async fn add_shared_folder_approved(
             let cfg = config.read().await;
             crate::sharing::indexer::DiscoveryScope::for_root(
                 &canonical_str,
-                &cfg.settings.pending_folder_allowlists,
+                &crate::sharing::indexer::discovery_lists(
+                    &cfg.settings.pending_folder_allowlists,
+                    &cfg.settings.withheld_folder_files,
+                ),
             )
         };
         let discovery = match tokio::task::spawn_blocking(move || {
@@ -4494,6 +4553,9 @@ pub async fn remove_shared_folder(
             .pending_folder_allowlists
             .retain(|folder, _| !crate::security::path_within_dir(folder, &canonical_path));
         new_settings
+            .withheld_folder_files
+            .retain(|folder, _| !crate::security::path_within_dir(folder, &canonical_path));
+        new_settings
             .shared_folder_scan_cursors
             .retain(|folder, _| !paths_equal_ignore_case(folder, &canonical_path));
         new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
@@ -4546,6 +4608,10 @@ pub async fn remove_shared_folder(
         config
             .settings
             .pending_folder_allowlists
+            .retain(|folder, _| !crate::security::path_within_dir(folder, &canonical_path));
+        config
+            .settings
+            .withheld_folder_files
             .retain(|folder, _| !crate::security::path_within_dir(folder, &canonical_path));
         config
             .settings
@@ -5726,7 +5792,10 @@ async fn reload_shared_files_page(
         (
             config.settings.shared_folders.clone(),
             config.settings.shared_folder_scan_cursors.clone(),
-            config.settings.pending_folder_allowlists.clone(),
+            crate::sharing::indexer::discovery_lists(
+                &config.settings.pending_folder_allowlists,
+                &config.settings.withheld_folder_files,
+            ),
         )
     };
 
@@ -6592,16 +6661,34 @@ pub(crate) async fn drop_from_allowlists(
         .iter()
         .map(|path| crate::search::index::normalize_path_key(path))
         .collect::<HashSet<_>>();
-    edit_folder_allowlists(state, |lists| {
-        let mut changed = false;
-        for files in lists.values_mut() {
-            let before = files.len();
-            files.retain(|item| !keys.contains(item));
-            changed |= files.len() != before;
+    edit_folder_lists(state, |allowlists, withheld| withhold_keys(allowlists, withheld, &keys)).await
+}
+
+/// Take `keys` off the allowlists, and record the ones a partly shared folder
+/// no longer offers as withheld, so discovery keeps walking them and the
+/// Library keeps showing them, unshared, as it would in a folder shared whole.
+fn withhold_keys(
+    allowlists: &mut std::collections::HashMap<String, Vec<String>>,
+    withheld: &mut std::collections::HashMap<String, Vec<String>>,
+    keys: &HashSet<String>,
+) -> bool {
+    let mut changed = false;
+    for (folder, files) in allowlists.iter_mut() {
+        let before = files.len();
+        files.retain(|item| !keys.contains(item));
+        changed |= files.len() != before;
+        let allowed = files.iter().cloned().collect::<HashSet<_>>();
+        for key in keys {
+            if crate::security::path_within_dir(key, folder) && !allowlist_permits(&allowed, key) {
+                let list = withheld.entry(folder.clone()).or_default();
+                if !list.contains(key) {
+                    list.push(key.clone());
+                    changed = true;
+                }
+            }
         }
-        changed
-    })
-    .await
+    }
+    changed
 }
 
 /// Put `paths` back on the allowlist of each partly shared folder they sit in.
@@ -7358,6 +7445,41 @@ mod tests {
         assert!(readmit_keys(&mut lists, &[back.clone(), back.clone(), elsewhere]));
         assert_eq!(lists[&folder], vec![kept.clone(), back.clone()]);
         assert!(!readmit_keys(&mut lists, &[kept]), "an entry already on the list is left alone");
+    }
+
+    #[test]
+    fn a_file_unshared_from_a_partial_share_stays_walked_until_shared_again() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let folder = crate::search::index::normalize_path_key(&format!("C:{sep}music"));
+        let a = format!("{folder}{sep}a.mp3");
+        let b = format!("{folder}{sep}b.mp3");
+        let sub = format!("{folder}{sep}live");
+        let in_sub = format!("{sub}{sep}c.mp3");
+        let elsewhere = crate::search::index::normalize_path_key(&format!("D:{sep}films{sep}d.mkv"));
+        let mut lists = std::collections::HashMap::from([(folder.clone(), vec![a.clone(), b.clone(), sub.clone()])]);
+        let mut withheld = std::collections::HashMap::new();
+
+        let keys = HashSet::from([a.clone(), in_sub.clone(), elsewhere]);
+        assert!(withhold_keys(&mut lists, &mut withheld, &keys));
+        assert_eq!(lists[&folder], vec![b.clone(), sub.clone()], "no longer offered");
+        // A file inside an offered folder entry is still offered by the list,
+        // so it is not withheld; one outside every partial share has nothing
+        // to be withheld from.
+        assert_eq!(withheld, std::collections::HashMap::from([(folder.clone(), vec![a.clone()])]));
+        let walked = crate::sharing::indexer::discovery_lists(&lists, &withheld);
+        assert!(walked[&folder].contains(&a), "discovery still walks it");
+
+        // Shared again: back on the list, and no longer withheld.
+        assert!(readmit_keys(&mut lists, std::slice::from_ref(&a)));
+        assert!(tidy_withheld(&lists, &mut withheld));
+        assert!(withheld.is_empty());
+
+        // A folder that lost its allowlist is shared whole; nothing is withheld.
+        withhold_keys(&mut lists, &mut withheld, &HashSet::from([b.clone()]));
+        assert!(!withheld.is_empty());
+        lists.clear();
+        assert!(tidy_withheld(&lists, &mut withheld));
+        assert!(withheld.is_empty());
     }
 
     #[test]

@@ -142,10 +142,12 @@ abandoned rather than trusted.
 Discovery of a folder with an allowlist now walks only the allowlisted files
 and folders and the folders that lead to them (`DiscoveryScope` in
 `sharing/indexer.rs`), in every scan: startup, add, full reload and
-filesystem events. Nothing else in the folder is hashed or indexed, so it no
-longer shows in the Library as an unshared file. Sharing a file again from the
-Library puts it back on the allowlist, and widening a partial share queues a
-scan of what it newly offers.
+filesystem events. Files never picked are not hashed or indexed, so they do not
+show in the Library. A file unshared from a partial share goes onto the
+folder's withheld list (`withheld_folder_files`), which discovery walks too, so
+it stays in the Library as an unshared file just as in a folder shared whole;
+sharing it again puts it back on the allowlist. Widening a partial share queues
+a scan of what it newly offers.
 
 ### eMule import: offer eMule's one-folder sharing
 

@@ -66,6 +66,23 @@ pub(crate) fn allowlist_permits(allowed: &HashSet<String>, key: &str) -> bool {
             .any(|(at, _)| allowed.contains(&key[..at]))
 }
 
+/// The lists discovery walks for each partly shared folder: its allowlist and
+/// the files the user unshared from it, which stay in the Library as unshared
+/// files. Only for discovery; what is offered is the allowlist alone.
+pub fn discovery_lists(
+    allowlists: &std::collections::HashMap<String, Vec<String>>,
+    withheld: &std::collections::HashMap<String, Vec<String>>,
+) -> std::collections::HashMap<String, Vec<String>> {
+    allowlists
+        .iter()
+        .map(|(folder, entries)| {
+            let mut walked = entries.clone();
+            walked.extend(withheld.get(folder).into_iter().flatten().cloned());
+            (folder.clone(), walked)
+        })
+        .collect()
+}
+
 /// What discovery may return from a folder shared with only some of its
 /// contents: the allowlisted files and folders, reached through the folders
 /// that lead to them. Nothing else in the folder is offered, so walking and

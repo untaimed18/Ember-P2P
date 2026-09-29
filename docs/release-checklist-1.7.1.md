@@ -149,7 +149,9 @@ git diff v1.7.0 -- messages/en.json
       scrolled into view.
 - [ ] Share part of a folder (Library explorer, "Include subfolders" off): only
       those files are hashed and listed. Sharing the rest later picks it up
-      without a manual reload.
+      without a manual reload. Unsharing one of them keeps it in the Library,
+      unshared, across a reload and a restart, and it can be shared again from
+      there.
 
 ## 9. Room transfers across versions
 
