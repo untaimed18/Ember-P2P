@@ -796,8 +796,27 @@ pub(super) fn build_ember_keyword_built(
 pub(super) struct EmberDigestVote {
     /// The digest this publisher named; all zero when it named none.
     pub(super) digest: [u8; 32],
-    /// Every node that returned one of this publisher's records.
-    pub(super) responders: Vec<ember::dht::EmberNodeId>,
+    /// Every responder that returned one of this publisher's records.
+    pub(super) responders: Vec<EmberResponder>,
+}
+
+/// One independent party behind a record, for counting how many stand behind a
+/// claim. A /24 where the search knows it: node ids are keypairs, so counting
+/// them let one host answering under three keys corroborate a digest alone. A
+/// node falls back to its own id when its address is unknown, which is also
+/// how our own store counts, once. Honest storers sharing one /24 (a LAN, one
+/// CGNAT pool) count once too, so a digest they alone hold does not
+/// corroborate; that fails safe, since the eD2K and AICH checks still run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum EmberResponder {
+    Subnet(u64),
+    Node(ember::dht::EmberNodeId),
+}
+
+impl EmberResponder {
+    fn of(node: ember::dht::EmberNodeId, subnet: Option<u64>) -> Self {
+        subnet.map_or(Self::Node(node), Self::Subnet)
+    }
 }
 
 /// Digest votes keyed by publisher key.
@@ -815,9 +834,13 @@ pub(super) fn note_ember_digest_vote(
     if digest != [0u8; 32] {
         vote.digest = digest;
     }
-    for node in std::iter::once(held.from_node).chain(held.confirmed_by) {
-        if !vote.responders.contains(&node) {
-            vote.responders.push(node);
+    let first = EmberResponder::of(held.from_node, held.from_subnet);
+    let second = held
+        .confirmed_by
+        .map(|node| EmberResponder::of(node, held.confirmed_subnet));
+    for responder in std::iter::once(first).chain(second) {
+        if !vote.responders.contains(&responder) {
+            vote.responders.push(responder);
         }
     }
 }
@@ -847,8 +870,7 @@ pub(super) fn majority_ember_digest(publisher_digests: &EmberDigestVotes) -> Opt
 fn ember_digest_tallies(
     publisher_digests: &EmberDigestVotes,
 ) -> impl Iterator<Item = ([u8; 32], usize, usize)> {
-    let mut tallies: HashMap<[u8; 32], (usize, HashSet<ember::dht::EmberNodeId>)> =
-        HashMap::new();
+    let mut tallies: HashMap<[u8; 32], (usize, HashSet<EmberResponder>)> = HashMap::new();
     for vote in publisher_digests.values() {
         if vote.digest != [0u8; 32] {
             let (publishers, responders) = tallies.entry(vote.digest).or_default();
@@ -1059,19 +1081,44 @@ mod ember_digest_corroboration_tests {
                     [*publisher; 32],
                     EmberDigestVote {
                         digest: [*digest; 32],
-                        responders: vec![ember::dht::EmberNodeId([*publisher; 16])],
+                        responders: vec![EmberResponder::Subnet(u64::from(*publisher))],
                     },
                 )
             })
             .collect()
     }
 
+    /// A record from `node`, confirmed by another; each in a /24 of its own.
     fn held_from(node: u8, confirmed_by: Option<u8>) -> ember::dht::search::SearchResultRecord {
         ember::dht::search::SearchResultRecord {
             data: Vec::new(),
             from_node: ember::dht::EmberNodeId([node; 16]),
             confirmed_by: confirmed_by.map(|n| ember::dht::EmberNodeId([n; 16])),
+            from_subnet: Some(u64::from(node)),
+            confirmed_subnet: confirmed_by.map(u64::from),
         }
+    }
+
+    /// One host answering under several keypairs is one responder: node ids
+    /// are free, a /24 is not.
+    #[test]
+    fn keypairs_in_one_subnet_do_not_corroborate() {
+        let mut votes = EmberDigestVotes::new();
+        for (publisher, node) in [(1u8, 1u8), (2, 2), (3, 3)] {
+            let held = ember::dht::search::SearchResultRecord {
+                from_subnet: Some(0xC0FFEE),
+                ..held_from(node, None)
+            };
+            note_ember_digest_vote(&mut votes, [publisher; 32], [0xEE; 32], &held);
+        }
+        assert_eq!(corroborated_ember_digest(&votes), None, "three keys, one host");
+
+        let other_host = ember::dht::search::SearchResultRecord {
+            from_subnet: Some(0xBEEF),
+            ..held_from(4, None)
+        };
+        note_ember_digest_vote(&mut votes, [4; 32], [0xEE; 32], &other_host);
+        assert_eq!(corroborated_ember_digest(&votes), Some([0xEE; 32]));
     }
 
     /// Publisher keys are free, so any number of them agreeing means nothing
@@ -1265,6 +1312,8 @@ mod ember_digest_corroboration_tests {
             data,
             from_node: ember::dht::EmberNodeId([node; 16]),
             confirmed_by: None,
+            from_subnet: None,
+            confirmed_subnet: None,
         };
         let mut held = Vec::new();
         for invented in 0..10u16 {
@@ -1317,6 +1366,8 @@ mod ember_source_self_filter_tests {
             data: blob,
             from_node: ember::dht::EmberNodeId([1; 16]),
             confirmed_by: None,
+            from_subnet: None,
+            confirmed_subnet: None,
         }];
 
         let parse = |self_ip: Option<Ipv4Addr>, local: [u8; 32]| {
@@ -1364,6 +1415,8 @@ mod ember_keyword_sanitize_tests {
             data: blob,
             from_node: ember::dht::EmberNodeId([1; 16]),
             confirmed_by: None,
+            from_subnet: None,
+            confirmed_subnet: None,
         }
     }
 

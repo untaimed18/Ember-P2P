@@ -1086,6 +1086,27 @@ impl DhtStore {
                 records[pos].last_republished = now;
                 return true;
             }
+            // A replacement that moves the record to another address takes a
+            // slot of that address's per-IP quota, the same as an insert would.
+            // Without this, storing from one address and replacing from another
+            // freed the first address's slot each time, so two hosts could fill
+            // every source slot of a key with one of them.
+            let record_ip = |r: &DhtRecord| r.attributed_ip.or_else(|| source_ip_from_record_data(&r.data));
+            if let Some(ip) = record_ip(&record).filter(|ip| record_ip(&records[pos]) != Some(*ip)) {
+                let same_ip = records
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, r)| *i != pos && r.expires_at_unix > now_unix && record_ip(r) == Some(ip))
+                    .count();
+                if same_ip >= self.scale.max_sources_per_ip() {
+                    self.source_ip_cap_rejections = self.source_ip_cap_rejections.saturating_add(1);
+                    debug!(
+                        "Key {} already has {same_ip} source record(s) attributed to {ip}, rejecting a replacement",
+                        hex::encode(key)
+                    );
+                    return false;
+                }
+            }
             let old_len = record_cost(records[pos].data.len());
             let new_len = record_cost(record.data.len());
             records[pos] = record;
@@ -2777,6 +2798,44 @@ mod tests {
             store.store(key, honest.data.clone(), honest.signature),
             "a genuine source from another address must still be accepted"
         );
+    }
+
+    /// Store from one address, then replace from another: the replacement
+    /// takes a slot of the new address's quota, so the old address's slot is
+    /// not freed for the next identity to reuse.
+    #[test]
+    fn a_replacement_cannot_move_a_source_past_the_per_ip_cap() {
+        use super::super::publish::{SignedRecord, SourceContact};
+        use std::net::Ipv4Addr;
+
+        let mut store = DhtStore::new();
+        store.set_scale(scale::NetworkScale::Established);
+        let cap = scale::NetworkScale::Established.max_sources_per_ip();
+        let file_hash = [0x78u8; 16];
+        let key = super::super::publish::source_key(&file_hash);
+        let target = Ipv4Addr::new(198, 51, 4, 1);
+        let contact = |ip, i: u8| SourceContact {
+            ip,
+            tcp_port: 4662,
+            udp_port: 4672,
+            flags: 0,
+            noise_pub: [i; 32],
+            ..Default::default()
+        };
+        let now = now_ts();
+
+        let mut moved = 0;
+        for i in 0..(cap as u8 + 3) {
+            let sk = SigningKey::from_bytes(&[i.wrapping_add(40); 32]);
+            let staging = Ipv4Addr::new(198, 51, 3, i + 1);
+            let first = SignedRecord::source_at(file_hash, "big.iso", contact(staging, i), &sk, now - 10);
+            assert!(store.store(key, first.data.clone(), first.signature));
+            let second = SignedRecord::source_at(file_hash, "big.iso", contact(target, i), &sk, now);
+            if store.store(key, second.data.clone(), second.signature) {
+                moved += 1;
+            }
+        }
+        assert_eq!(moved, cap, "replacements count against the address they move to");
     }
 
     /// Records are public, so anyone can harvest one from a FOUND_VALUE and

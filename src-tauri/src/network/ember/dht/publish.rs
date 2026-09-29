@@ -1024,6 +1024,31 @@ impl SignedRecord {
         )
     }
 
+    /// [`Self::source`] with a chosen creation time, so a test can build the
+    /// newer copy that replaces a resident.
+    #[cfg(test)]
+    pub(crate) fn source_at(
+        file_hash: [u8; 16],
+        file_name: &str,
+        contact: SourceContact,
+        signing_key: &SigningKey,
+        timestamp: i64,
+    ) -> Self {
+        Self::build_with_media(
+            RECORD_TYPE_SOURCE,
+            source_key(&file_hash),
+            file_hash,
+            [0u8; 32],
+            1,
+            file_name,
+            Some(contact),
+            None,
+            None,
+            signing_key,
+            timestamp,
+        )
+    }
+
     /// Public/private index listing, signed by the **channel** key. The
     /// language rides in `file_size` (see [`channel_language_from_file_size`]),
     /// so Discover can show it before anyone joins.

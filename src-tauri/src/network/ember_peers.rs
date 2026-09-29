@@ -664,11 +664,39 @@ pub(super) fn ember_session_introduced_among(
         || known.has_host(ip)
 }
 
+/// Whether a peer that sent us a signed frame may join the session-contact map.
+///
+/// Stricter than [`ember_session_introduced_among`], which also lets in any
+/// address we recently sent to so the IP filter passes replies from peers a
+/// search dialled. That includes the reply to a stranger's own ping, so used
+/// here it let any public host that pinged twice be pinned onto every lookup
+/// and offered as a publish target, outside the routing table's /24 limits.
+/// A dial vouches only for a LAN or CGNAT host, the peers the map exists for.
+pub(super) fn ember_session_contact_admitted_among(
+    keyless: &HostPortMap<std::time::Instant>,
+    session: &HostPortMap<ember::dht::EmberContact>,
+    known: &HostPortMap<std::time::Instant>,
+    recently_dialled: impl FnOnce() -> bool,
+    ip: Ipv4Addr,
+    udp_port: u16,
+) -> bool {
+    ember_session_introduced_among(keyless, session, known, || false, ip, udp_port)
+        || (crate::security::is_lan_or_cgnat_v4(ip) && recently_dialled())
+}
+
 pub(super) fn remember_ember_session_dht_contact(state: &mut NetworkState, contact: ember::dht::EmberContact) {
     let IpAddr::V4(ip) = contact.addr.ip() else {
         return;
     };
-    if !ember_session_introduced(state, ip, contact.addr.port()) {
+    let admitted = ember_session_contact_admitted_among(
+        &state.ember_keyless_peers,
+        &state.ember_session_dht_contacts,
+        &state.known_ember_peers,
+        || state.ember_transport.recently_dialled(IpAddr::V4(ip)),
+        ip,
+        contact.addr.port(),
+    );
+    if !admitted {
         return;
     }
     record_ember_session_dht_contact(&mut state.ember_session_dht_contacts, contact);

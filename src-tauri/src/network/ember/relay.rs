@@ -11,7 +11,9 @@ use tracing::{debug, info, warn};
 const MSG_RELAY_REQUEST: u8 = 0x01;
 const MSG_RELAY_ACCEPT: u8 = 0x02;
 const MSG_RELAY_CONNECT: u8 = 0x03;
-const MSG_RELAY_CLOSE: u8 = 0x05;
+// 0x05 was RELAY_CLOSE, which a relay sent after ACCEPT when it could not
+// reach the target. Current relays answer REJECT instead; 1.7.0 relays still
+// send it, so the number is retired, not free.
 const MSG_RELAY_REJECT: u8 = 0x06;
 
 /// Wire version for signed RELAY_REQUEST payloads (PoP).
@@ -26,6 +28,9 @@ const REJECT_CAPACITY: u8 = 0x01;
 const REJECT_BAD_TARGET: u8 = 0x02;
 const REJECT_AUTH: u8 = 0x03;
 const REJECT_BAD_SIGNATURE: u8 = 0x04;
+/// The relay could not reach the target. A 1.7.0 initiator reads an unknown
+/// reason as a plain refusal, which is also the right reading.
+const REJECT_TARGET_UNREACHABLE: u8 = 0x05;
 /// How long a (requester pubkey, nonce) pair is remembered to block replays.
 const RELAY_REQUEST_NONCE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Nonces remembered per requester identity, and identities tracked at once.
@@ -421,7 +426,7 @@ impl RelayManager {
 /// Encode a relay protocol message.
 pub fn encode_relay_message(msg_type: u8, session_id: u32, payload: &[u8]) -> Vec<u8> {
     // The wire framing uses a u16 length prefix. Every relay control message
-    // stays well under that — ACCEPT/CLOSE are empty, REJECT is 1 byte,
+    // stays well under that — ACCEPT is empty, REJECT is 1 byte,
     // CONNECT carries a 16-byte file hash, and REQUEST is a fixed 183-byte
     // signed v2 payload — but assert it so a future caller that overflows
     // the prefix (which would silently corrupt the framing) is caught in
@@ -627,15 +632,27 @@ pub fn build_relay_reject(session_id: u32, reason: u8) -> Vec<u8> {
     encode_relay_message(MSG_RELAY_REJECT, session_id, &[reason])
 }
 
+/// How long a relay holds a connection open for its REJECT to be read.
+const REJECT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Send a REJECT and keep the connection until the initiator has read it.
+///
+/// Returning drops the last handle on the connection, and quinn closes it on
+/// the spot, discarding what is still queued, so the initiator saw the
+/// connection drop instead of the answer. It then counted a working relay as
+/// unreachable and never learned that the relay had refused it.
+async fn send_relay_reject(send: &mut quinn::SendStream, session_id: u32, reason: u8) {
+    let reject = build_relay_reject(session_id, reason);
+    if write_relay_control(send, &reject, "send reject").await.is_ok() {
+        let _ = send.finish();
+        let _ = tokio::time::timeout(REJECT_DELIVERY_TIMEOUT, send.stopped()).await;
+    }
+}
+
 /// Build a RELAY_CONNECT message sent to the target peer,
 /// carrying the file_hash so the target knows what to serve.
 pub fn build_relay_connect(session_id: u32, file_hash: &[u8; 16]) -> Vec<u8> {
     encode_relay_message(MSG_RELAY_CONNECT, session_id, file_hash)
-}
-
-/// Build a RELAY_CLOSE message.
-pub fn build_relay_close(session_id: u32) -> Vec<u8> {
-    encode_relay_message(MSG_RELAY_CLOSE, session_id, &[])
 }
 
 const PUNCH_RDV_DOMAIN: &[u8] = b"ember-rdv-v1";
@@ -1178,6 +1195,9 @@ pub struct RelayDialError {
     /// first, and one unreachable source could walk the whole candidate list
     /// and empty it.
     pub relay_at_fault: bool,
+    /// The relay declined *us*, not this request: it serves only its friends,
+    /// so asking it again will get the same answer.
+    pub refused_us: bool,
 }
 
 impl RelayDialError {
@@ -1186,6 +1206,7 @@ impl RelayDialError {
         Self {
             reason: reason.into(),
             relay_at_fault: true,
+            refused_us: false,
         }
     }
 
@@ -1194,6 +1215,15 @@ impl RelayDialError {
         Self {
             reason: reason.into(),
             relay_at_fault: false,
+            refused_us: false,
+        }
+    }
+
+    /// The relay answered properly and will not serve this requester at all.
+    fn refused_requester(reason: impl Into<String>) -> Self {
+        Self {
+            refused_us: true,
+            ..Self::refused(reason)
         }
     }
 }
@@ -1223,9 +1253,16 @@ pub async fn connect_to_peer_relay(
     // The pinned handshake is where a fabricated attestation comes apart: it
     // names an address whose occupant cannot present the signing identity. That
     // makes this failure the relay's, and the one worth counting.
-    let conn = super::quic::connect_pinned(endpoint, relay_addr, "ember-relay", pin)
-        .await
-        .map_err(|e| RelayDialError::unreachable(format!("relay QUIC handshake failed: {e}")))?;
+    // Bounded so the whole dial, handshake plus the relay's answer, fits the
+    // broker's 30 s attempt timeout; left to quinn's idle timeout, a late answer
+    // found its attempt already expired and was dropped.
+    let conn = tokio::time::timeout(
+        RELAY_HANDSHAKE_TIMEOUT,
+        super::quic::connect_pinned(endpoint, relay_addr, "ember-relay", pin),
+    )
+    .await
+    .map_err(|_| RelayDialError::unreachable("relay QUIC handshake timed out"))?
+    .map_err(|e| RelayDialError::unreachable(format!("relay QUIC handshake failed: {e}")))?;
 
     let (mut send, mut recv) = tokio::time::timeout(RELAY_CONTROL_TIMEOUT, conn.open_bi())
         .await
@@ -1256,7 +1293,7 @@ pub async fn connect_to_peer_relay(
     // to avoid reading an attacker-chosen huge `payload_len` into
     // memory.
     let mut resp_header = [0u8; 7];
-    read_relay_control(&mut recv, &mut resp_header, "relay read response")
+    read_relay_control_within(&mut recv, &mut resp_header, "relay read response", RELAY_RESPONSE_TIMEOUT)
         .await
         .map_err(RelayDialError::unreachable)?;
     let payload_len = u16::from_le_bytes([resp_header[5], resp_header[6]]) as usize;
@@ -1280,19 +1317,27 @@ pub async fn connect_to_peer_relay(
 
     if msg_type == MSG_RELAY_REJECT {
         // Payload is a single reason byte (see `build_relay_reject`):
-        // 0x01 capacity, 0x02 bad target, 0x03 auth/attestation, 0x04 bad PoP.
+        // 0x01 capacity, 0x02 bad target, 0x03 auth/attestation, 0x04 bad PoP,
+        // 0x05 target unreachable.
         //
         // All of these are a working relay answering us, so none is counted
         // against it. Capacity in particular is what the most-used relays say,
         // and a bad target is a statement about the source we named.
         let reason = payload.first().copied();
+        // `REJECT_AUTH` is also the answer to a non-friend requester, which is
+        // most of the relays public EPX tells us about.
+        if reason == Some(REJECT_AUTH) {
+            return Err(RelayDialError::refused_requester(
+                "relay peer rejected request: not a friend, or unknown attestation",
+            ));
+        }
         return Err(RelayDialError::refused(match reason {
             Some(REJECT_CAPACITY) => "relay peer rejected request: at capacity".to_string(),
             Some(REJECT_BAD_TARGET) => {
                 "relay peer rejected request: invalid/non-public target".to_string()
             }
-            Some(REJECT_AUTH) => {
-                "relay peer rejected request: unauthenticated or unknown attestation".to_string()
+            Some(REJECT_TARGET_UNREACHABLE) => {
+                "relay peer rejected request: could not reach the source".to_string()
             }
             Some(REJECT_BAD_SIGNATURE) => {
                 "relay peer rejected request: bad requester signature or replay".to_string()
@@ -1497,7 +1542,22 @@ impl AsyncWrite for WsStream {
 }
 
 /// Timeout for the relay node to connect to the target peer.
-const RELAY_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+///
+/// The relay answers the request only after this, so it stays inside a 1.7.0
+/// initiator's [`RELAY_CONTROL_TIMEOUT`] read and our own
+/// [`RELAY_RESPONSE_TIMEOUT`].
+const RELAY_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long an initiator waits for the relay's answer, which a current relay
+/// sends once it has reached the target.
+const RELAY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long an initiator gives the QUIC handshake to a relay.
+const RELAY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+// The relay must answer inside both initiators' reads: a 1.7.0 initiator's
+// control read and our own response read.
+const _: () = assert!(
+    RELAY_TARGET_CONNECT_TIMEOUT.as_secs() < RELAY_CONTROL_TIMEOUT.as_secs()
+        && RELAY_TARGET_CONNECT_TIMEOUT.as_secs() < RELAY_RESPONSE_TIMEOUT.as_secs()
+);
 /// Bound every control-plane stream open/read/write after the QUIC handshake.
 /// Data-plane relay copies remain governed by `RELAY_MAX_DURATION`.
 const RELAY_CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1507,7 +1567,16 @@ async fn read_relay_control(
     buffer: &mut [u8],
     context: &str,
 ) -> Result<(), String> {
-    tokio::time::timeout(RELAY_CONTROL_TIMEOUT, recv.read_exact(buffer))
+    read_relay_control_within(recv, buffer, context, RELAY_CONTROL_TIMEOUT).await
+}
+
+async fn read_relay_control_within(
+    recv: &mut quinn::RecvStream,
+    buffer: &mut [u8],
+    context: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    tokio::time::timeout(timeout, recv.read_exact(buffer))
         .await
         .map_err(|_| format!("{context}: timed out"))?
         .map_err(|e| format!("{context}: {e}"))
@@ -2397,8 +2466,7 @@ pub async fn run_quic_accept_loop(
                         "QUIC accept: RELAY_REQUEST from {remote} has unexpected payload_len {payload_len} (want {RELAY_REQUEST_V2_PAYLOAD_LEN}; v1 hash-only requests are rejected)"
                     );
                     // Echo reject when we can (session id is in the header).
-                    let reject = build_relay_reject(peer_session_id, REJECT_AUTH);
-                    let _ = write_relay_control(&mut init_send, &reject, "send reject").await;
+                    send_relay_reject(&mut init_send, peer_session_id, REJECT_AUTH).await;
                     return;
                 }
 
@@ -2419,9 +2487,7 @@ pub async fn run_quic_accept_loop(
                         Ok(req) => req,
                         Err(reason) => {
                             debug!("QUIC accept: refusing relay request from {remote}: {reason}");
-                            let reject = build_relay_reject(peer_session_id, REJECT_BAD_SIGNATURE);
-                            let _ = write_relay_control(&mut init_send, &reject, "send reject")
-                                .await;
+                            send_relay_reject(&mut init_send, peer_session_id, REJECT_BAD_SIGNATURE).await;
                             return;
                         }
                     };
@@ -2438,8 +2504,7 @@ pub async fn run_quic_accept_loop(
                         "QUIC accept: refusing relay request from {remote} ({}): {reason}",
                         hex::encode(verified.requester_ember_hash)
                     );
-                    let reject = build_relay_reject(peer_session_id, REJECT_AUTH);
-                    let _ = write_relay_control(&mut init_send, &reject, "send reject").await;
+                    send_relay_reject(&mut init_send, peer_session_id, REJECT_AUTH).await;
                     return;
                 }
 
@@ -2456,8 +2521,7 @@ pub async fn run_quic_accept_loop(
                         "QUIC accept: refusing relay to target {}:{} from {remote}: {reason}",
                         verified.target_ip, verified.target_port
                     );
-                    let reject = build_relay_reject(peer_session_id, REJECT_BAD_TARGET);
-                    let _ = write_relay_control(&mut init_send, &reject, "send reject").await;
+                    send_relay_reject(&mut init_send, peer_session_id, REJECT_BAD_TARGET).await;
                     return;
                 }
 
@@ -2484,8 +2548,7 @@ pub async fn run_quic_accept_loop(
                     }
                 };
                 if let Some(reason) = reject_reason {
-                    let reject = build_relay_reject(peer_session_id, reason);
-                    let _ = write_relay_control(&mut init_send, &reject, "send reject").await;
+                    send_relay_reject(&mut init_send, peer_session_id, reason).await;
                     return;
                 }
 
@@ -2517,28 +2580,23 @@ pub async fn run_quic_accept_loop(
                     match created {
                         Some(sid) => sid,
                         None => {
-                            let reject = build_relay_reject(peer_session_id, REJECT_CAPACITY);
-                            let _ = write_relay_control(&mut init_send, &reject, "send reject")
-                                .await;
+                            send_relay_reject(&mut init_send, peer_session_id, REJECT_CAPACITY).await;
                             debug!("QUIC accept: at capacity, rejected relay from {remote}");
                             return;
                         }
                     }
                 };
 
-                let accept_msg = build_relay_accept(peer_session_id);
-                if let Err(e) =
-                    write_relay_control(&mut init_send, &accept_msg, "send ACCEPT").await
-                {
-                    debug!("QUIC accept: failed to send ACCEPT to {remote}: {e}");
-                    mgr.lock().await.remove_session(session_id);
-                    return;
-                }
-
                 info!(
-                    "Relay session {session_id}: accepted from {initiator_ip}:{initiator_port}, connecting to target {target_ip}:{target_port}"
+                    "Relay session {session_id}: request from {initiator_ip}:{initiator_port}, connecting to target {target_ip}:{target_port}"
                 );
 
+                // Target first, ACCEPT after. The initiator takes ACCEPT as a
+                // working relay and starts speaking eD2K on the stream, so an
+                // ACCEPT sent before the target answered turned every unreachable
+                // target into a recorded success: its CLOSE arrived as the reply
+                // to the initiator's Hello, and the relay's failure count was
+                // cleared each time.
                 let target_addr = SocketAddr::new(std::net::IpAddr::V4(target_ip), target_port);
 
                 let target_result = tokio::time::timeout(
@@ -2553,22 +2611,19 @@ pub async fn run_quic_accept_loop(
                 )
                 .await;
 
-                let (mut tgt_send, tgt_recv) = match target_result {
-                    Ok(Ok(streams)) => streams,
-                    Ok(Err(e)) => {
-                        info!("Relay session {session_id}: target connect failed: {e}");
-                        let close = build_relay_close(peer_session_id);
-                        let _ = write_relay_control(&mut init_send, &close, "send CLOSE").await;
-                        mgr.lock().await.remove_session(session_id);
-                        return;
-                    }
-                    Err(_) => {
-                        info!("Relay session {session_id}: target connect timed out");
-                        let close = build_relay_close(peer_session_id);
-                        let _ = write_relay_control(&mut init_send, &close, "send CLOSE").await;
-                        mgr.lock().await.remove_session(session_id);
-                        return;
-                    }
+                let unreachable = match &target_result {
+                    Ok(Ok(_)) => None,
+                    Ok(Err(e)) => Some(format!("target connect failed: {e}")),
+                    Err(_) => Some("target connect timed out".to_string()),
+                };
+                if let Some(why) = unreachable {
+                    info!("Relay session {session_id}: {why}");
+                    mgr.lock().await.remove_session(session_id);
+                    send_relay_reject(&mut init_send, peer_session_id, REJECT_TARGET_UNREACHABLE).await;
+                    return;
+                }
+                let Ok(Ok((mut tgt_send, tgt_recv))) = target_result else {
+                    return;
                 };
 
                 let session_present = {
@@ -2585,16 +2640,21 @@ pub async fn run_quic_accept_loop(
                     }
                 };
                 if !session_present {
-                    // Cleanup can reap the slot while ACCEPT/target-connect
-                    // is still in flight; bridging without it would leave
-                    // the later `remove_session` as a no-op. Same CLOSE as
-                    // the target-connect failure paths: the initiator already
-                    // returned from ACCEPT and treats the stream as eD2K, so
-                    // CLOSE is abort signalling rather than a parsed control
-                    // frame, matching those siblings.
-                    let close = build_relay_close(peer_session_id);
-                    let _ = write_relay_control(&mut init_send, &close, "send CLOSE").await;
-                    let _ = init_send.finish();
+                    // Cleanup can reap the slot while the target connect is in
+                    // flight; bridging without it would leave the later
+                    // `remove_session` as a no-op. Nothing is accepted yet, so
+                    // the initiator still reads this as a refusal.
+                    let _ = tgt_send.finish();
+                    send_relay_reject(&mut init_send, peer_session_id, REJECT_CAPACITY).await;
+                    return;
+                }
+
+                let accept_msg = build_relay_accept(peer_session_id);
+                if let Err(e) =
+                    write_relay_control(&mut init_send, &accept_msg, "send ACCEPT").await
+                {
+                    debug!("QUIC accept: failed to send ACCEPT to {remote}: {e}");
+                    mgr.lock().await.remove_session(session_id);
                     let _ = tgt_send.finish();
                     return;
                 }

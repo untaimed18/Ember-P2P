@@ -552,6 +552,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
                 settings.rendezvous_url.clone(),
                 broker_tx,
             );
+            broker.set_friend_hashes(state.xfer_friend_hashes.clone());
 
             match ember::quic::generate_self_signed_cert(&ed25519_secret_key) {
                 Ok((cert_der, key_der)) => {

@@ -1717,6 +1717,8 @@ fn held_records(blobs: &[Vec<u8>]) -> Vec<ember::dht::search::SearchResultRecord
             data: data.clone(),
             from_node: ember::dht::EmberNodeId([i as u8 + 1; 16]),
             confirmed_by: None,
+            from_subnet: None,
+            confirmed_subnet: None,
         })
         .collect()
 }
@@ -3021,6 +3023,8 @@ fn one_responder_minting_publishers_cannot_decide_a_files_digest() {
         data,
         from_node: ember::dht::EmberNodeId([node; 16]),
         confirmed_by: None,
+        from_subnet: None,
+        confirmed_subnet: None,
     };
     let minted: Vec<_> = (0..40u8)
         .map(|i| {
@@ -4872,6 +4876,33 @@ fn session_introduced_matches_the_key_scans_it_replaced() {
             }
         }
     }
+}
+
+/// Answering a public stranger's ping marks it dialled, which must not be
+/// enough to pin it as a session contact. A LAN host we dialled still is, and
+/// so is anything an eD2K session vouches for.
+#[test]
+fn a_public_peer_we_only_answered_is_not_a_session_contact() {
+    let now = std::time::Instant::now();
+    let keyless = HostPortMap::new();
+    let session = HostPortMap::new();
+    let mut known = HostPortMap::new();
+    let stranger = Ipv4Addr::new(80, 1, 2, 3);
+    let lan = Ipv4Addr::new(192, 168, 1, 7);
+    let introduced = Ipv4Addr::new(80, 9, 9, 9);
+    known.insert((introduced, 4662), now);
+
+    let admitted = |ip, dialled| {
+        ember_session_contact_admitted_among(&keyless, &session, &known, || dialled, ip, 4672)
+    };
+    assert!(!admitted(stranger, true), "a reply to its ping vouches for nothing");
+    assert!(
+        ember_session_introduced_among(&keyless, &session, &known, || true, stranger, 4672),
+        "the IP filter still lets the reply's answer through"
+    );
+    assert!(admitted(lan, true));
+    assert!(!admitted(lan, false));
+    assert!(admitted(introduced, false));
 }
 
 /// `handle_ember_dht_message` copies the session map only when the frame's

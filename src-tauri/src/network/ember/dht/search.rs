@@ -457,6 +457,15 @@ pub struct SearchResultRecord {
     /// A second node that returned the identical blob, if any. A record held
     /// by two responders is not one responder's word.
     pub confirmed_by: Option<EmberNodeId>,
+    /// The /24 (IPv6 /48) `from_node` answered from; `None` for our own store
+    /// or a node whose address the search no longer holds.
+    ///
+    /// A node id is a keypair, so counting responders by id let one host
+    /// answering under three keys vouch for a claim three times. Consumers that
+    /// count independent responders count these instead where they are known.
+    pub from_subnet: Option<u64>,
+    /// The /24 `confirmed_by` answered from, likewise.
+    pub confirmed_subnet: Option<u64>,
 }
 
 /// An active iterative search.
@@ -805,6 +814,8 @@ impl IterativeSearch {
                 data,
                 from_node: node,
                 confirmed_by: None,
+                from_subnet: self.node_subnet(&node),
+                confirmed_subnet: None,
             });
         }
     }
@@ -1359,6 +1370,7 @@ impl IterativeSearch {
                     let held = &mut self.results[slot];
                     if independent && held.from_node != *from_id && held.confirmed_by.is_none() {
                         held.confirmed_by = Some(*from_id);
+                        held.confirmed_subnet = from_subnet;
                     }
                     self.note_contributor(*from_id);
                 }
@@ -1428,7 +1440,8 @@ impl IterativeSearch {
                         .entry((*from_id, file, digest))
                         .or_insert(0) += 1;
                 }
-                let (from_node, confirmed_by) = match first_offered_by {
+                let prior_subnet = self.turned_away.get(&blob_digest).and_then(|(_, subnet)| *subnet);
+                let (from_node, confirmed_by, from_node_subnet, confirmed_subnet) = match first_offered_by {
                     Some(first) => {
                         self.turned_away.remove(&blob_digest);
                         if let Some((file, digest)) = publisher_share(&data) {
@@ -1437,11 +1450,11 @@ impl IterativeSearch {
                                 .entry((*from_id, file, digest))
                                 .or_insert(0) += 1;
                         }
-                        (first, Some(*from_id))
+                        (first, Some(*from_id), prior_subnet, from_subnet)
                     }
                     None => {
                         self.turned_away.remove(&blob_digest);
-                        (*from_id, prior_offerer)
+                        (*from_id, prior_offerer, from_subnet, prior_offerer.and(prior_subnet))
                     }
                 };
                 self.result_slots.insert(blob_digest, self.results.len());
@@ -1449,6 +1462,8 @@ impl IterativeSearch {
                     data,
                     from_node,
                     confirmed_by,
+                    from_subnet: from_node_subnet,
+                    confirmed_subnet,
                 });
             }
         }
@@ -2178,6 +2193,8 @@ impl SearchManager {
                 data,
                 from_node: local_id,
                 confirmed_by: None,
+                from_subnet: None,
+                confirmed_subnet: None,
             });
             search.seeded_count = search.seeded_count.saturating_add(1);
             added += 1;

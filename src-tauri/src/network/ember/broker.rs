@@ -34,6 +34,10 @@ const RELAY_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTEMPT_COOLDOWN: Duration = Duration::from_secs(120);
 const ATTEMPT_RESET: Duration = Duration::from_secs(600);
 const MAX_ATTEMPTS_PER_SOURCE: u32 = 3;
+/// How long a relay that declined to serve us is skipped. Long, because the
+/// usual reason is that we are not its friend, which does not change often;
+/// finite, because friendship can.
+const RELAY_REFUSAL_BACKOFF: Duration = Duration::from_secs(3600);
 /// Prefer fresh candidates when picking a relay; older-but-still-retained
 /// entries remain until `RELAY_CANDIDATE_PRUNE_MAX_AGE`.
 const RELAY_CANDIDATE_PICK_MAX_AGE: Duration = Duration::from_secs(600);
@@ -122,10 +126,18 @@ pub struct RelayCandidate {
     /// An attestation only proves that whoever signed it *claims* the address;
     /// nothing proves they hold it. The pinned QUIC handshake catches the lie,
     /// but only at the moment of use — so without recording the outcome the
-    /// broker kept choosing a candidate that could never work, and preferring
-    /// it, since [`Self::pick_relay_candidate`] ranks fewest-sessions first and
-    /// a fabricated entry has carried none.
+    /// broker kept choosing a candidate that could never work, freshly gossiped
+    /// as a fabricated entry always is.
     pub failures: u32,
+    /// Until when this relay is skipped because it declined to serve us.
+    ///
+    /// A relay carries only its friends' traffic, and attestations reach us
+    /// through public EPX, so most candidates will always say no. That is a
+    /// working relay answering correctly, so it is not a failure to evict it
+    /// for, but picking it again straight away only spent the source's
+    /// attempts on a relay that cannot help. Set when the relay answers
+    /// `REJECT_AUTH`; cleared when it carries a session.
+    pub refused_until: Option<Instant>,
     /// Which peer handed us this attestation, or `None` when we saw it on a
     /// swarm exchange rather than a friend's forward. Used only to bound one
     /// introducer's share of the list, never to decide trust — that rests
@@ -222,6 +234,10 @@ pub struct ConnectionBroker {
     event_tx: mpsc::Sender<BrokerEvent>,
     quic_endpoint: Option<Arc<quinn::Endpoint>>,
     stats: BrokerStats,
+    /// Our friends' Ember hashes, read when an attempt picks a relay.
+    friend_hashes: Option<crate::app_state::SharedFriendHashes>,
+    /// The friend set as of the last pick; see [`Self::pick_relay_candidate`].
+    friends: std::collections::HashSet<[u8; 16]>,
 }
 
 /// Events emitted by the broker for the main network loop to act on.
@@ -239,6 +255,10 @@ pub enum BrokerEvent {
     },
     /// Hole-punch or relay succeeded -- connection ready for download.
     ConnectionReady(BrokerConnection),
+    /// The source answered our eD2K Hello over the relay, which is what shows
+    /// the relay works. ACCEPT alone does not: a 1.7.0 relay sends it before
+    /// it has reached the source.
+    RelayGreeted { attempt_key: String },
     /// All methods exhausted for this source.
     ConnectionFailed {
         transfer_id: String,
@@ -258,6 +278,10 @@ pub enum BrokerEvent {
         /// about the peer. Charging those to a relay would evict a perfectly
         /// good one after three of our own stumbles.
         relay_at_fault: bool,
+        /// The relay declined to serve us (we are not its friend), so it is
+        /// skipped for a while rather than charged; see
+        /// [`ConnectionBroker::relay_refused_us`].
+        refused_us: bool,
     },
 }
 
@@ -286,7 +310,14 @@ impl ConnectionBroker {
             event_tx,
             quic_endpoint: None,
             stats: BrokerStats::default(),
+            friend_hashes: None,
+            friends: std::collections::HashSet::new(),
         }
+    }
+
+    /// Give the broker our friend list, which decides which relays can serve us.
+    pub fn set_friend_hashes(&mut self, friend_hashes: crate::app_state::SharedFriendHashes) {
+        self.friend_hashes = Some(friend_hashes);
     }
 
     /// Snapshot the broker's session counters. Cheap (`Copy`).
@@ -359,6 +390,9 @@ impl ConnectionBroker {
         // a v2 punch request, so the broker starts directly at relay.
         let start_phase = AttemptPhase::FindRelay;
 
+        if let Some(friend_hashes) = &self.friend_hashes {
+            self.friends = friend_hashes.read().await.clone();
+        }
         let relay_candidate = self.pick_relay_candidate();
         let relay_addr = relay_candidate.map(|c| (c.ip, c.port));
         let relay_attestation_hash = relay_candidate.map(|c| c.attestation_hash);
@@ -422,6 +456,20 @@ impl ConnectionBroker {
         }
     }
 
+    /// Called when the relay answered that it will not serve us. The attempt
+    /// fails like any other, and the relay is skipped for
+    /// [`RELAY_REFUSAL_BACKOFF`] without being counted as broken.
+    pub async fn relay_refused_us(&mut self, attempt_key: &str, reason: &str) {
+        if let Some((ip, port, pubkey)) = self.attempts.get(attempt_key).and_then(|a| a.relay) {
+            if let Some(c) = self.relay_candidates.iter_mut().find(|c| {
+                c.ip == ip && c.port == port && c.attestation.ed25519_pubkey == pubkey
+            }) {
+                c.refused_until = Some(Instant::now() + RELAY_REFUSAL_BACKOFF);
+            }
+        }
+        self.relay_failed(attempt_key, reason, false).await;
+    }
+
     /// Called when a relay succeeds.
     pub fn mark_succeeded(&mut self, attempt_key: &str, _method: ConnectionMethod) {
         if let Some(attempt) = self.attempts.remove(attempt_key) {
@@ -440,6 +488,7 @@ impl ConnectionBroker {
                     })
                 {
                     c.failures = 0;
+                    c.refused_until = None;
                     c.relay_sessions += 1;
                     debug!(
                         "Broker: incremented relay_sessions for {}:{} to {}",
@@ -509,6 +558,15 @@ impl ConnectionBroker {
                 && c.port == port
                 && c.attestation.ed25519_pubkey == attestation.ed25519_pubkey
         }) {
+            // A friend's relay never turns us away for not being its friend, so
+            // its `REJECT_AUTH` meant an attestation it has rotated away from,
+            // and a new one is worth trying. A stranger's is not cleared:
+            // relays re-sign on every exchange, so clearing on any new hash
+            // would undo the backoff within minutes.
+            let friend = ember_hash.is_some_and(|hash| self.friends.contains(&hash));
+            if friend && existing.attestation_hash != attestation_hash {
+                existing.refused_until = None;
+            }
             existing.attestation_hash = attestation_hash;
             existing.attestation = attestation;
             existing.ember_hash = ember_hash;
@@ -575,6 +633,7 @@ impl ConnectionBroker {
             attestation,
             ember_hash,
             failures: 0,
+            refused_until: None,
             introduced_by,
             last_seen: Instant::now(),
             relay_sessions: 0,
@@ -604,7 +663,14 @@ impl ConnectionBroker {
             .collect()
     }
 
-    /// Pick the best available relay candidate (fewest sessions, most recent).
+    /// Pick the best available relay candidate.
+    ///
+    /// A friend's relay first, because a relay carries only its friends'
+    /// traffic, then fewest failures, then a relay that has carried a session
+    /// before one that has not, then the most recently seen. Proven relays used
+    /// to rank *behind* unused ones, on a lifetime session count that never
+    /// went down, so one success sent a working friend relay behind every
+    /// stranger's.
     ///
     /// Filters on both the age-based `RELAY_CANDIDATE_PICK_MAX_AGE` window
     /// *and* the candidate's own signed `expires_at_unix` ??? the age window
@@ -617,19 +683,24 @@ impl ConnectionBroker {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let now = Instant::now();
         self.relay_candidates
             .iter()
             .filter(|c| {
-                c.last_seen.elapsed() < RELAY_CANDIDATE_PICK_MAX_AGE && c.expires_at_unix > now_unix
+                c.last_seen.elapsed() < RELAY_CANDIDATE_PICK_MAX_AGE
+                    && c.expires_at_unix > now_unix
+                    && c.refused_until.is_none_or(|until| until <= now)
             })
-            // Failures rank ahead of everything else. A candidate that has just
-            // failed must not keep winning on "carried no sessions and seen
-            // most recently", which is precisely how a fabricated entry used to
-            // outrank a relay that demonstrably works.
+            // Failures rank ahead of everything but friendship. A candidate that
+            // has just failed must not keep winning on "seen most recently",
+            // which is how a fabricated entry used to outrank a relay that
+            // demonstrably works.
             .min_by_key(|c| {
+                let friend = c.ember_hash.is_some_and(|hash| self.friends.contains(&hash));
                 (
+                    !friend,
                     c.failures,
-                    c.relay_sessions,
+                    c.relay_sessions == 0,
                     c.last_seen.elapsed().as_secs(),
                 )
             })
@@ -933,6 +1004,61 @@ mod tests {
         );
     }
 
+    /// A relay serves only its friends, so a friend's relay wins over a
+    /// stranger's however much better the stranger's looks otherwise, and a
+    /// stranger that refused us is not asked again straight away, even when a
+    /// re-signed attestation for it arrives.
+    #[tokio::test]
+    async fn a_friend_relay_that_worked_beats_strangers_who_refuse_us() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let fresh = unix_now() + 600;
+        let friend_relay = Ipv4Addr::new(198, 51, 100, 20);
+        let stranger = Ipv4Addr::new(198, 51, 100, 21);
+        let friend_hash = [0xF1u8; 16];
+        let friends: crate::app_state::SharedFriendHashes = Arc::new(tokio::sync::RwLock::new(
+            std::collections::HashSet::from([friend_hash]),
+        ));
+        broker.set_friend_hashes(friends);
+
+        // The stranger's relay looks better on every other count: proven, and
+        // seen more recently.
+        broker.add_relay_candidate(attestation(friend_relay, 4662, fresh), Some(friend_hash), None);
+        if let Some(c) = broker.relay_candidates.iter_mut().find(|c| c.ip == friend_relay) {
+            c.last_seen = Instant::now() - Duration::from_secs(5);
+        }
+        broker.add_relay_candidate(attestation(stranger, 4662, fresh), Some([0x55; 16]), None);
+        if let Some(c) = broker.relay_candidates.iter_mut().find(|c| c.ip == stranger) {
+            c.relay_sessions = 3;
+        }
+
+        assert!(
+            broker
+                .attempt_low_to_low("t1", [1; 16], Ipv4Addr::new(10, 0, 0, 1), 4662, NatType::Symmetric, None)
+                .await
+        );
+        assert_eq!(broker.attempts["t1:10.0.0.1:4662"].relay.map(|r| r.0), Some(friend_relay));
+
+        // Without the friend, the stranger is tried, refuses, and is skipped.
+        broker.relay_candidates.retain(|c| c.ip != friend_relay);
+        assert!(
+            broker
+                .attempt_low_to_low("t2", [2; 16], Ipv4Addr::new(10, 0, 0, 2), 4662, NatType::Symmetric, None)
+                .await
+        );
+        broker.relay_refused_us("t2:10.0.0.2:4662", "not a friend").await;
+        assert!(broker.pick_relay_candidate().is_none(), "a relay that refused us is skipped");
+        broker.add_relay_candidate(attestation(stranger, 4662, fresh + 60), Some([0x55; 16]), None);
+        assert!(
+            broker.pick_relay_candidate().is_none(),
+            "a re-signed attestation does not lift a stranger's refusal"
+        );
+        assert_eq!(
+            broker.relay_candidates[0].failures, 0,
+            "a refusal is a working relay's answer, not a failure"
+        );
+    }
+
     /// A fabricated attestation names an address its signer does not hold, and
     /// used to look *better* than a working relay: no sessions carried, freshly
     /// seen. Nothing recorded the outcome of using one, so the broker chose it
@@ -946,11 +1072,11 @@ mod tests {
         let bogus = Ipv4Addr::new(203, 0, 113, 5);
         let working = Ipv4Addr::new(198, 51, 100, 7);
 
-        // The working relay has carried traffic; the fabricated one has not,
-        // which is exactly why it wins on the session count alone.
+        // Neither has carried traffic; the fabricated one was seen more
+        // recently, which is exactly why it wins while its record is clean.
         broker.add_relay_candidate(attestation(working, 4662, fresh), None, None);
         if let Some(c) = broker.relay_candidates.iter_mut().find(|c| c.ip == working) {
-            c.relay_sessions = 2;
+            c.last_seen = Instant::now() - Duration::from_secs(5);
         }
         broker.add_relay_candidate(attestation(bogus, 4662, fresh), None, None);
 
@@ -1062,15 +1188,14 @@ mod tests {
         broker.add_relay_candidate(honest, None, None);
         // `pick_relay_candidate` ranks `last_seen` in whole seconds, so two
         // inserts in the same second are a tie and the first (honest) row
-        // wins. Give it sessions so the unused forged row is selected the
-        // same way a fabricated ERAT outranks a working relay on the
-        // live path.
+        // wins. Age it so the forged row is selected the way a freshly
+        // gossiped fabricated ERAT outranks a quiet relay on the live path.
         if let Some(c) = broker
             .relay_candidates
             .iter_mut()
             .find(|c| c.attestation.ed25519_pubkey == honest_pk)
         {
-            c.relay_sessions = 2;
+            c.last_seen = Instant::now() - Duration::from_secs(5);
         }
 
         let mut forged = attestation(ip, 4662, fresh);
