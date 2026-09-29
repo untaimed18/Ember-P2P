@@ -149,7 +149,9 @@
     if (!s.enabled) return lastSuccess;
     switch (s.phase) {
       case 'preparing':
-        return m.silent_update_status_preparing({ version });
+        return s.prepareFailed
+          ? m.silent_update_status_prepare_failed({ version })
+          : m.silent_update_status_preparing({ version });
       case 'waiting':
         return m.silent_update_status_waiting({ version });
       case 'postponed':

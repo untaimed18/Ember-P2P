@@ -354,6 +354,9 @@ pub enum NetworkCommand {
     GetEmberTransferActivity {
         tx: oneshot::Sender<usize>,
     },
+    /// The startup scan has put the library into the index (or there is no
+    /// library to scan), so last session's upload waiters can rejoin the queue.
+    StartupLibraryIndexed,
     UpdateSettings {
         settings: AppSettings,
     },

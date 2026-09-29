@@ -1476,6 +1476,11 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
     )))
 }
 
+/// Whether two signed platform entries name exactly the same artifact.
+fn same_artifact(a: &SignedPlatform, b: &SignedPlatform) -> bool {
+    a.url == b.url && a.sha256 == b.sha256 && a.size == b.size && a.signature.trim() == b.signature.trim()
+}
+
 /// Progress sink for an artifact download: the frontend's channel for a manual
 /// install, or nothing for one prepared in the background.
 type ProgressSink<'a> = &'a (dyn Fn(UpdateProgress) + Sync);
@@ -1675,6 +1680,12 @@ async fn install_locked(
     crate::auto_update::watchdog::spawn_for_install();
     if let Err(error) = update.update.install(&artifact) {
         tracing::warn!("Secure updater install failed: {error}");
+        // A manual install that failed leaves this Ember running and the user
+        // in charge of it; the watchdog must not relaunch it after they quit.
+        // A silent one restarts itself, which the watchdog then sees.
+        if reason == crate::auto_update::resume::ResumeReason::Manual {
+            crate::auto_update::watchdog::stand_down();
+        }
         // Distinct from `public_failure`: the teardown above already stopped
         // Ember's network services, so this process is no longer transferring
         // even though the window is still up.
@@ -1768,8 +1779,18 @@ pub(crate) async fn run_check(
     let _operation = service.operation.lock().await;
     crate::auto_update::record::note_check_attempt();
     match secure_check(app).await {
-        Ok(Some((info, pending))) => {
-            *service.pending.lock().await = Some(pending);
+        Ok(Some((info, mut pending))) => {
+            let mut slot = service.pending.lock().await;
+            // The same signed artifact found again keeps what was prepared for
+            // it. Dropping it made every check re-hash a staged 100 MB bundle,
+            // and a check landing during a silent-update countdown restarted
+            // the countdown and its warning.
+            if let Some(previous) = slot.take() {
+                if same_artifact(&previous.platform, &pending.platform) {
+                    pending.prepared = previous.prepared;
+                }
+            }
+            *slot = Some(pending);
             Ok(SecureUpdateCheckResult {
                 update: Some(info),
                 pending_retained: true,
@@ -2267,6 +2288,19 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
             sha256: hex::encode(Sha256::digest(b"test")),
             size: 4,
         }
+    }
+
+    #[test]
+    fn only_the_same_signed_artifact_keeps_its_preparation() {
+        let a = platform_for_test_payload();
+        assert!(same_artifact(&a, &a.clone()));
+        let other_hash = SignedPlatform { sha256: "0".repeat(64), ..a.clone() };
+        assert!(!same_artifact(&a, &other_hash));
+        let other_url = SignedPlatform {
+            url: Url::parse("https://example.com/Ember_9.9.10_x64-setup.exe").unwrap(),
+            ..a.clone()
+        };
+        assert!(!same_artifact(&a, &other_url));
     }
 
     #[test]

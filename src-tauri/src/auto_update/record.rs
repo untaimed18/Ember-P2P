@@ -46,6 +46,21 @@ pub struct UpdateRecord {
     /// machine that is never idle is told after a week instead of never.
     #[serde(default)]
     pub ready_since: Option<ReadySince>,
+    /// A silent install handed over and not yet seen to land. Written before
+    /// the hand-off, so the next launch can tell a failed install from a
+    /// successful one even when the resume file could not be written — the
+    /// full disk that forces that is also a likely reason for the install to
+    /// fail.
+    #[serde(default)]
+    pub attempting: Option<Attempt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attempt {
+    pub from: String,
+    pub to: String,
+    /// Unix seconds.
+    pub at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

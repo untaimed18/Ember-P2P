@@ -196,6 +196,11 @@ impl ResumeService {
     pub fn take_outcome(&self) -> Option<UpdateOutcome> {
         self.outcome.lock().take()
     }
+
+    /// Report an outcome learned some other way than the resume file.
+    pub fn set_outcome(&self, outcome: UpdateOutcome) {
+        *self.outcome.lock() = Some(outcome);
+    }
 }
 
 /// The server a resumed launch should reconnect to, taken once by the network

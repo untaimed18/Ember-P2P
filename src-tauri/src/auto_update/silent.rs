@@ -22,7 +22,7 @@ use serde::Serialize;
 use tauri::menu::MenuItem;
 use tauri::{AppHandle, Emitter, Manager, Wry};
 
-use super::record::{self, LastSuccess, ReadySince, UpdateRecord};
+use super::record::{self, Attempt, LastSuccess, ReadySince, UpdateRecord};
 use super::resume::{ResumeReason, ResumeService, UpdateOutcome};
 use crate::app_state::AppState;
 use crate::commands::updater::{self, UpdaterService};
@@ -53,6 +53,11 @@ const PREPARE_RETRY: Duration = Duration::from_secs(3600);
 const ACTIVITY_SAMPLE: Duration = Duration::from_secs(5);
 const NETWORK_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const RESTART_DELAY: Duration = Duration::from_secs(30);
+/// A gap this long between one-second ticks means the machine slept (or the
+/// clock jumped). Neither clock can be trusted across it: Windows' monotonic
+/// clock keeps counting through sleep, so a countdown would end the instant the
+/// lid opens, and Linux's stops, so one would sit frozen at 0:00.
+const SUSPEND_GAP: Duration = Duration::from_secs(15);
 
 /// Why this copy of Ember cannot update itself silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -128,6 +133,9 @@ pub struct SilentUpdateStatus {
     /// Ready for a week without a quiet moment: the ordinary notice should say
     /// the update is waiting.
     pub waiting_long: bool,
+    /// The last attempt to download the update failed; it is retried hourly.
+    /// The ordinary notice should offer it meanwhile.
+    pub prepare_failed: bool,
 }
 
 // ── Shared state the commands and the tray reach ────────────────────────────
@@ -239,6 +247,28 @@ struct Driver {
     record: UpdateRecord,
     record_read_at: Option<Instant>,
     tray_cancel: Option<MenuItem<Wry>>,
+    clock: TickClock,
+    prepare_failed: bool,
+}
+
+/// Both clocks at the previous tick, to notice a sleep in between.
+#[derive(Default)]
+struct TickClock {
+    last: Option<(Instant, i64)>,
+}
+
+impl TickClock {
+    /// Whether more time passed since the last tick than a tick explains, by
+    /// either clock, and remember this tick for the next.
+    fn woke_from_gap(&mut self, now: Instant, now_ms: i64) -> bool {
+        let gap = self.last.map(|(at, at_ms)| {
+            let monotonic = now.saturating_duration_since(at);
+            let wall = Duration::from_millis(now_ms.saturating_sub(at_ms).max(0) as u64);
+            monotonic.max(wall)
+        });
+        self.last = Some((now, now_ms));
+        gap.is_some_and(|gap| gap >= SUSPEND_GAP)
+    }
 }
 
 /// Start the silent-update driver. Call once, after `AppState` is managed and
@@ -254,7 +284,10 @@ pub fn spawn(app: AppHandle) {
                 return;
             }
             tracing::error!("Silent-update driver panicked; restarting it");
+            // Whatever countdown was running went with it; so does its tray
+            // entry, which would otherwise stay and postpone on a click.
             COUNTDOWN_LEFT.store(u64::MAX, Ordering::Relaxed);
+            restore_tray_menu(&app);
             tokio::time::sleep(RESTART_DELAY).await;
         }
     });
@@ -283,7 +316,19 @@ impl Driver {
         let support = support();
         self.refresh_record();
         let now = Instant::now();
-        let now_unix = chrono::Utc::now().timestamp();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_unix = now_ms.div_euclid(1000);
+
+        if self.clock.woke_from_gap(now, now_ms) {
+            // Someone opening the lid is someone at the machine: the quiet
+            // period and the away time both start again, and a countdown the
+            // sleep interrupted is not resumed.
+            tracing::info!("Silent update: the machine slept; waiting for a fresh quiet period");
+            self.leave_countdown(app);
+            self.quiet_since = None;
+            self.activity = None;
+            note_user_activity_now();
+        }
 
         if !enabled || support.is_err() {
             self.leave_countdown(app);
@@ -352,6 +397,16 @@ impl Driver {
 
         if let Some((ends, _)) = self.countdown_ends {
             if INSTALL_NOW.swap(false, Ordering::AcqRel) || now >= ends {
+                // Straight from disk: a "Not now" or a skip that landed while
+                // this tick sampled activity must win over the clock.
+                let fresh = record::load_stored();
+                if let Some(held) = held_by_record(&fresh, &version, now_unix) {
+                    self.record = fresh;
+                    self.leave_countdown(app);
+                    self.phase = held;
+                    self.publish(app, enabled, support, now_unix);
+                    return;
+                }
                 self.install(app, &version, enabled, support, now_unix).await;
                 return;
             }
@@ -372,18 +427,22 @@ impl Driver {
         }
         INSTALL_NOW.store(false, Ordering::Release);
 
-        let quiet = !activity.busy()
-            && user_away(LAST_INPUT.load(Ordering::Relaxed), now_unix)
-            && started.elapsed() >= SETTLE_PERIOD;
-        if quiet {
+        // Three conditions, each measured on its own clock: nothing has moved
+        // for the quiet period, nobody has touched Ember for the away time, and
+        // the session is old enough. Chaining the first two made the effective
+        // wait their sum.
+        if activity.busy() {
+            self.quiet_since = None;
+        } else {
             let since = *self.quiet_since.get_or_insert(now);
-            if now.duration_since(since) >= QUIET_PERIOD {
-                self.enter_countdown(app, now, now_unix);
+            if now.duration_since(since) >= QUIET_PERIOD
+                && user_away(LAST_INPUT.load(Ordering::Relaxed), now_unix)
+                && started.elapsed() >= SETTLE_PERIOD
+            {
+                self.enter_countdown(app, now, now_ms);
                 self.publish(app, enabled, support, now_unix);
                 return;
             }
-        } else {
-            self.quiet_since = None;
         }
         self.phase = Phase::Waiting;
         self.publish(app, enabled, support, now_unix);
@@ -411,15 +470,21 @@ impl Driver {
             Ok(Ok(Some(version))) => {
                 tracing::info!("Silent update: {version} is downloaded, verified and staged");
                 self.next_prepare_at = None;
+                self.prepare_failed = false;
             }
-            Ok(Ok(None)) => self.next_prepare_at = None,
+            Ok(Ok(None)) => {
+                self.next_prepare_at = None;
+                self.prepare_failed = false;
+            }
             Ok(Err(error)) => {
                 tracing::warn!("Silent update could not prepare the update: {error}");
                 self.next_prepare_at = Some(now + PREPARE_RETRY);
+                self.prepare_failed = true;
             }
             Err(error) => {
                 tracing::warn!("Silent update preparation task failed: {error}");
                 self.next_prepare_at = Some(now + PREPARE_RETRY);
+                self.prepare_failed = true;
             }
         }
     }
@@ -435,9 +500,9 @@ impl Driver {
         activity
     }
 
-    fn enter_countdown(&mut self, app: &AppHandle, now: Instant, now_unix: i64) {
+    fn enter_countdown(&mut self, app: &AppHandle, now: Instant, now_ms: i64) {
         let ends = now + COUNTDOWN;
-        let ends_ms = now_unix.saturating_mul(1000) + COUNTDOWN.as_millis() as i64;
+        let ends_ms = now_ms.saturating_add(COUNTDOWN.as_millis() as i64);
         self.countdown_ends = Some((ends, ends_ms));
         self.phase = Phase::Countdown;
         tracing::info!(
@@ -476,11 +541,7 @@ impl Driver {
         }
         COUNTDOWN_LEFT.store(u64::MAX, Ordering::Relaxed);
         if self.tray_cancel.take().is_some() {
-            if let Some(tray) = app.tray_by_id("main") {
-                if let Ok(menu) = crate::build_tray_menu(app, None) {
-                    let _ = tray.set_menu(Some(menu));
-                }
-            }
+            restore_tray_menu(app);
         }
     }
 
@@ -496,6 +557,15 @@ impl Driver {
         self.phase = Phase::Installing;
         self.publish(app, enabled, support, now_unix);
         tracing::info!("Silent update: installing {version}");
+
+        // Before the hand-off, in the one file this module owns: how the next
+        // launch knows this install was tried, even with no resume file.
+        let attempt = Attempt {
+            from: app.package_info().version.to_string(),
+            to: version.to_string(),
+            at: now_unix,
+        };
+        record::update_stored(|record| record.attempting = Some(attempt));
 
         let service = app.state::<UpdaterService>();
         match updater::install_prepared_update(app, &service, ResumeReason::Silent).await {
@@ -518,6 +588,7 @@ impl Driver {
                 // or the floor moved. Nothing restarts; the next tick prepares
                 // again or stands down.
                 tracing::warn!("Silent update of {version} did not start: {error}");
+                record::update_stored(|record| record.attempting = None);
                 self.phase = Phase::Waiting;
                 self.quiet_since = None;
                 self.publish(app, enabled, support, now_unix);
@@ -557,6 +628,7 @@ impl Driver {
                 to: last.to.clone(),
                 at: last.at.saturating_mul(1000),
             }),
+            prepare_failed: self.phase == Phase::Preparing && self.prepare_failed,
         };
         let mut last = LAST_STATUS.lock();
         if last.as_ref() != Some(&status) {
@@ -572,6 +644,15 @@ fn cancel_label(secs: u64) -> String {
     format!("Cancel update ({})", format_countdown(secs))
 }
 
+/// Put the tray back to its ordinary menu, without a "Cancel update" entry.
+fn restore_tray_menu(app: &AppHandle) {
+    if let Some(tray) = app.tray_by_id("main") {
+        if let Ok(menu) = crate::build_tray_menu(app, None) {
+            let _ = tray.set_menu(Some(menu));
+        }
+    }
+}
+
 async fn observe_activity(state: &AppState) -> Activity {
     let transfers_moving = {
         let manager = state.transfer_manager.read().await;
@@ -581,7 +662,8 @@ async fn observe_activity(state: &AppState) -> Activity {
             .any(|transfer| transfer_busy(&transfer.status, transfer.speed))
     };
     let local_work = state.scanning_count.load(Ordering::Relaxed) > 0
-        || !state.hash_cancel_flags.read().await.is_empty();
+        || !state.hash_cancel_flags.read().await.is_empty()
+        || crate::commands::sharing::hash_top_up_running();
     let throughput_bps = state
         .bandwidth_limiter
         .smoothed_download_speed()
@@ -612,14 +694,25 @@ async fn query_ember_transfers(state: &AppState) -> Option<usize> {
 /// for Settings → About, a failure so that version is never tried silently
 /// again. Call once, after `resume::begin_launch`.
 pub fn note_launch_outcome(app: &AppHandle) {
-    let Some(outcome) = app.state::<ResumeService>().outcome() else {
-        return;
+    let service = app.state::<ResumeService>();
+    let resumed = service
+        .outcome()
+        .filter(|outcome| outcome.reason == ResumeReason::Silent);
+    let attempt = record::load_stored().attempting;
+    // The resume file says how the update went when it could be written; the
+    // attempt recorded before the hand-off covers it when it could not.
+    let outcome = match (resumed, attempt) {
+        (Some(outcome), _) => outcome,
+        (None, Some(attempt)) => {
+            let outcome = outcome_of_attempt(&attempt, &app.package_info().version.to_string());
+            service.set_outcome(outcome.clone());
+            outcome
+        }
+        (None, None) => return,
     };
-    if outcome.reason != ResumeReason::Silent {
-        return;
-    }
     let now_unix = chrono::Utc::now().timestamp();
     record::update_stored(|record| {
+        record.attempting = None;
         if outcome.installed {
             record.last_success = Some(LastSuccess {
                 from: outcome.from_version.clone(),
@@ -636,6 +729,16 @@ pub fn note_launch_outcome(app: &AppHandle) {
         }
     });
     RECORD_DIRTY.store(true, Ordering::Release);
+}
+
+/// How an install attempt turned out, judged by the version now running.
+fn outcome_of_attempt(attempt: &Attempt, running: &str) -> UpdateOutcome {
+    UpdateOutcome {
+        reason: ResumeReason::Silent,
+        from_version: attempt.from.clone(),
+        target_version: attempt.to.clone(),
+        installed: attempt.to == running,
+    }
 }
 
 // ── Commands ────────────────────────────────────────────────────────────────
@@ -657,6 +760,7 @@ pub fn get_silent_update_status() -> SilentUpdateStatus {
         postponed_until: None,
         last_success: None,
         waiting_long: false,
+        prepare_failed: false,
     }
 }
 
@@ -778,6 +882,33 @@ mod tests {
         assert!(!waiting_long(&record, "1.8.0", NOW + LONG_WAIT_SECS - 1));
         assert!(waiting_long(&record, "1.8.0", NOW + LONG_WAIT_SECS));
         assert!(!waiting_long(&record, "1.8.1", NOW + LONG_WAIT_SECS), "a new release starts over");
+    }
+
+    #[test]
+    fn a_gap_on_either_clock_is_a_sleep() {
+        let mut clock = TickClock::default();
+        let start = Instant::now();
+        let ms = NOW * 1000;
+        assert!(!clock.woke_from_gap(start, ms), "the first tick has nothing to compare");
+        assert!(!clock.woke_from_gap(start + TICK, ms + 1000), "an ordinary tick");
+
+        // Windows: the monotonic clock ran on through the sleep.
+        let later = start + TICK + SUSPEND_GAP;
+        assert!(clock.woke_from_gap(later, ms + 1000 + SUSPEND_GAP.as_millis() as i64));
+
+        // Linux: it stopped, and only the wall clock moved.
+        let next = later + TICK;
+        assert!(clock.woke_from_gap(next, ms + 10 * 60 * 1000));
+        assert!(!clock.woke_from_gap(next + TICK, ms + 10 * 60 * 1000 + 1000));
+    }
+
+    #[test]
+    fn an_attempt_is_judged_by_the_version_that_came_back() {
+        let attempt = Attempt { from: "1.7.1".to_string(), to: "1.8.0".to_string(), at: NOW };
+        let landed = outcome_of_attempt(&attempt, "1.8.0");
+        assert!(landed.installed);
+        assert_eq!(landed.reason, ResumeReason::Silent);
+        assert!(!outcome_of_attempt(&attempt, "1.7.1").installed);
     }
 
     #[test]

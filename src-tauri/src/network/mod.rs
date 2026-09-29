@@ -2544,6 +2544,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             pending_auto_connect_server = false;
             // Only a server still in the user's own list: the resume file is
             // untrusted, and this is the one value in it that makes Ember dial.
+            let resuming = resume_server.is_some();
             let resumed = resume_server.take().filter(|(ip, port)| {
                 state
                     .server_list
@@ -2551,28 +2552,38 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     .iter()
                     .any(|s| &s.ip == ip && s.port == *port)
             });
-            match resumed.or_else(|| {
-                ed2k::server_list::ServerList::resolve_auto_connect_target(
-                    &state.data_dir,
-                    &state.server_list,
-                )
-            }) {
-                Some((server_ip, server_port)) => {
-                    initiate_server_connect(
-                        &mut state,
-                        &settings,
-                        &app_handle,
-                        &shared_server_addr,
-                        server_ip,
-                        server_port,
+            // Without it, fall back to the ordinary auto-connect target only
+            // for a user who has auto-connect on: a resume goes back to the
+            // server the user chose, not to one they never asked for.
+            let target = resumed.or_else(|| {
+                settings.auto_connect_server.then(|| {
+                    ed2k::server_list::ServerList::resolve_auto_connect_target(
+                        &state.data_dir,
+                        &state.server_list,
                     )
-                    .await;
-                }
-                None => {
-                    emit_server_auto_connect_failed(
-                        &app_handle,
-                        "no last server and eMule Sunrise not in list",
-                    );
+                })?
+            });
+            if target.is_none() && resuming && !settings.auto_connect_server {
+                info!("Not reconnecting after the update: that server is no longer in the list");
+            } else {
+                match target {
+                    Some((server_ip, server_port)) => {
+                        initiate_server_connect(
+                            &mut state,
+                            &settings,
+                            &app_handle,
+                            &shared_server_addr,
+                            server_ip,
+                            server_port,
+                        )
+                        .await;
+                    }
+                    None => {
+                        emit_server_auto_connect_failed(
+                            &app_handle,
+                            "no last server and eMule Sunrise not in list",
+                        );
+                    }
                 }
             }
         }

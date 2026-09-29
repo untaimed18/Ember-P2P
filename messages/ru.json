@@ -3163,6 +3163,7 @@
   "settings_silent_update_unsupported_msi": "Тихие обновления недоступны для установщика MSI: для установки обновления нужно разрешение администратора. Ember сообщит, когда обновление будет доступно.",
   "settings_silent_update_unsupported_other": "Тихие обновления недоступны для этой копии Ember.",
   "silent_update_status_preparing": "Ember {version} загружается в фоне.",
+  "silent_update_status_prepare_failed": "Пока не удалось загрузить Ember {version}. Ember попробует снова через час, или нажмите «Установить» сейчас.",
   "silent_update_status_waiting": "Ember {version} готов. Он установится, когда ничего не будет передаваться и вас не будет за компьютером.",
   "silent_update_status_postponed": "Ember {version} отложен до {time}.",
   "silent_update_status_held": "Ember {version} не установится сам. Нажмите «Установить», чтобы обновиться сейчас.",

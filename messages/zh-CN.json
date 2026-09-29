@@ -3163,6 +3163,7 @@
   "settings_silent_update_unsupported_msi": "MSI 安装程序不支持静默更新，因为安装更新需要管理员批准。有可用更新时 Ember 会通知你。",
   "settings_silent_update_unsupported_other": "此 Ember 副本不支持静默更新。",
   "silent_update_status_preparing": "正在后台下载 Ember {version}。",
+  "silent_update_status_prepare_failed": "暂时无法下载 Ember {version}。Ember 将在一小时后重试，你也可以现在点击“安装”。",
   "silent_update_status_waiting": "Ember {version} 已就绪，将在没有任何传输且你不在电脑前时安装。",
   "silent_update_status_postponed": "Ember {version} 已推迟到 {time}。",
   "silent_update_status_held": "Ember {version} 不会自动安装。点击“安装”立即更新。",

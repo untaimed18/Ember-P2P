@@ -3163,6 +3163,7 @@
   "settings_silent_update_unsupported_msi": "Gli aggiornamenti silenziosi non sono disponibili per il programma di installazione MSI, perché installare un aggiornamento richiede l'autorizzazione di un amministratore. Ember ti avviserà quando è disponibile un aggiornamento.",
   "settings_silent_update_unsupported_other": "Gli aggiornamenti silenziosi non sono disponibili per questa copia di Ember.",
   "silent_update_status_preparing": "Download di Ember {version} in background.",
+  "silent_update_status_prepare_failed": "Non è stato ancora possibile scaricare Ember {version}. Ember riproverà tra un'ora, oppure puoi usare Installa adesso.",
   "silent_update_status_waiting": "Ember {version} è pronto. Verrà installato quando non ci saranno trasferimenti in corso e tu non sarai al computer.",
   "silent_update_status_postponed": "Ember {version} è rimandato fino a {time}.",
   "silent_update_status_held": "Ember {version} non si installerà da solo. Usa Installa per aggiornare ora.",

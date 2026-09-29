@@ -136,28 +136,42 @@ does not change. Silent mode runs step 1 as soon as an update is found and step
 2 only after the countdown. As a result, the downtime the user experiences is
 shutdown, install and relaunch — no download in the middle.
 
-If a newer release appears while one is staged, the scheduler prepares the newer
-one and discards the old. If the security floor rises past the staged version,
+A later check that finds the same signed artifact again (same URL, hash, size
+and signature) keeps what was prepared for it, so an hourly check neither
+re-hashes the staged bundle nor interrupts a countdown. If a download keeps
+failing, it is retried hourly and the ordinary "update available" notice is
+shown meanwhile, so the user can still install it. If a newer release appears
+while one is staged, the scheduler prepares the newer one and discards the old. If the security floor rises past the staged version,
 the staged update is dropped, exactly as the manual path does today
 (`updater_pending_below_floor`).
 
 ### When Ember counts as idle
 
-The countdown starts only after **all** of the following have held continuously
-for **10 minutes**:
+The countdown starts only when **all** of the following hold at once. Each is
+measured on its own clock, so the longest of them is the wait, not their sum:
 
-1. **No bytes moving.** No download row with `speed > 0` or with a source in the
-   downloading state; no upload row with `speed > 0`; and no Ember Transfer
-   (room or friend) in progress.
-2. **No local work that must finish.** Nothing in `Verifying`, `Completing` or
-   `Hashing`, and no shared-folder scan or hash top-up running (the same tasks
-   `run_graceful_shutdown` cancels in `src-tauri/src/lib.rs`).
+1. **Nothing has moved for 10 minutes.** No download row with `speed > 0`; no
+   upload row with `speed > 0`; no Ember Transfer (room or friend) in progress;
+   and combined throughput below 2 KiB/s, which also catches a remote slot
+   whose first bytes have not yet shown up as a row's speed.
+2. **No local work that must finish**, for the same 10 minutes. Nothing in
+   `Verifying`, `Completing` or `Hashing`, and no shared-folder scan or hash
+   top-up running (the same tasks `run_graceful_shutdown` cancels in
+   `src-tauri/src/lib.rs`).
 3. **The user is away from Ember.** No keyboard or mouse input in any Ember
-   window for 10 minutes. A hidden or minimized window counts as no input. The
-   frontend reports input to the backend at most once every 30 seconds.
+   window, and no Ember window gaining focus, for 10 minutes. A hidden or
+   minimized window counts as no input. The frontend reports input to the
+   backend at most once every 30 seconds.
 4. **The session has settled.** At least 30 minutes since Ember launched, so an
    update never lands right after the user opened it.
 5. **Not postponed or skipped** under the state file.
+
+A machine that sleeps restarts all of this. More than 15 seconds between the
+driver's one-second ticks, by either the monotonic or the wall clock, counts as
+a sleep: the quiet period and the away time start over and a running countdown
+is abandoned. Windows' monotonic clock keeps counting through sleep, so without
+this a countdown would end the moment the lid opened; Linux's stops, so one
+would sit frozen at 0:00.
 
 This is a new predicate, not `count_working_transfers` in
 `src-tauri/src/background.rs`. That function is tuned for the sleep inhibitor
@@ -233,21 +247,27 @@ deletes it, and applies it.
 {
   "schema": 1,
   "written_at": 1790000000,
+  "reason": "silent",
   "from_version": "1.7.1",
   "target_version": "1.8.0",
   "window": {
     "visibility": "tray",
     "maximized": false,
     "bounds": { "x": 120, "y": 80, "width": 1400, "height": 900 },
-    "route": "/downloads",
-    "chat_window": { "open": true, "bounds": { "x": 1560, "y": 80, "width": 420, "height": 700 } }
+    "chat_window_open": true
   },
-  "ed2k": { "connected": true, "server": { "ip": "203.0.113.10", "port": 4661 } },
-  "search_tabs": "...same payload the search store keeps in sessionStorage..."
+  "ed2k": { "ip": "203.0.113.10", "port": 4661 },
+  "ui": {
+    "route": "/transfers",
+    "search_tabs": "...same payload the search store keeps in sessionStorage..."
+  }
 }
 ```
 
-`visibility` is one of `tray`, `minimized` or `normal`.
+`reason` is `silent` or `manual`, and `visibility` is one of `tray`,
+`minimized` or `normal`. `bounds` is in physical pixels and absent while
+maximized or minimized; `ed2k` is absent when the user was not on a server. The
+chat window keeps its own position.
 
 On launch it is applied like this:
 
@@ -297,7 +317,7 @@ update. Because the file is written for manual installs too, pressing
 **Upload waiting queue.** This lives only in memory today (`UploadQueueRef` in
 `network/ed2k/upload.rs`), so every restart drops everyone waiting on this user.
 On *every* graceful shutdown, not only updates, Ember saves a snapshot to
-`upload-queue.dat` for each `QueueEntry`. Each entry holds:
+`upload-queue.json` for each `QueueEntry`. Each entry holds:
 
 - `user_hash`, `file_hash`, `last_ip`, `tcp_port`, `udp_port`, `crypt_options`
   and `is_high_id`;
@@ -315,12 +335,16 @@ Restored rows do not join the live queue straight away
 until the startup scan has run, so the queue's own purge would evict every
 restored waiter as one for a file Ember does not share, and a push-grant dialled
 in that window would offer a file it cannot yet find. They are held until the
-startup scan's first shared-files reconcile, or three minutes for a node with no
-shared folders, and only rows for files Ember shares or is downloading are
-merged, under the live queue's own per-IP and size caps. A peer that re-asked
-before the merge keeps its live row and inherits the older wait only from the
-same address. Rows naming a private or special-use address are dropped, since a
-restored HighID row is one the queue may dial.
+startup scan has put the library into the index and says so
+(`NetworkCommand::StartupLibraryIndexed`, sent at once when there are no shared
+folders). A reconcile is not enough: a settings save can send one while
+discovery is still running. A 20-minute fallback covers a scan that fails
+without saying so. Only rows for files Ember shares or is downloading are then
+merged, under the live queue's own per-IP and size caps. The queue holds one row
+per peer, so a peer that re-asked before the merge, for any file, keeps its live
+row and inherits the older wait only from the same address; the saved file is
+also reduced to one row per peer. Rows naming a private or special-use address
+are dropped, since a restored HighID row is one the queue may dial.
 
 **Not restored, on purpose:** open dialogs, unsaved Settings edits, and chat
 drafts. The idle rule (no input for 10 minutes) means none of these should exist
@@ -346,15 +370,20 @@ The resume file carries `from_version` and `target_version`, and the launch
 compares them with its own version:
 
 - **Running `target_version`:** success. The state file records `last_success`.
-  The next time the user opens the window, a small corner notice (the
-  `UpdateNotice.svelte` style) says "Ember updated to 1.8.0 while you were away"
-  with a **What's new** link. There is no OS notification, since the user is
-  away. Settings → About shows "Last updated automatically on …".
+  The next time the user opens the window, a toast says "Ember updated to 1.8.0
+  while you were away". There is no OS notification, since the user is away.
+  Settings → About shows "Updated to 1.8.0 automatically on …".
 - **Running `from_version`:** the install did not happen. The state file records
   `failed_version`, so that version is never tried silently again. The existing
   stalled-install notice (`checkUpdateHandoff` / `phase: 'stalled'`) offers
   **Run installer** as it does today. The session is still restored first,
   because a failed update must not also cost the user their state.
+
+The resume file is best-effort, and the full disk that stops it being written is
+also a likely reason for an install to fail. So the silent path records the
+attempt in `silent-update-state.json` (`attempting { from, to, at }`) before
+handing over, and a launch with no resume file judges the attempt by the version
+it is running, with the same notice and the same `failed_version`.
 
 ### Failure safety
 
@@ -387,8 +416,10 @@ passes `/P /R /UPDATE /ARGS …`. So before handing off, Ember starts a
   replace, and the installer's running-app check would kill it by path.
 - It waits up to 3 minutes for Ember to exit, then up to 5 minutes for Ember to
   be running again. It judges both by probing `instance.lock`, an exclusive lock
-  every Ember takes at startup (retrying briefly, so the probe can never make it
-  give up) and holds for its lifetime. It does not look up processes by name,
+  every Ember takes as the very first step of startup (before migrations or an
+  antivirus scan of a new build can hold it up, and retrying briefly, so the
+  probe can never make it give up) and holds for its lifetime. It does not look
+  up processes by name,
   and it does not launch a second copy that would trip the single-instance
   plugin, whose handler *shows* the window. It is only started by a process
   that holds the lock, so it can never mistake the Ember that started it for a
@@ -398,6 +429,9 @@ passes `/P /R /UPDATE /ARGS …`. So before handing off, Ember starts a
   resume file, restores the session, and reports the failed update. The
   watchdog then exits. The next Ember deletes the watchdog's copy a minute after
   it starts.
+- A manual install whose installer call fails leaves Ember running and the user
+  in charge, so Ember leaves a `stand-down` marker beside the watchdog's copy and
+  the watchdog exits without relaunching anything, even after the user quits.
 
 On the AppImage, the install runs in-process and returns a result, so no
 watchdog is needed.

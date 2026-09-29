@@ -1971,6 +1971,16 @@ pub(crate) async fn queue_hash_top_up(app: tauri::AppHandle, files: &[FileInfo])
 /// Stop the background pass. Nothing is lost: a file whose root or digest was
 /// never computed is simply still missing one, and the next launch finds it
 /// again.
+/// Whether the background digest pass is reading files right now. A lock held
+/// by someone else counts as running: it is only held to start, stop or feed
+/// the pass, so guessing "idle" is the direction that interrupts it.
+pub(crate) fn hash_top_up_running() -> bool {
+    match HASH_TOP_UP.get() {
+        None => false,
+        Some(state) => state.try_lock().map_or(true, |state| state.running),
+    }
+}
+
 pub(crate) async fn cancel_hash_top_up() {
     let state = hash_top_up().lock().await;
     if let Some(cancel) = state.cancel.as_ref() {

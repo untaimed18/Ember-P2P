@@ -39,6 +39,8 @@ export interface SilentUpdateStatus {
   lastSuccess: { from: string; to: string; at: number } | null;
   /** Ready for a week without a quiet moment. */
   waitingLong: boolean;
+  /** The last attempt to download the update failed; retried hourly. */
+  prepareFailed: boolean;
 }
 
 interface UpdateOutcome {
@@ -55,11 +57,11 @@ export const silentUpdate = writable<SilentUpdateStatus | null>(null);
 /**
  * Whether silent updates will take care of the update on offer, so the
  * ordinary "update available" notice can stay out of the way. True only while
- * it is actually going to happen: switched on, possible here, and not held or
- * postponed.
+ * it is actually going to happen: switched on, possible here, not held or
+ * postponed, and not stuck failing to download.
  */
 export function silentUpdateHandlesIt(status: SilentUpdateStatus | null): boolean {
-  if (!status || !status.enabled || !status.supported) return false;
+  if (!status || !status.enabled || !status.supported || status.prepareFailed) return false;
   return (
     status.phase === 'preparing'
     || status.phase === 'waiting'

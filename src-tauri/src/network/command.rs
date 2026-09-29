@@ -5632,10 +5632,10 @@ async fn handle_command_inner(
             let _ = tx.send(retracted.len());
         }
 
-        NetworkCommand::SharedFilesChangedAck { tx: reconcile_ack } => {
-            // The startup scan's first reconcile is the first moment the index
-            // says which files we serve, so it is when last session's waiters
-            // can rejoin the upload queue.
+        NetworkCommand::StartupLibraryIndexed => {
+            // The first moment the index says which files we serve, so when last
+            // session's waiters can rejoin the upload queue. Not any reconcile:
+            // a settings save can send one while discovery is still running.
             if let Some(pending) = state.restored_upload_queue.take() {
                 ed2k::upload_queue_store::merge_pending(
                     pending,
@@ -5645,6 +5645,9 @@ async fn handle_command_inner(
                 )
                 .await;
             }
+        }
+
+        NetworkCommand::SharedFilesChangedAck { tx: reconcile_ack } => {
             // One pass under the read guard, keeping only the hashes and the
             // rows whose record drifted. Startup hashing fires this every 30 s,
             // and cloning the whole index each time was most of its cost.

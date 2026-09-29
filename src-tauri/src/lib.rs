@@ -554,6 +554,17 @@ pub fn run() {
         .setup(|app| {
             let app_handle = app.handle().clone();
 
+            // First, before anything slow: an update watchdog judges "Ember is
+            // running again" by this lock, and a first launch of a new version
+            // can spend minutes in migrations or an antivirus scan before
+            // reaching the rest of setup.
+            {
+                let lock_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
+                if std::fs::create_dir_all(&lock_dir).is_ok() {
+                    auto_update::watchdog::hold_instance_lock(&lock_dir);
+                }
+            }
+
             // Associate the `ed2k://` scheme with this executable.
             //
             // URI schemes have no Windows "UserChoice" protection: the last
@@ -652,9 +663,6 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             // Before the network task starts and before the window is shown:
             // both come back the way an update restart left them.
-            // Held for the life of the process, so an update watchdog can tell
-            // a running Ember from one that never came back.
-            auto_update::watchdog::hold_instance_lock(&data_dir);
             auto_update::watchdog::schedule_cleanup(&data_dir);
             let resume_window = auto_update::resume::begin_launch(&app_handle, &data_dir);
             auto_update::silent::note_launch_outcome(&app_handle);
@@ -1139,6 +1147,7 @@ pub fn run() {
             let startup_scan_handle = tauri::async_runtime::handle().inner().spawn(async move {
                 if shared_folders.is_empty() {
                     info!("Indexed 0 files from 0 shared folders");
+                    let _ = net_tx.send(network::NetworkCommand::StartupLibraryIndexed).await;
                     return;
                 }
                 // Held for the whole scan and released when this task ends. It is
@@ -1546,6 +1555,9 @@ pub fn run() {
                     }
                 }
                 commands::sharing::refresh_file_cache(&index_clone, &csf).await;
+                // Every file known from last session is in the index now, with
+                // its hash; only new ones wait for hashing.
+                let _ = net_tx.send(network::NetworkCommand::StartupLibraryIndexed).await;
 
                 let _ = startup_app.emit("shared-files-changed", serde_json::json!({
                     "phase": "discovered",

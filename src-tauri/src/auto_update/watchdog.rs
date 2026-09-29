@@ -38,6 +38,9 @@ const LAUNCH_ARG: &str = "--launch";
 pub const LOCK_FILE: &str = "instance.lock";
 const DIR: &str = "update-watchdog";
 const EXE_NAME: &str = "ember-update-watchdog.exe";
+/// Left by an Ember whose install failed without ending it, so a watchdog
+/// started for that install does not relaunch Ember after the user quits.
+const STAND_DOWN_FILE: &str = "stand-down";
 const LOG_FILE: &str = "update-watchdog.log";
 const MAX_LOG_BYTES: u64 = 64 * 1024;
 
@@ -148,11 +151,30 @@ pub fn spawn_for_install() {
     }
 }
 
+/// The install this watchdog was started for failed and Ember is still
+/// running: tell it there is nothing to bring back. Best-effort.
+pub fn stand_down() {
+    if !cfg!(windows) {
+        return;
+    }
+    if let Ok(data_dir) = crate::storage::paths::ensure_data_dir() {
+        let dir = data_dir.join(DIR);
+        if dir.exists() {
+            let _ = std::fs::write(dir.join(STAND_DOWN_FILE), b"1");
+        }
+    }
+}
+
+fn stood_down(data_dir: &Path) -> bool {
+    data_dir.join(DIR).join(STAND_DOWN_FILE).exists()
+}
+
 fn try_spawn() -> anyhow::Result<()> {
     let data_dir = crate::storage::paths::ensure_data_dir()?;
     let exe = std::env::current_exe()?;
     let dir = data_dir.join(DIR);
     std::fs::create_dir_all(&dir)?;
+    let _ = std::fs::remove_file(dir.join(STAND_DOWN_FILE));
     let copy = dir.join(EXE_NAME);
     std::fs::copy(&exe, &copy)?;
     let mut command = std::process::Command::new(&copy);
@@ -266,6 +288,8 @@ enum Verdict {
     Relaunched,
     /// There was nothing it could start.
     NothingToLaunch,
+    /// The install failed with Ember still running, which told it to stop.
+    StoodDown,
 }
 
 fn watch(args: &Args) {
@@ -281,6 +305,10 @@ fn watch_with(args: &Args, timings: Timings) -> Verdict {
 
     let waiting = Instant::now();
     loop {
+        if stood_down(&args.data_dir) {
+            log(&args.data_dir, "The install failed with Ember still running; standing down");
+            return Verdict::StoodDown;
+        }
         if matches!(lock_is_held(&args.data_dir), Ok(false)) {
             break;
         }
@@ -295,6 +323,10 @@ fn watch_with(args: &Args, timings: Timings) -> Verdict {
     let waiting = Instant::now();
     while waiting.elapsed() < timings.relaunch {
         std::thread::sleep(timings.poll);
+        if stood_down(&args.data_dir) {
+            log(&args.data_dir, "The install failed and Ember was quit; standing down");
+            return Verdict::StoodDown;
+        }
         if matches!(lock_is_held(&args.data_dir), Ok(true)) {
             log(&args.data_dir, "Ember is running again");
             return Verdict::CameBack;
@@ -427,6 +459,24 @@ mod tests {
         exit.join().unwrap();
         let log = std::fs::read_to_string(dir.join(LOG_FILE)).unwrap();
         assert!(log.contains("starting it"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_install_that_kept_ember_running_stands_the_watchdog_down() {
+        let dir = scratch_dir("stand-down");
+        let old = hold(&dir);
+        std::fs::create_dir_all(dir.join(DIR)).unwrap();
+        let args = Args { data_dir: dir.clone(), launch: harmless_exe() };
+        let marker = dir.join(DIR).join(STAND_DOWN_FILE);
+        let user = std::thread::spawn(move || {
+            // The install fails, Ember says so, and the user quits later.
+            std::fs::write(&marker, b"1").unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            drop(old);
+        });
+        assert_eq!(watch_with(&args, FAST), Verdict::StoodDown);
+        user.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

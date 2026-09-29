@@ -20,9 +20,10 @@
 //! index is still empty while the startup scan runs, so the queue's own purge
 //! would evict every one of them as a waiter for a file we do not share — and
 //! a push-grant dialled in that window would offer a file we cannot yet find.
-//! They wait in [`PendingRestore`] until the startup scan's first reconcile
-//! (or a fallback deadline, for a node with no shared folders), and then only
-//! the rows for files we serve are merged.
+//! They wait in [`PendingRestore`] until the startup scan says the library is
+//! in the index (`NetworkCommand::StartupLibraryIndexed`, sent at once for a
+//! node with no shared folders), and then only the rows for files we serve are
+//! merged. A long fallback deadline covers a scan that fails without saying so.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -47,9 +48,11 @@ const VERSION: u32 = 1;
 const MAX_ENTRIES: usize = 10_000;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TEXT_CHARS: usize = 256;
-/// When restored rows are merged if no startup reconcile has come by then: a
-/// node with no shared folders never runs one.
-const MERGE_FALLBACK: Duration = Duration::from_secs(3 * 60);
+/// When restored rows are merged if the startup scan never said the library is
+/// indexed — it failed, or was cancelled before discovery finished. Long, since
+/// merging early drops every waiter for a file not indexed yet; waiters re-ask
+/// within the purge window anyway.
+const MERGE_FALLBACK: Duration = Duration::from_secs(20 * 60);
 /// A row stamped in the future by more than this was written under a wrong
 /// clock, and its age says nothing.
 const MAX_FUTURE_SKEW_SECS: i64 = 5 * 60;
@@ -219,12 +222,16 @@ fn decode(bytes: &[u8], now: Instant, now_unix: i64) -> Vec<QueueEntry> {
         return Vec::new();
     }
     let mut per_ip: HashMap<IpAddr, usize> = HashMap::new();
-    let mut seen: std::collections::HashSet<(QueueIdentity, [u8; 16])> = Default::default();
+    // One row per peer, as the live queue keeps it: rank, removal and slot
+    // grants all find a peer by identity alone, so a second row for another
+    // file would be one they never reach, or reach instead of the right one.
+    // The first row wins; the file is saved live rows first.
+    let mut seen: HashSet<QueueIdentity> = HashSet::new();
     file.entries
         .into_iter()
         .take(MAX_ENTRIES)
         .filter_map(|saved| from_saved(saved, now, now_unix))
-        .filter(|entry| seen.insert((entry.identity.clone(), entry.file_hash)))
+        .filter(|entry| seen.insert(entry.identity.clone()))
         .filter(|entry| {
             let Some(ip) = entry.last_ip else {
                 return false;
@@ -244,7 +251,7 @@ pub(crate) struct PendingRestore {
 }
 
 impl PendingRestore {
-    /// Whether the fallback deadline has passed without a reconcile.
+    /// Whether the fallback deadline has passed without the startup signal.
     pub(crate) fn overdue(&self) -> bool {
         Instant::now() >= self.deadline
     }
@@ -259,8 +266,9 @@ impl PendingRestore {
 /// Merge restored rows into the live queue, keeping only rows for files
 /// `servable` says we serve and applying the caps the live queue applies.
 ///
-/// A peer that re-asked before the merge already has a live row, which wins;
-/// it inherits the restored row's earlier join only when it re-asked from the
+/// A peer that re-asked before the merge already has a live row, which wins —
+/// whichever file it now wants, since the live queue holds one row per peer.
+/// It inherits the restored row's earlier join only when it re-asked from the
 /// address the row was last seen on — the same rule a reconnect is held to.
 fn merge_into(
     queue: &mut Vec<QueueEntry>,
@@ -269,16 +277,16 @@ fn merge_into(
 ) -> usize {
     let mut merged = 0;
     for row in restored {
-        if row.last_request.elapsed().as_secs() >= MAX_PURGEQUEUETIME_SECS || !servable(&row.file_hash) {
+        if row.last_request.elapsed().as_secs() >= MAX_PURGEQUEUETIME_SECS {
             continue;
         }
-        if let Some(live) = queue
-            .iter_mut()
-            .find(|e| e.identity == row.identity && e.file_hash == row.file_hash)
-        {
+        if let Some(live) = queue.iter_mut().find(|e| e.identity == row.identity) {
             if live.last_ip == row.last_ip && row.join_time < live.join_time {
                 live.join_time = row.join_time;
             }
+            continue;
+        }
+        if !servable(&row.file_hash) {
             continue;
         }
         if queue.len() >= MAX_UPLOAD_QUEUE_SIZE {
@@ -546,6 +554,30 @@ mod tests {
         let mut queue = vec![live];
         merge_into(&mut queue, vec![old], |_| true);
         assert_eq!(queue[0].join_time, live_join);
+    }
+
+    #[test]
+    fn a_peer_that_switched_files_keeps_one_row() {
+        // Queued for file A last session, re-asked for file B before the merge.
+        let old = restored([1; 16], [8, 8, 8, 8], 3000);
+        let mut live = entry([1; 16], [8, 8, 8, 8], 10, 10);
+        live.file_hash = [0xCD; 16];
+        let mut queue = vec![live];
+        assert_eq!(merge_into(&mut queue, vec![old.clone()], |_| true), 0);
+        assert_eq!(queue.len(), 1, "the live queue holds one row per peer");
+        assert_eq!(queue[0].file_hash, [0xCD; 16], "for the file it wants now");
+        assert_eq!(queue[0].join_time, old.join_time, "keeping the wait it had");
+
+        // And a saved file carrying both rows restores only the first.
+        let now = Instant::now();
+        let mut for_a = entry([2; 16], [9, 9, 9, 9], 60, 60);
+        let mut for_b = for_a.clone();
+        for_b.file_hash = [0xCD; 16];
+        for_a.current_addr = None;
+        let (bytes, _) = encode(&[for_a, for_b], now, NOW_UNIX).unwrap();
+        let rows = decode(&bytes, now, NOW_UNIX);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_hash, [0xAB; 16]);
     }
 
     #[test]
