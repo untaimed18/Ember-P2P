@@ -2404,12 +2404,7 @@ pub(crate) fn path_key_covers(entry: &str, key: &str) -> bool {
             .is_some_and(|rest| rest.starts_with(std::path::MAIN_SEPARATOR))
 }
 
-fn allowlist_permits(allowed: &HashSet<String>, key: &str) -> bool {
-    allowed.contains(key)
-        || key
-            .rmatch_indices(std::path::MAIN_SEPARATOR)
-            .any(|(at, _)| allowed.contains(&key[..at]))
-}
+use crate::sharing::indexer::allowlist_permits;
 
 /// A folder freshly added under an allowlist offers exactly that list, whatever
 /// known.met remembers of its files from an earlier share of the same folder.
@@ -3363,8 +3358,15 @@ pub(crate) async fn add_shared_folder_approved(
         let scan_guard = ScanGuard(scanning.clone());
 
         let discover_path = canonical_str.clone();
+        let scope = {
+            let cfg = config.read().await;
+            crate::sharing::indexer::DiscoveryScope::for_root(
+                &canonical_str,
+                &cfg.settings.pending_folder_allowlists,
+            )
+        };
         let discovery = match tokio::task::spawn_blocking(move || {
-            FileIndexer::discover_directory(&discover_path)
+            FileIndexer::discover_directory_page_in(&discover_path, None, scope.as_ref())
         })
         .await
         {
@@ -5277,14 +5279,16 @@ pub async fn set_files_friends_only(
     Ok(count)
 }
 
-/// Offer every indexed file under `folder`. Used when a partial share (an
-/// allowlist) is promoted to a full folder share. Returns the paths that
-/// changed. Files already offered are left out of that list.
+/// Offer every indexed file under `folder`, and scan it for the ones that are
+/// not indexed. Used when a partial share (an allowlist) is promoted to a full
+/// folder share, whose files off the allowlist discovery never walked. Returns
+/// the paths that changed. Files already offered are left out of that list.
 pub(crate) async fn share_all_in_folder(
     app: tauri::AppHandle,
     state: &AppState,
     folder: &str,
 ) -> Result<Vec<String>, String> {
+    queue_rescan(&app, vec![std::path::PathBuf::from(folder)]);
     let (snapshot, mutation) = {
         let mut index = state.local_index.write().await;
         let snapshot = index.all_files().to_vec();
@@ -5548,6 +5552,28 @@ fn schedule_settle_recheck(app: &tauri::AppHandle, settling: &[FileInfo], now: i
     }
 }
 
+/// Scan `paths` now, the way a filesystem event would: files and folders a
+/// partly shared folder has just taken on, which discovery left alone while
+/// they were off its allowlist and so are not in the index to be shared.
+pub(crate) fn queue_rescan(app: &tauri::AppHandle, paths: Vec<std::path::PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    match state.shared_folder_watcher.as_ref() {
+        Some(watcher) => watcher.queue_rescan_after(paths, std::time::Duration::ZERO),
+        None => {
+            tokio::spawn(settle_recheck_without_watcher(
+                app.clone(),
+                paths,
+                std::time::Duration::ZERO,
+            ));
+        }
+    }
+}
+
 /// [`schedule_settle_recheck`] when live folder tracking is off. Boxed for the
 /// same reason as [`chained_scan_page`]: it is mutually recursive with
 /// [`reload_shared_files_page`].
@@ -5695,11 +5721,12 @@ async fn reload_shared_files_page(
         state.library_scan_truncated.store(false, Ordering::Relaxed);
     }
 
-    let (folders, scan_cursors) = {
+    let (folders, scan_cursors, discovery_allowlists) = {
         let config = state.config.read().await;
         (
             config.settings.shared_folders.clone(),
             config.settings.shared_folder_scan_cursors.clone(),
+            config.settings.pending_folder_allowlists.clone(),
         )
     };
 
@@ -5773,7 +5800,11 @@ async fn reload_shared_files_page(
             let mut scanned = Vec::new();
             if let Some(paths) = scope {
                 for path in outermost_paths(paths) {
-                    match FileIndexer::discover_scoped_path(&discovery_folders, &path) {
+                    match FileIndexer::discover_scoped_path(
+                        &discovery_folders,
+                        &discovery_allowlists,
+                        &path,
+                    ) {
                         crate::sharing::indexer::ScopedDiscovery::Skip => {}
                         crate::sharing::indexer::ScopedDiscovery::Removed => {
                             scanned.push(path.to_string_lossy().into_owned());
@@ -5792,9 +5823,14 @@ async fn reload_shared_files_page(
             }
             for folder in &discovery_folders {
                 let key = crate::search::index::normalize_path_key(folder);
-                let result = FileIndexer::discover_directory_page(
+                let scope = crate::sharing::indexer::DiscoveryScope::for_root(
+                    folder,
+                    &discovery_allowlists,
+                );
+                let result = FileIndexer::discover_directory_page_in(
                     folder,
                     discovery_cursors.get(&key).map(String::as_str),
+                    scope.as_ref(),
                 );
                 truncated |= result.truncated;
                 partial |= result.partial;
@@ -6509,6 +6545,33 @@ pub(crate) async fn drop_from_allowlists(
     .await
 }
 
+/// Put `paths` back on the allowlist of each partly shared folder they sit in.
+/// Discovery walks only what an allowlist names, so a file shared again from
+/// the Library but left off its folder's list would fall out of the index on
+/// the next scan.
+async fn readmit_to_allowlists(state: &AppState, paths: &[String]) -> Result<(), String> {
+    let keys = paths
+        .iter()
+        .map(|path| crate::search::index::normalize_path_key(path))
+        .collect::<Vec<_>>();
+    edit_folder_allowlists(state, |lists| readmit_keys(lists, &keys)).await
+}
+
+fn readmit_keys(lists: &mut std::collections::HashMap<String, Vec<String>>, keys: &[String]) -> bool {
+    let mut changed = false;
+    for (folder, entries) in lists.iter_mut() {
+        let mut allowed = entries.iter().cloned().collect::<HashSet<_>>();
+        for key in keys {
+            if crate::security::path_within_dir(key, folder) && !allowlist_permits(&allowed, key) {
+                allowed.insert(key.clone());
+                entries.push(key.clone());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// Forget the allowlists of `folder` and anything nested under it, and any
 /// entry in an enclosing share's allowlist that offers something inside it.
 /// Used when the whole folder stops being offered, so nothing is left to
@@ -6558,6 +6621,11 @@ pub async fn share_file(
         (snapshot, mutation)
     };
     if mutation.changed_paths > 0 {
+        let mut readmitted = mutation.hashed_paths.clone();
+        if !readmitted.iter().any(|path| path == &file_path) {
+            readmitted.push(file_path.clone());
+        }
+        readmit_to_allowlists(&state, &readmitted).await?;
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
         persist_share_mutation(&state, &mutation, true, snapshot).await?;
         let _ = app.emit(
@@ -7216,6 +7284,21 @@ mod tests {
         let work = resolve_from_known(&mut discovered, &known);
         assert_eq!(work.needs_hashing.len(), 1);
         assert!(work.needs_top_up.is_empty());
+    }
+
+    #[test]
+    fn sharing_a_file_again_puts_it_back_on_its_folders_allowlist() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let folder = crate::search::index::normalize_path_key(&format!("C:{sep}music"));
+        let kept = format!("{folder}{sep}a.mp3");
+        let back = format!("{folder}{sep}b.mp3");
+        let elsewhere = crate::search::index::normalize_path_key(&format!("D:{sep}films{sep}c.mkv"));
+        let mut lists = std::collections::HashMap::new();
+        lists.insert(folder.clone(), vec![kept.clone()]);
+
+        assert!(readmit_keys(&mut lists, &[back.clone(), back.clone(), elsewhere]));
+        assert_eq!(lists[&folder], vec![kept.clone(), back.clone()]);
+        assert!(!readmit_keys(&mut lists, &[kept]), "an entry already on the list is left alone");
     }
 
     #[test]

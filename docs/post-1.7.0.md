@@ -128,11 +128,15 @@ full reload) stays in the index and offerable until "Remove missing". Fix: track
 the paths seen across one complete cursor cycle and reconcile once the last page
 lands.
 
-### "Share without subfolders" still walks the whole tree
+### "Share without subfolders" still walks the whole tree — done in 1.7.1
 
-The allowlist keeps nested files off the wire (`shared = false`), but discovery
-is still recursive, so they are hashed and indexed locally. Walk only the
-allowlisted entries (depth 1 for a files-only allowlist).
+Discovery of a folder with an allowlist now walks only the allowlisted files
+and folders and the folders that lead to them (`DiscoveryScope` in
+`sharing/indexer.rs`), in every scan: startup, add, full reload and
+filesystem events. Nothing else in the folder is hashed or indexed, so it no
+longer shows in the Library as an unshared file. Sharing a file again from the
+Library puts it back on the allowlist, and widening a partial share queues a
+scan of what it newly offers.
 
 ### eMule import: offer eMule's one-folder sharing
 

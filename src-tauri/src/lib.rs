@@ -1137,6 +1137,7 @@ pub fn run() {
 
             let index_clone = local_index.clone();
             let shared_folders = settings.shared_folders.clone();
+            let startup_allowlists = settings.pending_folder_allowlists.clone();
             let startup_scanning = scanning_count.clone();
             let startup_scan_coordination = scan_coordination.clone();
             let csf = cached_shared_files.clone();
@@ -1178,10 +1179,16 @@ pub fn run() {
                         // scan at the first page; successful startup persists
                         // a fresh cursor for the next live reload.
                         let cursor: Option<String> = None;
+                        let scope =
+                            sharing::indexer::DiscoveryScope::for_root(&f, &startup_allowlists);
                         (
                             folder.clone(),
                             tokio::task::spawn_blocking(move || {
-                                FileIndexer::discover_directory_page(&f, cursor.as_deref())
+                                FileIndexer::discover_directory_page_in(
+                                    &f,
+                                    cursor.as_deref(),
+                                    scope.as_ref(),
+                                )
                             }),
                         )
                     })

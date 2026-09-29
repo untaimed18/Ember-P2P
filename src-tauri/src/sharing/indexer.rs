@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
@@ -51,6 +51,60 @@ pub struct DiscoveryResult {
     /// Normalized path after which the next bounded scan should continue.
     /// `None` means this page reached the end of the folder.
     pub next_cursor: Option<String>,
+}
+
+/// Whether an allowlist of `normalize_path_key` forms offers the file or
+/// folder at `key`: it is listed, or sits inside a listed folder.
+pub(crate) fn allowlist_permits(allowed: &HashSet<String>, key: &str) -> bool {
+    allowed.contains(key)
+        || key
+            .rmatch_indices(std::path::MAIN_SEPARATOR)
+            .any(|(at, _)| allowed.contains(&key[..at]))
+}
+
+/// What discovery may return from a folder shared with only some of its
+/// contents: the allowlisted files and folders, reached through the folders
+/// that lead to them. Nothing else in the folder is offered, so walking and
+/// hashing the rest of its tree only cost time and filled the Library with
+/// files that could not be shared.
+#[derive(Debug, Clone)]
+pub struct DiscoveryScope {
+    entries: HashSet<String>,
+    /// Every folder with an entry somewhere below it.
+    ancestors: HashSet<String>,
+}
+
+impl DiscoveryScope {
+    /// The scope for `root` from the folder allowlists, keyed as settings keys
+    /// them. `None` for a folder shared whole.
+    pub fn for_root(
+        root: &str,
+        allowlists: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Option<Self> {
+        let entries = allowlists.get(&normalize_path_key(root))?;
+        Some(Self::new(entries))
+    }
+
+    pub fn new(entries: &[String]) -> Self {
+        let entries: HashSet<String> = entries.iter().map(|entry| normalize_path_key(entry)).collect();
+        let mut ancestors = HashSet::new();
+        for entry in &entries {
+            for (at, _) in entry.rmatch_indices(std::path::MAIN_SEPARATOR) {
+                if !ancestors.insert(entry[..at].to_string()) {
+                    break;
+                }
+            }
+        }
+        Self { entries, ancestors }
+    }
+
+    fn admits_file(&self, key: &str) -> bool {
+        allowlist_permits(&self.entries, key)
+    }
+
+    fn admits_dir(&self, key: &str) -> bool {
+        self.ancestors.contains(key) || allowlist_permits(&self.entries, key)
+    }
 }
 
 /// Credential basenames that must never be published, whatever directory they
@@ -289,7 +343,11 @@ impl FileIndexer {
     /// the path, not only to the path: an event inside a recycle bin or a
     /// junction names an ordinary-looking file whose parent the full walk never
     /// enters.
-    pub fn discover_scoped_path(roots: &[String], path: &Path) -> ScopedDiscovery {
+    pub fn discover_scoped_path(
+        roots: &[String],
+        allowlists: &std::collections::HashMap<String, Vec<String>>,
+        path: &Path,
+    ) -> ScopedDiscovery {
         // Event paths are the watched root joined with the changed name, so
         // they carry the root exactly as it is stored.
         let Some(root) = roots
@@ -303,6 +361,8 @@ impl FileIndexer {
         if is_excluded_share_location(path) {
             return ScopedDiscovery::Removed;
         }
+        let scope = DiscoveryScope::for_root(&root.to_string_lossy(), allowlists);
+        let key = normalize_path_key(&path.to_string_lossy());
         for ancestor in path.ancestors().skip(1) {
             if ancestor == root || !ancestor.starts_with(root) {
                 break;
@@ -329,13 +389,19 @@ impl FileIndexer {
             return ScopedDiscovery::Removed;
         }
         if metadata.is_dir() {
-            let result = Self::discover_directory_page(&path.to_string_lossy(), None);
+            if scope.as_ref().is_some_and(|scope| !scope.admits_dir(&key)) {
+                return ScopedDiscovery::Removed;
+            }
+            let result = Self::discover_directory_page_in(&path.to_string_lossy(), None, scope.as_ref());
             return ScopedDiscovery::Found {
                 files: result.files,
                 partial: result.partial,
             };
         }
-        if !metadata.is_file() || is_excluded_share_file_name(path) {
+        if !metadata.is_file()
+            || is_excluded_share_file_name(path)
+            || scope.as_ref().is_some_and(|scope| !scope.admits_file(&key))
+        {
             return ScopedDiscovery::Removed;
         }
         match Self::discover_file(path) {
@@ -350,18 +416,21 @@ impl FileIndexer {
         }
     }
 
-    /// Quickly discover files in a directory -- metadata only, no hashing.
-    /// Files are returned with empty hash/aich_hash so they can be shown in the
-    /// UI immediately.  A temporary id is generated from the path so the file
-    /// can be identified until its real ED2K hash is computed.
-    pub fn discover_directory(dir: &str) -> DiscoveryResult {
-        Self::discover_directory_page(dir, None)
-    }
-
-    /// Discover one deterministic page of a directory. The indexer keeps a
-    /// bounded, globally sorted page in memory. Cursor pages advance strictly
-    /// forward; once the end is reached, a later scan resets to the beginning.
-    pub fn discover_directory_page(dir: &str, cursor: Option<&str>) -> DiscoveryResult {
+    /// Discover one deterministic page of a directory -- metadata only, no
+    /// hashing. Files are returned with empty hash/aich_hash so they can be
+    /// shown in the UI immediately, under a temporary id from the path until
+    /// their real ED2K hash is computed. The indexer keeps a bounded, globally
+    /// sorted page in memory. Cursor pages advance strictly forward; once the
+    /// end is reached, a later scan resets to the beginning.
+    ///
+    /// `scope` limits the walk for a folder shared with only some of its
+    /// contents. A scoped page is still the whole of what the folder offers,
+    /// so it reconciles like any other.
+    pub fn discover_directory_page_in(
+        dir: &str,
+        cursor: Option<&str>,
+        scope: Option<&DiscoveryScope>,
+    ) -> DiscoveryResult {
         let mut files = Vec::new();
         let mut truncated = false;
         let mut saw_before_cursor = false;
@@ -464,16 +533,22 @@ impl FileIndexer {
                     {
                         continue;
                     }
+                    let mut key = normalize_path_key(&entry_path.to_string_lossy());
+                    if scope.is_some_and(|scope| !scope.admits_dir(&key)) {
+                        continue;
+                    }
                     if let Ok(canonical) = entry_path.canonicalize() {
                         if canonical == data_canon || canonical.starts_with(&data_canon) {
                             continue;
                         }
                     }
-                    let mut key = normalize_path_key(&entry_path.to_string_lossy());
                     key.push(std::path::MAIN_SEPARATOR);
                     pending.push(Reverse((key, entry_path, true)));
                 } else if file_type.is_file() {
                     let key = normalize_path_key(&entry_path.to_string_lossy());
+                    if scope.is_some_and(|scope| !scope.admits_file(&key)) {
+                        continue;
+                    }
                     pending.push(Reverse((key, entry_path, false)));
                 }
             }
@@ -1090,14 +1165,14 @@ mod tests {
             std::fs::write(&path, b"x").unwrap();
         }
         let root_str = root.to_string_lossy().to_string();
-        let full = FileIndexer::discover_directory_page(&root_str, None);
+        let full = FileIndexer::discover_directory_page_in(&root_str, None, None);
         let keys: Vec<String> = full.files.iter().map(|f| normalize_path_key(&f.path)).collect();
         assert_eq!(keys.len(), 5);
         let mut sorted = keys.clone();
         sorted.sort();
         assert_eq!(keys, sorted, "discovery is globally ordered");
 
-        let resumed = FileIndexer::discover_directory_page(&root_str, Some(&keys[2]));
+        let resumed = FileIndexer::discover_directory_page_in(&root_str, Some(&keys[2]), None);
         let resumed_keys: Vec<String> =
             resumed.files.iter().map(|f| normalize_path_key(&f.path)).collect();
         assert_eq!(resumed_keys, keys[3..].to_vec());
@@ -1122,39 +1197,87 @@ mod tests {
     fn scoped_discovery_resolves_files_folders_and_deletions() {
         let root = scratch_tree("scoped");
         let roots = vec![root.to_string_lossy().to_string()];
+        let no_lists = std::collections::HashMap::new();
         let file = root.join("album").join("song.mp3");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, b"x").unwrap();
         std::fs::write(root.join("album").join("cover.jpg"), b"y").unwrap();
 
-        match FileIndexer::discover_scoped_path(&roots, &file) {
+        match FileIndexer::discover_scoped_path(&roots, &no_lists, &file) {
             ScopedDiscovery::Found { files, partial } => {
                 assert_eq!(files.len(), 1);
                 assert!(!partial);
             }
             other => panic!("expected the file, got {other:?}"),
         }
-        match FileIndexer::discover_scoped_path(&roots, &root.join("album")) {
+        match FileIndexer::discover_scoped_path(&roots, &no_lists, &root.join("album")) {
             ScopedDiscovery::Found { files, .. } => assert_eq!(files.len(), 2),
             other => panic!("expected the folder's files, got {other:?}"),
         }
         assert!(matches!(
-            FileIndexer::discover_scoped_path(&roots, &root.join("gone.mkv")),
+            FileIndexer::discover_scoped_path(&roots, &no_lists, &root.join("gone.mkv")),
             ScopedDiscovery::Removed
         ));
         let part = root.join("album").join("x.part");
         std::fs::write(&part, b"z").unwrap();
         assert!(matches!(
-            FileIndexer::discover_scoped_path(&roots, &part),
+            FileIndexer::discover_scoped_path(&roots, &no_lists, &part),
             ScopedDiscovery::Removed
         ));
         assert!(
             matches!(
-                FileIndexer::discover_scoped_path(&roots, Path::new("/elsewhere/a.mkv")),
+                FileIndexer::discover_scoped_path(&roots, &no_lists, Path::new("/elsewhere/a.mkv")),
                 ScopedDiscovery::Skip
             ),
             "a path under no shared root is not ours to reconcile"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn page_names(result: &DiscoveryResult) -> Vec<String> {
+        let mut names: Vec<String> = result.files.iter().map(|f| f.name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_partly_shared_folder_walks_only_its_allowlist() {
+        let root = scratch_tree("allowlist");
+        let key = |path: &Path| normalize_path_key(&path.to_string_lossy());
+        std::fs::create_dir_all(root.join("sub").join("deep")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        for file in ["a.mp3", "b.mp3", "sub/c.mp3", "sub/deep/d.mp3", "other/e.mp3"] {
+            std::fs::write(root.join(file), b"x").unwrap();
+        }
+        let root_str = root.to_string_lossy().to_string();
+
+        // "Include subfolders" off: only the folder's own files that were picked.
+        let own_files = DiscoveryScope::new(&[key(&root.join("a.mp3"))]);
+        let page = FileIndexer::discover_directory_page_in(&root_str, None, Some(&own_files));
+        assert_eq!(page_names(&page), ["a.mp3"]);
+        assert!(!page.partial, "a scoped page is the whole of what the folder offers");
+
+        // A dropped subfolder is offered whole, and the walk reaches it
+        // through its parent without taking the parent's own files.
+        let deep = DiscoveryScope::new(&[key(&root.join("sub").join("deep")), key(&root.join("b.mp3"))]);
+        let page = FileIndexer::discover_directory_page_in(&root_str, None, Some(&deep));
+        assert_eq!(page_names(&page), ["b.mp3", "d.mp3"]);
+
+        let mut lists = std::collections::HashMap::new();
+        lists.insert(key(&root), vec![key(&root.join("a.mp3"))]);
+        let roots = vec![root_str.clone()];
+        assert!(matches!(
+            FileIndexer::discover_scoped_path(&roots, &lists, &root.join("b.mp3")),
+            ScopedDiscovery::Removed
+        ));
+        assert!(matches!(
+            FileIndexer::discover_scoped_path(&roots, &lists, &root.join("sub")),
+            ScopedDiscovery::Removed
+        ));
+        match FileIndexer::discover_scoped_path(&roots, &lists, &root.join("a.mp3")) {
+            ScopedDiscovery::Found { files, .. } => assert_eq!(files.len(), 1),
+            other => panic!("expected the allowlisted file, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1270,7 +1393,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let measure =
             FileIndexer::measure_directories(std::slice::from_ref(&dir), deadline, &flag);
-        let discovered = FileIndexer::discover_directory(&dir.to_string_lossy());
+        let discovered = FileIndexer::discover_directory_page_in(&dir.to_string_lossy(), None, None);
         assert!(measure.complete);
         assert_eq!(measure.files, discovered.files.len() as u64);
         assert_eq!(measure.files, 3);

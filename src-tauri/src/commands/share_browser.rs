@@ -1688,6 +1688,7 @@ pub async fn share_browser_selection(
         .collect();
     if !cleared.is_empty() {
         persist_folder_allowlists(&state, &[], &cleared).await?;
+        crate::commands::sharing::queue_rescan(&app, cleared.iter().map(PathBuf::from).collect());
     }
 
     for group in file_groups {
@@ -1739,9 +1740,13 @@ pub async fn share_browser_selection(
                 }
             }
         }
-        if offered.is_empty() && add.allowlist_grew {
-            // Nothing indexed yet to flip, but the allowlist now offers them.
-            offered = add.files.iter().chain(&add.dirs).cloned().collect();
+        if add.allowlist_grew {
+            // Discovery skipped them while they were off the allowlist; the
+            // folders are scanned by `share_all_in_folder` above.
+            crate::commands::sharing::queue_rescan(&app, add.files.iter().map(PathBuf::from).collect());
+            if offered.is_empty() {
+                offered = add.files.iter().chain(&add.dirs).cloned().collect();
+            }
         }
         if !offered.is_empty() {
             result.files_shared.extend(offered);
@@ -1758,9 +1763,7 @@ pub async fn share_browser_selection(
             Ok(add) if add.outcome == FolderAddOutcome::Added => result.added.push(path),
             Ok(add) if promoting => {
                 match share_all_in_folder(app.clone(), state.inner(), &add.folder).await {
-                    Ok(paths) if paths.is_empty() => {
-                        remember_once(&mut result.already_shared, path);
-                    }
+                    Ok(paths) if paths.is_empty() => result.files_shared.push(add.folder.clone()),
                     Ok(paths) => result.files_shared.extend(paths),
                     Err(error) => {
                         tracing::warn!("Could not offer the rest of {path}: {error}");
