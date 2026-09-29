@@ -899,6 +899,8 @@ export interface AppSettings {
    *  menu, with the file's facts substituted into a URL template. Empty by
    *  default — opening one tells a third party which file you are after. */
   web_services: WebService[];
+  /** Download categories the user made, offered beside the built-in ones. */
+  download_categories?: string[];
   block_private_ips: boolean;
   filter_servers_by_ip: boolean;
   add_servers_from_server: boolean;

@@ -105,7 +105,7 @@ try that version silently again.
 
 ## 7. Translation review
 
-1.7.1 adds 49 strings and changes three (`settings_auto_check_updates_hint`,
+1.7.1 adds 67 strings and changes three (`settings_auto_check_updates_hint`,
 `settings_skip_compress_video` and its hint), in all eight non-English locales.
 List them with:
 
@@ -125,5 +125,8 @@ git diff v1.7.0 -- messages/en.json
 - [ ] The Add links dialog on Transfers and the transfer-rate graph on
       Statistics (`transfers_add_links_*`, `stats_graph_*`); the axis labels
       fit beside the legend at the narrowest window width.
+- [ ] Download categories: the filter chips, the New category item and the
+      categories dialog (`transfers_category_*`, `transfers_categories_*`,
+      `transfers_ctx_category_new`); a long category name stays on one chip.
 - [ ] German uses the formal *Sie*; the countdown title fits the dialog in every
       language.

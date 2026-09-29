@@ -690,6 +690,46 @@ const MAX_URL_LEN: usize = 2 * 1024;
 const MAX_FILENAME_CLEANUPS_LEN: usize = 16 * 1024;
 use crate::bandwidth::MAX_CONFIGURED_SPEED_BPS;
 
+/// Longest download category name, in characters; the menu and the filter chip
+/// show it whole.
+const DOWNLOAD_CATEGORY_MAX_CHARS: usize = 40;
+const MAX_DOWNLOAD_CATEGORIES: usize = 32;
+/// The category values the Transfers page ships with. A user category of the
+/// same name would be one filter shown twice.
+const BUILTIN_DOWNLOAD_CATEGORIES: [&str; 7] =
+    ["None", "Audio", "Video", "Image", "Archive", "Document", "Program"];
+
+/// The user's download categories, cleaned: invisible and control characters
+/// dropped, whitespace collapsed, names cut to length, and empty, built-in and
+/// case-insensitively repeated names removed, keeping the first of each.
+fn normalize_download_categories(names: &[String]) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for name in names {
+        let visible: String = name
+            .chars()
+            .filter(|c| !crate::security::is_invisible_or_bidi_control_pub(*c))
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let collapsed = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+        let cut: String = collapsed.chars().take(DOWNLOAD_CATEGORY_MAX_CHARS).collect();
+        let cleaned = cut.trim_end();
+        if cleaned.is_empty() {
+            continue;
+        }
+        let folded = cleaned.to_lowercase();
+        let taken = BUILTIN_DOWNLOAD_CATEGORIES.iter().any(|b| b.to_lowercase() == folded)
+            || kept.iter().any(|k| k.to_lowercase() == folded);
+        if taken {
+            continue;
+        }
+        kept.push(cleaned.to_string());
+        if kept.len() == MAX_DOWNLOAD_CATEGORIES {
+            break;
+        }
+    }
+    kept
+}
+
 fn clamp_assign<T: Ord + Copy>(value: &mut T, min: T, max: T) -> bool {
     let clamped = (*value).clamp(min, max);
     if clamped != *value {
@@ -834,6 +874,12 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     // resetting every other setting. One bad window is not worth a user's
     // whole configuration, and an inert rule was never throttling anything.
     changed |= crate::bandwidth::schedule::repair(&mut settings.bandwidth_schedule);
+
+    let categories = normalize_download_categories(&settings.download_categories);
+    if categories != settings.download_categories {
+        settings.download_categories = categories;
+        changed = true;
+    }
 
     // Drop shared folders that would fail validate (sensitive segments) or that
     // contain / are the Ember data directory. Older builds allowed some AppData
@@ -1346,6 +1392,7 @@ pub async fn update_settings(
         warn!("Dropping web service {name:?} from settings: {reason}");
     }
     settings.web_services = kept_services;
+    settings.download_categories = normalize_download_categories(&settings.download_categories);
     // Not exposed in Settings UI — always keep friend sessions encrypted.
     settings.friend_session_encryption = true;
     // Ember overlay is always on. The Settings / Ember-page switches stay
@@ -3221,6 +3268,35 @@ mod tests {
         };
         assert!(soft_repair_settings(&mut settings));
         assert!(settings.friend_session_encryption);
+    }
+
+    #[test]
+    fn download_categories_are_cleaned_on_load() {
+        let long = "x".repeat(DOWNLOAD_CATEGORY_MAX_CHARS + 5);
+        let mut settings = AppSettings {
+            download_categories: vec![
+                "  Linux   ISOs ".into(),
+                "linux isos".into(),
+                "video".into(),
+                "\u{202E}Films\t".into(),
+                "   ".into(),
+                long,
+            ],
+            ..AppSettings::default()
+        };
+        assert!(soft_repair_settings(&mut settings));
+        assert_eq!(
+            settings.download_categories,
+            vec![
+                "Linux ISOs".to_string(),
+                "Films".to_string(),
+                "x".repeat(DOWNLOAD_CATEGORY_MAX_CHARS),
+            ]
+        );
+        assert!(!soft_repair_settings(&mut settings), "a clean list is left alone");
+
+        let many: Vec<String> = (0..MAX_DOWNLOAD_CATEGORIES + 3).map(|i| format!("Cat {i}")).collect();
+        assert_eq!(normalize_download_categories(&many).len(), MAX_DOWNLOAD_CATEGORIES);
     }
 
     #[test]

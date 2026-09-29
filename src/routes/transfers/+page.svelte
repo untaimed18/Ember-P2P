@@ -3,6 +3,7 @@
   import PartsBar from '$lib/components/PartsBar.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import AddLinksDialog from '$lib/components/AddLinksDialog.svelte';
+  import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
   import { transfers, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
@@ -21,7 +22,7 @@
   import { getPeerReputationBatch, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
   import {
     formatSize, formatSpeed, formatDate, formatDateWithYear, formatDurationSecs,
-    formatRemaining, formatRelativeTime, copyToClipboard, readFromClipboard,
+    formatRemaining, formatRelativeTime, formatNumber, copyToClipboard, readFromClipboard,
   } from '$lib/utils';
   import { onMount, onDestroy, untrack } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
@@ -34,8 +35,8 @@
   import { scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
-  import { appSettings } from '$lib/stores/settings';
-  import { openWebService } from '$lib/api/settings';
+  import { appSettings, setAppSettings } from '$lib/stores/settings';
+  import { getSettings, openWebService, updateSettings } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
   import { mapSettledWithLimit } from '$lib/concurrency';
   import * as m from '$lib/paraglide/messages';
@@ -2032,10 +2033,55 @@
     return [...completedDownloads].sort(compareDownloads);
   });
 
+  // --- Categories ---
+  const BUILTIN_CATEGORIES = ['Audio', 'Video', 'Image', 'Archive', 'Document', 'Program'] as const;
+  let userCategories = $derived($appSettings?.download_categories ?? []);
+  let categoryCounts = $derived.by(() => {
+    const counts: Record<string, number> = {};
+    for (const t of allDownloads) {
+      if (t.category) counts[t.category] = (counts[t.category] ?? 0) + 1;
+    }
+    return counts;
+  });
+  /** The filter chips: the built-in categories in use, then the user's own
+   *  even while empty, then any other a download still carries (one the user
+   *  has since deleted, say). */
+  let categoryChips = $derived.by(() => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const add = (cat: string) => {
+      if (!seen.has(cat)) { seen.add(cat); out.push(cat); }
+    };
+    for (const cat of BUILTIN_CATEGORIES) if (categoryCounts[cat]) add(cat);
+    for (const cat of userCategories) add(cat);
+    for (const cat of Object.keys(categoryCounts).sort(sortCollator.compare)) add(cat);
+    return out;
+  });
+  const CATEGORY_FILTER_KEY = 'transfers-category-filter';
+  let categoryFilter = $state((() => {
+    try { return localStorage.getItem(CATEGORY_FILTER_KEY) ?? ''; } catch { return ''; }
+  })());
+  $effect(() => {
+    try { localStorage.setItem(CATEGORY_FILTER_KEY, categoryFilter); } catch { /* ignore */ }
+  });
+  /** The saved filter only applies while its chip exists, so a category that
+   *  emptied out cannot leave the list blank with nothing to click. */
+  let activeCategory = $derived(categoryChips.includes(categoryFilter) ? categoryFilter : '');
+  let downloadsNarrowed = $derived(Boolean(transferFilter.trim() || activeCategory));
+  /** How the bulk actions and their prompts name the narrowed view. */
+  let narrowLabel = $derived(
+    [activeCategory ? categoryLabel(activeCategory) : '', transferFilter.trim()].filter(Boolean).join(' · '),
+  );
+  function clearDownloadFilters() {
+    transferFilter = '';
+    categoryFilter = '';
+  }
+
   let filteredActiveDownloads = $derived.by(() => {
     const query = transferFilter.trim().toLowerCase();
-    if (!query) return sortedActiveDownloads;
-    return sortedActiveDownloads.filter((t) =>
+    const pool = activeCategory ? sortedActiveDownloads.filter((t) => t.category === activeCategory) : sortedActiveDownloads;
+    if (!query) return pool;
+    return pool.filter((t) =>
       t.file_name.toLowerCase().includes(query)
       || t.file_hash.toLowerCase().includes(query)
       || (t.category || '').toLowerCase().includes(query)
@@ -2048,8 +2094,9 @@
   });
   let filteredCompletedDownloads = $derived.by(() => {
     const query = transferFilter.trim().toLowerCase();
-    if (!query) return sortedCompletedDownloads;
-    return sortedCompletedDownloads.filter((t) =>
+    const pool = activeCategory ? sortedCompletedDownloads.filter((t) => t.category === activeCategory) : sortedCompletedDownloads;
+    if (!query) return pool;
+    return pool.filter((t) =>
       t.file_name.toLowerCase().includes(query)
       || t.file_hash.toLowerCase().includes(query)
       || (t.category || '').toLowerCase().includes(query)
@@ -2718,7 +2765,68 @@
   let ctxPrioritySub = $state(false);
   let ctxCategorySub = $state(false);
   let ctxWebSub = $state(false);
-  const CATEGORY_OPTIONS = ['None', 'Audio', 'Video', 'Image', 'Archive', 'Document', 'Program'] as const;
+  let categoryOptions = $derived(['None', ...BUILTIN_CATEGORIES, ...userCategories]);
+
+  let categoriesDialog = $state<{ open: boolean; assignIds: string[] }>({ open: false, assignIds: [] });
+
+  /** A category set from the menu goes to the whole selection when the
+   *  clicked row is part of it, as in eMule. */
+  function categoryTargets(t: Transfer): Transfer[] {
+    return selectedDlIdSet.has(t.id) && selectedBatchTransfers.length > 1 ? selectedBatchTransfers : [t];
+  }
+
+  async function assignCategory(targets: Transfer[], category: string) {
+    const done = new Set<string>();
+    try {
+      for (const target of targets) {
+        await setTransferCategory(target.id, category);
+        done.add(target.id);
+      }
+    } finally {
+      // The backend sends no event for this; show what it accepted right away.
+      if (done.size > 0) {
+        transfers.update((list) => list.map((x) => (done.has(x.id) ? { ...x, category } : x)));
+      }
+    }
+  }
+
+  function isCategoryTaken(name: string): boolean {
+    const folded = name.toLocaleLowerCase();
+    return ['None', ...BUILTIN_CATEGORIES].some(
+      (cat) => cat.toLocaleLowerCase() === folded || categoryLabel(cat).toLocaleLowerCase() === folded,
+    ) || userCategories.some((cat) => cat.toLocaleLowerCase() === folded);
+  }
+
+  async function saveUserCategories(next: string[]): Promise<string[]> {
+    const current = await getSettings();
+    const result = await updateSettings({ ...current, download_categories: next });
+    setAppSettings(result.settings);
+    return result.settings.download_categories ?? [];
+  }
+
+  async function addUserCategory(name: string) {
+    const saved = await saveUserCategories([...userCategories, name]);
+    // The name as the backend kept it, which may be trimmed or cut.
+    const kept = saved.find((cat) => cat.toLocaleLowerCase() === name.toLocaleLowerCase()) ?? saved[saved.length - 1];
+    const ids = new Set(categoriesDialog.assignIds);
+    if (kept && ids.size > 0) {
+      await assignCategory(allDownloads.filter((t) => ids.has(t.id)), kept);
+    }
+  }
+
+  async function removeUserCategory(name: string) {
+    await saveUserCategories(userCategories.filter((cat) => cat !== name));
+    const members = allDownloads.filter((t) => t.category === name);
+    if (members.length > 0) await assignCategory(members, '');
+    if (categoryFilter === name) categoryFilter = '';
+  }
+
+  function openNewCategory(t: Transfer) {
+    const targets = categoryTargets(t);
+    closeCtx();
+    categoriesDialog = { open: true, assignIds: targets.map((x) => x.id) };
+  }
+
   // Empty until settings load, which is the honest default: the submenu then
   // shows its "configure these in Settings" hint rather than a stale list.
   let webServices = $derived($appSettings?.web_services ?? []);
@@ -3111,7 +3219,7 @@
           ]);
           break;
         }
-        case 'set_category': if (extra !== undefined) await setTransferCategory(t.id, extra === 'None' ? '' : extra); break;
+        case 'set_category': if (extra !== undefined) await assignCategory(categoryTargets(t), extra === 'None' ? '' : extra); break;
         case 'add_friend': {
           const emberHash = emberHashForUpload(t);
           if (!emberHash) { transferError = m.transfers_no_ember_hash(); break; }
@@ -3146,7 +3254,7 @@
     const ids = globalDownloadTargets().filter((t) => canPause(t)).map((t) => t.id);
     if (!ids.length) { showInfo(m.transfers_nothing_to_pause()); return; }
     const ok = await runBatchCommand(ids, pauseTransfersBatch, m.transfers_batch_label_paused());
-    const filter = transferFilter.trim();
+    const filter = narrowLabel;
     if (filter && ok) {
       showInfo(plural(ids.length, {
         one: () => m.transfers_paused_matching_one({ filter }),
@@ -3158,7 +3266,7 @@
     const ids = globalDownloadTargets().filter((t) => canResume(t)).map((t) => t.id);
     if (!ids.length) { showInfo(m.transfers_nothing_to_resume()); return; }
     const ok = await runBatchCommand(ids, resumeTransfersBatch, m.transfers_batch_label_resumed());
-    const filter = transferFilter.trim();
+    const filter = narrowLabel;
     if (filter && ok) {
       showInfo(plural(ids.length, {
         one: () => m.transfers_resumed_matching_one({ filter }),
@@ -3537,7 +3645,7 @@
    *  them: an "all" that reaches rows the user cannot see is how people lose
    *  downloads they meant to keep. */
   function globalDownloadTargets(): Transfer[] {
-    return transferFilter.trim() ? filteredActiveDownloads : activeDownloads;
+    return downloadsNarrowed ? filteredActiveDownloads : activeDownloads;
   }
 
   /** Rows "Clear completed" applies to, scoped the same way. It was the one
@@ -3545,7 +3653,7 @@
    *  it cleared every finished download, including rows the current view never
    *  showed. */
   function clearCompletedTargets(): Transfer[] {
-    const pool = transferFilter.trim() ? filteredCompletedDownloads : completedDownloads;
+    const pool = downloadsNarrowed ? filteredCompletedDownloads : completedDownloads;
     return pool.filter((t) => t.status === 'completed');
   }
 
@@ -3553,7 +3661,7 @@
     const targets = clearCompletedTargets();
     confirmClearCompleted = {
       open: true,
-      filter: transferFilter.trim(),
+      filter: narrowLabel,
       count: targets.length,
     };
   }
@@ -3562,7 +3670,7 @@
     const ids = globalDownloadTargets().filter((t) => canStop(t)).map((t) => t.id);
     if (!ids.length) { showInfo(m.transfers_nothing_to_stop()); return; }
     const ok = await runBatchCommand(ids, stopTransfersBatch, m.transfers_batch_label_stopped());
-    const filter = transferFilter.trim();
+    const filter = narrowLabel;
     if (filter && ok) {
       showInfo(plural(ids.length, {
         one: () => m.transfers_stopped_matching_one({ filter }),
@@ -3580,7 +3688,7 @@
       ids,
       count: ids.length,
       removeIds: [],
-      filter: transferFilter.trim(),
+      filter: narrowLabel,
     };
   }
 
@@ -4602,6 +4710,15 @@
 </div>
 
 <AddLinksDialog bind:open={addLinksOpen} busy={pasteLinkBusy} maxLength={MAX_PASTE_LEN} onsubmit={queueLinksFromDialog} />
+<CategoriesDialog
+  bind:open={categoriesDialog.open}
+  categories={userCategories}
+  counts={categoryCounts}
+  assignCount={categoriesDialog.assignIds.length}
+  isTaken={isCategoryTaken}
+  onadd={addUserCategory}
+  onremove={removeUserCategory}
+/>
 
 {#if transferError}
   <div class="error-banner" role="alert">
@@ -4644,6 +4761,31 @@
         {/if}
       </label>
     </div>
+    {#if categoryChips.length > 0}
+      <div class="category-chips" role="group" aria-label={m.transfers_category_filter_aria()}>
+        <button
+          type="button"
+          class="category-chip"
+          class:active={!activeCategory}
+          aria-pressed={!activeCategory}
+          onclick={() => (categoryFilter = '')}
+        >{m.transfers_category_filter_all()} <span class="category-chip-count">{formatNumber(allDownloads.length)}</span></button>
+        {#each categoryChips as cat (cat)}
+          <button
+            type="button"
+            class="category-chip"
+            class:active={activeCategory === cat}
+            aria-pressed={activeCategory === cat}
+            onclick={() => (categoryFilter = activeCategory === cat ? '' : cat)}
+          >{categoryLabel(cat)} <span class="category-chip-count">{formatNumber(categoryCounts[cat] ?? 0)}</span></button>
+        {/each}
+        <button
+          type="button"
+          class="category-chip category-chip-edit"
+          onclick={() => (categoriesDialog = { open: true, assignIds: [] })}
+        >{m.transfers_category_edit()}</button>
+      </div>
+    {/if}
     <div class="pane-toolbar">
       <span class="pane-title">{m.transfers_downloading_count({ shown: filteredActiveDownloads.length, total: activeDownloads.length })}</span>
       <div class="toolbar-actions">
@@ -5026,7 +5168,7 @@
                   <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                 </svg>
                 <p class="empty-title">{m.transfers_empty_no_matches()}</p>
-                <button class="secondary empty-action" type="button" onclick={() => (transferFilter = '')}>{m.transfers_known_clear_filter()}</button>
+                <button class="secondary empty-action" type="button" onclick={clearDownloadFilters}>{m.transfers_known_clear_filter()}</button>
               </div>
             </td></tr>
           {/if}
@@ -6076,7 +6218,7 @@
         </button>
         {#if ctxCategorySub}
           <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
-            {#each CATEGORY_OPTIONS as cat}
+            {#each categoryOptions as cat (cat)}
               <button
                 class="ctx-item"
                 role="menuitemradio"
@@ -6084,6 +6226,8 @@
                 onclick={() => ctxAction('set_category', cat)}
               >{categoryLabel(cat)}</button>
             {/each}
+            <div class="ctx-sep" role="separator"></div>
+            <button class="ctx-item" role="menuitem" onclick={() => ctxTransfer && openNewCategory(ctxTransfer)}>{m.transfers_ctx_category_new()}</button>
           </div>
         {/if}
       </div>
@@ -6274,7 +6418,7 @@
   onconfirm={async () => {
     let markedIds: string[] = [];
     try {
-      if (transferFilter.trim()) {
+      if (downloadsNarrowed) {
         await removeTransfersBatch(clearCompletedTargets().map((t) => t.id), false);
       } else {
         markedIds = $transfers.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id);
@@ -6801,6 +6945,51 @@
     font-weight: 600;
     color: var(--text-muted);
     margin-right: 2px;
+  }
+  /* One row that scrolls sideways, so many categories never push the list down. */
+  .category-chips {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+  .category-chip {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
+    background: var(--bg-primary);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    white-space: nowrap;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+  }
+  .category-chip:hover:not(.active) {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+  }
+  .category-chip.active {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+  .category-chip-count {
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+  }
+  .category-chip.active .category-chip-count {
+    color: inherit;
+  }
+  .category-chip-edit {
+    margin-left: auto;
+    border-style: dashed;
   }
   /* The Known Clients search, at the right of the downloads overview bar. */
   .pill-search.dl-filter {

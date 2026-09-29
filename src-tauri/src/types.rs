@@ -1441,6 +1441,11 @@ pub struct AppSettings {
     /// a download is stuck, and it has to be there at that moment.
     #[serde(default = "default_web_services")]
     pub web_services: Vec<crate::webservices::WebService>,
+    /// Download categories the user made, offered beside the built-in ones
+    /// (Audio, Video, …) in the Transfers category menu and filter. Only the
+    /// names live here; each download stores its own category string.
+    #[serde(default)]
+    pub download_categories: Vec<String>,
     /// Block private/LAN/CGNAT IPs across KAD contact admission, outbound
     /// dials, UDP ingest, and (when filter-incoming is on) inbound TCP.
     /// Bogus/unroutable space is always rejected regardless of this toggle.
@@ -2290,6 +2295,7 @@ impl Default for AppSettings {
             filter_incoming_connections: false,
             allow_shared_files_browse: false,
             web_services: default_web_services(),
+            download_categories: Vec::new(),
             block_private_ips: true,
             filter_servers_by_ip: true,
             add_servers_from_server: true,
