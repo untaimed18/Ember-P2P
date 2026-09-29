@@ -1318,6 +1318,7 @@ impl IterativeSearch {
         // marked above, and nothing here queries anyone).
         let offer_allowance = self.per_node_result_allowance(from_id);
         let from_subnet = self.node_subnet(from_id);
+        let now_unix = chrono::Utc::now().timestamp();
         if let Some(subnet) = from_subnet.filter(|_| value_answer_expected) {
             self.responder_subnets.insert(*from_id, subnet);
         }
@@ -1406,6 +1407,10 @@ impl IterativeSearch {
                     .is_some_and(|&n| n >= MAX_PUBLISHERS_PER_FILE_PER_NODE)
             });
             *offered += 1;
+            if !SignedRecord::value_blob_is_current(&data, now_unix) {
+                debug!("Search {}: dropping an expired or future-dated FOUND_VALUE blob", self.id);
+                continue;
+            }
             if over_share {
                 // Charged like any other offer, or a node could be paged to its
                 // ceiling handing over records none of which are taken.

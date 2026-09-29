@@ -1706,6 +1706,15 @@ impl SignedRecord {
     /// The framing checks mirror [`Self::from_wire`] on purpose: a blob that
     /// would be refused there has to be refused here too, or it wins a result
     /// slot only to be dropped at the far end.
+    /// Whether a `FOUND_VALUE` blob is still within its life by the storer's
+    /// rule. A responder is not a storer and need not have applied it, so a
+    /// search checks for itself: an expired source record names an address
+    /// that may belong to someone else by now, and an expired keyword record a
+    /// file its publisher has stopped sharing.
+    pub fn value_blob_is_current(blob: &[u8], now_unix: i64) -> bool {
+        blob.len() >= 64 && super::store::record_is_current(&blob[..blob.len() - 64], now_unix)
+    }
+
     pub fn value_blob_is_authentic(blob: &[u8]) -> bool {
         if blob.len() < 115 + 64 {
             return false;
@@ -2855,6 +2864,24 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+
+    /// A searcher applies the storer's clock rule itself: a responder can
+    /// return records it would never have been allowed to store.
+    #[test]
+    fn a_searcher_refuses_expired_and_future_dated_records() {
+        let sk = SigningKey::from_bytes(&[0x61; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let blob = |at: i64| {
+            let rec = SignedRecord::source_at([0x11; 16], "a.iso", SourceContact::default(), &sk, at);
+            let mut blob = rec.data;
+            blob.extend_from_slice(&rec.signature);
+            blob
+        };
+        assert!(SignedRecord::value_blob_is_current(&blob(now - 60), now));
+        assert!(!SignedRecord::value_blob_is_current(&blob(now - 6 * 3600 - 1), now), "past its six-hour TTL");
+        assert!(!SignedRecord::value_blob_is_current(&blob(now + 2 * 3600), now), "beyond the skew tolerance");
+        assert!(!SignedRecord::value_blob_is_current(&[0u8; 80], now), "too short to carry a date");
+    }
 
     /// A maximum size of zero is how every search path here spells "no limit",
     /// and a sender that forwards it unfiltered must not have every record under

@@ -206,6 +206,19 @@ fn record_ttl(data: &[u8]) -> Duration {
 /// we treat it as bogus (clock-skew tolerance between peers).
 const CLOCK_SKEW_TOLERANCE_SECS: i64 = 3600;
 
+/// Whether a record body is within its life by the rule a storer admits it
+/// under: not dated past the skew tolerance, and younger than its TTL. Unsigned
+/// fields only, so check the signature separately. `false` for a body too short
+/// to carry a timestamp.
+pub(crate) fn record_is_current(data: &[u8], now_unix: i64) -> bool {
+    let Some(created_at) = data.get(105..113).and_then(|b| b.try_into().ok()).map(i64::from_le_bytes)
+    else {
+        return false;
+    };
+    let ttl_secs = record_ttl(data).as_secs() as i64;
+    created_at <= now_unix + CLOCK_SKEW_TOLERANCE_SECS && now_unix.saturating_sub(created_at).max(0) < ttl_secs
+}
+
 /// One record on its way to or from disk.
 ///
 /// Only `data` and `signature` are load-bearing on the way back in. Everything

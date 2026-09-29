@@ -382,10 +382,11 @@ pub(in crate::network) async fn on_ember_search_tick(
         //     purely by ed2k hash) get promoted below — there is no
         //     server/KAD here to drive promotion — and it stores the
         //     connect options so the eventual c2c dial can obfuscate
-        //     when the source advertised it. The DHT record's IP is
-        //     already bound to the publisher's observed sender IP by
-        //     the storer's anti-reflection check, so a forged
-        //     third-party/special-use address can't reach us here.
+        //     when the source advertised it. An honest storer bound
+        //     the record's IP to its publisher's sender address, but a
+        //     responder need not be honest, so `parse_ember_source_records`
+        //     caps what one responder can name; the filter and ban
+        //     checks below still apply to every address.
         {
             let mut sm = source_manager.write().await;
             for (fh, sources) in &entries {

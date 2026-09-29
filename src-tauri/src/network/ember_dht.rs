@@ -2124,6 +2124,10 @@ pub(super) async fn handle_ember_dht_message(
         &session_extras,
     );
 
+    // Read now, before the handlers below consume the pending query a
+    // FOUND_NODE answers.
+    let leads_asked_for = ember_leads_were_asked_for(state, &inbound, from, now);
+
     // A STORE that did not authenticate cost nothing the budget exists to
     // ration, so give the charge back. `sender_id` is set for every frame that
     // decoded, so its absence here is precisely "the version, the signature, the
@@ -2507,7 +2511,15 @@ pub(super) async fn handle_ember_dht_message(
             }
         }
     }
-    probe_ember_gossip_leads(socket, state, &inbound.gossip_leads, inbound.sender_id).await;
+    // Probed only when the frame carrying them answers something we asked this
+    // peer, or cost a lookup token to send (ANNOUNCE_PEER). An unsolicited
+    // FOUND_NODE or PEER_LIST is charged to nothing, so one peer sending them
+    // as fast as the frame gate allows used up the shared probe budget with
+    // leads it chose and starved the probes of real ones. Their contacts are
+    // still merged into the table, unverified.
+    if leads_asked_for {
+        probe_ember_gossip_leads(socket, state, &inbound.gossip_leads, inbound.sender_id).await;
+    }
 
     if inbound.pong_received {
         state.ember_diagnostics.ember_dht_pongs_received = state

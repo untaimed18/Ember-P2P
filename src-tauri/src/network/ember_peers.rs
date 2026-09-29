@@ -1006,6 +1006,52 @@ pub(super) fn ember_announce_due(
     }
 }
 
+/// Whether the gossip leads in `inbound` arrived in a frame we asked for, or
+/// one that cost its sender a lookup token: an `ANNOUNCE_PEER`, a `PEER_LIST`
+/// from a peer we announced to within the last two maintenance cycles, or a
+/// `FOUND_NODE` answering a query outstanding to its sender. Only those have
+/// their leads probed; see `handle_ember_dht_message`.
+pub(super) fn ember_leads_were_asked_for(
+    state: &NetworkState,
+    inbound: &ember::dht::engine::DhtInbound,
+    from: SocketAddr,
+    now: i64,
+) -> bool {
+    if inbound.announce_peer_received {
+        return true;
+    }
+    let Some(sender) = inbound.sender_id else {
+        return false;
+    };
+    if inbound.peer_list.is_some() {
+        let window = 2 * EMBER_MAINT_INTERVAL.as_secs() as i64;
+        return state
+            .ember_announced_at
+            .get(&sender)
+            .is_some_and(|at| now.saturating_sub(*at) <= window);
+    }
+    if let Some((rid, _)) = &inbound.found_node {
+        if state
+            .ember_dht_pending_finds
+            .get(rid)
+            .is_some_and(|(_, dest, _)| *dest == from)
+        {
+            return true;
+        }
+        return state
+            .ember_dht_search_requests
+            .get(rid)
+            .and_then(|req| {
+                state
+                    .ember_search
+                    .get(req.search_id)
+                    .and_then(|search| search.pending_query(req.per_search_req_id))
+            })
+            .is_some_and(|(node, _)| node == sender);
+    }
+    true
+}
+
 /// Public-table contacts plus firsthand session peers, least-recently-announced
 /// first. `ANNOUNCE_PEER` used to walk only the public table, so a friend the
 /// IP policy kept in the session map (LAN / CGNAT with `block_private_ips`)

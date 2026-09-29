@@ -3071,7 +3071,11 @@ fn one_responder_minting_publishers_cannot_decide_a_files_digest() {
         &HashSet::new(),
         &mut content_hashes,
     );
-    assert_eq!(sources.len(), 40, "every contact stays connectable");
+    assert_eq!(
+        sources.len(),
+        MAX_UNCONFIRMED_SOURCES_PER_RESPONDER,
+        "one responder's unconfirmed addresses are capped, not all dialled"
+    );
     assert!(
         content_hashes.is_empty(),
         "but no digest is pinned on one responder's word"
