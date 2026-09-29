@@ -48,6 +48,10 @@ pub struct DiscoveryResult {
     /// Kept separate from `truncated`: every resumed page omits its prefix, so
     /// folding the two together raised the cap warning on ordinary reloads.
     pub partial: bool,
+    /// Entries between this page's start and its end were never visited (the
+    /// traversal frontier was trimmed), so the page does not even account for
+    /// its own stretch of the folder.
+    pub frontier_trimmed: bool,
     /// Normalized path after which the next bounded scan should continue.
     /// `None` means this page reached the end of the folder.
     pub next_cursor: Option<String>,
@@ -445,6 +449,7 @@ impl FileIndexer {
                 files,
                 truncated: false,
                 partial: true,
+                frontier_trimmed: false,
                 next_cursor: None,
             };
         }
@@ -462,6 +467,7 @@ impl FileIndexer {
                     files,
                     truncated: false,
                     partial: true,
+                    frontier_trimmed: false,
                     next_cursor: None,
                 };
             }
@@ -636,6 +642,7 @@ impl FileIndexer {
             files,
             truncated,
             partial,
+            frontier_trimmed,
             next_cursor,
         }
     }

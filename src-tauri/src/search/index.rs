@@ -446,6 +446,17 @@ impl LocalIndex {
         self.rebuild_indices();
     }
 
+    /// Remove every row `remove` picks, returning how many went.
+    pub fn remove_files_where(&mut self, remove: impl Fn(&FileInfo) -> bool) -> usize {
+        let before = self.files.len();
+        self.files.retain(|file| !remove(file));
+        let removed = before - self.files.len();
+        if removed > 0 {
+            self.rebuild_indices();
+        }
+        removed
+    }
+
     /// Remove indexed rows that are no longer covered by any active shared
     /// root, returning every removed row (including pending/unhashed rows).
     /// Used by whole-settings root topology changes where replacing a parent

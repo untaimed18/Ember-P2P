@@ -5786,18 +5786,21 @@ async fn reload_shared_files_page(
             discovery_partial,
             discovery_cursor_updates,
             scanned_paths,
+            discovery_pages,
         ): (
             Vec<FileInfo>,
             bool,
             bool,
             std::collections::HashMap<String, Option<String>>,
             Vec<String>,
+            Vec<(String, crate::sharing::paged_cycle::PageFacts)>,
         ) = match tokio::task::spawn_blocking(move || {
             let mut files = Vec::new();
             let mut truncated = false;
             let mut partial = false;
             let mut cursor_updates = std::collections::HashMap::new();
             let mut scanned = Vec::new();
+            let mut pages = Vec::new();
             if let Some(paths) = scope {
                 for path in outermost_paths(paths) {
                     match FileIndexer::discover_scoped_path(
@@ -5819,7 +5822,7 @@ async fn reload_shared_files_page(
                         }
                     }
                 }
-                return (files, truncated, partial, cursor_updates, scanned);
+                return (files, truncated, partial, cursor_updates, scanned, pages);
             }
             for folder in &discovery_folders {
                 let key = crate::search::index::normalize_path_key(folder);
@@ -5827,17 +5830,23 @@ async fn reload_shared_files_page(
                     folder,
                     &discovery_allowlists,
                 );
-                let result = FileIndexer::discover_directory_page_in(
-                    folder,
-                    discovery_cursors.get(&key).map(String::as_str),
-                    scope.as_ref(),
-                );
+                let cursor = discovery_cursors.get(&key).cloned();
+                let result =
+                    FileIndexer::discover_directory_page_in(folder, cursor.as_deref(), scope.as_ref());
                 truncated |= result.truncated;
                 partial |= result.partial;
+                pages.push((
+                    folder.clone(),
+                    crate::sharing::paged_cycle::PageFacts {
+                        cursor,
+                        next: result.next_cursor.clone(),
+                        frontier_trimmed: result.frontier_trimmed,
+                    },
+                ));
                 cursor_updates.insert(folder.clone(), result.next_cursor);
                 files.extend(result.files);
             }
-            (files, truncated, partial, cursor_updates, scanned)
+            (files, truncated, partial, cursor_updates, scanned, pages)
         })
         .await
         {
@@ -5992,7 +6001,48 @@ async fn reload_shared_files_page(
         let (removed_fresh_hashes, placeholders_before_pass) = {
             let mut index = local_index.write().await;
             let placeholders_before_pass = unhashed_placeholders_under(&index, &reloaded_folders);
-            let before = (!discovery_partial || !settling.is_empty()).then(|| {
+            // Folders past the page cap reconcile once per cursor cycle; see
+            // `sharing::paged_cycle`.
+            let finished_cycles = {
+                let mut cycles = crate::sharing::paged_cycle::cycles()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if scoped {
+                    cycles.note_found(discovered.iter().map(|file| file.path.as_str()));
+                    Vec::new()
+                } else {
+                    cycles.retain_roots(&reloaded_folders);
+                    discovery_pages
+                        .iter()
+                        .filter(|(folder, _)| {
+                            reloaded_folders.iter().any(|active| paths_equal_ignore_case(active, folder))
+                        })
+                        .filter_map(|(folder, facts)| {
+                            let under = |path: &str| crate::security::path_within_dir(path, folder);
+                            cycles
+                                .note_page(
+                                    folder,
+                                    facts,
+                                    || {
+                                        index
+                                            .all_files()
+                                            .iter()
+                                            .filter(|file| under(&file.path))
+                                            .map(|file| file.path.clone())
+                                            .collect()
+                                    },
+                                    discovered
+                                        .iter()
+                                        .filter(|file| under(&file.path))
+                                        .map(|file| file.path.as_str()),
+                                )
+                                .filter(|doomed| !doomed.is_empty())
+                                .map(|doomed| (folder.clone(), doomed))
+                        })
+                        .collect::<Vec<_>>()
+                }
+            };
+            let before = (!discovery_partial || !settling.is_empty() || !finished_cycles.is_empty()).then(|| {
                 index
                     .all_files()
                     .iter()
@@ -6001,6 +6051,15 @@ async fn reload_shared_files_page(
                     .collect::<Vec<_>>()
             });
             index.reconcile_files_for_folders(&reloaded_folders, discovered, !discovery_partial);
+            for (folder, doomed) in &finished_cycles {
+                let removed = index.remove_files_where(|file| {
+                    crate::security::path_within_dir(&file.path, folder)
+                        && doomed.contains(&crate::sharing::paged_cycle::fingerprint(&file.path))
+                });
+                if removed > 0 {
+                    info!("Removed {removed} missing file(s) from {folder} at the end of its paged scan");
+                }
+            }
             let removed = before
                 .as_deref()
                 .map(|before| {

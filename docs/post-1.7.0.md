@@ -118,15 +118,16 @@ the attachment's friend, so this is for symmetry only.
 
 ## Sharing and library
 
-### Prune deletes on paged reloads of very large shares
+### Prune deletes on paged reloads of very large shares — done in 1.7.1
 
 A share root over 100,000 files is walked in pages (`MAX_DISCOVERED_FILES` in
-`sharing/indexer.rs`); every page after the first is `partial`, so a full reload
-never reconciles deletions for such a root. File-system events cover the usual
-case, but a file deleted while hashing is paused (events deferred, then a paged
-full reload) stays in the index and offerable until "Remove missing". Fix: track
-the paths seen across one complete cursor cycle and reconcile once the last page
-lands.
+`sharing/indexer.rs`), and no page after the first may reconcile deletions.
+`sharing/paged_cycle.rs` now follows each such root through one cursor cycle,
+collecting what every page saw, and the page that finishes the folder removes
+the rows indexed when the cycle began that no page found. Rows indexed during
+the cycle are kept, paths found by filesystem-event rescans count as seen, and
+a cycle that skips a stretch (a page out of sequence, a trimmed frontier) is
+abandoned rather than trusted.
 
 ### "Share without subfolders" still walks the whole tree — done in 1.7.1
 
