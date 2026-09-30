@@ -1198,9 +1198,24 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         .ember_dht
         .set_ip_filter(state.shared_ip_filter.clone());
 
-    state.ember_verified_highwater =
-        load_ember_verified_highwater(&ember_highwater_path(&data_dir));
-    state.ember_source_address = load_ember_source_address(&ember_source_address_path(&data_dir));
+    {
+        let highwater_path = ember_highwater_path(&data_dir);
+        let source_address_path = ember_source_address_path(&data_dir);
+        match tokio::task::spawn_blocking(move || {
+            (
+                load_ember_verified_highwater(&highwater_path),
+                load_ember_source_address(&source_address_path),
+            )
+        })
+        .await
+        {
+            Ok((highwater, source_address)) => {
+                state.ember_verified_highwater = highwater;
+                state.ember_source_address = source_address;
+            }
+            Err(e) => warn!("Ember startup state load task failed: {e}"),
+        }
+    }
 
     // Carry the record store across the restart too. Every record is re-verified
     // and re-dated on the way in, so anything that expired while we were closed
@@ -1213,14 +1228,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     crate::security::recover_interrupted_replace(&store_ember_path);
     if store_ember_path.exists() {
         // Same reasoning as `nodes_ember.dat` above: synchronous file read and
-        // record validation, so it belongs on the blocking pool.
+        // record validation, so it belongs on the blocking pool — the
+        // signature checks included, one per record for up to twenty thousand.
         let loaded = tokio::task::spawn_blocking(move || {
-            ember::dht::bootstrap::load_store(&store_ember_path)
+            ember::dht::bootstrap::load_store(&store_ember_path).map(|records| {
+                let offered = records.len();
+                (offered, ember::dht::store::VerifiedRecords::verify(records))
+            })
         })
         .await;
         match loaded {
-            Ok(Ok(records)) => {
-                let offered = records.len();
+            Ok(Ok((offered, records))) => {
                 let accepted = state.ember_dht.restore_records(records);
                 // Recorded so the shutdown save can tell "this store is genuinely
                 // empty" from "we never got to read the file" — see `save_store`.

@@ -90,6 +90,9 @@ pub enum ConnectionMethod {
 enum AttemptPhase {
     FindRelay,
     RelayConnect,
+    /// The relay has connected us and the source is being greeted, so a
+    /// timeout now is the source's silence, not the relay's.
+    Greeting,
 }
 
 /// Tracks an in-progress LowID-to-LowID connection attempt.
@@ -399,6 +402,17 @@ impl ConnectionBroker {
             return false;
         }
 
+        if let Some(friend_hashes) = &self.friend_hashes {
+            self.friends = friend_hashes.read().await.clone();
+        }
+        // Before the cooldown is charged: with no relay to ask, the attempt
+        // could only fail, and it used to spend one of the source's
+        // `MAX_ATTEMPTS_PER_SOURCE` tries doing so.
+        if self.pick_relay_candidate().is_none() {
+            debug!("Broker: no relay candidate for {source_ip}:{source_port}");
+            return false;
+        }
+
         let now = Instant::now();
         self.cooldowns.insert(source_key, (now, cooldown_count + 1));
 
@@ -406,9 +420,6 @@ impl ConnectionBroker {
         // a v2 punch request, so the broker starts directly at relay.
         let start_phase = AttemptPhase::FindRelay;
 
-        if let Some(friend_hashes) = &self.friend_hashes {
-            self.friends = friend_hashes.read().await.clone();
-        }
         let relay_candidate = self.pick_relay_candidate();
         let relay_addr = relay_candidate.map(|c| (c.ip, c.port));
         let relay_attestation_hash = relay_candidate.map(|c| c.attestation_hash);
@@ -495,7 +506,11 @@ impl ConnectionBroker {
 
     /// Called when a relay succeeds.
     pub fn mark_succeeded(&mut self, attempt_key: &str, _method: ConnectionMethod) {
-        if let Some(attempt) = self.attempts.remove(attempt_key) {
+        // An attempt already timed out was counted as a failure then.
+        let Some(attempt) = self.attempts.remove(attempt_key) else {
+            return;
+        };
+        {
             if let Some((ip, port, pubkey)) = attempt.relay {
                 // Clears the count rather than decrementing it: a relay that
                 // just carried a connection has proved itself, and occasional
@@ -739,11 +754,15 @@ impl ConnectionBroker {
             .collect();
 
         for key in expired {
-            if self.attempts.contains_key(&key) {
-                info!("Broker: relay timed out for {key}");
-                // The relay's account: it was asked and did not answer in time.
-                self.relay_failed(&key, "timeout", true).await;
-            }
+            let Some(phase) = self.attempts.get(&key).map(|a| a.phase) else {
+                continue;
+            };
+            info!("Broker: relay timed out for {key} ({phase:?})");
+            // The relay's account only once it had been asked: before that
+            // no relay was involved, and after it connected us the silence is
+            // the source's.
+            self.relay_failed(&key, "timeout", phase == AttemptPhase::RelayConnect)
+                .await;
         }
 
         // Prune stale relay candidates (aligned with ERAT max TTL) and any
@@ -794,10 +813,26 @@ impl ConnectionBroker {
 
     /// Transition an attempt to the RelayConnect phase.
     pub fn set_relay_phase(&mut self, attempt_key: &str) {
+        self.set_phase(attempt_key, AttemptPhase::RelayConnect);
+    }
+
+    /// The relay delivered a stream; the source's Hello is next.
+    pub fn set_greeting_phase(&mut self, attempt_key: &str) {
+        self.set_phase(attempt_key, AttemptPhase::Greeting);
+    }
+
+    fn set_phase(&mut self, attempt_key: &str, phase: AttemptPhase) {
         if let Some(attempt) = self.attempts.get_mut(attempt_key) {
-            attempt.phase = AttemptPhase::RelayConnect;
+            attempt.phase = phase;
             attempt.phase_started = Instant::now();
         }
+    }
+
+    /// Whether the attempt is still live. A stream the relay delivers after the
+    /// attempt timed out has already been counted as a failure, so it is
+    /// dropped rather than also counted as a success.
+    pub fn has_attempt(&self, attempt_key: &str) -> bool {
+        self.attempts.contains_key(attempt_key)
     }
 }
 
@@ -805,10 +840,21 @@ impl ConnectionBroker {
 mod tests {
     use super::*;
 
+    /// A broker holding one usable relay candidate, which every attempt needs.
+    fn broker_with_relay(tx: mpsc::Sender<BrokerEvent>) -> ConnectionBroker {
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        broker.add_relay_candidate(
+            attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, unix_now() + 600),
+            None,
+            None,
+        );
+        broker
+    }
+
     #[tokio::test]
     async fn attempt_respects_cooldown() {
         let (tx, mut rx) = mpsc::channel(16);
-        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let mut broker = broker_with_relay(tx);
 
         let started = broker
             .attempt_low_to_low(
@@ -844,7 +890,7 @@ mod tests {
     #[tokio::test]
     async fn symmetric_nat_starts_relay() {
         let (tx, mut rx) = mpsc::channel(16);
-        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let mut broker = broker_with_relay(tx);
 
         broker
             .attempt_low_to_low(
@@ -866,7 +912,7 @@ mod tests {
     #[tokio::test]
     async fn punchable_nat_without_target_identity_starts_relay() {
         let (tx, mut rx) = mpsc::channel(16);
-        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let mut broker = broker_with_relay(tx);
 
         broker
             .attempt_low_to_low(
@@ -1339,24 +1385,117 @@ mod tests {
     async fn anonymous_lowid_emits_only_one_relay_event() {
         let (tx, mut rx) = mpsc::channel(16);
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        broker.add_relay_candidate(
+            attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, unix_now() + 600),
+            None,
+            None,
+        );
 
-        broker
-            .attempt_low_to_low(
-                "t4",
-                [4u8; 16],
-                Ipv4Addr::new(10, 20, 30, 40),
-                4662,
-                RelayTarget::default(),
-                NatType::PortRestricted,
-                Some("5.6.7.8:9999".parse().unwrap()),
-            )
-            .await;
+        assert!(
+            broker
+                .attempt_low_to_low(
+                    "t4",
+                    [4u8; 16],
+                    Ipv4Addr::new(10, 20, 30, 40),
+                    4662,
+                    RelayTarget::default(),
+                    NatType::PortRestricted,
+                    Some("5.6.7.8:9999".parse().unwrap()),
+                )
+                .await
+        );
 
         assert!(matches!(
-            rx.recv().await,
-            Some(BrokerEvent::StartRelay { .. })
+            rx.try_recv(),
+            Ok(BrokerEvent::StartRelay { .. })
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// With no relay to ask, an attempt could only fail, so none starts and
+    /// the source keeps its tries for when a relay is known.
+    #[tokio::test]
+    async fn no_relay_candidate_starts_no_attempt_and_spends_no_retry() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let source = Ipv4Addr::new(10, 20, 30, 43);
+        for _ in 0..MAX_ATTEMPTS_PER_SOURCE + 1 {
+            assert!(
+                !broker
+                    .attempt_low_to_low(
+                        "t7",
+                        [7u8; 16],
+                        source,
+                        4662,
+                        RelayTarget::default(),
+                        NatType::PortRestricted,
+                        None,
+                    )
+                    .await
+            );
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(!broker.cooldowns.contains_key(&(source, 4662)));
+
+        broker.add_relay_candidate(
+            attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, unix_now() + 600),
+            None,
+            None,
+        );
+        assert!(
+            broker
+                .attempt_low_to_low(
+                    "t7",
+                    [7u8; 16],
+                    source,
+                    4662,
+                    RelayTarget::default(),
+                    NatType::PortRestricted,
+                    None,
+                )
+                .await
+        );
+    }
+
+    /// A timeout before the relay was asked, or while the source it connected
+    /// us to is being greeted, is not the relay's failure; and a stream that
+    /// arrives after the attempt was failed does not also count as a success.
+    #[tokio::test]
+    async fn timeouts_blame_the_relay_only_while_it_is_connecting_us() {
+        let (tx, _rx) = mpsc::channel(64);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        broker.add_relay_candidate(
+            attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, unix_now() + 600),
+            None,
+            None,
+        );
+        let expire = |broker: &mut ConnectionBroker, key: &str| {
+            let attempt = broker.attempts.get_mut(key).unwrap();
+            attempt.phase_started = Instant::now() - RELAY_TIMEOUT - Duration::from_secs(1);
+        };
+        let start = |n: u8| (format!("t{n}"), Ipv4Addr::new(10, 0, 0, n));
+
+        let (id, ip) = start(1);
+        broker.attempt_low_to_low(&id, [1u8; 16], ip, 4662, RelayTarget::default(), NatType::PortRestricted, None).await;
+        let key = format!("{id}:{ip}:4662");
+        broker.set_relay_phase(&key);
+        broker.set_greeting_phase(&key);
+        expire(&mut broker, &key);
+        broker.tick().await;
+        assert_eq!(broker.relay_candidates[0].failures, 0, "the source went quiet, not the relay");
+
+        let (id, ip) = start(2);
+        broker.attempt_low_to_low(&id, [2u8; 16], ip, 4662, RelayTarget::default(), NatType::PortRestricted, None).await;
+        let key = format!("{id}:{ip}:4662");
+        broker.set_relay_phase(&key);
+        expire(&mut broker, &key);
+        broker.tick().await;
+        assert_eq!(broker.relay_candidates[0].failures, 1, "the relay did not answer in time");
+        assert!(!broker.has_attempt(&key));
+
+        let successes = broker.stats().relay_successes;
+        broker.mark_succeeded(&key, ConnectionMethod::PeerRelay);
+        assert_eq!(broker.stats().relay_successes, successes, "a late success is not counted");
     }
 
     /// The relay is told the source's QUIC port whenever it is known, and the
@@ -1409,6 +1548,11 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(16);
         let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        broker.add_relay_candidate(
+            attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, unix_now() + 600),
+            None,
+            None,
+        );
         broker
             .attempt_low_to_low(
                 "t6",
@@ -1421,8 +1565,8 @@ mod tests {
             )
             .await;
         assert!(matches!(
-            rx.recv().await,
-            Some(BrokerEvent::StartRelay { target_quic_port: 4662, target_node_id: None, .. })
+            rx.try_recv(),
+            Ok(BrokerEvent::StartRelay { target_quic_port: 4662, target_node_id: None, .. })
         ));
     }
 }

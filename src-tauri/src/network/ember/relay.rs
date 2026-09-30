@@ -3075,7 +3075,14 @@ pub async fn connect_server_relay(
         tokio_tungstenite::client_async_tls_with_config(
             request,
             tcp_stream,
-            None,
+            // Enforced as frames are read. The defaults allow 64 MiB, which
+            // tungstenite buffers in full before the `MAX_WS_RELAY_FRAME`
+            // check on the read path ever sees it.
+            Some(
+                tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                    .max_message_size(Some(MAX_WS_RELAY_FRAME))
+                    .max_frame_size(Some(MAX_WS_RELAY_FRAME)),
+            ),
             None,
         ),
     )

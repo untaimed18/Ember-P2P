@@ -2606,8 +2606,8 @@ impl EmberDht {
 
     /// Load persisted records back into the store, returning how many were
     /// accepted (see [`DhtStore::restore`]).
-    pub fn restore_records(&mut self, records: Vec<super::store::PersistedRecord>) -> usize {
-        self.store.restore(records)
+    pub fn restore_records(&mut self, records: super::store::VerifiedRecords) -> usize {
+        self.store.restore_verified(records)
     }
 
     /// Records waiting to be replicated onward (see

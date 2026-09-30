@@ -928,6 +928,19 @@ impl DhtStore {
         signature: [u8; 64],
         attributed_ip: Option<std::net::Ipv4Addr>,
     ) -> bool {
+        self.store_record(key, data, signature, attributed_ip, false)
+    }
+
+    /// [`Self::store_attributed`], skipping the signature check only when
+    /// `signature_checked` — which only [`VerifiedRecords`] can vouch for.
+    fn store_record(
+        &mut self,
+        key: [u8; 16],
+        data: Vec<u8>,
+        signature: [u8; 64],
+        attributed_ip: Option<std::net::Ipv4Addr>,
+        signature_checked: bool,
+    ) -> bool {
         // A body that cannot pack into a FOUND_VALUE even as the only blob
         // would store-but-hide: live under the key, skipped by the packer,
         // and if every live record is oversized the peer answers FOUND_NODE
@@ -1005,7 +1018,7 @@ impl DhtStore {
         if !self.admit_created_at(&key, created_at, ttl_secs, now_unix) {
             return false;
         }
-        if !verify_record_signature(&data, &signature, &publisher_key) {
+        if !signature_checked && !verify_record_signature(&data, &signature, &publisher_key) {
             self.signature_rejections = self.signature_rejections.saturating_add(1);
             debug!(
                 "DHT store: signature verification failed for key {} from publisher {}",
@@ -1618,9 +1631,12 @@ impl DhtStore {
     /// the answer, and at restore time no eviction pressure exists to abuse anyway,
     /// since it runs against an empty store with far fewer records than the key
     /// budget.
-    pub fn restore(&mut self, records: Vec<PersistedRecord>) -> usize {
+    ///
+    /// The signatures were checked by [`VerifiedRecords::verify`], off the
+    /// runtime, and are not checked again.
+    pub fn restore_verified(&mut self, records: VerifiedRecords) -> usize {
         let mut accepted = 0usize;
-        for record in records {
+        for record in records.0 {
             if record.data.first() == Some(&RECORD_TYPE_SOURCE) {
                 continue;
             }
@@ -1683,11 +1699,17 @@ impl DhtStore {
                     continue;
                 }
             }
-            if self.store_attributed(key, record.data, record.signature, None) {
+            if self.store_record(key, record.data, record.signature, None, true) {
                 accepted += 1;
             }
         }
         accepted
+    }
+
+    /// [`Self::restore_verified`], verifying on the spot.
+    #[cfg(test)]
+    pub fn restore(&mut self, records: Vec<PersistedRecord>) -> usize {
+        self.restore_verified(VerifiedRecords::verify(records))
     }
 
     /// How many records are waiting to be replicated onward — those a
@@ -1942,6 +1964,39 @@ fn signed_identity_from_record_data(data: &[u8]) -> Option<([u8; 16], [u8; 32], 
 /// Returns false on any failure (malformed key, malformed sig, or
 /// signature mismatch). Uses the same strict verify as frame / record
 /// parse paths so weak-key forgeries cannot sneak in via `store` alone.
+/// Persisted records whose signatures have been checked, under the author their
+/// own body names.
+///
+/// Built only by [`Self::verify`], which is the point: a restore of up to
+/// twenty thousand records used to spend an Ed25519 check per record on the
+/// async runtime, and this lets the check run where the file is read while the
+/// store still cannot be handed an unchecked record by mistake.
+pub struct VerifiedRecords(Vec<PersistedRecord>);
+
+impl VerifiedRecords {
+    /// Keep the records with a valid signature. Blocking: one verification
+    /// each, so call it off the runtime.
+    pub fn verify(records: Vec<PersistedRecord>) -> Self {
+        let now_unix = chrono::Utc::now().timestamp();
+        Self(
+            records
+                .into_iter()
+                // What `restore_verified` drops anyway is not worth a check.
+                .filter(|record| record.data.first() != Some(&RECORD_TYPE_SOURCE))
+                .filter(|record| {
+                    signed_identity_from_record_data(&record.data).is_some_and(
+                        |(_, author, created_at)| {
+                            let ttl_secs = record_ttl(&record.data).as_secs() as i64;
+                            now_unix.saturating_sub(created_at) < ttl_secs
+                                && verify_record_signature(&record.data, &record.signature, &author)
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
 fn verify_record_signature(data: &[u8], signature: &[u8; 64], publisher_key: &[u8; 32]) -> bool {
     let Some(vk) = crypto::verifying_key_from_bytes(publisher_key) else {
         return false;

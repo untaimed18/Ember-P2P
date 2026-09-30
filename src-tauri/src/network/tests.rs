@@ -4288,6 +4288,17 @@ fn mirrored_ember_counters_pin_at_the_ceiling_instead_of_wrapping() {
     assert_eq!(saturating_u32(u64::from(u32::MAX) + 5), u32::MAX);
 }
 
+/// Two strangers in one provider block are one party as far as proof of an
+/// open port goes.
+#[test]
+fn udp_open_witnesses_must_come_from_different_networks() {
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    assert!(!ember_reach_witnesses_independent(ip("203.0.113.5"), ip("203.0.200.9")));
+    assert!(ember_reach_witnesses_independent(ip("203.0.113.5"), ip("198.51.100.9")));
+    assert!(!ember_reach_witnesses_independent(ip("2001:db8:1::1"), ip("2001:db8:1:ff::2")));
+    assert!(ember_reach_witnesses_independent(ip("2001:db8:1::1"), ip("2001:db8:2::1")));
+}
+
 #[test]
 fn the_rendezvous_advert_follows_udp_reachability_not_tcp() {
     // KAD proved the port open: advertise, whatever TCP says.

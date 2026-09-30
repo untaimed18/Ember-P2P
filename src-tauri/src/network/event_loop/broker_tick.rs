@@ -176,10 +176,17 @@ pub(in crate::network) async fn on_broker_tick(
                 ember::broker::BrokerEvent::ConnectionReady(conn) => {
                     tracing::info!("Broker: connection ready for transfer {} from {}:{} via {:?}", conn.transfer_id, conn.source_ip, conn.source_port, conn.method);
                     let key = format!("{}:{}:{}", conn.transfer_id, conn.source_ip, conn.source_port);
+                    // An attempt that already timed out was failed then, and
+                    // its source has moved on; greeting the stream now would
+                    // count the same attempt as a success too.
+                    if !state.connection_broker.as_ref().is_some_and(|b| b.has_attempt(&key)) {
+                        tracing::debug!("Broker: dropping a relayed stream for {key} that arrived after its attempt ended");
+                        continue;
+                    }
                     // The Hello below is part of the attempt; restart its clock
                     // so a slow dial does not leave it to expire mid-greeting.
                     if let Some(ref mut broker) = state.connection_broker {
-                        broker.set_relay_phase(&key);
+                        broker.set_greeting_phase(&key);
                     }
 
                     // The broker stream is freshly established and

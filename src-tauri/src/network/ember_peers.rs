@@ -768,6 +768,21 @@ pub(super) fn ember_peer_ip_verdict(state: &NetworkState, ip: Ipv4Addr, udp_port
     })
 }
 
+/// Whether the ban list holds `addr`'s IPv4 address.
+///
+/// For the dial paths that check the routing table's filter gate instead of
+/// [`ember_addr_ip_verdict`]: the table knows the user's filter but not the ban
+/// list, so without this a banned address kept being queried, pinged and
+/// re-learned from gossip after it faulted out.
+pub(super) fn ember_addr_banned(state: &NetworkState, addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(v4) => state.banned_ips.contains(&v4),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .is_some_and(|v4| state.banned_ips.contains(&v4)),
+    }
+}
+
 /// [`ember_peer_ip_verdict`] for a socket address. A genuinely IPv6 peer is
 /// outside what the IPv4 filter and ban list can represent.
 pub(super) fn ember_addr_ip_verdict(state: &NetworkState, addr: SocketAddr) -> EmberIpVerdict {
@@ -2038,7 +2053,9 @@ pub(super) async fn probe_ember_gossip_leads(
         // A gossiped address is one the sender named, so the user's own filter
         // has to apply before we dial it — `is_bogus_v4` alone let `ipfilter.dat`
         // be bypassed for every address learned this way.
-        if !state.ember_dht.routing().admits_addr(&contact.addr) {
+        if !state.ember_dht.routing().admits_addr(&contact.addr)
+            || ember_addr_banned(state, contact.addr)
+        {
             continue;
         }
         if state

@@ -252,8 +252,10 @@ pub(crate) async fn probe_nat_with_replies(
         }
     }
 
-    let local_ip = local_probe_ip(&local_socket, results.first().map(|(server, _)| *server));
-    build_nat_info_from_results(local_ip, results, failures)
+    let local_port = local_socket.local_addr().map(|a| a.port()).unwrap_or(0);
+    let local = local_probe_ip(&local_socket, results.first().map(|(server, _)| *server))
+        .map(|ip| SocketAddr::new(ip, local_port));
+    build_nat_info_from_results(local, results, failures)
 }
 
 /// Our own address on the interface that reaches `reflector`, for the "no NAT
@@ -285,7 +287,7 @@ async fn resolve_stun_server(server: &str) -> Result<SocketAddr, String> {
 }
 
 fn build_nat_info_from_results(
-    local_ip: Option<IpAddr>,
+    local: Option<SocketAddr>,
     results: Vec<(SocketAddr, SocketAddr)>,
     failures: Vec<String>,
 ) -> NatInfo {
@@ -317,11 +319,23 @@ fn build_nat_info_from_results(
 
     // Every entry in `results` came from a distinct reflector address, so a
     // second entry is a genuinely independent vantage point.
-    let nat_type = if local_ip
-        .is_some_and(|ip| ip == external_addr.ip() && !ip.is_loopback() && !ip.is_unspecified())
-    {
+    // The whole address, port included: a firewall that keeps our IP but
+    // rewrites the port still has to be kept open, and calling it Open
+    // suspended the keep-alive that does that.
+    let nat_type = if local.is_some_and(|local| {
+        local == external_addr && !local.ip().is_loopback() && !local.ip().is_unspecified()
+    }) {
         info!("NAT probe: local address {external_addr} is the mapped address — no NAT");
         NatType::Open
+    } else if results.len() >= 2 && results[0].1.ip() != results[1].1.ip() {
+        // A NAT spreading our flows across a pool of public addresses maps per
+        // destination as surely as one that changes ports does.
+        info!(
+            "NAT probe: symmetric NAT detected (addresses {} vs {})",
+            results[0].1.ip(),
+            results[1].1.ip()
+        );
+        NatType::Symmetric
     } else if results.len() >= 2 && results[0].1.port() != results[1].1.port() {
         info!(
             "NAT probe: symmetric NAT detected (ports {} vs {})",
@@ -592,7 +606,7 @@ mod tests {
     #[test]
     fn two_reflectors_disagreeing_on_port_is_symmetric() {
         let info = build_nat_info_from_results(
-            Some("192.168.1.5".parse().unwrap()),
+            Some("192.168.1.5:5000".parse().unwrap()),
             vec![
                 reading("74.125.250.129:19302", "1.2.3.4:5000"),
                 reading("162.159.207.0:3478", "1.2.3.4:6000"),
@@ -606,7 +620,7 @@ mod tests {
     #[test]
     fn two_reflectors_agreeing_on_port_is_port_restricted() {
         let info = build_nat_info_from_results(
-            Some("192.168.1.5".parse().unwrap()),
+            Some("192.168.1.5:5000".parse().unwrap()),
             vec![
                 reading("74.125.250.129:19302", "1.2.3.4:5000"),
                 reading("162.159.207.0:3478", "1.2.3.4:5000"),
@@ -621,7 +635,7 @@ mod tests {
     #[test]
     fn a_single_reflector_leaves_the_type_unknown() {
         let info = build_nat_info_from_results(
-            Some("192.168.1.5".parse().unwrap()),
+            Some("192.168.1.5:5000".parse().unwrap()),
             vec![reading("74.125.250.129:19302", "1.2.3.4:5000")],
             Vec::new(),
         );
@@ -635,11 +649,41 @@ mod tests {
     #[test]
     fn mapped_address_equal_to_the_local_address_is_open() {
         let info = build_nat_info_from_results(
-            Some("1.2.3.4".parse().unwrap()),
+            Some("1.2.3.4:5000".parse().unwrap()),
             vec![reading("74.125.250.129:19302", "1.2.3.4:5000")],
             Vec::new(),
         );
         assert_eq!(info.nat_type, NatType::Open);
+    }
+
+    /// Our own IP with a rewritten port is a firewall that translates ports,
+    /// whose mapping needs keeping alive, not an open host.
+    #[test]
+    fn a_rewritten_port_on_our_own_address_is_not_open() {
+        let info = build_nat_info_from_results(
+            Some("1.2.3.4:4672".parse().unwrap()),
+            vec![
+                reading("74.125.250.129:19302", "1.2.3.4:5000"),
+                reading("162.159.207.0:3478", "1.2.3.4:5000"),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(info.nat_type, NatType::PortRestricted);
+    }
+
+    /// A NAT that picks a public address per destination from a pool maps per
+    /// destination, even when it keeps the port.
+    #[test]
+    fn reflectors_seeing_different_addresses_is_symmetric() {
+        let info = build_nat_info_from_results(
+            Some("192.168.1.5:5000".parse().unwrap()),
+            vec![
+                reading("74.125.250.129:19302", "1.2.3.4:5000"),
+                reading("162.159.207.0:3478", "1.2.3.9:5000"),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(info.nat_type, NatType::Symmetric);
     }
 
     #[test]
@@ -658,7 +702,7 @@ mod tests {
     #[test]
     fn no_replies_leaves_everything_unknown() {
         let info = build_nat_info_from_results(
-            Some("192.168.1.5".parse().unwrap()),
+            Some("192.168.1.5:5000".parse().unwrap()),
             Vec::new(),
             vec!["stun.example:timeout".to_string()],
         );

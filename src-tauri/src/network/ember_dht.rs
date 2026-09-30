@@ -10,6 +10,20 @@ pub(super) fn ember_highwater_path(data_dir: &std::path::Path) -> std::path::Pat
     data_dir.join("ember_dht_highwater.json")
 }
 
+/// Whether two unsolicited senders are far enough apart to corroborate that our
+/// UDP port is open: different /16s for IPv4, different /48s for IPv6.
+///
+/// Two addresses anyone holds, a pair of VPS in one provider block, would
+/// otherwise make a firewalled node drop its firewalled flag and its buddy
+/// fan-out.
+pub(super) fn ember_reach_witnesses_independent(a: IpAddr, b: IpAddr) -> bool {
+    match (a, b) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => a.octets()[..2] != b.octets()[..2],
+        (IpAddr::V6(a), IpAddr::V6(b)) => a.octets()[..6] != b.octets()[..6],
+        _ => true,
+    }
+}
+
 pub(super) fn load_ember_verified_highwater(path: &std::path::Path) -> EmberVerifiedHighwater {
     crate::security::recover_interrupted_replace(path);
     let Ok(bytes) = std::fs::read(path) else {
@@ -1056,6 +1070,12 @@ pub(super) async fn probe_bucket_oldest(
         {
             continue;
         }
+        // Not sent to, and faulted like any contact we cannot reach, which is
+        // what hands the waiting newcomer its slot.
+        if ember_addr_banned(state, *oldest_addr) {
+            fault_ember_contact(state, oldest_id, "banned");
+            continue;
+        }
         let (wire_req_id, frame) = state.ember_dht.build_ping();
         let mut behind_handshake = false;
         let mut delivery_certain = true;
@@ -1679,6 +1699,10 @@ pub(super) async fn run_ember_maintenance(
         {
             continue;
         }
+        if ember_addr_banned(state, contact.addr) {
+            fault_ember_contact(state, &contact.node_id, "banned");
+            continue;
+        }
         let (wire_req_id, frame) = state.ember_dht.build_ping();
         let mut behind_handshake = false;
         let mut delivery_certain = true;
@@ -2262,7 +2286,7 @@ pub(super) async fn handle_ember_dht_message(
             .ember_reach_witness
             .filter(|(_, at)| now.saturating_sub(*at) < EMBER_UDP_REACHABLE_TTL_SECS);
         match witness {
-            Some((first, _)) if first != from.ip() => {
+            Some((first, _)) if ember_reach_witnesses_independent(first, from.ip()) => {
                 if state.ember_udp_reachable_at.is_none() {
                     info!(
                         "Ember DHT: strangers at {first} and {} both reached us unsolicited, \

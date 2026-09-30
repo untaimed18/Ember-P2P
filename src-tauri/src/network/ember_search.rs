@@ -72,7 +72,9 @@ pub(super) async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkSt
         // whole shortlist without dialling anyone. "Known bad" is the right
         // question for whether to dial; the routing table draws the same
         // distinction for admission versus eviction.
-        if state.ember_dht.routing().definitely_blocked(&contact.addr) {
+        if state.ember_dht.routing().definitely_blocked(&contact.addr)
+            || ember_addr_banned(state, contact.addr)
+        {
             debug!(
                 "Ember search {search_id}: refusing to query {} — the IP policy blocks it",
                 contact.addr
