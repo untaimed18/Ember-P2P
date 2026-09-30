@@ -76,6 +76,112 @@ the one forwarded port carries everything. Deferred because it changes how every
 inbound UDP packet is read (KAD, Ember DHT, room chat, presence); it needs
 careful packet classification and broad testing.
 
+It also settles which port a relay should dial. Today QUIC binds its own socket
+on the TCP port number (or +1 to +4, or an OS-chosen port) and STUNs it
+separately, so a peer's QUIC port has to be advertised on its own. 1.7.1 added
+it to firewalled source records (contact flag bit 7) for that reason. Once QUIC
+shares the socket, that field and every other advertised QUIC port are simply
+the public UDP port.
+
+#### Design
+
+**Today.** The main loop owns `recv_from` on the KAD socket and routes each
+datagram in order: STUN replies (`route_stun_binding_packet`), Ember frames
+(magic `0xEB 0x3E`), then everything else to `handle_udp_packet` (KAD, eD2K
+UDP, and their eMule-obfuscated forms). QUIC has a separate `quinn::Endpoint`
+on its own socket (`build_server_client_endpoint`).
+
+**One reader, four destinations.** A dedicated task owns `recv_from` on the
+shared socket and classifies each datagram before anything else sees it:
+
+1. STUN: unchanged.
+2. Ember: the magic bytes, unchanged.
+3. QUIC: sent straight to quinn over a channel.
+4. Everything else: to the main loop over a bounded channel, which replaces its
+   `udp_socket.recv_from` arm.
+
+QUIC must not go through the main loop. Relayed transfers, attachments and room
+streams all ride QUIC, and the main loop awaits inside its handlers, so its
+latency would become their throughput. The channels drop on full, as UDP does,
+and count the drops.
+
+**Classifying QUIC.** Plain KAD and eD2K begin with `0xE3`, `0xE4`, `0xE5`,
+`0xC5` or `0xD4`, and `0xE4` / `0xE5` are also valid QUIC long-header first
+bytes. Obfuscated eMule packets begin with random bytes. So the first byte alone
+decides nothing:
+
+- **Long header** (first two bits `11`): QUIC only when bytes 1 to 4 are a
+  version we speak (`0x00000001`, or `0` for version negotiation) and the
+  connection-ID lengths that follow fit the datagram. A KAD packet would need
+  opcode `0x00` followed by `00 00 01`. A random obfuscated packet matches about
+  one time in 2^34.
+- **Short header** (first two bits `01`): QUIC only when the destination
+  connection ID is one we issued. Plain KAD and eD2K never start in `0x40` to
+  `0x7F`, so only obfuscated packets can land here. Two quinn settings make the
+  test sound:
+  - A custom `ConnectionIdGenerator` issues 16-byte IDs: 8 random bytes plus an
+    8-byte keyed BLAKE3 tag. The classifier and `validate` both check the tag,
+    so a random packet passes about one time in 2^64. quinn's own
+    `HashedConnectionIdGenerator` is too thin for this, with a 5-byte FxHash tag
+    and a 3-byte nonce.
+  - `EndpointConfig::grease_quic_bit(false)`, so every QUIC packet we are sent
+    keeps the fixed bit set.
+
+A packet sent the wrong way costs only that packet. QUIC routed to
+`handle_udp_packet` fails deobfuscation and is dropped. Obfuscated KAD routed to
+quinn fails CID validation, so quinn neither answers it nor sends a stateless
+reset. One known loss: a stateless reset sent to us looks random, reaches
+`handle_udp_packet`, and is dropped, so such a connection ends by idle timeout
+instead of at once.
+
+**The quinn side.** `Endpoint::new_with_abstract_socket` with an
+`AsyncUdpSocket` whose:
+
+- `poll_recv` drains the QUIC channel;
+- `try_send` calls `try_send_to` on the shared tokio socket;
+- segment counts are 1.
+
+This gives up GSO, GRO and ECN, which quinn-udp would otherwise enable. They
+matter little at our rates. Do not create a `quinn_udp::UdpSocketState` on the
+shared socket: on Linux it turns on GRO, which coalesces datagrams and breaks
+the KAD reader.
+
+**What changes around it:**
+
+- `state.quic_port` becomes `udp_port`, and `advertised_quic_port` becomes
+  `advertised_udp_port`: one socket, one NAT mapping, one STUN reading, one
+  keep-alive. The separate QUIC STUN probe and its mapping keep-alive go away.
+- UPnP already skips the QUIC mapping when `quic_port == udp_port`
+  (`upnp.rs` `map_all`), and the Windows firewall already skips the dedicated
+  QUIC rule (`dedicated_quic_udp_port`). The firewall call site passes
+  `tcp_port` as the QUIC port and must pass the real one.
+- Everything that advertises our QUIC port reads `advertised_quic_port`, so it
+  follows with no wire change. That covers rendezvous registration, friend
+  presence, punch records, relay attestations, attachment offers and the source
+  record field.
+- KAD's per-IP rate limiter and overhead statistics must count only what reaches
+  `handle_udp_packet`, not QUIC bulk data. QUIC keeps its own admission limits
+  (`QUIC_PENDING_PER_IP` and the rest) in the accept loop.
+
+**Compatibility.** Peers dial whatever port we advertise, so 1.7.x peers reach a
+shared-port node without change, and it reaches them the same way. The one gap
+is a peer that guesses instead of reading an advertisement: an old relay dialling
+a KAD-sourced target on its TCP port number. To cover it, keep a second endpoint
+on the old port for one release. It uses the same server config and accept loop,
+and opens no new firewall or UPnP mapping. Keep a hidden config switch that goes
+back to the separate socket in case classification misbehaves in the field.
+
+**Tests before shipping:**
+
+- The classifier never calls obfuscated KAD or eD2K traffic (real captures plus
+  fuzz) QUIC, and always recognises packets carrying our own CIDs.
+- Loopback: two nodes on shared sockets carry KAD pings, Ember DHT traffic and a
+  QUIC bulk stream at the same time, with no loss on the KAD side and QUIC
+  throughput within reach of the separate-socket build.
+- Interop with a 1.7.1 node in both directions: relay, punch and attachments.
+- The motivating case: a single forwarded UDP port (a VPN such as ProtonVPN)
+  reaching QUIC with no TCP fallback.
+
 ## Ember DHT
 
 ### Resume `FIND_VALUE` pages by record, not by index
