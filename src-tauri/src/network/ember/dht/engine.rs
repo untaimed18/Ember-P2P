@@ -1303,10 +1303,9 @@ impl EmberDht {
 
         // The other way a seen signature stops being held is the publisher
         // superseding it with a republish. That is not an eviction to make
-        // good: `DhtStore::store` finds the newer copy, keeps it, and
-        // reports success — so every replay of the retired copy was
-        // reported as a fresh store, re-armed this cache entry, and paid a
-        // second Ed25519 verification for the privilege.
+        // good: `DhtStore::store` finds the newer copy and keeps it, so a
+        // replay of the retired copy must not be treated as a fresh store,
+        // re-arm this cache entry, or pay a second Ed25519 verification.
         //
         // Only past the verification, because what decides it — file hash and
         // creation date — is read from the body, and those are the fields a
