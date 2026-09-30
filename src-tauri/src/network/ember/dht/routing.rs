@@ -1875,6 +1875,16 @@ impl RoutingTable {
             let newcomer_unpromotable = unpromotable(&contact);
             let bucket = &mut self.buckets[bucket_idx];
             match ineligible {
+                // A newcomer the caps would refuse too gains nothing by the
+                // swap, and a flood from one saturated /24 used to cycle the
+                // cache through it. Only proof of contact outranks the victim.
+                Some(pos)
+                    if newcomer_unpromotable
+                        && !(contact.is_verified()
+                            && !bucket.replacement_cache[pos].is_verified()) =>
+                {
+                    return;
+                }
                 Some(pos) => {
                     bucket.replacement_cache.remove(pos);
                 }
@@ -2672,6 +2682,36 @@ mod tests {
                 "firsthand observation {i} was flushed by gossip"
             );
         }
+    }
+
+    /// A newcomer the caps would refuse is no better than the unpromotable entry
+    /// it would displace, so a flood from a saturated /24 cannot cycle a proven
+    /// demotee out of the cache.
+    #[test]
+    fn a_flood_from_a_saturated_subnet_cannot_flush_the_cache() {
+        let mut rt = RoutingTable::new(make_id(0), false);
+        for i in 0..(K_BUCKET_SIZE as u8 - 4) {
+            rt.add_contact(contact_at(0x80 + i, 80, i, 1, 1));
+        }
+        for i in 0..4u8 {
+            rt.add_contact(contact_at(0xF0 + i, 9, 9, 9, 1 + i));
+        }
+        assert_eq!(rt.total_contacts(), K_BUCKET_SIZE);
+
+        let demotee = contact_at(0xE0, 9, 9, 9, 50);
+        rt.add_contact(demotee.clone());
+        assert!(rt.get_contact(&demotee.node_id).is_some(), "parked in the cache");
+
+        for i in 0..(2 * K_BUCKET_SIZE as u8) {
+            let mut lead = contact_at(0xA0 + (i % 0x20), 9, 9, 9, 100 + i);
+            lead.node_id.0[1] = i;
+            lead.last_seen = 0;
+            rt.add_contact(lead);
+        }
+        assert!(
+            rt.get_contact(&demotee.node_id).is_some(),
+            "unpromotable hearsay must not displace an unpromotable contact we have reached"
+        );
     }
 
     /// Preferring proven cache entries is only safe if one that has since gone

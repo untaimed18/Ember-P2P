@@ -1514,9 +1514,13 @@ pub(super) async fn run_ember_maintenance(
         && outstanding < EMBER_SEED_BATCH
     {
         let local_id = state.ember_dht.local_id();
-        let batch = state
-            .ember_bootstrap_cache
-            .seed_batch(&local_id, &held, EMBER_SEED_BATCH);
+        // Only what the outstanding seeds leave of one batch, or 31 unproven
+        // seeds earned 32 more and the two shared one batch's ping budget.
+        let batch = state.ember_bootstrap_cache.seed_batch(
+            &local_id,
+            &held,
+            EMBER_SEED_BATCH - outstanding,
+        );
         if !batch.is_empty() {
             let offered_count = batch.len();
             // One at a time through the admission gate, not `load_contacts`:

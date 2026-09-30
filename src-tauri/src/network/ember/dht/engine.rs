@@ -484,6 +484,14 @@ pub struct EmberDht {
     /// session it was proved on. Relearned in one maintenance ping if we forget
     /// it, which is also why nothing here needs to survive a restart.
     peer_versions: HashMap<EmberNodeId, VersionRange>,
+    /// Contacts that have answered a request of ours.
+    ///
+    /// A contact's `last_seen` moves on any signed frame, so a peer behind a
+    /// NAT that only ever pings us looks exactly as alive as one that can be
+    /// reached, and we used to hand it to third parties who cannot reach it.
+    /// An answer is the nearest thing to KAD's correlated response. Bounded
+    /// and pruned the same way as [`Self::peer_versions`].
+    answered: HashSet<EmberNodeId>,
     /// Noise static we currently advertise. A `PROXY_STORE` trailer must
     /// name this key, otherwise a firewalled publisher can steer every
     /// searcher's `CALLBACK_REQ` at someone else.
@@ -599,6 +607,7 @@ impl EmberDht {
             #[cfg(test)]
             inbound_record_verifications: 0,
             peer_versions: HashMap::new(),
+            answered: HashSet::new(),
             local_noise_pub: noise_public_key,
             local_contact_ip: Ipv4Addr::UNSPECIFIED,
             local_contact_udp: 0,
@@ -1056,14 +1065,26 @@ impl EmberDht {
     /// one to the other is what keeps this from being a second, unbounded
     /// notion of "peers we know about".
     pub fn prune_peer_versions(&mut self) -> usize {
+        let routing = &self.routing;
+        self.answered.retain(|id| routing.get_contact(id).is_some());
         if self.peer_versions.is_empty() {
             return 0;
         }
         let before = self.peer_versions.len();
-        let routing = &self.routing;
         self.peer_versions
             .retain(|id, _| routing.get_contact(id).is_some());
         before - self.peer_versions.len()
+    }
+
+    /// Record that `id` answered one of our requests.
+    fn note_answered(&mut self, id: EmberNodeId) {
+        if self.routing.get_contact(&id).is_none() {
+            return;
+        }
+        if self.answered.len() >= MAX_TRACKED_PEER_VERSIONS && !self.answered.contains(&id) {
+            return;
+        }
+        self.answered.insert(id);
     }
 
     /// Whether `peer` said it can decode `version`.
@@ -2013,8 +2034,12 @@ impl EmberDht {
         session_contacts: &[EmberContact],
     ) -> Vec<EmberContact> {
         let budget = messages::MAX_CONTACTS_PER_DATAGRAM;
-        let mut closest = self.routing.find_closest(target, budget + 1);
+        let mut closest = self.routing.find_closest(target, 2 * budget + 1);
         closest.retain(|c| c.node_id != asker);
+        // Contacts that have answered us first, nearest first within each
+        // group: one that has only ever pinged us may be behind a NAT the asker
+        // cannot cross. It still fills a reply the answered ones cannot.
+        closest.sort_by_key(|c| !self.answered.contains(&c.node_id));
         closest.truncate(budget);
         // LAN/CGNAT session peers live beside the public table when
         // `block_private_ips` is on. A neighbour on that island already
@@ -2676,6 +2701,17 @@ impl EmberDht {
                 } => out.ping_oldest.push((addr, node_id, noise_pub)),
                 AddResult::Rejected => {}
             }
+        }
+        if matches!(
+            msg.payload,
+            DhtPayload::Pong { .. }
+                | DhtPayload::FoundNode { .. }
+                | DhtPayload::FoundValue { .. }
+                | DhtPayload::StoreAck { .. }
+                | DhtPayload::StoreBatchAck { .. }
+                | DhtPayload::ProxyStoreAck { .. }
+        ) {
+            self.note_answered(msg.sender_id);
         }
 
         match msg.payload {
@@ -3750,6 +3786,30 @@ mod tests {
         let held = local.contact_for(&alice.local_id()).unwrap();
         assert_eq!(held.failed_queries, 0);
         assert!(held.last_seen > 1000);
+    }
+
+    /// A contact that has only ever pinged us may sit behind a NAT the asker
+    /// cannot cross, so one that has answered us goes first in a `FOUND_NODE`,
+    /// even from further away.
+    #[test]
+    fn contacts_that_answered_us_lead_a_found_node_reply() {
+        let mut d = dht(40);
+        let local = d.local_id();
+        let asker = EmberNodeId([0xEE; 16]);
+        let budget = messages::MAX_CONTACTS_PER_DATAGRAM;
+        for bucket in 0..budget + 4 {
+            assert!(d.add_contact(contact_in_bucket(local, bucket, 1_000)));
+        }
+        let far = contact_in_bucket(local, 120, 1_000);
+        assert!(d.add_contact(far.clone()));
+
+        let reply = d.closest_excluding(&local, asker, &[]);
+        assert!(!reply.iter().any(|c| c.node_id == far.node_id));
+
+        d.note_answered(far.node_id);
+        let reply = d.closest_excluding(&local, asker, &[]);
+        assert_eq!(reply.len(), budget);
+        assert_eq!(reply[0].node_id, far.node_id);
     }
 
     #[test]

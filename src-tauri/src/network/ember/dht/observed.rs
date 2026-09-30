@@ -83,6 +83,16 @@ pub struct EmberObservedIpVotes {
     /// The port [`Self::confirmed`] reports, re-read after every vote and prune
     /// with itself as the incumbent.
     confirmed_port: Option<u16>,
+    /// The most distinct nets that backed [`Self::confirmed`] at once.
+    confirmed_peak: usize,
+    /// A confirmation that lapsed for want of fresh votes: the address, the
+    /// peak it had, and when it lapsed.
+    ///
+    /// Honest peers that talk to us constantly rarely need to ask, so their
+    /// votes age out, while a quiet peer we ping votes every time. Counting a
+    /// lapsed incumbent as zero let any three /24s take the address over at
+    /// that moment; for one vote lifetime a rival has to beat its peak instead.
+    lapsed: Option<(IpAddr, usize, Instant)>,
 }
 
 impl EmberObservedIpVotes {
@@ -189,15 +199,23 @@ impl EmberObservedIpVotes {
         // address that still has a live quorum. Switch only when nothing is
         // confirmed (prune already dropped a lapsed one) or the new address
         // has strictly more distinct nets.
+        if self.confirmed == Some(reported_ip) {
+            self.confirmed_peak = self.confirmed_peak.max(new_count);
+        }
         if quorum && self.confirmed != Some(reported_ip) {
-            let current_count = self
-                .confirmed
-                .and_then(|ip| self.votes.get(&ip))
-                .map(|v| v.nets.len())
-                .unwrap_or(0);
+            let current_count = match self.confirmed {
+                Some(ip) => self.votes.get(&ip).map(|v| v.nets.len()).unwrap_or(0),
+                None => self
+                    .lapsed
+                    .filter(|(ip, _, _)| *ip != reported_ip)
+                    .map(|(_, peak, _)| peak)
+                    .unwrap_or(0),
+            };
             if current_count == 0 || new_count > current_count {
                 self.confirmed = Some(reported_ip);
                 self.confirmed_port = None;
+                self.confirmed_peak = new_count;
+                self.lapsed = None;
                 self.refresh_confirmed_port();
                 return self.confirmed();
             }
@@ -222,7 +240,15 @@ impl EmberObservedIpVotes {
                 .unwrap_or(false);
             if !still_backed {
                 self.confirmed = None;
+                self.lapsed = Some((addr, self.confirmed_peak, now));
+                self.confirmed_peak = 0;
             }
+        }
+        if self
+            .lapsed
+            .is_some_and(|(_, _, at)| now.saturating_duration_since(at) >= VOTE_TTL)
+        {
+            self.lapsed = None;
         }
         self.refresh_confirmed_port();
     }
@@ -421,15 +447,52 @@ mod tests {
             Some(first)
         );
 
+        // Just after the lapse a rival has to beat the old peak of three.
         let later = t0 + VOTE_TTL + Duration::from_secs(1);
         votes.record_vote_at(second, reporter(8, 8, 1), later);
         votes.record_vote_at(second, reporter(8, 8, 2), later);
         assert_eq!(
             votes.record_vote_at(second, reporter(9, 9, 1), later),
+            None,
+            "three nets only tie the lapsed incumbent"
+        );
+        assert_eq!(
+            votes.record_vote_at(second, reporter(9, 9, 2), later),
             Some(second),
-            "after the old quorum lapses a new address may confirm"
+            "four beat it"
         );
         assert_eq!(votes.confirmed(), Some(second));
+
+        // Once the lapse is a vote lifetime old, an ordinary quorum is enough.
+        let mut votes = EmberObservedIpVotes::new();
+        votes.record_vote_at(first, reporter(1, 0, 1), t0);
+        votes.record_vote_at(first, reporter(1, 1, 1), t0);
+        votes.record_vote_at(first, reporter(1, 2, 1), t0);
+        let lapse = t0 + VOTE_TTL + Duration::from_secs(1);
+        votes.record_vote_at(second, reporter(8, 8, 1), lapse);
+        let much_later = lapse + VOTE_TTL + Duration::from_secs(1);
+        votes.record_vote_at(second, reporter(8, 8, 2), much_later);
+        votes.record_vote_at(second, reporter(8, 8, 3), much_later);
+        assert_eq!(
+            votes.record_vote_at(second, reporter(9, 9, 1), much_later),
+            Some(second)
+        );
+    }
+
+    /// The incumbent that lapsed is not held to its own bar: its peers voting
+    /// again restore it.
+    #[test]
+    fn a_lapsed_incumbent_reconfirms_on_its_own_votes() {
+        let mut votes = EmberObservedIpVotes::new();
+        let first = addr(50, 4672);
+        let t0 = Instant::now();
+        votes.record_vote_at(first, reporter(1, 0, 1), t0);
+        votes.record_vote_at(first, reporter(1, 1, 1), t0);
+        votes.record_vote_at(first, reporter(1, 2, 1), t0);
+        let later = t0 + VOTE_TTL + Duration::from_secs(1);
+        votes.record_vote_at(first, reporter(1, 0, 1), later);
+        votes.record_vote_at(first, reporter(1, 1, 1), later);
+        assert_eq!(votes.record_vote_at(first, reporter(1, 2, 1), later), Some(first));
     }
 
     /// The quorum has to be contemporaneous: three votes spread across hours
