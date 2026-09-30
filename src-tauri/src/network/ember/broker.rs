@@ -38,6 +38,10 @@ const MAX_ATTEMPTS_PER_SOURCE: u32 = 3;
 /// usual reason is that we are not its friend, which does not change often;
 /// finite, because friendship can.
 const RELAY_REFUSAL_BACKOFF: Duration = Duration::from_secs(3600);
+/// How long a relay that answered it is at capacity is skipped. Short, because
+/// its sessions end and free slots; without it a busy friend relay stays the
+/// first pick and every further source spends an attempt on the same refusal.
+const RELAY_BUSY_BACKOFF: Duration = Duration::from_secs(60);
 /// Prefer fresh candidates when picking a relay; older-but-still-retained
 /// entries remain until `RELAY_CANDIDATE_PRUNE_MAX_AGE`.
 const RELAY_CANDIDATE_PICK_MAX_AGE: Duration = Duration::from_secs(600);
@@ -113,11 +117,18 @@ struct ConnectionAttempt {
     /// possession), so success and failure must be charged to the signer we
     /// actually picked, not to the first row at that address.
     relay: Option<(Ipv4Addr, u16, [u8; 32])>,
+    /// The attestation hash the request to that relay presented. A refusal
+    /// answers this attestation, which may no longer be the candidate's.
+    relay_attestation_hash: Option<[u8; 32]>,
 }
 
 impl ConnectionAttempt {
     fn is_expired(&self) -> bool {
         self.phase_started.elapsed() > RELAY_TIMEOUT
+    }
+
+    fn time_left(&self) -> Duration {
+        RELAY_TIMEOUT.saturating_sub(self.phase_started.elapsed())
     }
 }
 
@@ -152,6 +163,10 @@ pub struct RelayCandidate {
     /// attempts on a relay that cannot help. Set when the relay answers
     /// `REJECT_AUTH`; cleared when it carries a session.
     pub refused_until: Option<Instant>,
+    /// Until when this relay is skipped because it answered `REJECT_CAPACITY`.
+    /// Kept apart from `refused_until` so a re-signed attestation, which lifts
+    /// a friend's refusal, does not lift this too.
+    pub busy_until: Option<Instant>,
     /// Which peer handed us this attestation, or `None` when we saw it on a
     /// swarm exchange rather than a friend's forward. Used only to bound one
     /// introducer's share of the list, never to decide trust — that rests
@@ -220,6 +235,54 @@ pub async fn punch_quic_pinned(
     .await
 }
 
+/// Run `hello` on a relayed stream within `time_left` of its attempt and report
+/// the outcome to the broker loop.
+///
+/// Returns the Hello's result only once the loop has confirmed the attempt was
+/// still live, so the stream reaches the download exactly when the attempt
+/// counted as a success. Both reports are awaited sends: this runs off the loop
+/// that drains `event_tx`, and a dropped `RelayGreeted` would leave a working
+/// connection to be failed by the timeout.
+pub async fn greet_within_attempt<T>(
+    hello: impl std::future::Future<Output = anyhow::Result<T>>,
+    time_left: Duration,
+    attempt_key: String,
+    event_tx: &mpsc::Sender<BrokerEvent>,
+) -> Option<T> {
+    let greeted = tokio::time::timeout(time_left, hello)
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("no answer within the attempt's time")));
+    match greeted {
+        Ok(value) => {
+            let (live, verdict) = tokio::sync::oneshot::channel();
+            if event_tx
+                .send(BrokerEvent::RelayGreeted { attempt_key, live })
+                .await
+                .is_err()
+            {
+                return None;
+            }
+            verdict.await.unwrap_or(false).then_some(value)
+        }
+        Err(e) => {
+            debug!("Broker: Ember client Hello failed for {attempt_key}: {e}");
+            // Fails the attempt, so the source is not left parked as relayed.
+            // Not the relay's fault as far as we can tell: the source may be
+            // gone.
+            let _ = event_tx
+                .send(BrokerEvent::RelayFailed {
+                    attempt_key,
+                    reason: format!("Hello over the relay failed: {e}"),
+                    relay_at_fault: false,
+                    refused_us: false,
+                    relay_busy: false,
+                })
+                .await;
+            None
+        }
+    }
+}
+
 /// Session counters for the LowID-to-LowID broker. Owned by
 /// `ConnectionBroker` so the state machine itself is the source of truth
 /// for what counts as an "attempt" or "failure" — consumers should
@@ -276,7 +339,14 @@ pub enum BrokerEvent {
     /// The source answered our eD2K Hello over the relay, which is what shows
     /// the relay works. ACCEPT alone does not: a 1.7.0 relay sends it before
     /// it has reached the source.
-    RelayGreeted { attempt_key: String },
+    ///
+    /// `live` is answered with whether the attempt was still running, and only
+    /// then may the greeted stream be handed to the download: an attempt that
+    /// timed out has already been failed and its source moved on.
+    RelayGreeted {
+        attempt_key: String,
+        live: tokio::sync::oneshot::Sender<bool>,
+    },
     /// All methods exhausted for this source.
     ConnectionFailed {
         transfer_id: String,
@@ -300,6 +370,9 @@ pub enum BrokerEvent {
         /// skipped for a while rather than charged; see
         /// [`ConnectionBroker::relay_refused_us`].
         refused_us: bool,
+        /// The relay answered that it is at capacity, so it is skipped briefly;
+        /// see [`ConnectionBroker::relay_was_busy`].
+        relay_busy: bool,
     },
 }
 
@@ -440,6 +513,7 @@ impl ConnectionBroker {
             started: now,
             phase_started: now,
             relay,
+            relay_attestation_hash,
         };
 
         info!(
@@ -493,22 +567,53 @@ impl ConnectionBroker {
     /// Called when the relay answered that it will not serve us. The attempt
     /// fails like any other, and the relay is skipped for
     /// [`RELAY_REFUSAL_BACKOFF`] without being counted as broken.
+    ///
+    /// A friend's relay refuses us only for an attestation it no longer
+    /// honours, so its refusal is dropped when the candidate has since been
+    /// refreshed with a different one: that is the attestation the next
+    /// attempt presents. A stranger's is kept, since it refuses whatever we
+    /// present.
     pub async fn relay_refused_us(&mut self, attempt_key: &str, reason: &str) {
-        if let Some((ip, port, pubkey)) = self.attempts.get(attempt_key).and_then(|a| a.relay) {
-            if let Some(c) = self.relay_candidates.iter_mut().find(|c| {
-                c.ip == ip && c.port == port && c.attestation.ed25519_pubkey == pubkey
-            }) {
-                c.refused_until = Some(Instant::now() + RELAY_REFUSAL_BACKOFF);
+        if let Some(attempt) = self.attempts.get(attempt_key) {
+            let presented = attempt.relay_attestation_hash;
+            let friends = &self.friends;
+            if let Some(c) = attempt.relay.and_then(|relay| self.relay_candidates.iter_mut().find(|c| {
+                c.ip == relay.0 && c.port == relay.1 && c.attestation.ed25519_pubkey == relay.2
+            })) {
+                let friend = c.ember_hash.is_some_and(|hash| friends.contains(&hash));
+                if !friend || presented == Some(c.attestation_hash) {
+                    c.refused_until = Some(Instant::now() + RELAY_REFUSAL_BACKOFF);
+                }
             }
         }
         self.relay_failed(attempt_key, reason, false).await;
     }
 
-    /// Called when a relay succeeds.
-    pub fn mark_succeeded(&mut self, attempt_key: &str, _method: ConnectionMethod) {
+    /// Called when the relay answered that it is at capacity. The attempt fails
+    /// without blaming the relay, which is skipped for [`RELAY_BUSY_BACKOFF`].
+    pub async fn relay_was_busy(&mut self, attempt_key: &str, reason: &str) {
+        if let Some(relay) = self.attempts.get(attempt_key).and_then(|a| a.relay) {
+            if let Some(c) = self.relay_candidates.iter_mut().find(|c| {
+                c.ip == relay.0 && c.port == relay.1 && c.attestation.ed25519_pubkey == relay.2
+            }) {
+                c.busy_until = Some(Instant::now() + RELAY_BUSY_BACKOFF);
+            }
+        }
+        self.relay_failed(attempt_key, reason, false).await;
+    }
+
+    /// Time the attempt has left in its current phase, or `None` once it has
+    /// ended.
+    pub fn attempt_time_left(&self, attempt_key: &str) -> Option<Duration> {
+        self.attempts.get(attempt_key).map(ConnectionAttempt::time_left)
+    }
+
+    /// Called when a relay succeeds. Returns whether the attempt was still
+    /// live; a late success is not counted, and its stream must be dropped.
+    pub fn mark_succeeded(&mut self, attempt_key: &str, _method: ConnectionMethod) -> bool {
         // An attempt already timed out was counted as a failure then.
         let Some(attempt) = self.attempts.remove(attempt_key) else {
-            return;
+            return false;
         };
         {
             if let Some((ip, port, pubkey)) = attempt.relay {
@@ -527,6 +632,7 @@ impl ConnectionBroker {
                 {
                     c.failures = 0;
                     c.refused_until = None;
+                    c.busy_until = None;
                     c.relay_sessions += 1;
                     debug!(
                         "Broker: incremented relay_sessions for {}:{} to {}",
@@ -536,6 +642,7 @@ impl ConnectionBroker {
             }
         }
         self.stats.relay_successes = self.stats.relay_successes.saturating_add(1);
+        true
     }
 
     /// Charge a failed attempt to the relay that was tried, dropping it once it
@@ -672,6 +779,7 @@ impl ConnectionBroker {
             ember_hash,
             failures: 0,
             refused_until: None,
+            busy_until: None,
             introduced_by,
             last_seen: Instant::now(),
             relay_sessions: 0,
@@ -728,6 +836,7 @@ impl ConnectionBroker {
                 c.last_seen.elapsed() < RELAY_CANDIDATE_PICK_MAX_AGE
                     && c.expires_at_unix > now_unix
                     && c.refused_until.is_none_or(|until| until <= now)
+                    && c.busy_until.is_none_or(|until| until <= now)
             })
             // Failures rank ahead of everything but friendship. A candidate that
             // has just failed must not keep winning on "seen most recently",
@@ -1496,6 +1605,185 @@ mod tests {
         let successes = broker.stats().relay_successes;
         broker.mark_succeeded(&key, ConnectionMethod::PeerRelay);
         assert_eq!(broker.stats().relay_successes, successes, "a late success is not counted");
+    }
+
+    fn friends(hashes: &[[u8; 16]]) -> crate::app_state::SharedFriendHashes {
+        Arc::new(tokio::sync::RwLock::new(hashes.iter().copied().collect()))
+    }
+
+    /// Answers the next `RelayGreeted` the way the network loop does, skipping
+    /// the `ConnectionFailed` a timed-out attempt emits first.
+    async fn answer_greeting(broker: &mut ConnectionBroker, rx: &mut mpsc::Receiver<BrokerEvent>) {
+        loop {
+            match rx.recv().await {
+                Some(BrokerEvent::RelayGreeted { attempt_key, live }) => {
+                    let _ = live.send(broker.mark_succeeded(&attempt_key, ConnectionMethod::PeerRelay));
+                    return;
+                }
+                Some(_) => continue,
+                None => panic!("broker channel closed"),
+            }
+        }
+    }
+
+    /// A Hello that answers while its attempt is live hands the stream over and
+    /// counts the success; one that answers after the attempt timed out, and
+    /// was failed, hands nothing over and counts nothing.
+    #[tokio::test]
+    async fn a_greeted_stream_goes_to_the_download_only_while_its_attempt_is_live() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut broker = broker_with_relay(tx.clone());
+        let source = Ipv4Addr::new(10, 0, 0, 1);
+        assert!(broker.attempt_low_to_low("t1", [1; 16], source, 4662, RelayTarget::default(), NatType::Symmetric, None).await);
+        let key = "t1:10.0.0.1:4662".to_string();
+        assert!(matches!(rx.recv().await, Some(BrokerEvent::StartRelay { .. })));
+        broker.set_relay_phase(&key);
+        broker.set_greeting_phase(&key);
+
+        let time_left = broker.attempt_time_left(&key).unwrap();
+        assert!(time_left > RELAY_TIMEOUT - Duration::from_secs(1));
+        let greeting = tokio::spawn({
+            let (key, tx) = (key.clone(), tx.clone());
+            async move { greet_within_attempt(async { Ok(7u8) }, time_left, key, &tx).await }
+        });
+        answer_greeting(&mut broker, &mut rx).await;
+        assert_eq!(greeting.await.unwrap(), Some(7));
+        assert_eq!(broker.stats().relay_successes, 1);
+
+        broker.cooldowns.clear();
+        assert!(broker.attempt_low_to_low("t1", [1; 16], source, 4662, RelayTarget::default(), NatType::Symmetric, None).await);
+        broker.set_greeting_phase(&key);
+        let (answered_tx, answered_rx) = tokio::sync::oneshot::channel::<()>();
+        let greeting = tokio::spawn({
+            let (key, tx) = (key.clone(), tx.clone());
+            async move {
+                let hello = async {
+                    let _ = answered_rx.await;
+                    Ok(7u8)
+                };
+                greet_within_attempt(hello, RELAY_TIMEOUT, key, &tx).await
+            }
+        });
+        broker.attempts.get_mut(&key).unwrap().phase_started =
+            Instant::now() - RELAY_TIMEOUT - Duration::from_secs(1);
+        broker.tick().await;
+        assert!(!broker.has_attempt(&key));
+        answered_tx.send(()).unwrap();
+        answer_greeting(&mut broker, &mut rx).await;
+        assert_eq!(greeting.await.unwrap(), None, "a late stream is dropped");
+        assert_eq!(broker.stats().relay_successes, 1, "and not counted");
+    }
+
+    /// The Hello is bounded by what is left of its attempt, and a silent source
+    /// fails the attempt through the loop rather than holding the stream.
+    #[tokio::test]
+    async fn a_hello_that_never_answers_is_bounded_by_its_attempt() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let greeted = greet_within_attempt(
+            std::future::pending::<anyhow::Result<()>>(),
+            Duration::from_millis(50),
+            "t1:10.0.0.1:4662".into(),
+            &tx,
+        )
+        .await;
+        assert!(greeted.is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(BrokerEvent::RelayFailed { relay_at_fault: false, refused_us: false, relay_busy: false, .. })
+        ));
+    }
+
+    /// A full event queue delays the report of a working connection rather
+    /// than losing it, which would leave the attempt to be failed by the
+    /// timeout.
+    #[tokio::test]
+    async fn a_greeting_report_waits_for_room_in_the_event_queue() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(BrokerEvent::RelayFailed {
+            attempt_key: "filler".into(),
+            reason: String::new(),
+            relay_at_fault: false,
+            refused_us: false,
+            relay_busy: false,
+        })
+        .unwrap();
+        let greeting = tokio::spawn({
+            let tx = tx.clone();
+            async move { greet_within_attempt(async { Ok(()) }, RELAY_TIMEOUT, "t1".into(), &tx).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(rx.recv().await, Some(BrokerEvent::RelayFailed { .. })));
+        match rx.recv().await {
+            Some(BrokerEvent::RelayGreeted { live, .. }) => live.send(true).unwrap(),
+            other => panic!("expected RelayGreeted, got {other:?}"),
+        }
+        assert_eq!(greeting.await.unwrap(), Some(()));
+    }
+
+    /// A relay at capacity is passed over for a minute, not blamed, and not
+    /// asked for the next source in the meantime, which would only spend that
+    /// source's attempt on the same refusal.
+    #[tokio::test]
+    async fn a_busy_relay_is_skipped_briefly_without_blame() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let friend_hash = [0xF1u8; 16];
+        broker.set_friend_hashes(friends(&[friend_hash]));
+        let relay = Ipv4Addr::new(198, 51, 100, 30);
+        broker.add_relay_candidate(attestation(relay, 4662, unix_now() + 600), Some(friend_hash), None);
+
+        assert!(broker.attempt_low_to_low("t1", [1; 16], Ipv4Addr::new(10, 0, 0, 1), 4662, RelayTarget::default(), NatType::Symmetric, None).await);
+        broker.relay_was_busy("t1:10.0.0.1:4662", "at capacity").await;
+        assert!(broker.pick_relay_candidate().is_none(), "a busy relay is skipped");
+        assert_eq!(broker.relay_candidates[0].failures, 0, "being busy is not failing");
+        let next = Ipv4Addr::new(10, 0, 0, 2);
+        assert!(
+            !broker.attempt_low_to_low("t2", [2; 16], next, 4662, RelayTarget::default(), NatType::Symmetric, None).await,
+            "no attempt is spent on a relay known to be full"
+        );
+        assert!(!broker.cooldowns.contains_key(&(next, 4662)));
+
+        let busy_until = broker.relay_candidates[0].busy_until.unwrap();
+        assert!(busy_until <= Instant::now() + RELAY_BUSY_BACKOFF);
+        assert!(busy_until > Instant::now() + RELAY_BUSY_BACKOFF - Duration::from_secs(5));
+        broker.relay_candidates[0].busy_until = Some(Instant::now());
+        assert_eq!(broker.pick_relay_candidate().map(|c| c.ip), Some(relay), "and tried again after");
+    }
+
+    /// A friend's `REJECT_AUTH` answers the attestation the attempt presented.
+    /// When the candidate has been refreshed with another since, the refusal
+    /// says nothing about the one the next attempt will present, so it does not
+    /// bench the relay for an hour; a stranger's refusal does, either way.
+    #[tokio::test]
+    async fn a_refusal_of_a_superseded_friend_attestation_does_not_bench_the_relay() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let friend_hash = [0xF1u8; 16];
+        let stranger_hash = [0x55u8; 16];
+        broker.set_friend_hashes(friends(&[friend_hash]));
+        let fresh = unix_now() + 600;
+        let relay = Ipv4Addr::new(198, 51, 100, 40);
+        let source = |n: u8| Ipv4Addr::new(10, 0, 0, n);
+        let attempt = |n: u8| format!("t{n}:{}:4662", source(n));
+
+        for (n, hash) in [(1u8, friend_hash), (2, stranger_hash)] {
+            broker.relay_candidates.clear();
+            broker.add_relay_candidate(attestation(relay, 4662, fresh), Some(hash), None);
+            assert!(broker.attempt_low_to_low(&format!("t{n}"), [n; 16], source(n), 4662, RelayTarget::default(), NatType::Symmetric, None).await);
+            broker.add_relay_candidate(attestation(relay, 4662, fresh + 60), Some(hash), None);
+            broker.relay_refused_us(&attempt(n), "not a friend").await;
+            let benched = broker.relay_candidates[0].refused_until.is_some();
+            assert_eq!(benched, hash == stranger_hash, "friend={}", hash == friend_hash);
+        }
+
+        broker.relay_candidates.clear();
+        broker.add_relay_candidate(attestation(relay, 4662, fresh), Some(friend_hash), None);
+        assert!(broker.attempt_low_to_low("t3", [3; 16], source(3), 4662, RelayTarget::default(), NatType::Symmetric, None).await);
+        broker.relay_refused_us(&attempt(3), "unknown attestation").await;
+        assert!(
+            broker.relay_candidates[0].refused_until.is_some(),
+            "a friend refusing the attestation it still holds is benched"
+        );
     }
 
     /// The relay is told the source's QUIC port whenever it is known, and the

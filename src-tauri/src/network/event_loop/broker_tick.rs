@@ -54,6 +54,7 @@ pub(in crate::network) async fn on_broker_tick(
                                     // Our endpoint, not their fault.
                                     relay_at_fault: false,
                                     refused_us: false,
+                                    relay_busy: false,
                                 }) {
                                     tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
                                 }
@@ -103,6 +104,7 @@ pub(in crate::network) async fn on_broker_tick(
                                     // Missing on our side, before we ever dialled.
                                     relay_at_fault: false,
                                     refused_us: false,
+                                    relay_busy: false,
                                 }) {
                                     tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
                                 }
@@ -147,6 +149,7 @@ pub(in crate::network) async fn on_broker_tick(
                                             // does not.
                                             relay_at_fault: e.relay_at_fault,
                                             refused_us: e.refused_us,
+                                            relay_busy: e.relay_busy,
                                             reason: e.reason,
                                         }) {
                                         tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
@@ -167,6 +170,7 @@ pub(in crate::network) async fn on_broker_tick(
                                 // No relay was involved at all.
                                 relay_at_fault: false,
                                 refused_us: false,
+                                relay_busy: false,
                             }) {
                                 tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
                             }
@@ -185,9 +189,12 @@ pub(in crate::network) async fn on_broker_tick(
                     }
                     // The Hello below is part of the attempt; restart its clock
                     // so a slow dial does not leave it to expire mid-greeting.
-                    if let Some(ref mut broker) = state.connection_broker {
-                        broker.set_greeting_phase(&key);
-                    }
+                    let Some(broker) = state.connection_broker.as_mut() else {
+                        continue;
+                    };
+                    broker.set_greeting_phase(&key);
+                    let greet_time_left = broker.attempt_time_left(&key).unwrap_or_default();
+                    let greet_broker_tx = broker.event_sender();
 
                     // The broker stream is freshly established and
                     // NOT yet greeted: WE initiated it (QUIC
@@ -235,69 +242,55 @@ pub(in crate::network) async fn on_broker_tick(
                     let greet_peer_port = conn.source_port;
                     let greet_file_hash = conn.file_hash;
                     let greet_attempt_key = key.clone();
-                    let greet_broker_tx = state.connection_broker.as_ref().map(|b| b.event_sender());
                     let mut greet_reader = conn.reader;
                     let mut greet_writer = conn.writer;
                     tokio::spawn(async move {
-                        match ed2k::multi_source::perform_outbound_hello(
-                            &mut *greet_reader,
-                            &mut *greet_writer,
-                            &greet_user_hash,
-                            greet_client_id,
-                            greet_tcp_port,
-                            greet_udp_port,
-                            &greet_nickname,
+                        let greeted = ember::broker::greet_within_attempt(
+                            ed2k::multi_source::perform_outbound_hello(
+                                &mut *greet_reader,
+                                &mut *greet_writer,
+                                &greet_user_hash,
+                                greet_client_id,
+                                greet_tcp_port,
+                                greet_udp_port,
+                                &greet_nickname,
+                            ),
+                            greet_time_left,
+                            greet_attempt_key,
+                            &greet_broker_tx,
                         )
-                        .await
-                        {
-                            Ok((peer_user_hash, peer_caps)) => {
-                                if let Some(tx) = &greet_broker_tx {
-                                    let _ = tx.try_send(ember::broker::BrokerEvent::RelayGreeted {
-                                        attempt_key: greet_attempt_key.clone(),
-                                    });
-                                }
-                                let parts = upload_server::KadCallbackParts {
-                                    peer_ip: greet_peer_ip,
-                                    peer_port: greet_peer_port,
-                                    peer_hello_port: 0,
-                                    peer_user_hash,
-                                    file_hash: greet_file_hash,
-                                    reader: greet_reader,
-                                    writer: greet_writer,
-                                    emule_info_done: false,
-                                    peer_caps,
-                                    friend_ember_hash: None,
-                                    origin: None,
-                                };
-                                if let Err(e) = greet_tx.send(parts).await {
-                                    tracing::debug!(
-                                        "Broker: kad-callback channel closed; dropping greeted connection for {greet_peer_ip}:{greet_peer_port}: {e}"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    "Broker: Ember client Hello failed for {greet_peer_ip}:{greet_peer_port}: {e}"
-                                );
-                                // Fails the attempt, so the source is not left
-                                // parked as relayed. Not the relay's fault as
-                                // far as we can tell: the source may be gone.
-                                if let Some(tx) = greet_broker_tx {
-                                    let _ = tx.try_send(ember::broker::BrokerEvent::RelayFailed {
-                                        attempt_key: greet_attempt_key,
-                                        reason: format!("Hello over the relay failed: {e}"),
-                                        relay_at_fault: false,
-                                        refused_us: false,
-                                    });
-                                }
-                            }
+                        .await;
+                        let Some((peer_user_hash, peer_caps)) = greeted else {
+                            return;
+                        };
+                        let parts = upload_server::KadCallbackParts {
+                            peer_ip: greet_peer_ip,
+                            peer_port: greet_peer_port,
+                            peer_hello_port: 0,
+                            peer_user_hash,
+                            file_hash: greet_file_hash,
+                            reader: greet_reader,
+                            writer: greet_writer,
+                            emule_info_done: false,
+                            peer_caps,
+                            friend_ember_hash: None,
+                            origin: None,
+                        };
+                        if let Err(e) = greet_tx.send(parts).await {
+                            tracing::debug!(
+                                "Broker: kad-callback channel closed; dropping greeted connection for {greet_peer_ip}:{greet_peer_port}: {e}"
+                            );
                         }
                     });
                 }
-                ember::broker::BrokerEvent::RelayGreeted { ref attempt_key } => {
-                    if let Some(ref mut broker) = state.connection_broker {
-                        broker.mark_succeeded(attempt_key, ember::broker::ConnectionMethod::PeerRelay);
+                ember::broker::BrokerEvent::RelayGreeted { ref attempt_key, live } => {
+                    let still_live = state.connection_broker.as_mut().is_some_and(|broker| {
+                        broker.mark_succeeded(attempt_key, ember::broker::ConnectionMethod::PeerRelay)
+                    });
+                    if !still_live {
+                        tracing::debug!("Broker: dropping a greeted stream for {attempt_key} whose attempt already ended");
                     }
+                    let _ = live.send(still_live);
                 }
                 ember::broker::BrokerEvent::ConnectionFailed { ref transfer_id, source_ip, source_port, ref reason } => {
                     tracing::debug!("Broker: all methods failed for {}:{} (transfer {}): {}", source_ip, source_port, transfer_id, reason);
@@ -312,10 +305,12 @@ pub(in crate::network) async fn on_broker_tick(
                         pfs.set_low_to_low(source_ip, source_port, None);
                     }
                 }
-                ember::broker::BrokerEvent::RelayFailed { ref attempt_key, ref reason, relay_at_fault, refused_us } => {
+                ember::broker::BrokerEvent::RelayFailed { ref attempt_key, ref reason, relay_at_fault, refused_us, relay_busy } => {
                     if let Some(ref mut broker) = state.connection_broker {
                         if refused_us {
                             broker.relay_refused_us(attempt_key, reason).await;
+                        } else if relay_busy {
+                            broker.relay_was_busy(attempt_key, reason).await;
                         } else {
                             broker.relay_failed(attempt_key, reason, relay_at_fault).await;
                         }
