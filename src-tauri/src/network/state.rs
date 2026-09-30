@@ -786,6 +786,10 @@ pub(super) struct NetworkState {
     /// placed at least one record, so the round counts as published however
     /// its last key resolves.
     pub(super) ember_publish_placed: HashSet<([u8; 16], EmberPublishKind)>,
+    /// Rounds in `ember_publish_unplaced` in which at least one key failed on
+    /// every replica, so a round that also placed others comes back soon for
+    /// the one that did not.
+    pub(super) ember_publish_partial: HashSet<([u8; 16], EmberPublishKind)>,
     /// Consecutive publish rounds each file has left unconfirmed, driving the
     /// [`EMBER_PUBLISH_MAX_ATTEMPTS`] backoff.
     pub(super) ember_publish_attempts: HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
@@ -1250,6 +1254,10 @@ pub(super) struct NetworkState {
     /// schedule but is driven independently of KAD connectivity so it works
     /// on a KAD-less network. A file with no entry is due now.
     pub(super) ember_source_publish_at: HashMap<[u8; 16], std::time::Instant>,
+    /// The buddy our firewalled source records last named. When it changes,
+    /// every record naming the old one is republished rather than left
+    /// pointing searchers at it until its own republish comes round.
+    pub(super) ember_named_source_buddy: Option<ember::dht::EmberNodeId>,
     /// Unix-second copy of the source-publish stamps, written to known.met
     /// so a restart does not treat the whole library as never-published.
     pub(super) ember_source_publish_unix: HashMap<[u8; 16], u32>,

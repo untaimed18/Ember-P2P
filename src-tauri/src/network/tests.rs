@@ -2108,6 +2108,7 @@ fn a_queued_batch_uses_the_handshake_extended_deadline() {
 struct TestSchedule {
     unplaced: HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
     placed: HashSet<([u8; 16], EmberPublishKind)>,
+    partial: HashSet<([u8; 16], EmberPublishKind)>,
     attempts: HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
     source_at: HashMap<[u8; 16], std::time::Instant>,
     keyword_at: HashMap<[u8; 16], std::time::Instant>,
@@ -2118,6 +2119,7 @@ impl TestSchedule {
         EmberPublishSchedule {
             unplaced: &mut self.unplaced,
             placed: &mut self.placed,
+            partial: &mut self.partial,
             attempts: &mut self.attempts,
             source_at: &mut self.source_at,
             keyword_at: &mut self.keyword_at,
@@ -2310,9 +2312,45 @@ fn a_file_awaiting_placement_is_not_selected_again() {
     );
 }
 
+/// A record names a buddy only while its endorsement outlives the next
+/// republish, and the endorsement is renewed before it gets that short, so
+/// there is no stretch in which records name an endorsement searchers refuse.
+#[test]
+fn a_buddy_endorsement_is_renewed_before_records_stop_naming_it() {
+    let now = 1_800_000_000i64;
+    let republish = EMBER_SOURCE_REPUBLISH.as_secs() as i64;
+    let fresh = now + 6 * 3600;
+    assert!(ember_buddy_endorsement_outlives_republish(fresh, now));
+    assert!(!ember_buddy_endorsement_renew_due(fresh, now));
+
+    let ageing = now + republish + 45 * 60;
+    assert!(ember_buddy_endorsement_outlives_republish(ageing, now), "still named");
+    assert!(ember_buddy_endorsement_renew_due(ageing, now), "and already being renewed");
+
+    let dying = now + republish + 10 * 60;
+    assert!(
+        !ember_buddy_endorsement_outlives_republish(dying, now),
+        "it would lapse before the record's next republish"
+    );
+}
+
+/// Target lookups keep pace with the queue instead of a fixed two a minute.
+#[test]
+fn target_lookups_scale_with_the_queue() {
+    assert_eq!(ember_target_lookups_this_cycle(0), EMBER_MAINT_MIN_TARGET_LOOKUPS);
+    assert_eq!(ember_target_lookups_this_cycle(100), EMBER_MAINT_MIN_TARGET_LOOKUPS);
+    assert_eq!(ember_target_lookups_this_cycle(300), 5);
+    assert_eq!(
+        ember_target_lookups_this_cycle(EMBER_PUBLISH_TARGET_QUEUE_MAX),
+        EMBER_MAINT_MAX_TARGET_LOOKUPS
+    );
+}
+
 /// Which of a file's keys resolves last is timing, not outcome: a timeout
 /// always lands after the acks. A round in which one keyword landed and
-/// another was refused everywhere is published, not a failed round.
+/// another was refused everywhere is published, not a failed round — but it
+/// comes back soon for the keyword that did not land, rather than leaving that
+/// word unsearchable for the twelve-hour interval.
 #[test]
 fn a_round_that_placed_one_key_is_published_when_its_last_key_fails() {
     let mut sched = TestSchedule::default();
@@ -2333,18 +2371,22 @@ fn a_round_that_placed_one_key_is_published_when_its_last_key_fails() {
     );
     assert!(!sched.unplaced.contains_key(&slot));
     assert!(!sched.placed.contains(&slot));
-    assert_eq!(sched.rounds_failed(landed), 0, "and nothing is charged");
-    assert_eq!(
+    assert!(!sched.partial.contains(&slot));
+    assert_eq!(sched.rounds_failed(landed), 1, "the lost keyword counts against the file");
+    let staleness_at = |at| {
         ember_publish_staleness(
             &sched.unplaced,
             &sched.keyword_at,
             landed.file_hash,
             landed.kind,
             EMBER_KEYWORD_REPUBLISH,
-            now,
-        ),
-        None,
-        "the file waits out its interval like any confirmed one"
+            at,
+        )
+    };
+    assert_eq!(staleness_at(now), None, "not straight away");
+    assert!(
+        staleness_at(now + EMBER_KEYWORD_PARTIAL_RETRY + std::time::Duration::from_secs(1)).is_some(),
+        "but after the short retry, not the full interval"
     );
 }
 

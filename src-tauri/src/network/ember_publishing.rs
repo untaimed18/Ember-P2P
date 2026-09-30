@@ -51,6 +51,8 @@ pub(super) struct EmberPublishSchedule<'a> {
     pub(super) unplaced: &'a mut HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
     /// Rounds still in progress that have already placed at least one record.
     pub(super) placed: &'a mut HashSet<([u8; 16], EmberPublishKind)>,
+    /// Rounds still in progress in which a key has failed on every replica.
+    pub(super) partial: &'a mut HashSet<([u8; 16], EmberPublishKind)>,
     pub(super) attempts: &'a mut HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
     /// When each file's source record next falls due.
     pub(super) source_at: &'a mut HashMap<[u8; 16], std::time::Instant>,
@@ -63,6 +65,7 @@ impl EmberPublishSchedule<'_> {
         EmberPublishSchedule {
             unplaced: self.unplaced,
             placed: self.placed,
+            partial: self.partial,
             attempts: self.attempts,
             source_at: self.source_at,
             keyword_at: self.keyword_at,
@@ -91,10 +94,30 @@ impl EmberPublishSchedule<'_> {
     /// Which of a file's keys resolves last is an accident of timing — a
     /// timeout always resolves after the acks — so the verdict has to rest on
     /// the round as a whole rather than on the final reply.
+    ///
+    /// A keyword round that placed some keys but lost one on every replica is
+    /// still published, but comes back after [`EMBER_KEYWORD_PARTIAL_RETRY`]
+    /// rather than the twelve-hour interval: its siblings used to hide the
+    /// failure, and on a file's first publish that word stayed unsearchable
+    /// for twelve hours. Counted against [`EMBER_PUBLISH_MAX_ATTEMPTS`] like a
+    /// failed round, so a word that never lands stops being retried.
     pub(super) fn finish_round(&mut self, slot: ([u8; 16], EmberPublishKind), now: std::time::Instant) -> bool {
         self.unplaced.remove(&slot);
+        let partial = self.partial.remove(&slot);
         if !self.placed.remove(&slot) {
             return false;
+        }
+        if partial && slot.1 == EmberPublishKind::Keyword {
+            let attempts = self.attempts.entry(slot).or_insert(EmberPublishAttempts {
+                rounds_failed: 0,
+                last_charged: now,
+            });
+            attempts.rounds_failed += 1;
+            attempts.last_charged = now;
+            if attempts.rounds_failed <= EMBER_PUBLISH_MAX_ATTEMPTS {
+                self.keyword_at.insert(slot.0, now + EMBER_KEYWORD_PARTIAL_RETRY);
+                return true;
+            }
         }
         self.attempts.remove(&slot);
         self.stamp(slot.0, slot.1, now);
@@ -107,6 +130,7 @@ impl NetworkState {
         EmberPublishSchedule {
             unplaced: &mut self.ember_publish_unplaced,
             placed: &mut self.ember_publish_placed,
+            partial: &mut self.ember_publish_partial,
             attempts: &mut self.ember_publish_attempts,
             source_at: &mut self.ember_source_publish_at,
             keyword_at: &mut self.ember_keyword_publish_at,
@@ -667,6 +691,9 @@ pub(super) fn note_ember_source_address(state: &mut NetworkState, ip: Ipv4Addr) 
     state
         .ember_publish_placed
         .retain(|(_, kind)| *kind != EmberPublishKind::Source);
+    state
+        .ember_publish_partial
+        .retain(|(_, kind)| *kind != EmberPublishKind::Source);
 }
 
 /// How often we re-announce an Ember DHT *source* record for each shared
@@ -856,6 +883,10 @@ pub(super) fn ember_source_files_per_tick(publishable: usize, due: usize, contac
 /// cadence can be slower; 12 h matches the KAD keyword-republish spirit
 /// and sits inside the 24 h record TTL.
 pub(super) const EMBER_KEYWORD_REPUBLISH: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
+
+/// When a keyword round that lost one of its keys comes back for another go.
+/// See [`EmberPublishSchedule::finish_round`].
+pub(super) const EMBER_KEYWORD_PARTIAL_RETRY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Floor on how many files' keyword records are (re)published per tick.
 ///
@@ -1437,14 +1468,29 @@ pub(super) const EMBER_PERSIST_MAX_RECORDS: usize = 20_000;
 /// one, short enough that the set still reflects a network peers join and leave.
 pub(super) const EMBER_PUBLISH_TARGETS_TTL_SECS: i64 = 4 * 3600;
 
-/// Target lookups started per maintenance cycle.
+/// Fewest target lookups started per maintenance cycle while any are queued.
+pub(super) const EMBER_MAINT_MIN_TARGET_LOOKUPS: usize = 2;
+/// Most target lookups started per maintenance cycle.
 ///
-/// A lookup is a handful of round trips, and there are as many keys as shared
-/// files, so resolving every key on every publish would undo the batching the
-/// publisher exists for. Two a minute costs almost nothing and works through a
-/// large library over a few hours — comfortably inside the keyword republish
-/// interval, which is when a better target set actually gets used.
-pub(super) const EMBER_MAINT_MAX_TARGET_LOOKUPS: usize = 2;
+/// A lookup is a handful of round trips and occupies a background search slot
+/// for well under a minute, so this many a minute stays far inside the
+/// background share of the search pool.
+pub(super) const EMBER_MAINT_MAX_TARGET_LOOKUPS: usize = 8;
+
+/// Target lookups to start this cycle with `queued` keys waiting.
+///
+/// Enough to drain the queue within a quarter of a target set's lifetime. A
+/// fixed two a minute assumed one key per file; there are about eight (the
+/// source key plus each keyword), so at two a minute a large library held
+/// fewer fresh target sets than it had keys, a full queue took longer to drain
+/// than a set lived, and most records went to our own table's closest, which
+/// on a large overlay refuse on proximity.
+pub(super) fn ember_target_lookups_this_cycle(queued: usize) -> usize {
+    let cycles = (EMBER_PUBLISH_TARGETS_TTL_SECS as u64 / 4 / EMBER_MAINT_INTERVAL.as_secs()).max(1) as usize;
+    queued
+        .div_ceil(cycles)
+        .clamp(EMBER_MAINT_MIN_TARGET_LOOKUPS, EMBER_MAINT_MAX_TARGET_LOOKUPS)
+}
 
 /// Keys that may be waiting for a target lookup at once.
 pub(super) const EMBER_PUBLISH_TARGET_QUEUE_MAX: usize = 512;
@@ -1617,11 +1663,33 @@ pub(super) fn ember_named_source_buddy(
     contact: &ember::dht::EmberContact,
     now: i64,
 ) -> Option<ember::dht::publish::SourceBuddy> {
-    let buddy = state
-        .ember_dht
-        .buddy_endorsement(&contact.node_id, now)?
-        .as_source_buddy();
+    let endorsement = state.ember_dht.buddy_endorsement(&contact.node_id, now)?;
+    // A record lives six hours and is republished every two, and searchers
+    // refuse an endorsement past its expiry. Naming one that dies before the
+    // next republish left each record published in its last two hours
+    // uncallable until that republish; see `ember_buddy_endorsement_renew_due`.
+    if !ember_buddy_endorsement_outlives_republish(endorsement.expires_at, now) {
+        return None;
+    }
+    let buddy = endorsement.as_source_buddy();
     buddy.is_routable().then_some(buddy)
+}
+
+/// Life an endorsement must have left for a record to name it: past the next
+/// republish, with half an hour to spare for a slow cycle.
+const EMBER_BUDDY_ENDORSEMENT_MIN_LIFE_SECS: i64 = EMBER_SOURCE_REPUBLISH.as_secs() as i64 + 1800;
+/// Asking this much before the minimum gives the buddy a few maintenance cycles
+/// to answer before records stop naming it.
+const EMBER_BUDDY_ENDORSEMENT_RENEW_SECS: i64 = EMBER_BUDDY_ENDORSEMENT_MIN_LIFE_SECS + 3600;
+
+pub(super) fn ember_buddy_endorsement_outlives_republish(expires_at: i64, now: i64) -> bool {
+    expires_at >= now.saturating_add(EMBER_BUDDY_ENDORSEMENT_MIN_LIFE_SECS)
+}
+
+/// Whether the named buddy should be asked for a fresh endorsement now, while
+/// the one we hold can still be named.
+pub(super) fn ember_buddy_endorsement_renew_due(expires_at: i64, now: i64) -> bool {
+    expires_at < now.saturating_add(EMBER_BUDDY_ENDORSEMENT_RENEW_SECS)
 }
 
 /// Whether consume should `CALLBACK_REQ` this source. Unusable, unendorsed,
@@ -1798,6 +1866,7 @@ pub(super) fn retract_ember_publish(
         for kind in [EmberPublishKind::Keyword, EmberPublishKind::Source] {
             state.ember_publish_unplaced.remove(&(*file_hash, kind));
             state.ember_publish_placed.remove(&(*file_hash, kind));
+            state.ember_publish_partial.remove(&(*file_hash, kind));
             state.ember_publish_attempts.remove(&(*file_hash, kind));
         }
         state.ember_published_sources.remove(file_hash);
@@ -2008,6 +2077,30 @@ pub(super) async fn maybe_publish_ember_sources(
         // the next tick retries it; `ember_dht_waiting_buddy` is
         // what surfaces the wait.
         ask_ember_buddy_endorsements(socket, state, &buddy_candidates).await;
+    }
+
+    if firewalled_like {
+        let now_ts = chrono::Utc::now().timestamp();
+        let named_id = named_buddy.as_ref().map(|(contact, _)| contact.node_id);
+        // A new buddy, including the one that replaces a buddy gone quiet:
+        // records naming the old one would send searchers to a peer that no
+        // longer relays for us until each came up for republish, up to two
+        // hours later. Making them all due lets the per-tick budget pace them.
+        if named_id.is_some() && named_id != state.ember_named_source_buddy {
+            if state.ember_named_source_buddy.is_some() {
+                state.ember_source_publish_at.clear();
+            }
+            state.ember_named_source_buddy = named_id;
+        }
+        if let Some((contact, _)) = named_buddy.as_ref() {
+            let renew = state
+                .ember_dht
+                .buddy_endorsement(&contact.node_id, now_ts)
+                .is_some_and(|e| ember_buddy_endorsement_renew_due(e.expires_at, now_ts));
+            if renew {
+                ask_ember_buddy_endorsements(socket, state, std::slice::from_ref(contact)).await;
+            }
+        }
     }
 
     // The endorsement ask above is wanted every tick, so this comes after it.

@@ -117,7 +117,9 @@ pub(super) fn fail_ember_record_pending(
         return false;
     };
     unplaced.remove(&reference.key);
-    if !unplaced.is_empty() {
+    let round_open = !unplaced.is_empty();
+    schedule.partial.insert(slot);
+    if round_open {
         return false;
     }
     if schedule.finish_round(slot, now) {
@@ -1604,7 +1606,7 @@ pub(super) async fn run_ember_maintenance(
     }
 
     // 1b) Publish-target lookups — resolve the nodes genuinely closest to keys
-    //     we publish under, a couple per cycle, so republishes stop relying on
+    //     we publish under, a few per cycle, so republishes stop relying on
     //     our own table's answer for a distant key. Same shape as a bucket
     //     refresh: the search has no waiter, and `maybe_finish_ember_search`
     //     files the result under the key it was resolving.
@@ -1614,7 +1616,8 @@ pub(super) async fn run_ember_maintenance(
     //     FIND_NODEs are two more unanswered queries on the same handshake
     //     that the liveness ping is already waiting on.
     if state.ember_dht.routing().verified_len() > 0 {
-        for _ in 0..EMBER_MAINT_MAX_TARGET_LOOKUPS {
+        let lookups = ember_target_lookups_this_cycle(state.ember_publish_target_queue.len());
+        for _ in 0..lookups {
             let Some(key) = state.ember_publish_target_queue.pop_front() else {
                 break;
             };

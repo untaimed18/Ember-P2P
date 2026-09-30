@@ -1214,7 +1214,7 @@ pub(super) fn ember_overlay_publish_targets(
 
 /// Target-lookup queue slots a buddy's `PROXY_STORE` forwards may occupy.
 ///
-/// The queue drains [`EMBER_MAINT_MAX_TARGET_LOOKUPS`] keys a cycle and is
+/// The queue drains at most [`EMBER_MAINT_MAX_TARGET_LOOKUPS`] keys a cycle and is
 /// first come, first served, so every key queued on someone else's behalf
 /// delays one of ours. A forwarded key is as distant as any of ours, so it
 /// still gets a share — just not one that can crowd our own keys out.
