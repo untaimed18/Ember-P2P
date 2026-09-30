@@ -66,21 +66,35 @@ pub(crate) fn allowlist_permits(allowed: &HashSet<String>, key: &str) -> bool {
             .any(|(at, _)| allowed.contains(&key[..at]))
 }
 
-/// Whether the folder allowlists let the file at `path` be offered: no partly
-/// shared folder holds it, or the innermost one that does lists it.
-pub(crate) fn allowlists_offer(
-    allowlists: &std::collections::HashMap<String, Vec<String>>,
-    path: &str,
-) -> bool {
-    let Some((_, list)) = allowlists
-        .iter()
-        .filter(|(folder, _)| crate::security::path_within_dir(path, folder))
-        .max_by_key(|(folder, _)| folder.len())
-    else {
-        return true;
-    };
-    let allowed = list.iter().cloned().collect::<HashSet<_>>();
-    allowlist_permits(&allowed, &normalize_path_key(path))
+/// The folder allowlists as sets, for asking about many paths.
+#[derive(Debug, Default)]
+pub(crate) struct AllowlistOffers {
+    lists: Vec<(String, HashSet<String>)>,
+}
+
+impl AllowlistOffers {
+    pub(crate) fn new(allowlists: &std::collections::HashMap<String, Vec<String>>) -> Self {
+        Self {
+            lists: allowlists
+                .iter()
+                .map(|(folder, entries)| (folder.clone(), entries.iter().cloned().collect()))
+                .collect(),
+        }
+    }
+
+    /// Whether the file at `path` may be offered: no partly shared folder
+    /// holds it, or the innermost one that does lists it.
+    pub(crate) fn offers(&self, path: &str) -> bool {
+        let Some((_, allowed)) = self
+            .lists
+            .iter()
+            .filter(|(folder, _)| crate::security::path_within_dir(path, folder))
+            .max_by_key(|(folder, _)| folder.len())
+        else {
+            return true;
+        };
+        allowlist_permits(allowed, &normalize_path_key(path))
+    }
 }
 
 /// The lists discovery walks for each partly shared folder: its allowlist and
@@ -142,6 +156,30 @@ impl DiscoveryScope {
 
     fn admits_dir(&self, key: &str) -> bool {
         self.ancestors.contains(key) || allowlist_permits(&self.entries, key)
+    }
+}
+
+/// A [`DiscoveryScope`] for every partly shared folder, built once for a pass
+/// that resolves many paths.
+#[derive(Debug, Default)]
+pub struct DiscoveryScopes {
+    by_root: std::collections::HashMap<String, DiscoveryScope>,
+}
+
+impl DiscoveryScopes {
+    /// From the folder allowlists, keyed as settings keys them.
+    pub fn new(allowlists: &std::collections::HashMap<String, Vec<String>>) -> Self {
+        Self {
+            by_root: allowlists
+                .iter()
+                .map(|(root, entries)| (normalize_path_key(root), DiscoveryScope::new(entries)))
+                .collect(),
+        }
+    }
+
+    /// `None` for a folder shared whole.
+    pub fn for_root(&self, root: &str) -> Option<&DiscoveryScope> {
+        self.by_root.get(&normalize_path_key(root))
     }
 }
 
@@ -383,7 +421,7 @@ impl FileIndexer {
     /// enters.
     pub fn discover_scoped_path(
         roots: &[String],
-        allowlists: &std::collections::HashMap<String, Vec<String>>,
+        scopes: &DiscoveryScopes,
         path: &Path,
     ) -> ScopedDiscovery {
         // Event paths are the watched root joined with the changed name, but
@@ -409,10 +447,20 @@ impl FileIndexer {
             root.join(below)
         };
         let path = respelled.as_path();
+        let scope = scopes.for_root(&root.to_string_lossy());
+        // The root is walked as a full pass walks it. The refusals below are
+        // for what lies inside it: a drive root is hidden and system, and an
+        // allowlist names entries under the root, never the root itself.
+        if path == root {
+            let result = Self::discover_directory_page_in(&path.to_string_lossy(), None, scope);
+            return ScopedDiscovery::Found {
+                files: result.files,
+                partial: result.partial,
+            };
+        }
         if is_excluded_share_location(path) {
             return ScopedDiscovery::Removed;
         }
-        let scope = DiscoveryScope::for_root(&root.to_string_lossy(), allowlists);
         let key = normalize_path_key(&path.to_string_lossy());
         for ancestor in path.ancestors().skip(1) {
             if ancestor == root || !ancestor.starts_with(root) {
@@ -440,10 +488,10 @@ impl FileIndexer {
             return ScopedDiscovery::Removed;
         }
         if metadata.is_dir() {
-            if scope.as_ref().is_some_and(|scope| !scope.admits_dir(&key)) {
+            if scope.is_some_and(|scope| !scope.admits_dir(&key)) {
                 return ScopedDiscovery::Removed;
             }
-            let result = Self::discover_directory_page_in(&path.to_string_lossy(), None, scope.as_ref());
+            let result = Self::discover_directory_page_in(&path.to_string_lossy(), None, scope);
             return ScopedDiscovery::Found {
                 files: result.files,
                 partial: result.partial,
@@ -451,7 +499,7 @@ impl FileIndexer {
         }
         if !metadata.is_file()
             || is_excluded_share_file_name(path)
-            || scope.as_ref().is_some_and(|scope| !scope.admits_file(&key))
+            || scope.is_some_and(|scope| !scope.admits_file(&key))
         {
             return ScopedDiscovery::Removed;
         }
@@ -1292,7 +1340,7 @@ mod tests {
     fn scoped_discovery_resolves_files_folders_and_deletions() {
         let root = scratch_tree("scoped");
         let roots = vec![root.to_string_lossy().to_string()];
-        let no_lists = std::collections::HashMap::new();
+        let no_lists = DiscoveryScopes::default();
         let file = root.join("album").join("song.mp3");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, b"x").unwrap();
@@ -1338,7 +1386,7 @@ mod tests {
         let roots = vec![root.to_string_lossy().to_string()];
         std::fs::write(root.join("song.mp3"), b"x").unwrap();
         let shown = std::path::PathBuf::from(crate::commands::share_browser::display_fs_path(&root));
-        match FileIndexer::discover_scoped_path(&roots, &std::collections::HashMap::new(), &shown.join("song.mp3")) {
+        match FileIndexer::discover_scoped_path(&roots, &DiscoveryScopes::default(), &shown.join("song.mp3")) {
             ScopedDiscovery::Found { files, .. } => {
                 assert_eq!(files.len(), 1);
                 assert_eq!(Path::new(&files[0].path), root.join("song.mp3"));
@@ -1379,6 +1427,7 @@ mod tests {
 
         let mut lists = std::collections::HashMap::new();
         lists.insert(key(&root), vec![key(&root.join("a.mp3"))]);
+        let lists = DiscoveryScopes::new(&lists);
         let roots = vec![root_str.clone()];
         assert!(matches!(
             FileIndexer::discover_scoped_path(&roots, &lists, &root.join("b.mp3")),
@@ -1392,7 +1441,56 @@ mod tests {
             ScopedDiscovery::Found { files, .. } => assert_eq!(files.len(), 1),
             other => panic!("expected the allowlisted file, got {other:?}"),
         }
+        match FileIndexer::discover_scoped_path(&roots, &lists, &root) {
+            ScopedDiscovery::Found { files, partial } => {
+                assert_eq!(page_names(&DiscoveryResult { files, ..Default::default() }), ["a.mp3"]);
+                assert!(!partial);
+            }
+            other => panic!("a rescan of the root walks what it offers, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A drive root reports itself hidden and system, and an allowlist names
+    /// the entries under it, never the root: a rescan naming the root must
+    /// walk it rather than report it gone, which removed every row it had.
+    #[cfg(windows)]
+    #[test]
+    fn a_scoped_rescan_of_a_partly_shared_drive_root_walks_it() {
+        let drive = format!(
+            "{}\\",
+            std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string())
+        );
+        let listed = format!("{drive}ember-scope-{:016x}.bin", rand::random::<u64>());
+        let lists = std::collections::HashMap::from([(
+            normalize_path_key(&drive),
+            vec![normalize_path_key(&listed)],
+        )]);
+        let roots = vec![drive.clone()];
+        match FileIndexer::discover_scoped_path(&roots, &DiscoveryScopes::new(&lists), Path::new(&drive)) {
+            ScopedDiscovery::Found { files, partial } => {
+                assert!(files.is_empty(), "nothing listed exists: {files:?}");
+                assert!(!partial);
+            }
+            other => panic!("expected the root to be walked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allowlist_offers_follow_the_innermost_partly_shared_folder() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let music = normalize_path_key(&format!("C:{sep}music"));
+        let live = format!("{music}{sep}live");
+        let lists = std::collections::HashMap::from([
+            (music.clone(), vec![format!("{music}{sep}a.mp3"), live.clone()]),
+            (live.clone(), vec![format!("{live}{sep}b.mp3")]),
+        ]);
+        let offers = AllowlistOffers::new(&lists);
+        assert!(offers.offers(&format!("{music}{sep}a.mp3")));
+        assert!(!offers.offers(&format!("{music}{sep}c.mp3")));
+        assert!(offers.offers(&format!("{live}{sep}b.mp3")));
+        assert!(!offers.offers(&format!("{live}{sep}c.mp3")), "the nested list decides");
+        assert!(offers.offers(&format!("D:{sep}films{sep}d.mkv")), "no list, shared whole");
     }
 
     #[test]

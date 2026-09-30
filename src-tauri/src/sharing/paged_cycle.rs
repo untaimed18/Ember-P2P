@@ -13,11 +13,15 @@
 //! may already have passed their place in the order. Paths are held as 64-bit
 //! fingerprints, since these folders run to hundreds of thousands of files. A
 //! collision can only keep a row that should have gone, never remove one.
+//!
+//! A file put back after its page ran, with no event to say so (live tracking
+//! off), is found by [`still_on_disk`] before its row is removed.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::search::index::normalize_path_key;
 
@@ -134,6 +138,39 @@ pub fn cycles() -> &'static Mutex<PagedCycles> {
     CYCLES.get_or_init(Default::default)
 }
 
+/// Rows [`still_on_disk`] looks at per call, and how long it may take. The
+/// rest are removed as the cycle decided; a later page finds them again.
+const MAX_RECHECKED: usize = 20_000;
+const RECHECK_BUDGET: Duration = Duration::from_secs(10);
+
+/// Fingerprints of the rows, `(path, size, modified_at)`, whose file is on disk
+/// as the row indexed it. Blocking.
+pub fn still_on_disk(rows: &[(String, u64, i64)]) -> HashSet<u64> {
+    still_on_disk_within(rows, MAX_RECHECKED, Instant::now() + RECHECK_BUDGET)
+}
+
+fn still_on_disk_within(rows: &[(String, u64, i64)], max: usize, deadline: Instant) -> HashSet<u64> {
+    let mut back = HashSet::new();
+    for (path, size, modified_at) in rows.iter().take(max) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or(0);
+        if metadata.is_file() && metadata.len() == *size && modified == *modified_at {
+            back.insert(fingerprint(path));
+        }
+    }
+    back
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +254,40 @@ mod tests {
             .note_page("/share", &facts(None, None), || paths(&["a"]), std::iter::empty())
             .is_none());
         assert!(cycles.cycles.is_empty());
+    }
+
+    /// With live tracking off, a file deleted and put back after its page ran
+    /// is only seen again by this check, which must keep it and only it.
+    #[test]
+    fn a_file_back_on_disk_as_indexed_is_spared() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("ember-paged-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let back = dir.join("back.bin");
+        std::fs::write(&back, b"abc").unwrap();
+        let modified = std::fs::metadata(&back)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let back = back.to_string_lossy().to_string();
+        let gone = dir.join("gone.bin").to_string_lossy().to_string();
+        let rows = vec![
+            (back.clone(), 3, modified),
+            (gone, 3, modified),
+            (back.clone(), 4, modified),
+        ];
+
+        assert_eq!(still_on_disk(&rows), HashSet::from([fingerprint(&back)]));
+        let changed = vec![(back.clone(), 4, modified), (back.clone(), 3, modified + 7)];
+        assert!(still_on_disk(&changed).is_empty(), "a different file at the path goes");
+        assert!(
+            still_on_disk_within(&rows, 0, Instant::now() + RECHECK_BUDGET).is_empty(),
+            "rows past the bound are removed as decided"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

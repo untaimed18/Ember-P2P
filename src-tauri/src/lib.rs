@@ -1388,7 +1388,9 @@ pub fn run() {
                     let hydration_allowlists = {
                         let state = startup_app.state::<AppState>();
                         let cfg = state.config.read().await;
-                        cfg.settings.pending_folder_allowlists.clone()
+                        crate::sharing::indexer::AllowlistOffers::new(
+                            &cfg.settings.pending_folder_allowlists,
+                        )
                     };
                     let hydrated_records = tokio::task::spawn_blocking(move || {
                         hydration_records
@@ -1411,10 +1413,7 @@ pub fn run() {
                                 // alone, so a record it does not offer is one
                                 // left by an earlier share of the folder, and
                                 // its flag in known.met may still say shared.
-                                if !crate::sharing::indexer::allowlists_offer(
-                                    &hydration_allowlists,
-                                    &record.file_path,
-                                ) {
+                                if !hydration_allowlists.offers(&record.file_path) {
                                     return false;
                                 }
                                 // Re-apply discovery's exclusions. Hydration

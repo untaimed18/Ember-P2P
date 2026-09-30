@@ -2938,10 +2938,11 @@ async fn extend_folder_allowlist(
         let Some(list) = lists.get_mut(&key) else {
             return false;
         };
+        let mut listed = list.iter().cloned().collect::<HashSet<_>>();
         let missing: Vec<String> = entries
             .iter()
             .map(|entry| crate::search::index::normalize_path_key(entry))
-            .filter(|entry| !list.iter().any(|item| path_key_covers(item, entry)))
+            .filter(|entry| !allowlist_permits(&listed, entry))
             .collect();
         if missing.is_empty() {
             return false;
@@ -2951,7 +2952,8 @@ async fn extend_folder_allowlist(
             return false;
         }
         for entry in missing {
-            if !list.iter().any(|item| path_key_covers(item, &entry)) {
+            if !allowlist_permits(&listed, &entry) {
+                listed.insert(entry.clone());
                 list.push(entry);
             }
         }
@@ -3954,11 +3956,12 @@ pub async fn pick_shared_folder(
                 // The stored form, which is what the allowlist and the index
                 // rows are keyed by; the picked spelling may be a mapped drive.
                 let folder = added.folder;
+                let before = FolderListsBefore::take(&state).await;
                 if let Err(error) = clear_allowlists_under(&state, &folder).await {
                     tracing::warn!("Could not lift the file limit on {display_path}: {error}");
                     result.failed.push(error);
                 }
-                match share_all_in_folder(app.clone(), state.inner(), &folder).await {
+                match share_all_in_folder(app.clone(), state.inner(), &folder, &before).await {
                     Ok(files) if files.is_empty() => result.already_shared.push(display_path),
                     Ok(files) => result.files_shared.extend(files),
                     Err(error) => {
@@ -5360,7 +5363,21 @@ pub async fn set_files_friends_only(
 /// not indexed. Used when a partial share (an allowlist) is promoted to a full
 /// folder share, whose files off the allowlist discovery never walked. Returns
 /// the paths that changed. Files already offered are left out of that list.
+/// `before` is how the folder lists stood before the promotion; see
+/// [`admit_known_files`].
 pub(crate) async fn share_all_in_folder(
+    app: tauri::AppHandle,
+    state: &AppState,
+    folder: &str,
+    before: &FolderListsBefore,
+) -> Result<Vec<String>, String> {
+    admit_known_files(state, before, &[folder.to_string()]).await;
+    offer_all_in_folder(app, state, folder).await
+}
+
+/// [`share_all_in_folder`] for a caller that has already run
+/// [`admit_known_files`] over `folder`.
+pub(crate) async fn offer_all_in_folder(
     app: tauri::AppHandle,
     state: &AppState,
     folder: &str,
@@ -5387,6 +5404,142 @@ pub(crate) async fn share_all_in_folder(
         );
     }
     Ok(paths)
+}
+
+/// The folder allowlists and withheld files as they stood before an edit that
+/// may offer more of a partly shared folder, for [`admit_known_files`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FolderListsBefore {
+    allowlists: std::collections::HashMap<String, Vec<String>>,
+    withheld: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl FolderListsBefore {
+    pub(crate) async fn take(state: &AppState) -> Self {
+        let config = state.config.read().await;
+        Self {
+            allowlists: config.settings.pending_folder_allowlists.clone(),
+            withheld: config.settings.withheld_folder_files.clone(),
+        }
+    }
+}
+
+/// Mark shared in known.met the files under `under` that an allowlist edit has
+/// just let a partly shared folder offer, where known.met still has them
+/// unshared: 1.7.0 walked every file of such a folder and unshared the ones
+/// off its list, and discovery since walks only the list, so the rescan that
+/// indexes them would restore that flag. Run before that rescan.
+///
+/// Only files the lists did not offer before are touched, so a file the user
+/// unshared inside what was already offered keeps that choice. So does a
+/// withheld file, one a pending intent keeps unshared, one the Library has a
+/// row for (the row is its current state) and one whose content a Library row
+/// has taken off the network. Best effort: on failure the files stay unshared.
+pub(crate) async fn admit_known_files(state: &AppState, before: &FolderListsBefore, under: &[String]) {
+    if under.is_empty() {
+        return;
+    }
+    let (after, kept_unshared) = {
+        let config = state.config.read().await;
+        let settings = &config.settings;
+        let kept = before
+            .withheld
+            .values()
+            .flatten()
+            .cloned()
+            .chain(
+                settings
+                    .pending_share_states
+                    .iter()
+                    .filter(|(_, shared)| !**shared)
+                    .map(|(path, _)| path.clone()),
+            )
+            .collect::<HashSet<_>>();
+        (settings.pending_folder_allowlists.clone(), kept)
+    };
+    if after == before.allowlists {
+        return;
+    }
+    let known = match load_known_files().await {
+        Ok(known) => known,
+        Err(error) => {
+            warn!("Files newly offered by a partial share were left as known.met has them: {error}");
+            return;
+        }
+    };
+    let under = under.to_vec();
+    let before_lists = before.allowlists.clone();
+    let candidates = tokio::task::spawn_blocking(move || {
+        newly_admitted_unshared(
+            known.all_records(),
+            &under,
+            &crate::sharing::indexer::AllowlistOffers::new(&before_lists),
+            &crate::sharing::indexer::AllowlistOffers::new(&after),
+            &kept_unshared,
+        )
+    })
+    .await
+    .unwrap_or_default();
+    if candidates.is_empty() {
+        return;
+    }
+    let mut hashes = {
+        let index = state.local_index.read().await;
+        let off_network = index
+            .all_files()
+            .iter()
+            .filter(|file| !file.shared && !file.hash.is_empty())
+            .map(|file| file.hash.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        candidates
+            .into_iter()
+            .filter(|(path, hash)| index.get_by_path(path).is_none() && !off_network.contains(hash))
+            .map(|(_, hash)| hash)
+            .collect::<Vec<_>>()
+    };
+    hashes.sort();
+    hashes.dedup();
+    match persist_shared_states(&state.network_tx, &hashes, true).await {
+        Ok(()) if !hashes.is_empty() => {
+            info!("Marked {} file(s) a partial share now offers as shared in known.met", hashes.len());
+        }
+        Ok(()) => {}
+        Err(error) => warn!("Files newly offered by a partial share were left unshared: {error}"),
+    }
+}
+
+/// `(path, content hash)` of the known.met records under `under` that are
+/// unshared, that `after` offers and `before` did not, and that are not in
+/// `kept_unshared` (normalized paths).
+fn newly_admitted_unshared<'a>(
+    records: impl Iterator<Item = &'a crate::storage::known_files::KnownFileRecord>,
+    under: &[String],
+    before: &crate::sharing::indexer::AllowlistOffers,
+    after: &crate::sharing::indexer::AllowlistOffers,
+    kept_unshared: &HashSet<String>,
+) -> Vec<(String, String)> {
+    let under = under
+        .iter()
+        .map(|entry| crate::search::index::normalize_path_key(entry))
+        .collect::<HashSet<_>>();
+    // `..=at` as well, for a drive root, whose key keeps its separator.
+    let is_under = |key: &str| {
+        under.contains(key)
+            || key.match_indices(std::path::MAIN_SEPARATOR).any(|(at, _)| {
+                under.contains(&key[..at]) || under.contains(&key[..=at])
+            })
+    };
+    records
+        .filter(|record| !record.is_shared && !record.file_path.is_empty())
+        .filter(|record| {
+            let key = crate::search::index::normalize_path_key(&record.file_path);
+            is_under(&key)
+                && !kept_unshared.contains(&key)
+                && after.offers(&record.file_path)
+                && !before.offers(&record.file_path)
+        })
+        .map(|record| (record.file_path.clone(), hex::encode(record.file_hash)))
+        .collect()
 }
 
 /// Bulk-unshare many files in a single Tauri call. Returns the count of
@@ -5509,6 +5662,65 @@ fn unhashed_placeholders_under(index: &LocalIndex, folders: &[String]) -> HashSe
         })
         .map(|file| crate::search::index::normalize_path_key(&file.path))
         .collect()
+}
+
+/// The folders of `reloaded` whose own listing was complete, so a pass may
+/// remove the rows under them it did not find, whatever another folder's page
+/// was. One overlapping a folder in `incomplete` is left out: the partial page
+/// of an enclosing or nested share may be all that lists some of its rows.
+fn authoritative_folders(reloaded: &[String], incomplete: &[String]) -> Vec<String> {
+    reloaded
+        .iter()
+        .filter(|folder| {
+            !incomplete.iter().any(|partial| {
+                crate::security::path_within_dir(folder, partial)
+                    || crate::security::path_within_dir(partial, folder)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Take out of each finished paged cycle's doomed rows those whose file is on
+/// disk as indexed: deleted and put back after its page ran, with no event to
+/// tell the cycle. The check runs on the blocking pool.
+async fn spare_rows_back_on_disk(
+    index: &RwLock<LocalIndex>,
+    mut finished: Vec<(String, HashSet<u64>)>,
+) -> Vec<(String, HashSet<u64>)> {
+    if finished.is_empty() {
+        return finished;
+    }
+    let rows = {
+        let index = index.read().await;
+        index
+            .all_files()
+            .iter()
+            .filter(|file| {
+                let print = crate::sharing::paged_cycle::fingerprint(&file.path);
+                finished.iter().any(|(folder, doomed)| {
+                    doomed.contains(&print) && crate::security::path_within_dir(&file.path, folder)
+                })
+            })
+            .map(|file| (file.path.clone(), file.size, file.modified_at))
+            .collect::<Vec<_>>()
+    };
+    let back = match tokio::task::spawn_blocking(move || {
+        crate::sharing::paged_cycle::still_on_disk(&rows)
+    })
+    .await
+    {
+        Ok(back) => back,
+        Err(error) => {
+            warn!("Could not re-check the files a paged scan found missing: {error}");
+            HashSet::new()
+        }
+    };
+    for (_, doomed) in &mut finished {
+        doomed.retain(|print| !back.contains(print));
+    }
+    finished.retain(|(_, doomed)| !doomed.is_empty());
+    finished
 }
 
 /// `remove_pending_files_under(folders)`, sparing the placeholders whose
@@ -5855,39 +6067,38 @@ async fn reload_shared_files_page(
         scanning.fetch_add(1, Ordering::Relaxed);
         let scan_guard = ScanGuard(scanning.clone());
 
-        // `truncated` gates the user-facing cap warning; `partial` gates
-        // reconciliation. A resumed page is always partial but only rarely
-        // truncated, so they cannot share one flag.
+        // `truncated` gates the user-facing cap warning; `incomplete` gates
+        // reconciliation, per folder. A resumed page is always partial but only
+        // rarely truncated, so they cannot share one flag.
         // `scanned_paths` is what a scoped pass examined and may reconcile
         // under; empty for a full pass, which reconciles whole roots.
+        // `incomplete` names the folders, or a scoped pass's paths, whose
+        // listing was partial.
         let (
             mut discovered,
             discovery_truncated,
-            discovery_partial,
+            discovery_incomplete,
             discovery_cursor_updates,
             scanned_paths,
             discovery_pages,
         ): (
             Vec<FileInfo>,
             bool,
-            bool,
+            Vec<String>,
             std::collections::HashMap<String, Option<String>>,
             Vec<String>,
             Vec<(String, crate::sharing::paged_cycle::PageFacts)>,
         ) = match tokio::task::spawn_blocking(move || {
             let mut files = Vec::new();
             let mut truncated = false;
-            let mut partial = false;
+            let mut incomplete = Vec::new();
             let mut cursor_updates = std::collections::HashMap::new();
             let mut scanned = Vec::new();
             let mut pages = Vec::new();
+            let scopes = crate::sharing::indexer::DiscoveryScopes::new(&discovery_allowlists);
             if let Some(paths) = scope {
                 for path in outermost_paths(paths) {
-                    match FileIndexer::discover_scoped_path(
-                        &discovery_folders,
-                        &discovery_allowlists,
-                        &path,
-                    ) {
+                    match FileIndexer::discover_scoped_path(&discovery_folders, &scopes, &path) {
                         crate::sharing::indexer::ScopedDiscovery::Skip => {}
                         crate::sharing::indexer::ScopedDiscovery::Removed => {
                             scanned.push(path.to_string_lossy().into_owned());
@@ -5896,25 +6107,29 @@ async fn reload_shared_files_page(
                             files: found,
                             partial: found_partial,
                         } => {
-                            partial |= found_partial;
+                            let path = path.to_string_lossy().into_owned();
+                            if found_partial {
+                                incomplete.push(path.clone());
+                            }
                             files.extend(found);
-                            scanned.push(path.to_string_lossy().into_owned());
+                            scanned.push(path);
                         }
                     }
                 }
-                return (files, truncated, partial, cursor_updates, scanned, pages);
+                return (files, truncated, incomplete, cursor_updates, scanned, pages);
             }
             for folder in &discovery_folders {
                 let key = crate::search::index::normalize_path_key(folder);
-                let scope = crate::sharing::indexer::DiscoveryScope::for_root(
-                    folder,
-                    &discovery_allowlists,
-                );
                 let cursor = discovery_cursors.get(&key).cloned();
-                let result =
-                    FileIndexer::discover_directory_page_in(folder, cursor.as_deref(), scope.as_ref());
+                let result = FileIndexer::discover_directory_page_in(
+                    folder,
+                    cursor.as_deref(),
+                    scopes.for_root(folder),
+                );
                 truncated |= result.truncated;
-                partial |= result.partial;
+                if result.partial {
+                    incomplete.push(folder.clone());
+                }
                 pages.push((
                     folder.clone(),
                     crate::sharing::paged_cycle::PageFacts {
@@ -5926,7 +6141,7 @@ async fn reload_shared_files_page(
                 cursor_updates.insert(folder.clone(), result.next_cursor);
                 files.extend(result.files);
             }
-            (files, truncated, partial, cursor_updates, scanned, pages)
+            (files, truncated, incomplete, cursor_updates, scanned, pages)
         })
         .await
         {
@@ -6078,12 +6293,11 @@ async fn reload_shared_files_page(
         }
         discovered.extend(unchanged_rows);
 
-        let (removed_fresh_hashes, placeholders_before_pass) = {
-            let mut index = local_index.write().await;
-            let placeholders_before_pass = unhashed_placeholders_under(&index, &reloaded_folders);
-            // Folders past the page cap reconcile once per cursor cycle; see
-            // `sharing::paged_cycle`.
-            let finished_cycles = {
+        // Folders past the page cap reconcile once per cursor cycle; see
+        // `sharing::paged_cycle`.
+        let finished_cycles = {
+            let index = local_index.read().await;
+            {
                 let mut cycles = crate::sharing::paged_cycle::cycles()
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -6121,8 +6335,14 @@ async fn reload_shared_files_page(
                         })
                         .collect::<Vec<_>>()
                 }
-            };
-            let before = (!discovery_partial || !settling.is_empty() || !finished_cycles.is_empty()).then(|| {
+            }
+        };
+        let finished_cycles = spare_rows_back_on_disk(&local_index, finished_cycles).await;
+        let authoritative = authoritative_folders(&reloaded_folders, &discovery_incomplete);
+        let (removed_fresh_hashes, placeholders_before_pass) = {
+            let mut index = local_index.write().await;
+            let placeholders_before_pass = unhashed_placeholders_under(&index, &reloaded_folders);
+            let before = (!authoritative.is_empty() || !settling.is_empty() || !finished_cycles.is_empty()).then(|| {
                 index
                     .all_files()
                     .iter()
@@ -6130,7 +6350,7 @@ async fn reload_shared_files_page(
                     .cloned()
                     .collect::<Vec<_>>()
             });
-            index.reconcile_files_for_folders(&reloaded_folders, discovered, !discovery_partial);
+            index.reconcile_files_for_folders(&authoritative, discovered, !authoritative.is_empty());
             for (folder, doomed) in &finished_cycles {
                 let removed = index.remove_files_where(|file| {
                     crate::security::path_within_dir(&file.path, folder)
@@ -6689,13 +6909,21 @@ fn withhold_keys(
         files.retain(|item| !keys.contains(item));
         changed |= files.len() != before;
         let allowed = files.iter().cloned().collect::<HashSet<_>>();
-        for key in keys {
-            if crate::security::path_within_dir(key, folder) && !allowlist_permits(&allowed, key) {
-                let list = withheld.entry(folder.clone()).or_default();
-                if !list.contains(key) {
-                    list.push(key.clone());
-                    changed = true;
-                }
+        let mut newly = keys
+            .iter()
+            .filter(|key| {
+                crate::security::path_within_dir(key, folder) && !allowlist_permits(&allowed, key)
+            })
+            .peekable();
+        if newly.peek().is_none() {
+            continue;
+        }
+        let list = withheld.entry(folder.clone()).or_default();
+        let mut listed = list.iter().cloned().collect::<HashSet<_>>();
+        for key in newly {
+            if listed.insert(key.clone()) {
+                list.push(key.clone());
+                changed = true;
             }
         }
     }
@@ -7575,6 +7803,129 @@ mod tests {
         assert_eq!(lists[&other], vec![film], "another share is untouched");
         let scope = crate::sharing::indexer::DiscoveryScope::for_root(&folder, &lists);
         assert!(scope.is_some(), "discovery still walks only what is listed");
+    }
+
+    #[test]
+    fn withholding_a_file_twice_lists_it_once() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let folder = crate::search::index::normalize_path_key(&format!("C:{sep}music"));
+        let a = format!("{folder}{sep}a.mp3");
+        let b = format!("{folder}{sep}b.mp3");
+        let mut lists = std::collections::HashMap::from([(folder.clone(), vec![a.clone(), b.clone()])]);
+        let mut withheld = std::collections::HashMap::new();
+        assert!(withhold_keys(&mut lists, &mut withheld, &HashSet::from([a.clone()])));
+        assert!(!withhold_keys(&mut lists, &mut withheld, &HashSet::from([a.clone()])));
+        assert!(withhold_keys(&mut lists, &mut withheld, &HashSet::from([a.clone(), b.clone()])));
+        let mut listed = withheld[&folder].clone();
+        listed.sort();
+        assert_eq!(listed, vec![a, b]);
+    }
+
+    /// One folder past the page cap must not keep every other folder's deleted
+    /// files in the index: each folder whose own page is complete reconciles.
+    #[test]
+    fn a_complete_folder_reconciles_while_another_folder_pages() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let big = format!("C:{sep}big");
+        let small = format!("C:{sep}small");
+        let nested = format!("{big}{sep}inner");
+        let reloaded = vec![big.clone(), small.clone(), nested.clone()];
+        let incomplete = vec![big.clone()];
+        assert_eq!(
+            authoritative_folders(&reloaded, &incomplete),
+            vec![small.clone()],
+            "a share inside a partial one may owe rows to its page"
+        );
+        assert_eq!(authoritative_folders(&reloaded, &[]), reloaded);
+
+        let path = |folder: &str, name: &str| format!("{folder}{sep}{name}");
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            indexed_file(&path(&big, "kept.bin"), &"a1".repeat(16)),
+            indexed_file(&path(&big, "not-on-this-page.bin"), &"a2".repeat(16)),
+            indexed_file(&path(&small, "kept.bin"), &"b1".repeat(16)),
+            indexed_file(&path(&small, "deleted.bin"), &"b2".repeat(16)),
+        ]);
+        let discovered = vec![
+            indexed_file(&path(&big, "kept.bin"), &"a1".repeat(16)),
+            indexed_file(&path(&small, "kept.bin"), &"b1".repeat(16)),
+        ];
+        let authoritative = authoritative_folders(&[big.clone(), small.clone()], &incomplete);
+        index.reconcile_files_for_folders(&authoritative, discovered, !authoritative.is_empty());
+        assert!(index.get_by_path(&path(&big, "not-on-this-page.bin")).is_some());
+        assert!(index.get_by_path(&path(&small, "deleted.bin")).is_none());
+        assert!(index.get_by_path(&path(&small, "kept.bin")).is_some());
+    }
+
+    /// A 1.7.0 install unshared in known.met every file a partial share left
+    /// off its list. Widening the list must bring those up shared, and nothing
+    /// the user unshared themselves.
+    #[test]
+    fn widening_a_partial_share_admits_only_what_it_newly_offers() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let folder = crate::search::index::normalize_path_key(&format!("C:{sep}music"));
+        let file = |name: &str| format!("{folder}{sep}{name}");
+        let live = file("live");
+        let unshared = |name: &str, byte: u8| {
+            let mut record = known_record(&file(name), [byte; 16], "");
+            record.is_shared = false;
+            record
+        };
+        let records = [
+            unshared("stale.mp3", 1),
+            unshared("withheld.mp3", 2),
+            unshared(&format!("live{sep}by-hand.mp3"), 3),
+            unshared("still-off.mp3", 4),
+            unshared("intent.mp3", 5),
+            known_record(&file("shared.mp3"), [6; 16], ""),
+            unshared("outside.mp3", 7),
+        ];
+        let before = std::collections::HashMap::from([(folder.clone(), vec![live.clone()])]);
+        let after = std::collections::HashMap::from([(
+            folder.clone(),
+            vec![
+                live.clone(),
+                file("stale.mp3"),
+                file("withheld.mp3"),
+                file("intent.mp3"),
+                file("shared.mp3"),
+                file("outside.mp3"),
+            ],
+        )]);
+        let kept = HashSet::from([file("withheld.mp3"), file("intent.mp3")]);
+        let under = vec![
+            file("stale.mp3"),
+            file("withheld.mp3"),
+            live.clone(),
+            file("still-off.mp3"),
+            file("intent.mp3"),
+            file("shared.mp3"),
+        ];
+        let admitted = newly_admitted_unshared(
+            records.iter(),
+            &under,
+            &crate::sharing::indexer::AllowlistOffers::new(&before),
+            &crate::sharing::indexer::AllowlistOffers::new(&after),
+            &kept,
+        );
+        assert_eq!(admitted, vec![(file("stale.mp3"), hex::encode([1u8; 16]))]);
+
+        // Lifting the list admits the whole folder, a drive root included.
+        let drive = crate::search::index::normalize_path_key(&format!("D:{sep}"));
+        let on_drive = unshared("x", 8);
+        let on_drive = crate::storage::known_files::KnownFileRecord {
+            file_path: format!("{drive}films{sep}x.mkv"),
+            ..on_drive
+        };
+        let before = std::collections::HashMap::from([(drive.clone(), Vec::new())]);
+        let admitted = newly_admitted_unshared(
+            std::iter::once(&on_drive),
+            std::slice::from_ref(&drive),
+            &crate::sharing::indexer::AllowlistOffers::new(&before),
+            &crate::sharing::indexer::AllowlistOffers::default(),
+            &HashSet::new(),
+        );
+        assert_eq!(admitted.len(), 1);
     }
 
     #[test]

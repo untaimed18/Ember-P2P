@@ -32,9 +32,9 @@ use serde::Serialize;
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
 use crate::commands::sharing::{
-    add_shared_folder_approved, batch_share, finish_pick, path_key_covers,
-    persist_folder_allowlists, share_all_in_folder, FolderAddOutcome, ShareApproval,
-    SharedFolderPick,
+    add_shared_folder_approved, admit_known_files, batch_share, finish_pick, offer_all_in_folder,
+    path_key_covers, persist_folder_allowlists, share_all_in_folder, FolderAddOutcome,
+    FolderListsBefore, ShareApproval, SharedFolderPick,
 };
 use crate::commands::settings::{elide_for_dialog, shared_paths_overlap};
 use crate::search::index::normalize_path_key;
@@ -1609,6 +1609,7 @@ pub async fn share_browser_selection(
     })?;
     let shared_folders = current_shared_folders(&state).await;
     let allowlists = current_allowlists(&state).await;
+    let lists_before = FolderListsBefore::take(&state).await;
     let (unshared, offers) = current_offer_state(&state, &shared_folders).await;
     let mut chosen = Vec::new();
     let mut already_noted = Vec::new();
@@ -1688,6 +1689,7 @@ pub async fn share_browser_selection(
         .collect();
     if !cleared.is_empty() {
         persist_folder_allowlists(&state, &[], &cleared).await?;
+        admit_known_files(&state, &lists_before, &cleared).await;
         crate::commands::sharing::queue_rescan(&app, cleared.iter().map(PathBuf::from).collect());
     }
 
@@ -1719,6 +1721,10 @@ pub async fn share_browser_selection(
         // indexed and taken off the network has to be offered now.
         let mut offered: Vec<String> = Vec::new();
         let mut failed = false;
+        if add.allowlist_grew {
+            let admitted: Vec<String> = add.files.iter().chain(&add.dirs).cloned().collect();
+            admit_known_files(&state, &lists_before, &admitted).await;
+        }
         if !add.files.is_empty() {
             match batch_share(app.clone(), state.clone(), add.files.clone()).await {
                 Ok(0) => {}
@@ -1731,7 +1737,7 @@ pub async fn share_browser_selection(
             }
         }
         for dir in &add.dirs {
-            match share_all_in_folder(app.clone(), state.inner(), dir).await {
+            match offer_all_in_folder(app.clone(), state.inner(), dir).await {
                 Ok(paths) => offered.extend(paths),
                 Err(error) => {
                     tracing::warn!("Could not offer {dir}: {error}");
@@ -1742,7 +1748,7 @@ pub async fn share_browser_selection(
         }
         if add.allowlist_grew {
             // Discovery skipped them while they were off the allowlist; the
-            // folders are scanned by `share_all_in_folder` above.
+            // folders are scanned by `offer_all_in_folder` above.
             crate::commands::sharing::queue_rescan(&app, add.files.iter().map(PathBuf::from).collect());
             if offered.is_empty() {
                 offered = add.files.iter().chain(&add.dirs).cloned().collect();
@@ -1762,7 +1768,12 @@ pub async fn share_browser_selection(
         {
             Ok(add) if add.outcome == FolderAddOutcome::Added => result.added.push(path),
             Ok(add) if promoting => {
-                match share_all_in_folder(app.clone(), state.inner(), &add.folder).await {
+                let offered = if cleared.iter().any(|folder| same_folder(folder, &add.folder)) {
+                    offer_all_in_folder(app.clone(), state.inner(), &add.folder).await
+                } else {
+                    share_all_in_folder(app.clone(), state.inner(), &add.folder, &lists_before).await
+                };
+                match offered {
                     Ok(paths) if paths.is_empty() => result.files_shared.push(add.folder.clone()),
                     Ok(paths) => result.files_shared.extend(paths),
                     Err(error) => {
