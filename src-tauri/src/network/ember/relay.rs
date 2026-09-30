@@ -115,14 +115,24 @@ const MAX_CONCURRENT_RELAY_SESSIONS: usize = 4;
 /// sensible donation, low enough that a typo in config.json cannot turn the
 /// node into an unbounded proxy.
 const MAX_RELAY_SESSIONS_CEILING: usize = 64;
+/// Sessions one requester may hold at once. Below the default total so that one
+/// friend, however many transfers it has queued, leaves the others a slot.
+const MAX_RELAY_SESSIONS_PER_REQUESTER: usize = 2;
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const RELAY_MAX_DURATION: Duration = Duration::from_secs(7200);
+/// How long a bridge may move nothing in either direction before it is torn
+/// down. eMule drops a silent client socket well inside this, so an eD2K session
+/// that is still alive has sent something by then.
+const RELAY_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const RELAY_BRIDGE_IDLE_CHECK: Duration = Duration::from_secs(10);
 const MAX_WS_RELAY_FRAME: usize = 16 * 1024;
 
 /// A relay session between two LowID peers through an intermediary.
 #[derive(Debug)]
 pub struct RelaySession {
     pub session_id: u32,
+    /// The requester's handshake-proven Ember node id.
+    pub requester: [u8; 16],
     pub initiator_ip: Ipv4Addr,
     pub initiator_port: u16,
     pub target_ip: Ipv4Addr,
@@ -145,6 +155,7 @@ pub enum RelaySessionState {
 impl RelaySession {
     pub fn new(
         session_id: u32,
+        requester: [u8; 16],
         initiator_ip: Ipv4Addr,
         initiator_port: u16,
         target_ip: Ipv4Addr,
@@ -154,6 +165,7 @@ impl RelaySession {
         let now = Instant::now();
         Self {
             session_id,
+            requester,
             initiator_ip,
             initiator_port,
             target_ip,
@@ -341,6 +353,7 @@ impl RelayManager {
     /// Create a new relay session if capacity allows.
     pub fn create_session(
         &mut self,
+        requester: [u8; 16],
         initiator_ip: Ipv4Addr,
         initiator_port: u16,
         target_ip: Ipv4Addr,
@@ -359,12 +372,25 @@ impl RelayManager {
             );
             return None;
         }
+        let held = self
+            .sessions
+            .values()
+            .filter(|session| session.requester == requester)
+            .count();
+        if held >= MAX_RELAY_SESSIONS_PER_REQUESTER {
+            debug!(
+                "RelayManager: requester {} already holds {held} sessions",
+                hex::encode(requester)
+            );
+            return None;
+        }
 
         let id = self.next_session_id;
         self.next_session_id = self.next_session_id.wrapping_add(1);
 
         let session = RelaySession::new(
             id,
+            requester,
             initiator_ip,
             initiator_port,
             target_ip,
@@ -1940,11 +1966,9 @@ const RELAY_PACE_CHUNK: usize = 16 * 1024;
 /// before the session is torn down.
 ///
 /// Pacing makes starvation reachable: with a small cap and busy file-upload
-/// slots, `yield_then_take_upload` can wait indefinitely. An `Active` session
-/// is exempt from `RELAY_IDLE_TIMEOUT` (see `RelaySession::is_expired`) and is
-/// only reaped at `RELAY_MAX_DURATION`, so a starved bridge would otherwise
-/// squat one of `MAX_CONCURRENT_RELAY_SESSIONS` for two hours while moving
-/// nothing. Failing out frees the slot and logs the cause.
+/// slots, `yield_then_take_upload` can wait indefinitely. The bridge watchdog
+/// ([`relay_bridge_stalled`]) would end such a session too; failing here first
+/// names the cause.
 const RELAY_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Copy `reader` → `writer`, yielding to file-upload slots when a cap is set.
@@ -1953,11 +1977,16 @@ const RELAY_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// top of the token bucket file uploads already live in. HighID nodes that
 /// serve as a Kad buddy are also the nodes that donate relay, so an
 /// unmetered bridge looked like "buddy serving killed my upload speed".
+///
+/// Each chunk is also added to `moved` as it lands, which is what the bridge's
+/// progress watchdog reads and what the session is credited with when it ends
+/// in an error, as most eD2K sessions do.
 async fn copy_yielding_to_file_uploads<R, W>(
     reader: &mut R,
     writer: &mut W,
     limiter: &crate::bandwidth::limiter::BandwidthLimiter,
     max_bytes: u64,
+    moved: &std::sync::atomic::AtomicU64,
 ) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -1985,8 +2014,33 @@ where
         }
         writer.write_all(&buf[..n]).await?;
         copied += n as u64;
+        moved.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(copied)
+}
+
+/// Resolves once `moved` has stood still for `idle`, checking every `check`.
+///
+/// Covers what neither copy direction can see alone: a read that never returns
+/// because the far side went silent, and a write parked on flow control
+/// because nobody is reading.
+async fn relay_bridge_stalled(
+    moved: &std::sync::atomic::AtomicU64,
+    idle: Duration,
+    check: Duration,
+) {
+    let mut seen = moved.load(std::sync::atomic::Ordering::Relaxed);
+    let mut since = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(check).await;
+        let now = moved.load(std::sync::atomic::Ordering::Relaxed);
+        if now != seen {
+            seen = now;
+            since = tokio::time::Instant::now();
+        } else if since.elapsed() >= idle {
+            return;
+        }
+    }
 }
 
 /// What the accept loop needs in order to serve a chat attachment.
@@ -2570,6 +2624,7 @@ pub async fn run_quic_accept_loop(
                     let created = {
                         let mut mgr_lock = mgr.lock().await;
                         mgr_lock.create_session(
+                            verified.requester_ember_hash,
                             initiator_ip,
                             initiator_port,
                             target_ip,
@@ -2660,6 +2715,7 @@ pub async fn run_quic_accept_loop(
                 }
 
                 let bw_limit = RELAY_MAX_BYTES_PER_DIRECTION;
+                let moved = std::sync::atomic::AtomicU64::new(0);
                 let relay_result = tokio::time::timeout(RELAY_MAX_DURATION, async {
                     let mut i2t_limited = init_recv.take(bw_limit);
                     let mut t2i_limited = tgt_recv.take(bw_limit);
@@ -2668,43 +2724,50 @@ pub async fn run_quic_accept_loop(
                         &mut tgt_send,
                         &limiter,
                         bw_limit,
+                        &moved,
                     );
                     let t2i = copy_yielding_to_file_uploads(
                         &mut t2i_limited,
                         &mut init_send,
                         &limiter,
                         bw_limit,
+                        &moved,
                     );
 
-                    match tokio::try_join!(i2t, t2i) {
-                        Ok((i2t_bytes, t2i_bytes)) => {
-                            let total = i2t_bytes + t2i_bytes;
-                            if i2t_bytes >= bw_limit || t2i_bytes >= bw_limit {
-                                info!(
-                                    "Relay session {session_id}: per-direction byte ceiling reached (i→t: {i2t_bytes}B, t→i: {t2i_bytes}B)"
-                                );
-                            } else {
-                                info!(
-                                    "Relay session {session_id}: completed (i→t: {i2t_bytes}B, t→i: {t2i_bytes}B)"
-                                );
+                    tokio::select! {
+                        joined = async { tokio::try_join!(i2t, t2i) } => match joined {
+                            Ok((i2t_bytes, t2i_bytes)) => {
+                                if i2t_bytes >= bw_limit || t2i_bytes >= bw_limit {
+                                    info!(
+                                        "Relay session {session_id}: per-direction byte ceiling reached (i→t: {i2t_bytes}B, t→i: {t2i_bytes}B)"
+                                    );
+                                } else {
+                                    info!(
+                                        "Relay session {session_id}: completed (i→t: {i2t_bytes}B, t→i: {t2i_bytes}B)"
+                                    );
+                                }
                             }
-                            total
-                        }
-                        Err(e) => {
-                            debug!("Relay session {session_id}: IO error during relay: {e}");
-                            0
+                            Err(e) => {
+                                debug!("Relay session {session_id}: IO error during relay: {e}");
+                            }
+                        },
+                        () = relay_bridge_stalled(
+                            &moved,
+                            RELAY_BRIDGE_IDLE_TIMEOUT,
+                            RELAY_BRIDGE_IDLE_CHECK,
+                        ) => {
+                            info!(
+                                "Relay session {session_id}: nothing moved for {}s, closing the bridge",
+                                RELAY_BRIDGE_IDLE_TIMEOUT.as_secs()
+                            );
                         }
                     }
                 })
                 .await;
-
-                let total_bytes = match relay_result {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
-                        debug!("Relay session {session_id}: max duration reached");
-                        0
-                    }
-                };
+                if relay_result.is_err() {
+                    debug!("Relay session {session_id}: max duration reached");
+                }
+                let total_bytes = moved.load(std::sync::atomic::Ordering::Relaxed);
 
                 let _ = init_send.finish();
                 let _ = tgt_send.finish();
@@ -3359,6 +3422,7 @@ mod tests {
     fn active_relay_ignores_waiting_session_idle_timeout() {
         let mut session = RelaySession::new(
             1,
+            [0xA1; 16],
             Ipv4Addr::new(1, 2, 3, 4),
             4662,
             Ipv4Addr::new(5, 6, 7, 8),
@@ -3392,6 +3456,7 @@ mod tests {
 
         let sid = mgr
             .create_session(
+                [0xA1; 16],
                 Ipv4Addr::new(1, 2, 3, 4),
                 4662,
                 Ipv4Addr::new(5, 6, 7, 8),
@@ -3418,6 +3483,7 @@ mod tests {
 
         let sid = mgr
             .create_session(
+                [0xA1; 16],
                 Ipv4Addr::new(1, 2, 3, 4),
                 4662,
                 Ipv4Addr::new(5, 6, 7, 8),
@@ -3439,6 +3505,7 @@ mod tests {
         // A second session's bytes accumulate on top rather than replacing.
         let sid2 = mgr
             .create_session(
+                [0xA2; 16],
                 Ipv4Addr::new(9, 9, 9, 9),
                 4662,
                 Ipv4Addr::new(5, 6, 7, 8),
@@ -3459,6 +3526,7 @@ mod tests {
             ip_bytes[3] = (i + 1) as u8;
             assert!(mgr
                 .create_session(
+                    [i as u8; 16],
                     Ipv4Addr::from(ip_bytes),
                     4662,
                     Ipv4Addr::new(10, 10, 10, 10),
@@ -3470,6 +3538,7 @@ mod tests {
         // Next one should fail
         assert!(mgr
             .create_session(
+                [0xFF; 16],
                 Ipv4Addr::new(99, 99, 99, 99),
                 4662,
                 Ipv4Addr::new(10, 10, 10, 10),
@@ -3477,6 +3546,82 @@ mod tests {
                 [0xFF; 16],
             )
             .is_none());
+    }
+
+    /// One requester, however many transfers it has, cannot take every slot.
+    #[test]
+    fn one_requester_holds_at_most_its_share_of_the_relay() {
+        let mut mgr = RelayManager::new();
+        let greedy = [0xB1; 16];
+        let open = |mgr: &mut RelayManager, requester: [u8; 16], port: u16| {
+            mgr.create_session(
+                requester,
+                Ipv4Addr::new(1, 2, 3, 4),
+                port,
+                Ipv4Addr::new(10, 10, 10, 10),
+                4663,
+                [7u8; 16],
+            )
+        };
+        let mut held = Vec::new();
+        for port in 0..MAX_RELAY_SESSIONS_PER_REQUESTER as u16 {
+            held.push(open(&mut mgr, greedy, 5000 + port).expect("within its share"));
+        }
+        assert!(open(&mut mgr, greedy, 6000).is_none(), "over its share");
+        assert!(
+            open(&mut mgr, [0xB2; 16], 6001).is_some(),
+            "another requester still gets a slot"
+        );
+        mgr.remove_session(held[0]);
+        assert!(open(&mut mgr, greedy, 6002).is_some(), "an ended session frees its slot");
+    }
+
+    /// A bridge that moves nothing is closed after the idle limit, and one that
+    /// keeps moving is not.
+    #[tokio::test]
+    async fn a_silent_bridge_is_closed_and_a_busy_one_is_not() {
+        let idle = Duration::from_millis(200);
+        let check = Duration::from_millis(20);
+        let moved = std::sync::atomic::AtomicU64::new(0);
+        let started = tokio::time::Instant::now();
+        relay_bridge_stalled(&moved, idle, check).await;
+        assert!(started.elapsed() >= idle);
+
+        let moved = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let feeder = {
+            let moved = moved.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(check).await;
+                    moved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        };
+        let busy =
+            tokio::time::timeout(idle * 4, relay_bridge_stalled(&moved, idle, check)).await;
+        feeder.abort();
+        assert!(busy.is_err(), "a bridge still moving bytes is left alone");
+    }
+
+    /// The bytes a session is credited with are the ones that crossed, even when
+    /// it ends in an error rather than a clean close.
+    #[tokio::test]
+    async fn copied_bytes_are_counted_as_they_land() {
+        let limiter = crate::bandwidth::limiter::BandwidthLimiter::new(0, 0);
+        let moved = std::sync::atomic::AtomicU64::new(0);
+        let mut reader: &[u8] = &[5u8; RELAY_PACE_CHUNK * 3 + 17];
+        let mut writer = Vec::new();
+        let copied = copy_yielding_to_file_uploads(
+            &mut reader,
+            &mut writer,
+            &limiter,
+            u64::MAX,
+            &moved,
+        )
+        .await
+        .unwrap();
+        assert_eq!(copied, (RELAY_PACE_CHUNK * 3 + 17) as u64);
+        assert_eq!(moved.load(std::sync::atomic::Ordering::Relaxed), copied);
     }
 
     #[test]
