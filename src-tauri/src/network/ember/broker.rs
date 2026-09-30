@@ -222,7 +222,7 @@ pub async fn punch_quic_pinned(
 
 /// Session counters for the LowID-to-LowID broker. Owned by
 /// `ConnectionBroker` so the state machine itself is the source of truth
-/// for what counts as an "attempt" or "failure" ??? consumers should
+/// for what counts as an "attempt" or "failure" — consumers should
 /// snapshot via `ConnectionBroker::stats()` rather than incrementing
 /// from the outside.
 #[derive(Debug, Default, Clone, Copy)]
@@ -567,7 +567,7 @@ impl ConnectionBroker {
 
     /// Add a relay-capable peer discovered via EPX. `expires_at_unix` must
     /// come from the verified `RelayAttestation` this candidate was
-    /// admitted with (see `verify_relay_attestation` at the call site) ???
+    /// admitted with (see `verify_relay_attestation` at the call site) —
     /// it is the caller's job to have already checked the signature.
     /// `introduced_by` is the peer that handed us this attestation, which is
     /// *not* the relay it names — a friend forwards attestations it did not
@@ -711,7 +711,7 @@ impl ConnectionBroker {
     /// stranger's.
     ///
     /// Filters on both the age-based `RELAY_CANDIDATE_PICK_MAX_AGE` window
-    /// *and* the candidate's own signed `expires_at_unix` ??? the age window
+    /// *and* the candidate's own signed `expires_at_unix` — the age window
     /// alone is only an upper bound (aligned to the max ERAT TTL); a
     /// short-TTL attestation can expire well before it, and picking an
     /// already-expired candidate just wastes a relay attempt that the
@@ -998,7 +998,7 @@ mod tests {
 
     /// A candidate whose signed `expires_at_unix` has already passed must
     /// never be picked, even though it's well within the age-based
-    /// `RELAY_CANDIDATE_PICK_MAX_AGE` window ??? the age window is only an
+    /// `RELAY_CANDIDATE_PICK_MAX_AGE` window — the age window is only an
     /// upper bound (aligned to the max ERAT TTL), not a substitute for
     /// checking the attestation's own shorter-lived expiry.
     #[test]

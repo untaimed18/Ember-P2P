@@ -1740,16 +1740,10 @@ fn relay_requester_refusal(
 /// fired, which `REJECT_BAD_TARGET` alone cannot (a port-0 typo and a
 /// deliberate LAN probe are the same byte on the wire).
 ///
-/// Deliberately *not* decided here: the operator's `ipfilter.dat` ranges and
-/// the enforced ban set. Both live on the network task's `NetworkState` and
-/// the QUIC accept task holds no shared handle to either, so an address the
-/// operator has explicitly blocked is currently kept out only by the friend
-/// gate applied to the *requester* on the RELAY_REQUEST path. Threading a
-/// `kad::ip_filter::SharedIpFilter` plus an `ed2k::upload::SharedBannedIps`
-/// into this function — both are already published for the upload listener,
-/// which applies exactly this pair to inbound eD2K TCP — is what closes the
-/// remaining half: without it a friend can still name a blocked host and the
-/// relay will dial it.
+/// Not decided here: the operator's `ipfilter.dat` ranges and the enforced
+/// ban set. The accept path applies those next, through
+/// [`RelayAddressPolicy::outbound_refusal`], unconditionally on the filter because
+/// a relay target is an outbound dial to an address a remote peer chose.
 fn relay_target_refusal(
     target_ip: Ipv4Addr,
     target_port: u16,

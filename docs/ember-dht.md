@@ -223,7 +223,8 @@ session is an authenticated, live, bidirectional channel to exactly the peer we
 want to meet. That is all a UDP simultaneous open needs, and it needs no third
 party, no rendezvous server and no new trust relationship.
 
-One new `EMBER_EXT` sub-type (`0x07`; `0x06` is the highest in use), sent over the
+One new `EMBER_EXT` sub-type (the next free one; `0x01` to `0x0C` are taken, `0x07`
+being `EMBER_EXT_FRIEND_DECLINE`), sent over the
 friend session: *"I am sending you a DHT `PING` from my Ember UDP socket now — send
 me one too."* Both sides send immediately, each outbound datagram opens the return
 path through its own NAT, and whichever `PING` lands first is answered with a
@@ -313,7 +314,8 @@ unexercised end to end:
 - Republish behaviour across a full record TTL on a large library.
 
 For a local two-node test where neither side can reach KAD, the dev
-*commands* remain even though the dev page is gone —
+*commands* remain in debug builds (they are `#[cfg(debug_assertions)]`, so a
+release build has none of them) even though the dev page is gone —
 `add_ember_dht_contact` is the only way to introduce two nodes directly,
 alongside `ember_dht_ping_peer`, `ember_dht_find_node`,
 `ember_dht_iterative_find_node`, `ember_dht_publish_keyword`,
@@ -652,9 +654,9 @@ against KAD.
   join timeout with still-zero verified peers, Search shows the muted
   no-peers hint.
 - Storer-side replication telemetry. The publish side logs an
-  `Ember publish cycle` heartbeat each minute; maintenance now logs an
-  `Ember replication cycle` heartbeat as well (see
-  [Closed](#closed)).
+  `Ember publish cycle` heartbeat each minute. Maintenance has no heartbeat of
+  its own; the replication counters in Ember diagnostics are where storer-side
+  work shows.
 
 ### Integrity and downloads
 
@@ -802,9 +804,11 @@ against KAD.
   responders vouch for it before how many publishers name it; and automatic
   pinning needs `MIN_EMBER_DIGEST_PUBLISHERS` (2) publishers carried by
   `MIN_EMBER_DIGEST_RESPONDERS` (2) distinct responders, where a record two
-  nodes both returned counts as two. That bounds what a responder can fabricate
-  in its own reply: the attack costs a second node on the searcher's shortlist
-  rather than a second keypair.
+  responders both returned counts as two. A responder is its /24 when the search
+  knows the address (`EmberResponder`), because a node id is only a keypair and
+  one host answering under several keys used to corroborate a digest alone. That
+  bounds what a responder can fabricate in its own reply: the attack costs a
+  second node in another /24 on the searcher's shortlist, not a second keypair.
 
   It does not bound what a node can STORE. The storers near a keyword return
   records planted on them as their own, so a fake digest planted there arrives
@@ -847,8 +851,7 @@ outcomes are in the specification. Kept as a ledger so this file reads as a plan
 - Firewalled sources are discoverable but not dialable.
 - The pre-endorsement buddy trailer — retired rather than fixed.
 - Persist the Ember source publish schedule.
-- Storer-side replication costs more than it buys — settled, with an
-  `Ember replication cycle` heartbeat now logged each maintenance tick.
+- Storer-side replication costs more than it buys — settled.
 - Contact encoding wasted 18% of every response — done, wire v3.
 - Search slots were held by searches that had finished.
 - A truncated `nodes_ember.dat` could still shrink itself away.
@@ -927,7 +930,8 @@ Not Ember-specific, but they cost time to rediscover and had no other home.
 | Area | Location |
 | --- | --- |
 | DHT engine / wire | `src-tauri/src/network/ember/dht/` |
-| Network loop / publish / search drivers | `src-tauri/src/network/mod.rs` |
+| Network loop | `src-tauri/src/network/mod.rs`, ticks in `network/event_loop/` |
+| Ember maintenance / publish / search drivers | `network/ember_dht.rs`, `network/ember_publishing.rs`, `network/ember_search.rs` |
 | Adaptive abuse limits | `src-tauri/src/network/ember/dht/scale.rs` |
 | Dormant native transfer | `src-tauri/src/network/ember/transfer.rs` |
 | Overlay enable flag | `ember_native_enabled` — always on, with no UI control anywhere |

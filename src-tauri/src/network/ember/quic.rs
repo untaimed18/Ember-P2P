@@ -16,7 +16,7 @@ const IDLE_TIMEOUT_SECS: u64 = 120;
 /// Keep-alive interval.
 const KEEP_ALIVE_SECS: u64 = 15;
 
-/// Concurrent stream limits. Ember uses one bidi stream per "request"; 64
+/// Concurrent stream limits. Ember uses one bidi stream per "request"; 128
 /// is plenty for normal RPC and leaves headroom for DHT/relay bursts.
 const MAX_CONCURRENT_BIDI_STREAMS: u32 = 128;
 const MAX_CONCURRENT_UNI_STREAMS: u32 = 128;
@@ -320,12 +320,12 @@ pub fn connection_ed25519_pubkey(connection: &quinn::Connection) -> Option<[u8; 
 /// path (`expected_node_id: None`), that still doesn't prove the key
 /// belongs to a *specific* node_id, and not every dial is pinned: the
 /// relay's `connect_relay_target` calls `endpoint.connect` with no pin.
-/// It does recover the answering peer's node id from the completed
-/// handshake and refuses a target with no Ember identity, or one that
-/// turns out to be the requester itself — but that is an identity check
-/// after the fact, not a pin, because the v2 RELAY_REQUEST carries no
-/// expected identity for the target to compare against. Acceptable
-/// because the relay is untrusted by design and the
+/// It recovers the answering peer's node id from the completed handshake
+/// and refuses a target with no Ember identity, or one that turns out to
+/// be the requester itself. A v3 RELAY_REQUEST names the target's node id,
+/// and the relay then refuses any other identity, which makes that check a
+/// pin in effect; a v2 request names none, so for it the check stays after
+/// the fact. Acceptable because the relay is untrusted by design and the
 /// only traffic that crosses it is an anonymous LowID eD2K transfer whose
 /// integrity rests on MD4/AICH part verification, not on this channel.
 /// Friend *file* transfers never cross this relay: `EmberXferMethod`
