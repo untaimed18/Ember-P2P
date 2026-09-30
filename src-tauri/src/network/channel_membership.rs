@@ -3106,10 +3106,33 @@ pub(super) struct ChannelPresenceIngest {
     /// someone already on the list is not a new XOR-neighbor, but it *is*
     /// the last_seen the presence dot reads.
     pub(super) roster_changed: bool,
+    /// Noise keys to cache for admitted members, or `None` to forget a leaver's.
+    pub(super) noise_keys: Vec<([u8; 32], Option<[u8; 32]>)>,
+    /// Members whose last_seen alone moved, for the next presence emit.
+    pub(super) touched: Vec<([u8; 32], i64)>,
+}
+
+impl ChannelPresenceIngest {
+    /// The part of an ingest that lives in [`NetworkState`], which the database
+    /// half runs without so it can leave the network loop.
+    pub(super) fn apply(&self, state: &mut NetworkState, channel_id: [u8; 16]) {
+        for (publisher, noise_pub) in &self.noise_keys {
+            match noise_pub {
+                Some(key) => {
+                    state.ember_channel_noise_keys.insert(*publisher, *key);
+                }
+                None => {
+                    state.ember_channel_noise_keys.remove(publisher);
+                }
+            }
+        }
+        for (member, at) in &self.touched {
+            mark_channel_presence_dirty(state, channel_id, member, *at);
+        }
+    }
 }
 
 pub(super) fn ingest_channel_presence_records(
-    state: &mut NetworkState,
     db: &Database,
     our_pubkey: &[u8; 32],
     channel_id: [u8; 16],
@@ -3118,6 +3141,8 @@ pub(super) fn ingest_channel_presence_records(
     let mut outcome = ChannelPresenceIngest {
         new_neighbors: false,
         roster_changed: false,
+        noise_keys: Vec::new(),
+        touched: Vec::new(),
     };
     if db.chat_locked() {
         return outcome;
@@ -3196,7 +3221,7 @@ pub(super) fn ingest_channel_presence_records(
                     );
                 }
             }
-            state.ember_channel_noise_keys.remove(&member.publisher_key);
+            outcome.noise_keys.push((member.publisher_key, None));
             continue;
         }
         if !current.contains(&member.publisher_key)
@@ -3217,9 +3242,9 @@ pub(super) fn ingest_channel_presence_records(
             if write == ChannelMemberWrite::Refused {
                 continue;
             }
-            state
-                .ember_channel_noise_keys
-                .insert(member.publisher_key, member.noise_pub);
+            outcome
+                .noise_keys
+                .push((member.publisher_key, Some(member.noise_pub)));
             match write {
                 ChannelMemberWrite::Inserted => {
                     if member.publisher_key != *our_pubkey {
@@ -3237,12 +3262,7 @@ pub(super) fn ingest_channel_presence_records(
                 // was clamped when the batch was merged.
                 ChannelMemberWrite::Touched => {
                     if member.publisher_key != *our_pubkey {
-                        mark_channel_presence_dirty(
-                            state,
-                            channel_id,
-                            &member.publisher_key,
-                            member.timestamp,
-                        );
+                        outcome.touched.push((member.publisher_key, member.timestamp));
                     }
                 }
                 ChannelMemberWrite::Unchanged | ChannelMemberWrite::Refused => {}
@@ -3250,6 +3270,93 @@ pub(super) fn ingest_channel_presence_records(
         }
     }
     outcome
+}
+
+/// Room lookup results waiting to be written, taken off [`NetworkState`] in one
+/// go so the writes can run away from the network loop.
+#[derive(Default)]
+pub(super) struct ChannelIngestBatch {
+    pub(super) presence: Vec<([u8; 16], Vec<Vec<u8>>)>,
+    pub(super) moderation: Vec<([u8; 16], Vec<Vec<u8>>, usize)>,
+    pub(super) claim: Vec<([u8; 16], Vec<Vec<u8>>)>,
+    pub(super) epoch: Vec<([u8; 16], i64, Vec<Vec<u8>>)>,
+    pub(super) handoff: Vec<([u8; 16], Vec<Vec<u8>>)>,
+}
+
+impl ChannelIngestBatch {
+    /// Everything queued, or `None` when nothing is.
+    pub(super) fn take(state: &mut NetworkState) -> Option<Self> {
+        let batch = Self {
+            presence: std::mem::take(&mut state.ember_pending_channel_presence),
+            moderation: std::mem::take(&mut state.ember_pending_channel_moderation),
+            claim: std::mem::take(&mut state.ember_pending_channel_claim),
+            epoch: std::mem::take(&mut state.ember_pending_channel_epoch),
+            handoff: std::mem::take(&mut state.ember_pending_channel_handoff),
+        };
+        let empty = batch.presence.is_empty()
+            && batch.moderation.is_empty()
+            && batch.claim.is_empty()
+            && batch.epoch.is_empty()
+            && batch.handoff.is_empty();
+        (!empty).then_some(batch)
+    }
+}
+
+/// What a [`ChannelIngestBatch`] changed, for the network loop to act on.
+#[derive(Default)]
+pub(super) struct ChannelIngestResults {
+    pub(super) presence: Vec<([u8; 16], ChannelPresenceIngest)>,
+    /// Rooms whose moderation snapshot landed.
+    pub(super) moderated: Vec<[u8; 16]>,
+    /// `(room, successor)` for each ownership claim applied.
+    pub(super) claimed: Vec<([u8; 16], [u8; 16])>,
+    /// Rooms that became readable under a new epoch.
+    pub(super) rekeyed: Vec<[u8; 16]>,
+    /// `(room, successor)` for each handoff followed.
+    pub(super) followed: Vec<([u8; 16], [u8; 16])>,
+}
+
+/// Apply a batch to the database. Blocking: every step takes the database lock.
+pub(super) fn run_channel_ingest(
+    db: &Database,
+    identity: &crate::storage::identity::NodeIdentity,
+    our_pubkey: &[u8; 32],
+    batch: ChannelIngestBatch,
+) -> ChannelIngestResults {
+    let mut results = ChannelIngestResults::default();
+    for (channel_id, records) in batch.presence {
+        let ingest = ingest_channel_presence_records(db, our_pubkey, channel_id, &records);
+        results.presence.push((channel_id, ingest));
+    }
+    let checked_at = chrono::Utc::now().timestamp();
+    for (channel_id, records, answered) in batch.moderation {
+        // Only a search some peer actually answered counts as having looked.
+        // Finding no owner record because nobody replied is not evidence the
+        // owner has gone, and succession is the one feature that acts on
+        // absence.
+        if answered > 0 {
+            let _ = db.touch_channel_moderation_checked(&hex::encode(channel_id), checked_at);
+        }
+        if ingest_channel_moderation_records(db, channel_id, &records) {
+            results.moderated.push(channel_id);
+        }
+    }
+    for (channel_id, records) in batch.claim {
+        if let Some(successor) = ingest_channel_claim_records(db, channel_id, &records) {
+            results.claimed.push((channel_id, successor));
+        }
+    }
+    for (channel_id, epoch, records) in batch.epoch {
+        if ingest_channel_epoch_records(db, identity, channel_id, epoch, &records) {
+            results.rekeyed.push(channel_id);
+        }
+    }
+    for (channel_id, records) in batch.handoff {
+        if let Some(successor) = ingest_channel_handoff_records(db, channel_id, &records) {
+            results.followed.push((channel_id, successor));
+        }
+    }
+    results
 }
 
 /// Hold presence blobs until every FIND_VALUE for this room (current and

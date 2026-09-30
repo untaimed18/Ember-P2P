@@ -121,6 +121,7 @@ pub(super) fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_channel_presence_searches.clear();
     state.ember_channel_presence_buffer.clear();
     state.ember_pending_channel_presence.clear();
+    state.ember_channel_ingest = None;
     state.channel_presence_fetch_at.clear();
     state.channel_focused = None;
     state.channel_beacon_beat_at.clear();

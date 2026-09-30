@@ -1410,6 +1410,10 @@ pub(super) struct NetworkState {
     pub(super) ember_channel_presence_buffer: HashMap<[u8; 16], Vec<Vec<u8>>>,
     /// Presence blobs waiting for DB upsert + UI emit (async drain).
     pub(super) ember_pending_channel_presence: Vec<([u8; 16], Vec<Vec<u8>>)>,
+    /// The room lookup results being written off the loop. One at a time, so
+    /// batches land in the order their lookups finished.
+    pub(super) ember_channel_ingest:
+        Option<tokio::task::JoinHandle<super::channel_membership::ChannelIngestResults>>,
     /// Last presence FIND_VALUE start per channel.
     pub(super) channel_presence_fetch_at: HashMap<[u8; 16], i64>,
     /// The one room the user currently has open, if any.

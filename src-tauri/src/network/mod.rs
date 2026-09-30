@@ -1056,6 +1056,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_channel_presence_searches: HashMap::new(),
         ember_channel_presence_buffer: HashMap::new(),
         ember_pending_channel_presence: Vec::new(),
+        ember_channel_ingest: None,
         channel_presence_fetch_at: HashMap::new(),
         channel_focused: None,
         channel_beacon_beat_at: HashMap::new(),

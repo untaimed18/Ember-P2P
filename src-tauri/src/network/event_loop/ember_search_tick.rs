@@ -102,6 +102,7 @@ pub(in crate::network) async fn on_ember_search_tick(
         && state.ember_pending_channel_handoff.is_empty()
         && state.ember_pending_channel_epoch.is_empty()
         && state.ember_pending_channel_claim.is_empty()
+        && state.ember_channel_ingest.is_none()
         // The batch publisher is on an entirely separate path from
         // the maps above — `flush_ember_batch_publish` only ever
         // writes `in_flight` — and `expire()` below is its only
@@ -859,18 +860,46 @@ pub(in crate::network) async fn on_ember_search_tick(
             }
         }
     }
-    if !state.ember_pending_channel_presence.is_empty() {
-        let pending = std::mem::take(&mut state.ember_pending_channel_presence);
+    if state
+        .ember_channel_ingest
+        .as_ref()
+        .is_some_and(|job| job.is_finished())
+    {
+        if let Some(job) = state.ember_channel_ingest.take() {
+            match job.await {
+                Ok(results) => {
+                    apply_channel_ingest_results(udp_socket, state, db, app_handle, results)
+                        .await
+                }
+                Err(e) => tracing::warn!("channel lookup ingest failed: {e}"),
+            }
+        }
+    }
+    if state.ember_channel_ingest.is_none() {
+        if let Some(batch) = ChannelIngestBatch::take(state) {
+            let db = db.clone();
+            let identity = identity.clone();
+            state.ember_channel_ingest = Some(tokio::task::spawn_blocking(move || {
+                run_channel_ingest(&db, &identity, &ed25519_pubkey, batch)
+            }));
+        }
+    }
+}
+
+/// Act on what a [`run_channel_ingest`] job wrote: roster emits, re-dialling
+/// new neighbours, and dropping a banned room's transfers.
+async fn apply_channel_ingest_results(
+    udp_socket: &Arc<UdpSocket>,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    results: ChannelIngestResults,
+) {
+    if !results.presence.is_empty() {
         let mut any_new = false;
         let mut updated_ids = HashSet::new();
-        for (channel_id, records) in pending {
-            let ingest = ingest_channel_presence_records(
-                state,
-                db,
-                &ed25519_pubkey,
-                channel_id,
-                &records,
-            );
+        for (channel_id, ingest) in results.presence {
+            ingest.apply(state, channel_id);
             if ingest.new_neighbors {
                 any_new = true;
                 // Members we did not know a moment ago, who
@@ -899,84 +928,42 @@ pub(in crate::network) async fn on_ember_search_tick(
             );
         }
     }
-    if !state.ember_pending_channel_moderation.is_empty() {
-        let pending = std::mem::take(&mut state.ember_pending_channel_moderation);
-        let checked_at = chrono::Utc::now().timestamp();
-        for (channel_id, records, answered) in pending {
-            // Only a search some peer actually answered counts as
-            // having looked. Finding no owner record because nobody
-            // replied is not evidence the owner has gone, and
-            // succession is the one feature that acts on absence.
-            if answered > 0 {
-                let _ = db.touch_channel_moderation_checked(
-                    &hex::encode(channel_id),
-                    checked_at,
-                );
-            }
-            if ingest_channel_moderation_records(db, channel_id, &records) {
-                // The snapshot carries the owner's whole ban list, so
-                // this is where most bans actually land on a member's
-                // device — and a ban has to reach the transfer engine
-                // and not just the roster.
-                drop_banned_channel_transfers(
-                    state,
-                    db,
-                    app_handle,
-                    channel_id,
-                );
-                let _ = app_handle.emit(
-                    "ember:channel-moderation",
-                    serde_json::json!({ "channel_id": hex::encode(channel_id) }),
-                );
-            }
-        }
+    for channel_id in results.moderated {
+        // The snapshot carries the owner's whole ban list, so this is where
+        // most bans actually land on a member's device — and a ban has to
+        // reach the transfer engine and not just the roster.
+        drop_banned_channel_transfers(state, db, app_handle, channel_id);
+        let _ = app_handle.emit(
+            "ember:channel-moderation",
+            serde_json::json!({ "channel_id": hex::encode(channel_id) }),
+        );
     }
-    if !state.ember_pending_channel_claim.is_empty() {
-        let pending = std::mem::take(&mut state.ember_pending_channel_claim);
-        for (channel_id, records) in pending {
-            if let Some(successor_id) =
-                ingest_channel_claim_records(db, channel_id, &records)
-            {
-                let _ = app_handle.emit(
-                    "ember:channel-handoff",
-                    serde_json::json!({
-                        "channel_id": hex::encode(channel_id),
-                        "successor_id": hex::encode(successor_id),
-                        "phase": "claimed",
-                    }),
-                );
-            }
-        }
+    for (channel_id, successor_id) in results.claimed {
+        let _ = app_handle.emit(
+            "ember:channel-handoff",
+            serde_json::json!({
+                "channel_id": hex::encode(channel_id),
+                "successor_id": hex::encode(successor_id),
+                "phase": "claimed",
+            }),
+        );
     }
-    if !state.ember_pending_channel_epoch.is_empty() {
-        let pending = std::mem::take(&mut state.ember_pending_channel_epoch);
-        for (channel_id, epoch, records) in pending {
-            if ingest_channel_epoch_records(db, identity, channel_id, epoch, &records)
-            {
-                // The room is readable again, so the list's badges
-                // and the composer state want refreshing.
-                let _ = app_handle.emit(
-                    "ember:channel-moderation",
-                    serde_json::json!({ "channel_id": hex::encode(channel_id) }),
-                );
-            }
-        }
+    // The room is readable again, so the list's badges and the composer state
+    // want refreshing.
+    for channel_id in results.rekeyed {
+        let _ = app_handle.emit(
+            "ember:channel-moderation",
+            serde_json::json!({ "channel_id": hex::encode(channel_id) }),
+        );
     }
-    if !state.ember_pending_channel_handoff.is_empty() {
-        let pending = std::mem::take(&mut state.ember_pending_channel_handoff);
-        for (channel_id, records) in pending {
-            if let Some(successor_id) =
-                ingest_channel_handoff_records(db, channel_id, &records)
-            {
-                let _ = app_handle.emit(
-                    "ember:channel-handoff",
-                    serde_json::json!({
-                        "channel_id": hex::encode(channel_id),
-                        "successor_id": hex::encode(successor_id),
-                        "phase": "followed",
-                    }),
-                );
-            }
-        }
+    for (channel_id, successor_id) in results.followed {
+        let _ = app_handle.emit(
+            "ember:channel-handoff",
+            serde_json::json!({
+                "channel_id": hex::encode(channel_id),
+                "successor_id": hex::encode(successor_id),
+                "phase": "followed",
+            }),
+        );
     }
 }

@@ -388,38 +388,6 @@ pub(in crate::network) async fn save_on_shutdown(
         }
     }
 
-    // Persist the record store so the next session starts holding what this one
-    // held. Shutdown only, deliberately: the store can be several megabytes and
-    // writing that every few minutes is the disk hitch the peer-list save was
-    // changed to avoid. An abnormal exit falls back to replication refilling the
-    // store, which is what happened on every exit before this.
-    let ember_records = state
-        .ember_dht
-        .persistable_records(EMBER_PERSIST_MAX_RECORDS);
-    let store_ember_path = state.data_dir.join("store_ember.dat");
-    let ember_store_loaded = state.ember_store_loaded;
-    if tokio::time::Instant::now() >= shutdown_deadline {
-        error!(
-            "Shutdown deadline exhausted before store_ember.dat save; shutdown result is explicitly truncated"
-        );
-    } else {
-        let writer = tokio::task::spawn_blocking(move || {
-            ember::dht::bootstrap::save_store(
-                &store_ember_path,
-                &ember_records,
-                ember_store_loaded,
-            )
-        });
-        match tokio::time::timeout_at(shutdown_deadline, writer).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(e))) => error!("Failed to save store_ember.dat on shutdown: {e}"),
-            Ok(Err(e)) => error!("store_ember.dat shutdown writer failed: {e}"),
-            Err(_) => error!(
-                "Shutdown deadline exhausted joining store_ember.dat writer; shutdown result is explicitly truncated"
-            ),
-        }
-    }
-
     // Drain any in-flight periodic statistics save before the final write.
     // The 60s timer spawns a detached `spawn_blocking` with a snapshot of
     // `cumulative_save_pairs()` — the same stale-overwrite race we already
@@ -758,6 +726,45 @@ pub(in crate::network) async fn save_on_shutdown(
             Ok(Err(error)) => error!("Reputation shutdown writer failed: {error}"),
             Err(_) => error!(
                 "Shutdown deadline exhausted joining reputation/ban writer; shutdown result is explicitly truncated"
+            ),
+        }
+    }
+
+    // Persist the record store so the next session starts holding what this one
+    // held. Shutdown only, deliberately: the store can be several megabytes and
+    // writing that every few minutes is the disk hitch the peer-list save was
+    // changed to avoid. An abnormal exit falls back to replication refilling the
+    // store, which is what happened on every exit before this.
+    //
+    // After known.met, credits and the bans, and in a phase of its own: it is
+    // the one save here that replication can replace, and it used to run first
+    // with the whole remaining deadline, so a slow disk spent the time the ban
+    // save needed and a restart silently lifted automatic bans.
+    let ember_records = state
+        .ember_dht
+        .persistable_records(EMBER_PERSIST_MAX_RECORDS);
+    let store_ember_path = state.data_dir.join("store_ember.dat");
+    let ember_store_loaded = state.ember_store_loaded;
+    if tokio::time::Instant::now() >= shutdown_deadline {
+        error!(
+            "Shutdown deadline exhausted before store_ember.dat save; shutdown result is explicitly truncated"
+        );
+    } else {
+        let writer = tokio::task::spawn_blocking(move || {
+            ember::dht::bootstrap::save_store(
+                &store_ember_path,
+                &ember_records,
+                ember_store_loaded,
+            )
+        });
+        let store_deadline =
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(3));
+        match tokio::time::timeout_at(store_deadline, writer).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => error!("Failed to save store_ember.dat on shutdown: {e}"),
+            Ok(Err(e)) => error!("store_ember.dat shutdown writer failed: {e}"),
+            Err(_) => error!(
+                "store_ember.dat writer still running at the end of its shutdown phase; the next session refills the store by replication"
             ),
         }
     }
