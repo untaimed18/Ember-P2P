@@ -928,6 +928,11 @@ pub(super) const EMBER_DISCONNECT_SECS: i64 = 20 * 60;
 /// far shorter than [`EMBER_DISCONNECT_SECS`].
 pub(super) const EMBER_EMPTY_REARM_SECS: i64 = 300;
 
+/// How long a remembered peer that was offered and did not stick waits before
+/// a thin table offers it again. Long against a dead address's three missed
+/// pings, short against a laptop coming back online.
+pub(super) const EMBER_REOFFER_AFTER_SECS: i64 = 30 * 60;
+
 /// How long a verified contact may go unheard before it is purged outright,
 /// matching KAD's two hours. Well beyond the liveness-ping interval, so this
 /// only catches contacts the ping budget never got around to probing — which
@@ -1315,6 +1320,16 @@ pub(super) async fn run_ember_maintenance(
         // transition is retried once the floor passes.
         if contacts > 0 || rearmed {
             state.ember_last_overlay_contacts = contacts;
+        }
+        // Short of an empty table, re-offer the book on a slow clock while the
+        // table is still thin; see `BootstrapCache::rearm_stale_offers`.
+        if state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
+            let reoffered = state
+                .ember_bootstrap_cache
+                .rearm_stale_offers(now_secs, EMBER_REOFFER_AFTER_SECS);
+            if reoffered > 0 {
+                debug!("Ember DHT: {reoffered} remembered peer(s) may be offered to the table again");
+            }
         }
     }
 
