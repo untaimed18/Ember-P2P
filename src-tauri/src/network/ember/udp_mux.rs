@@ -29,7 +29,7 @@ use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -207,20 +207,33 @@ pub fn start(
     cid_key: Option<CidKey>,
 ) -> (mpsc::Receiver<Datagram>, Option<SharedQuicSocket>) {
     let (other_tx, other_rx) = mpsc::channel(OTHER_QUEUE);
-    let (quic_tx, quic) = match &cid_key {
+    let (quic_route, quic) = match &cid_key {
         Some(_) => {
             let (tx, rx) = mpsc::channel(QUIC_QUEUE);
+            let claimed = Arc::new(AtomicBool::new(false));
             let shared = SharedQuicSocket {
                 socket: socket.clone(),
                 rx: parking_lot::Mutex::new(rx),
+                claimed: claimed.clone(),
                 last_send_error_log: parking_lot::Mutex::new(None),
             };
-            (Some(tx), Some(shared))
+            (Some(QuicRoute { tx, claimed }), Some(shared))
         }
         None => (None, None),
     };
-    tokio::spawn(read_loop(socket, cid_key, other_tx, quic_tx));
+    tokio::spawn(read_loop(socket, cid_key, other_tx, quic_route));
     (other_rx, quic)
+}
+
+/// Where the reader sends QUIC.
+struct QuicRoute {
+    tx: mpsc::Sender<Datagram>,
+    /// Set by [`SharedQuicSocket`] once quinn first polls it. The endpoint is
+    /// built only once our external address is known, and possibly never, so
+    /// until then nothing drains the queue: QUIC would fill it and then warn,
+    /// and whatever did fit would reach quinn as Initials long since given up
+    /// on. Until then QUIC is dropped, as a socket nobody listens on would.
+    claimed: Arc<AtomicBool>,
 }
 
 /// Says so if the reader ends while the loop still wants datagrams: nothing
@@ -239,7 +252,7 @@ async fn read_loop(
     socket: Arc<UdpSocket>,
     cid_key: Option<CidKey>,
     other_tx: mpsc::Sender<Datagram>,
-    mut quic_tx: Option<mpsc::Sender<Datagram>>,
+    mut quic_route: Option<QuicRoute>,
 ) {
     let _exit_notice = ReaderExitNotice(other_tx.clone());
     let mut buf = vec![0u8; MAX_DATAGRAM];
@@ -277,13 +290,21 @@ async fn read_loop(
             }
         };
         let data = &buf[..len];
-        if let (Some(key), Some(tx)) = (&cid_key, &quic_tx) {
+        if let (Some(key), Some(route)) = (&cid_key, &quic_route) {
             if is_quic(data, key) {
-                match charge(&quic_budget, data, from).map(|datagram| tx.try_send(datagram)) {
+                if !route.claimed.load(Ordering::Acquire) {
+                    // The endpoint was never built (QUIC fell back to a socket
+                    // of its own), so there is nothing left to classify for.
+                    if route.tx.is_closed() {
+                        quic_route = None;
+                    }
+                    continue;
+                }
+                match charge(&quic_budget, data, from).map(|datagram| route.tx.try_send(datagram)) {
                     Some(Ok(())) => {}
                     // The endpoint is gone (QUIC fell back to a socket of its
                     // own), so there is nothing left to classify for.
-                    Some(Err(mpsc::error::TrySendError::Closed(_))) => quic_tx = None,
+                    Some(Err(mpsc::error::TrySendError::Closed(_))) => quic_route = None,
                     Some(Err(mpsc::error::TrySendError::Full(_))) | None => {
                         dropped_quic += 1;
                         note_drop("QUIC", dropped_quic);
@@ -320,6 +341,8 @@ fn note_drop(queue: &str, total: u64) {
 pub struct SharedQuicSocket {
     socket: Arc<UdpSocket>,
     rx: parking_lot::Mutex<mpsc::Receiver<Datagram>>,
+    /// See [`QuicRoute::claimed`].
+    claimed: Arc<AtomicBool>,
     last_send_error_log: parking_lot::Mutex<Option<std::time::Instant>>,
 }
 
@@ -383,6 +406,9 @@ impl AsyncUdpSocket for SharedQuicSocket {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        if !self.claimed.load(Ordering::Relaxed) {
+            self.claimed.store(true, Ordering::Release);
+        }
         let mut rx = self.rx.lock();
         let slots = bufs.len().min(meta.len());
         if slots == 0 {
@@ -539,6 +565,73 @@ mod tests {
         for case in &cases {
             assert!(!is_quic(case, &key), "{:02x?}", &case[..case.len().min(8)]);
         }
+    }
+
+    /// The loss the test above accepts, pinned: a plain datagram with opcode 0
+    /// whose next bytes read as version 1 and whose connection-id lengths fit
+    /// is handed to quinn, whichever plain protocol byte it starts with.
+    #[test]
+    fn a_plain_datagram_reading_as_version_1_goes_to_quic() {
+        let key = CidKey::random();
+        for proto in [0xE3u8, 0xE4, 0xE5, 0xC5, 0xD4] {
+            let mut datagram = vec![proto, 0x00, 0x00, 0x00, 0x01, 8];
+            datagram.extend_from_slice(&[0x11; 8]);
+            datagram.push(0);
+            datagram.extend_from_slice(&[0x55; 16]);
+            assert!(is_quic(&datagram, &key), "{proto:02x} 00 00 00 01");
+            assert!(is_quic(&[proto, 0, 0, 0, 1, 0, 0], &key), "{proto:02x} with empty ids");
+
+            datagram[5] = 30;
+            assert!(!is_quic(&datagram, &key), "{proto:02x} with an id that does not fit");
+        }
+    }
+
+    /// Until quinn first polls the shared socket nothing drains its queue, so
+    /// QUIC that arrives before the endpoint exists is dropped, neither held
+    /// for quinn nor passed to the loop, and reaches quinn once it polls.
+    #[tokio::test]
+    async fn quic_is_dropped_until_the_endpoint_polls() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = socket.local_addr().unwrap();
+        let (mut other, quic_half) = start(socket.clone(), Some(CidKey::random()));
+        let quic_half = quic_half.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let initial = long_header(QUIC_VERSION_1, 0xC3);
+        // Yielding lets the reader drain as they arrive, since a send does not
+        // yield on its own and the kernel buffer would otherwise overflow.
+        for _ in 0..64 {
+            sender.send_to(&initial, addr).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        sender.send_to(&[0xE4, 0x21, 1, 2], addr).await.unwrap();
+        let kad = tokio::time::timeout(Duration::from_secs(5), other.recv())
+            .await
+            .expect("the KAD datagram arrives")
+            .unwrap();
+        assert_eq!(&kad.data[..2], &[0xE4, 0x21], "only KAD reaches the loop");
+        assert!(quic_half.rx.lock().try_recv().is_err(), "nothing is held for quinn");
+
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        let mut meta = [RecvMeta::default()];
+        std::future::poll_fn(|cx| {
+            let mut bufs = [IoSliceMut::new(&mut buf)];
+            let _ = quic_half.poll_recv(cx, &mut bufs, &mut meta);
+            Poll::Ready(())
+        })
+        .await;
+        sender.send_to(&initial, addr).await.unwrap();
+        let received = tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                let mut bufs = [IoSliceMut::new(&mut buf)];
+                quic_half.poll_recv(cx, &mut bufs, &mut meta)
+            }),
+        )
+        .await
+        .expect("QUIC reaches quinn once it polls")
+        .unwrap();
+        assert_eq!(received, 1);
+        assert_eq!(meta[0].len, initial.len());
     }
 
     /// Obfuscated eMule packets begin with random bytes, so they are the traffic

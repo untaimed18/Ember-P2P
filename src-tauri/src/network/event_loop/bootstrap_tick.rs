@@ -41,7 +41,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
     upnp_maintain_in_flight: &mut bool,
     upnp_maintain_result_tx: &mpsc::UnboundedSender<UpnpMaintainResult>,
     upnp_maintain_started_at: &mut Option<tokio::time::Instant>,
-    upnp_mappings: &upnp::UpnpMappings,
+    upnp_mappings: &mut upnp::UpnpMappings,
 ) {
     // Only the KAD bootstrap below depends on KAD being up. The
     // friend-presence and friend-search work after this block must
@@ -693,10 +693,10 @@ pub(in crate::network) async fn on_bootstrap_tick(
                             // and on a port distinct from the KAD UDP port —
                             // so without this, inbound QUIC (relay target /
                             // hole-punch accept) stays unreachable behind NAT
-                            // even when TCP/KAD are mapped. Called even when
-                            // no gateway is known yet: `map_quic_port` then
-                            // just records the port so the periodic
-                            // `maintain` maps it once discovery succeeds.
+                            // even when TCP/KAD are mapped. Recorded whatever
+                            // else is running, so the next `maintain` maps it
+                            // if this pass cannot run or finds no gateway.
+                            upnp_mappings.record_quic_port(upnp_quic_port);
                             if upnp_enabled && !*upnp_maintain_in_flight {
                                 let mut mappings = upnp_mappings.clone();
                                 let revision = mappings.revision();
@@ -738,6 +738,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
                 ctx.quic_endpoint = Some(ep.clone());
                 ctx.quic_public_port = state.quic_public_port;
                 ctx.quic_shares_udp = state.quic_shares_udp;
+                ctx.advertised_udp_port = state.advertise_udp_port.clone();
             }
             state.connection_broker = Some(broker);
             state.broker_event_rx = Some(broker_rx);

@@ -3112,7 +3112,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &mut upnp_maintain_in_flight,
                     &upnp_maintain_result_tx,
                     &mut upnp_maintain_started_at,
-                    &upnp_mappings,
+                    &mut upnp_mappings,
                 ))
                 .catch_unwind()
                 .await;

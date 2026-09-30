@@ -698,9 +698,8 @@ pub(super) fn update_publish_manager_state(state: &mut NetworkState) {
         state.low_id,
         state.firewall_checker.tcp_status(),
     );
-    state.publish_manager.use_extern_kad_port =
-        matches!(state.external_udp_port, Some(port) if port != 0 && port != state.udp_port);
-    state.publish_manager.udp_port = state.external_udp_port.unwrap_or(state.udp_port);
+    state.publish_manager.udp_port = advertised_udp_port(state);
+    state.publish_manager.use_extern_kad_port = state.publish_manager.udp_port != state.udp_port;
     state.publish_manager.tcp_port = advertised_tcp_port(state);
     // BuddyManager bakes tcp_port/udp_port in at construction (buddy Hello
     // handshake / OP_CALLBACK payloads) with no other refresh path — without

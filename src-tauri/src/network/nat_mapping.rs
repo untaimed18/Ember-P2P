@@ -138,6 +138,15 @@ pub(super) fn capture_advertised_tcp_port_then_reset_low_id(
 
 /// UDP counterpart of `advertised_tcp_port` — the KAD-peer-voted or
 /// STUN-confirmed public UDP port when known, otherwise the raw bind port.
+///
+/// The one answer for the KAD / Ember socket's public port, which QUIC shares:
+/// rendezvous, relay attestations, source records, attachment offers and punch
+/// registrations (through `FriendNatContext::advertised_udp_port`) all read it.
+/// `external_udp_port` outranks the NAT probe's `nat_info.external_addr`
+/// because it is the better-confirmed value: either two consecutive keep-alive
+/// readings, which KAD votes may not overwrite while the keep-alive holds it,
+/// or the port KAD peers saw our firewall checks come from. The probe is one
+/// sample, taken at startup or on a probe trigger, and not re-read after.
 pub(super) fn advertised_udp_port(state: &NetworkState) -> u16 {
     state
         .external_udp_port

@@ -191,16 +191,23 @@ pub struct FriendNatContext {
     /// same thing when the NAT preserves ports.
     pub quic_public_port: Option<u16>,
     /// Whether `quic_endpoint` runs on the KAD / Ember UDP socket, in which
-    /// case its public port is `external_addr`'s, the one that socket's own
-    /// STUN and mapping keep-alive maintain.
+    /// case its public port is that socket's advertised one.
     pub quic_shares_udp: bool,
+    /// The KAD / Ember socket's advertised UDP port, as the network loop keeps
+    /// it from `advertised_udp_port`. Shared rather than copied, and read
+    /// instead of `external_addr`'s port, so that a punch registration names
+    /// the same port as rendezvous, relay attestations and source records: the
+    /// NAT probe that fills `external_addr` is one sample, and on a NAT that
+    /// re-maps ports it can disagree with what peers and the keep-alive see.
+    pub advertised_udp_port: Arc<std::sync::atomic::AtomicU16>,
 }
 
 impl FriendNatContext {
     /// The port a friend should dial to reach `quic_endpoint`, when known.
     pub fn quic_public_port(&self) -> Option<u16> {
         if self.quic_shares_udp {
-            self.external_addr.map(|addr| addr.port())
+            Some(self.advertised_udp_port.load(std::sync::atomic::Ordering::Relaxed))
+                .filter(|port| *port != 0)
         } else {
             self.quic_public_port
         }
@@ -590,6 +597,29 @@ mod tests {
         assert!(!NatType::Symmetric.can_punch_with(&NatType::Symmetric));
         assert!(!NatType::Symmetric.can_punch_with(&NatType::PortRestricted));
         assert!(!NatType::PortRestricted.can_punch_with(&NatType::Symmetric));
+    }
+
+    /// On the shared socket a punch registration names the port the loop
+    /// advertises everywhere else, and follows it as it changes, not the port
+    /// the NAT probe happened to read.
+    #[test]
+    fn a_shared_socket_punches_on_the_advertised_udp_port() {
+        let advertised = Arc::new(std::sync::atomic::AtomicU16::new(40_001));
+        let ctx = FriendNatContext {
+            external_addr: Some("198.51.100.7:52000".parse().unwrap()),
+            quic_public_port: Some(4662),
+            quic_shares_udp: true,
+            advertised_udp_port: advertised.clone(),
+            ..Default::default()
+        };
+        assert_eq!(ctx.quic_public_port(), Some(40_001));
+        advertised.store(40_002, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(ctx.quic_public_port(), Some(40_002));
+        advertised.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(ctx.quic_public_port(), None, "unknown, so the bound port is used");
+
+        let separate = FriendNatContext { quic_shares_udp: false, ..ctx };
+        assert_eq!(separate.quic_public_port(), Some(4662), "a socket of its own has its own");
     }
 
     fn reading(server: &str, mapped: &str) -> (SocketAddr, SocketAddr) {

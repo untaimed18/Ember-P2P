@@ -2173,6 +2173,11 @@ pub(super) async fn handle_ember_dht_message(
     // Read now, before the handlers below consume the pending query a
     // FOUND_NODE answers.
     let leads_asked_for = ember_leads_were_asked_for(state, &inbound, from, now);
+    if ember_reply_was_solicited(state, &inbound, from) {
+        if let Some(id) = inbound.sender_id {
+            state.ember_dht.note_answered(id, std::time::Instant::now());
+        }
+    }
 
     // A STORE that did not authenticate cost nothing the budget exists to
     // ration, so give the charge back. `sender_id` is set for every frame that

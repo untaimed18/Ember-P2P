@@ -484,11 +484,15 @@ pub(super) fn parse_ember_source_records(
     let mut publisher_digests = EmberDigestVotes::new();
     // Every HighID source here is an address we are about to dial, and a
     // responder is not an honest storer that checked it: it can mint keys and
-    // name any host. Records two independent responders returned go first, and
-    // the rest are capped per responder, so one node answering a popular hash
-    // cannot aim every downloader of it at a victim.
+    // name any host. Records two independent responders returned, or our own
+    // store bound to the storer's address, go first, and the rest are capped
+    // per responder, so one node answering a popular hash cannot aim every
+    // downloader of it at a victim.
+    let vouched = |record: &ember::dht::search::SearchResultRecord| {
+        record.confirmed_by.is_some() || record.from_local_store
+    };
     let mut order: Vec<&ember::dht::search::SearchResultRecord> = held.iter().collect();
-    order.sort_by_key(|record| record.confirmed_by.is_none());
+    order.sort_by_key(|record| !vouched(record));
     let mut unconfirmed_from: HashMap<EmberResponder, usize> = HashMap::new();
     for held_record in order {
         let Some(rec) = ember::dht::publish::SignedRecord::from_value_blob(&held_record.data)
@@ -527,7 +531,7 @@ pub(super) fn parse_ember_source_records(
         if out.len() >= MAX_EMBER_SOURCES_PER_LOOKUP {
             continue;
         }
-        if held_record.confirmed_by.is_none() && sc.flags & ember::SOURCE_FLAG_FIREWALLED == 0 {
+        if !vouched(held_record) && sc.flags & ember::SOURCE_FLAG_FIREWALLED == 0 {
             let responder = EmberResponder::of(held_record.from_node, held_record.from_subnet);
             let taken = unconfirmed_from.entry(responder).or_insert(0);
             if *taken >= MAX_UNCONFIRMED_SOURCES_PER_RESPONDER {
@@ -1126,6 +1130,7 @@ mod ember_digest_corroboration_tests {
             confirmed_by: confirmed_by.map(|n| ember::dht::EmberNodeId([n; 16])),
             from_subnet: Some(u64::from(node)),
             confirmed_subnet: confirmed_by.map(u64::from),
+            from_local_store: false,
         }
     }
 
@@ -1344,6 +1349,7 @@ mod ember_digest_corroboration_tests {
             confirmed_by: None,
             from_subnet: None,
             confirmed_subnet: None,
+            from_local_store: false,
         };
         let mut held = Vec::new();
         for invented in 0..10u16 {
@@ -1399,6 +1405,7 @@ mod ember_source_self_filter_tests {
                 confirmed_by: confirmed.then_some(ember::dht::EmberNodeId([2; 16])),
                 from_subnet: Some(1),
                 confirmed_subnet: confirmed.then_some(2),
+                from_local_store: false,
             }
         };
         let mut held: Vec<_> = (1..=40u8).map(|i| record(i, false)).collect();
@@ -1417,6 +1424,57 @@ mod ember_source_self_filter_tests {
         assert_eq!(sources.len(), 3 + MAX_UNCONFIRMED_SOURCES_PER_RESPONDER);
         for confirmed in 41..=43u8 {
             assert!(sources.iter().any(|s| s.ip == Ipv4Addr::new(81, 7, 7, confirmed)));
+        }
+    }
+
+    /// Our own store took each HighID source only from the address it names,
+    /// so on a network of two or three nodes a file's whole swarm is dialled
+    /// rather than the ten one remote responder would be allowed.
+    #[test]
+    fn our_own_stores_sources_are_not_capped_as_one_responder() {
+        let file_hash = [0x63u8; 16];
+        let record = |i: u8, local: bool| {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[i.wrapping_add(90); 32]);
+            let rec = ember::dht::publish::SignedRecord::source(
+                file_hash,
+                [0u8; 32],
+                1,
+                "big.iso",
+                ember::dht::publish::SourceContact {
+                    ip: Ipv4Addr::new(81, 7, 8, i),
+                    tcp_port: 4662,
+                    flags: 0,
+                    ..Default::default()
+                },
+                &sk,
+            );
+            let mut data = rec.data.clone();
+            data.extend_from_slice(&rec.signature);
+            ember::dht::search::SearchResultRecord {
+                data,
+                from_node: ember::dht::EmberNodeId([u8::from(!local); 16]),
+                confirmed_by: None,
+                from_subnet: (!local).then_some(1),
+                confirmed_subnet: None,
+                from_local_store: local,
+            }
+        };
+        let mut held: Vec<_> = (1..=20u8).map(|i| record(i, false)).collect();
+        held.extend((21..=45u8).map(|i| record(i, true)));
+
+        let sources = parse_ember_source_records(
+            &held,
+            file_hash,
+            None,
+            &[0u8; 32],
+            &mut crate::types::EmberDiagnostics::default(),
+            &mut HashMap::new(),
+            &HashSet::new(),
+            &mut HashMap::new(),
+        );
+        assert_eq!(sources.len(), 25 + MAX_UNCONFIRMED_SOURCES_PER_RESPONDER);
+        for local in 21..=45u8 {
+            assert!(sources.iter().any(|s| s.ip == Ipv4Addr::new(81, 7, 8, local)));
         }
     }
 
@@ -1448,6 +1506,7 @@ mod ember_source_self_filter_tests {
             confirmed_by: None,
             from_subnet: None,
             confirmed_subnet: None,
+            from_local_store: false,
         }];
 
         let parse = |self_ip: Option<Ipv4Addr>, local: [u8; 32]| {
@@ -1497,6 +1556,7 @@ mod ember_keyword_sanitize_tests {
             confirmed_by: None,
             from_subnet: None,
             confirmed_subnet: None,
+            from_local_store: false,
         }
     }
 

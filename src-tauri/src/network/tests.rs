@@ -1719,6 +1719,7 @@ fn held_records(blobs: &[Vec<u8>]) -> Vec<ember::dht::search::SearchResultRecord
             confirmed_by: None,
             from_subnet: None,
             confirmed_subnet: None,
+            from_local_store: false,
         })
         .collect()
 }
@@ -3067,6 +3068,7 @@ fn one_responder_minting_publishers_cannot_decide_a_files_digest() {
         confirmed_by: None,
         from_subnet: None,
         confirmed_subnet: None,
+        from_local_store: false,
     };
     let minted: Vec<_> = (0..40u8)
         .map(|i| {

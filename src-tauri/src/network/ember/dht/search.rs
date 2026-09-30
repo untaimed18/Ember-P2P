@@ -466,6 +466,13 @@ pub struct SearchResultRecord {
     pub from_subnet: Option<u64>,
     /// The /24 `confirmed_by` answered from, likewise.
     pub confirmed_subnet: Option<u64>,
+    /// Seeded from our own store rather than returned by a remote node.
+    ///
+    /// Our store admits a HighID source record only when the STORE came from
+    /// the address it names, so such a record is not one responder's say-so
+    /// about where to dial. Its publishers and digest still count as one
+    /// responder's word.
+    pub from_local_store: bool,
 }
 
 /// An active iterative search.
@@ -816,6 +823,7 @@ impl IterativeSearch {
                 confirmed_by: None,
                 from_subnet: self.node_subnet(&node),
                 confirmed_subnet: None,
+                from_local_store: seeded,
             });
         }
     }
@@ -1480,6 +1488,7 @@ impl IterativeSearch {
                     confirmed_by,
                     from_subnet: from_node_subnet,
                     confirmed_subnet,
+                    from_local_store: self.local_node == Some(from_node),
                 });
             }
         }
@@ -2211,6 +2220,7 @@ impl SearchManager {
                 confirmed_by: None,
                 from_subnet: None,
                 confirmed_subnet: None,
+                from_local_store: true,
             });
             search.seeded_count = search.seeded_count.saturating_add(1);
             added += 1;
@@ -4233,6 +4243,11 @@ mod tests {
         assert_eq!(
             search.results.len(),
             MAX_LOCAL_SEED_RESULTS + 2 * MAX_RESULTS_PER_NODE
+        );
+        assert_eq!(
+            search.results.iter().filter(|r| r.from_local_store).count(),
+            MAX_LOCAL_SEED_RESULTS,
+            "only the seed is marked as our own store's"
         );
         assert!(
             !search.complete,

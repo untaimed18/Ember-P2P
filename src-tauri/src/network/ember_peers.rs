@@ -1067,6 +1067,65 @@ pub(super) fn ember_leads_were_asked_for(
     true
 }
 
+/// Whether `inbound` is a reply to a request we sent its sender and still hold
+/// open, bound the way each reply's own handler binds it. Request ids come from
+/// counters, so an id alone proves nothing; the reply also has to come from the
+/// node or address the request went to. Read before the handlers consume the
+/// pending entries.
+pub(super) fn ember_reply_was_solicited(
+    state: &NetworkState,
+    inbound: &ember::dht::engine::DhtInbound,
+    from: SocketAddr,
+) -> bool {
+    let Some(sender) = inbound.sender_id else {
+        return false;
+    };
+    let search_query_to_sender = |rid: u32| {
+        state
+            .ember_dht_search_requests
+            .get(&rid)
+            .and_then(|req| {
+                state
+                    .ember_search
+                    .get(req.search_id)
+                    .and_then(|search| search.pending_query(req.per_search_req_id))
+            })
+            .is_some_and(|(node, _)| node == sender)
+    };
+    if let Some(rid) = inbound.pong_request_id {
+        return state
+            .ember_dht_pending_pings
+            .get(&rid)
+            .is_some_and(|(_, dest, _)| *dest == from)
+            || state
+                .ember_dht_maint_pings
+                .get(&rid)
+                .is_some_and(|ping| ping.node_id == sender);
+    }
+    if let Some((rid, _)) = &inbound.found_node {
+        return state
+            .ember_dht_pending_finds
+            .get(rid)
+            .is_some_and(|(_, dest, _)| *dest == from)
+            || search_query_to_sender(*rid);
+    }
+    if let Some(page) = &inbound.found_value {
+        return search_query_to_sender(page.request_id);
+    }
+    if let Some(rid) = inbound.store_ack_request_id {
+        return state
+            .ember_dht_publish_requests
+            .get(&rid)
+            .is_some_and(|req| req.node_id == sender);
+    }
+    if let Some((rid, _)) = inbound.store_batch_ack {
+        return state.ember_batch_publish.awaits_ack(rid, sender);
+    }
+    // The engine reports a PROXY_STORE_ACK only when it echoes an ask we sent
+    // this buddy.
+    inbound.proxy_store_ack.is_some()
+}
+
 /// Public-table contacts plus firsthand session peers, least-recently-announced
 /// first. `ANNOUNCE_PEER` used to walk only the public table, so a friend the
 /// IP policy kept in the session map (LAN / CGNAT with `block_private_ips`)

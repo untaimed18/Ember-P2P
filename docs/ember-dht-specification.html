@@ -895,8 +895,20 @@ footer.doc-end {
 <p>
   Inbound XX handshakes may briefly queue outbound traffic for that peer
   (honest simultaneous-open). After a 3-second grace the node dials the
-  identity itself; once an IK initiator is pending, further inbound msg1s from
-  that address are refused so a forged handshake cannot be renewed.
+  identity itself; once an initiator handshake of ours is pending, further
+  inbound XX msg1s from that address are refused so a forged handshake cannot
+  be renewed.
+</p>
+<p>
+  Two nodes that dial each other with IK at the same moment are settled by
+  Noise static key rather than both refusing and waiting out the 30-second
+  handshake timeout. The node with the lower static key stays initiator and
+  refuses the inbound <code>IK_INIT</code>. The node with the higher key answers
+  it as responder, and when that handshake is from the identity it was dialling,
+  it drops its own initiator and re-sends that initiator's first message and
+  queued payloads over the resulting session. Each side decides from its own key
+  and the key it dialled, so both reach the same answer. A pending XX initiator
+  still refuses an inbound <code>IK_INIT</code>.
 </p>
 
 <h3>4.3 Session lifecycle</h3>
@@ -1531,9 +1543,27 @@ footer.doc-end {
   a 24-hour source TTL would.
 </p>
 <p>
-  Clock skew tolerance on the signed timestamp is <strong>1 hour</strong> into
-  the future; older than TTL is expired. A replayed older copy cannot replace
-  a newer one: <code>created_at</code> is kept and compared.
+  A record's signed timestamp may sit at most
+  <strong>min(1 hour, TTL / 2)</strong> in the future: an hour for keyword,
+  source and room-index records, 22.5 minutes for a 45-minute presence record.
+  A flat hour was longer than a presence record's whole life. A record dated
+  ahead of the storer's clock is aged from the storer's clock, not from its
+  timestamp, so the tolerated skew cannot extend its life past the TTL. A record
+  older than its TTL is expired.
+</p>
+<p>
+  From 1.7.1 a storer refuses a presence record from a publisher whose clock
+  runs 22.5 to 60 minutes fast; 1.7.0 accepted it. Such a node's room presence
+  does not reach 1.7.1 storers until its clock is corrected.
+</p>
+<p>
+  A replayed older copy cannot replace a newer one: <code>created_at</code> is
+  kept and compared. The store does not acknowledge the refused copy
+  (<code>STORE_ACK</code> is withheld and its <code>STORE_BATCH_ACK</code> bit is
+  clear), so its sender does not count it as placed. One exception remains: a
+  byte-identical copy whose signature the storer saw within
+  <code>STORE_SIG_REPLAY_TTL</code> (§12.4) is still answered as a replay after
+  a newer copy superseded it.
 </p>
 
 <h3>7.5 Store capacity</h3>
@@ -1829,6 +1859,16 @@ footer.doc-end {
   process lifetime, so a stale address stayed qualified indefinitely and a
   genuine address change could not displace it.
 </p>
+<p>
+  A rival address displaces a confirmed one only with strictly more distinct
+  nets. When the confirmed address lapses because its votes aged out, then for
+  one vote lifetime a rival must beat the most nets that ever backed it at once,
+  or else have a quorum of its own nets among those that voted for the lapsed
+  address. The first rule stops three quiet /24s from taking the address the
+  moment honest votes age out. The second admits a genuine address change: the
+  same peers now seeing us somewhere else. On a network with no more nets than
+  the old peak, the change could not otherwise confirm until the lapse aged out.
+</p>
 
 <h3>11.2 Firewalled publishing and consume</h3>
 <p>
@@ -1873,6 +1913,51 @@ footer.doc-end {
   the same path: the buddy table is populated when a <code>PROXY_STORE_ACK</code>
   matches a request we sent, so a network that is already forwarding publishes can bounce
   callbacks without a second handshake.
+</p>
+
+<h3>11.3 Relay requests</h3>
+<p>
+  When neither side can accept a connection, the broker asks a relay admitted
+  from an ERAT attestation to bridge a QUIC stream. The request is
+  <code>RELAY_REQUEST</code> (relay message type <code>0x01</code>), framed as
+  <code>type (1) | session_id (4 LE) | payload_len (2 LE) | payload</code>.
+  Version 2 has a 183-byte payload. Version 3 appends the target's Ember node id
+  (16 bytes) before the signature, for a 199-byte payload. The relay then
+  refuses to bridge to any endpoint whose QUIC certificate does not prove that
+  node id.
+</p>
+<table class="data">
+  <thead><tr><th>Bytes</th><th>Field</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>version</td><td><code>2</code> or <code>3</code></td></tr>
+    <tr><td>1..5</td><td>target_ip</td><td>IPv4 the relay dials</td></tr>
+    <tr><td>5..7</td><td>target_port</td><td>LE; the port the relay dials over QUIC (for Ember DHT sources, the record's <code>quic_port</code>)</td></tr>
+    <tr><td>7..23</td><td>file_hash</td><td>eD2K file hash</td></tr>
+    <tr><td>23..55</td><td>attestation_hash</td><td>The relay's ERAT attestation hash</td></tr>
+    <tr><td>55..87</td><td>requester_pubkey</td><td>Requester's Ed25519 key</td></tr>
+    <tr><td>87..103</td><td>requester_ember_hash</td><td>Must bind to <code>requester_pubkey</code></td></tr>
+    <tr><td>103..119</td><td>nonce</td><td>Fresh random; replays within 10 minutes are refused</td></tr>
+    <tr><td>119..135</td><td>target_node_id</td><td>Version 3 only</td></tr>
+    <tr><td>135..199</td><td>signature</td><td>Version 3; at 119..183 in version 2</td></tr>
+  </tbody>
+</table>
+<p>
+  The signature is Ed25519 by <code>requester_pubkey</code> over
+  <code>domain | session_id (4 LE) | attestation_hash | target_ip | target_port (2 LE) | file_hash | requester_pubkey | requester_ember_hash | nonce</code>,
+  followed by <code>target_node_id</code> in version 3. The domain is
+  <code>"ember-relay-request-v3\0"</code> for version 3 and
+  <code>"ember-relay-request-v2\0"</code> for version 2, so a version 2
+  signature cannot be replayed with a node id attached. The signed order is not
+  the payload order: the attestation hash comes before the target.
+</p>
+<p>
+  A relay advertises version 3 support with ERAT capability bit
+  <code>0x02</code> (<code>RELAY_ATTESTATION_CAP_PINNED_TARGET</code>) beside
+  the required relay bit <code>0x01</code>. Verifiers require only
+  <code>0x01</code>, so older peers accept attestations carrying the new bit. A
+  requester sends version 3 only to a relay with bit <code>0x02</code>, because a
+  1.7.0 relay accepts no payload length but version 2's.
+  <span class="badge">additive</span>
 </p>
 
 <!-- ══════════════════════════════════════════════ 12 ══════════════════════════════════════════════ -->
@@ -2212,7 +2297,7 @@ footer.doc-end {
     <tr><td>EMBER_SOURCE_PUBLISH_MIN/MAX_PER_TICK</td><td>5 / 256 files</td><td>network/mod.rs</td></tr>
     <tr><td>KEYWORD_RECORD_TTL</td><td>24 h</td><td>dht/store.rs</td></tr>
     <tr><td>SOURCE_RECORD_TTL</td><td>6 h</td><td>dht/store.rs</td></tr>
-    <tr><td>CLOCK_SKEW_TOLERANCE_SECS</td><td>1 h</td><td>dht/store.rs</td></tr>
+    <tr><td>CLOCK_SKEW_TOLERANCE_SECS</td><td>1 h, capped at TTL / 2 per record</td><td>dht/store.rs</td></tr>
     <tr><td>EMBER_RENDEZVOUS_REPUBLISH_SECS</td><td>5 h</td><td>network/mod.rs</td></tr>
     <tr><td>EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS</td><td>10 min</td><td>network/mod.rs</td></tr>
     <tr><td>EMBER_SEARCH_QUEUED_QUERY_TIMEOUT</td><td>12 s</td><td>network/mod.rs</td></tr>
