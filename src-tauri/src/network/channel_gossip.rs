@@ -858,11 +858,14 @@ pub(super) async fn handle_inbound_channel_gossip(
             &sender,
             chrono::Utc::now().timestamp(),
         );
+        if ember::channel::xfer_frame_proves_sealed_reader(&plain) {
+            note_sealed_offer_reader(state, db, app_handle, gossip.channel_id, &sender);
+        }
         // Anything the recipient says about a transfer we offered — "seen", a
         // reply, a block request — means it read the sealed offer.
         if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
-            if send.peer == sender {
-                send.offer_was_read();
+            if send.heard_from(&sender) {
+                emit_xfer_send_update(app_handle, &xfer_id, send);
             }
         }
         if answer_finished_xfer(socket, state, db, xfer_id, sender).await {
@@ -1560,6 +1563,8 @@ async fn apply_room_friend_request(
         forget_channel_gossip(state, &gossip.msg_id);
         return;
     }
+    // Signed by its sender, and v1.6.x has no room friend request.
+    note_sealed_offer_reader(state, db, app_handle, channel_id, &sender_pk);
     let for_us = ember::channel::room_friend_request_is_for(
         &state.local_ed25519_seed,
         &sender_pk,
@@ -2196,6 +2201,8 @@ pub(super) fn apply_channel_typing(
         );
         return;
     }
+    // Signed by the member it names, and v1.6.x has no typing signal.
+    note_sealed_offer_reader(state, db, app_handle, channel_id, &member);
     let _ = app_handle.emit(
         "ember:channel-typing",
         serde_json::json!({

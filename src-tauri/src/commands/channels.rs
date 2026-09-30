@@ -5882,6 +5882,25 @@ pub async fn cancel_channel_transfer(
     Ok(())
 }
 
+/// Send the standard offer for a file you offered whose recipient has not
+/// answered the private one. Every member it is forwarded through can read the
+/// file's name and size, so this only runs when the user asks for it.
+#[tauri::command]
+pub async fn send_channel_transfer_standard_offer(
+    state: tauri::State<'_, AppState>,
+    xfer_id: String,
+) -> Result<(), String> {
+    require_ember(&state).await?;
+    let xfer_id = parse_xfer_id(&xfer_id)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::SendChannelTransferPlainOffer { xfer_id, tx })
+        .map_err(|_| coded("channels_xfer_failed", "Network is busy"))?;
+    await_reply(rx, "channels_xfer_failed", "No response from network").await??;
+    Ok(())
+}
+
 /// Open the Channel Files folder, creating it if nothing has landed there yet.
 #[tauri::command]
 pub async fn open_channel_files_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {

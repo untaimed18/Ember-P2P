@@ -703,6 +703,12 @@ pub enum NetworkCommand {
         xfer_id: [u8; 16],
         tx: oneshot::Sender<Result<(), String>>,
     },
+    /// Send the plain offer for one of our offers the user was asked about.
+    /// Does nothing once the recipient has shown it read the sealed one.
+    SendChannelTransferPlainOffer {
+        xfer_id: [u8; 16],
+        tx: oneshot::Sender<Result<(), String>>,
+    },
     /// Everything in flight, for the Channels page to draw.
     ListChannelTransfers {
         tx: oneshot::Sender<Vec<ChannelTransferSnapshot>>,
@@ -769,6 +775,9 @@ pub struct ChannelTransferSnapshot {
     /// The name is a program, shortcut or script, or one dressed up as a
     /// document (`report.pdf.exe`); see `security::is_dangerous_extension`.
     pub risky: bool,
+    /// A send whose recipient has not shown it read the sealed offer, and
+    /// whose user is being asked whether to send the plain one.
+    pub awaiting_consent: bool,
 }
 
 /// One Ember DHT routing-table contact, flattened to strings for IPC.

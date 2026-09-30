@@ -5,15 +5,39 @@ Ordered by priority within each section.
 
 ## Room transfers (Ember Transfer)
 
-### 1. Send encrypted offers — done in 1.7.1, with the fallback
+### 1. Send encrypted offers — done in 1.7.1, with a fallback the sender approves
 
 **Done in 1.7.1:** Senders send the sealed offer and hold the plain one back.
 The recipient answers a sealed offer at once with an "offer seen" frame
 (`XFER_SEEN_PLAIN_VERSION` 28). Anything the recipient says about the transfer
-cancels the plain offer; with nothing heard in `XFER_PLAIN_OFFER_FALLBACK_SECS`
-(10 s) it goes out too, which a 1.7.0 recipient ignores as a repeat and a 1.6
-recipient prompts on. What remains is the second option below: stop sending the
-plain offer once 1.6 members are rare.
+cancels the plain offer. With nothing heard in `XFER_PLAIN_OFFER_FALLBACK_SECS`
+(10 s) the plain offer is **not** sent on its own: the sender's transfer card
+says there is no reply yet, that the recipient may be on an older Ember, and
+that a standard offer lets the members relaying it see the file's name and size,
+with a **Send standard offer** button (`send_channel_transfer_standard_offer`).
+That sends the held offer once, and only while the transfer is still waiting
+and unread. A 1.7.0 recipient ignores it as a repeat; a 1.6 recipient prompts
+on it. A forwarder that drops "seen" can bring the question up but cannot make
+the offer go out.
+
+Members proven to read sealed offers are remembered in the database
+(`sealed_offer_readers`, created on first use so the schema stays at 62 and
+1.7.0 can still open it after a downgrade) for 180 days
+(`SEALED_OFFER_READER_KEEP_SECS`). No plain offer is held for them, so they are
+never asked about. The proof is a frame 1.6.x never sends whose authentication
+names the member: a "seen", sealed offer or sealed stream frame (pairwise
+transfer key), a typing signal or a room friend request (the member's
+signature). Only members on the room's roster are recorded. A 1.7.0 recipient
+never sends "seen", so its sender is asked until that member has typed, sent a
+sealed offer or stream frame, or asked for a friendship in a shared room.
+
+The sealed offer pads the name with NULs to `XFER_NAME_MAX` (160 bytes), so
+every sealed offer is the same length. 1.7.0's decoder takes the padding as
+part of the name (valid UTF-8, within the limit), and `sanitize_filename` strips
+NULs before the name is used, so its prompt reads the same.
+
+What remains is the second option below: stop holding the plain offer once 1.6
+members are rare.
 
 **Why:** An offer carries the file name and size. It is encrypted only with the
 room's content key, so when it travels through other members (no direct session

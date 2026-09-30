@@ -2261,6 +2261,7 @@ pub fn run() {
             commands::channels::pick_and_offer_channel_transfer,
             commands::channels::respond_channel_transfer,
             commands::channels::cancel_channel_transfer,
+            commands::channels::send_channel_transfer_standard_offer,
             commands::channels::list_channel_transfers,
             commands::settings::get_settings,
             commands::settings::update_settings,

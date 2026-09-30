@@ -990,18 +990,118 @@ pub(super) fn emit_xfer_update(
 ) {
     let _ = app_handle.emit(
         "ember:xfer-update",
-        serde_json::json!({
-            "xfer_id": hex::encode(xfer_id),
-            "channel_id": hex::encode(channel_id),
-            "peer_pubkey": hex::encode(peer),
-            "direction": direction,
-            "name": name,
-            "size": size,
-            "transferred": transferred,
-            "status": status,
-            "risky": crate::security::is_dangerous_extension(name),
-        }),
+        xfer_update_payload(xfer_id, channel_id, peer, direction, name, size, transferred, status),
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn xfer_update_payload(
+    xfer_id: &[u8; 16],
+    channel_id: &[u8; 16],
+    peer: &[u8; 32],
+    direction: &str,
+    name: &str,
+    size: u64,
+    transferred: u64,
+    status: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "xfer_id": hex::encode(xfer_id),
+        "channel_id": hex::encode(channel_id),
+        "peer_pubkey": hex::encode(peer),
+        "direction": direction,
+        "name": name,
+        "size": size,
+        "transferred": transferred,
+        "status": status,
+        "risky": crate::security::is_dangerous_extension(name),
+    })
+}
+
+/// [`emit_xfer_update`] for a send, saying whether the user is being asked to
+/// send its plain offer. Every other update leaves that out, which the page
+/// reads as no.
+pub(super) fn emit_xfer_send_update(
+    app_handle: &tauri::AppHandle,
+    xfer_id: &[u8; 16],
+    send: &ember::xfer::SendState,
+) {
+    let mut payload = xfer_update_payload(
+        xfer_id,
+        &send.channel_id,
+        &send.peer,
+        "send",
+        &send.name,
+        send.size,
+        send.bytes_sent().min(send.size),
+        if send.accepted { "active" } else { "offered" },
+    );
+    payload["awaiting_consent"] = send.awaiting_consent().into();
+    let _ = app_handle.emit("ember:xfer-update", payload);
+}
+
+/// Proof older than this is written again when it is seen again.
+const SEALED_OFFER_READER_REWRITE_SECS: i64 = 24 * 3600;
+/// Bounds [`NetworkState::sealed_offer_readers`]. Only a write-saver: the
+/// database still answers for anyone it drops.
+const SEALED_OFFER_READER_CACHE_CAP: usize = 4096;
+
+/// Remember that `member` reads sealed offers, and take down any question
+/// about sending them a plain offer.
+///
+/// Call only for a frame 1.6.x never sends whose authentication names
+/// `member` — its signature, or the pairwise transfer key — so that a member
+/// forwarding it cannot have made it. Only members on the room's roster are
+/// written, so fresh identities cannot fill the table.
+pub(super) fn note_sealed_offer_reader(
+    state: &mut NetworkState,
+    db: &Database,
+    app_handle: &tauri::AppHandle,
+    channel_id: [u8; 16],
+    member: &[u8; 32],
+) {
+    if *member == state.local_ed25519_pubkey
+        || !channel_member_on_roster(state, db, channel_id, member)
+    {
+        return;
+    }
+    for (xfer_id, send) in state.xfer_send.iter_mut() {
+        if send.heard_from(member) {
+            emit_xfer_send_update(app_handle, xfer_id, send);
+        }
+    }
+    let now = chrono::Utc::now().timestamp();
+    if state
+        .sealed_offer_readers
+        .get(member)
+        .is_some_and(|at| now.saturating_sub(*at) < SEALED_OFFER_READER_REWRITE_SECS)
+    {
+        return;
+    }
+    let forget_before = now.saturating_sub(ember::xfer::SEALED_OFFER_READER_KEEP_SECS);
+    if let Err(e) = db.note_sealed_offer_reader(&hex::encode(member), now, forget_before) {
+        warn!("Ember Transfer: could not remember a member that reads sealed offers: {e}");
+        return;
+    }
+    if state.sealed_offer_readers.len() >= SEALED_OFFER_READER_CACHE_CAP {
+        state.sealed_offer_readers.clear();
+    }
+    state.sealed_offer_readers.insert(*member, now);
+}
+
+/// Whether `member` has recently proven it reads sealed offers, so it is
+/// neither held a plain offer nor asked about.
+pub(super) fn member_reads_sealed_offers(
+    state: &NetworkState,
+    db: &Database,
+    member: &[u8; 32],
+) -> bool {
+    let last_seen = state.sealed_offer_readers.get(member).copied().or_else(|| {
+        db.sealed_offer_reader_seen_at(&hex::encode(member))
+            .ok()
+            .flatten()
+    });
+    ember::xfer::sealed_offer_reader_current(last_seen, chrono::Utc::now().timestamp())
 }
 
 /// Whether `peer` is allowed to put an offer in front of the user.
@@ -1138,6 +1238,38 @@ fn xfer_sender_protected(
         || channel_roster_snapshot(state, db, channel_id).is_moderator(peer)
 }
 
+/// What becomes of an authenticated offer before anything about the file is
+/// looked at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum XferOfferGate {
+    /// From a banned member, or one the room does not show: dropped.
+    Refused,
+    /// Over the sender's rate: dropped, and its gossip id let go.
+    Shed,
+    /// Taken further, with "seen" sent back first when it was sealed.
+    Admitted { send_seen: bool },
+}
+
+/// Ban, then roster, then rate, each asked only once the one before passed, so
+/// a refused offer spends none of its sender's allowance. "Seen" is owed only
+/// past all three: any earlier, it would answer a banned or absent member, or
+/// be an echo anyone over their rate could draw for free.
+pub(super) fn xfer_offer_gate<S>(
+    ctx: &mut S,
+    sealed: bool,
+    banned: impl FnOnce(&mut S) -> bool,
+    on_roster: impl FnOnce(&mut S) -> bool,
+    rate_ok: impl FnOnce(&mut S) -> bool,
+) -> XferOfferGate {
+    if banned(ctx) || !on_roster(ctx) {
+        return XferOfferGate::Refused;
+    }
+    if !rate_ok(ctx) {
+        return XferOfferGate::Shed;
+    }
+    XferOfferGate::Admitted { send_seen: sealed }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn apply_xfer_offer(
     socket: &UdpSocket,
@@ -1151,30 +1283,37 @@ pub(super) async fn apply_xfer_offer(
     sealed: bool,
 ) {
     let sender_hex = hex::encode(offer.sender);
-    if channel_member_banned(state, db, gossip.channel_id, &offer.sender) {
-        return;
-    }
-    // Only someone we can see in the room may offer. Without this a member
-    // who left, or was never here, could still put a dialog on screen.
-    if !channel_member_pubkeys_cached(state, db, gossip.channel_id).contains(&offer.sender) {
-        return;
-    }
-    // An offer costs the recipient a prompt, so it is rate-limited exactly
-    // like a chat line from the same author.
-    if !channel_author_gossip_ok(state, gossip.channel_id, &offer.sender) {
-        forget_channel_gossip(state, &gossip.msg_id);
-        return;
-    }
-    // At once, and ahead of the checks below: the sender only needs to know it
-    // need not send the plain offer, whatever becomes of this one.
-    if sealed {
-        let seen = ember::channel::encode_xfer_seen(
-            &key,
-            &state.local_ed25519_pubkey,
-            &offer.sender,
-            &offer.xfer_id,
-        );
-        send_xfer_frame(socket, state, db, gossip.channel_id, offer.sender, &seen).await;
+    let channel_id = gossip.channel_id;
+    let gate = xfer_offer_gate(
+        state,
+        sealed,
+        |state| channel_member_banned(state, db, channel_id, &offer.sender),
+        // Only someone we can see in the room may offer. Without this a member
+        // who left, or was never here, could still put a dialog on screen.
+        |state| channel_member_pubkeys_cached(state, db, channel_id).contains(&offer.sender),
+        // An offer costs the recipient a prompt, so it is rate-limited exactly
+        // like a chat line from the same author.
+        |state| channel_author_gossip_ok(state, channel_id, &offer.sender),
+    );
+    match gate {
+        XferOfferGate::Refused => return,
+        XferOfferGate::Shed => {
+            forget_channel_gossip(state, &gossip.msg_id);
+            return;
+        }
+        // At once, and ahead of the checks below: the sender only needs to
+        // know it need not ask about the plain offer, whatever becomes of
+        // this one.
+        XferOfferGate::Admitted { send_seen: true } => {
+            let seen = ember::channel::encode_xfer_seen(
+                &key,
+                &state.local_ed25519_pubkey,
+                &offer.sender,
+                &offer.xfer_id,
+            );
+            send_xfer_frame(socket, state, db, channel_id, offer.sender, &seen).await;
+        }
+        XferOfferGate::Admitted { send_seen: false } => {}
     }
     let name = crate::security::sanitize_filename(&offer.name);
     if name.is_empty() {
@@ -1822,23 +1961,12 @@ pub(super) async fn drive_channel_transfers(
     let now = std::time::Instant::now();
     let me = state.local_ed25519_pubkey;
 
-    // Sealed offers nobody said they could read: the recipient may be on
-    // v1.6.x, so it gets the plain one too.
-    let plain_offers: Vec<([u8; 16], [u8; 16], [u8; 32], Vec<u8>)> = state
-        .xfer_send
-        .iter_mut()
-        .filter_map(|(xfer_id, send)| {
-            send.take_due_plain_offer(now)
-                .map(|frame| (*xfer_id, send.channel_id, send.peer, frame))
-        })
-        .collect();
-    for (xfer_id, channel_id, peer, frame) in plain_offers {
-        if !send_xfer_frame(socket, state, db, channel_id, peer, &frame).await {
-            // Nothing else carries the offer to a v1.6.x member, so try again
-            // shortly for as long as the offer lives.
-            if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
-                send.hold_plain_offer(frame, now + std::time::Duration::from_secs(5));
-            }
+    // Sealed offers nobody said they could read. The recipient may be on
+    // v1.6.x, but every member the plain offer is forwarded through can read
+    // the file's name and size in it, so the user is asked instead.
+    for (xfer_id, send) in state.xfer_send.iter_mut() {
+        if send.plain_offer_came_due(now) {
+            emit_xfer_send_update(app_handle, xfer_id, send);
         }
     }
 
@@ -2228,6 +2356,59 @@ mod xfer_offer_admission_tests {
             xfer_offer_admission(&[], XFER_MAX_ACTIVE, &member(1), true, Instant::now()),
             XferOfferAdmission::Busy
         );
+    }
+}
+
+#[cfg(test)]
+mod xfer_offer_gate_tests {
+    use super::{xfer_offer_gate, XferOfferGate};
+
+    /// Which checks ran, in order.
+    #[derive(Default)]
+    struct Asked(Vec<&'static str>);
+
+    fn gate(sealed: bool, banned: bool, on_roster: bool, rate_ok: bool) -> (XferOfferGate, Vec<&'static str>) {
+        let mut asked = Asked::default();
+        let verdict = xfer_offer_gate(
+            &mut asked,
+            sealed,
+            |a| {
+                a.0.push("ban");
+                banned
+            },
+            |a| {
+                a.0.push("roster");
+                on_roster
+            },
+            |a| {
+                a.0.push("rate");
+                rate_ok
+            },
+        );
+        (verdict, asked.0)
+    }
+
+    /// "Seen" goes back only for a sealed offer, and only once the ban, roster
+    /// and rate checks have all passed.
+    #[test]
+    fn seen_is_owed_only_for_a_sealed_offer_past_every_check() {
+        assert_eq!(
+            gate(true, false, true, true),
+            (XferOfferGate::Admitted { send_seen: true }, vec!["ban", "roster", "rate"])
+        );
+        assert_eq!(gate(false, false, true, true).0, XferOfferGate::Admitted { send_seen: false });
+        assert_eq!(gate(true, true, true, true), (XferOfferGate::Refused, vec!["ban"]));
+        assert_eq!(gate(true, false, false, true), (XferOfferGate::Refused, vec!["ban", "roster"]));
+        assert_eq!(gate(true, false, true, false).0, XferOfferGate::Shed);
+    }
+
+    /// A refused offer does not spend its sender's rate allowance.
+    #[test]
+    fn a_refused_offer_is_never_rate_counted() {
+        for (banned, on_roster) in [(true, true), (true, false), (false, false)] {
+            let (_, asked) = gate(true, banned, on_roster, true);
+            assert!(!asked.contains(&"rate"), "{asked:?}");
+        }
     }
 }
 

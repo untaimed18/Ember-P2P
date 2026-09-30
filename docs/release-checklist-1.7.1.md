@@ -155,11 +155,24 @@ git diff v1.7.0 -- messages/en.json
 
 ## 9. Room transfers across versions
 
-- [ ] 1.7.1 to 1.7.1: the prompt appears at once, and one prompt only.
-- [ ] 1.7.1 to 1.7.0: the prompt appears at once; after 10 seconds no second
-      prompt appears, whether the first is still open, accepted or finished.
-- [ ] 1.7.1 to 1.6.x: the prompt appears after about 10 seconds and the transfer
-      completes.
+- [ ] 1.7.1 to 1.7.1: the recipient's prompt appears at once, and one prompt
+      only. The sender's card never shows **Send standard offer**.
+- [ ] 1.7.1 to 1.7.0, a member the sender has not seen type in a room: the
+      recipient's prompt appears at once. After about 10 seconds the sender's
+      card says there is no reply yet and offers **Send standard offer**; the
+      question goes away when the recipient accepts or declines. Clicking it
+      before then sends one standard offer, and the recipient sees no second
+      prompt, whether the first is still open, accepted or finished.
+- [ ] 1.7.1 to 1.7.0 after that member has typed in a room the sender is in
+      (also after restarting the sender): no question appears on the sender's
+      card.
+- [ ] 1.7.1 to 1.6.x: nothing appears on the recipient's side until the sender
+      clicks **Send standard offer** (about 10 seconds after offering); then the
+      prompt appears and the transfer completes. Without the click the offer
+      expires unseen.
+- [ ] A recipient that goes offline before answering: the sender's question
+      stays until the transfer ends; clicking it while the member cannot be
+      reached says so and leaves the button there to try again.
 
 ## 10. QUIC on the shared UDP port
 

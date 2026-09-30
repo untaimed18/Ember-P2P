@@ -8148,6 +8148,58 @@ impl Database {
         Self::delete_channel_handoff_commit_locked(&conn, channel_id)
     }
 
+    /// Created on first use rather than by a numbered migration, like
+    /// `channel_handoff_commits`: nothing refers to it, and a numbered one
+    /// would stop 1.7.0 from opening the database after a downgrade.
+    fn ensure_sealed_offer_readers_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sealed_offer_readers (
+                member_pubkey TEXT PRIMARY KEY,
+                last_seen INTEGER NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Record that the room member with Ed25519 key `member_pubkey` (hex)
+    /// proved at `now` that it reads sealed transfer offers, and forget every
+    /// member last proven before `forget_before`.
+    pub fn note_sealed_offer_reader(
+        &self,
+        member_pubkey: &str,
+        now: i64,
+        forget_before: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_sealed_offer_readers_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO sealed_offer_readers (member_pubkey, last_seen) VALUES (?1, ?2)
+             ON CONFLICT(member_pubkey) DO UPDATE SET last_seen = MAX(last_seen, excluded.last_seen)",
+            params![member_pubkey.to_ascii_lowercase(), now],
+        )?;
+        tx.execute(
+            "DELETE FROM sealed_offer_readers WHERE last_seen < ?1",
+            params![forget_before],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// When the member with Ed25519 key `member_pubkey` (hex) last proved it
+    /// reads sealed transfer offers, if it ever did.
+    pub fn sealed_offer_reader_seen_at(&self, member_pubkey: &str) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock();
+        Self::ensure_sealed_offer_readers_locked(&conn)?;
+        Ok(conn
+            .query_row(
+                "SELECT last_seen FROM sealed_offer_readers WHERE member_pubkey = ?1",
+                params![member_pubkey.to_ascii_lowercase()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Hand a room we own to its confirmed successor, if that is still the
     /// handoff this device is committed to.
     ///
@@ -14574,6 +14626,34 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A member proven to read sealed offers is remembered across a restart
+    /// under its newest proof, and forgotten once that proof is too old.
+    #[test]
+    fn sealed_offer_readers_survive_a_restart_and_age_out() {
+        let path = temp_db_path("sealed-readers");
+        let (alice, bob) = ("A1".repeat(32), "b0".repeat(32));
+        {
+            let db = Database::open_at(&path).expect("open db");
+            assert_eq!(db.sealed_offer_reader_seen_at(&alice).unwrap(), None);
+            db.note_sealed_offer_reader(&alice, 1_000, 0).unwrap();
+            db.note_sealed_offer_reader(&alice, 900, 0).unwrap();
+            db.note_sealed_offer_reader(&bob, 500, 0).unwrap();
+            assert_eq!(
+                db.sealed_offer_reader_seen_at(&alice.to_ascii_lowercase()).unwrap(),
+                Some(1_000),
+                "an older proof does not move it back, and case does not matter"
+            );
+        }
+        let db = Database::open_at(&path).expect("reopen db");
+        assert_eq!(db.sealed_offer_reader_seen_at(&alice).unwrap(), Some(1_000));
+        assert_eq!(db.sealed_offer_reader_seen_at(&bob).unwrap(), Some(500));
+        db.note_sealed_offer_reader(&alice, 2_000, 600).unwrap();
+        assert_eq!(db.sealed_offer_reader_seen_at(&bob).unwrap(), None, "aged out");
+        assert_eq!(db.sealed_offer_reader_seen_at(&alice).unwrap(), Some(2_000));
+        drop(db);
+        remove_temp_db(&path);
     }
 
     #[test]

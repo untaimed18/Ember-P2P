@@ -525,6 +525,9 @@ export interface ChannelTransferInfo {
   status: ChannelTransferStatus;
   /** A program, shortcut or script, or one named like a document. */
   risky?: boolean;
+  /** An offer we sent that nobody has said they could read, waiting on the
+   *  user to decide whether to send the standard one. */
+  awaiting_consent?: boolean;
 }
 
 /** Offer one file to one member. Returns the transfer id, or `null` if the
@@ -550,6 +553,12 @@ export async function respondChannelTransfer(xferId: string, accept: boolean): P
 
 export async function cancelChannelTransfer(xferId: string): Promise<void> {
   return invoke('cancel_channel_transfer', { xferId });
+}
+
+/** Send the standard offer for a file whose private one went unanswered. The
+ *  members it is forwarded through can read the file's name and size. */
+export async function sendChannelTransferStandardOffer(xferId: string): Promise<void> {
+  return invoke('send_channel_transfer_standard_offer', { xferId });
 }
 
 export async function listChannelTransfers(): Promise<ChannelTransferInfo[]> {

@@ -1120,6 +1120,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_handoff_fetch_at: HashMap::new(),
         local_ed25519_seed: ed25519_secret_key,
         xfer_send: HashMap::new(),
+        sealed_offer_readers: HashMap::new(),
         xfer_recv: HashMap::new(),
         xfer_finish_tx,
         xfer_finish_in_flight: 0,

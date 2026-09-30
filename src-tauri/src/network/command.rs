@@ -3227,17 +3227,21 @@ async fn handle_command_inner(
                 root,
                 name: name.clone(),
             };
-            // Sealed first, so the members it is forwarded through cannot read
+            // Sealed only, so the members it is forwarded through cannot read
             // the file's name and size. A recipient on v1.6.x cannot read it
-            // either, so the plain offer follows unless the recipient says it
-            // has the sealed one first.
+            // either, so unless this one is known to, the plain offer is kept
+            // and the user is asked about it if the recipient stays silent.
             let mut send =
                 ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path.clone());
-            send.hold_plain_offer(
-                ember::channel::encode_xfer_offer(&key, &offer),
-                std::time::Instant::now()
-                    + std::time::Duration::from_secs(ember::channel::XFER_PLAIN_OFFER_FALLBACK_SECS),
-            );
+            if !member_reads_sealed_offers(state, db, &peer) {
+                send.hold_plain_offer(
+                    ember::channel::encode_xfer_offer(&key, &offer),
+                    std::time::Instant::now()
+                        + std::time::Duration::from_secs(
+                            ember::channel::XFER_PLAIN_OFFER_FALLBACK_SECS,
+                        ),
+                );
+            }
             state.xfer_send.insert(xfer_id, send);
             let sealed = ember::channel::encode_xfer_offer_sealed(&key, &offer);
             let sent = send_xfer_frame(socket, state, db, channel_id, peer, &sealed).await;
@@ -3572,6 +3576,45 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(()));
         }
 
+        NetworkCommand::SendChannelTransferPlainOffer { xfer_id, tx } => {
+            let me = state.local_ed25519_pubkey;
+            let Some(send) = state.xfer_send.get_mut(&xfer_id) else {
+                let _ = tx.send(Err(coded(
+                    "channels_xfer_not_found",
+                    "That transfer is no longer running",
+                )));
+                return;
+            };
+            let (channel_id, peer) = (send.channel_id, send.peer);
+            // Nothing held means the recipient read the sealed offer in the
+            // meantime, or the plain one already went: either way it has one.
+            let Some(frame) = send.take_consented_plain_offer() else {
+                let _ = tx.send(Ok(()));
+                return;
+            };
+            if ember::channel::xfer_frame_peek(&frame) != Some((me, peer, xfer_id)) {
+                let _ = tx.send(Err(coded(
+                    "channels_xfer_not_found",
+                    "That transfer is no longer running",
+                )));
+                return;
+            }
+            if !send_xfer_frame(socket, state, db, channel_id, peer, &frame).await {
+                if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
+                    send.ask_again(frame);
+                }
+                let _ = tx.send(Err(coded(
+                    "channels_xfer_unreachable",
+                    "Could not reach that member right now",
+                )));
+                return;
+            }
+            if let Some(send) = state.xfer_send.get(&xfer_id) {
+                emit_xfer_send_update(app_handle, &xfer_id, send);
+            }
+            let _ = tx.send(Ok(()));
+        }
+
         NetworkCommand::DropChannelTransfers { channel_id, member } => {
             // `delete_owned_channel` tombstones the row and then sends this, so
             // it is the point at which the network task learns a room it may be
@@ -3607,6 +3650,7 @@ async fn handle_command_inner(
                     transferred: 0,
                     status: "awaiting".into(),
                     risky: crate::security::is_dangerous_extension(&offer.name),
+                    awaiting_consent: false,
                 });
             }
             for (xfer_id, recv) in &state.xfer_recv {
@@ -3620,6 +3664,7 @@ async fn handle_command_inner(
                     transferred: recv.bytes_received(),
                     status: "active".into(),
                     risky: crate::security::is_dangerous_extension(&recv.name),
+                    awaiting_consent: false,
                 });
             }
             for (xfer_id, send) in &state.xfer_send {
@@ -3636,6 +3681,7 @@ async fn handle_command_inner(
                         .min(send.size),
                     status: if send.accepted { "active" } else { "offered" }.into(),
                     risky: crate::security::is_dangerous_extension(&send.name),
+                    awaiting_consent: send.awaiting_consent(),
                 });
             }
             let _ = tx.send(out);

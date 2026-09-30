@@ -681,6 +681,12 @@ export const awaitingChannelOffers = derived(
     ).length,
 );
 
+/** A file this user offered that nobody has said they could read, so the room
+ *  asks whether to send the standard offer. Only a send can ask. */
+export function xferNeedsConsent(xfer: ChannelTransferInfo): boolean {
+  return xfer.direction === 'send' && xfer.status === 'offered' && xfer.awaiting_consent === true;
+}
+
 const TERMINAL_XFER: ReadonlyArray<ChannelTransferInfo['status']> = [
   'complete',
   'declined',
