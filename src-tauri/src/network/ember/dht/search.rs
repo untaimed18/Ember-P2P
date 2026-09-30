@@ -1005,6 +1005,11 @@ impl IterativeSearch {
     /// been asked yet, and page follow-ups to nodes that already answered with
     /// more records than their datagram could carry.
     pub fn next_to_query(&mut self) -> Vec<QueryTarget> {
+        // The response handlers drive a search once more before it is removed,
+        // and anything sent then is answered to nobody.
+        if self.complete {
+            return Vec::new();
+        }
         let in_flight = self
             .shortlist
             .iter()
@@ -1324,6 +1329,11 @@ impl IterativeSearch {
         }
         let mut cut_short = false;
         let mut delivered_now = 0usize;
+        // Records this reply carried for our key, taken or not. A page with
+        // none earns no follow-up: otherwise an empty answer bought another
+        // query, up to the per-node page allowance, and a cheap identity could
+        // hold half the search's slots answering nothing.
+        let mut carried = 0usize;
         for data in value_records {
             if self.search_type == SearchType::FindValue {
                 if data.len() < 17 + 64 {
@@ -1339,6 +1349,7 @@ impl IterativeSearch {
                     continue;
                 }
             }
+            carried += 1;
             // No single peer gets to fill the budget. See
             // [`MAX_RESULTS_PER_NODE`]: the walk ends when the budget is full,
             // so without this the node that answers first also decides how far
@@ -1473,7 +1484,7 @@ impl IterativeSearch {
             }
         }
 
-        if let Some(page) = page {
+        if let Some(page) = page.filter(|_| carried > 0) {
             self.queue_next_page(from_id, asked_start, page, cut_short, delivered_now > 0);
         }
 
