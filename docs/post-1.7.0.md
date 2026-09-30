@@ -68,14 +68,17 @@ past session has seen for that member.
 
 **Done in 1.7.1:** as designed below, in `network/ember/udp_mux.rs`. QUIC runs
 on the KAD / Ember socket, a listen-only endpoint stays on the TCP port number
-for 1.7.0 peers that guess it, and `quic_shares_udp_port: false` in
-`config.json` restores the separate socket. The legacy listener keeps the old
-socket's UPnP mapping and Windows Firewall rule, since the 1.7.0 relays it is
-for dial it from outside the NAT. One cost the design did not name: the shared
-socket cannot set don't-fragment, because Ember frames up to 4 KiB rely on
-fragmentation, so quinn skips path-MTU discovery and stays at 1200-byte
-packets. What remains: drop the legacy listener, its mapping and its firewall
-rule once 1.7.0 relays are rare.
+for peers that guess it, and `quic_shares_udp_port: false` in `config.json`
+restores the separate socket. The guessers are not only 1.7.0: a relay asked to
+reach a source known only from KAD dials the source's TCP port number, because
+a KAD record has nowhere to carry a QUIC port, and 1.7.1 requesters still ask
+for that. The legacy listener keeps the old socket's UPnP mapping and Windows
+Firewall rule, since those relays dial it from outside the NAT. One cost the
+design did not name: the shared socket cannot set don't-fragment, because Ember
+frames up to 4 KiB rely on fragmentation, so quinn skips path-MTU discovery and
+stays at 1200-byte packets. What remains: the legacy listener can go only once
+nothing dials the TCP port for QUIC, which needs a relay target for KAD-only
+sources first.
 
 **Why:** QUIC listens on its own UDP port. Setups that forward a single port (a
 VPN such as ProtonVPN, many routers) leave it unreachable. 1.7.0 covers this

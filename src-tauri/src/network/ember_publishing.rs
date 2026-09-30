@@ -2310,7 +2310,16 @@ pub(super) fn ember_source_buddy_choice(
             ember_named_source_buddy(state, contact, now_ts).map(|buddy| (contact.clone(), buddy))
         })
     };
-    let named = endorsed(&live).or_else(|| endorsed(&skipped));
+    // The buddy already named stays named while it still qualifies. Picking
+    // the most recently heard endorsed contact afresh each tick changed the
+    // name whenever another one spoke, and every change makes the whole
+    // library's source records due again.
+    let current = state.ember_named_source_buddy.and_then(|id| {
+        live.iter()
+            .find(|contact| contact.node_id == id)
+            .and_then(|contact| endorsed(std::slice::from_ref(contact)))
+    });
+    let named = current.or_else(|| endorsed(&live)).or_else(|| endorsed(&skipped));
     (live, named)
 }
 

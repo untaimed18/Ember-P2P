@@ -3458,6 +3458,9 @@ async fn handle_command_inner(
                 return;
             }
             state.xfer_pending.remove(&xfer_id);
+            if !accept {
+                super::channel_xfer::remember_declined_xfer(xfer_id, offer.channel_id, offer.peer, plain);
+            }
             emit_xfer_update(
                 app_handle,
                 &xfer_id,
@@ -5190,11 +5193,14 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::GetEmberTransferActivity { tx } => {
+            // A chat attachment arriving counts too: its bytes bypass the
+            // bandwidth limiter, and a restart fails it and deletes its part.
             let _ = tx.send(
                 state.xfer_send.len()
                     + state.xfer_recv.len()
                     + state.xfer_streams.len()
-                    + state.xfer_finish_in_flight,
+                    + state.xfer_finish_in_flight
+                    + super::chat_attach::running_fetches(state),
             );
         }
 

@@ -312,6 +312,7 @@ impl SendState {
         if !self.accepted {
             self.accepted = true;
             self.updated_at = Instant::now();
+            self.offer_was_read();
         }
         if position > self.streamed {
             self.streamed = position.min(self.size);
@@ -843,6 +844,16 @@ impl FinishedXfers {
         Some((entry.channel_id, entry.verdict.clone()))
     }
 
+    /// Whether `xfer_id` from `peer` is a transfer remembered here, answered
+    /// or not: a frame about it, even inside the answer gap, is never a new
+    /// offer.
+    pub fn remembers(&self, xfer_id: &[u8; 16], peer: &[u8; 32], now: Instant) -> bool {
+        self.entries.get(xfer_id).is_some_and(|entry| {
+            entry.peer == *peer
+                && now.saturating_duration_since(entry.finished_at) <= XFER_FINISHED_REMEMBER
+        })
+    }
+
     /// Verdicts due to be sent again unasked, as `(channel_id, peer, frame)`.
     pub fn due(&mut self, now: Instant) -> Vec<([u8; 16], [u8; 32], Vec<u8>)> {
         self.prune(now);
@@ -955,11 +966,17 @@ mod tests {
         );
         assert_eq!(finished.answer(&xfer, &sender, later), Some((room, b"done".to_vec())));
         assert!(finished.answer(&xfer, &sender, later + Duration::from_secs(1)).is_none());
+        assert!(
+            finished.remembers(&xfer, &sender, later + Duration::from_secs(1)),
+            "inside the gap it is still no new offer"
+        );
+        assert!(!finished.remembers(&xfer, &stranger, later));
         assert!(finished.answer(&xfer, &sender, later + Duration::from_secs(3)).is_some());
         assert!(finished.answer(&[0u8; 16], &sender, later).is_none());
         assert!(finished
             .answer(&xfer, &sender, t0 + XFER_FINISHED_REMEMBER + Duration::from_secs(1))
             .is_none());
+        assert!(!finished.remembers(&xfer, &sender, t0 + XFER_FINISHED_REMEMBER + Duration::from_secs(1)));
     }
 
     #[test]

@@ -2818,27 +2818,31 @@
     ) || userCategories.some((cat) => cat.toLocaleLowerCase() === folded);
   }
 
-  async function saveUserCategories(next: string[]): Promise<string[]> {
+  /** Edits the categories as the backend holds them now, not as this page last saw them. */
+  async function saveUserCategories(edit: (current: string[]) => string[]): Promise<{ before: string[]; saved: string[] }> {
     const current = await getSettings();
-    const result = await updateSettings({ ...current, download_categories: next });
+    const before = current.download_categories ?? [];
+    const result = await updateSettings({ ...current, download_categories: edit(before) });
     setAppSettings(result.settings);
-    return result.settings.download_categories ?? [];
+    return { before, saved: result.settings.download_categories ?? [] };
   }
 
   async function addUserCategory(name: string) {
-    const saved = await saveUserCategories([...userCategories, name]);
-    // The name as the backend kept it, which may be trimmed or cut.
-    const kept = saved.find((cat) => cat.toLocaleLowerCase() === name.toLocaleLowerCase()) ?? saved[saved.length - 1];
+    const { before, saved } = await saveUserCategories((current) => [...current, name]);
+    // The name as the backend kept it, which may be trimmed or cut; none when
+    // it cleaned the name into one that already exists.
+    const kept = saved.find((cat) => !before.includes(cat));
+    if (!kept) throw new Error(m.transfers_categories_exists());
     const ids = new Set(categoriesDialog.assignIds);
-    if (kept && ids.size > 0) {
+    if (ids.size > 0) {
       await assignCategory(allDownloads.filter((t) => ids.has(t.id)), kept);
     }
   }
 
   async function removeUserCategory(name: string) {
-    await saveUserCategories(userCategories.filter((cat) => cat !== name));
     const members = allDownloads.filter((t) => t.category === name);
     if (members.length > 0) await assignCategory(members, '');
+    await saveUserCategories((current) => current.filter((cat) => cat !== name));
     if (categoryFilter === name) categoryFilter = '';
   }
 

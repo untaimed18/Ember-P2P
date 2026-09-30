@@ -5945,6 +5945,24 @@ impl UploadHandler {
         let push_grant_file_hash = req.push_grant_file_hash;
         let push_grant_accepted = req.push_grant_accepted;
         let peer_hash = req.user_hash.filter(|h| *h != [0u8; 16]);
+        // A waiter was filtered when it connected in, but a push-grant dials an
+        // address remembered since, possibly from the last session and before
+        // the filter was updated. Fail closed as the inbound check does.
+        if push_grant_file_hash.is_some()
+            && self
+                .filter_incoming_connections
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let std::net::IpAddr::V4(v4) = peer_addr.ip() {
+                let blocked = self
+                    .shared_ip_filter
+                    .read()
+                    .map_or(true, |snap| snap.is_blocked(v4));
+                if blocked {
+                    anyhow::bail!("connect_and_serve {peer_addr}: blocked by the IP filter");
+                }
+            }
+        }
         // eMule would reuse a socket it already has with this peer; we cannot,
         // and a second one makes the peer close the first.
         let _peer_session = match peer_addr.ip() {
@@ -9305,6 +9323,7 @@ impl UploadHandler {
                         }
                         continue;
                     }
+                    super::upload_queue_store::note_asked(&queue_identity);
 
                     // Duplicate OP_STARTUPLOADREQ on an already-granted session.
                     // eMule/Ember peers occasionally re-send STARTUPLOADREQ after

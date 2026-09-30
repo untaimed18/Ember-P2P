@@ -15,8 +15,8 @@ const OFFER_RETRY_AFTER_REFUSAL: std::time::Duration = std::time::Duration::from
 /// Whether the `.part` exists is a file-system call per download, and on a
 /// Temp folder on a slow or network drive that adds up. The candidates are
 /// collected under the transfer-manager lock and checked after it is
-/// released, on the blocking pool, so neither the network loop nor any
-/// transfer-status writer waits on the disk.
+/// released, on the blocking pool, so no transfer-status writer waits on the
+/// disk. The caller still awaits the checks.
 pub(in crate::network) async fn partial_download_offers(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     settings: &AppSettings,

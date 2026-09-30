@@ -1660,6 +1660,20 @@ pub(super) async fn apply_xfer_finish(
     );
 }
 
+/// Remember an offer declined here like a receive that ended, so a later
+/// copy of it (the plain offer a sender falls back to, or a retransmit) gets
+/// the decline again instead of a second prompt.
+pub(super) fn remember_declined_xfer(
+    xfer_id: [u8; 16],
+    channel_id: [u8; 16],
+    peer: [u8; 32],
+    reply: Vec<u8>,
+) {
+    finished_xfers()
+        .lock()
+        .record(xfer_id, channel_id, peer, reply, std::time::Instant::now());
+}
+
 /// Receives that have ended here, with the verdict their sender was sent.
 /// Beside the event loop's state rather than in it because only the transfer
 /// handlers read it.
@@ -1682,12 +1696,15 @@ pub(super) async fn answer_finished_xfer(
     xfer_id: [u8; 16],
     sender: [u8; 32],
 ) -> bool {
-    let answer = finished_xfers()
-        .lock()
-        .answer(&xfer_id, &sender, std::time::Instant::now());
-    let Some((channel_id, verdict)) = answer else {
-        return false;
+    let now = std::time::Instant::now();
+    let answer = {
+        let mut finished = finished_xfers().lock();
+        match finished.answer(&xfer_id, &sender, now) {
+            Some(answer) => answer,
+            None => return finished.remembers(&xfer_id, &sender, now),
+        }
     };
+    let (channel_id, verdict) = answer;
     send_xfer_frame(socket, state, db, channel_id, sender, &verdict).await;
     true
 }
@@ -1807,16 +1824,22 @@ pub(super) async fn drive_channel_transfers(
 
     // Sealed offers nobody said they could read: the recipient may be on
     // v1.6.x, so it gets the plain one too.
-    let plain_offers: Vec<([u8; 16], [u8; 32], Vec<u8>)> = state
+    let plain_offers: Vec<([u8; 16], [u8; 16], [u8; 32], Vec<u8>)> = state
         .xfer_send
-        .values_mut()
-        .filter_map(|send| {
+        .iter_mut()
+        .filter_map(|(xfer_id, send)| {
             send.take_due_plain_offer(now)
-                .map(|frame| (send.channel_id, send.peer, frame))
+                .map(|frame| (*xfer_id, send.channel_id, send.peer, frame))
         })
         .collect();
-    for (channel_id, peer, frame) in plain_offers {
-        send_xfer_frame(socket, state, db, channel_id, peer, &frame).await;
+    for (xfer_id, channel_id, peer, frame) in plain_offers {
+        if !send_xfer_frame(socket, state, db, channel_id, peer, &frame).await {
+            // Nothing else carries the offer to a v1.6.x member, so try again
+            // shortly for as long as the offer lives.
+            if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
+                send.hold_plain_offer(frame, now + std::time::Duration::from_secs(5));
+            }
+        }
     }
 
     // Offers nobody answered. Dropping them keeps a stale dialog from

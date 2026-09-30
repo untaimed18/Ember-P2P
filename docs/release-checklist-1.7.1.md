@@ -170,8 +170,10 @@ git diff v1.7.0 -- messages/en.json
       friend's chat attachment arrives over QUIC, not the TCP fallback, and a
       relayed LowID download through that node works.
 - [ ] 1.7.1 and 1.7.0 in both directions: friend hole-punch, a chat attachment,
-      and a relay for a KAD-only source (the 1.7.0 relay dials the TCP port
-      number, which the legacy listener answers).
+      and a relay for a KAD-only source (the relay, on either version, dials
+      the source's TCP port number, which the legacy listener answers).
+- [ ] The same KAD-only relay between two 1.7.1 nodes whose TCP and UDP ports
+      differ.
 - [ ] KAD and Ember DHT keep working through a long QUIC transfer: searches
       answer, the KAD overhead statistic does not jump with the transfer, and
       the log shows no `UDP reader: ... queue full`.

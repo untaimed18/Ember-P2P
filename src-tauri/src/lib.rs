@@ -1385,6 +1385,11 @@ pub fn run() {
                     let hydration_records = known_list.all_records().cloned().collect::<Vec<_>>();
                     let hydration_folders = current_shared_folders.clone();
                     let hydration_paths = known_paths.clone();
+                    let hydration_allowlists = {
+                        let state = startup_app.state::<AppState>();
+                        let cfg = state.config.read().await;
+                        cfg.settings.pending_folder_allowlists.clone()
+                    };
                     let hydrated_records = tokio::task::spawn_blocking(move || {
                         hydration_records
                             .into_iter()
@@ -1400,6 +1405,16 @@ pub fn run() {
                                         &hydration_folders,
                                     )
                                 {
+                                    return false;
+                                }
+                                // Discovery walks a partly shared folder's list
+                                // alone, so a record it does not offer is one
+                                // left by an earlier share of the folder, and
+                                // its flag in known.met may still say shared.
+                                if !crate::sharing::indexer::allowlists_offer(
+                                    &hydration_allowlists,
+                                    &record.file_path,
+                                ) {
                                     return false;
                                 }
                                 // Re-apply discovery's exclusions. Hydration

@@ -215,10 +215,18 @@ fn held_by_record(record: &UpdateRecord, version: &str, now_unix: i64) -> Option
     {
         return Some(Phase::Held);
     }
-    if record.postponed_until.is_some_and(|until| until > now_unix) {
+    if postponed_until(record, now_unix).is_some() {
         return Some(Phase::Postponed);
     }
     None
+}
+
+/// A "Not now" still in force. One further off than a postpone can reach was
+/// stamped under a clock running ahead, and would hold updates until then.
+fn postponed_until(record: &UpdateRecord, now_unix: i64) -> Option<i64> {
+    record.postponed_until.filter(|until| {
+        *until > now_unix && *until <= now_unix.saturating_add(POSTPONE_SECS + 3600)
+    })
 }
 
 /// Whether the user has been away from every Ember window long enough.
@@ -230,7 +238,9 @@ fn waiting_long(record: &UpdateRecord, version: &str, now_unix: i64) -> bool {
     record
         .ready_since
         .as_ref()
-        .is_some_and(|ready| ready.version == version && now_unix - ready.at >= LONG_WAIT_SECS)
+        .is_some_and(|ready| {
+            ready.version == version && now_unix.saturating_sub(ready.at) >= LONG_WAIT_SECS
+        })
 }
 
 // ── The driver ──────────────────────────────────────────────────────────────
@@ -585,11 +595,18 @@ impl Driver {
             }
             Err(error) => {
                 // Failed before anything was stopped: the staged copy vanished
-                // or the floor moved. Nothing restarts; the next tick prepares
-                // again or stands down.
+                // (antivirus, most likely, which will do it again) or the floor
+                // moved. Nothing restarts, and the version is not tried silently
+                // again, or every tick would download it and count down anew.
                 tracing::warn!("Silent update of {version} did not start: {error}");
-                record::update_stored(|record| record.attempting = None);
-                self.phase = Phase::Waiting;
+                let failed = version.to_string();
+                record::update_stored(|record| {
+                    record.attempting = None;
+                    record.failed_version = Some(failed.clone());
+                });
+                self.record.attempting = None;
+                self.record.failed_version = Some(failed);
+                self.phase = Phase::Held;
                 self.quiet_since = None;
                 self.publish(app, enabled, support, now_unix);
             }
@@ -618,10 +635,7 @@ impl Driver {
                 version
             },
             countdown_ends_at: self.countdown_ends.map(|(_, ms)| ms),
-            postponed_until: self
-                .record
-                .postponed_until
-                .filter(|until| *until > now_unix)
+            postponed_until: postponed_until(&self.record, now_unix)
                 .map(|until| until.saturating_mul(1000)),
             last_success: self.record.last_success.as_ref().map(|last| LastSuccessStatus {
                 from: last.from.clone(),
@@ -871,6 +885,9 @@ mod tests {
         let postponed = UpdateRecord { postponed_until: Some(NOW + 60), ..Default::default() };
         assert_eq!(held_by_record(&postponed, "1.8.0", NOW), Some(Phase::Postponed));
         assert_eq!(held_by_record(&postponed, "1.8.0", NOW + 61), None, "a postpone runs out");
+
+        let ahead = UpdateRecord { postponed_until: Some(NOW + 30 * 24 * 3600), ..Default::default() };
+        assert_eq!(held_by_record(&ahead, "1.8.0", NOW), None, "a postpone no click could make");
     }
 
     #[test]

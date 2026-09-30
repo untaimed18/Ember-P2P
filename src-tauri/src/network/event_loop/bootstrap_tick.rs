@@ -602,15 +602,17 @@ pub(in crate::network) async fn on_bootstrap_tick(
                                 "Broker: QUIC server+client endpoint ready on UDP port {bound_port}{}",
                                 if shares_udp { " (shared with KAD)" } else { "" },
                             );
-                            // Still listening where QUIC used to be, for one
-                            // release; see `build_legacy_endpoint`. Nothing
-                            // advertises it and nothing maps it.
+                            // Still listening where QUIC used to be; see
+                            // `build_legacy_endpoint`. Nothing advertises it,
+                            // but a relay reaching a source it knows only from
+                            // KAD dials the TCP port number, whichever version
+                            // asked it to, so this stays while that fallback does.
                             let legacy = (shares_udp && state.tcp_port != state.udp_port)
                                 .then(|| {
                                     ember::quic::build_legacy_endpoint(&cert_der, &key_der, state.tcp_port)
                                         .map_err(|e| {
-                                            tracing::debug!(
-                                                "Broker: no legacy QUIC listener on {}: {e}",
+                                            tracing::warn!(
+                                                "Broker: no legacy QUIC listener on {}, so relays that dial the TCP port for this node will fail: {e}",
                                                 state.tcp_port
                                             )
                                         })
@@ -620,8 +622,8 @@ pub(in crate::network) async fn on_bootstrap_tick(
                                 .map(std::sync::Arc::new);
                             // The port UPnP forwards for QUIC. A shared socket
                             // needs none of its own, so a legacy listener gets
-                            // the one the old socket had: the 1.7.0 relays it
-                            // exists for are dialling it from outside the NAT.
+                            // the one the old socket had: the relays it exists
+                            // for are dialling it from outside the NAT.
                             let upnp_quic_port = if legacy.is_some() { state.tcp_port } else { bound_port };
 
                             let relay_mgr = state.relay_manager.clone();

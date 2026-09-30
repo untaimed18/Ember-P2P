@@ -521,7 +521,20 @@ pub async fn write_before_install(app: &AppHandle, reason: ResumeReason, target_
 }
 
 fn write_to(dir: &Path, state: &ResumeState) -> anyhow::Result<()> {
-    let bytes = serde_json::to_vec(state)?;
+    let mut bytes = serde_json::to_vec(state)?;
+    let tabs_too_big = state
+        .ui
+        .search_tabs
+        .as_ref()
+        .is_some_and(|tabs| tabs.len() > MAX_SEARCH_TABS_BYTES);
+    if tabs_too_big || bytes.len() as u64 > MAX_FILE_BYTES {
+        // The reader drops tabs past their cap and a file past its own unread,
+        // window, server and page with it. The tabs are the part to lose.
+        tracing::warn!("Leaving the search tabs out of {RESUME_FILE}: too large");
+        let mut trimmed = state.clone();
+        trimmed.ui.search_tabs = None;
+        bytes = serde_json::to_vec(&trimmed)?;
+    }
     crate::security::atomic_write(&dir.join(RESUME_FILE), &bytes, true)?;
     Ok(())
 }
@@ -669,6 +682,21 @@ mod tests {
         odd.target_version = "1.8.0; rm -rf /".to_string();
         write_to(&dir, &odd).unwrap();
         assert!(take_from(&dir, "1.8.0", NOW).outcome.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Search tabs too big to restore are left out at write time, so the
+    /// window, server and page still come back.
+    #[test]
+    fn oversized_search_tabs_cost_only_the_tabs() {
+        let dir = scratch_dir("big-tabs");
+        let mut state = sample();
+        state.ui.search_tabs = Some(format!("\"{}\"", "\\\"".repeat(MAX_SEARCH_TABS_BYTES / 2)));
+        write_to(&dir, &state).unwrap();
+        let taken = take_from(&dir, &state.target_version, NOW);
+        let restored = taken.state.expect("the rest of the session survives");
+        assert_eq!(restored.ui.search_tabs, None);
+        assert_eq!(restored.ui.route, state.ui.route);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

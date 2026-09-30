@@ -331,6 +331,9 @@ pub(in crate::network) async fn on_ember_search_tick(
             Vec::new();
         let mut relay_targets: HashMap<(Ipv4Addr, u16), ember::broker::RelayTarget> =
             HashMap::new();
+        // Whether the target held for an address came from a record whose
+        // buddy we could corroborate.
+        let mut relay_target_trusted: HashMap<(Ipv4Addr, u16), bool> = HashMap::new();
         let now_ts = chrono::Utc::now().timestamp();
         for (fh, sources) in &entries {
             let mut rest = Vec::new();
@@ -374,14 +377,37 @@ pub(in crate::network) async fn on_ember_search_tick(
                     }
                     if src.flags & ember::SOURCE_FLAG_FIREWALLED != 0 {
                         // The node id is the record's signer, so a relay
-                        // pinned to it reaches that publisher or nobody.
-                        relay_targets.entry((src.ip, src.tcp_port)).or_insert(
-                            ember::broker::RelayTarget {
-                                quic_port: src.quic_port,
-                                node_id: (src.publisher_id != [0u8; 16])
-                                    .then_some(src.publisher_id),
-                            },
-                        );
+                        // pinned to it reaches that publisher or nobody. A
+                        // firewalled record is not bound to its sender's
+                        // address, so anyone can sign one naming this one:
+                        // a record whose buddy we corroborated wins, and two
+                        // that disagree at the same trust pin nothing, which
+                        // dials the address as an unpinned relay always has.
+                        let key = (src.ip, src.tcp_port);
+                        let target = ember::broker::RelayTarget {
+                            quic_port: src.quic_port,
+                            node_id: (src.publisher_id != [0u8; 16]).then_some(src.publisher_id),
+                        };
+                        let trusted = buddy_corroborated
+                            && src
+                                .buddy
+                                .is_some_and(|b| b.endorsement_covers(&src.publisher_id, now_ts));
+                        match relay_target_trusted.get(&key).copied() {
+                            None => {
+                                relay_targets.insert(key, target);
+                                relay_target_trusted.insert(key, trusted);
+                            }
+                            Some(false) if trusted => {
+                                relay_targets.insert(key, target);
+                                relay_target_trusted.insert(key, true);
+                            }
+                            Some(held_trusted) if held_trusted == trusted => {
+                                if relay_targets.get(&key) != Some(&target) {
+                                    relay_targets.insert(key, ember::broker::RelayTarget::default());
+                                }
+                            }
+                            Some(_) => {}
+                        }
                     }
                     rest.push((src.ip, src.tcp_port, src.udp_port, src.flags));
                 }

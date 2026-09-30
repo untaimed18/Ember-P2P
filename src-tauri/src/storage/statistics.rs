@@ -62,7 +62,9 @@ const MAX_MINUTE_HISTORY: usize = 60;
 pub struct RateHistory {
     /// Unix seconds of the newest sample in `recent`.
     pub recent_end: i64,
-    /// One sample per stats tick (about a second), the last five minutes.
+    /// One sample a second by the clock, the last five minutes up to
+    /// `recent_end`, starting later only while the session is younger.
+    /// Seconds no tick covered (a sleep) are zeros.
     pub recent: Vec<[u64; 2]>,
     /// One average per completed minute, the last hour. Minutes the process
     /// did not see (a sleep) are zeros, so the axis stays true to the clock.
@@ -75,7 +77,8 @@ struct MinuteAccumulator {
     minute: i64,
     down: u64,
     up: u64,
-    samples: u64,
+    /// Seconds the ticks folded in so far covered.
+    seconds: u64,
 }
 
 /// Lock-free counters that the ed2k upload / transfer / multi_source
@@ -357,6 +360,12 @@ impl StatsManager {
         self.last_down_snapshot = down;
         self.last_up_snapshot = up;
 
+        // A late tick carries every second since the last one.
+        let covered = self
+            .down_rate_history
+            .back()
+            .map_or(1, |(at, _)| now.saturating_sub(*at).max(1));
+
         self.down_rate_history.push_back((now, down_delta));
         self.up_rate_history.push_back((now, up_delta));
         if self.down_rate_history.len() > MAX_RATE_HISTORY {
@@ -369,26 +378,54 @@ impl StatsManager {
         self.stats.session_down_rate = Self::windowed_rate(&self.down_rate_history, now);
         self.stats.session_up_rate = Self::windowed_rate(&self.up_rate_history, now);
 
-        self.fold_into_minutes(now, down_delta, up_delta);
+        self.fold_into_minutes(now, covered, down_delta, up_delta);
         self.stats.rate_history = RateHistory {
             recent_end: now,
-            recent: self
-                .down_rate_history
-                .iter()
-                .zip(self.up_rate_history.iter())
-                .map(|((_, down), (_, up))| [*down, *up])
-                .collect(),
+            recent: Self::recent_series(&self.down_rate_history, &self.up_rate_history, now),
             minutes: self.minute_history.iter().copied().collect(),
         };
     }
 
+    /// The last five minutes to `now`, one slot a second by the clock. A tick's
+    /// bytes are spread over the seconds since the tick before it, so a late
+    /// tick is no spike, and seconds no tick covered (a sleep) are zeros, so
+    /// what came before a sleep is not drawn as the last five minutes.
+    fn recent_series(
+        down: &VecDeque<(i64, u64)>,
+        up: &VecDeque<(i64, u64)>,
+        now: i64,
+    ) -> Vec<[u64; 2]> {
+        let Some(&(first, _)) = down.front() else {
+            return Vec::new();
+        };
+        let start = first.max(now - MAX_RATE_HISTORY as i64 + 1).min(now);
+        let mut series = vec![[0u64; 2]; (now - start + 1) as usize];
+        let mut previous: Option<i64> = None;
+        for (&(at, down), &(_, up)) in down.iter().zip(up.iter()) {
+            // The seconds after the previous tick up to this one; a clock that
+            // stepped back leaves just this tick's own second.
+            let from = previous.map_or(at, |p| p.saturating_add(1).min(at));
+            previous = Some(at);
+            let seconds = (at - from + 1) as u64;
+            let share = [down / seconds, up / seconds];
+            for second in from.max(start)..=at.min(now) {
+                let slot = &mut series[(second - start) as usize];
+                slot[0] = slot[0].saturating_add(share[0]);
+                slot[1] = slot[1].saturating_add(share[1]);
+            }
+        }
+        series
+    }
+
     /// Add one tick's bytes to the minute being averaged, closing it — and any
     /// minutes skipped since, as zeros — once the clock has moved past it.
-    fn fold_into_minutes(&mut self, now: i64, down: u64, up: u64) {
+    /// `covered` is the seconds since the previous tick, so a minute with a
+    /// stall averages its bytes over the time that passed, not the ticks.
+    fn fold_into_minutes(&mut self, now: i64, covered: i64, down: u64, up: u64) {
         let minute = now.div_euclid(60);
         let acc = &mut self.minute_acc;
-        if acc.samples > 0 && minute != acc.minute {
-            let average = [acc.down / acc.samples, acc.up / acc.samples];
+        if acc.seconds > 0 && minute != acc.minute {
+            let average = [acc.down / acc.seconds, acc.up / acc.seconds];
             self.minute_history.push_back(average);
             // A clock that jumped backwards has nothing to fill.
             let skipped = (minute - acc.minute - 1).clamp(0, MAX_MINUTE_HISTORY as i64);
@@ -400,10 +437,15 @@ impl StatsManager {
             }
             *acc = MinuteAccumulator::default();
         }
+        // Only this minute's share of a long gap, in seconds and in bytes: the
+        // rest belongs to minutes already closed (as zeros, after a sleep).
+        let into_minute = now - minute * 60 + 1;
+        let seconds = covered.clamp(1, into_minute);
+        let share = |bytes: u64| (u128::from(bytes) * seconds as u128 / covered.max(1) as u128) as u64;
         acc.minute = minute;
-        acc.down = acc.down.saturating_add(down);
-        acc.up = acc.up.saturating_add(up);
-        acc.samples += 1;
+        acc.down = acc.down.saturating_add(share(down));
+        acc.up = acc.up.saturating_add(share(up));
+        acc.seconds += seconds as u64;
     }
 
     /// Moving-average rate (bytes/sec) over the most recent samples of
@@ -603,13 +645,39 @@ mod tests {
         // An hour cap, however long the gap.
         mgr.record_rate(start + 10 * 3600);
         assert_eq!(mgr.stats.rate_history.minutes.len(), MAX_MINUTE_HISTORY);
-        assert_eq!(mgr.stats.rate_history.recent.len(), 63);
+        assert_eq!(mgr.stats.rate_history.recent.len(), MAX_RATE_HISTORY);
+        assert!(
+            mgr.stats.rate_history.recent.iter().all(|slot| *slot == [0, 0]),
+            "the five minutes after a long sleep show nothing from before it"
+        );
 
         // A clock stepping back does not invent minutes.
         let before = mgr.stats.rate_history.minutes.len();
         mgr.record_rate(start);
         mgr.record_rate(start + 1);
         assert_eq!(mgr.stats.rate_history.minutes.len(), MAX_MINUTE_HISTORY.min(before + 1));
+    }
+
+    /// A tick that ran late carries several seconds of bytes: the graph shows
+    /// the rate those seconds had, not one second of all of it, and the minute
+    /// averages over the time that passed.
+    #[test]
+    fn a_late_tick_is_spread_over_the_seconds_it_covers() {
+        let mut mgr = StatsManager::new();
+        let start: i64 = 1_790_000_040;
+        mgr.record_rate(start);
+        mgr.session_down_counter.store(100, Ordering::Relaxed);
+        mgr.record_rate(start + 1);
+        mgr.session_down_counter.store(600, Ordering::Relaxed);
+        mgr.record_rate(start + 6);
+        let recent = &mgr.stats.rate_history.recent;
+        assert_eq!(recent.len(), 7);
+        assert_eq!(recent[1], [100, 0]);
+        assert!(recent[2..].iter().all(|slot| *slot == [100, 0]), "{recent:?}");
+
+        // The minute closes over the seven seconds its ticks covered.
+        mgr.record_rate(start + 60);
+        assert_eq!(mgr.stats.rate_history.minutes, vec![[600 / 7, 0]]);
     }
 
     /// Upload path shares the same helper; verify it is wired up too.

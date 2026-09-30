@@ -87,9 +87,9 @@ pub(in crate::network) async fn save_on_shutdown(
         .and_then(|broker| broker.quic_endpoint())
     {
         endpoint.close(0u32.into(), b"shutting down");
-        // Briefly: on the shared socket the endpoint driver is the last holder
-        // of the KAD port, and a network restart in this process has to bind
-        // that port again rather than move to a neighbour.
+        // Briefly, so peers get the CONNECTION_CLOSE instead of waiting out
+        // an idle timeout. This does not release the socket: the driver lives
+        // until every `Endpoint` handle is dropped.
         let _ = tokio::time::timeout_at(
             shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(1)),
             endpoint.wait_idle(),
@@ -211,32 +211,24 @@ pub(in crate::network) async fn save_on_shutdown(
         );
     }
     // The upload waiting queue, so the peers queued here keep their place
-    // across a restart (`ed2k::upload_queue_store`). Bounded like every phase
-    // here: the listener may still hold the lock, and a queue that cannot be
-    // saved in time costs the waiters their place, not the user their data.
-    let queue_phase_deadline =
+    // across a restart (`ed2k::upload_queue_store`). Taken now, while the
+    // sessions that hold rows are still up, and written after the saves that
+    // matter more. Bounded like every phase here: the listener may still hold
+    // the lock, and a queue that cannot be saved in time costs the waiters
+    // their place, not the user their data.
+    let queue_lock_deadline =
         shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(2));
-    match tokio::time::timeout_at(queue_phase_deadline, upload_queue.lock()).await {
-        Ok(queue) => {
-            let mut entries = queue.clone();
-            drop(queue);
-            // Last session's waiters, if this one ended before they could
-            // rejoin. Live rows come first, so they win a duplicate.
-            if let Some(pending) = state.restored_upload_queue.take() {
-                entries.extend(pending.into_entries());
-            }
-            let dir = state.data_dir.clone();
-            let writer = tokio::task::spawn_blocking(move || {
-                ed2k::upload_queue_store::save(&dir, &entries)
-            });
-            match tokio::time::timeout_at(queue_phase_deadline, writer).await {
-                Ok(Ok(Ok(count))) => info!("Saved {count} upload queue waiter(s) on shutdown"),
-                Ok(Ok(Err(e))) => error!("Failed to save the upload queue on shutdown: {e}"),
-                Ok(Err(e)) => error!("Upload queue shutdown writer failed: {e}"),
-                Err(_) => warn!("Upload queue save did not finish within its shutdown phase"),
-            }
+    let mut queue_entries = match tokio::time::timeout_at(queue_lock_deadline, upload_queue.lock()).await {
+        Ok(queue) => queue.clone(),
+        Err(_) => {
+            warn!("The upload queue stayed locked into shutdown; saving only waiters still held from the last session");
+            Vec::new()
         }
-        Err(_) => warn!("Skipping the upload queue save: the queue stayed locked into shutdown"),
+    };
+    // Last session's waiters, if this one ended before they could rejoin.
+    // Live rows come first, so they win a duplicate.
+    if let Some(pending) = state.restored_upload_queue.take() {
+        queue_entries.extend(pending.into_entries());
     }
 
     let contacts = state.routing_table.export_bootstrap_contacts(200);
@@ -774,6 +766,23 @@ pub(in crate::network) async fn save_on_shutdown(
             Err(_) => error!(
                 "store_ember.dat writer still running at the end of its shutdown phase; the next session refills the store by replication"
             ),
+        }
+    }
+
+    if !queue_entries.is_empty() && tokio::time::Instant::now() >= shutdown_deadline {
+        warn!("Shutdown deadline exhausted before the upload queue save");
+    } else if !queue_entries.is_empty() {
+        let dir = state.data_dir.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            ed2k::upload_queue_store::save(&dir, &queue_entries)
+        });
+        let queue_phase_deadline =
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(2));
+        match tokio::time::timeout_at(queue_phase_deadline, writer).await {
+            Ok(Ok(Ok(count))) => info!("Saved {count} upload queue waiter(s) on shutdown"),
+            Ok(Ok(Err(e))) => error!("Failed to save the upload queue on shutdown: {e}"),
+            Ok(Err(e)) => error!("Upload queue shutdown writer failed: {e}"),
+            Err(_) => warn!("Upload queue save did not finish within its shutdown phase"),
         }
     }
 

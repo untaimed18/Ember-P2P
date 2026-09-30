@@ -49,8 +49,8 @@ pub struct DiscoveryResult {
     /// folding the two together raised the cap warning on ordinary reloads.
     pub partial: bool,
     /// Entries between this page's start and its end were never visited (the
-    /// traversal frontier was trimmed), so the page does not even account for
-    /// its own stretch of the folder.
+    /// traversal frontier was trimmed, or the folder itself could not be read),
+    /// so the page does not even account for its own stretch of the folder.
     pub frontier_trimmed: bool,
     /// Normalized path after which the next bounded scan should continue.
     /// `None` means this page reached the end of the folder.
@@ -64,6 +64,23 @@ pub(crate) fn allowlist_permits(allowed: &HashSet<String>, key: &str) -> bool {
         || key
             .rmatch_indices(std::path::MAIN_SEPARATOR)
             .any(|(at, _)| allowed.contains(&key[..at]))
+}
+
+/// Whether the folder allowlists let the file at `path` be offered: no partly
+/// shared folder holds it, or the innermost one that does lists it.
+pub(crate) fn allowlists_offer(
+    allowlists: &std::collections::HashMap<String, Vec<String>>,
+    path: &str,
+) -> bool {
+    let Some((_, list)) = allowlists
+        .iter()
+        .filter(|(folder, _)| crate::security::path_within_dir(path, folder))
+        .max_by_key(|(folder, _)| folder.len())
+    else {
+        return true;
+    };
+    let allowed = list.iter().cloned().collect::<HashSet<_>>();
+    allowlist_permits(&allowed, &normalize_path_key(path))
 }
 
 /// The lists discovery walks for each partly shared folder: its allowlist and
@@ -369,16 +386,29 @@ impl FileIndexer {
         allowlists: &std::collections::HashMap<String, Vec<String>>,
         path: &Path,
     ) -> ScopedDiscovery {
-        // Event paths are the watched root joined with the changed name, so
-        // they carry the root exactly as it is stored.
+        // Event paths are the watched root joined with the changed name, but
+        // paths queued by a share are spelled for display (no `\\?\`, the
+        // case the user picked), so the root is matched the way
+        // `path_within_dir` compares and the path re-spelled under it.
+        let path_text = path.to_string_lossy();
         let Some(root) = roots
             .iter()
+            .filter(|root| crate::security::path_within_dir(&path_text, root))
             .map(Path::new)
-            .filter(|root| path.starts_with(root))
             .max_by_key(|root| root.components().count())
         else {
             return ScopedDiscovery::Skip;
         };
+        let display =
+            |path: &Path| std::path::PathBuf::from(crate::commands::share_browser::display_fs_path(path));
+        let depth = display(root).components().count();
+        let below = display(path).components().skip(depth).collect::<std::path::PathBuf>();
+        let respelled = if below.as_os_str().is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(below)
+        };
+        let path = respelled.as_path();
         if is_excluded_share_location(path) {
             return ScopedDiscovery::Removed;
         }
@@ -461,12 +491,13 @@ impl FileIndexer {
             warn!("Directory does not exist or is not a directory: {dir}");
             // `partial` so a folder that is temporarily unreachable (an
             // unmounted drive) is never treated as an authoritative empty
-            // listing that reconciliation would delete every row against.
+            // listing that reconciliation would delete every row against, and
+            // `frontier_trimmed` so it cannot finish a paged cycle either.
             return DiscoveryResult {
                 files,
                 truncated: false,
                 partial: true,
-                frontier_trimmed: false,
+                frontier_trimmed: true,
                 next_cursor: None,
             };
         }
@@ -484,7 +515,7 @@ impl FileIndexer {
                     files,
                     truncated: false,
                     partial: true,
-                    frontier_trimmed: false,
+                    frontier_trimmed: true,
                     next_cursor: None,
                 };
             }
@@ -501,6 +532,19 @@ impl FileIndexer {
         // dropping files between cursor pages.
         let mut pending: BinaryHeap<Reverse<(String, std::path::PathBuf, bool)>> =
             BinaryHeap::new();
+        // A root that exists but cannot be listed (a network share dropping,
+        // access revoked) is as unreachable as a missing one.
+        if let Err(error) = std::fs::read_dir(path) {
+            warn!("Failed to read shared directory {dir}: {error}");
+            return DiscoveryResult {
+                files,
+                truncated: false,
+                partial: true,
+                frontier_trimmed: true,
+                next_cursor: None,
+            };
+        }
+
         let enqueue_children = |directory: &Path,
                                 pending: &mut BinaryHeap<
             Reverse<(String, std::path::PathBuf, bool)>,
@@ -1204,6 +1248,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A large folder whose drive goes away mid-cycle must not have its empty
+    /// page read as the one that finished the folder, which would remove
+    /// every row the earlier pages found.
+    #[test]
+    fn an_unreachable_folder_cannot_finish_a_paged_cycle() {
+        let root = scratch_tree("unreachable");
+        let root_str = root.to_string_lossy().to_string();
+        let _ = std::fs::remove_dir_all(&root);
+        let page = FileIndexer::discover_directory_page_in(&root_str, Some("x"), None);
+        assert!(page.partial && page.frontier_trimmed && page.next_cursor.is_none());
+
+        let mut cycles = crate::sharing::paged_cycle::PagedCycles::default();
+        let indexed = vec![format!("{root_str}/a"), format!("{root_str}/b")];
+        let first = crate::sharing::paged_cycle::PageFacts {
+            cursor: None,
+            next: Some("x".into()),
+            frontier_trimmed: false,
+        };
+        cycles.note_page(&root_str, &first, || indexed.clone(), std::iter::once(indexed[0].as_str()));
+        let gone = crate::sharing::paged_cycle::PageFacts {
+            cursor: Some("x".into()),
+            next: page.next_cursor,
+            frontier_trimmed: page.frontier_trimmed,
+        };
+        assert!(cycles.note_page(&root_str, &gone, Vec::new, std::iter::empty()).is_none());
+    }
+
     #[test]
     fn recently_written_files_are_left_to_settle() {
         let now = 1_000_000;
@@ -1255,6 +1326,25 @@ mod tests {
             ),
             "a path under no shared root is not ours to reconcile"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Roots are stored canonicalized (`\\?\C:\…` on Windows) while a share
+    /// queues its paths spelled for display; the rescan must still find them,
+    /// and record them under the root as stored.
+    #[test]
+    fn scoped_discovery_matches_a_display_spelled_path_to_its_stored_root() {
+        let root = scratch_tree("spelling").canonicalize().unwrap();
+        let roots = vec![root.to_string_lossy().to_string()];
+        std::fs::write(root.join("song.mp3"), b"x").unwrap();
+        let shown = std::path::PathBuf::from(crate::commands::share_browser::display_fs_path(&root));
+        match FileIndexer::discover_scoped_path(&roots, &std::collections::HashMap::new(), &shown.join("song.mp3")) {
+            ScopedDiscovery::Found { files, .. } => {
+                assert_eq!(files.len(), 1);
+                assert_eq!(Path::new(&files[0].path), root.join("song.mp3"));
+            }
+            other => panic!("expected the file, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

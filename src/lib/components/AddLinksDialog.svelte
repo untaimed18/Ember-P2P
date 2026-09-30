@@ -24,6 +24,9 @@
   } = $props();
 
   const instanceId = Math.random().toString(36).slice(2, 10);
+  const encoder = new TextEncoder();
+  /** The backend caps the paste in UTF-8 bytes, which non-Latin names exceed long before characters. */
+  const overLimit = (value: string) => value.length > maxLength || encoder.encode(value).length > maxLength;
   let text = $state('');
   let batch = $state<Ed2kLinkBatch | null>(null);
   let dialogEl: HTMLDivElement | undefined = $state(undefined);
@@ -41,7 +44,7 @@
     batch = null;
     let cancelled = false;
     void readFromClipboard().then((clip) => {
-      if (cancelled || !clip || !/ed2k:\/\//i.test(clip) || clip.length > maxLength) return;
+      if (cancelled || !clip || !/ed2k:\/\//i.test(clip) || overLimit(clip)) return;
       if (text === '') text = clip.trim();
     });
     requestAnimationFrame(() => textareaEl?.focus());
@@ -61,7 +64,7 @@
   // Parsed as the user types, so the button says how many will be queued.
   $effect(() => {
     const value = text.trim();
-    if (!open || value === '' || value.length > maxLength) {
+    if (!open || value === '' || overLimit(value)) {
       batch = null;
       return;
     }
@@ -81,7 +84,7 @@
     };
   });
 
-  const tooLong = $derived(text.trim().length > maxLength);
+  const tooLong = $derived(overLimit(text.trim()));
   const count = $derived(batch?.links.length ?? 0);
   const ignored = $derived((batch?.invalid ?? 0) + (batch?.skipped ?? 0));
 
@@ -90,8 +93,11 @@
   }
 
   async function submit() {
-    if (busy || count === 0 || tooLong) return;
     const value = text.trim();
+    if (busy || value === '' || tooLong) return;
+    // Parsed afresh: the count above trails typing and the clipboard fill.
+    const parsed = await parseEd2kLinks(value).catch(() => null);
+    if (!parsed || parsed.links.length === 0 || !open || text.trim() !== value) return;
     open = false;
     await onsubmit(value);
   }

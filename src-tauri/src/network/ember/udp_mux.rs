@@ -38,7 +38,7 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, ConnectionId, ConnectionIdGenerator, UdpPoller};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 /// Length of the connection ids our endpoint issues.
 pub const CID_LEN: usize = 16;
@@ -223,12 +223,25 @@ pub fn start(
     (other_rx, quic)
 }
 
+/// Says so if the reader ends while the loop still wants datagrams: nothing
+/// else would, since the loop's receive arm just goes quiet.
+struct ReaderExitNotice(mpsc::Sender<Datagram>);
+
+impl Drop for ReaderExitNotice {
+    fn drop(&mut self) {
+        if !self.0.is_closed() {
+            error!("UDP reader stopped while the network runs; KAD, Ember and QUIC reception has ended");
+        }
+    }
+}
+
 async fn read_loop(
     socket: Arc<UdpSocket>,
     cid_key: Option<CidKey>,
     other_tx: mpsc::Sender<Datagram>,
     mut quic_tx: Option<mpsc::Sender<Datagram>>,
 ) {
+    let _exit_notice = ReaderExitNotice(other_tx.clone());
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let other_budget = Arc::new(AtomicUsize::new(0));
     let quic_budget = Arc::new(AtomicUsize::new(0));
@@ -515,8 +528,9 @@ mod tests {
         ];
         let stun = crate::network::ember::nat::build_binding_request(&[7u8; 12]);
         let mut cases: Vec<Vec<u8>> = vec![ember.to_vec(), stun];
-        // Every plain protocol byte, with every opcode, including opcode 0
-        // followed by what reads as version 1.
+        // Every plain protocol byte, with every opcode. Opcode 0 followed by
+        // `00 00 01` would read as version 1 and go to quinn; only the retired
+        // KAD1 bootstrap starts that way, so that loss is accepted.
         for proto in [0xE3u8, 0xE4, 0xE5, 0xC5, 0xD4] {
             for opcode in 0..=255u8 {
                 cases.push(vec![proto, opcode, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60]);

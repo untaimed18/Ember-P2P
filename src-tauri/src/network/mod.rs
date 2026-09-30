@@ -301,11 +301,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     } = deps;
     // Do not bind KAD/eD2K/Ember sockets or start the upload listener while a
     // recovered/reset policy database is awaiting explicit acknowledgement.
+    // The startup scan's one-shot signal is kept rather than dropped: restored
+    // upload waiters would otherwise wait out the fallback.
+    let mut library_indexed_during_gate = false;
     while !security_policy.is_loaded() {
         tokio::select! {
             command = cmd_rx.recv() => {
                 match command {
                     Some(NetworkCommand::Shutdown { .. }) | None => return Ok(()),
+                    Some(NetworkCommand::StartupLibraryIndexed) => library_indexed_during_gate = true,
                     Some(_) => {
                         warn!("Dropping network command while security policy reset is unacknowledged");
                     }
@@ -861,7 +865,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         server_login_tcp_port: None,
         last_tcp_remap_reconnect_at: None,
         pending_server_connect: None,
-        restored_upload_queue: ed2k::upload_queue_store::restore(&data_dir),
+        restored_upload_queue: ed2k::upload_queue_store::restore(&data_dir).map(|mut pending| {
+            if library_indexed_during_gate {
+                pending.make_due();
+            }
+            pending
+        }),
         pending_buddy_hashes: pending_buddy_hashes.clone(),
         shared_buddy_info: shared_buddy_info.clone(),
         shared_ip_filter: shared_ip_filter.clone(),

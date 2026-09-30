@@ -256,6 +256,12 @@ impl PendingRestore {
         Instant::now() >= self.deadline
     }
 
+    /// The startup signal came before the loop could act on it, so merge at
+    /// the next check instead of waiting for the fallback.
+    pub(crate) fn make_due(&mut self) {
+        self.deadline = Instant::now();
+    }
+
     /// The rows themselves, for a shutdown that comes before the merge: they
     /// are saved again rather than lost.
     pub(crate) fn into_entries(self) -> Vec<QueueEntry> {
@@ -270,9 +276,12 @@ impl PendingRestore {
 /// whichever file it now wants, since the live queue holds one row per peer.
 /// It inherits the restored row's earlier join only when it re-asked from the
 /// address the row was last seen on — the same rule a reconnect is held to.
+/// A peer in `asked` that has no live row left it for a reason newer than
+/// its restored row (a slot, a cancel, a ban), so that row stays out.
 fn merge_into(
     queue: &mut Vec<QueueEntry>,
     restored: Vec<QueueEntry>,
+    asked: &HashSet<QueueIdentity>,
     servable: impl Fn(&[u8; 16]) -> bool,
 ) -> usize {
     let mut merged = 0;
@@ -286,7 +295,7 @@ fn merge_into(
             }
             continue;
         }
-        if !servable(&row.file_hash) {
+        if asked.contains(&row.identity) || !servable(&row.file_hash) {
             continue;
         }
         if queue.len() >= MAX_UPLOAD_QUEUE_SIZE {
@@ -339,7 +348,8 @@ pub(crate) async fn merge_pending(
             .collect()
     };
     let offered = pending.entries.len();
-    let merged = merge_into(&mut *queue.lock().await, pending.entries, |h| {
+    let asked = asked_while_held().lock().take().unwrap_or_default();
+    let merged = merge_into(&mut *queue.lock().await, pending.entries, &asked, |h| {
         shared.contains(h) || downloading.contains(h)
     });
     tracing::info!("Upload queue: {merged} of {offered} waiter(s) from the last session rejoined");
@@ -356,10 +366,31 @@ pub fn save(dir: &Path, entries: &[QueueEntry]) -> anyhow::Result<usize> {
 /// `None` when there is nothing to restore.
 pub(crate) fn restore(dir: &Path) -> Option<PendingRestore> {
     let entries = read_saved(dir);
-    (!entries.is_empty()).then(|| PendingRestore {
+    if entries.is_empty() {
+        return None;
+    }
+    *asked_while_held().lock() = Some(HashSet::new());
+    Some(PendingRestore {
         entries,
         deadline: Instant::now() + MERGE_FALLBACK,
     })
+}
+
+/// Identities that asked for an upload while restored rows were held,
+/// collected only then. See [`merge_into`].
+fn asked_while_held() -> &'static parking_lot::Mutex<Option<HashSet<QueueIdentity>>> {
+    static ASKED: std::sync::OnceLock<parking_lot::Mutex<Option<HashSet<QueueIdentity>>>> =
+        std::sync::OnceLock::new();
+    ASKED.get_or_init(Default::default)
+}
+
+/// Note a peer asking for an upload, for a restore still held.
+pub(crate) fn note_asked(identity: &QueueIdentity) {
+    if let Some(asked) = asked_while_held().lock().as_mut() {
+        if asked.len() < MAX_UPLOAD_QUEUE_SIZE * 10 {
+            asked.insert(identity.clone());
+        }
+    }
 }
 
 /// The file is removed whether or not it parses, so a crash before the next
@@ -531,7 +562,7 @@ mod tests {
         let mut unserved = restored([2; 16], [9, 9, 9, 9], 600);
         unserved.file_hash = [0xCD; 16];
         let mut queue = Vec::new();
-        let merged = merge_into(&mut queue, vec![served, unserved], |h| *h == [0xAB; 16]);
+        let merged = merge_into(&mut queue, vec![served, unserved], &HashSet::new(), |h| *h == [0xAB; 16]);
         assert_eq!(merged, 1);
         assert_eq!(queue[0].identity, QueueIdentity::UserHash([1; 16]));
     }
@@ -542,7 +573,7 @@ mod tests {
         let mut live = entry([1; 16], [8, 8, 8, 8], 10, 10);
         let live_join = live.join_time;
         let mut queue = vec![live.clone()];
-        assert_eq!(merge_into(&mut queue, vec![old.clone()], |_| true), 0);
+        assert_eq!(merge_into(&mut queue, vec![old.clone()], &HashSet::new(), |_| true), 0);
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].current_addr, live.current_addr, "the live row wins");
         assert_eq!(queue[0].join_time, old.join_time, "and inherits the earlier join");
@@ -552,8 +583,21 @@ mod tests {
         live.last_ip = Some(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)));
         live.join_time = live_join;
         let mut queue = vec![live];
-        merge_into(&mut queue, vec![old], |_| true);
+        merge_into(&mut queue, vec![old], &HashSet::new(), |_| true);
         assert_eq!(queue[0].join_time, live_join);
+    }
+
+    /// A peer that asked while the rows were held and has no live row left
+    /// was served, cancelled or refused since; its old row must not give it a
+    /// second turn.
+    #[test]
+    fn a_peer_that_asked_while_held_and_left_does_not_rejoin() {
+        let old = restored([1; 16], [8, 8, 8, 8], 3000);
+        let other = restored([2; 16], [9, 9, 9, 9], 3000);
+        let asked = HashSet::from([QueueIdentity::UserHash([1; 16])]);
+        let mut queue = Vec::new();
+        assert_eq!(merge_into(&mut queue, vec![old, other], &asked, |_| true), 1);
+        assert_eq!(queue[0].identity, QueueIdentity::UserHash([2; 16]));
     }
 
     #[test]
@@ -563,7 +607,7 @@ mod tests {
         let mut live = entry([1; 16], [8, 8, 8, 8], 10, 10);
         live.file_hash = [0xCD; 16];
         let mut queue = vec![live];
-        assert_eq!(merge_into(&mut queue, vec![old.clone()], |_| true), 0);
+        assert_eq!(merge_into(&mut queue, vec![old.clone()], &HashSet::new(), |_| true), 0);
         assert_eq!(queue.len(), 1, "the live queue holds one row per peer");
         assert_eq!(queue[0].file_hash, [0xCD; 16], "for the file it wants now");
         assert_eq!(queue[0].join_time, old.join_time, "keeping the wait it had");
@@ -585,6 +629,6 @@ mod tests {
         let mut queue: Vec<QueueEntry> = (0..MAX_QUEUE_ENTRIES_PER_IP as u8)
             .map(|i| entry([i + 1; 16], [8, 8, 8, 8], 60, 60))
             .collect();
-        assert_eq!(merge_into(&mut queue, vec![restored([99; 16], [8, 8, 8, 8], 60)], |_| true), 0);
+        assert_eq!(merge_into(&mut queue, vec![restored([99; 16], [8, 8, 8, 8], 60)], &HashSet::new(), |_| true), 0);
     }
 }

@@ -110,6 +110,17 @@ impl ReputationEvent {
             ReputationEvent::ProtocolViolation => SCORE_PROTOCOL_VIOLATION,
         }
     }
+
+    /// What also counts toward the penalty goodwill cannot offset: proof of
+    /// misbehaviour. Timeouts and failed chunks are what an honest peer on a
+    /// poor link produces, and with nothing to offset them a few an hour
+    /// would decay toward a ban on their own.
+    fn penalty_delta(self) -> i32 {
+        match self {
+            ReputationEvent::CorruptData | ReputationEvent::ProtocolViolation => self.score_delta(),
+            _ => 0,
+        }
+    }
 }
 
 /// Per-peer reputation record.
@@ -122,7 +133,8 @@ pub struct PeerReputation {
     pub last_interaction: u64,
     pub first_seen: u64,
     pub banned_until: Option<u64>,
-    /// The negative events alone, decaying like `score`.
+    /// The corrupt-data and protocol-violation strikes alone, decaying like
+    /// `score`.
     ///
     /// Good and bad share `score`, which is clamped at +1000, so a peer that
     /// first banked goodwill by downloading from us needed twenty-four
@@ -172,9 +184,7 @@ impl IpReputation {
     fn apply_event(&mut self, event: ReputationEvent, now: u64) {
         let delta = event.score_delta();
         self.score = (self.score + delta).clamp(MIN_REPUTATION, MAX_REPUTATION);
-        if delta < 0 {
-            self.penalty = (self.penalty + delta).max(MIN_REPUTATION);
-        }
+        self.penalty = (self.penalty + event.penalty_delta()).max(MIN_REPUTATION);
         self.last_interaction = now;
         // See `PeerReputation::apply_event` for why this is gated on a
         // negative delta and on not already being banned.
@@ -215,9 +225,7 @@ impl PeerReputation {
     fn apply_event(&mut self, event: ReputationEvent, now: u64) {
         let delta = event.score_delta();
         self.score = (self.score + delta).clamp(MIN_REPUTATION, MAX_REPUTATION);
-        if delta < 0 {
-            self.penalty = (self.penalty + delta).max(MIN_REPUTATION);
-        }
+        self.penalty = (self.penalty + event.penalty_delta()).max(MIN_REPUTATION);
         self.last_interaction = now;
 
         match event {
@@ -684,7 +692,7 @@ impl ReputationManager {
                 (
                     *ip,
                     record.is_banned(now),
-                    record.score,
+                    record.score.min(record.penalty),
                     record.last_interaction,
                 )
             })
@@ -722,7 +730,9 @@ impl ReputationManager {
             if p.is_banned(now) {
                 banned.push((*id, p.banned_until.unwrap_or(0)));
             } else {
-                non_banned.push((*id, p.score, p.last_interaction));
+                // Strikes count as the score they would be without goodwill,
+                // or evicting the peer would forgive them.
+                non_banned.push((*id, p.score.min(p.penalty), p.last_interaction));
             }
         }
         // Evicting a peer forgets it completely: `get_score` on an unknown id
@@ -995,6 +1005,23 @@ mod tests {
         assert!(!mgr.is_banned(&peer), "three strikes are not enough");
         mgr.record_event(&peer, ReputationEvent::CorruptData);
         assert!(mgr.is_banned(&peer), "the fourth bans it despite its score");
+    }
+
+    /// Timeouts and failed chunks are a poor link, not misbehaviour: a peer
+    /// whose goodwill outweighs them is not banned for them.
+    #[test]
+    fn a_poor_link_offset_by_goodwill_is_not_banned() {
+        let mut mgr = ReputationManager::new();
+        let peer = [13u8; 16];
+        for _ in 0..60 {
+            for _ in 0..3 {
+                mgr.record_event(&peer, ReputationEvent::SuccessfulHandshake);
+            }
+            mgr.record_event(&peer, ReputationEvent::FailedChunk);
+            mgr.record_event(&peer, ReputationEvent::Timeout);
+        }
+        assert!(!mgr.is_banned(&peer));
+        assert_eq!(mgr.peers[&peer].penalty, 0);
     }
 
     #[test]

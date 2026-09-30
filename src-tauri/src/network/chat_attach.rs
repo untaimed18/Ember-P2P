@@ -368,7 +368,7 @@ pub(super) fn quic_endpoint(state: &NetworkState) -> Option<Arc<quinn::Endpoint>
         .cloned()
 }
 
-fn running_fetches(state: &mut NetworkState) -> usize {
+pub(super) fn running_fetches(state: &mut NetworkState) -> usize {
     state.attach_fetches.retain(|_, handle| !handle.is_finished());
     state.attach_fetches.len()
 }

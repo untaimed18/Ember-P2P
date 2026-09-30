@@ -33,6 +33,9 @@
     // rather than a yes/no.
     altLabel,
     onalt,
+    // Focus Cancel on open without the danger styling, for a prompt that can
+    // appear unasked, where a stray Enter must not confirm.
+    focusCancel = false,
   }: {
     open?: boolean;
     title?: string;
@@ -40,6 +43,7 @@
     confirmLabel?: string;
     cancelLabel?: string;
     danger?: boolean;
+    focusCancel?: boolean;
     isolateMessage?: boolean;
     alert?: boolean;
     onconfirm?: () => void;
@@ -122,7 +126,7 @@
     let openFocusFrame: number | undefined;
     if (open) {
       actionTaken = false;
-      const preferCancel = danger && !alert;
+      const preferCancel = (danger || focusCancel) && !alert;
       const active = typeof document !== 'undefined' ? document.activeElement : null;
       if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
       openFocusFrame = requestAnimationFrame(() => {

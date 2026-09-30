@@ -3500,11 +3500,22 @@ pub(crate) async fn add_shared_folder_approved(
             &pending_folder_allowlists,
         );
         let withheld = if limited {
-            withhold_known_files_outside_allowlist(
+            let mut withheld = withhold_known_files_outside_allowlist(
                 &mut discovered,
                 &canonical_str,
                 &pending_folder_allowlists,
-            )
+            );
+            // Discovery walks only the list, so the rest of an earlier share
+            // of this folder is in known.met alone, still marked shared, and
+            // startup hydration would bring it back offered.
+            withheld.extend(known_hashes_outside_allowlist(
+                &known_list,
+                &canonical_str,
+                &pending_folder_allowlists,
+            ));
+            withheld.sort();
+            withheld.dedup();
+            withheld
         } else {
             Vec::new()
         };
@@ -6737,6 +6748,47 @@ async fn clear_allowlists_under(state: &AppState, folder: &str) -> Result<(), St
     .await
 }
 
+/// Stop the allowlists offering anything under `folder`, for a folder being
+/// unshared while it stays shared. Entries inside it go, and a partly shared
+/// folder at or under it keeps an empty list rather than none: a folder with
+/// no list is shared whole, and discovery never walked the rest of its files,
+/// so no known.met record would stop the next scan offering them. `indexed`
+/// are the Library's paths under `folder`; the ones a partly shared folder no
+/// longer offers are withheld, so they stay listed as unshared.
+async fn withhold_allowlists_under(
+    state: &AppState,
+    folder: &str,
+    indexed: &[String],
+) -> Result<(), String> {
+    let keys = indexed
+        .iter()
+        .map(|path| crate::search::index::normalize_path_key(path))
+        .collect::<HashSet<_>>();
+    edit_folder_lists(state, |allowlists, withheld| {
+        withhold_under(allowlists, withheld, folder, &keys)
+    })
+    .await
+}
+
+fn withhold_under(
+    allowlists: &mut std::collections::HashMap<String, Vec<String>>,
+    withheld: &mut std::collections::HashMap<String, Vec<String>>,
+    folder: &str,
+    keys: &HashSet<String>,
+) -> bool {
+    let mut changed = false;
+    for (listed, entries) in allowlists.iter_mut() {
+        let before = entries.len();
+        if crate::security::path_within_dir(listed, folder) {
+            entries.clear();
+        } else {
+            entries.retain(|entry| !crate::security::path_within_dir(entry, folder));
+        }
+        changed |= entries.len() != before;
+    }
+    withhold_keys(allowlists, withheld, keys) || changed
+}
+
 #[tauri::command]
 pub async fn share_file(
     app: tauri::AppHandle,
@@ -6806,7 +6858,16 @@ pub async fn unshare_folder(
     }
     // Before the index write, so a failure here cannot leave an allowlist
     // that re-offers the folder's files on the next scan.
-    clear_allowlists_under(&state, &path).await?;
+    let indexed = {
+        let index = state.local_index.read().await;
+        index
+            .all_files()
+            .iter()
+            .filter(|file| crate::security::path_within_dir(&file.path, &path))
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>()
+    };
+    withhold_allowlists_under(&state, &path, &indexed).await?;
     let (snapshot, mutation) = {
         let mut index = state.local_index.write().await;
         let snapshot = index.all_files().to_vec();
@@ -7480,6 +7541,40 @@ mod tests {
         lists.clear();
         assert!(tidy_withheld(&lists, &mut withheld));
         assert!(withheld.is_empty());
+    }
+
+    /// Unsharing a partly shared folder must leave it limited, to nothing: with
+    /// no list it would be shared whole, and the next scan would hash and offer
+    /// every file discovery had never walked.
+    #[test]
+    fn unsharing_a_partial_share_keeps_it_limited_and_its_files_listed() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let folder = crate::search::index::normalize_path_key(&format!("C:{sep}music"));
+        let a = format!("{folder}{sep}a.mp3");
+        let sub = format!("{folder}{sep}live");
+        let in_sub = format!("{sub}{sep}c.mp3");
+        let other = crate::search::index::normalize_path_key(&format!("D:{sep}films"));
+        let film = format!("{other}{sep}d.mkv");
+        let mut lists = std::collections::HashMap::from([
+            (folder.clone(), vec![a.clone(), sub.clone()]),
+            (other.clone(), vec![film.clone()]),
+        ]);
+        let mut withheld = std::collections::HashMap::new();
+
+        let indexed = HashSet::from([in_sub.clone()]);
+        assert!(withhold_under(&mut lists, &mut withheld, &sub, &indexed));
+        assert_eq!(lists[&folder], vec![a.clone()], "a subfolder leaves the rest of the list");
+        assert_eq!(withheld[&folder], vec![in_sub.clone()]);
+
+        let indexed = HashSet::from([a.clone(), in_sub.clone()]);
+        assert!(withhold_under(&mut lists, &mut withheld, &folder, &indexed));
+        assert!(lists[&folder].is_empty(), "the folder keeps an empty list, not none");
+        let mut listed = withheld[&folder].clone();
+        listed.sort();
+        assert_eq!(listed, vec![a.clone(), in_sub.clone()]);
+        assert_eq!(lists[&other], vec![film], "another share is untouched");
+        let scope = crate::sharing::indexer::DiscoveryScope::for_root(&folder, &lists);
+        assert!(scope.is_some(), "discovery still walks only what is listed");
     }
 
     #[test]

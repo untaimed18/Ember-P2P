@@ -59,6 +59,7 @@
   confirmLabel={m.silent_update_countdown_now()}
   cancelLabel={m.silent_update_countdown_later()}
   altLabel={m.silent_update_countdown_skip()}
+  focusCancel
   onconfirm={() => answer(silentUpdateNow)}
   oncancel={() => answer(silentUpdatePostpone)}
   onalt={() => answer(() => silentUpdateSkip(version))}
