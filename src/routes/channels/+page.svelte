@@ -135,6 +135,7 @@
     sectionRooms,
   } from '$lib/channelSections';
   import { isApplePlatform, shortcutModAria } from '$lib/platform';
+  import { isShortcutLetter } from '$lib/shortcutKey';
 
   let channelList = $derived($channelsStore.filter((c) => !c.deleted));
   let joinedCount = $derived(channelList.filter((c) => c.in_room).length);
@@ -725,7 +726,7 @@
       e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey
       && (e.key === 'ArrowUp' || e.key === 'ArrowDown');
     const searchKey =
-      (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.key === 'k' || e.key === 'K');
+      (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isShortcutLetter(e, 'k');
     // Everything below costs a DOM query, and this runs on every keypress.
     if (!menuKey && !roomStep && !searchKey) return;
     if (document.querySelector('[aria-modal="true"]')) return;

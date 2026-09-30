@@ -713,6 +713,23 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!(error))?
     };
 
+    // Up to sixteen megabytes read and parsed, so off the async task too.
+    let restored_upload_queue = {
+        let dir = data_dir.clone();
+        match tokio::task::spawn_blocking(move || ed2k::upload_queue_store::restore(&dir)).await {
+            Ok(pending) => pending.map(|mut pending| {
+                if library_indexed_during_gate {
+                    pending.make_due();
+                }
+                pending
+            }),
+            Err(e) => {
+                warn!("Upload queue restore task failed: {e}");
+                None
+            }
+        }
+    };
+
     // Verified channel transfers, hashed off the event loop. Created here
     // rather than with the other result channels below because the sender
     // lives in `NetworkState`, which is built next.
@@ -865,12 +882,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         server_login_tcp_port: None,
         last_tcp_remap_reconnect_at: None,
         pending_server_connect: None,
-        restored_upload_queue: ed2k::upload_queue_store::restore(&data_dir).map(|mut pending| {
-            if library_indexed_during_gate {
-                pending.make_due();
-            }
-            pending
-        }),
+        restored_upload_queue,
         pending_buddy_hashes: pending_buddy_hashes.clone(),
         shared_buddy_info: shared_buddy_info.clone(),
         shared_ip_filter: shared_ip_filter.clone(),
@@ -4561,7 +4573,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &bandwidth_limiter,
                     &db,
                     &app_handle,
-                    &stats_manager,
                     &known_files,
                     &mut cache_write_handle,
                     &mut last_cache_refresh_started_at,
@@ -4573,7 +4584,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &shared_searches,
                     &shared_servers,
                     &shared_stats,
-                    &shared_transfer_stats,
                 ))
                 .catch_unwind()
                 .await;

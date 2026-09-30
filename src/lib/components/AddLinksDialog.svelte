@@ -33,6 +33,15 @@
   let overlayEl: HTMLDivElement | undefined = $state(undefined);
   let textareaEl: HTMLTextAreaElement | undefined = $state(undefined);
   let returnFocusEl: HTMLElement | null = null;
+  /** Where focus goes back to once the submitted batch is done: the opener
+   *  is disabled while it runs, and a disabled button cannot take focus. */
+  let deferredFocusEl: HTMLElement | null = null;
+
+  function returnFocus(el: HTMLElement) {
+    if (!document.contains(el)) return;
+    if (el.matches(':disabled')) deferredFocusEl = el;
+    else el.focus();
+  }
 
   // Opening fills the box from the clipboard when it holds links, so the
   // common case is one click more than the old paste, with a look first.
@@ -52,7 +61,7 @@
       cancelled = true;
       const el = returnFocusEl;
       returnFocusEl = null;
-      if (el) requestAnimationFrame(() => document.contains(el) && el.focus());
+      if (el) requestAnimationFrame(() => returnFocus(el));
     };
   });
 
@@ -99,7 +108,18 @@
     const parsed = await parseEd2kLinks(value).catch(() => null);
     if (!parsed || parsed.links.length === 0 || !open || text.trim() !== value) return;
     open = false;
-    await onsubmit(value);
+    try {
+      await onsubmit(value);
+    } finally {
+      // After the frame the close handed focus back in, and after the opener
+      // is re-enabled; not if the user has put focus somewhere since.
+      requestAnimationFrame(() => {
+        const el = deferredFocusEl;
+        deferredFocusEl = null;
+        const active = document.activeElement;
+        if (el && !open && (active === null || active === document.body)) returnFocus(el);
+      });
+    }
   }
 
   function onKeydown(e: KeyboardEvent) {

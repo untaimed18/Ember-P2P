@@ -11,7 +11,6 @@ pub(in crate::network) async fn on_cache_refresh_tick(
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
-    stats_manager: &StatsManager,
     known_files: &KnownFileList,
     cache_write_handle: &mut Option<tokio::task::JoinHandle<()>>,
     last_cache_refresh_started_at: &mut i64,
@@ -23,7 +22,6 @@ pub(in crate::network) async fn on_cache_refresh_tick(
     shared_searches: &Arc<RwLock<Vec<KadSearchInfo>>>,
     shared_servers: &Arc<RwLock<Vec<ServerInfo>>>,
     shared_stats: &Arc<RwLock<NetworkStats>>,
-    shared_transfer_stats: &Arc<RwLock<TransferStats>>,
 ) {
     // Skip if previous write task hasn't finished yet — avoids
     // accumulating queued writers on the RwLocks which would starve
@@ -123,8 +121,6 @@ pub(in crate::network) async fn on_cache_refresh_tick(
 
     let cached_conn_srv: Option<ServerInfo> = connected_server_info(state);
 
-    let cached_tstats = stats_manager.get_stats();
-
     let kad_connected = state.stats.status == NetworkStatus::Connected;
     let srv_connected = state.server_connected;
     let ember_live =
@@ -175,7 +171,6 @@ pub(in crate::network) async fn on_cache_refresh_tick(
     let ssrch = shared_searches.clone();
     let s_srv = shared_servers.clone();
     let s_conn = shared_connected_server.clone();
-    let s_tstats = shared_transfer_stats.clone();
     let s_files = shared_files.clone();
     let db_ref = db.clone();
     let li_ref = local_index.clone();
@@ -257,7 +252,6 @@ pub(in crate::network) async fn on_cache_refresh_tick(
         *ssrch.write().await = cached_s;
         *s_srv.write().await = cached_srv;
         *s_conn.write().await = cached_conn_srv;
-        *s_tstats.write().await = cached_tstats;
         // Apply the file snapshot last, after every expensive/fallible
         // preparation step. The watchdog never aborts this task, so
         // a refresh cannot leave only the leading subset of this

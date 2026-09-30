@@ -105,6 +105,12 @@ describe('transfer event flushing while the window is hidden', () => {
     expect(activeSources()).toBe(0);
   });
 
+  it('says the list is loaded once that snapshot is in, and not after a reset', () => {
+    expect(get(store.transfersLoaded)).toBe(true);
+    store.cleanupTransferStore();
+    expect(get(store.transfersLoaded)).toBe(false);
+  });
+
   it('flushes on a backstop timer when the requested frame never comes', () => {
     emitSources(4);
     expect(activeSources()).toBe(0);

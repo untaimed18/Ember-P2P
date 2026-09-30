@@ -65,6 +65,7 @@
     transferFailureReasonText,
   } from '$lib/i18n';
   import { plural } from '$lib/plural';
+  import { isShortcutLetter } from '$lib/shortcutKey';
 
   const searchTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
   /** Request ids whose invoke has settled (success or error). Prevents a late
@@ -3391,7 +3392,7 @@
   // Ctrl+C copies the ticked results' links, or the whole filtered list when
   // nothing is ticked. Skipped while text is selected or focus is in a field,
   // so the normal copy still works in the query box.
-  if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C')) {
+  if ((e.ctrlKey || e.metaKey) && isShortcutLetter(e, 'c')) {
     const target = e.target as HTMLElement | null;
     if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
     if (confirmOpen || networkAlertOpen || selectedResult || !(window.getSelection()?.isCollapsed ?? true)) return;

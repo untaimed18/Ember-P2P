@@ -117,12 +117,11 @@ fn unix_of(instant: Instant, now: Instant, now_unix: i64) -> i64 {
     now_unix.saturating_sub(ago)
 }
 
-/// The `Instant` for wall-clock `at`, or `now` when the monotonic clock cannot
-/// reach back that far — after a reboot, where losing the seniority is the
-/// honest answer.
-fn instant_of(at: i64, now: Instant, now_unix: i64) -> Instant {
+/// The `Instant` for wall-clock `at`, or `None` when the monotonic clock cannot
+/// reach back that far, as after a reboot.
+fn instant_of(at: i64, now: Instant, now_unix: i64) -> Option<Instant> {
     let ago = now_unix.saturating_sub(at).max(0);
-    now.checked_sub(Duration::from_secs(ago as u64)).unwrap_or(now)
+    now.checked_sub(Duration::from_secs(ago as u64))
 }
 
 fn to_saved(entry: &QueueEntry, now: Instant, now_unix: i64) -> Option<SavedEntry> {
@@ -151,7 +150,12 @@ fn to_saved(entry: &QueueEntry, now: Instant, now_unix: i64) -> Option<SavedEntr
     })
 }
 
-fn from_saved(saved: SavedEntry, now: Instant, now_unix: i64) -> Option<QueueEntry> {
+fn from_saved(
+    saved: SavedEntry,
+    now: Instant,
+    now_unix: i64,
+    instant_at: &impl Fn(i64) -> Option<Instant>,
+) -> Option<QueueEntry> {
     let waited_since_ask = now_unix.saturating_sub(saved.last_request_at);
     if !(-MAX_FUTURE_SKEW_SECS..MAX_PURGEQUEUETIME_SECS as i64).contains(&waited_since_ask) {
         return None;
@@ -171,10 +175,13 @@ fn from_saved(saved: SavedEntry, now: Instant, now_unix: i64) -> Option<QueueEnt
         Some(text) => Some(decode_32(text)?),
         None => None,
     };
-    let last_request = instant_of(saved.last_request_at, now, now_unix);
+    // A last request the monotonic clock cannot reach was made before a
+    // reboot. Stamped `now`, it would restart the purge window and be dialled
+    // for a push-grant as if it had just asked; its seniority is lost anyway.
+    let last_request = instant_at(saved.last_request_at)?;
     // A join after the last request cannot happen; clamp rather than let a
     // rewritten file hand a row more wait than it could have accrued.
-    let join_time = instant_of(saved.joined_at.min(saved.last_request_at), now, now_unix);
+    let join_time = instant_at(saved.joined_at.min(saved.last_request_at)).unwrap_or(now);
     Some(QueueEntry {
         identity,
         current_addr: None,
@@ -213,6 +220,16 @@ fn encode(entries: &[QueueEntry], now: Instant, now_unix: i64) -> serde_json::Re
 }
 
 fn decode(bytes: &[u8], now: Instant, now_unix: i64) -> Vec<QueueEntry> {
+    decode_on(bytes, now, now_unix, |at| instant_of(at, now, now_unix))
+}
+
+/// [`decode`] with the wall-clock-to-`Instant` conversion supplied.
+fn decode_on(
+    bytes: &[u8],
+    now: Instant,
+    now_unix: i64,
+    instant_at: impl Fn(i64) -> Option<Instant>,
+) -> Vec<QueueEntry> {
     let Ok(file) = serde_json::from_slice::<SnapshotFile>(bytes) else {
         tracing::warn!("Discarding an unreadable {FILE}");
         return Vec::new();
@@ -230,7 +247,7 @@ fn decode(bytes: &[u8], now: Instant, now_unix: i64) -> Vec<QueueEntry> {
     file.entries
         .into_iter()
         .take(MAX_ENTRIES)
-        .filter_map(|saved| from_saved(saved, now, now_unix))
+        .filter_map(|saved| from_saved(saved, now, now_unix, &instant_at))
         .filter(|entry| seen.insert(entry.identity.clone()))
         .filter(|entry| {
             let Some(ip) = entry.last_ip else {
@@ -262,8 +279,8 @@ impl PendingRestore {
         self.deadline = Instant::now();
     }
 
-    /// The rows themselves, for a shutdown that comes before the merge: they
-    /// are saved again rather than lost.
+    /// The rows themselves, for a shutdown before the merge that could not
+    /// read the live queue: they are saved again rather than lost.
     pub(crate) fn into_entries(self) -> Vec<QueueEntry> {
         self.entries
     }
@@ -274,8 +291,8 @@ impl PendingRestore {
 ///
 /// A peer that re-asked before the merge already has a live row, which wins —
 /// whichever file it now wants, since the live queue holds one row per peer.
-/// It inherits the restored row's earlier join only when it re-asked from the
-/// address the row was last seen on — the same rule a reconnect is held to.
+/// It inherits the restored row's earlier join only under the rule a
+/// reconnect is held to ([`may_inherit_join`]).
 /// A peer in `asked` that has no live row left it for a reason newer than
 /// its restored row (a slot, a cancel, a ban), so that row stays out.
 fn merge_into(
@@ -290,7 +307,7 @@ fn merge_into(
             continue;
         }
         if let Some(live) = queue.iter_mut().find(|e| e.identity == row.identity) {
-            if live.last_ip == row.last_ip && row.join_time < live.join_time {
+            if may_inherit_join(live, &row) && row.join_time < live.join_time {
                 live.join_time = row.join_time;
             }
             continue;
@@ -309,6 +326,24 @@ fn merge_into(
         merged += 1;
     }
     merged
+}
+
+/// Whether a peer's live row may take its restored row's earlier join: it
+/// asked from the address the row was last seen on, or proved the Ember key
+/// the row recorded. The rule `session_may_inherit_seniority` holds a
+/// reconnect to, since the user hash alone is replayable.
+fn may_inherit_join(live: &QueueEntry, row: &QueueEntry) -> bool {
+    live.last_ip == row.last_ip
+        || (live.ember_verified && live.ember_pubkey.is_some() && live.ember_pubkey == row.ember_pubkey)
+}
+
+/// Fold rows still held into the live rows a shutdown is about to save, by the
+/// merge's own rules minus the served-file check (the library may not be
+/// indexed yet). The file keeps one row per peer, the live one, so a peer that
+/// re-asked keeps its older wait only if it inherits it here.
+pub(crate) fn fold_for_save(queue: &mut Vec<QueueEntry>, pending: PendingRestore) {
+    let asked = asked_while_held().lock().take().unwrap_or_default();
+    merge_into(queue, pending.entries, &asked, |_| true);
 }
 
 /// Merge a pending restore into the live queue now.
@@ -578,13 +613,86 @@ mod tests {
         assert_eq!(queue[0].current_addr, live.current_addr, "the live row wins");
         assert_eq!(queue[0].join_time, old.join_time, "and inherits the earlier join");
 
-        // From another address, the wait is not inherited — the rule a
-        // reconnect is held to.
+        // From another address and without proving the row's Ember key, the
+        // wait is not inherited — the rule a reconnect is held to.
         live.last_ip = Some(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)));
+        live.ember_verified = false;
         live.join_time = live_join;
         let mut queue = vec![live];
         merge_into(&mut queue, vec![old], &HashSet::new(), |_| true);
         assert_eq!(queue[0].join_time, live_join);
+    }
+
+    #[test]
+    fn a_verified_ember_key_inherits_the_wait_from_another_address() {
+        let old = restored([1; 16], [8, 8, 8, 8], 3000);
+        let mut live = entry([1; 16], [9, 9, 9, 9], 10, 10);
+        let live_join = live.join_time;
+        let mut queue = vec![live.clone()];
+        merge_into(&mut queue, vec![old.clone()], &HashSet::new(), |_| true);
+        assert_eq!(queue[0].join_time, old.join_time, "the key the row recorded, proven");
+
+        live.ember_pubkey = Some([0x22; 32]);
+        let mut queue = vec![live.clone()];
+        merge_into(&mut queue, vec![old.clone()], &HashSet::new(), |_| true);
+        assert_eq!(queue[0].join_time, live_join, "another key proves nothing");
+
+        live.ember_pubkey = old.ember_pubkey;
+        live.ember_verified = false;
+        let mut queue = vec![live];
+        merge_into(&mut queue, vec![old], &HashSet::new(), |_| true);
+        assert_eq!(queue[0].join_time, live_join, "an unproven key is only a claim");
+    }
+
+    /// A peer that re-asked while its row was held, then a shutdown before the
+    /// merge: the file keeps only the first row per peer, the live one, so the
+    /// older wait has to be on it by then.
+    #[test]
+    fn a_shutdown_before_the_merge_saves_the_older_wait_on_the_live_row() {
+        let held = restored([1; 16], [8, 8, 8, 8], 3000);
+        let other = restored([2; 16], [9, 9, 9, 9], 3000);
+        let mut queue = vec![entry([1; 16], [8, 8, 8, 8], 10, 10)];
+        fold_for_save(
+            &mut queue,
+            PendingRestore {
+                entries: vec![held, other],
+                deadline: Instant::now(),
+            },
+        );
+        assert_eq!(queue.len(), 2, "one row per peer");
+
+        let now = Instant::now();
+        let (bytes, _) = encode(&queue, now, NOW_UNIX).unwrap();
+        let rows = decode(&bytes, now, NOW_UNIX);
+        assert_eq!(rows.len(), 2);
+        let row = rows
+            .iter()
+            .find(|r| r.identity == QueueIdentity::UserHash([1; 16]))
+            .unwrap();
+        assert!(row.join_time.elapsed() >= Duration::from_secs(3000 - 5));
+    }
+
+    #[test]
+    fn a_row_last_asked_before_a_reboot_is_dropped() {
+        // Two minutes of uptime: the monotonic clock reaches no further back.
+        let now = Instant::now();
+        let uptime_secs = 120;
+        let clock = move |at: i64| {
+            if NOW_UNIX - at <= uptime_secs {
+                instant_of(at, now, NOW_UNIX)
+            } else {
+                None
+            }
+        };
+        let before_boot = entry([1; 16], [8, 8, 8, 8], 7200, 600);
+        let since_boot = entry([2; 16], [9, 9, 9, 9], 7200, 60);
+        let (bytes, _) = encode(&[before_boot, since_boot], now, NOW_UNIX).unwrap();
+        let rows = decode_on(&bytes, now, NOW_UNIX, clock);
+        assert_eq!(rows.len(), 1, "its purge clock would restart at a full hour");
+        let row = &rows[0];
+        assert_eq!(row.identity, QueueIdentity::UserHash([2; 16]));
+        assert!(row.last_request < now, "keeps the age it has");
+        assert!(row.join_time >= now, "a join from before the boot is not kept");
     }
 
     /// A peer that asked while the rows were held and has no live row left

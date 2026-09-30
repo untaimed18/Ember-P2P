@@ -51,23 +51,46 @@ fn drain_fresh_part_hashes(
 }
 
 /// Transfer ids whose `.part` existed at the last probe, for the reconcile's
-/// OP_OFFERFILES change check. The probe runs on the blocking pool after the
-/// check reads this, so a check sees the previous pass's answer; a download
-/// that is unknown or stale here only makes the check request an offer drain
-/// that recomputes the list itself and finds nothing new to send.
+/// OP_OFFERFILES change check and the offer drain's partial files. The probe
+/// runs on the blocking pool after they read this, so each sees the previous
+/// pass's answer. A download stale here makes the check request a drain that
+/// finds nothing new to send; one the probe finds for the first time sets
+/// `grew`, which requests a drain that offers it.
 #[derive(Default)]
-struct PartPresence {
+pub(in crate::network) struct PartPresence {
     generation: u64,
-    present: HashSet<String>,
+    pub(in crate::network) present: HashSet<String>,
+    grew: bool,
 }
 
-fn part_presence() -> &'static parking_lot::Mutex<PartPresence> {
+impl PartPresence {
+    fn land(&mut self, generation: u64, present: HashSet<String>) {
+        // Probes can finish out of order; an older one must not overwrite a
+        // newer answer.
+        if generation <= self.generation {
+            return;
+        }
+        self.generation = generation;
+        if present.iter().any(|id| !self.present.contains(id)) {
+            self.grew = true;
+        }
+        self.present = present;
+    }
+}
+
+pub(in crate::network) fn part_presence() -> &'static parking_lot::Mutex<PartPresence> {
     static PRESENCE: std::sync::OnceLock<parking_lot::Mutex<PartPresence>> =
         std::sync::OnceLock::new();
     PRESENCE.get_or_init(Default::default)
 }
 
-fn spawn_part_presence_probe(candidates: Vec<(String, PathBuf)>) {
+/// Whether a probe has found a `.part` it had not seen since this was last
+/// asked.
+pub(in crate::network) fn take_part_presence_grew() -> bool {
+    std::mem::take(&mut part_presence().lock().grew)
+}
+
+pub(in crate::network) fn spawn_part_presence_probe(candidates: Vec<(String, PathBuf)>) {
     static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     tokio::task::spawn_blocking(move || {
@@ -76,13 +99,7 @@ fn spawn_part_presence_probe(candidates: Vec<(String, PathBuf)>) {
             .filter(|(_, path)| path.exists())
             .map(|(id, _)| id)
             .collect();
-        let mut slot = part_presence().lock();
-        // Probes can finish out of order; an older one must not overwrite a
-        // newer answer.
-        if generation > slot.generation {
-            slot.generation = generation;
-            slot.present = present;
-        }
+        part_presence().lock().land(generation, present);
     });
 }
 
@@ -7478,5 +7495,26 @@ mod reconcile_helper_tests {
         }
         assert!(!part_presence().lock().present.contains(&absent_id));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_part_found_for_the_first_time_asks_for_another_drain() {
+        let ids = |list: &[&str]| list.iter().map(|id| id.to_string()).collect::<HashSet<_>>();
+        let mut presence = PartPresence::default();
+        presence.land(1, ids(&["a"]));
+        assert!(std::mem::take(&mut presence.grew));
+
+        presence.land(2, ids(&["a"]));
+        assert!(!presence.grew, "the same answer again offers nothing new");
+        presence.land(3, ids(&[]));
+        assert!(!presence.grew, "nor does a part going away");
+
+        presence.land(2, ids(&["b"]));
+        assert!(!presence.grew, "an older probe landing late is ignored");
+        assert!(presence.present.is_empty());
+
+        presence.land(4, ids(&["b"]));
+        assert!(presence.grew);
+        assert_eq!(presence.present, ids(&["b"]));
     }
 }

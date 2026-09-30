@@ -288,6 +288,10 @@ interface TransferEventPayload extends StatusEventPayload {
 
 export const transfers = writable<Transfer[]>([]);
 
+/** Whether `transfers` holds the backend's list, not only rows events have
+ *  delivered ahead of the first sync. */
+export const transfersLoaded = writable(false);
+
 /** The upload cap in force (`RuntimeStatus.effective_upload_speed`, bytes/s,
  *  0 = unlimited), or `null` until the backend has published one. Differs from
  *  `AppSettings.max_upload_speed` while a schedule rule or USS is in charge. */
@@ -1000,6 +1004,7 @@ async function runSync(pollStartedAt: number): Promise<void> {
     if (!sticky.has(row.id)) reconciledRows.add(row);
   }
   commitTransfers(next);
+  transfersLoaded.set(true);
 }
 
 /**
@@ -1169,6 +1174,7 @@ export function cleanupTransferStore() {
   syncInFlight = null;
   initialized = false;
   transfers.set([]);
+  transfersLoaded.set(false);
 }
 
 let pollPumpOnNextVisible = false;

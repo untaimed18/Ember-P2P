@@ -163,9 +163,9 @@ pub(in crate::network) async fn on_stats_tick(
     stats_manager.drain_sx_counters();
     stats_manager.record_rate(chrono::Utc::now().timestamp());
     // Keep the Statistics IPC cache in lock-step with the 1s rate
-    // tick. The heavy 5s cache refresh can skip while a prior write
-    // is still running; without this, the page lagged several
-    // seconds behind StatsManager under load.
+    // tick. This is its only writer: a snapshot written anywhere
+    // after an await can land behind a newer one from here and move
+    // the rate graph backwards.
     {
         let snap = stats_manager.get_stats();
         *shared_transfer_stats.write().await = snap;

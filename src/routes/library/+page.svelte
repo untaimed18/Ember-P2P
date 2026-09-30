@@ -84,6 +84,7 @@
   import { serviceAvailableFor } from '$lib/webServices';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import { createMaxWaitDebounce } from '$lib/debounce';
+  import { isShortcutLetter } from '$lib/shortcutKey';
   import {
     applySharedFileStats,
     isUploadCounterPhase,
@@ -2242,7 +2243,7 @@
     // designed to persist across filter changes (see `checkedHiddenCount`),
     // so a blanket `new Set()` here would silently drop any checks hidden by
     // the current filter.
-    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'a' || e.key === 'A')) {
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && isShortcutLetter(e, 'a')) {
       if (sortedFiles.length === 0) return;
       e.preventDefault();
       checkedPaths = new Set([...checkedPaths, ...sortedFiles.map(f => f.path)]);
@@ -2251,7 +2252,7 @@
     }
 
     // Ctrl/Cmd+D clears the check selection.
-    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'd' || e.key === 'D')) {
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && isShortcutLetter(e, 'd')) {
       if (checkedPaths.size === 0) return;
       e.preventDefault();
       clearChecked();
@@ -2259,7 +2260,7 @@
     }
 
     // Ctrl/Cmd+C copies links for the current check selection or selected row.
-    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'c' || e.key === 'C')) {
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && isShortcutLetter(e, 'c')) {
       // Selected text (a path or comment in the drawer) keeps the normal copy.
       if (window.getSelection()?.toString()) return;
       const hasChecked = checkedCount > 0;

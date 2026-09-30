@@ -218,18 +218,23 @@ pub(in crate::network) async fn save_on_shutdown(
     // their place, not the user their data.
     let queue_lock_deadline =
         shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(2));
-    let mut queue_entries = match tokio::time::timeout_at(queue_lock_deadline, upload_queue.lock()).await {
-        Ok(queue) => queue.clone(),
+    let live_entries = match tokio::time::timeout_at(queue_lock_deadline, upload_queue.lock()).await {
+        Ok(queue) => Some(queue.clone()),
         Err(_) => {
             warn!("The upload queue stayed locked into shutdown; saving only waiters still held from the last session");
-            Vec::new()
+            None
         }
     };
     // Last session's waiters, if this one ended before they could rejoin.
-    // Live rows come first, so they win a duplicate.
-    if let Some(pending) = state.restored_upload_queue.take() {
-        queue_entries.extend(pending.into_entries());
-    }
+    let queue_entries = match (live_entries, state.restored_upload_queue.take()) {
+        (Some(mut live), Some(pending)) => {
+            ed2k::upload_queue_store::fold_for_save(&mut live, pending);
+            live
+        }
+        (Some(live), None) => live,
+        (None, Some(pending)) => pending.into_entries(),
+        (None, None) => Vec::new(),
+    };
 
     let contacts = state.routing_table.export_bootstrap_contacts(200);
     let nodes_path = state.data_dir.join("nodes.dat");

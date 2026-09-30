@@ -115,6 +115,7 @@
   import { silentUpdate, silentUpdateResume } from '$lib/stores/silentUpdate';
   import { toastError } from '$lib/stores/toast';
   import { networkStats } from '$lib/stores/network';
+  import { isShortcutLetter } from '$lib/shortcutKey';
 
   const appVersion = import.meta.env.VITE_APP_VERSION;
   const appLicense = import.meta.env.VITE_APP_LICENSE;
@@ -1082,7 +1083,7 @@
       if (hasUnsavedChanges) e.preventDefault();
     };
     const handleKeyboardSave = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+      if ((e.ctrlKey || e.metaKey) && isShortcutLetter(e, 's')) {
         e.preventDefault();
         if (hasUnsavedChanges) handleSave();
       }

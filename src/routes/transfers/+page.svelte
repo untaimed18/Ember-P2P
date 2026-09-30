@@ -4,7 +4,7 @@
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import AddLinksDialog from '$lib/components/AddLinksDialog.svelte';
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
-  import { transfers, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
+  import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
@@ -55,6 +55,7 @@
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import IconX from '$lib/components/IconX.svelte';
   import { TableWindow } from '$lib/tableWindow.svelte';
+  import { isShortcutLetter } from '$lib/shortcutKey';
 
   function countryFlagSrc(code: string | undefined): string | null {
     if (!code || code.length !== 2) return null;
@@ -1284,14 +1285,16 @@
    *  clients) and keeps the dependent computations reactive. */
   let reputationMap = $state<Record<string, PeerReputationInfo | null>>({});
   let reputationInFlight = new Set<string>();
+  /** Hashes a fetch has answered, a `null` "no record" included. */
+  const reputationAnswered = new Set<string>();
 
   async function refreshReputations(hashes: string[], force = false) {
-    // Skip hashes currently in flight. Non-null cache entries are
-    // re-fetched when `force` is set (Known Clients poll) so score /
-    // ban changes surface without a full page reload; otherwise only
-    // missing/`null` entries are eligible (first paint).
+    // Skip hashes currently in flight. Answered hashes are re-fetched only
+    // when `force` is set (Known Clients poll), so score / ban changes and a
+    // peer the tracker only later records surface on the poll's cadence;
+    // otherwise only hashes never answered are eligible (rows scrolled in).
     const targets = hashes.filter(
-      (h) => (force || reputationMap[h] == null) && !reputationInFlight.has(h),
+      (h) => (force || !reputationAnswered.has(h)) && !reputationInFlight.has(h),
     );
     if (targets.length === 0) return;
     for (const h of targets) reputationInFlight.add(h);
@@ -1303,6 +1306,7 @@
     let fetched: Record<string, PeerReputationInfo | null> = {};
     try {
       fetched = await getPeerReputationBatch(targets);
+      for (const h of targets) reputationAnswered.add(h);
     } catch (e) {
       // Leave the cache as it was; the poll retries. Clearing entries here
       // would flash every badge back to "unknown" on one transient failure.
@@ -1430,12 +1434,14 @@
   });
   let displayedKnownClients = $derived(knownWindow.slice(filteredKnownClients));
   // Trust badges for rows scrolled into view; the poll refreshes the rest.
+  // Once scrolling settles: every step of the window would otherwise take a
+  // slot in the backend's shared command channel.
   $effect(() => {
     if (!knownLedgerActive) return;
     const hashes = displayedKnownClients.map((k) => k.user_hash);
-    untrack(() => {
-      if (hashes.length > 0) void refreshReputations(hashes);
-    });
+    if (hashes.length === 0) return;
+    const timer = setTimeout(() => void refreshReputations(hashes), 250);
+    return () => clearTimeout(timer);
   });
 
   // Top-line stats for the active known-peers tab. Computed off the
@@ -2088,6 +2094,13 @@
   /** The saved filter only applies while its chip exists, so a category that
    *  emptied out cannot leave the list blank with nothing to click. */
   let activeCategory = $derived(categoryChips.includes(categoryFilter) ? categoryFilter : '');
+  // And is forgotten once the chips are known, or a download filed under it
+  // days later would narrow the list, and the bulk actions, by itself.
+  // Not before: until the list and the settings load, no chip exists.
+  $effect(() => {
+    if (!$transfersLoaded || $appSettings === null) return;
+    if (categoryFilter && !categoryChips.includes(categoryFilter)) categoryFilter = '';
+  });
   let downloadsNarrowed = $derived(Boolean(transferFilter.trim() || activeCategory));
   /** How the bulk actions and their prompts name the narrowed view. */
   let narrowLabel = $derived(
@@ -4580,6 +4593,9 @@
           reputationInFlight.delete(hash);
         }
       }
+      for (const hash of [...reputationAnswered]) {
+        if (!liveHashes.has(hash)) reputationAnswered.delete(hash);
+      }
       if (mutated) {
         reputationMap = { ...reputationMap };
       }
@@ -4683,7 +4699,7 @@
   if (fileDetailsId) return;
   // Paste eD2K links, as in eMule. Only outside a text field (guarded above),
   // where a native paste has nowhere to go anyway, and on an empty list too.
-  if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'v') {
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isShortcutLetter(e, 'v')) {
     e.preventDefault();
     void pasteLinksFromClipboard();
     return;
