@@ -8,7 +8,9 @@
 //! a clock.
 //!
 //! The result is emitted to the frontend, which applies it exactly as it applies
-//! a silent check it ran itself.
+//! a silent check it ran itself. A webview that was not listening yet, or has
+//! reloaded since, asks for it with `get_last_update_check_result`, since the
+//! next check may be a month away.
 
 use std::time::Duration;
 

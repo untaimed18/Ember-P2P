@@ -35,6 +35,7 @@ pub mod security;
 mod session_end;
 mod sharing;
 mod storage;
+mod tray;
 mod types;
 mod webservices;
 
@@ -114,14 +115,16 @@ fn repair_legacy_data_acls(data_dir: &std::path::Path) {
     }
 }
 
-/// The tray icon's menu. `cancel` is the silent-update countdown's "Cancel
-/// update" entry, shown above the others while the countdown runs.
+/// The tray icon's menu, in the language the frontend last sent (`tray`).
+/// `cancel` is the silent-update countdown's "Cancel update" entry, shown above
+/// the others while the countdown runs.
 pub(crate) fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(
     manager: &M,
     cancel: Option<&MenuItem<R>>,
 ) -> tauri::Result<Menu<R>> {
-    let show_item = MenuItem::with_id(manager, "tray_show", "Show Ember", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(manager, "tray_quit", "Quit Ember", true, None::<&str>)?;
+    let labels = tray::labels();
+    let show_item = MenuItem::with_id(manager, "tray_show", &labels.show, true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(manager, "tray_quit", &labels.quit, true, None::<&str>)?;
     match cancel {
         Some(cancel) => {
             let separator = PredefinedMenuItem::separator(manager)?;
@@ -1031,10 +1034,15 @@ pub fn run() {
             // file that launched Ember arrives in our own process args. Buffer
             // it now (AppState is managed above) — the frontend drains the
             // buffer once it mounts the deep-link handler. Done after
-            // `app.manage` so `dispatch_deep_links` can reach the buffer.
+            // `app.manage` so `dispatch_deep_links` can reach the buffer. An
+            // update restart carries the replaced process's args, whose links
+            // were offered then.
             {
                 let args: Vec<String> = std::env::args().collect();
-                let payloads = commands::deeplink::extract_deep_link_payloads(&args);
+                let payloads = auto_update::resume::without_replayed_links(
+                    &app_handle,
+                    commands::deeplink::extract_deep_link_payloads(&args),
+                );
                 if !payloads.is_empty() {
                     commands::deeplink::dispatch_deep_links(&app_handle, payloads);
                 }
@@ -2333,6 +2341,7 @@ pub fn run() {
             commands::deeplink::preview_deep_link,
             commands::deeplink::open_pending_collection,
             commands::updater::secure_updater_check,
+            commands::updater::get_last_update_check_result,
             commands::updater::secure_updater_install,
             commands::updater::secure_updater_handoff_status,
             commands::updater::secure_updater_run_saved_installer,
@@ -2345,6 +2354,7 @@ pub fn run() {
             auto_update::silent::silent_update_resume,
             auto_update::silent::note_user_activity,
             auto_update::silent::take_update_outcome,
+            tray::set_tray_labels,
                     ]
                 };
             }

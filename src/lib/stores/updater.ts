@@ -294,6 +294,22 @@ export async function applyBackgroundCheckResult(result: SecureUpdateCheckResult
 }
 
 /**
+ * Apply the backend's last check result, for a webview that was not listening
+ * when it was emitted: one still starting up when the first automatic check
+ * landed, or one reloaded since. The next check may be a month away. Call once
+ * the event listener is registered, so nothing falls between the two.
+ */
+export async function loadLastBackgroundCheckResult(): Promise<void> {
+  let result: SecureUpdateCheckResult | null;
+  try {
+    result = await invoke<SecureUpdateCheckResult | null>('get_last_update_check_result');
+  } catch {
+    return;
+  }
+  if (result) await applyBackgroundCheckResult(result);
+}
+
+/**
  * Put a check's result into the store.
  *
  * `staged` is the `stalled` offer captured before the check started, if any,

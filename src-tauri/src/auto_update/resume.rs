@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::app_state::AppState;
@@ -35,6 +36,7 @@ const MAX_FUTURE_SKEW_SECS: i64 = 5 * 60;
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SEARCH_TABS_BYTES: usize = 6 * 1024 * 1024;
 const MAX_VERSION_CHARS: usize = 64;
+const MAX_LAUNCH_LINKS: usize = 32;
 /// How long the frontend has to hand over its page and search tabs. A webview
 /// throttled in the tray still answers events; one that is hung must not hold
 /// up the update.
@@ -141,6 +143,12 @@ pub struct ResumeState {
     pub ed2k: Option<ServerSnapshot>,
     #[serde(default)]
     pub ui: UiSnapshot,
+    /// SHA-256, in hex, of each deep link the writing process was launched
+    /// with. The relaunch after an update is handed those arguments again (the
+    /// NSIS installer's `/ARGS`, `AppHandle::restart`), and they are not links
+    /// anyone just clicked.
+    #[serde(default)]
+    pub launch_links: Vec<String>,
 }
 
 /// How the update the file was written for turned out, judged by the version
@@ -162,6 +170,9 @@ pub struct LaunchResume {
     pub outcome: Option<UpdateOutcome>,
     /// Present only when the file is fresh enough to describe this session.
     pub state: Option<ResumeState>,
+    /// [`ResumeState::launch_links`], fresh or not: however long the relaunch
+    /// took, its arguments are still the old process's.
+    pub replayed_links: Vec<String>,
 }
 
 /// The frontend's half of a restored session, handed over once.
@@ -184,6 +195,7 @@ pub struct ResumeService {
     /// window shows it on some platforms, so it is maximized the first time it
     /// is shown instead.
     maximize_on_show: AtomicBool,
+    replayed_links: parking_lot::Mutex<Vec<String>>,
 }
 
 impl ResumeService {
@@ -209,6 +221,46 @@ static RESUME_SERVER: parking_lot::Mutex<Option<(String, u16)>> = parking_lot::M
 
 pub fn take_resume_server() -> Option<(String, u16)> {
     RESUME_SERVER.lock().take()
+}
+
+fn link_digest(payload: &str) -> String {
+    hex::encode(Sha256::digest(payload.as_bytes()))
+}
+
+/// Digests of the deep links in `args`, as [`ResumeState::launch_links`]
+/// records them.
+fn launch_link_digests(args: &[String]) -> Vec<String> {
+    crate::commands::deeplink::extract_deep_link_payloads(args)
+        .iter()
+        .take(MAX_LAUNCH_LINKS)
+        .map(|payload| link_digest(payload))
+        .collect()
+}
+
+fn without_replayed(payloads: Vec<String>, replayed: &[String]) -> Vec<String> {
+    payloads
+        .into_iter()
+        .filter(|payload| !replayed.contains(&link_digest(payload)))
+        .collect()
+}
+
+/// The launch's deep links, less those an update restart handed back from the
+/// process it replaced. Matching each link rather than dropping them all keeps
+/// one the user clicked while the update was relaunching Ember.
+pub fn without_replayed_links(app: &AppHandle, payloads: Vec<String>) -> Vec<String> {
+    let replayed = std::mem::take(&mut *app.state::<ResumeService>().replayed_links.lock());
+    if payloads.is_empty() || replayed.is_empty() {
+        return payloads;
+    }
+    let given = payloads.len();
+    let kept = without_replayed(payloads, &replayed);
+    if kept.len() < given {
+        tracing::info!(
+            "Not offering again the {} deep link(s) this update restart was relaunched with",
+            given - kept.len()
+        );
+    }
+    kept
 }
 
 // ── Consuming ───────────────────────────────────────────────────────────────
@@ -260,6 +312,7 @@ pub fn take_from(dir: &Path, running_version: &str, now: i64) -> LaunchResume {
         target_version: state.target_version.clone(),
         installed: running_version == state.target_version,
     };
+    let replayed_links = plausible_digests(&state.launch_links);
     let age = now.saturating_sub(state.written_at);
     let fresh = (-MAX_FUTURE_SKEW_SECS..=MAX_AGE_SECS).contains(&age);
     if !fresh {
@@ -268,7 +321,19 @@ pub fn take_from(dir: &Path, running_version: &str, now: i64) -> LaunchResume {
     LaunchResume {
         outcome: Some(outcome),
         state: fresh.then(|| sanitize(state)),
+        replayed_links,
     }
+}
+
+/// The digests that look like ones this build writes. A forged list can only
+/// keep a link from being offered, which deleting it from the queue does too.
+fn plausible_digests(digests: &[String]) -> Vec<String> {
+    digests
+        .iter()
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+        .take(MAX_LAUNCH_LINKS)
+        .map(|digest| digest.to_ascii_lowercase())
+        .collect()
 }
 
 fn plausible_version(version: &str) -> bool {
@@ -290,6 +355,7 @@ fn sanitize(mut state: ResumeState) -> ResumeState {
         .ui
         .search_tabs
         .filter(|tabs| !tabs.is_empty() && tabs.len() <= MAX_SEARCH_TABS_BYTES);
+    state.launch_links = plausible_digests(&state.launch_links);
     state
 }
 
@@ -310,6 +376,7 @@ pub fn begin_launch(app: &AppHandle, dir: &Path) -> Option<WindowSnapshot> {
         );
     }
     *service.outcome.lock() = launch.outcome;
+    *service.replayed_links.lock() = launch.replayed_links;
     let state = launch.state?;
     *RESUME_SERVER.lock() = state.ed2k.map(|server| (server.ip, server.port));
     *service.launch_ui.lock() = Some(UiResume {
@@ -501,6 +568,11 @@ pub async fn capture(app: &AppHandle, reason: ResumeReason, target_version: &str
         window,
         ed2k,
         ui,
+        launch_links: launch_link_digests(
+            &std::env::args_os()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        ),
     }
 }
 
@@ -602,6 +674,7 @@ mod tests {
                 route: Some("/transfers".to_string()),
                 search_tabs: Some("{\"tabs\":[],\"activeId\":null}".to_string()),
             },
+            launch_links: Vec::new(),
         }
     }
 
@@ -706,6 +779,52 @@ mod tests {
         std::fs::write(dir.join(RESUME_FILE), vec![b' '; MAX_FILE_BYTES as usize + 1]).unwrap();
         assert!(take_from(&dir, "1.8.0", NOW).outcome.is_none());
         assert!(!dir.join(RESUME_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An update restart is handed the old process's arguments again, so the
+    /// link Ember was first opened with must not be offered a second time,
+    /// while one clicked during the relaunch still is.
+    #[test]
+    fn links_the_relaunch_was_handed_back_are_not_offered_again() {
+        let dir = scratch_dir("launch-links");
+        let old = "ed2k://|file|a.iso|1024|0123456789ABCDEF0123456789ABCDEF|/";
+        let args = vec!["ember.exe".to_string(), old.to_string()];
+        let mut state = sample();
+        state.launch_links = launch_link_digests(&args);
+        assert_eq!(state.launch_links.len(), 1);
+        write_to(&dir, &state).unwrap();
+
+        // However long the relaunch took.
+        let taken = take_from(&dir, "1.8.0", NOW + MAX_AGE_SECS + 1);
+        assert!(taken.state.is_none());
+        let relaunch = crate::commands::deeplink::extract_deep_link_payloads(&args);
+        assert!(without_replayed(relaunch, &taken.replayed_links).is_empty());
+
+        let fresh = "ed2k://|file|b.iso|2048|FEDCBA9876543210FEDCBA9876543210|/";
+        let clicked = crate::commands::deeplink::extract_deep_link_payloads(&[
+            "ember.exe".to_string(),
+            fresh.to_string(),
+        ]);
+        assert_eq!(clicked.len(), 1);
+        assert_eq!(without_replayed(clicked.clone(), &taken.replayed_links), clicked);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launch_link_digests_this_build_would_not_write_are_dropped() {
+        let dir = scratch_dir("launch-link-garbage");
+        let good = link_digest("ed2k://|server|203.0.113.8|4661|/");
+        let mut state = sample();
+        state.launch_links = vec![
+            good.clone(),
+            "not-a-digest".to_string(),
+            "g".repeat(64),
+            good.to_ascii_uppercase(),
+        ];
+        write_to(&dir, &state).unwrap();
+        let taken = take_from(&dir, "1.8.0", NOW);
+        assert_eq!(taken.replayed_links, vec![good.clone(), good]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

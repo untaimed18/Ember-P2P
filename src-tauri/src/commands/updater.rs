@@ -89,10 +89,39 @@ fn is_missing_updater_resource(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<UpdaterResourceMissing>().is_some())
 }
 
+/// Locks are taken in the order `operation`, `staging`, `pending`, and
+/// `pending` is only ever held briefly outside an install.
 #[derive(Default)]
 pub struct UpdaterService {
+    /// One check or install at a time.
     operation: Mutex<()>,
+    /// Held by whoever downloads an artifact into the staging folder or
+    /// otherwise changes what is in it, so a background preparation and a
+    /// manual install never write the same file at once. A download holds only
+    /// this, which leaves checks and installs free while it runs.
+    staging: Mutex<()>,
     pending: Mutex<Option<PendingUpdate>>,
+    /// `(received, size)` of the artifact being downloaded right now, so an
+    /// install waiting for a background download can show how far it is.
+    download_progress: parking_lot::Mutex<Option<(u64, u64)>>,
+}
+
+/// The last update check's result, for a webview that missed the event.
+static LAST_CHECK: parking_lot::Mutex<Option<SecureUpdateCheckResult>> =
+    parking_lot::Mutex::new(None);
+
+/// Proof that the caller holds [`UpdaterService`]'s operation lock.
+pub(crate) struct OperationGuard<'a> {
+    _held: tokio::sync::MutexGuard<'a, ()>,
+}
+
+/// The operation lock, if no check or install holds it right now.
+pub(crate) fn try_lock_operation(service: &UpdaterService) -> Option<OperationGuard<'_>> {
+    service
+        .operation
+        .try_lock()
+        .ok()
+        .map(|held| OperationGuard { _held: held })
 }
 
 struct PendingUpdate {
@@ -108,7 +137,7 @@ struct PendingUpdate {
     /// later recovery can keep them — see [`UpdateHandoff::manifest`].
     manifest: String,
     manifest_signature: String,
-    /// Where [`prepare_locked`] left the verified artifact. Staged bytes are
+    /// Where [`prepare_staged`] left the verified artifact. Staged bytes are
     /// re-verified before anything installs them, since they may sit for days
     /// waiting for a quiet moment.
     prepared: Option<PreparedArtifact>,
@@ -171,9 +200,21 @@ impl SecureUpdateCheckResult {
     pub(crate) fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
+
+    /// This result with its offer brought up to date: `pending` is what the
+    /// updater holds now, which an install or a floor rise may have changed
+    /// since the check. Every check reports exactly the pending update's
+    /// metadata, so nothing else needs reconciling.
+    fn brought_up_to_date(self, pending: Option<&UpdateInfo>) -> Self {
+        Self {
+            update: pending.cloned(),
+            pending_retained: pending.is_some(),
+            ..self
+        }
+    }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", content = "data")]
 pub enum UpdateProgress {
     Started {
@@ -962,10 +1003,10 @@ fn discard_staged(app: &AppHandle) {
 /// Remove artifacts a preparation staged and never installed, once they are no
 /// longer newer than the running build.
 ///
-/// Only reached when there is no hand-off record, so nothing here is a failed
-/// install anyone needs to hear about. The version comes from the file name,
-/// which is untrusted, but it is only ever used to decide what to delete: the
-/// worst a rewritten name can do is cost a re-download or keep one stale file.
+/// Nothing here is a failed install anyone needs to hear about. The version
+/// comes from the file name, which is untrusted, but it is only ever used to
+/// decide what to delete: the worst a rewritten name can do is cost a
+/// re-download or keep one stale file. Call with the staging lock held.
 fn sweep_stale_staged(app: &AppHandle) {
     if let Ok(dir) = pending_dir(app) {
         sweep_stale_staged_in(&dir, &app.package_info().version.to_string());
@@ -978,6 +1019,10 @@ fn sweep_stale_staged_in(dir: &Path, running: &str) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
+        // `atomic_write` writes through a dot-named temporary beside the file.
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
         let newer = name
             .to_str()
             .and_then(staged_version_from_name)
@@ -991,13 +1036,26 @@ fn sweep_stale_staged_in(dir: &Path, running: &str) {
     }
 }
 
-/// Forget a hand-off and delete the installer it refers to.
-fn clear_handoff(app: &AppHandle) {
-    if let Ok(path) = handoff_path(app) {
-        let _ = std::fs::remove_file(path);
-    }
-    if let Ok(dir) = pending_dir(app) {
-        let _ = std::fs::remove_dir_all(dir);
+/// Forget a hand-off and delete the installer it refers to, which is `claim`'s
+/// when the marker could be verified. One that could not names nothing we can
+/// trust, so only what is no longer an upgrade goes. Anything else in the
+/// staging folder, such as a newer release prepared since, stays. Call with
+/// the staging lock held.
+fn clear_handoff(app: &AppHandle, claim: Option<&HandoffClaim>) {
+    let (Ok(marker), Ok(dir)) = (handoff_path(app), pending_dir(app)) else {
+        return;
+    };
+    let own = claim.map(|claim| installer_name(&claim.version.to_string(), claim.kind));
+    clear_handoff_in(&marker, &dir, own.as_deref(), &app.package_info().version.to_string());
+}
+
+fn clear_handoff_in(marker: &Path, dir: &Path, own: Option<&str>, running: &str) {
+    let _ = std::fs::remove_file(marker);
+    match own {
+        Some(name) => {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        None => sweep_stale_staged_in(dir, running),
     }
 }
 
@@ -1543,43 +1601,193 @@ async fn download_artifact(
     Ok(artifact)
 }
 
-/// Download, verify and stage the pending update, so that installing it later
-/// needs no network and the downtime is only shutdown, install and relaunch.
-///
-/// A copy already staged for the same signed artifact — by an earlier
-/// preparation, possibly in an earlier session — is reused once it re-verifies.
-async fn prepare_locked(
-    app: &AppHandle,
-    update: &mut PendingUpdate,
-    public_key: &str,
-    on_event: ProgressSink<'_>,
-) -> Result<()> {
+/// The pending update's artifact, copied out so it can be downloaded without
+/// holding the pending update.
+struct PrepareTarget {
+    platform: SignedPlatform,
+    version: String,
+    path: PathBuf,
+}
+
+/// What the updater holds, at a glance.
+enum PendingLook {
+    Nothing,
+    /// It fell below the signed security floor and has been dropped.
+    BelowFloor,
+    Prepared { version: String },
+    Unprepared(PrepareTarget),
+}
+
+async fn look_at_pending(app: &AppHandle, service: &UpdaterService) -> Result<PendingLook> {
+    let mut pending = service.pending.lock().await;
+    let Some(update) = pending.as_ref() else {
+        return Ok(PendingLook::Nothing);
+    };
+    if !pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)? {
+        pending.take();
+        return Ok(PendingLook::BelowFloor);
+    }
+    if update.prepared.is_some() {
+        return Ok(PendingLook::Prepared {
+            version: update.info.version.clone(),
+        });
+    }
     let path = pending_dir(app)?.join(installer_name(
         &update.info.version,
         staged_kind(&update.platform.url),
     ));
-    if read_verified_staged(&path, &update.platform, public_key).is_ok() {
-        // Reported the way a download would be, so a progress UI moves on.
-        on_event(UpdateProgress::Started {
-            content_length: update.platform.size,
-        });
-        on_event(UpdateProgress::Progress {
-            chunk_length: update.platform.size,
-        });
-        on_event(UpdateProgress::Finished);
-        update.prepared = Some(PreparedArtifact::Staged(path));
-        return Ok(());
+    Ok(PendingLook::Unprepared(PrepareTarget {
+        platform: update.platform.clone(),
+        version: update.info.version.clone(),
+        path,
+    }))
+}
+
+/// Download, verify and stage `target`, so that installing it later needs no
+/// network and the downtime is only shutdown, install and relaunch. Holds only
+/// the staging lock (`_staging`), then records the result against the pending
+/// update if that is still the same artifact. Returns whether the pending
+/// update is now prepared.
+///
+/// A copy already staged for the same signed artifact — by an earlier
+/// preparation, possibly in an earlier session — is reused once it re-verifies.
+async fn prepare_staged(
+    service: &UpdaterService,
+    _staging: &tokio::sync::MutexGuard<'_, ()>,
+    target: PrepareTarget,
+    public_key: &str,
+    on_event: ProgressSink<'_>,
+) -> Result<bool> {
+    // A check may have replaced the target, or someone else prepared it, while
+    // this waited for the staging lock.
+    match service.pending.lock().await.as_ref() {
+        Some(update) if same_artifact(&update.platform, &target.platform) => {
+            if update.prepared.is_some() {
+                return Ok(true);
+            }
+        }
+        _ => return Ok(false),
     }
 
-    let artifact = download_artifact(&update.platform, public_key, on_event).await?;
-    update.prepared = Some(match stage_artifact(&path, &artifact) {
-        Ok(()) => PreparedArtifact::Staged(path),
-        Err(error) => {
-            tracing::warn!("Could not stage the verified update; keeping it in memory: {error:#}");
-            PreparedArtifact::InMemory(artifact)
+    let prepared = if read_verified_staged(&target.path, &target.platform, public_key).is_ok() {
+        // Reported the way a download would be, so a progress UI moves on.
+        on_event(UpdateProgress::Started {
+            content_length: target.platform.size,
+        });
+        on_event(UpdateProgress::Progress {
+            chunk_length: target.platform.size,
+        });
+        on_event(UpdateProgress::Finished);
+        PreparedArtifact::Staged(target.path.clone())
+    } else {
+        let track = |event: UpdateProgress| {
+            note_download_progress(&service.download_progress, &event);
+            on_event(event);
+        };
+        let downloaded = download_artifact(&target.platform, public_key, &track).await;
+        service.download_progress.lock().take();
+        let artifact = downloaded?;
+        match stage_artifact(&target.path, &artifact) {
+            Ok(()) => PreparedArtifact::Staged(target.path.clone()),
+            Err(error) => {
+                tracing::warn!("Could not stage the verified update; keeping it in memory: {error:#}");
+                PreparedArtifact::InMemory(artifact)
+            }
         }
-    });
-    Ok(())
+    };
+
+    let mut pending = service.pending.lock().await;
+    match pending.as_mut() {
+        Some(update) if same_artifact(&update.platform, &target.platform) => {
+            if update.prepared.is_none() {
+                update.prepared = Some(prepared);
+            }
+            Ok(true)
+        }
+        _ => {
+            // Superseded while it downloaded. Nothing else can have staged
+            // anything meanwhile, since this held the staging lock.
+            tracing::info!(
+                "Discarding the prepared update for {}: a check replaced it while it downloaded",
+                target.version
+            );
+            if let PreparedArtifact::Staged(path) = prepared {
+                let _ = std::fs::remove_file(path);
+            }
+            Ok(false)
+        }
+    }
+}
+
+fn note_download_progress(progress: &parking_lot::Mutex<Option<(u64, u64)>>, event: &UpdateProgress) {
+    let mut progress = progress.lock();
+    match *event {
+        UpdateProgress::Started { content_length } => *progress = Some((0, content_length)),
+        UpdateProgress::Progress { chunk_length } => {
+            if let Some((received, _)) = progress.as_mut() {
+                *received = received.saturating_add(chunk_length);
+            }
+        }
+        UpdateProgress::Finished => {}
+    }
+}
+
+/// How often an install waiting for someone else's download passes its
+/// progress on.
+const PROGRESS_FORWARD_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Turns snapshots of another download's progress into the event stream a
+/// progress UI expects.
+#[derive(Default)]
+struct ProgressForward {
+    size: Option<u64>,
+    sent: u64,
+}
+
+impl ProgressForward {
+    fn forward(&mut self, progress: Option<(u64, u64)>, on_event: ProgressSink<'_>) {
+        let Some((received, size)) = progress else {
+            return;
+        };
+        if self.size != Some(size) {
+            on_event(UpdateProgress::Started {
+                content_length: size,
+            });
+            self.size = Some(size);
+            self.sent = 0;
+        }
+        if received > self.sent {
+            on_event(UpdateProgress::Progress {
+                chunk_length: received - self.sent,
+            });
+            self.sent = received;
+        }
+    }
+}
+
+/// The staging lock, passing on the progress of whatever download holds it
+/// meanwhile, so an Install pressed during a background download shows that
+/// download moving instead of sitting still.
+async fn lock_staging_reporting<'a>(
+    service: &'a UpdaterService,
+    on_event: ProgressSink<'_>,
+) -> tokio::sync::MutexGuard<'a, ()> {
+    if let Ok(guard) = service.staging.try_lock() {
+        return guard;
+    }
+    let lock = service.staging.lock();
+    tokio::pin!(lock);
+    let mut ticker = tokio::time::interval(PROGRESS_FORWARD_INTERVAL);
+    let mut forward = ProgressForward::default();
+    loop {
+        tokio::select! {
+            guard = &mut lock => return guard,
+            _ = ticker.tick() => {
+                let progress = *service.download_progress.lock();
+                forward.forward(progress, on_event);
+            }
+        }
+    }
 }
 
 /// Hand the prepared update to the installer.
@@ -1778,6 +1986,35 @@ pub(crate) async fn run_check(
 ) -> Result<SecureUpdateCheckResult, String> {
     let _operation = service.operation.lock().await;
     crate::auto_update::record::note_check_attempt();
+    let result = check_and_retain(app, service).await;
+    *LAST_CHECK.lock() = Some(match &result {
+        Ok(result) => result.clone(),
+        Err(error) => SecureUpdateCheckResult::failed(error.clone()),
+    });
+    result
+}
+
+/// The last update check's result as it applies now, or nothing before the
+/// first check. For a webview that was not listening when the scheduler's
+/// result was emitted: one still starting up, or one reloaded since.
+#[tauri::command]
+pub fn get_last_update_check_result(
+    service: State<'_, UpdaterService>,
+) -> Option<SecureUpdateCheckResult> {
+    let last = LAST_CHECK.lock().clone()?;
+    // Held for long only by an install, which is about to end this process.
+    match service.pending.try_lock() {
+        Ok(pending) => {
+            Some(last.brought_up_to_date(pending.as_ref().map(|update| &update.info)))
+        }
+        Err(_) => Some(last),
+    }
+}
+
+async fn check_and_retain(
+    app: &AppHandle,
+    service: &UpdaterService,
+) -> Result<SecureUpdateCheckResult, String> {
     match secure_check(app).await {
         Ok(Some((info, mut pending))) => {
             let mut slot = service.pending.lock().await;
@@ -1848,9 +2085,8 @@ pub(crate) async fn run_check(
 /// The verified update waiting to be installed, if any, and whether it is
 /// already staged: what the silent-update scheduler plans around.
 ///
-/// Never waits: the outer `None` means a check or a preparation holds the
-/// update right now, and the caller should look again later rather than stall
-/// behind a download.
+/// Never waits: the outer `None` means something is swapping the pending update
+/// right now, and the caller should look again on its next tick.
 pub(crate) fn try_pending_update_state(service: &UpdaterService) -> Option<Option<(String, bool)>> {
     let pending = service.pending.try_lock().ok()?;
     Some(
@@ -1861,39 +2097,41 @@ pub(crate) fn try_pending_update_state(service: &UpdaterService) -> Option<Optio
 }
 
 /// Download, verify and stage the pending update in the background, with no
-/// progress UI. `Ok(None)` when nothing is pending or it has fallen below the
-/// signed floor since it was checked.
+/// progress UI. `Ok(None)` when nothing is pending, it has fallen below the
+/// signed floor since it was checked, or a check replaced it while it
+/// downloaded.
+///
+/// Holds no operation lock, so a check or an install pressed meanwhile is not
+/// stuck behind a download that may take half an hour.
 pub(crate) async fn prepare_pending_update(
     app: &AppHandle,
     service: &UpdaterService,
 ) -> Result<Option<String>, String> {
-    let _operation = service.operation.lock().await;
-    let mut pending = service.pending.lock().await;
-    let Some(update) = pending.as_mut() else {
-        return Ok(None);
+    let fail = |error: anyhow::Error| public_failure(UpdaterOperation::Install, error);
+    let target = match look_at_pending(app, service).await.map_err(fail)? {
+        PendingLook::Nothing | PendingLook::BelowFloor => return Ok(None),
+        PendingLook::Prepared { version } => return Ok(Some(version)),
+        PendingLook::Unprepared(target) => target,
     };
-    if !pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)
-        .map_err(|error| public_failure(UpdaterOperation::Install, error))?
-    {
-        pending.take();
-        return Ok(None);
-    }
-    let config = embedded_updater_config()
-        .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
-    prepare_locked(app, update, &config.public_key, &|_| {})
+    let config = embedded_updater_config().map_err(fail)?;
+    let version = target.version.clone();
+    let staging = service.staging.lock().await;
+    let prepared = prepare_staged(service, &staging, target, &config.public_key, &|_| {})
         .await
-        .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
-    Ok(Some(update.info.version.clone()))
+        .map_err(fail)?;
+    Ok(prepared.then_some(version))
 }
 
-/// Install the update [`prepare_pending_update`] staged, for the silent path.
-/// Does not return on Windows when it succeeds.
+/// Install the update [`prepare_pending_update`] staged, for the silent path,
+/// which has already taken the operation lock (`_operation`) so that nothing
+/// it checked before committing can change underneath it. Does not return on
+/// Windows when it succeeds.
 pub(crate) async fn install_prepared_update(
     app: &AppHandle,
     service: &UpdaterService,
+    _operation: OperationGuard<'_>,
     reason: crate::auto_update::resume::ResumeReason,
 ) -> Result<(), String> {
-    let _operation = service.operation.lock().await;
     let mut pending = service.pending.lock().await;
     let config = embedded_updater_config()
         .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
@@ -1907,30 +2145,40 @@ pub async fn secure_updater_install(
     on_event: Channel<UpdateProgress>,
 ) -> Result<(), String> {
     let _operation = service.operation.lock().await;
-    let mut pending = service.pending.lock().await;
-    let Some(update) = pending.as_mut() else {
-        return Err(coded(
-            "updater_no_pending_update",
-            "No verified update is ready to install.",
-        ));
+    let fail = |error: anyhow::Error| public_failure(UpdaterOperation::Install, error);
+    let target = match look_at_pending(&app, &service).await.map_err(fail)? {
+        PendingLook::Nothing => {
+            return Err(coded(
+                "updater_no_pending_update",
+                "No verified update is ready to install.",
+            ))
+        }
+        PendingLook::BelowFloor => {
+            return Err(coded(
+                "updater_pending_below_floor",
+                "The previously checked update is older than the signed security floor. Check for updates again.",
+            ))
+        }
+        PendingLook::Prepared { .. } => None,
+        PendingLook::Unprepared(target) => Some(target),
     };
-    if !pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)
-        .map_err(|error| public_failure(UpdaterOperation::Install, error))?
-    {
-        pending.take();
-        return Err(coded(
-            "updater_pending_below_floor",
-            "The previously checked update is older than the signed security floor. Check for updates again.",
-        ));
-    }
-    let config = embedded_updater_config()
-        .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
+    let config = embedded_updater_config().map_err(fail)?;
     let report = |event: UpdateProgress| {
         let _ = on_event.send(event);
     };
-    prepare_locked(&app, update, &config.public_key, &report)
-        .await
-        .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
+    // A background preparation of this same update may be downloading it:
+    // wait for it and use its copy rather than fetch a second one beside it.
+    let _staging = match target {
+        Some(target) => {
+            let staging = lock_staging_reporting(&service, &report).await;
+            prepare_staged(&service, &staging, target, &config.public_key, &report)
+                .await
+                .map_err(fail)?;
+            Some(staging)
+        }
+        None => None,
+    };
+    let mut pending = service.pending.lock().await;
     install_locked(
         &app,
         &mut pending,
@@ -1959,7 +2207,9 @@ pub async fn secure_updater_install(
 #[tauri::command]
 pub async fn secure_updater_handoff_status(
     app: AppHandle,
+    service: State<'_, UpdaterService>,
 ) -> Result<Option<UpdateHandoffReport>, String> {
+    let _staging = service.staging.lock().await;
     let path =
         handoff_path(&app).map_err(|error| public_failure(UpdaterOperation::HandoffCheck, error))?;
     let record = match read_handoff(&path) {
@@ -1975,7 +2225,7 @@ pub async fn secure_updater_handoff_status(
             // An unreadable marker is not worth surfacing, and keeping it would
             // make every launch retry the same parse.
             tracing::warn!("Discarding an unreadable update hand-off record: {error:#}");
-            clear_handoff(&app);
+            clear_handoff(&app, None);
             return Ok(None);
         }
     };
@@ -1987,7 +2237,7 @@ pub async fn secure_updater_handoff_status(
             // manifest does not contain. Nothing here can be offered, and keeping
             // it would make every launch repeat the same work.
             tracing::warn!("Discarding an unverifiable update hand-off record: {error:#}");
-            clear_handoff(&app);
+            clear_handoff(&app, None);
             return Ok(None);
         }
     };
@@ -2001,7 +2251,7 @@ pub async fn secure_updater_handoff_status(
             claim.version,
             app.package_info().version
         );
-        clear_handoff(&app);
+        clear_handoff(&app, Some(&claim));
         return Ok(None);
     }
 
@@ -2009,7 +2259,7 @@ pub async fn secure_updater_handoff_status(
         .timestamp()
         .saturating_sub(record.attempted_at);
     if !(0..=HANDOFF_MAX_AGE_SECS).contains(&age) {
-        clear_handoff(&app);
+        clear_handoff(&app, Some(&claim));
         return Ok(None);
     }
 
@@ -2023,7 +2273,7 @@ pub async fn secure_updater_handoff_status(
                 "Discarding the staged installer for {}: it is below the signed security floor",
                 claim.version
             );
-            clear_handoff(&app);
+            clear_handoff(&app, Some(&claim));
             return Ok(None);
         }
         // No floor, or one we could not read: say nothing and keep the bytes. The
@@ -2080,7 +2330,11 @@ pub async fn secure_updater_handoff_status(
 /// the invisible one, and if something is going to refuse this binary the user
 /// should be able to see it happen and answer whatever prompt appears.
 #[tauri::command]
-pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), String> {
+pub async fn secure_updater_run_saved_installer(
+    app: AppHandle,
+    service: State<'_, UpdaterService>,
+) -> Result<(), String> {
+    let _staging = service.staging.lock().await;
     let path = handoff_path(&app)
         .map_err(|error| public_failure(UpdaterOperation::InstallerLaunch, error))?;
     let Some(record) = read_handoff(&path)
@@ -2095,7 +2349,7 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
     // record's own fields are not evidence — see `verified_handoff_claim`.
     let claim = verified_handoff_claim(&record).map_err(|error| {
         tracing::warn!("Refusing to run the staged installer: {error:#}");
-        clear_handoff(&app);
+        clear_handoff(&app, None);
         coded(
             "updater_staged_unverified",
             "The staged installer could not be verified against its signed manifest. Check for updates again.",
@@ -2105,7 +2359,7 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
     // not the same question as a permitted version, and a permitted version is
     // not the same question as a newer one.
     if !handoff_is_an_upgrade(&app, &claim) {
-        clear_handoff(&app);
+        clear_handoff(&app, Some(&claim));
         return Err(coded(
             "updater_staged_not_newer",
             "The staged update is not newer than the version already installed.",
@@ -2116,7 +2370,7 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
     {
         Some(true) => {}
         Some(false) => {
-            clear_handoff(&app);
+            clear_handoff(&app, Some(&claim));
             return Err(coded(
                 "updater_staged_below_floor",
                 "The staged update is older than the signed security floor. Check for updates again.",
@@ -2360,7 +2614,9 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         let same = dir.join(installer_name("1.7.1", "exe"));
         let older = dir.join(installer_name("1.6.0", "bin"));
         let foreign = dir.join("something-else.tmp");
-        for path in [&newer, &same, &older, &foreign] {
+        // What `atomic_write` names the file while it is still being written.
+        let writing = crate::security::unique_tmp_path(&dir.join(installer_name("1.8.1", "exe")));
+        for path in [&newer, &same, &older, &foreign, &writing] {
             std::fs::write(path, b"x").unwrap();
         }
 
@@ -2369,7 +2625,153 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         assert!(!same.exists());
         assert!(!older.exists());
         assert!(!foreign.exists());
+        assert!(writing.exists(), "a staging write in progress is left alone");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_a_handoff_keeps_what_was_staged_since() {
+        let dir = scratch_dir("clear-handoff");
+        let staging = dir.join(PENDING_DIR);
+        std::fs::create_dir_all(&staging).unwrap();
+        let marker = dir.join(HANDOFF_FILE);
+        let handed_off = staging.join(installer_name("1.8.0", "exe"));
+        let newer = staging.join(installer_name("1.8.1", "exe"));
+        for path in [&marker, &handed_off, &newer] {
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        clear_handoff_in(&marker, &staging, Some(&installer_name("1.8.0", "exe")), "1.8.0");
+        assert!(!marker.exists());
+        assert!(!handed_off.exists());
+        assert!(newer.exists(), "a newer release prepared since is not the hand-off's");
+
+        // A marker that could not be verified names nothing to trust: only
+        // what is no longer an upgrade goes.
+        std::fs::write(&marker, b"x").unwrap();
+        std::fs::write(&handed_off, b"x").unwrap();
+        clear_handoff_in(&marker, &staging, None, "1.8.0");
+        assert!(!marker.exists());
+        assert!(!handed_off.exists());
+        assert!(newer.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn info(version: &str) -> UpdateInfo {
+        UpdateInfo {
+            version: version.to_string(),
+            security_epoch: 1,
+            notes: None,
+            date: None,
+        }
+    }
+
+    /// A webview that missed the scheduler's event is handed the last result,
+    /// but offering what the updater no longer holds would put up an Install
+    /// button that fails.
+    #[test]
+    fn a_cached_check_result_offers_only_what_is_still_pending() {
+        let found = SecureUpdateCheckResult {
+            update: Some(info("1.8.0")),
+            pending_retained: true,
+            error: None,
+            signature_missing: false,
+        };
+        let still = found.clone().brought_up_to_date(Some(&info("1.8.0")));
+        assert_eq!(still.update.map(|update| update.version).as_deref(), Some("1.8.0"));
+        assert!(still.pending_retained);
+
+        let gone = found.brought_up_to_date(None);
+        assert!(gone.update.is_none());
+        assert!(!gone.pending_retained);
+
+        let failed = SecureUpdateCheckResult {
+            signature_missing: true,
+            ..SecureUpdateCheckResult::failed("offline".to_string())
+        };
+        let failed = failed.brought_up_to_date(Some(&info("1.8.0")));
+        assert_eq!(failed.error(), Some("offline"));
+        assert!(failed.signature_missing, "what the check learned is kept");
+        assert!(failed.pending_retained);
+    }
+
+    #[test]
+    fn download_progress_is_tracked_for_whoever_waits_on_it() {
+        let progress = parking_lot::Mutex::new(None);
+        note_download_progress(&progress, &UpdateProgress::Progress { chunk_length: 5 });
+        assert_eq!(*progress.lock(), None, "nothing before the download starts");
+        note_download_progress(&progress, &UpdateProgress::Started { content_length: 100 });
+        note_download_progress(&progress, &UpdateProgress::Progress { chunk_length: 30 });
+        note_download_progress(&progress, &UpdateProgress::Progress { chunk_length: 20 });
+        note_download_progress(&progress, &UpdateProgress::Finished);
+        assert_eq!(*progress.lock(), Some((50, 100)));
+    }
+
+    #[test]
+    fn forwarded_progress_reads_like_a_download_of_ones_own() {
+        let events = parking_lot::Mutex::new(Vec::new());
+        let sink = |event: UpdateProgress| events.lock().push(event);
+        let mut forward = ProgressForward::default();
+        forward.forward(None, &sink);
+        forward.forward(Some((10, 100)), &sink);
+        forward.forward(Some((10, 100)), &sink);
+        forward.forward(Some((60, 100)), &sink);
+        // A download that started over, for a different artifact.
+        forward.forward(Some((5, 200)), &sink);
+        assert_eq!(
+            *events.lock(),
+            vec![
+                UpdateProgress::Started { content_length: 100 },
+                UpdateProgress::Progress { chunk_length: 10 },
+                UpdateProgress::Progress { chunk_length: 50 },
+                UpdateProgress::Started { content_length: 200 },
+                UpdateProgress::Progress { chunk_length: 5 },
+            ]
+        );
+    }
+
+    /// The silent path must never sit in "Installing" behind a check, with the
+    /// countdown and its tray entry gone.
+    #[tokio::test]
+    async fn a_silent_install_does_not_wait_behind_a_check() {
+        let service = UpdaterService::default();
+        let check = service.operation.lock().await;
+        assert!(try_lock_operation(&service).is_none());
+        drop(check);
+        assert!(try_lock_operation(&service).is_some());
+    }
+
+    /// Install pressed while a background download holds the staging folder
+    /// waits for it and shows it moving, rather than sitting on nothing.
+    #[tokio::test]
+    async fn an_install_waiting_on_a_background_download_shows_its_progress() {
+        let service = UpdaterService::default();
+        let background = service.staging.lock().await;
+        *service.download_progress.lock() = Some((10, 100));
+        let events = parking_lot::Mutex::new(Vec::new());
+        let sink = |event: UpdateProgress| events.lock().push(event);
+
+        let waiting = lock_staging_reporting(&service, &sink);
+        tokio::pin!(waiting);
+        tokio::select! {
+            _ = &mut waiting => panic!("took the staging lock from a running download"),
+            _ = tokio::time::sleep(PROGRESS_FORWARD_INTERVAL * 2) => {}
+        }
+        *service.download_progress.lock() = Some((100, 100));
+        tokio::select! {
+            _ = &mut waiting => panic!("took the staging lock from a running download"),
+            _ = tokio::time::sleep(PROGRESS_FORWARD_INTERVAL * 2) => {}
+        }
+        drop(background);
+        let _staging = waiting.await;
+        assert_eq!(
+            *events.lock(),
+            vec![
+                UpdateProgress::Started { content_length: 100 },
+                UpdateProgress::Progress { chunk_length: 10 },
+                UpdateProgress::Progress { chunk_length: 90 },
+            ]
+        );
     }
 
     /// A staged installer with the version its own signed manifest declares.

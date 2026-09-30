@@ -43,6 +43,20 @@ export async function readClipboardText(): Promise<string | null> {
   return invoke('read_clipboard_text');
 }
 
+/**
+ * Hand the tray menu its labels in the current language. The backend never
+ * learns the locale, and a language change reloads the page, so calling this
+ * on every mount keeps the tray in step. `cancelUpdate` carries a literal
+ * `{time}` where the backend puts the countdown.
+ */
+export async function setTrayLabels(labels: {
+  show: string;
+  quit: string;
+  cancelUpdate: string;
+}): Promise<void> {
+  return invoke('set_tray_labels', labels);
+}
+
 /** Write text to the system clipboard. See {@link readClipboardText}. */
 export async function writeClipboardText(text: string): Promise<void> {
   return invoke('write_clipboard_text', { text });

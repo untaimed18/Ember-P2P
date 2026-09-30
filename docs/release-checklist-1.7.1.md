@@ -32,6 +32,8 @@ AppImage.
 - [ ] With automatic checks on and Ember left open, a release published after
       launch is noticed within the cadence without restarting Ember.
 - [ ] A manual Check postpones the next automatic check by the cadence.
+- [ ] After the automatic check has found a release, switch the language
+      (which reloads the page): the "update available" notice is still there.
 - [ ] `silent-update-state.json` appears in the data folder with
       `last_check_at`.
 
@@ -54,6 +56,9 @@ the chat popped out, and a few peers waiting in the upload queue.
       was.
 - [ ] Unplug the monitor the window was on before updating: it opens centred on
       one that is there.
+- [ ] Start Ember by clicking an `ed2k://` link, then update: the new version
+      does not ask to add that link again, and a tray-hidden session stays in
+      the tray.
 
 ## 4. Silent updates (Windows NSIS and AppImage)
 
@@ -73,6 +78,14 @@ the chat popped out, and a few peers waiting in the upload queue.
       the window is never brought to the front. Cancel from the tray works.
 - [ ] Countdown with notifications turned off: the tray entry still works.
 - [ ] A transfer starting mid-countdown aborts it, with the "busy again" toast.
+- [ ] While the release is downloading in the background, **Check now**
+      answers promptly, and **Install** shows that download's progress and then
+      installs it without downloading it again.
+- [ ] Press **Check now** in Settings a few seconds before the countdown ends:
+      the dialog and tray entry stay at 0:00 until the check finishes, and
+      **Not now** pressed meanwhile still postpones.
+- [ ] Press **Install** in Settings during a countdown: after the update, no
+      "updated while you were away" toast appears.
 - [ ] After **Not now**, Settings shows "postponed until ..." and **Resume**
       lifts it.
 - [ ] After a silent update, the next time the window is opened a toast says
@@ -100,12 +113,13 @@ try that version silently again.
 - [ ] NSIS: does the silent path's installer show its progress window? If a
       quiet install (`/S`) is wanted, confirm the Tauri template honours it
       alongside `/P` before adding it.
-- [ ] AppImage: `AppHandle::restart` relaunches the *new* AppImage (from
-      `$APPIMAGE`), not the old mount.
+- [ ] AppImage: the silent path's restart (`AppHandle::request_restart`)
+      relaunches the *new* AppImage (from `$APPIMAGE`), not the old mount, and
+      the old process exits cleanly rather than hanging in its shutdown.
 
 ## 7. Translation review
 
-1.7.1 adds 67 strings and changes three (`settings_auto_check_updates_hint`,
+1.7.1 adds 70 strings and changes three (`settings_auto_check_updates_hint`,
 `settings_skip_compress_video` and its hint), in all eight non-English locales.
 List them with:
 
@@ -128,6 +142,11 @@ git diff v1.7.0 -- messages/en.json
 - [ ] Download categories: the filter chips, the New category item and the
       categories dialog (`transfers_category_*`, `transfers_categories_*`,
       `transfers_ctx_category_new`); a long category name stays on one chip.
+- [ ] The tray menu (`tray_show`, `tray_quit`, `tray_cancel_update`): right-click
+      the tray icon in each language and see Show, Quit and, during a countdown,
+      Cancel update in that language. Switch language with Ember running and
+      the menu follows within a second, also mid-countdown, with the Cancel
+      entry kept.
 - [ ] German uses the formal *Sie*; the countdown title fits the dialog in every
       language.
 

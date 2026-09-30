@@ -11,6 +11,7 @@ import { invoke } from '@tauri-apps/api/core';
 import {
   applyBackgroundCheckResult,
   checkUpdateHandoff,
+  loadLastBackgroundCheckResult,
   updater,
   type SecureUpdateCheckResult,
 } from './updater';
@@ -100,5 +101,25 @@ describe('applyBackgroundCheckResult', () => {
     resolveHandoff(null);
     await handoff;
     await vi.waitFor(() => expect(get(updater).phase).toBe('available'));
+  });
+});
+
+describe('loadLastBackgroundCheckResult', () => {
+  it('offers an update the backend found before this window was listening', async () => {
+    invokeMock.mockResolvedValueOnce(found('9.9.9'));
+    await loadLastBackgroundCheckResult();
+    expect(invokeMock).toHaveBeenCalledWith('get_last_update_check_result');
+    expect(get(updater).phase).toBe('available');
+    expect(get(updater).version).toBe('9.9.9');
+  });
+
+  it('does nothing before the first check or when the backend cannot answer', async () => {
+    invokeMock.mockResolvedValueOnce(null);
+    await loadLastBackgroundCheckResult();
+    expect(get(updater)).toEqual(IDLE);
+
+    invokeMock.mockRejectedValueOnce(new Error('ipc'));
+    await loadLastBackgroundCheckResult();
+    expect(get(updater)).toEqual(IDLE);
   });
 });

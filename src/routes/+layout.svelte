@@ -37,8 +37,10 @@
   import {
     applyBackgroundCheckResult,
     checkUpdateHandoff,
+    loadLastBackgroundCheckResult,
     type SecureUpdateCheckResult,
   } from '$lib/stores/updater';
+  import { setTrayLabels } from '$lib/api/system';
   import {
     acknowledgeSecurityPolicyReset,
     getSecurityPolicyState,
@@ -460,8 +462,22 @@
     listen<SecureUpdateCheckResult>('ember:updater-check-result', (event) => {
       if (mounted) void applyBackgroundCheckResult(event.payload);
     })
-      .then((fn) => { if (mounted) unlistenUpdateCheck = fn; else fn(); })
+      .then((fn) => {
+        if (!mounted) {
+          fn();
+          return;
+        }
+        unlistenUpdateCheck = fn;
+        void loadLastBackgroundCheckResult();
+      })
       .catch((e) => console.error('Failed to register updater-check-result listener:', e));
+
+    // The tray menu is built by the backend, which cannot know the language.
+    void setTrayLabels({
+      show: m.tray_show(),
+      quit: m.tray_quit(),
+      cancelUpdate: m.tray_cancel_update({ time: '{time}' }),
+    }).catch((e) => console.error('Failed to set the tray labels:', e));
 
     // An update restart asks for the page and search tabs just before it shuts
     // Ember down, so the launch after it can put them back.

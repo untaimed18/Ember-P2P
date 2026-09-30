@@ -259,6 +259,11 @@ struct Driver {
     tray_cancel: Option<MenuItem<Wry>>,
     clock: TickClock,
     prepare_failed: bool,
+    /// The countdown ran out or "Update now" was pressed, and the install is
+    /// waiting for the updater to be free.
+    install_due: bool,
+    /// A restart has been asked for; nothing is left to decide.
+    restarting: bool,
 }
 
 /// Both clocks at the previous tick, to notice a sleep in between.
@@ -316,6 +321,10 @@ async fn run(app: AppHandle) {
 
 impl Driver {
     async fn tick(&mut self, app: &AppHandle, started: Instant) {
+        if self.restarting {
+            return;
+        }
+        self.refresh_tray_labels(app);
         let Some(state) = app.try_state::<AppState>() else {
             return;
         };
@@ -350,8 +359,8 @@ impl Driver {
 
         self.reap_prepare(now);
         let service = app.state::<UpdaterService>();
-        // Not while a preparation holds the lock: that is a download, and the
-        // tick must keep running (and the countdown keep counting) meanwhile.
+        // Never waiting: the tick must keep running (and the countdown keep
+        // counting) whatever the updater is doing.
         let pending = match updater::try_pending_update_state(&service) {
             Some(pending) => pending,
             None => {
@@ -407,18 +416,15 @@ impl Driver {
 
         if let Some((ends, _)) = self.countdown_ends {
             if INSTALL_NOW.swap(false, Ordering::AcqRel) || now >= ends {
-                // Straight from disk: a "Not now" or a skip that landed while
-                // this tick sampled activity must win over the clock.
-                let fresh = record::load_stored();
-                if let Some(held) = held_by_record(&fresh, &version, now_unix) {
-                    self.record = fresh;
-                    self.leave_countdown(app);
-                    self.phase = held;
-                    self.publish(app, enabled, support, now_unix);
+                self.install_due = true;
+            }
+            if self.install_due && !activity.busy() {
+                if self.install(app, &state, &version, enabled, support, now_unix).await {
                     return;
                 }
-                self.install(app, &version, enabled, support, now_unix).await;
-                return;
+                // A check or a manual install holds the updater. The warning
+                // stays up, so an answer given meanwhile still counts, and the
+                // next tick tries again.
             }
             // Input does not abort the countdown: the dialog is how a user who
             // is here answers it, and clicking it is input. A transfer that
@@ -514,6 +520,7 @@ impl Driver {
         let ends = now + COUNTDOWN;
         let ends_ms = now_ms.saturating_add(COUNTDOWN.as_millis() as i64);
         self.countdown_ends = Some((ends, ends_ms));
+        self.install_due = false;
         self.phase = Phase::Countdown;
         tracing::info!(
             "Silent update: nothing has moved for {} minutes and nobody is at Ember; warning before installing {}",
@@ -545,7 +552,29 @@ impl Driver {
         }
     }
 
+    /// Build the tray menu again once the frontend has sent the labels in its
+    /// language, keeping the countdown's entry if one is running.
+    fn refresh_tray_labels(&self, app: &AppHandle) {
+        if !crate::tray::take_changed() {
+            return;
+        }
+        let Some(item) = &self.tray_cancel else {
+            restore_tray_menu(app);
+            return;
+        };
+        let _ = item.set_text(cancel_label(countdown_remaining_secs().unwrap_or(0)));
+        if let Some(tray) = app.tray_by_id("main") {
+            match crate::build_tray_menu(app, Some(item)) {
+                Ok(menu) => {
+                    let _ = tray.set_menu(Some(menu));
+                }
+                Err(error) => tracing::warn!("Could not rebuild the tray menu: {error}"),
+            }
+        }
+    }
+
     fn leave_countdown(&mut self, app: &AppHandle) {
+        self.install_due = false;
         if self.countdown_ends.take().is_none() {
             return;
         }
@@ -555,14 +584,46 @@ impl Driver {
         }
     }
 
+    /// Install now, unless the countdown's answer changed first. Returns false,
+    /// leaving everything as it was, when a check or a manual install holds
+    /// the updater: waiting for it here would leave nothing on screen to say
+    /// "Not now" with, and a manual install that got there first must not be
+    /// reported next launch as one that happened while the user was away.
     async fn install(
         &mut self,
         app: &AppHandle,
+        state: &AppState,
         version: &str,
         enabled: bool,
         support: Result<(), Unsupported>,
         now_unix: i64,
-    ) {
+    ) -> bool {
+        let service = app.state::<UpdaterService>();
+        let Some(operation) = updater::try_lock_operation(&service) else {
+            return false;
+        };
+        // Straight from disk, and from the machine, now that nothing else can
+        // start an install: a "Not now", a skip or a transfer that arrived
+        // since this tick began must win over the clock.
+        let fresh = record::load_stored();
+        if let Some(held) = held_by_record(&fresh, version, now_unix) {
+            self.record = fresh;
+            self.leave_countdown(app);
+            self.phase = held;
+            self.publish(app, enabled, support, now_unix);
+            return true;
+        }
+        let activity = observe_activity(state).await;
+        if activity.busy() {
+            tracing::info!("Silent update countdown aborted: Ember is busy again");
+            self.activity = Some((Instant::now(), activity));
+            self.leave_countdown(app);
+            self.quiet_since = None;
+            self.phase = Phase::Waiting;
+            self.publish(app, enabled, support, now_unix);
+            return true;
+        }
+
         self.leave_countdown(app);
         self.phase = Phase::Installing;
         self.publish(app, enabled, support, now_unix);
@@ -577,12 +638,11 @@ impl Driver {
         };
         record::update_stored(|record| record.attempting = Some(attempt));
 
-        let service = app.state::<UpdaterService>();
-        match updater::install_prepared_update(app, &service, ResumeReason::Silent).await {
+        match updater::install_prepared_update(app, &service, operation, ResumeReason::Silent).await {
             // In-process installs (the AppImage) land here; Windows exits inside.
             Ok(()) => {
                 tracing::info!("Silent update installed {version}; restarting into it");
-                app.restart();
+                self.restart(app);
             }
             Err(error) if error.contains("updater_install_failed_services_stopped") => {
                 // The network is already down for the install, so staying up
@@ -591,7 +651,7 @@ impl Driver {
                 tracing::warn!("Silent update of {version} failed after shutdown: {error}");
                 let failed = version.to_string();
                 record::update_stored(|record| record.failed_version = Some(failed));
-                app.restart();
+                self.restart(app);
             }
             Err(error) => {
                 // Failed before anything was stopped: the staged copy vanished
@@ -611,6 +671,18 @@ impl Driver {
                 self.publish(app, enabled, support, now_unix);
             }
         }
+        true
+    }
+
+    /// Ask the event loop to exit and start Ember again, and stop deciding
+    /// anything meanwhile. `AppHandle::restart` from this task would park a
+    /// runtime worker forever while the shutdown still needs it.
+    fn restart(&mut self, app: &AppHandle) {
+        self.restarting = true;
+        if let Some(state) = app.try_state::<AppState>() {
+            state.quit_confirmed.store(true, Ordering::Release);
+        }
+        app.request_restart();
     }
 
     fn publish(
@@ -655,7 +727,7 @@ impl Driver {
 }
 
 fn cancel_label(secs: u64) -> String {
-    format!("Cancel update ({})", format_countdown(secs))
+    crate::tray::labels().cancel_update_with(&format_countdown(secs))
 }
 
 /// Put the tray back to its ordinary menu, without a "Cancel update" entry.

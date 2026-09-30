@@ -105,6 +105,13 @@ launch-time check moves over to this timer. Its `localStorage` timestamp
 (`ember.updater.lastCheckedAt` in `src/lib/stores/updater.ts`) is replaced by the
 backend's `last_check_at`.
 
+The result is emitted as `ember:updater-check-result`. The backend also keeps
+the last check's result, so a webview that was not listening when it was
+emitted (still starting up, or reloaded since) fetches it with
+`get_last_update_check_result` once its listener is registered, instead of
+waiting for the next due check, which may be a month away. The offer in it is
+brought up to date with what the updater still holds.
+
 Silent updates require update checks, so turning **Silent updates** on also
 turns on **Check for updates automatically**, and turning that off also turns
 silent updates off.
@@ -114,7 +121,7 @@ silent updates off.
 `secure_updater_install` used to download and install in one call. It is split
 into two steps (`commands/updater.rs`):
 
-1. **`prepare_locked`** downloads the artifact, verifies it against the signed
+1. **`prepare_staged`** downloads the artifact, verifies it against the signed
    manifest (same key, same rollback floor, same security epoch), and stages it
    on disk in the `updates/` staging directory, on every platform. A copy
    already staged for the same signed artifact, possibly by an earlier session,
@@ -122,6 +129,17 @@ into two steps (`commands/updater.rs`):
    while waiting for idle is not acceptable, so the bytes live on disk; only if
    staging fails are they kept in memory, so an update the user asked for is
    not refused.
+
+   A download can take up to 30 minutes, so it holds only the staging lock
+   (`UpdaterService.staging`), never the operation lock that checks and
+   installs share. It copies what it needs out of the pending update, downloads
+   and stages, and then records the result against the pending update only if
+   that is still the same signed artifact; if a check replaced it meanwhile,
+   the staged copy is deleted and the new one is prepared on the next tick.
+   Only one holder of the staging lock ever writes to `updates/`, so a
+   background preparation and a manual install never write the same file. An
+   **Install** pressed during a background download waits for it, showing that
+   download's progress, and then installs the copy it produced.
 2. **`install_locked`** re-checks the persisted security floor, re-reads the
    staged bytes and re-checks their size, hash and signature. Only then does it
    write the Windows `update-handoff.json` record (so the recovery path already
@@ -215,7 +233,13 @@ hidden window in front of whatever they are doing.
 - **Always:** the tray menu gains a **Cancel update (0:45)** item above
   **Show** / **Quit**, and the tray tooltip reads "Ember ⟳ 0:45" (a symbol and
   the time, like the rest of the tooltip, which the backend composes without
-  knowing the user's language). The tray is the one surface that works in every
+  knowing the user's language). The menu's own words are in the user's
+  language: the frontend sends the three labels (`set_tray_labels`, in
+  `src-tauri/src/tray.rs`) on every page load, and a language change reloads
+  the page. The backend checks each one (length, no control characters, the
+  `{time}` placeholder exactly once in the cancel label), keeps English for any
+  it refuses and until the first arrive, and rebuilds the menu, keeping a
+  running countdown's entry. The tray is the one surface that works in every
   case, including notifications turned off.
 
 The countdown aborts by itself if a transfer starts moving bytes, or local work
@@ -223,6 +247,14 @@ such as hashing starts. It returns to `Waiting` without counting as a
 postpone, and a toast says "Update postponed: Ember is busy again." Input does
 *not* abort it: the dialog is how a user who is there answers it, and clicking
 it is input.
+
+When the countdown ends (or **Update now** is pressed), the install starts only
+once it holds the updater's operation lock, taken without waiting. If a check
+or a manual install holds it, the dialog and the tray entry stay up at 0:00 and
+the next tick tries again, so a **Not now** or a transfer arriving meanwhile is
+still honoured. Once the lock is held, the state file is re-read and activity
+sampled again; a postpone, a skip or a busy machine found then wins over the
+clock.
 
 **Not now** (or Escape) postpones for 24 hours. **Skip this version** stops
 silent installs of that version; the normal "update available" notice still
@@ -260,7 +292,8 @@ deletes it, and applies it.
   "ui": {
     "route": "/transfers",
     "search_tabs": "...same payload the search store keeps in sessionStorage..."
-  }
+  },
+  "launch_links": ["...SHA-256 of each deep link this process was started with..."]
 }
 ```
 
@@ -268,6 +301,18 @@ deletes it, and applies it.
 `minimized` or `normal`. `bounds` is in physical pixels and absent while
 maximized or minimized; `ed2k` is absent when the user was not on a server. The
 chat window keeps its own position.
+
+`launch_links` exists because the relaunch is handed the old process's
+arguments again: the NSIS installer is passed them as `/ARGS`
+(`tauri-plugin-updater`), and `AppHandle::restart` reuses them too. An Ember
+first opened by clicking an `ed2k://` link would otherwise offer that link again
+after every update, and bring a tray-hidden window to the front to do it. The
+arguments cannot be cleaned at the source, since the plugin reads them from the
+app's startup environment and offers no way to replace them. Skipping every
+cold-start link after an update would be simpler but would also swallow a link
+the user clicked while the update was relaunching Ember. So the launch drops
+exactly the links whose digests the file lists, stale file or not, and offers
+any other.
 
 On launch it is applied like this:
 
@@ -383,7 +428,10 @@ The resume file is best-effort, and the full disk that stops it being written is
 also a likely reason for an install to fail. So the silent path records the
 attempt in `silent-update-state.json` (`attempting { from, to, at }`) before
 handing over, and a launch with no resume file judges the attempt by the version
-it is running, with the same notice and the same `failed_version`.
+it is running, with the same notice and the same `failed_version`. It is written
+only once the silent install holds the updater's operation lock, so a manual
+**Install** that got there first is never reported as an update that happened
+while the user was away.
 
 ### Failure safety
 
@@ -391,15 +439,21 @@ The worst outcome for an unattended update is that Ember closes and nothing
 starts again. It could then sit closed for days, sharing nothing, before the user
 notices. Each path is covered as follows.
 
-**Install call returns an error** (Windows `ShellExecuteW` failed; AppImage
-rewrite failed). The graceful shutdown has already stopped the network services.
-Today that leaves the error `updater_install_failed_services_stopped`. In silent
-mode Ember instead restarts itself (`AppHandle::restart`). The resume file is
-already written, so the old version comes back in the same state and reports the
-failure.
+**Install call returns an error** (the AppImage rewrite failed, or on Windows the
+plugin could not write the installer out of the bundle). The graceful shutdown
+has already stopped the network services. Today that leaves the error
+`updater_install_failed_services_stopped`. In silent mode Ember instead restarts
+itself (`AppHandle::request_restart`, which lets the event loop exit and run the
+shutdown; `AppHandle::restart` called from the driver's task would park a
+runtime worker forever). The resume file is already written, so the old version
+comes back in the same state and reports the failure.
 
-**Windows installer handed off but never finishes** (antivirus blocks it, the
-user kills it, or it fails midway). The NSIS installer only relaunches Ember on
+A Windows `ShellExecuteW` failure does *not* come back as an error: the plugin
+ignores its result and exits the process either way. That case, the installer
+never starting, is the watchdog's, below.
+
+**Windows installer handed off but never starts or never finishes** (Windows
+refuses to run it, antivirus blocks it, the user kills it, or it fails midway). The NSIS installer only relaunches Ember on
 success: `.onInstSuccess` runs the app when `/R` is present, and the updater
 passes `/P /R /UPDATE /ARGS …`. So before handing off, Ember starts a
 **watchdog**:
@@ -470,11 +524,18 @@ About panel, under the existing update controls:
   nothing is transferring and you are away, warns you for a minute, then updates
   and reopens the way you left it."
 - A status line under it, one of:
-  - "Up to date"
+  - "Downloading Ember 1.8.0 in the background" (or that it could not be
+    downloaded yet)
   - "Ember 1.8.0 is ready — it will install when Ember is idle"
   - "Postponed until tomorrow, 3:10 PM" (with **Resume**)
+  - "Ember 1.8.0 will not install by itself" (skipped, or failed once)
   - "Last updated automatically on 28 Sep 2026"
   - the unsupported reason
+
+  With no update known (`Idle`) the line shows only the last automatic update,
+  or nothing. There is no "Up to date" line here: `Idle` does not mean a check
+  confirmed anything, and the update controls below already say "up to date"
+  after a check that did.
 - The existing **Check now**, **Install** and **Restart** buttons stay. A staged
   silent update can always be installed immediately with **Install**.
 
@@ -496,7 +557,7 @@ done; each was its own commit.
 1. **Periodic backend update check.** Scheduler skeleton, `last_check_at` in the
    state file, the launch-time check moved into the backend. Everyone with
    auto-check on starts hearing about updates while Ember stays running.
-2. **Prepare / install split.** `prepare_locked` and `install_locked` in
+2. **Prepare / install split.** `prepare_staged` and `install_locked` in
    `commands/updater.rs`; the manual Install button calls both. No behaviour
    change yet.
 3. **Resume state.** `update-resume.json` write and consume, hidden-by-default
@@ -562,8 +623,9 @@ with a test key.**
 
 - Whether `/S` works alongside `/P` in the Tauri NSIS template (see "Quiet
   installer on Windows").
-- Whether `AppHandle::restart` resolves the AppImage path from `$APPIMAGE` or
-  the mounted binary. If it is the mounted binary, relaunch through `$APPIMAGE`
+- Whether a restart (`AppHandle::request_restart`, which relaunches the same way
+  `AppHandle::restart` does) resolves the AppImage path from `$APPIMAGE` or the
+  mounted binary. If it is the mounted binary, relaunch through `$APPIMAGE`
   explicitly.
 - Whether Ember Transfer and friend transfers appear in `TransferManager.active`.
   If not, the idle predicate reads their own state directly.
