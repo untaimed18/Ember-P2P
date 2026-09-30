@@ -160,3 +160,20 @@ git diff v1.7.0 -- messages/en.json
       prompt appears, whether the first is still open, accepted or finished.
 - [ ] 1.7.1 to 1.6.x: the prompt appears after about 10 seconds and the transfer
       completes.
+
+## 10. QUIC on the shared UDP port
+
+- [ ] The log says `QUIC server+client endpoint ready on UDP port N (shared
+      with KAD)`, with N the UDP port, and `QUIC legacy endpoint listening` on
+      the TCP port when the two differ.
+- [ ] Behind a VPN forwarding a single UDP port (and the same TCP port), a
+      friend's chat attachment arrives over QUIC, not the TCP fallback, and a
+      relayed LowID download through that node works.
+- [ ] 1.7.1 and 1.7.0 in both directions: friend hole-punch, a chat attachment,
+      and a relay for a KAD-only source (the 1.7.0 relay dials the TCP port
+      number, which the legacy listener answers).
+- [ ] KAD and Ember DHT keep working through a long QUIC transfer: searches
+      answer, the KAD overhead statistic does not jump with the transfer, and
+      the log shows no `UDP reader: ... queue full`.
+- [ ] `"quic_shares_udp_port": false` in `config.json` brings back the separate
+      socket: the endpoint line shows the TCP port and no "shared".

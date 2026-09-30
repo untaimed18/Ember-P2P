@@ -367,7 +367,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 anyhow::bail!("Failed to create UDP socket: {e}");
             }
         };
-        let _ = sock2.set_recv_buffer_size(1024 * 1024);
+        // Sized for QUIC bulk transfer, which shares this socket: what the
+        // separate QUIC socket used to ask for.
+        let _ = sock2.set_recv_buffer_size(8 * 1024 * 1024);
+        let _ = sock2.set_send_buffer_size(2 * 1024 * 1024);
         sock2.set_nonblocking(true)?;
         let addr: SocketAddr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), candidate);
         if let Err(e) = sock2.bind(&socket2::SockAddr::from(addr)) {
@@ -410,10 +413,19 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     }
     info!("UDP socket bound on port {udp_port}");
 
-    // The connection broker binds a *second* UDP socket for QUIC on the
-    // configured `tcp_port`, so `tcp_port == udp_port` means QUIC loses that
-    // port to the Kad UDP socket bound above and
-    // `build_server_client_endpoint` takes the next free neighbour.
+    // One task reads this socket from here on and splits QUIC from the rest;
+    // the loop below takes everything else from `udp_rx`. With the switch off
+    // it passes every datagram through and QUIC binds a socket of its own.
+    let quic_cid_key = settings
+        .quic_shares_udp_port
+        .then(ember::udp_mux::CidKey::random);
+    let (mut udp_rx, quic_shared_socket) =
+        ember::udp_mux::start(udp_socket.clone(), quic_cid_key.clone());
+
+    // With QUIC on its own socket it binds the configured `tcp_port`, so
+    // `tcp_port == udp_port` means it loses that port to the Kad UDP socket
+    // bound above and `build_server_client_endpoint` takes the next free
+    // neighbour.
     //
     // Noted rather than warned about, and no advice offered. Setting both
     // fields to one number is what a VPN forwarding a single port requires,
@@ -425,7 +437,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // local port QUIC ended up on. The one thing worth having in a log is
     // that port, because the Windows Firewall rule is added for the port QUIC
     // actually bound rather than the one configured here.
-    if settings.tcp_port == settings.udp_port {
+    if !settings.quic_shares_udp_port && settings.tcp_port == settings.udp_port {
         info!(
             "tcp_port and udp_port are both {} — a single-port setup. Kad UDP \
              holds that port, so QUIC will bind a neighbour and advertise its \
@@ -786,6 +798,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         udp_port,
         quic_port: None,
         quic_public_port: None,
+        quic_shares_udp: false,
+        quic_shared_socket,
+        quic_cid_key,
         upnp_mapped: upnp_success,
         ip_filter,
         banned_ips,
@@ -1769,7 +1784,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         });
     }
 
-    let mut udp_buf = vec![0u8; 65535];
     let mut server_udp_ping_idx: usize = 0;
 
     // Use MissedTickBehavior::Skip on ALL timers so that slow loop iterations
@@ -2754,140 +2768,80 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 }
             }
 
-            // Incoming UDP packets: batch up to 20 per iteration so we re-check
-            // commands and timers between batches
-            result = udp_socket.recv_from(&mut udp_buf) => {
-                match result {
-                    Ok((len, from)) => {
-                        if route_stun_binding_packet(
-                            &mut nat_probe_packet_tx,
-                            &mut udp_map_ka_packet_tx,
-                            &udp_buf[..len],
-                            from,
-                        ) {
-                            // STUN replies are consumed by the background NAT
-                            // probe; keep the main loop as the only UDP
-                            // receiver so normal KAD/Ember packets cannot be
-                            // stolen by a concurrent recv task.
-                        } else if settings.ember_native_enabled
-                            && ember::transport::EmberTransport::is_ember_packet(&udp_buf[..len])
-                        {
-                            // Ember rides the KAD socket but skips
-                            // `handle_udp_packet`, so the shared
-                            // IP-filter/ban/rate-limit gate must run here.
-                            if ember_udp_recv_allowed(&mut state, from) {
-                                handle_ember_native_udp(
-                                    &udp_socket,
-                                    &udp_buf[..len],
-                                    from,
-                                    &mut state,
-                                    &transfer_manager,
-                                    &source_manager,
-                                    &local_index,
-                                    &db,
-                                    &app_handle,
-                                    &bandwidth_limiter,
-                                ).await;
-                            }
-                        } else {
-                            // Always dispatch: this handler owns eD2K peer UDP as
-                            // well as KAD, and it gates the KAD half on connection
-                            // state itself. Only the KAD accounting is conditional.
-                            if state.stats.status != NetworkStatus::Disconnected {
-                                last_kad_activity_at = chrono::Utc::now().timestamp();
-                                stats_manager.add_overhead(
-                                    crate::storage::statistics::OverheadCategory::Kad,
-                                    crate::storage::statistics::OverheadDirection::Download,
-                                    len as u64,
-                                );
-                            }
-                            handle_udp_packet(
+            // Incoming UDP datagrams, from the reader that owns the socket (see
+            // `ember::udp_mux`; QUIC never comes this way). Up to 20 per
+            // iteration so commands and timers are re-checked between batches.
+            Some(first) = udp_rx.recv() => {
+                let mut next = Some(first);
+                let mut handled = 0usize;
+                while let Some(datagram) = next {
+                    let (data, from) = (&datagram.data, datagram.from);
+                    let len = data.len();
+                    if route_stun_binding_packet(
+                        &mut nat_probe_packet_tx,
+                        &mut udp_map_ka_packet_tx,
+                        data,
+                        from,
+                    ) {
+                        // STUN replies are consumed by the background NAT
+                        // probe; the loop is still the only consumer of this
+                        // socket's non-QUIC traffic, so normal KAD/Ember
+                        // packets cannot be stolen by a concurrent reader.
+                    } else if settings.ember_native_enabled
+                        && ember::transport::EmberTransport::is_ember_packet(data)
+                    {
+                        // Ember rides the KAD socket but skips
+                        // `handle_udp_packet`, so the shared
+                        // IP-filter/ban/rate-limit gate must run here.
+                        if ember_udp_recv_allowed(&mut state, from) {
+                            handle_ember_native_udp(
                                 &udp_socket,
-                                &udp_buf[..len],
+                                data,
                                 from,
                                 &mut state,
-                                &app_handle,
-                                &local_index,
-                                &settings,
-                                &db,
-                                &active_port_tests,
-                                &upload_queue_handle,
-                                &credit_manager,
                                 &transfer_manager,
                                 &source_manager,
-                                &known_files,
+                                &local_index,
+                                &db,
+                                &app_handle,
                                 &bandwidth_limiter,
                             ).await;
                         }
-                    }
-                    Err(e) => {
-                        debug!("UDP recv error: {e}");
-                    }
-                }
-                // Process up to 19 more queued packets without re-entering select
-                for _ in 0..19 {
-                    match udp_socket.try_recv_from(&mut udp_buf) {
-                        Ok((len, from)) => {
-                            if route_stun_binding_packet(
-                                &mut nat_probe_packet_tx,
-                                &mut udp_map_ka_packet_tx,
-                                &udp_buf[..len],
-                                from,
-                            ) {
-                                // Routed to the active NAT probe.
-                            } else if settings.ember_native_enabled
-                                && ember::transport::EmberTransport::is_ember_packet(&udp_buf[..len])
-                            {
-                                // See the gate rationale on the first
-                                // recv branch above — same fast-path
-                                // bypass of `handle_udp_packet`.
-                                if ember_udp_recv_allowed(&mut state, from) {
-                                    handle_ember_native_udp(
-                                        &udp_socket,
-                                        &udp_buf[..len],
-                                        from,
-                                        &mut state,
-                                        &transfer_manager,
-                                        &source_manager,
-                                        &local_index,
-                                        &db,
-                                        &app_handle,
-                                        &bandwidth_limiter,
-                                    ).await;
-                                }
-                            } else {
-                                // See the first recv branch: dispatch regardless so
-                                // eD2K peer UDP is served with KAD down, and gate
-                                // only the KAD accounting.
-                                if state.stats.status != NetworkStatus::Disconnected {
-                                    last_kad_activity_at = chrono::Utc::now().timestamp();
-                                    stats_manager.add_overhead(
-                                        crate::storage::statistics::OverheadCategory::Kad,
-                                        crate::storage::statistics::OverheadDirection::Download,
-                                        len as u64,
-                                    );
-                                }
-                                handle_udp_packet(
-                                    &udp_socket,
-                                    &udp_buf[..len],
-                                    from,
-                                    &mut state,
-                                    &app_handle,
-                                    &local_index,
-                                    &settings,
-                                    &db,
-                                    &active_port_tests,
-                                    &upload_queue_handle,
-                                    &credit_manager,
-                                    &transfer_manager,
-                                    &source_manager,
-                                    &known_files,
-                                    &bandwidth_limiter,
-                                ).await;
-                            }
+                    } else {
+                        // Always dispatch: this handler owns eD2K peer UDP as
+                        // well as KAD, and it gates the KAD half on connection
+                        // state itself. Only the KAD accounting is conditional.
+                        if state.stats.status != NetworkStatus::Disconnected {
+                            last_kad_activity_at = chrono::Utc::now().timestamp();
+                            stats_manager.add_overhead(
+                                crate::storage::statistics::OverheadCategory::Kad,
+                                crate::storage::statistics::OverheadDirection::Download,
+                                len as u64,
+                            );
                         }
-                        Err(_) => break,
+                        handle_udp_packet(
+                            &udp_socket,
+                            data,
+                            from,
+                            &mut state,
+                            &app_handle,
+                            &local_index,
+                            &settings,
+                            &db,
+                            &active_port_tests,
+                            &upload_queue_handle,
+                            &credit_manager,
+                            &transfer_manager,
+                            &source_manager,
+                            &known_files,
+                            &bandwidth_limiter,
+                        ).await;
                     }
+                    handled += 1;
+                    if handled >= 20 {
+                        break;
+                    }
+                    next = udp_rx.try_recv().ok();
                 }
             }
 

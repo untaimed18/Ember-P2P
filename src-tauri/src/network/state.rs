@@ -383,6 +383,16 @@ pub(super) struct NetworkState {
     /// mapping open but cannot re-read this port: quinn never surfaces
     /// non-QUIC datagrams.
     pub(super) quic_public_port: Option<u16>,
+    /// Whether QUIC runs on the KAD / Ember UDP socket (see
+    /// [`super::ember::udp_mux`]). When it does, `quic_port` is `udp_port` and
+    /// the port a peer dials is the KAD socket's advertised one, so
+    /// `quic_public_port` stays `None`.
+    pub(super) quic_shares_udp: bool,
+    /// The QUIC half of the shared socket, until the endpoint takes it.
+    pub(super) quic_shared_socket: Option<ember::udp_mux::SharedQuicSocket>,
+    /// The key the shared socket's classifier and the endpoint's connection
+    /// ids agree on.
+    pub(super) quic_cid_key: Option<ember::udp_mux::CidKey>,
     pub(super) upnp_mapped: bool,
     /// IP filter for blocking known-bad ranges (eMule ipfilter.dat compatible)
     pub(super) ip_filter: IpFilter,

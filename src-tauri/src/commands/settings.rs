@@ -120,6 +120,9 @@ const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     // a friend lookup that silently stops working, which is exactly the kind
     // of change no renderer needs to make.
     "rendezvous_url",
+    // `config.json` only, like the URL above: the escape hatch back to a
+    // separate QUIC socket is an operator's call, not the renderer's.
+    "quic_shares_udp_port",
 ];
 
 fn merge_renderer_settings(

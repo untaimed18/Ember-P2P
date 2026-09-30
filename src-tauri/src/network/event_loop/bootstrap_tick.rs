@@ -556,13 +556,35 @@ pub(in crate::network) async fn on_bootstrap_tick(
 
             match ember::quic::generate_self_signed_cert(&ed25519_secret_key) {
                 Ok((cert_der, key_der)) => {
-                    match ember::quic::build_server_client_endpoint(
-                        &cert_der,
-                        &key_der,
-                        state.tcp_port,
-                        true,
-                    ).await {
-                        Ok((ep, public_port)) => {
+                    // On the KAD / Ember socket when that is enabled, and on a
+                    // socket of its own otherwise or if that fails.
+                    let shared = match (state.quic_shared_socket.take(), state.quic_cid_key.clone()) {
+                        (Some(socket), Some(key)) => {
+                            match ember::quic::build_shared_endpoint(&cert_der, &key_der, socket, &key) {
+                                Ok(ep) => Some(ep),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Broker: QUIC could not share the UDP socket ({e}); using a socket of its own"
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
+                    let built = match shared {
+                        Some(ep) => Ok((ep, None, true)),
+                        None => ember::quic::build_server_client_endpoint(
+                            &cert_der,
+                            &key_der,
+                            state.tcp_port,
+                            true,
+                        )
+                        .await
+                        .map(|(ep, public_port)| (ep, public_port, false)),
+                    };
+                    match built {
+                        Ok((ep, public_port, shares_udp)) => {
                             let bound_port = ep
                                 .local_addr()
                                 .map(|a| a.port())
@@ -570,18 +592,43 @@ pub(in crate::network) async fn on_bootstrap_tick(
                             state.quic_port = Some(bound_port);
                             // Only the socket's own STUN reading can
                             // say where a peer reaches QUIC; see
-                            // `advertised_quic_port`.
+                            // `advertised_quic_port`. A shared socket has
+                            // none of its own: it is the KAD socket.
                             state.quic_public_port = public_port;
+                            state.quic_shares_udp = shares_udp;
                             let ep_arc = std::sync::Arc::new(ep);
                             broker.set_quic_endpoint(ep_arc.clone());
                             tracing::info!(
-                                "Broker: QUIC server+client endpoint ready on UDP port {bound_port}",
+                                "Broker: QUIC server+client endpoint ready on UDP port {bound_port}{}",
+                                if shares_udp { " (shared with KAD)" } else { "" },
                             );
+                            // Still listening where QUIC used to be, for one
+                            // release; see `build_legacy_endpoint`. Nothing
+                            // advertises it and nothing maps it.
+                            let legacy = (shares_udp && state.tcp_port != state.udp_port)
+                                .then(|| {
+                                    ember::quic::build_legacy_endpoint(&cert_der, &key_der, state.tcp_port)
+                                        .map_err(|e| {
+                                            tracing::debug!(
+                                                "Broker: no legacy QUIC listener on {}: {e}",
+                                                state.tcp_port
+                                            )
+                                        })
+                                        .ok()
+                                })
+                                .flatten()
+                                .map(std::sync::Arc::new);
+                            // The port UPnP forwards for QUIC. A shared socket
+                            // needs none of its own, so a legacy listener gets
+                            // the one the old socket had: the 1.7.0 relays it
+                            // exists for are dialling it from outside the NAT.
+                            let upnp_quic_port = if legacy.is_some() { state.tcp_port } else { bound_port };
 
                             let relay_mgr = state.relay_manager.clone();
                             let quic_cb_tx = inbound_stream_tx.clone();
                             tokio::spawn(ember::relay::run_quic_accept_loop(
                                 ep_arc,
+                                legacy,
                                 relay_mgr,
                                 quic_cb_tx,
                                 friend_hashes.clone(),
@@ -625,7 +672,9 @@ pub(in crate::network) async fn on_bootstrap_tick(
                             // QUIC on `tcp_port`. If bind landed on a
                             // fallback neighbour, open that port too —
                             // otherwise inbound punch/relay is dropped
-                            // even when UPnP forwarded it.
+                            // even when UPnP forwarded it. A shared socket
+                            // is `udp_port` itself, so this and the UPnP
+                            // mapping below are both already covered.
                             #[cfg(target_os = "windows")]
                             {
                                 let fw_quic = bound_port;
@@ -654,9 +703,9 @@ pub(in crate::network) async fn on_bootstrap_tick(
                                 *upnp_maintain_started_at =
                                     Some(tokio::time::Instant::now());
                                 *upnp_maintain_handle = Some(tokio::spawn(async move {
-                                    let mapped = mappings.map_quic_port(bound_port).await;
+                                    let mapped = mappings.map_quic_port(upnp_quic_port).await;
                                     if mapped {
-                                        tracing::info!("UPnP: QUIC UDP port {bound_port} mapped");
+                                        tracing::info!("UPnP: QUIC UDP port {upnp_quic_port} mapped");
                                     }
                                     let _ = tx.send(UpnpMaintainResult {
                                         revision,
@@ -686,6 +735,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
                 let mut ctx = state.friend_nat_context.write().unwrap_or_else(|p| p.into_inner());
                 ctx.quic_endpoint = Some(ep.clone());
                 ctx.quic_public_port = state.quic_public_port;
+                ctx.quic_shares_udp = state.quic_shares_udp;
             }
             state.connection_broker = Some(broker);
             state.broker_event_rx = Some(broker_rx);

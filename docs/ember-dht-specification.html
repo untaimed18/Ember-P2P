@@ -1469,8 +1469,10 @@ footer.doc-end {
 </table>
 <p>
   Firewalled records set bit 7 and end with the publisher's advertised QUIC
-  port. The relay dials that port, not <code>tcp_port</code>: the QUIC endpoint
-  sits elsewhere whenever it could not bind the TCP port or a NAT remapped it.
+  port. The relay dials that port, not <code>tcp_port</code>. From 1.7.1 QUIC
+  shares the UDP socket, so the value is the public UDP port. A 1.7.0 publisher's
+  QUIC endpoint sits on the TCP port number unless it could not bind it, in which
+  case it is on a neighbouring port, and a NAT may remap either.
   Older parsers read these records unchanged. They infer the callback trailer
   from the residual length being at least its size and ignore any bytes after
   it, and two bytes alone fall short of that size. The decoder clears bit 7

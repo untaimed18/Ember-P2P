@@ -190,6 +190,21 @@ pub struct FriendNatContext {
     /// was created. `None` falls back to the bound port, which is only the
     /// same thing when the NAT preserves ports.
     pub quic_public_port: Option<u16>,
+    /// Whether `quic_endpoint` runs on the KAD / Ember UDP socket, in which
+    /// case its public port is `external_addr`'s, the one that socket's own
+    /// STUN and mapping keep-alive maintain.
+    pub quic_shares_udp: bool,
+}
+
+impl FriendNatContext {
+    /// The port a friend should dial to reach `quic_endpoint`, when known.
+    pub fn quic_public_port(&self) -> Option<u16> {
+        if self.quic_shares_udp {
+            self.external_addr.map(|addr| addr.port())
+        } else {
+            self.quic_public_port
+        }
+    }
 }
 
 pub type SharedFriendNatContext = Arc<std::sync::RwLock<FriendNatContext>>;

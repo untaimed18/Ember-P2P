@@ -109,9 +109,12 @@ pub(in crate::network) async fn on_mapping_keepalive_tick(
             mapped,
         });
     });
+    // A shared socket is the KAD socket, whose mapping the UDP cycle above
+    // already holds.
     if let Some(quic_ep) = state
         .connection_broker
         .as_ref()
+        .filter(|_| !state.quic_shares_udp)
         .and_then(|b| b.quic_endpoint().cloned())
     {
         let quic_index = ka_index.wrapping_add(1);

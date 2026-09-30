@@ -996,6 +996,9 @@ export interface AppSettings {
    *  the built-in default rather than "relay nothing" — that is
    *  `relay_for_peers`. */
   max_relay_sessions: number;
+  /** Whether QUIC shares the KAD / Ember UDP port. `config.json` only, owned
+   *  by the backend (`BACKEND_OWNED_SETTINGS_FIELDS`). */
+  readonly quic_shares_udp_port: boolean;
   /** What to do when the user closes the main window via the title-bar X.
    *
    *  - `'ask'` (default): show a dialog letting the user pick.

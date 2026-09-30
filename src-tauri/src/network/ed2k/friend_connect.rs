@@ -1240,7 +1240,7 @@ pub async fn connect_friend_with_fallback(
             ctx.nat_type,
             ctx.external_addr,
             ctx.quic_endpoint.clone(),
-            ctx.quic_public_port,
+            ctx.quic_public_port(),
         )
     };
 

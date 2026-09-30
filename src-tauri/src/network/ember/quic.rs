@@ -640,6 +640,45 @@ pub async fn build_server_client_endpoint(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no QUIC bind candidates exhausted")))
 }
 
+/// The QUIC endpoint on the shared KAD / Ember UDP socket (see
+/// [`super::udp_mux`]), so it is reached on the UDP port and its public port is
+/// the one the KAD socket's STUN and NAT mapping already establish.
+pub fn build_shared_endpoint(
+    cert_der: &[u8],
+    key_der: &[u8],
+    socket: super::udp_mux::SharedQuicSocket,
+    cid_key: &super::udp_mux::CidKey,
+) -> anyhow::Result<Endpoint> {
+    let server_config = build_server_config(cert_der, key_der)?;
+    let client_config = build_client_config(cert_der, key_der, None)?;
+    let mut endpoint = Endpoint::new_with_abstract_socket(
+        super::udp_mux::endpoint_config(cid_key),
+        Some(server_config),
+        Arc::new(socket),
+        Arc::new(quinn::TokioRuntime),
+    )?;
+    endpoint.set_default_client_config(client_config);
+    info!("QUIC server+client endpoint sharing UDP {}", endpoint.local_addr()?);
+    Ok(endpoint)
+}
+
+/// A listen-only endpoint on the port QUIC used before it shared the UDP
+/// socket, exactly that port or nothing, for peers that dial it by guessing
+/// instead of reading an advertisement: a 1.7.x relay asked to reach a source
+/// it knows only from KAD dials the source's TCP port number.
+pub fn build_legacy_endpoint(cert_der: &[u8], key_der: &[u8], port: u16) -> anyhow::Result<Endpoint> {
+    let server_config = build_server_config(cert_der, key_der)?;
+    let socket = bind_tuned_udp(SocketAddr::from(([0, 0, 0, 0], port)))?;
+    let endpoint = Endpoint::new(
+        EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )?;
+    info!("QUIC legacy endpoint listening on {}", endpoint.local_addr()?);
+    Ok(endpoint)
+}
+
 /// Connect to a peer over an existing endpoint, optionally pinning the peer's
 /// Ember node id into the TLS verifier.
 ///

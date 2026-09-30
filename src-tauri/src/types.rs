@@ -1662,6 +1662,12 @@ pub struct AppSettings {
     /// rather than "relay nothing", which [`Self::relay_for_peers`] expresses.
     #[serde(default = "default_max_relay_sessions")]
     pub max_relay_sessions: u32,
+    /// Whether QUIC shares the KAD / Ember UDP socket, so one forwarded UDP
+    /// port carries everything. `config.json` only: the way back to a separate
+    /// QUIC socket should packet classification misbehave somewhere in the
+    /// field. Read at startup.
+    #[serde(default = "default_true")]
+    pub quic_shares_udp_port: bool,
     /// What to do when the user closes the main window via the title-bar X.
     ///
     /// - `"ask"` (default): emit a dialog asking the user to choose.
@@ -2354,6 +2360,7 @@ impl Default for AppSettings {
             ember_default_on_migrated: true,
             relay_for_peers: default_relay_for_peers(),
             max_relay_sessions: default_max_relay_sessions(),
+            quic_shares_udp_port: true,
             close_to_tray_behavior: default_close_to_tray_behavior(),
             launch_maximized: false,
             auto_check_updates: true,

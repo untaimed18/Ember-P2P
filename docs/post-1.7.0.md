@@ -64,7 +64,18 @@ past session has seen for that member.
 
 ## Networking
 
-### 5. Share the open UDP port with QUIC
+### 5. Share the open UDP port with QUIC — done in 1.7.1
+
+**Done in 1.7.1:** as designed below, in `network/ember/udp_mux.rs`. QUIC runs
+on the KAD / Ember socket, a listen-only endpoint stays on the TCP port number
+for 1.7.0 peers that guess it, and `quic_shares_udp_port: false` in
+`config.json` restores the separate socket. The legacy listener keeps the old
+socket's UPnP mapping and Windows Firewall rule, since the 1.7.0 relays it is
+for dial it from outside the NAT. One cost the design did not name: the shared
+socket cannot set don't-fragment, because Ember frames up to 4 KiB rely on
+fragmentation, so quinn skips path-MTU discovery and stays at 1200-byte
+packets. What remains: drop the legacy listener, its mapping and its firewall
+rule once 1.7.0 relays are rare.
 
 **Why:** QUIC listens on its own UDP port. Setups that forward a single port (a
 VPN such as ProtonVPN, many routers) leave it unreachable. 1.7.0 covers this

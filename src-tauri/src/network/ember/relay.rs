@@ -2251,6 +2251,14 @@ async fn attachment_delivered(send: &quinn::SendStream) -> bool {
     }
 }
 
+/// The next connection on `endpoint`, or never when there is none.
+async fn accept_or_wait(endpoint: Option<&quinn::Endpoint>) -> Option<quinn::Incoming> {
+    match endpoint {
+        Some(endpoint) => endpoint.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Run the QUIC accept loop. Handles five kinds of inbound QUIC connections:
 ///   4. **Chat attachment** — a friend is fetching a file we offered them in
 ///      chat. Dispatched on [`super::attach::ATTACH_STREAM_MSG_TYPE`] and
@@ -2272,8 +2280,12 @@ async fn attachment_delivered(send: &quinn::SendStream) -> bool {
 /// path rather than `kad_callback_tx` (which only adopts sources for *our
 /// own* pending downloads and has no consumer for a connection with no
 /// matching active download).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_quic_accept_loop(
     endpoint: std::sync::Arc<quinn::Endpoint>,
+    // Accepted from on the same terms and under the same caps, which is why
+    // one loop takes both rather than each endpoint running its own.
+    legacy_endpoint: Option<std::sync::Arc<quinn::Endpoint>>,
     relay_manager: std::sync::Arc<tokio::sync::Mutex<RelayManager>>,
     inbound_stream_tx: tokio::sync::mpsc::Sender<
         crate::network::ed2k::upload::InboundStreamRequest,
@@ -2297,12 +2309,15 @@ pub async fn run_quic_accept_loop(
         usize,
     >::new()));
     loop {
-        let incoming = match endpoint.accept().await {
-            Some(inc) => inc,
-            None => {
-                info!("QUIC accept loop: endpoint closed");
-                break;
-            }
+        let incoming = tokio::select! {
+            accepted = endpoint.accept() => match accepted {
+                Some(inc) => inc,
+                None => {
+                    info!("QUIC accept loop: endpoint closed");
+                    break;
+                }
+            },
+            Some(inc) = accept_or_wait(legacy_endpoint.as_deref()) => inc,
         };
 
         if quic_incoming_address_policy(incoming.remote_address_validated())
@@ -2912,6 +2927,11 @@ pub async fn run_quic_accept_loop(
                 }
             }
         });
+    }
+    // The main endpoint closing is what ends the loop; the legacy one goes
+    // with it, so its sessions close cleanly too.
+    if let Some(legacy) = legacy_endpoint {
+        legacy.close(0u32.into(), b"shutting down");
     }
 }
 

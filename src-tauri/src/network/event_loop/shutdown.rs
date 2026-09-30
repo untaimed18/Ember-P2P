@@ -87,6 +87,14 @@ pub(in crate::network) async fn save_on_shutdown(
         .and_then(|broker| broker.quic_endpoint())
     {
         endpoint.close(0u32.into(), b"shutting down");
+        // Briefly: on the shared socket the endpoint driver is the last holder
+        // of the KAD port, and a network restart in this process has to bind
+        // that port again rather than move to a neighbour.
+        let _ = tokio::time::timeout_at(
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(1)),
+            endpoint.wait_idle(),
+        )
+        .await;
     }
 
     if let Some(handle) = cache_write_handle.take() {

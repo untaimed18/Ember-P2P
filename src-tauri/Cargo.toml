@@ -114,6 +114,9 @@ ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 snow = "0.9"
 chacha20poly1305 = "0.10"
 quinn = "0.11"
+# The version quinn already pulls in, named directly for `InvalidCid`, which
+# quinn does not re-export and a custom connection-id generator must return.
+quinn-proto = "0.11"
 rcgen = "0.14"
 rustls = { version = "0.23", features = ["ring"] }
 # Used to robustly parse a peer's QUIC/TLS certificate and extract its
