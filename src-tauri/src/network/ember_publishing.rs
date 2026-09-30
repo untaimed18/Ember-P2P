@@ -1750,6 +1750,7 @@ pub(super) async fn start_ember_low_to_low_broker(
     file_hash: [u8; 16],
     source_ip: Ipv4Addr,
     source_port: u16,
+    target: ember::broker::RelayTarget,
 ) -> bool {
     let ext = state.nat_info.external_addr.map(|addr| {
         SocketAddr::new(
@@ -1767,6 +1768,7 @@ pub(super) async fn start_ember_low_to_low_broker(
             file_hash,
             source_ip,
             source_port,
+            target,
             nat_type,
             ext,
         )
@@ -2206,6 +2208,9 @@ pub(super) async fn maybe_publish_ember_sources(
         user_hash: None,
         buddy: None,
         callback_token: None,
+        // Only a firewalled source is reached through a relay, and HighID
+        // records stay at their 41 bytes.
+        quic_port: firewalled_like.then(|| advertised_quic_port(state)).flatten(),
     };
     if let Some((_, buddy)) = &named_buddy {
         contact.buddy = Some(*buddy);

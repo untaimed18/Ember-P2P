@@ -1163,6 +1163,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                                     });
                                     broker.attempt_low_to_low(
                                         &transfer_id, fh, cb_src.ip, cb_src.tcp_port,
+                                        ember::broker::RelayTarget::default(),
                                         state.nat_info.nat_type, ext,
                                     ).await
                                 } else {

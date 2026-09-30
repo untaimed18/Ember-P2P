@@ -176,6 +176,18 @@ pub(super) const SOURCE_CALLBACK_TRAILER_V1_LEN: usize = 16 + 4 + 2 + 32 + 16;
 /// key, the expiry, and its signature over its own endpoint.
 pub(super) const BUDDY_ENDORSEMENT_TRAILER_LEN: usize = 32 + 8 + 64;
 
+/// Contact flag: the record's last two bytes are the publisher's advertised
+/// QUIC port, which a relay dials to reach it.
+///
+/// A flag and a fixed position at the very end, rather than a length rule like
+/// the callback trailer's: older decoders infer that trailer from the residual
+/// length being at least its size and ignore anything past it, and two bytes
+/// alone are below it, so they read these records exactly as before. The bit
+/// is the high one so it cannot collide with the EPX source flags this byte
+/// otherwise shares, and the decoder clears it from [`SourceContact::flags`].
+const SOURCE_CONTACT_FLAG_QUIC_PORT: u8 = 0x80;
+const SOURCE_QUIC_PORT_LEN: usize = 2;
+
 /// Domain separator for the buddy endorsement signature.
 ///
 /// Without one, a signature this scheme accepts could be harvested from
@@ -229,21 +241,36 @@ fn buddy_survives_decode(buddy: &SourceBuddy) -> bool {
     buddy.udp_port != 0 && !buddy.ip.is_unspecified()
 }
 
+/// The QUIC port the encoder will write. Port 0 is nobody's, so it is dropped
+/// rather than round-tripped.
+fn encoded_quic_port(sc: &SourceContact) -> Option<u16> {
+    sc.quic_port.filter(|port| *port != 0)
+}
+
 fn source_contact_encoded_len(contact: Option<&SourceContact>) -> usize {
-    match contact {
-        Some(sc) if sc.buddy.as_ref().is_some_and(buddy_survives_decode) => {
-            SOURCE_CONTACT_WIRE_LEN + SOURCE_CALLBACK_TRAILER_LEN
-        }
-        Some(_) => SOURCE_CONTACT_WIRE_LEN,
-        None => 0,
-    }
+    let Some(sc) = contact else {
+        return 0;
+    };
+    let trailer = if sc.buddy.as_ref().is_some_and(buddy_survives_decode) {
+        SOURCE_CALLBACK_TRAILER_LEN
+    } else {
+        0
+    };
+    let quic = if encoded_quic_port(sc).is_some() { SOURCE_QUIC_PORT_LEN } else { 0 };
+    SOURCE_CONTACT_WIRE_LEN + trailer + quic
 }
 
 fn encode_source_contact(data: &mut Vec<u8>, sc: &SourceContact) {
+    let quic_port = encoded_quic_port(sc);
+    let flags = if quic_port.is_some() {
+        sc.flags | SOURCE_CONTACT_FLAG_QUIC_PORT
+    } else {
+        sc.flags & !SOURCE_CONTACT_FLAG_QUIC_PORT
+    };
     data.extend_from_slice(&sc.ip.octets());
     data.write_u16::<LittleEndian>(sc.tcp_port).unwrap();
     data.write_u16::<LittleEndian>(sc.udp_port).unwrap();
-    data.push(sc.flags);
+    data.push(flags);
     data.extend_from_slice(&sc.noise_pub);
     if let Some(buddy) = sc.buddy.filter(buddy_survives_decode) {
         data.extend_from_slice(&sc.user_hash.unwrap_or([0u8; 16]));
@@ -254,6 +281,9 @@ fn encode_source_contact(data: &mut Vec<u8>, sc: &SourceContact) {
         data.extend_from_slice(&buddy.ed25519_pub);
         data.write_i64::<LittleEndian>(buddy.endorsed_until).unwrap();
         data.extend_from_slice(&buddy.endorsement);
+    }
+    if let Some(port) = quic_port {
+        data.write_u16::<LittleEndian>(port).unwrap();
     }
 }
 
@@ -267,17 +297,29 @@ fn decode_source_contact(data: &[u8], off: usize) -> Option<SourceContact> {
     let flags = data[off + 8];
     let mut noise_pub = [0u8; 32];
     noise_pub.copy_from_slice(&data[off + 9..off + 41]);
+    let rest = off + SOURCE_CONTACT_WIRE_LEN;
+    let (end, quic_port) = if flags & SOURCE_CONTACT_FLAG_QUIC_PORT != 0 {
+        if data.len() < rest + SOURCE_QUIC_PORT_LEN {
+            return None;
+        }
+        let at = data.len() - SOURCE_QUIC_PORT_LEN;
+        let port = u16::from_le_bytes([data[at], data[at + 1]]);
+        (at, (port != 0).then_some(port))
+    } else {
+        (data.len(), None)
+    };
+    let data = &data[..end];
     let mut contact = SourceContact {
         ip,
         tcp_port,
         udp_port,
-        flags,
+        flags: flags & !SOURCE_CONTACT_FLAG_QUIC_PORT,
         noise_pub,
         user_hash: None,
         buddy: None,
         callback_token: None,
+        quic_port,
     };
-    let rest = off + SOURCE_CONTACT_WIRE_LEN;
     // Trailer presence is still inferred from residual length, and the
     // endorsement sits last, so a record published before it existed reads
     // back as an unendorsed buddy rather than as no buddy at all.
@@ -662,6 +704,9 @@ pub struct SourceContact {
     /// the buddy copies into `CALLBACK`. Bind connect-back to a file we
     /// actually asked this buddy to proxy.
     pub callback_token: Option<[u8; 16]>,
+    /// The publisher's advertised QUIC port, on firewalled records. A relay
+    /// dials this to reach the publisher; it is often not `tcp_port`.
+    pub quic_port: Option<u16>,
 }
 
 impl Default for SourceContact {
@@ -675,6 +720,7 @@ impl Default for SourceContact {
             user_hash: None,
             buddy: None,
             callback_token: None,
+            quic_port: None,
         }
     }
 }
@@ -697,6 +743,8 @@ pub struct DiscoveredSource {
     /// `BLAKE3(publisher Ed25519)[..16]` — the identity `CALLBACK_REQ`
     /// names so the buddy can look up who it proxied for.
     pub publisher_id: [u8; 16],
+    /// See [`SourceContact::quic_port`].
+    pub quic_port: Option<u16>,
 }
 
 impl DiscoveredSource {
@@ -3256,6 +3304,7 @@ mod tests {
                 buddy: parsed.buddy,
                 callback_token: parsed.callback_token,
                 publisher_id: TEST_PUBLISHER,
+                quic_port: parsed.quic_port,
             }
             .takes_callback(false, true, 1_000),
             "and so must park rather than be dialled"
@@ -4145,6 +4194,60 @@ mod tests {
     /// random `u16` name length is small enough for the body to hold it, which
     /// is a fraction of a percent per iteration. Fuzzing the decoder directly is
     /// what the moderation test already does, and is the model here.
+    /// A firewalled record's QUIC port survives the round trip, and older
+    /// decoders see the record they always did: two bytes alone are below the
+    /// callback trailer's size, and with a buddy the trailer's own bytes come
+    /// first, unchanged.
+    #[test]
+    fn a_quic_port_round_trips_without_disturbing_older_decoders() {
+        let buddy = SourceBuddy {
+            ip: Ipv4Addr::new(198, 51, 100, 9),
+            udp_port: 4672,
+            noise_pub: [0x66; 32],
+            ed25519_pub: [0x77; 32],
+            endorsed_until: 1_900_000_000,
+            endorsement: [0x88; 64],
+        };
+        let plain = SourceContact {
+            ip: Ipv4Addr::new(203, 0, 113, 7),
+            tcp_port: 4662,
+            udp_port: 4672,
+            flags: crate::network::ember::SOURCE_FLAG_FIREWALLED,
+            noise_pub: [0x33; 32],
+            ..SourceContact::default()
+        };
+        let buddied = SourceContact {
+            user_hash: Some([0x44; 16]),
+            callback_token: Some([0x55; 16]),
+            buddy: Some(buddy),
+            ..plain
+        };
+        for base in [plain, buddied] {
+            let with_port = SourceContact { quic_port: Some(4711), ..base };
+            let mut without = Vec::new();
+            encode_source_contact(&mut without, &base);
+            let mut with = Vec::new();
+            encode_source_contact(&mut with, &with_port);
+
+            assert_eq!(decode_source_contact(&with, 0), Some(with_port));
+            assert_eq!(decode_source_contact(&without, 0), Some(base));
+            assert_eq!(with.len(), source_contact_encoded_len(Some(&with_port)));
+            assert_eq!(with.len(), without.len() + SOURCE_QUIC_PORT_LEN);
+            // Everything but the flag byte matches up to the old length.
+            let flags_at = 8;
+            assert_eq!(with[..flags_at], without[..flags_at]);
+            assert_eq!(with[flags_at + 1..without.len()], without[flags_at + 1..]);
+            let residual = with.len() - SOURCE_CONTACT_WIRE_LEN;
+            if base.buddy.is_none() {
+                assert!(residual < SOURCE_CALLBACK_TRAILER_V1_LEN);
+            }
+        }
+        let zero = SourceContact { quic_port: Some(0), ..plain };
+        let mut buf = Vec::new();
+        encode_source_contact(&mut buf, &zero);
+        assert_eq!(buf.len(), SOURCE_CONTACT_WIRE_LEN, "port 0 is not written");
+    }
+
     #[test]
     fn decode_source_contact_fuzz_never_panics() {
         use rand::{Rng, SeedableRng};
@@ -4159,6 +4262,7 @@ mod tests {
             user_hash: None,
             buddy: None,
             callback_token: None,
+            quic_port: None,
         };
         let with_buddy = SourceContact {
             flags: crate::network::ember::SOURCE_FLAG_RELAY_CAPABLE,
@@ -4174,8 +4278,10 @@ mod tests {
             }),
             ..plain
         };
+        let with_quic = SourceContact { quic_port: Some(4711), ..plain };
+        let buddy_and_quic = SourceContact { quic_port: Some(4711), ..with_buddy };
         let mut seeds = Vec::new();
-        for sc in [plain, with_buddy] {
+        for sc in [plain, with_buddy, with_quic, buddy_and_quic] {
             let mut buf = Vec::new();
             encode_source_contact(&mut buf, &sc);
             seeds.push(buf);
@@ -4462,6 +4568,7 @@ mod tests {
             buddy,
             callback_token: Some([0xDDu8; 16]),
             publisher_id: [0xAAu8; 16],
+            quic_port: None,
         }
     }
 

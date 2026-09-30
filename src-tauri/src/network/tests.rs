@@ -3768,6 +3768,7 @@ fn firewalled_source_records_preserve_callback_buddy() {
             user_hash: Some([0xCCu8; 16]),
             buddy: Some(buddy),
             callback_token: Some([0xDDu8; 16]),
+            quic_port: None,
         },
     );
     let mut diag = crate::types::EmberDiagnostics::default();

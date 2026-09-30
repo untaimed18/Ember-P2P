@@ -451,6 +451,7 @@ pub(super) async fn handle_ember_control_message(
                         "ember-udp",
                         false,
                         we_are_unreachable,
+                        &HashMap::new(),
                     )
                     .await;
                     debug!("ember-udp: ingested EPX from {from} ({injected} sources injected)");

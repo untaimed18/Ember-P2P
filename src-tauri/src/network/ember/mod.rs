@@ -75,6 +75,10 @@ pub const SOURCE_FLAG_OBFUSCATION: u8 = 0x02;
 pub const SOURCE_FLAG_RELAY_CAPABLE: u8 = 0x04;
 
 pub const RELAY_ATTESTATION_CAP_RELAY_V1: u32 = 0x01;
+/// The relay accepts a v3 RELAY_REQUEST and pins its dial to the target node id
+/// it names. Verifiers only require the V1 bit, so this is safe to set for
+/// peers that do not know it.
+pub const RELAY_ATTESTATION_CAP_PINNED_TARGET: u32 = 0x02;
 /// Max attestation lifetime. Kept aligned with the connection broker's
 /// relay-candidate prune window (`broker.rs` tick) so a cryptographically
 /// valid ERAT cannot outlive the broker's retained candidates.

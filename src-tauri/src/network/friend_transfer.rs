@@ -1401,6 +1401,7 @@ mod friend_transfer_tests {
             }),
             callback_token: Some([0xDDu8; 16]),
             publisher_id: [0xAAu8; 16],
+            quic_port: None,
         };
         assert!(
             !ember_source_uses_callback(&src, false, false, true, 1_000),
@@ -1442,6 +1443,7 @@ mod friend_transfer_tests {
             buddy: Some(buddy),
             callback_token: Some([0xDDu8; 16]),
             publisher_id,
+            quic_port: None,
         };
         assert!(ember_source_uses_callback(&src, false, false, true, now));
         assert!(

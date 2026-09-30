@@ -557,6 +557,7 @@ pub(super) fn parse_ember_source_records(
             callback_token: sc.callback_token,
             publisher_id: ember::crypto::node_id_from_ed25519_bytes(&rec.publisher_key)
                 .unwrap_or([0u8; 16]),
+            quic_port: sc.quic_port,
         });
     }
     // Only ever on corroboration, and only if this plurality rests on more

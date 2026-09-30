@@ -46,6 +46,17 @@ const RELAY_CANDIDATE_PICK_MAX_AGE: Duration = Duration::from_secs(600);
 const RELAY_CANDIDATE_PRUNE_MAX_AGE: Duration =
     Duration::from_secs(super::RELAY_ATTESTATION_MAX_TTL_SECS);
 
+/// What a relay needs to reach a source beyond the address it is known by.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RelayTarget {
+    /// The source's advertised QUIC port. Unknown for eMule KAD sources, whose
+    /// records have nowhere to carry one; the relay then dials the TCP port,
+    /// which is where the source's QUIC endpoint binds when it can.
+    pub quic_port: Option<u16>,
+    /// The source's Ember node id, for a relay that pins its dial to it.
+    pub node_id: Option<[u8; 16]>,
+}
+
 /// Outcome of a successful broker connection attempt.
 pub struct BrokerConnection {
     pub transfer_id: String,
@@ -248,6 +259,10 @@ pub enum BrokerEvent {
         attempt_key: String,
         source_ip: Ipv4Addr,
         source_port: u16,
+        /// The port the relay is to dial over QUIC.
+        target_quic_port: u16,
+        /// Set only when the chosen relay can pin to it.
+        target_node_id: Option<[u8; 16]>,
         file_hash: [u8; 16],
         relay_addr: Option<(Ipv4Addr, u16)>,
         relay_attestation_hash: Option<[u8; 32]>,
@@ -345,6 +360,7 @@ impl ConnectionBroker {
         file_hash: [u8; 16],
         source_ip: Ipv4Addr,
         source_port: u16,
+        target: RelayTarget,
         our_nat: NatType,
         _our_external_addr: Option<SocketAddr>,
     ) -> bool {
@@ -398,6 +414,11 @@ impl ConnectionBroker {
         let relay_attestation_hash = relay_candidate.map(|c| c.attestation_hash);
         let relay_ember_hash = relay_candidate.and_then(|c| c.ember_hash);
         let relay = relay_candidate.map(|c| (c.ip, c.port, c.attestation.ed25519_pubkey));
+        let relay_pins = relay_candidate.is_some_and(|c| {
+            c.attestation.capability_bits & super::RELAY_ATTESTATION_CAP_PINNED_TARGET != 0
+        });
+        let target_node_id = target.node_id.filter(|_| relay_pins);
+        let target_quic_port = target.quic_port.unwrap_or(source_port);
 
         let attempt = ConnectionAttempt {
             transfer_id: transfer_id.to_string(),
@@ -424,6 +445,8 @@ impl ConnectionBroker {
                 attempt_key,
                 source_ip,
                 source_port,
+                target_quic_port,
+                target_node_id,
                 file_hash,
                 relay_addr,
                 relay_attestation_hash,
@@ -793,6 +816,7 @@ mod tests {
                 [1u8; 16],
                 Ipv4Addr::new(1, 2, 3, 4),
                 4662,
+                RelayTarget::default(),
                 NatType::PortRestricted,
                 Some("5.6.7.8:9999".parse().unwrap()),
             )
@@ -806,6 +830,7 @@ mod tests {
                 [1u8; 16],
                 Ipv4Addr::new(1, 2, 3, 4),
                 4662,
+                RelayTarget::default(),
                 NatType::PortRestricted,
                 Some("5.6.7.8:9999".parse().unwrap()),
             )
@@ -827,6 +852,7 @@ mod tests {
                 [2u8; 16],
                 Ipv4Addr::new(10, 20, 30, 40),
                 4662,
+                RelayTarget::default(),
                 NatType::Symmetric,
                 Some("5.6.7.8:9999".parse().unwrap()),
             )
@@ -848,6 +874,7 @@ mod tests {
                 [3u8; 16],
                 Ipv4Addr::new(10, 20, 30, 40),
                 4662,
+                RelayTarget::default(),
                 NatType::PortRestricted,
                 Some("5.6.7.8:9999".parse().unwrap()),
             )
@@ -1034,7 +1061,7 @@ mod tests {
 
         assert!(
             broker
-                .attempt_low_to_low("t1", [1; 16], Ipv4Addr::new(10, 0, 0, 1), 4662, NatType::Symmetric, None)
+                .attempt_low_to_low("t1", [1; 16], Ipv4Addr::new(10, 0, 0, 1), 4662, RelayTarget::default(), NatType::Symmetric, None)
                 .await
         );
         assert_eq!(broker.attempts["t1:10.0.0.1:4662"].relay.map(|r| r.0), Some(friend_relay));
@@ -1043,7 +1070,7 @@ mod tests {
         broker.relay_candidates.retain(|c| c.ip != friend_relay);
         assert!(
             broker
-                .attempt_low_to_low("t2", [2; 16], Ipv4Addr::new(10, 0, 0, 2), 4662, NatType::Symmetric, None)
+                .attempt_low_to_low("t2", [2; 16], Ipv4Addr::new(10, 0, 0, 2), 4662, RelayTarget::default(), NatType::Symmetric, None)
                 .await
         );
         broker.relay_refused_us("t2:10.0.0.2:4662", "not a friend").await;
@@ -1127,6 +1154,7 @@ mod tests {
                     [9u8; 16],
                     Ipv4Addr::new(10, 0, 0, 1),
                     4662,
+                    RelayTarget::default(),
                     NatType::Symmetric,
                     Some("5.6.7.8:9999".parse().unwrap()),
                 )
@@ -1217,6 +1245,7 @@ mod tests {
                 [7u8; 16],
                 Ipv4Addr::new(10, 0, 0, 2),
                 4662,
+                RelayTarget::default(),
                 NatType::Symmetric,
                 Some("5.6.7.8:9999".parse().unwrap()),
             )
@@ -1317,6 +1346,7 @@ mod tests {
                 [4u8; 16],
                 Ipv4Addr::new(10, 20, 30, 40),
                 4662,
+                RelayTarget::default(),
                 NatType::PortRestricted,
                 Some("5.6.7.8:9999".parse().unwrap()),
             )
@@ -1327,5 +1357,72 @@ mod tests {
             Some(BrokerEvent::StartRelay { .. })
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// The relay is told the source's QUIC port whenever it is known, and the
+    /// source's node id only when the relay says it can pin to one, since a
+    /// relay that cannot refuses the longer request outright.
+    #[tokio::test]
+    async fn the_target_id_goes_only_to_a_relay_that_pins() {
+        let source = RelayTarget {
+            quic_port: Some(5001),
+            node_id: Some([9u8; 16]),
+        };
+        for (caps, expect_id) in [
+            (crate::network::ember::RELAY_ATTESTATION_CAP_RELAY_V1, None),
+            (
+                crate::network::ember::RELAY_ATTESTATION_CAP_RELAY_V1
+                    | crate::network::ember::RELAY_ATTESTATION_CAP_PINNED_TARGET,
+                Some([9u8; 16]),
+            ),
+        ] {
+            let (tx, mut rx) = mpsc::channel(16);
+            let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+            let mut relay = attestation(Ipv4Addr::new(1, 1, 1, 1), 4662, unix_now() + 600);
+            relay.capability_bits = caps;
+            broker.add_relay_candidate(relay, None, None);
+            broker
+                .attempt_low_to_low(
+                    "t5",
+                    [5u8; 16],
+                    Ipv4Addr::new(10, 20, 30, 41),
+                    4662,
+                    source,
+                    NatType::PortRestricted,
+                    None,
+                )
+                .await;
+            match rx.recv().await {
+                Some(BrokerEvent::StartRelay {
+                    target_quic_port,
+                    target_node_id,
+                    relay_addr,
+                    ..
+                }) => {
+                    assert!(relay_addr.is_some());
+                    assert_eq!(target_quic_port, 5001);
+                    assert_eq!(target_node_id, expect_id);
+                }
+                other => panic!("expected StartRelay, got {other:?}"),
+            }
+        }
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        broker
+            .attempt_low_to_low(
+                "t6",
+                [6u8; 16],
+                Ipv4Addr::new(10, 20, 30, 42),
+                4662,
+                RelayTarget::default(),
+                NatType::PortRestricted,
+                None,
+            )
+            .await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(BrokerEvent::StartRelay { target_quic_port: 4662, target_node_id: None, .. })
+        ));
     }
 }

@@ -1456,15 +1456,28 @@ footer.doc-end {
     <tr><td>ip</td><td>4</td><td>IPv4, the address downloaders should dial</td></tr>
     <tr><td>tcp_port</td><td>2 LE</td><td>eD2K client-to-client</td></tr>
     <tr><td>udp_port</td><td>2 LE</td><td>Ember / KAD UDP</td></tr>
-    <tr><td>flags</td><td>1</td><td>bit 0 firewalled, bit 1 obfuscation, bit 2 relay-capable</td></tr>
+    <tr><td>flags</td><td>1</td><td>bit 0 firewalled, bit 1 obfuscation, bit 2 relay-capable, bit 7 QUIC port present</td></tr>
     <tr><td>noise_pub</td><td>32</td><td>Stashed for future native (Noise) dialing</td></tr>
     <tr><td>user_hash</td><td>16</td><td>Optional trailer: publisher's eD2K user hash, present with the buddy block</td></tr>
     <tr><td>buddy_ip</td><td>4</td><td>Optional trailer: HighID buddy the searcher should <code>CALLBACK_REQ</code></td></tr>
     <tr><td>buddy_udp</td><td>2 LE</td><td>Optional trailer</td></tr>
     <tr><td>buddy_noise_pub</td><td>32</td><td>Optional trailer: buddy's Noise static key</td></tr>
     <tr><td>callback_token</td><td>16</td><td>Optional trailer: publisher-derived token copied into <code>CALLBACK_REQ</code> / <code>CALLBACK</code></td></tr>
+    <tr><td>buddy endorsement</td><td>104</td><td>Optional trailer: buddy Ed25519 key (32), expiry (8 LE), signature (64)</td></tr>
+    <tr><td>quic_port</td><td>2 LE</td><td>Only when flags bit 7 is set, and always the record's last two bytes: the publisher's advertised QUIC port, which a relay dials</td></tr>
   </tbody>
 </table>
+<p>
+  Firewalled records set bit 7 and end with the publisher's advertised QUIC
+  port. The relay dials that port, not <code>tcp_port</code>: the QUIC endpoint
+  sits elsewhere whenever it could not bind the TCP port or a NAT remapped it.
+  Older parsers read these records unchanged. They infer the callback trailer
+  from the residual length being at least its size and ignore any bytes after
+  it, and two bytes alone fall short of that size. The decoder clears bit 7
+  before exposing <code>flags</code>, so it never reaches the EPX source flags
+  that share the byte.
+  <span class="badge">additive</span>
+</p>
 <p>
   A downloader uses <code>ip + tcp_port</code> over the existing eD2K path
   when the source is not firewalled. Firewalled records append a 70-byte

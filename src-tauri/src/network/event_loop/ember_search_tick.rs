@@ -329,6 +329,8 @@ pub(in crate::network) async fn on_ember_search_tick(
             Vec::new();
         let mut callback_jobs: Vec<([u8; 16], ember::dht::publish::DiscoveredSource)> =
             Vec::new();
+        let mut relay_targets: HashMap<(Ipv4Addr, u16), ember::broker::RelayTarget> =
+            HashMap::new();
         let now_ts = chrono::Utc::now().timestamp();
         for (fh, sources) in &entries {
             let mut rest = Vec::new();
@@ -369,6 +371,17 @@ pub(in crate::network) async fn on_ember_search_tick(
                             .ember_diagnostics
                             .ember_dht_buddy_uncorroborated
                             .saturating_add(1);
+                    }
+                    if src.flags & ember::SOURCE_FLAG_FIREWALLED != 0 {
+                        // The node id is the record's signer, so a relay
+                        // pinned to it reaches that publisher or nobody.
+                        relay_targets.entry((src.ip, src.tcp_port)).or_insert(
+                            ember::broker::RelayTarget {
+                                quic_port: src.quic_port,
+                                node_id: (src.publisher_id != [0u8; 16])
+                                    .then_some(src.publisher_id),
+                            },
+                        );
                     }
                     rest.push((src.ip, src.tcp_port, src.udp_port, src.flags));
                 }
@@ -440,6 +453,7 @@ pub(in crate::network) async fn on_ember_search_tick(
                 "ember-dht",
                 true,
                 we_are_unreachable,
+                &relay_targets,
             )
             .await;
         }

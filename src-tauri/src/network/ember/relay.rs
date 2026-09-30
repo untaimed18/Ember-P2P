@@ -21,8 +21,15 @@ pub const RELAY_REQUEST_VERSION: u8 = 2;
 /// Fixed payload size for v2: version(1) + target(6) + file(16) +
 /// attestation_hash(32) + pubkey(32) + ember_hash(16) + nonce(16) + sig(64).
 pub const RELAY_REQUEST_V2_PAYLOAD_LEN: usize = 183;
+/// v2 plus the target's node id, which the relay requires the far end of its
+/// dial to prove. Sent only to relays whose attestation carries
+/// [`super::RELAY_ATTESTATION_CAP_PINNED_TARGET`]: a 1.7.0 relay accepts no
+/// length but v2's.
+pub const RELAY_REQUEST_VERSION_PINNED: u8 = 3;
+pub const RELAY_REQUEST_V3_PAYLOAD_LEN: usize = RELAY_REQUEST_V2_PAYLOAD_LEN + 16;
 const RELAY_REQUEST_NONCE_LEN: usize = 16;
 const RELAY_REQUEST_SIGNATURE_DOMAIN: &[u8] = b"ember-relay-request-v2\0";
+const RELAY_REQUEST_PINNED_SIGNATURE_DOMAIN: &[u8] = b"ember-relay-request-v3\0";
 /// Reject reasons for RELAY_REJECT payload.
 const REJECT_CAPACITY: u8 = 0x01;
 const REJECT_BAD_TARGET: u8 = 0x02;
@@ -504,18 +511,22 @@ pub fn decode_relay_header(data: &[u8]) -> Option<(u8, u32, u16)> {
     Some((msg_type, session_id, payload_len))
 }
 
-/// Parsed + verified v2 RELAY_REQUEST fields (signature already checked).
+/// Parsed + verified RELAY_REQUEST fields (signature already checked).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelayRequestV2 {
+pub struct RelayRequest {
     pub target_ip: Ipv4Addr,
+    /// The port the relay dials over QUIC.
     pub target_port: u16,
     pub file_hash: [u8; 16],
     pub attestation_hash: [u8; 32],
     pub requester_pubkey: [u8; 32],
     pub requester_ember_hash: [u8; 16],
     pub nonce: [u8; 16],
+    /// v3 only: the node id the target must prove in the QUIC handshake.
+    pub target_node_id: Option<[u8; 16]>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_relay_request_signed_message(
     session_id: u32,
     attestation_hash: &[u8; 32],
@@ -525,11 +536,15 @@ fn build_relay_request_signed_message(
     requester_pubkey: &[u8; 32],
     requester_ember_hash: &[u8; 16],
     nonce: &[u8; 16],
+    target_node_id: Option<&[u8; 16]>,
 ) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(
-        RELAY_REQUEST_SIGNATURE_DOMAIN.len() + 4 + 32 + 4 + 2 + 16 + 32 + 16 + 16,
-    );
-    msg.extend_from_slice(RELAY_REQUEST_SIGNATURE_DOMAIN);
+    let domain = if target_node_id.is_some() {
+        RELAY_REQUEST_PINNED_SIGNATURE_DOMAIN
+    } else {
+        RELAY_REQUEST_SIGNATURE_DOMAIN
+    };
+    let mut msg = Vec::with_capacity(domain.len() + 4 + 32 + 4 + 2 + 16 + 32 + 16 + 16 + 16);
+    msg.extend_from_slice(domain);
     msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(attestation_hash);
     msg.extend_from_slice(&target_ip.octets());
@@ -538,16 +553,21 @@ fn build_relay_request_signed_message(
     msg.extend_from_slice(requester_pubkey);
     msg.extend_from_slice(requester_ember_hash);
     msg.extend_from_slice(nonce);
+    if let Some(node_id) = target_node_id {
+        msg.extend_from_slice(node_id);
+    }
     msg
 }
 
-/// Build a signed v2 RELAY_REQUEST (proof-of-possession).
+/// Build a signed RELAY_REQUEST (proof-of-possession): v3 when
+/// `target_node_id` is given, v2 otherwise.
 ///
 /// The requester signs a domain-separated message binding session id,
 /// the relay's public ERAT attestation hash, target, file hash, and a
 /// fresh nonce. The attestation hash alone is no longer accepted as a
 /// bearer credential.
-pub fn build_relay_request_v2(
+#[allow(clippy::too_many_arguments)]
+pub fn build_relay_request(
     session_id: u32,
     target_ip: Ipv4Addr,
     target_port: u16,
@@ -556,6 +576,7 @@ pub fn build_relay_request_v2(
     requester_pubkey: &[u8; 32],
     requester_ember_hash: &[u8; 16],
     requester_secret_key: &[u8; 32],
+    target_node_id: Option<&[u8; 16]>,
 ) -> Vec<u8> {
     use rand::RngCore;
 
@@ -571,12 +592,18 @@ pub fn build_relay_request_v2(
         requester_pubkey,
         requester_ember_hash,
         &nonce,
+        target_node_id,
     );
     let signing_key = super::crypto::signing_key_from_bytes(requester_secret_key);
     let signature = super::crypto::sign(&signing_key, &signed);
 
-    let mut payload = Vec::with_capacity(RELAY_REQUEST_V2_PAYLOAD_LEN);
-    payload.push(RELAY_REQUEST_VERSION);
+    let (version, len) = if target_node_id.is_some() {
+        (RELAY_REQUEST_VERSION_PINNED, RELAY_REQUEST_V3_PAYLOAD_LEN)
+    } else {
+        (RELAY_REQUEST_VERSION, RELAY_REQUEST_V2_PAYLOAD_LEN)
+    };
+    let mut payload = Vec::with_capacity(len);
+    payload.push(version);
     payload.extend_from_slice(&target_ip.octets());
     payload.extend_from_slice(&target_port.to_le_bytes());
     payload.extend_from_slice(file_hash);
@@ -584,25 +611,35 @@ pub fn build_relay_request_v2(
     payload.extend_from_slice(requester_pubkey);
     payload.extend_from_slice(requester_ember_hash);
     payload.extend_from_slice(&nonce);
+    if let Some(node_id) = target_node_id {
+        payload.extend_from_slice(node_id);
+    }
     payload.extend_from_slice(&signature);
-    debug_assert_eq!(payload.len(), RELAY_REQUEST_V2_PAYLOAD_LEN);
+    debug_assert_eq!(payload.len(), len);
     encode_relay_message(MSG_RELAY_REQUEST, session_id, &payload)
 }
 
-/// Parse and cryptographically verify a v2 RELAY_REQUEST payload.
+/// Whether `len` is the payload length of a RELAY_REQUEST version we accept.
+fn relay_request_payload_len_ok(len: usize) -> bool {
+    len == RELAY_REQUEST_V2_PAYLOAD_LEN || len == RELAY_REQUEST_V3_PAYLOAD_LEN
+}
+
+/// Parse and cryptographically verify a v2 or v3 RELAY_REQUEST payload.
 ///
 /// Does **not** check attestation-hash membership or nonce replay —
 /// those are policy checks owned by [`RelayManager`] on the accept path.
-pub fn parse_and_verify_relay_request_v2(
+pub fn parse_and_verify_relay_request(
     session_id: u32,
     payload: &[u8],
-) -> Result<RelayRequestV2, &'static str> {
-    if payload.len() != RELAY_REQUEST_V2_PAYLOAD_LEN {
-        return Err("unexpected relay request payload length");
-    }
-    if payload[0] != RELAY_REQUEST_VERSION {
-        return Err("unsupported relay request version");
-    }
+) -> Result<RelayRequest, &'static str> {
+    let pinned = match (payload.first(), payload.len()) {
+        (Some(&RELAY_REQUEST_VERSION), RELAY_REQUEST_V2_PAYLOAD_LEN) => false,
+        (Some(&RELAY_REQUEST_VERSION_PINNED), RELAY_REQUEST_V3_PAYLOAD_LEN) => true,
+        (Some(&RELAY_REQUEST_VERSION | &RELAY_REQUEST_VERSION_PINNED), _) => {
+            return Err("unexpected relay request payload length");
+        }
+        _ => return Err("unsupported relay request version"),
+    };
     let target_ip = Ipv4Addr::new(payload[1], payload[2], payload[3], payload[4]);
     let target_port = u16::from_le_bytes([payload[5], payload[6]]);
     let mut file_hash = [0u8; 16];
@@ -615,8 +652,14 @@ pub fn parse_and_verify_relay_request_v2(
     requester_ember_hash.copy_from_slice(&payload[87..103]);
     let mut nonce = [0u8; 16];
     nonce.copy_from_slice(&payload[103..119]);
+    let target_node_id = pinned.then(|| {
+        let mut node_id = [0u8; 16];
+        node_id.copy_from_slice(&payload[119..135]);
+        node_id
+    });
+    let sig_at = if pinned { 135 } else { 119 };
     let mut signature = [0u8; 64];
-    signature.copy_from_slice(&payload[119..183]);
+    signature.copy_from_slice(&payload[sig_at..sig_at + 64]);
 
     if !super::crypto::verify_ember_hash_binding(&requester_pubkey, &requester_ember_hash) {
         return Err("requester pubkey does not bind to ember_hash");
@@ -633,11 +676,12 @@ pub fn parse_and_verify_relay_request_v2(
         &requester_pubkey,
         &requester_ember_hash,
         &nonce,
+        target_node_id.as_ref(),
     );
     if !super::crypto::verify(&vk, &signed, &signature) {
         return Err("bad relay request signature");
     }
-    Ok(RelayRequestV2 {
+    Ok(RelayRequest {
         target_ip,
         target_port,
         file_hash,
@@ -645,6 +689,7 @@ pub fn parse_and_verify_relay_request_v2(
         requester_pubkey,
         requester_ember_hash,
         nonce,
+        target_node_id,
     })
 }
 
@@ -1262,11 +1307,18 @@ impl std::fmt::Display for RelayDialError {
 
 /// Connect to a relay-capable peer over QUIC and negotiate a relay session.
 /// Returns the QUIC streams on success.
+///
+/// `target_port` is the port the relay dials over QUIC. `target_node_id`, when
+/// given, sends a v3 request the relay pins its dial to, so it must only be
+/// given for a relay that advertises
+/// [`super::RELAY_ATTESTATION_CAP_PINNED_TARGET`].
+#[allow(clippy::too_many_arguments)]
 pub async fn connect_to_peer_relay(
     endpoint: &quinn::Endpoint,
     relay_addr: SocketAddr,
     target_ip: Ipv4Addr,
     target_port: u16,
+    target_node_id: Option<[u8; 16]>,
     file_hash: &[u8; 16],
     attestation_hash: &[u8; 32],
     requester_pubkey: &[u8; 32],
@@ -1296,7 +1348,7 @@ pub async fn connect_to_peer_relay(
         .map_err(|e| RelayDialError::unreachable(format!("relay open_bi failed: {e}")))?;
 
     let session_id = rand::random::<u32>();
-    let request = build_relay_request_v2(
+    let request = build_relay_request(
         session_id,
         target_ip,
         target_port,
@@ -1305,6 +1357,7 @@ pub async fn connect_to_peer_relay(
         requester_pubkey,
         requester_ember_hash,
         requester_secret_key,
+        target_node_id.as_ref(),
     );
 
     tokio::time::timeout(RELAY_CONTROL_TIMEOUT, send.write_all(&request))
@@ -2515,9 +2568,9 @@ pub async fn run_quic_accept_loop(
                         return;
                     }
                 };
-                if payload_len as usize != RELAY_REQUEST_V2_PAYLOAD_LEN {
+                if !relay_request_payload_len_ok(payload_len as usize) {
                     debug!(
-                        "QUIC accept: RELAY_REQUEST from {remote} has unexpected payload_len {payload_len} (want {RELAY_REQUEST_V2_PAYLOAD_LEN}; v1 hash-only requests are rejected)"
+                        "QUIC accept: RELAY_REQUEST from {remote} has unexpected payload_len {payload_len} (want {RELAY_REQUEST_V2_PAYLOAD_LEN} or {RELAY_REQUEST_V3_PAYLOAD_LEN}; v1 hash-only requests are rejected)"
                     );
                     // Echo reject when we can (session id is in the header).
                     send_relay_reject(&mut init_send, peer_session_id, REJECT_AUTH).await;
@@ -2537,7 +2590,7 @@ pub async fn run_quic_accept_loop(
                 }
 
                 let verified =
-                    match parse_and_verify_relay_request_v2(peer_session_id, &payload_buf) {
+                    match parse_and_verify_relay_request(peer_session_id, &payload_buf) {
                         Ok(req) => req,
                         Err(reason) => {
                             debug!("QUIC accept: refusing relay request from {remote}: {reason}");
@@ -2662,6 +2715,7 @@ pub async fn run_quic_accept_loop(
                         session_id,
                         &file_hash,
                         verified.requester_ember_hash,
+                        verified.target_node_id,
                     ),
                 )
                 .await;
@@ -2872,12 +2926,15 @@ pub async fn run_quic_accept_loop(
 ///
 /// `requester_node_id` is the handshake-proven identity of the peer that asked
 /// for the bridge, used to establish that the far end is somebody else.
+/// `expected_target` is the identity a v3 request names, which the far end
+/// must then be.
 async fn connect_relay_target(
     endpoint: &quinn::Endpoint,
     target_addr: SocketAddr,
     session_id: u32,
     file_hash: &[u8; 16],
     requester_node_id: [u8; 16],
+    expected_target: Option<[u8; 16]>,
 ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
     let conn = endpoint
         .connect(target_addr, "ember-relay")
@@ -2891,18 +2948,22 @@ async fn connect_relay_target(
     // the certificate quinn has already proved possession of, rather than
     // treating "something completed TLS on that port" as the target.
     //
-    // The v2 RELAY_REQUEST carries no expected node id for the target, so this
-    // cannot yet be a pin — an initiator that names the wrong address reaches
-    // whichever Ember node lives there. Extending the request to carry the
-    // target's node id (the initiator learns it from the same source metadata
-    // it dials) would let this comparison become an equality check and remove
-    // the last caller-chosen degree of freedom from the dial.
+    // A v2 RELAY_REQUEST carries no expected node id, so for those this is not
+    // a pin: an initiator that names the wrong address reaches whichever Ember
+    // node lives there.
     let Some(target_node_id) = super::quic::connection_node_id(&conn) else {
         conn.close(0u32.into(), b"relay target has no ember identity");
         return Err(format!(
             "target {target_addr} has no verifiable Ember identity"
         ));
     };
+    if expected_target.is_some_and(|expected| expected != target_node_id) {
+        conn.close(0u32.into(), b"relay target is not the named node");
+        return Err(format!(
+            "target {target_addr} is {}, not the node the request named",
+            hex::encode(target_node_id)
+        ));
+    }
     // A target that turns out to be the requester itself — same identity on a
     // different address, so the address-level check on the accept path cannot
     // see it — is asking this node to loop its bytes back to it, at the cost
@@ -3060,7 +3121,7 @@ mod tests {
         let ember_hash = super::super::crypto::node_id_from_public_key(&sk.verifying_key());
         let secret = sk.to_bytes();
 
-        let msg = build_relay_request_v2(
+        let msg = build_relay_request(
             1,
             ip,
             port,
@@ -3069,18 +3130,66 @@ mod tests {
             &pk,
             &ember_hash,
             &secret,
+            None,
         );
         let (msg_type, sid, payload) = decode_relay_message(&msg).unwrap();
         assert_eq!(msg_type, MSG_RELAY_REQUEST);
         assert_eq!(sid, 1);
         assert_eq!(payload.len(), RELAY_REQUEST_V2_PAYLOAD_LEN);
-        let parsed = parse_and_verify_relay_request_v2(1, payload).unwrap();
+        let parsed = parse_and_verify_relay_request(1, payload).unwrap();
         assert_eq!(parsed.target_ip, ip);
         assert_eq!(parsed.target_port, port);
         assert_eq!(parsed.file_hash, file_hash);
         assert_eq!(parsed.attestation_hash, attestation_hash);
         assert_eq!(parsed.requester_pubkey, pk);
         assert_eq!(parsed.requester_ember_hash, ember_hash);
+        assert_eq!(parsed.target_node_id, None);
+    }
+
+    /// v3 carries the target's node id under the signature, and the two
+    /// versions' signatures cannot stand in for each other.
+    #[test]
+    fn relay_request_v3_carries_a_signed_target_id() {
+        let sk = super::super::crypto::signing_key_from_bytes(&[8u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let ember_hash = super::super::crypto::node_id_from_public_key(&sk.verifying_key());
+        let secret = sk.to_bytes();
+        let target = [0x5Au8; 16];
+        let msg = build_relay_request(
+            3,
+            Ipv4Addr::new(1, 2, 3, 4),
+            4700,
+            &[0xAA; 16],
+            &[0xBB; 32],
+            &pk,
+            &ember_hash,
+            &secret,
+            Some(&target),
+        );
+        let (_, sid, payload) = decode_relay_message(&msg).unwrap();
+        assert_eq!(payload.len(), RELAY_REQUEST_V3_PAYLOAD_LEN);
+        let parsed = parse_and_verify_relay_request(sid, payload).unwrap();
+        assert_eq!(parsed.target_node_id, Some(target));
+        assert_eq!(parsed.target_port, 4700);
+
+        let mut other_target = payload.to_vec();
+        other_target[119] ^= 0x01;
+        assert!(
+            parse_and_verify_relay_request(sid, &other_target).is_err(),
+            "the target id is under the signature"
+        );
+
+        // A v3 body relabelled v2 and cut to v2's length keeps v2's layout up
+        // to the nonce, but the signature bytes are the node id and the domain
+        // differs, so it cannot verify.
+        let mut downgraded = payload[..RELAY_REQUEST_V2_PAYLOAD_LEN].to_vec();
+        downgraded[0] = RELAY_REQUEST_VERSION;
+        downgraded[119..183].copy_from_slice(&payload[135..199]);
+        assert!(parse_and_verify_relay_request(sid, &downgraded).is_err());
+
+        let mut wrong_length = payload.to_vec();
+        wrong_length[0] = RELAY_REQUEST_VERSION;
+        assert!(parse_and_verify_relay_request(sid, &wrong_length).is_err());
     }
 
     #[test]
@@ -3089,7 +3198,7 @@ mod tests {
         let pk = sk.verifying_key().to_bytes();
         let ember_hash = super::super::crypto::node_id_from_public_key(&sk.verifying_key());
         let secret = sk.to_bytes();
-        let msg = build_relay_request_v2(
+        let msg = build_relay_request(
             42,
             Ipv4Addr::new(8, 8, 8, 8),
             4662,
@@ -3098,11 +3207,12 @@ mod tests {
             &pk,
             &ember_hash,
             &secret,
+            None,
         );
         let (_, sid, payload) = decode_relay_message(&msg).unwrap();
         let mut bad = payload.to_vec();
         bad[7] ^= 0xFF; // flip a file_hash byte under the signature
-        assert!(parse_and_verify_relay_request_v2(sid, &bad).is_err());
+        assert!(parse_and_verify_relay_request(sid, &bad).is_err());
     }
 
     #[test]
@@ -3111,7 +3221,7 @@ mod tests {
         let pk = sk.verifying_key().to_bytes();
         let secret = sk.to_bytes();
         let wrong_hash = [0xABu8; 16];
-        let msg = build_relay_request_v2(
+        let msg = build_relay_request(
             7,
             Ipv4Addr::new(1, 1, 1, 1),
             4662,
@@ -3120,9 +3230,10 @@ mod tests {
             &pk,
             &wrong_hash,
             &secret,
+            None,
         );
         let (_, sid, payload) = decode_relay_message(&msg).unwrap();
-        assert!(parse_and_verify_relay_request_v2(sid, payload).is_err());
+        assert!(parse_and_verify_relay_request(sid, payload).is_err());
     }
 
     /// A verified signature is proof of identity, not of a relationship. The

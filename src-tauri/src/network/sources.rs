@@ -23,6 +23,9 @@ pub(super) async fn handle_epx_sources(
     label: &str,
     include_pending_downloads: bool,
     we_are_unreachable: bool,
+    // What a relay needs to reach a firewalled source, by `(ip, tcp_port)`.
+    // Only our own DHT lookups know it; a peer's exchange carries neither.
+    relay_targets: &HashMap<(Ipv4Addr, u16), ember::broker::RelayTarget>,
 ) -> usize {
     state.ember_diagnostics.epx_events_received = state
         .ember_diagnostics
@@ -135,6 +138,7 @@ pub(super) async fn handle_epx_sources(
                         *file_hash,
                         ip,
                         port,
+                        relay_targets.get(&(ip, port)).copied().unwrap_or_default(),
                     )
                     .await;
                     let pfs = state

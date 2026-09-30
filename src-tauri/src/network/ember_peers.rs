@@ -1388,7 +1388,7 @@ pub(super) fn sign_local_relay_attestation(
         relay_ip,
         relay_port,
         now_unix + ember::RELAY_ATTESTATION_MAX_TTL_SECS,
-        ember::RELAY_ATTESTATION_CAP_RELAY_V1,
+        ember::RELAY_ATTESTATION_CAP_RELAY_V1 | ember::RELAY_ATTESTATION_CAP_PINNED_TARGET,
     ))
 }
 

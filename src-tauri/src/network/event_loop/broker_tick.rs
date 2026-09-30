@@ -22,7 +22,7 @@ pub(in crate::network) async fn on_broker_tick(
     if let Some(ref mut rx) = state.broker_event_rx {
         while let Ok(event) = rx.try_recv() {
             match event {
-                ember::broker::BrokerEvent::StartRelay { ref attempt_key, source_ip, source_port, file_hash, relay_addr, relay_attestation_hash, relay_ember_hash, .. } => {
+                ember::broker::BrokerEvent::StartRelay { ref attempt_key, source_ip, source_port, target_quic_port, target_node_id, file_hash, relay_addr, relay_attestation_hash, relay_ember_hash } => {
                     tracing::info!("Broker: initiating relay for {} -> {}:{} (relay={:?})", attempt_key, source_ip, source_port, relay_addr);
 
                     let attempt_key_owned = attempt_key.clone();
@@ -112,7 +112,8 @@ pub(in crate::network) async fn on_broker_tick(
                                 &endpoint,
                                 relay_addr,
                                 source_ip,
-                                source_port,
+                                target_quic_port,
+                                target_node_id,
                                 &file_hash,
                                 &attestation_hash,
                                 &ed25519_pubkey,
