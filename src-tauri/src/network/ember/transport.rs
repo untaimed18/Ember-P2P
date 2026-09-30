@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -488,6 +488,10 @@ enum PendingHandshake {
     /// Noise_IK: we sent message 1, waiting for message 2.
     IkInitiator {
         state: snow::HandshakeState,
+        /// The payload message 1 carried. Kept because a crossed dial we lose
+        /// the tie on is refused by the peer, message and all, so it has to go
+        /// again over the session the peer's handshake produces.
+        first_message: Vec<u8>,
         queued: Vec<QueuedPayload>,
         created: Instant,
         /// Static key this handshake was started for. `pending` is keyed by
@@ -717,16 +721,29 @@ impl EmberControlMessage {
     }
 }
 
+/// Sessions by `(address, static key)`. Ordered so that one address's slots
+/// are a range: the per-packet lookups run for junk from unknown addresses
+/// too, and a scan made each one cost the whole table.
+type SessionMap = BTreeMap<(SocketAddr, [u8; 32]), NoiseSession>;
+
+/// Every slot at `addr`.
+fn slots_at(
+    map: &SessionMap,
+    addr: SocketAddr,
+) -> impl Iterator<Item = (&(SocketAddr, [u8; 32]), &NoiseSession)> {
+    map.range((addr, [0u8; 32])..=(addr, [0xFFu8; 32]))
+}
+
 pub struct EmberTransport {
     local_noise_key: [u8; 32],
     local_noise_pub: [u8; 32],
-    sessions: HashMap<(SocketAddr, [u8; 32]), NoiseSession>,
+    sessions: SessionMap,
     /// Completed handshakes waiting to replace a slot that already holds a
     /// *proven* session. Consulted only after every live session at the address
     /// has failed AEAD, and promoted the moment one of these decrypts a frame.
     /// See [`EmberTransport::install_session`] for why a proven session is
     /// never displaced on the strength of a handshake alone.
-    staged_sessions: HashMap<(SocketAddr, [u8; 32]), NoiseSession>,
+    staged_sessions: SessionMap,
     pending: HashMap<SocketAddr, PendingHandshake>,
     /// BLAKE3 digests of recently-processed handshake-initiation packets
     /// (`IK_INIT`, `XX_MSG1`) with the time we first saw them. An attacker can
@@ -865,8 +882,8 @@ impl EmberTransport {
         Self {
             local_noise_key,
             local_noise_pub,
-            sessions: HashMap::new(),
-            staged_sessions: HashMap::new(),
+            sessions: BTreeMap::new(),
+            staged_sessions: BTreeMap::new(),
             pending: HashMap::new(),
             recent_handshakes: HashMap::new(),
             recent_handshake_order: VecDeque::new(),
@@ -1183,9 +1200,7 @@ impl EmberTransport {
     /// Check if we have an established session with a peer.
     #[allow(dead_code)]
     pub fn has_session(&self, addr: &SocketAddr) -> bool {
-        self.sessions
-            .keys()
-            .any(|(session_addr, _)| session_addr == addr)
+        slots_at(&self.sessions, *addr).next().is_some()
     }
 
     /// Whether a completed Noise session exists for this identity at `addr`.
@@ -1268,6 +1283,10 @@ impl EmberTransport {
         remote_noise_pub: Option<&[u8; 32]>,
         message: &[u8],
     ) -> OutgoingResult {
+        if message.is_empty() {
+            // What `encode_message` returns for a frame it refused to build.
+            return OutgoingResult::Error("empty message".to_string());
+        }
         self.note_dialled(peer.ip());
 
         // Fast path: an established session for the identity we were asked to
@@ -1429,10 +1448,7 @@ impl EmberTransport {
         let mut unique: Option<(SocketAddr, [u8; 32])> = None;
         let mut best: Option<((SocketAddr, [u8; 32]), bool, Instant)> = None;
         let mut count = 0usize;
-        for (slot, session) in &self.sessions {
-            if slot.0 != peer {
-                continue;
-            }
+        for (slot, session) in slots_at(&self.sessions, peer) {
             count += 1;
             unique = Some(*slot);
             let rank = (session.addr_validated, session.last_activity);
@@ -1528,23 +1544,13 @@ impl EmberTransport {
     /// she is the arrival, so the oldest spoof stays and a newer one is dropped
     /// instead of her.
     fn trim_sessions_at(&mut self, addr: SocketAddr, arriving: [u8; 32]) {
-        while self
-            .sessions
-            .keys()
-            .filter(|(session_addr, _)| *session_addr == addr)
-            .count()
-            > MAX_SESSIONS_PER_ADDR
-        {
+        while slots_at(&self.sessions, addr).count() > MAX_SESSIONS_PER_ADDR {
             let arriving_validated = self
                 .sessions
                 .get(&(addr, arriving))
                 .is_some_and(|session| session.addr_validated);
-            let newest_unvalidated = self
-                .sessions
-                .iter()
-                .filter(|((session_addr, key), session)| {
-                    *session_addr == addr && *key != arriving && !session.addr_validated
-                })
+            let newest_unvalidated = slots_at(&self.sessions, addr)
+                .filter(|((_, key), session)| *key != arriving && !session.addr_validated)
                 .max_by_key(|(_, session)| session.established)
                 .map(|(slot, _)| *slot);
             if let Some(victim) = newest_unvalidated {
@@ -1556,10 +1562,8 @@ impl EmberTransport {
                 self.sessions.remove(&(addr, arriving));
                 break;
             }
-            let lru = self
-                .sessions
-                .iter()
-                .filter(|((session_addr, key), _)| *session_addr == addr && *key != arriving)
+            let lru = slots_at(&self.sessions, addr)
+                .filter(|((_, key), _)| *key != arriving)
                 .min_by_key(|(_, session)| session.last_activity)
                 .map(|(slot, _)| *slot);
             if let Some(victim) = lru {
@@ -1914,6 +1918,7 @@ impl EmberTransport {
                     peer,
                     PendingHandshake::IkInitiator {
                         state: initiator,
+                        first_message: first_message.to_vec(),
                         queued,
                         created: Instant::now(),
                         remote_noise_pub: *remote_pub,
@@ -1940,10 +1945,20 @@ impl EmberTransport {
         // `prepare_outgoing` keeps refreshing `last_activity` so the idle
         // timeout never fires, and the collision itself marked the contact
         // fresh enough to skip liveness pings for ten minutes.
-        if matches!(
-            self.pending.get(&from),
-            Some(PendingHandshake::IkInitiator { .. } | PendingHandshake::XxInitiatorMsg1 { .. })
-        ) {
+        //
+        // Refusing on both sides left each first message to wait out the 30 s
+        // timeout instead, so a crossed IK dial is settled by static key: the
+        // lower key stays initiator, and the higher one answers as responder
+        // and hands what it had queued to the session that produces. Each side
+        // decides from its own key and the one it dialled, so they agree.
+        let initiator_in_flight = match self.pending.get(&from) {
+            Some(PendingHandshake::IkInitiator { remote_noise_pub, .. }) => {
+                *self.local_noise_public_key() < *remote_noise_pub
+            }
+            Some(PendingHandshake::XxInitiatorMsg1 { .. }) => true,
+            _ => false,
+        };
+        if initiator_in_flight {
             debug!("Ignoring IK init from {from}: an initiator handshake is in flight");
             return IncomingResult::Rejected;
         }
@@ -2064,18 +2079,42 @@ impl EmberTransport {
         // problem — an unauthenticated forged `XX_MSG1` would then block real IK
         // handshakes, which is the worse trade, since msg1 proves nothing at all
         // while a completed IK is authenticated.
-        let hold_inbound_xx = matches!(
-            self.pending.get(&from),
-            Some(PendingHandshake::XxResponderMsg2 { created, .. })
-                if created.elapsed() < XX_RESPONDER_QUEUE_GRACE
-        );
-        if !hold_inbound_xx {
-            self.pending.remove(&from);
-        }
+        //
+        // Our own IK initiator is only still here when we lost the tie above.
+        // It is ours to give up only if this handshake reached the identity it
+        // was dialling; another identity at the address leaves it running.
+        let crossed_initiator = match self.pending.get(&from) {
+            Some(PendingHandshake::IkInitiator { remote_noise_pub: target, .. }) => {
+                Some(*target == remote_noise_pub)
+            }
+            _ => None,
+        };
+        let keep_pending = crossed_initiator == Some(false)
+            || matches!(
+                self.pending.get(&from),
+                Some(PendingHandshake::XxResponderMsg2 { created, .. })
+                    if created.elapsed() < XX_RESPONDER_QUEUE_GRACE
+            );
         trace!("IK handshake completed (responder) with {from}");
 
         self.remember_handshake_response(handshake_digest, resp_buf.clone());
         let mut packets_to_send = vec![resp_buf];
+        if crossed_initiator == Some(true) {
+            if let Some(PendingHandshake::IkInitiator { first_message, queued, .. }) =
+                self.pending.get(&from)
+            {
+                let first = (!first_message.is_empty()).then_some(first_message.as_slice());
+                let rest = queued
+                    .iter()
+                    .filter(|q| q.addressed_to(&remote_noise_pub))
+                    .map(|q| q.bytes.as_slice());
+                for msg in first.into_iter().chain(rest) {
+                    if let Some(packet) = session.seal(msg) {
+                        packets_to_send.push(packet);
+                    }
+                }
+            }
+        }
 
         // Nothing in message 1 proves the sender can *receive* where it says
         // it is. IK is 1-RTT and every node's static key is published in
@@ -2156,6 +2195,9 @@ impl EmberTransport {
             self.forget_handshake(&handshake_digest);
             debug!("IK responder: per-address session cap refused {from}; not answering");
             return IncomingResult::Rejected;
+        }
+        if !keep_pending {
+            self.pending.remove(&from);
         }
 
         IncomingResult::HandshakeComplete {
@@ -2964,17 +3006,11 @@ impl EmberTransport {
 
         // Try every session at this address until AEAD succeeds. A squatter's
         // replay window or decrypt failure must not hide the real peer's frame.
-        let candidates: Vec<[u8; 32]> = self
-            .sessions
-            .keys()
-            .filter(|(addr, _)| *addr == from)
-            .map(|(_, key)| *key)
+        let candidates: Vec<[u8; 32]> = slots_at(&self.sessions, from)
+            .map(|((_, key), _)| *key)
             .collect();
-        let staged: Vec<[u8; 32]> = self
-            .staged_sessions
-            .keys()
-            .filter(|(addr, _)| *addr == from)
-            .map(|(_, key)| *key)
+        let staged: Vec<[u8; 32]> = slots_at(&self.staged_sessions, from)
+            .map(|((_, key), _)| *key)
             .collect();
         if candidates.is_empty() && staged.is_empty() {
             debug!("Ember transport packet from {from} with no session");
@@ -3068,16 +3104,26 @@ impl EmberTransport {
     /// when nothing unproven remains. Ties break on a per-process salted hash
     /// of the address, so the order cannot be aimed by choosing source addresses.
     fn evict_one_session(&mut self) {
-        let victim = self
+        // The salted rank is a hash, so it is only computed to break a tie.
+        let this = &*self;
+        let by = |time: fn(&NoiseSession) -> Instant| {
+            move |a: &(&(SocketAddr, [u8; 32]), &NoiseSession),
+                  b: &(&(SocketAddr, [u8; 32]), &NoiseSession)| {
+                time(a.1).cmp(&time(b.1)).then_with(|| {
+                    this.salted_addr_rank(&a.0 .0).cmp(&this.salted_addr_rank(&b.0 .0))
+                })
+            }
+        };
+        let victim = this
             .sessions
             .iter()
             .filter(|(_, s)| !s.addr_validated)
-            .max_by_key(|(slot, s)| (s.established, self.salted_addr_rank(&slot.0)))
+            .max_by(by(|s| s.established))
             .map(|(k, _)| *k)
             .or_else(|| {
-                self.sessions
+                this.sessions
                     .iter()
-                    .min_by_key(|(slot, s)| (s.last_activity, self.salted_addr_rank(&slot.0)))
+                    .min_by(by(|s| s.last_activity))
                     .map(|(k, _)| *k)
             });
         if let Some(victim) = victim {
@@ -3292,6 +3338,63 @@ mod tests {
             vec![b"after".to_vec()],
             "a replayed init must neither wedge the live session nor re-deliver its payload"
         );
+    }
+
+    /// Two peers that IK-dial each other at once settle on one handshake at
+    /// once, and both first messages arrive, instead of each refusing the
+    /// other and waiting out the pending timeout.
+    #[test]
+    fn a_crossed_ik_dial_is_settled_by_static_key() {
+        let (a_priv, a_pub) = make_keypair();
+        let (b_priv, b_pub) = make_keypair();
+        let ((low_priv, low_pub), (high_priv, high_pub)) = if a_pub < b_pub {
+            ((a_priv, a_pub), (b_priv, b_pub))
+        } else {
+            ((b_priv, b_pub), (a_priv, a_pub))
+        };
+        let mut low = EmberTransport::new(low_priv, low_pub);
+        let mut high = EmberTransport::new(high_priv, high_pub);
+        let low_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let high_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let start = |t: &mut EmberTransport, to: SocketAddr, key: &[u8; 32], msg: &[u8]| {
+            match t.prepare_outgoing(to, Some(key), msg) {
+                OutgoingResult::HandshakeStarted { packet } => packet,
+                other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+            }
+        };
+        let low_init = start(&mut low, high_addr, &high_pub, b"from low");
+        let high_init = start(&mut high, low_addr, &low_pub, b"from high");
+        match high.prepare_outgoing(low_addr, Some(&low_pub), b"high, queued") {
+            OutgoingResult::Queued => {}
+            other => panic!("expected Queued, got {}", variant_name(&other)),
+        }
+
+        assert!(
+            matches!(low.process_incoming(&high_init, high_addr), IncomingResult::Rejected),
+            "the lower key keeps its own dial"
+        );
+        let answer = match high.process_incoming(&low_init, low_addr) {
+            IncomingResult::HandshakeComplete { packets_to_send, .. } => packets_to_send,
+            _ => panic!("the higher key answers"),
+        };
+        assert!(!high.pending.contains_key(&low_addr), "and gives up its own dial");
+        // IK_RESP, high's two messages, then the routability probe.
+        assert_eq!(answer.len(), 4);
+
+        let _ = low.process_incoming(&answer[0], high_addr);
+        let mut heard = Vec::new();
+        for packet in &answer[1..3] {
+            match low.process_incoming(packet, high_addr) {
+                IncomingResult::Message { payload, .. } => heard.push(payload),
+                _ => panic!("expected Message"),
+            }
+        }
+        assert_eq!(heard, vec![b"from high".to_vec(), b"high, queued".to_vec()]);
+
+        let probe_answer = low.dispatch_incoming(&answer[3], high_addr);
+        let released = high.dispatch_incoming(&probe_answer.responses[0], low_addr);
+        assert_eq!(released.app_payloads, vec![b"from low".to_vec()]);
     }
 
     #[test]
