@@ -10,7 +10,8 @@
 //! waits for Ember to exit, then for Ember to be running again, and if that has
 //! not happened within a few minutes it starts the installed executable itself.
 //! That launch finds the resume file, restores the session and reports the
-//! update that did not land.
+//! update that did not land. An Ember that comes back but exits before taking
+//! the resume file failed in its own setup, and is started once more.
 //!
 //! Two details keep it out of the installer's way. It runs from a copy in the
 //! data folder under its own name, because running the installed executable
@@ -24,6 +25,7 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -50,7 +52,21 @@ const MAX_LOG_BYTES: u64 = 64 * 1024;
 const PARENT_EXIT_DEADLINE: Duration = Duration::from_secs(3 * 60);
 /// How long the installer has to bring Ember back before the watchdog does.
 const RELAUNCH_DEADLINE: Duration = Duration::from_secs(5 * 60);
+/// The same for an MSI install, whose elevation prompt waits as long as nobody
+/// answers it. An Ember started meanwhile holds the files the install must
+/// then replace.
+const MSI_RELAUNCH_DEADLINE: Duration = Duration::from_secs(30 * 60);
+/// How long an Ember that came back is watched until it has taken the resume
+/// file, which it does early in setup, once the database and settings opened.
+const SETTLE_PERIOD: Duration = Duration::from_secs(2 * 60);
 const POLL: Duration = Duration::from_secs(2);
+/// A poll that overran by this much means the machine slept. `Instant` counts
+/// through sleep on Windows, so every deadline has passed on waking, while the
+/// installer, asleep just as long, has not moved on.
+const SLEEP_GAP: Duration = Duration::from_secs(15);
+/// Before trying a failed launch once more: an antivirus may still be scanning
+/// an executable the installer just wrote.
+const RELAUNCH_RETRY: Duration = Duration::from_secs(10);
 /// A starting Ember retries the lock this often, so the watchdog's own
 /// instantaneous probe can never make it give up.
 const LOCK_ATTEMPTS: u32 = 10;
@@ -58,8 +74,13 @@ const LOCK_RETRY: Duration = Duration::from_millis(200);
 /// How long a relaunched Ember waits before deleting the watchdog's copy, which
 /// cannot be deleted while it is still running its last poll.
 const CLEANUP_DELAY: Duration = Duration::from_secs(60);
+/// A watchdog that missed Ember restarting between two of its polls keeps
+/// polling until its own deadline, minutes later.
+const CLEANUP_ATTEMPTS: u32 = 10;
 
 static INSTANCE_LOCK: OnceLock<File> = OnceLock::new();
+/// This process started a watchdog, which now owns the folder.
+static STARTED: AtomicBool = AtomicBool::new(false);
 
 fn open_lock(data_dir: &Path) -> std::io::Result<File> {
     OpenOptions::new()
@@ -125,9 +146,19 @@ pub fn schedule_cleanup(data_dir: &Path) {
         return;
     }
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(CLEANUP_DELAY).await;
-        if let Err(error) = std::fs::remove_dir_all(&dir) {
-            tracing::debug!("Could not remove the update watchdog's copy yet: {error}");
+        for attempt in 1..=CLEANUP_ATTEMPTS {
+            tokio::time::sleep(CLEANUP_DELAY).await;
+            if STARTED.load(Ordering::Acquire) {
+                return;
+            }
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => return,
+                Err(_) if !dir.exists() => return,
+                Err(error) if attempt == CLEANUP_ATTEMPTS => {
+                    tracing::debug!("Could not remove the update watchdog's copy: {error}");
+                }
+                Err(_) => {}
+            }
         }
     });
 }
@@ -170,6 +201,7 @@ fn stood_down(data_dir: &Path) -> bool {
 }
 
 fn try_spawn() -> anyhow::Result<()> {
+    STARTED.store(true, Ordering::Release);
     let data_dir = crate::storage::paths::ensure_data_dir()?;
     let exe = std::env::current_exe()?;
     let dir = data_dir.join(DIR);
@@ -268,13 +300,19 @@ fn log(data_dir: &Path, line: &str) {
 struct Timings {
     parent_exit: Duration,
     relaunch: Duration,
+    settle: Duration,
     poll: Duration,
+    sleep_gap: Duration,
+    retry: Duration,
 }
 
 const TIMINGS: Timings = Timings {
     parent_exit: PARENT_EXIT_DEADLINE,
     relaunch: RELAUNCH_DEADLINE,
+    settle: SETTLE_PERIOD,
     poll: POLL,
+    sleep_gap: SLEEP_GAP,
+    retry: RELAUNCH_RETRY,
 };
 
 /// What the watchdog ended up doing.
@@ -284,6 +322,9 @@ enum Verdict {
     NeverExited,
     /// The installer brought Ember back.
     CameBack,
+    /// Something brought Ember back, but it exited before restoring its
+    /// session, so the watchdog started it once more.
+    StartedAgain,
     /// Nothing did, so the watchdog started Ember itself.
     Relaunched,
     /// There was nothing it could start.
@@ -293,7 +334,22 @@ enum Verdict {
 }
 
 fn watch(args: &Args) {
-    watch_with(args, TIMINGS);
+    use tauri::utils::config::BundleType;
+    let timings = match tauri::utils::platform::bundle_type() {
+        Some(BundleType::Msi) => Timings {
+            relaunch: MSI_RELAUNCH_DEADLINE,
+            ..TIMINGS
+        },
+        _ => TIMINGS,
+    };
+    watch_with(args, timings);
+}
+
+/// Sleep for `interval`, and say whether the machine slept through it.
+fn nap(interval: Duration, timings: Timings) -> bool {
+    let started = Instant::now();
+    std::thread::sleep(interval);
+    started.elapsed() >= interval + timings.sleep_gap
 }
 
 fn watch_with(args: &Args, timings: Timings) -> Verdict {
@@ -303,7 +359,7 @@ fn watch_with(args: &Args, timings: Timings) -> Verdict {
     }
     log(&args.data_dir, "Watching for Ember to exit for its update");
 
-    let waiting = Instant::now();
+    let mut waiting = Instant::now();
     loop {
         if stood_down(&args.data_dir) {
             log(&args.data_dir, "The install failed with Ember still running; standing down");
@@ -313,32 +369,75 @@ fn watch_with(args: &Args, timings: Timings) -> Verdict {
             break;
         }
         if waiting.elapsed() >= timings.parent_exit {
-            log(&args.data_dir, "Ember never exited; the install did not start, nothing to watch");
+            log(
+                &args.data_dir,
+                "Ember is still running: it never exited for the install, or restarted \
+                 between two checks; nothing to watch",
+            );
             return Verdict::NeverExited;
         }
-        std::thread::sleep(timings.poll / 2);
+        if nap(timings.poll / 2, timings) {
+            log(&args.data_dir, "The machine slept; waiting as long again for Ember to exit");
+            waiting = Instant::now();
+        }
     }
 
     log(&args.data_dir, "Ember exited; waiting for it to come back");
-    let waiting = Instant::now();
+    let mut waiting = Instant::now();
     while waiting.elapsed() < timings.relaunch {
-        std::thread::sleep(timings.poll);
+        let slept = nap(timings.poll, timings);
         if stood_down(&args.data_dir) {
             log(&args.data_dir, "The install failed and Ember was quit; standing down");
             return Verdict::StoodDown;
         }
         if matches!(lock_is_held(&args.data_dir), Ok(true)) {
             log(&args.data_dir, "Ember is running again");
-            return Verdict::CameBack;
+            if settled(args, timings) {
+                return Verdict::CameBack;
+            }
+            log(
+                &args.data_dir,
+                "Ember exited before restoring its session; starting it once more",
+            );
+            relaunch(args, timings);
+            return Verdict::StartedAgain;
+        }
+        if slept {
+            log(&args.data_dir, "The machine slept; giving the installer as long again");
+            waiting = Instant::now();
         }
     }
 
     log(&args.data_dir, "Ember did not come back after the update; starting it");
-    let mut command = std::process::Command::new(&args.launch);
-    if let Err(error) = detach(&mut command) {
-        log(&args.data_dir, &format!("Could not start Ember: {error}"));
-    }
+    relaunch(args, timings);
     Verdict::Relaunched
+}
+
+/// Whether an Ember that came back stays up until it has taken the resume
+/// file. Without one there is no telling a failed start from a quick quit,
+/// and it counts as settled.
+fn settled(args: &Args, timings: Timings) -> bool {
+    let resume = args.data_dir.join(crate::auto_update::resume::RESUME_FILE);
+    let watching = Instant::now();
+    while resume.exists() && watching.elapsed() < timings.settle {
+        if matches!(lock_is_held(&args.data_dir), Ok(false)) {
+            return !resume.exists();
+        }
+        std::thread::sleep(timings.poll);
+    }
+    true
+}
+
+/// Start the installed Ember, once more after a pause if that fails.
+fn relaunch(args: &Args, timings: Timings) {
+    let start = || detach(&mut std::process::Command::new(&args.launch));
+    if let Err(error) = start() {
+        log(&args.data_dir, &format!("Could not start Ember: {error}; trying once more"));
+        std::thread::sleep(timings.retry);
+        if let Err(error) = start() {
+            log(&args.data_dir, &format!("Could not start Ember: {error}"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -399,7 +498,10 @@ mod tests {
     const FAST: Timings = Timings {
         parent_exit: Duration::from_millis(600),
         relaunch: Duration::from_millis(600),
+        settle: Duration::from_millis(600),
         poll: Duration::from_millis(50),
+        sleep_gap: Duration::from_secs(60),
+        retry: Duration::from_millis(50),
     };
 
     /// Something harmless that exits at once, standing in for Ember.
@@ -443,6 +545,90 @@ mod tests {
         });
         assert_eq!(watch_with(&args, FAST), Verdict::CameBack);
         installer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The new build takes the lock first thing, then fails opening its
+    /// database, before it reaches the resume file.
+    #[test]
+    fn an_ember_that_exits_before_restoring_its_session_is_started_once_more() {
+        let dir = scratch_dir("fails-setup");
+        std::fs::write(dir.join(crate::auto_update::resume::RESUME_FILE), b"{}").unwrap();
+        let old = hold(&dir);
+        let args = Args { data_dir: dir.clone(), launch: harmless_exe() };
+        let relaunch_dir = dir.clone();
+        let installer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(old);
+            std::thread::sleep(Duration::from_millis(150));
+            let new = hold(&relaunch_dir);
+            std::thread::sleep(Duration::from_millis(200));
+            drop(new);
+        });
+        assert_eq!(watch_with(&args, FAST), Verdict::StartedAgain);
+        installer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ember_quit_after_restoring_its_session_is_not_started_again() {
+        let dir = scratch_dir("quit-after-resume");
+        let resume = dir.join(crate::auto_update::resume::RESUME_FILE);
+        std::fs::write(&resume, b"{}").unwrap();
+        let old = hold(&dir);
+        let args = Args { data_dir: dir.clone(), launch: harmless_exe() };
+        let relaunch_dir = dir.clone();
+        let installer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(old);
+            std::thread::sleep(Duration::from_millis(150));
+            let new = hold(&relaunch_dir);
+            std::thread::sleep(Duration::from_millis(150));
+            std::fs::remove_file(&resume).unwrap();
+            drop(new);
+        });
+        assert_eq!(watch_with(&args, FAST), Verdict::CameBack);
+        installer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Instant` keeps counting while the machine sleeps, and the installer
+    /// sleeps with it: on waking it still needs its time.
+    #[test]
+    fn a_machine_that_slept_gives_the_installer_its_time_again() {
+        let every_poll_a_sleep = Timings { sleep_gap: Duration::ZERO, ..FAST };
+        let dir = scratch_dir("slept");
+        let old = hold(&dir);
+        let args = Args { data_dir: dir.clone(), launch: harmless_exe() };
+        let relaunch_dir = dir.clone();
+        let installer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(old);
+            std::thread::sleep(FAST.relaunch * 3);
+            let new = hold(&relaunch_dir);
+            std::thread::sleep(Duration::from_millis(800));
+            drop(new);
+        });
+        assert_eq!(watch_with(&args, every_poll_a_sleep), Verdict::CameBack);
+        installer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_launch_that_fails_is_tried_once_more() {
+        let dir = scratch_dir("cannot-start");
+        let not_ember = dir.join("not-ember.exe");
+        std::fs::write(&not_ember, b"not an executable").unwrap();
+        let old = hold(&dir);
+        let args = Args { data_dir: dir.clone(), launch: not_ember };
+        let exit = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(old);
+        });
+        assert_eq!(watch_with(&args, FAST), Verdict::Relaunched);
+        exit.join().unwrap();
+        let log = std::fs::read_to_string(dir.join(LOG_FILE)).unwrap();
+        assert_eq!(log.matches("Could not start Ember").count(), 2, "{log}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -298,9 +298,14 @@ deletes it, and applies it.
 ```
 
 `reason` is `silent` or `manual`, and `visibility` is one of `tray`,
-`minimized` or `normal`. `bounds` is in physical pixels and absent while
-maximized or minimized; `ed2k` is absent when the user was not on a server. The
-chat window keeps its own position.
+`minimized` or `normal`. `bounds` is in physical pixels: the top-left of the
+window's outer frame and the size of its client area, the pair the window is
+restored with (restoring the outer size as the client size would grow the window
+by its title bar and borders on every update). It is absent while maximized or
+minimized; a maximized window records `maximized_center` instead, the centre of
+its maximized frame, which names the monitor to maximize on again. `ed2k` is
+absent when the user was not on a server. The chat window keeps its own
+position.
 
 `launch_links` exists because the relaunch is handed the old process's
 arguments again: the NSIS installer is passed them as `/ARGS`
@@ -310,9 +315,21 @@ after every update, and bring a tray-hidden window to the front to do it. The
 arguments cannot be cleaned at the source, since the plugin reads them from the
 app's startup environment and offers no way to replace them. Skipping every
 cold-start link after an update would be simpler but would also swallow a link
-the user clicked while the update was relaunching Ember. So the launch drops
-exactly the links whose digests the file lists, stale file or not, and offers
-any other.
+the user clicked while the update was relaunching Ember. So for ten minutes
+after the launch that reads the file, stale file or not, Ember drops each link
+whose digest the file lists, once, and offers any other. That holds for the
+launch's own arguments and for links the single-instance plugin forwards from a
+later launch, which is how the installer's relaunch arrives when the watchdog's
+relaunch or the user opening Ember got there first.
+
+The installer hands the arguments back without the quotes that kept each one
+whole (the NSIS template reads `/ARGS` with `GetOptions`, which strips them, and
+passes the rest on as one string), so an argument holding spaces comes back in
+pieces. The file therefore also lists the pieces that still read as links, and a
+`.emulecollection` path is only taken as a deep link when it is absolute: what is
+left of `C:\Users\John Smith\x.emulecollection` after the split is the relative
+`Smith\x.emulecollection`, and a relative path would be opened against the
+running Ember's working directory anyway.
 
 On launch it is applied like this:
 
@@ -320,11 +337,15 @@ On launch it is applied like this:
   every launch starts hidden and `setup` decides what to show
   (`auto_update::resume::show_main_window`, called once the tray exists). On a
   normal launch it shows the window, as happens now. From a resume file it:
-  - restores the bounds, unless the title bar would land on a monitor that is no
-    longer attached, in which case the window opens centred;
-  - maximizes the window if it was maximized — for a window going back to the
-    tray, the first time it is shown, since maximizing a hidden window shows it
-    on some platforms;
+  - restores the bounds, position first, since a move onto a monitor with
+    another scale rescales whatever size the window has by then; unless the
+    title bar would land on a monitor that is no longer attached, in which case
+    the window opens centred;
+  - maximizes the window if it was maximized, after centring it on the monitor
+    `maximized_center` names if that monitor is still attached — for a window
+    going back to the tray, the first time it is shown, since maximizing a
+    hidden window shows it on some platforms. A tray session waiting for that
+    first showing still counts as maximized if another update comes first;
   - then shows it, minimizes it, or leaves it hidden in the tray. Without a tray
     icon it is always shown, since a hidden window could never be reached.
 
@@ -332,6 +353,17 @@ On launch it is applied like this:
   go through one path. Without this, every silent update would pop Ember onto
   the desktop of someone who keeps it in the tray, which is the one thing they
   would notice.
+
+  Two gaps remain. A maximized or minimized window's normal size and place are
+  not known, so un-maximizing after an update gives the default size, and a
+  minimized window comes back on the primary monitor. Tauri does not report the
+  normal bounds, and tracking them from move and resize events records the
+  maximized frame, since on Windows the move arrives before the window counts as
+  maximized; reading them needs `GetWindowPlacement`. And a minimized window is
+  shown and then minimized, so it appears for a moment; `SetWindowPlacement`
+  with `SW_SHOWMINNOACTIVE` would avoid that, but bypassing the window library
+  leaves its own state saying the window is hidden, and its next change would
+  hide it.
 - **Server.** If `ed2k.connected` was true, the network task starts with
   `pending_auto_connect_server` set and that server as its explicit target,
   whatever `auto_connect_server` says (`network/mod.rs`, the deferred
@@ -469,7 +501,10 @@ passes `/P /R /UPDATE /ARGS …`. So before handing off, Ember starts a
   Running from the installed `ember.exe` would lock the file the installer must
   replace, and the installer's running-app check would kill it by path.
 - It waits up to 3 minutes for Ember to exit, then up to 5 minutes for Ember to
-  be running again. It judges both by probing `instance.lock`, an exclusive lock
+  be running again (30 for an MSI install, whose elevation prompt waits as long
+  as nobody answers it; an Ember started meanwhile would hold the files the
+  install must replace). It judges both by probing `instance.lock`, an exclusive
+  lock
   every Ember takes as the very first step of startup (before migrations or an
   antivirus scan of a new build can hold it up, and retrying briefly, so the
   probe can never make it give up) and holds for its lifetime. It does not look
@@ -478,11 +513,24 @@ passes `/P /R /UPDATE /ARGS …`. So before handing off, Ember starts a
   plugin, whose handler *shows* the window. It is only started by a process
   that holds the lock, so it can never mistake the Ember that started it for a
   relaunch.
+- A poll that overruns by 15 seconds or more means the machine slept, and the
+  wait in progress starts over. Windows' monotonic clock counts through sleep,
+  so on waking every deadline would have passed while the installer, asleep
+  just as long, had not moved on.
+- An Ember that comes back is watched for up to 2 minutes more, until it has
+  taken the resume file, which it does early in setup, once its database and
+  settings have opened. One that lets go of the lock before then failed in its
+  own setup, and the watchdog starts it once more. One that took the file and
+  then exits was quit, and is left alone; so is one launched with no resume
+  file to watch.
 - If Ember is not running by the deadline, it launches the installed executable
-  itself, using only the path it was given at spawn time. That Ember finds the
-  resume file, restores the session, and reports the failed update. The
-  watchdog then exits. The next Ember deletes the watchdog's copy a minute after
-  it starts.
+  itself, using only the path it was given at spawn time, and tries once more
+  ten seconds later if that fails. That Ember finds the resume file, restores
+  the session, and reports the failed update. The watchdog then exits. The next
+  Ember deletes the watchdog's copy a minute after it starts, and tries again
+  each minute for ten minutes while the copy is still running: after a silent
+  install that failed and restarted Ember, the watchdog can miss the moment
+  nobody held the lock and polls on until its own deadline.
 - A manual install whose installer call fails leaves Ember running and the user
   in charge, so Ember leaves a `stand-down` marker beside the watchdog's copy and
   the watchdog exits without relaunching anything, even after the user quits.

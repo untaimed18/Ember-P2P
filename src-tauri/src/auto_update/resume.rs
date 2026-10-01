@@ -13,7 +13,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,6 +37,12 @@ const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SEARCH_TABS_BYTES: usize = 6 * 1024 * 1024;
 const MAX_VERSION_CHARS: usize = 64;
 const MAX_LAUNCH_LINKS: usize = 32;
+/// How long after the launch that read the resume file the links it lists are
+/// still dropped. The installer's relaunch can come after another launch (the
+/// watchdog's, or the user opening Ember) and then reaches the running Ember
+/// through the single-instance plugin; past this, a link is one somebody
+/// clicked.
+const REPLAYED_LINKS_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// How long the frontend has to hand over its page and search tabs. A webview
 /// throttled in the tray still answers events; one that is hung must not hold
 /// up the update.
@@ -81,7 +87,8 @@ pub enum Visibility {
     Normal,
 }
 
-/// Outer bounds in physical pixels.
+/// The outer frame's top-left and the client area's size, in physical pixels:
+/// what `set_position` and `set_size` take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bounds {
     pub x: i32,
@@ -99,6 +106,19 @@ impl Bounds {
     }
 }
 
+/// A point on the desktop in physical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Point {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl Point {
+    fn is_sane(&self) -> bool {
+        i64::from(self.x).abs() <= MAX_EXTENT && i64::from(self.y).abs() <= MAX_EXTENT
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowSnapshot {
     pub visibility: Visibility,
@@ -108,6 +128,10 @@ pub struct WindowSnapshot {
     /// frame or an off-screen parking spot rather than where the window sits.
     #[serde(default)]
     pub bounds: Option<Bounds>,
+    /// While maximized, the centre of the maximized frame: the monitor to
+    /// maximize on again.
+    #[serde(default)]
+    pub maximized_center: Option<Point>,
     /// The chat was popped out into its own window. Its position is kept by the
     /// chat window itself.
     #[serde(default)]
@@ -144,8 +168,9 @@ pub struct ResumeState {
     #[serde(default)]
     pub ui: UiSnapshot,
     /// SHA-256, in hex, of each deep link the writing process was launched
-    /// with. The relaunch after an update is handed those arguments again (the
-    /// NSIS installer's `/ARGS`, `AppHandle::restart`), and they are not links
+    /// with, and of the pieces of one holding spaces that still read as links.
+    /// The relaunch after an update is handed those arguments again (the NSIS
+    /// installer's `/ARGS`, `AppHandle::restart`), and they are not links
     /// anyone just clicked.
     #[serde(default)]
     pub launch_links: Vec<String>,
@@ -195,7 +220,43 @@ pub struct ResumeService {
     /// window shows it on some platforms, so it is maximized the first time it
     /// is shown instead.
     maximize_on_show: AtomicBool,
-    replayed_links: parking_lot::Mutex<Vec<String>>,
+    replayed_links: parking_lot::Mutex<ReplayedLinks>,
+}
+
+/// [`ResumeState::launch_links`], dropped for [`REPLAYED_LINKS_WINDOW`] after
+/// the launch that read them.
+#[derive(Default)]
+struct ReplayedLinks {
+    digests: Vec<String>,
+    until: Option<Instant>,
+}
+
+impl ReplayedLinks {
+    fn arm(&mut self, digests: Vec<String>, now: Instant) {
+        self.digests = digests;
+        self.until = Some(now + REPLAYED_LINKS_WINDOW);
+    }
+
+    /// `payloads` less the listed ones, each listing used up by the link it
+    /// drops, so the same link clicked again afterwards goes through.
+    fn drop_from(&mut self, payloads: Vec<String>, now: Instant) -> Vec<String> {
+        if self.until.is_none_or(|until| now >= until) {
+            self.digests.clear();
+        }
+        payloads
+            .into_iter()
+            .filter(|payload| {
+                let digest = link_digest(payload);
+                match self.digests.iter().position(|listed| *listed == digest) {
+                    Some(index) => {
+                        self.digests.swap_remove(index);
+                        false
+                    }
+                    None => true,
+                }
+            })
+            .collect()
+    }
 }
 
 impl ResumeService {
@@ -228,32 +289,48 @@ fn link_digest(payload: &str) -> String {
 }
 
 /// Digests of the deep links in `args`, as [`ResumeState::launch_links`]
-/// records them.
+/// records them. The NSIS installer hands the arguments back with the quotes
+/// that kept each one whole stripped, so one holding spaces comes back in
+/// pieces.
 fn launch_link_digests(args: &[String]) -> Vec<String> {
-    crate::commands::deeplink::extract_deep_link_payloads(args)
+    use crate::commands::deeplink::extract_deep_link_payloads;
+    let pieces: Vec<String> = std::iter::once(String::new())
+        .chain(
+            args.iter()
+                .skip(1)
+                .flat_map(|arg| arg.split([' ', '\t']))
+                .map(str::to_string),
+        )
+        .collect();
+    let mut digests: Vec<String> = extract_deep_link_payloads(args)
         .iter()
-        .take(MAX_LAUNCH_LINKS)
         .map(|payload| link_digest(payload))
-        .collect()
+        .collect();
+    for piece in extract_deep_link_payloads(&pieces) {
+        let digest = link_digest(&piece);
+        if !digests.contains(&digest) {
+            digests.push(digest);
+        }
+    }
+    digests.truncate(MAX_LAUNCH_LINKS);
+    digests
 }
 
-fn without_replayed(payloads: Vec<String>, replayed: &[String]) -> Vec<String> {
-    payloads
-        .into_iter()
-        .filter(|payload| !replayed.contains(&link_digest(payload)))
-        .collect()
-}
-
-/// The launch's deep links, less those an update restart handed back from the
-/// process it replaced. Matching each link rather than dropping them all keeps
-/// one the user clicked while the update was relaunching Ember.
+/// A launch's deep links, less those an update restart handed back from the
+/// process it replaced, whether on this launch's own command line or forwarded
+/// by the single-instance plugin from a later one. Matching each link rather
+/// than dropping them all keeps one the user clicked while the update was
+/// relaunching Ember.
 pub fn without_replayed_links(app: &AppHandle, payloads: Vec<String>) -> Vec<String> {
-    let replayed = std::mem::take(&mut *app.state::<ResumeService>().replayed_links.lock());
-    if payloads.is_empty() || replayed.is_empty() {
+    if payloads.is_empty() {
         return payloads;
     }
     let given = payloads.len();
-    let kept = without_replayed(payloads, &replayed);
+    let kept = app
+        .state::<ResumeService>()
+        .replayed_links
+        .lock()
+        .drop_from(payloads, Instant::now());
     if kept.len() < given {
         tracing::info!(
             "Not offering again the {} deep link(s) this update restart was relaunched with",
@@ -347,6 +424,7 @@ fn plausible_version(version: &str) -> bool {
 /// Drop every field that is not something this build would have written.
 fn sanitize(mut state: ResumeState) -> ResumeState {
     state.window.bounds = state.window.bounds.filter(Bounds::is_sane);
+    state.window.maximized_center = state.window.maximized_center.filter(Point::is_sane);
     state.ed2k = state.ed2k.filter(|server| {
         server.port != 0 && server.ip.parse::<std::net::IpAddr>().is_ok()
     });
@@ -376,7 +454,7 @@ pub fn begin_launch(app: &AppHandle, dir: &Path) -> Option<WindowSnapshot> {
         );
     }
     *service.outcome.lock() = launch.outcome;
-    *service.replayed_links.lock() = launch.replayed_links;
+    service.replayed_links.lock().arm(launch.replayed_links, Instant::now());
     let state = launch.state?;
     *RESUME_SERVER.lock() = state.ed2k.map(|server| (server.ip, server.port));
     *service.launch_ui.lock() = Some(UiResume {
@@ -397,6 +475,41 @@ fn title_bar_on_screen(bounds: &Bounds, monitors: &[(i64, i64, i64, i64)]) -> bo
     monitors.iter().any(|&(left, top, width, height)| {
         grab_x >= left && grab_x < left + width && grab_y >= top && grab_y < top + height
     })
+}
+
+/// The work area of the attached monitor that `point` lands on.
+fn monitor_at(point: &Point, monitors: &[(i64, i64, i64, i64)]) -> Option<(i64, i64, i64, i64)> {
+    let (x, y) = (i64::from(point.x), i64::from(point.y));
+    monitors.iter().copied().find(|&(left, top, width, height)| {
+        x >= left && x < left + width && y >= top && y < top + height
+    })
+}
+
+/// The top-left that centres a `width` x `height` frame in `area`.
+fn centred_in(area: (i64, i64, i64, i64), width: u32, height: u32) -> (i32, i32) {
+    let (left, top, area_width, area_height) = area;
+    let x = left + (area_width - i64::from(width)) / 2;
+    let y = top + (area_height - i64::from(height)) / 2;
+    (
+        i32::try_from(x).unwrap_or(i32::MAX),
+        i32::try_from(y).unwrap_or(i32::MAX),
+    )
+}
+
+fn work_areas(app: &AppHandle) -> Vec<(i64, i64, i64, i64)> {
+    app.available_monitors()
+        .unwrap_or_default()
+        .iter()
+        .map(|monitor| {
+            let area = monitor.work_area();
+            (
+                i64::from(area.position.x),
+                i64::from(area.position.y),
+                i64::from(area.size.width),
+                i64::from(area.size.height),
+            )
+        })
+        .collect()
 }
 
 /// Show the main window the way the session left it, or the ordinary way when
@@ -421,23 +534,18 @@ pub fn show_main_window(
     };
 
     if let Some(bounds) = snapshot.bounds {
-        let monitors: Vec<(i64, i64, i64, i64)> = app
-            .available_monitors()
-            .unwrap_or_default()
-            .iter()
-            .map(|monitor| {
-                let area = monitor.work_area();
-                (
-                    i64::from(area.position.x),
-                    i64::from(area.position.y),
-                    i64::from(area.size.width),
-                    i64::from(area.size.height),
-                )
-            })
-            .collect();
-        if title_bar_on_screen(&bounds, &monitors) {
-            let _ = window.set_size(tauri::PhysicalSize::new(bounds.width, bounds.height));
+        if title_bar_on_screen(&bounds, &work_areas(app)) {
+            // Moved first: a move onto a monitor with another scale rescales
+            // whatever size the window has by then.
             let _ = window.set_position(tauri::PhysicalPosition::new(bounds.x, bounds.y));
+            let _ = window.set_size(tauri::PhysicalSize::new(bounds.width, bounds.height));
+        }
+    } else if let Some(center) = snapshot.maximized_center.filter(|_| snapshot.maximized) {
+        // A window maximizes on the monitor it is on.
+        let area = monitor_at(&center, &work_areas(app));
+        if let (Some(area), Ok(size)) = (area, window.outer_size()) {
+            let (x, y) = centred_in(area, size.width, size.height);
+            let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
         }
     }
 
@@ -486,12 +594,20 @@ fn capture_window(app: &AppHandle) -> WindowSnapshot {
             visibility: Visibility::Normal,
             maximized: false,
             bounds: None,
+            maximized_center: None,
             chat_window_open,
         };
     };
     let visible = window.is_visible().unwrap_or(true);
     let minimized = window.is_minimized().unwrap_or(false);
-    let maximized = window.is_maximized().unwrap_or(false);
+    let zoomed = window.is_maximized().unwrap_or(false);
+    // A session restored to the tray from a maximized window is maximized only
+    // once it is shown, and is still maximized to the user until then.
+    let maximized = zoomed
+        || app
+            .state::<ResumeService>()
+            .maximize_on_show
+            .load(Ordering::Acquire);
     let visibility = if !visible {
         Visibility::Tray
     } else if minimized {
@@ -499,11 +615,12 @@ fn capture_window(app: &AppHandle) -> WindowSnapshot {
     } else {
         Visibility::Normal
     };
-    let bounds = if maximized || minimized {
+    let position = window.outer_position().ok();
+    let bounds = if zoomed || minimized {
         None
     } else {
-        match (window.outer_position(), window.outer_size()) {
-            (Ok(position), Ok(size)) => Some(Bounds {
+        match (position, window.inner_size()) {
+            (Some(position), Ok(size)) => Some(Bounds {
                 x: position.x,
                 y: position.y,
                 width: size.width,
@@ -513,10 +630,19 @@ fn capture_window(app: &AppHandle) -> WindowSnapshot {
             _ => None,
         }
     };
+    let maximized_center = match (zoomed && !minimized, position, window.outer_size()) {
+        (true, Some(position), Ok(size)) => Some(Point {
+            x: position.x.saturating_add_unsigned(size.width / 2),
+            y: position.y.saturating_add_unsigned(size.height / 2),
+        })
+        .filter(Point::is_sane),
+        _ => None,
+    };
     WindowSnapshot {
         visibility,
         maximized,
         bounds,
+        maximized_center,
         chat_window_open,
     }
 }
@@ -667,6 +793,7 @@ mod tests {
                 visibility: Visibility::Tray,
                 maximized: false,
                 bounds: Some(Bounds { x: 120, y: 80, width: 1400, height: 900 }),
+                maximized_center: None,
                 chat_window_open: false,
             },
             ed2k: Some(ServerSnapshot { ip: "203.0.113.10".to_string(), port: 4661 }),
@@ -726,6 +853,7 @@ mod tests {
         let dir = scratch_dir("sanitize");
         let mut state = sample();
         state.window.bounds = Some(Bounds { x: 0, y: 0, width: 10, height: 10 });
+        state.window.maximized_center = Some(Point { x: 0, y: i32::MIN });
         state.ed2k = Some(ServerSnapshot { ip: "not-an-ip".to_string(), port: 4661 });
         state.ui.route = Some("https://example.com/".to_string());
         state.ui.search_tabs = Some(String::new());
@@ -733,6 +861,7 @@ mod tests {
 
         let restored = take_from(&dir, "1.8.0", NOW).state.unwrap();
         assert_eq!(restored.window.bounds, None);
+        assert_eq!(restored.window.maximized_center, None);
         assert_eq!(restored.ed2k, None);
         assert_eq!(restored.ui.route, None);
         assert_eq!(restored.ui.search_tabs, None);
@@ -798,8 +927,9 @@ mod tests {
         // However long the relaunch took.
         let taken = take_from(&dir, "1.8.0", NOW + MAX_AGE_SECS + 1);
         assert!(taken.state.is_none());
-        let relaunch = crate::commands::deeplink::extract_deep_link_payloads(&args);
-        assert!(without_replayed(relaunch, &taken.replayed_links).is_empty());
+        let now = Instant::now();
+        let mut replayed = ReplayedLinks::default();
+        replayed.arm(taken.replayed_links, now);
 
         let fresh = "ed2k://|file|b.iso|2048|FEDCBA9876543210FEDCBA9876543210|/";
         let clicked = crate::commands::deeplink::extract_deep_link_payloads(&[
@@ -807,8 +937,62 @@ mod tests {
             fresh.to_string(),
         ]);
         assert_eq!(clicked.len(), 1);
-        assert_eq!(without_replayed(clicked.clone(), &taken.replayed_links), clicked);
+        assert_eq!(replayed.drop_from(clicked.clone(), now), clicked);
+
+        let relaunch = crate::commands::deeplink::extract_deep_link_payloads(&args);
+        assert!(replayed.drop_from(relaunch.clone(), now).is_empty());
+        assert_eq!(
+            replayed.drop_from(relaunch.clone(), now),
+            relaunch,
+            "the same link clicked again afterwards is a new one"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The installer's relaunch can arrive after a launch with no links at all
+    /// (the watchdog's, a shortcut), forwarded by the single-instance plugin.
+    #[test]
+    fn replayed_links_wait_for_the_relaunch_but_not_forever() {
+        let old = "ed2k://|file|a.iso|1024|0123456789ABCDEF0123456789ABCDEF|/".to_string();
+        let digests = launch_link_digests(&["ember.exe".to_string(), old.clone()]);
+        let now = Instant::now();
+
+        let mut replayed = ReplayedLinks::default();
+        replayed.arm(digests.clone(), now);
+        assert!(replayed.drop_from(Vec::new(), now).is_empty());
+        let later = now + REPLAYED_LINKS_WINDOW - Duration::from_secs(1);
+        assert!(replayed.drop_from(vec![old.clone()], later).is_empty());
+
+        let mut replayed = ReplayedLinks::default();
+        replayed.arm(digests, now);
+        assert_eq!(
+            replayed.drop_from(vec![old.clone()], now + REPLAYED_LINKS_WINDOW),
+            vec![old]
+        );
+    }
+
+    /// The NSIS installer relaunches with each argument's quotes stripped, so
+    /// one holding spaces comes back as several.
+    #[test]
+    fn a_link_split_at_its_spaces_by_the_relaunch_is_not_offered_again() {
+        fn split(args: &[String]) -> Vec<String> {
+            args.iter().flat_map(|arg| arg.split(' ')).map(str::to_string).collect()
+        }
+        let collection = std::env::temp_dir()
+            .join("John Smith")
+            .join("Downloads")
+            .join("set.emulecollection")
+            .to_string_lossy()
+            .into_owned();
+        let link = "ed2k://|file|my file.iso|1024|0123456789ABCDEF0123456789ABCDEF|/".to_string();
+        for arg in [collection, link] {
+            let args = vec!["ember.exe".to_string(), arg];
+            let now = Instant::now();
+            let mut replayed = ReplayedLinks::default();
+            replayed.arm(launch_link_digests(&args), now);
+            let relaunch = crate::commands::deeplink::extract_deep_link_payloads(&split(&args));
+            assert!(replayed.drop_from(relaunch, now).is_empty(), "{args:?}");
+        }
     }
 
     #[test]
@@ -837,5 +1021,18 @@ mod tests {
         let on_unplugged_right = Bounds { x: 2200, ..bounds };
         assert!(!title_bar_on_screen(&on_unplugged_right, &[primary]));
         assert!(title_bar_on_screen(&on_unplugged_right, &[primary, (1920, 0, 1920, 1080)]));
+    }
+
+    #[test]
+    fn a_maximized_window_goes_back_to_its_monitor_before_maximizing() {
+        let primary = (0, 0, 1920, 1040);
+        let right = (1920, 0, 2560, 1400);
+        // The maximized frame on the right monitor overhangs its edges.
+        let center = Point { x: 1912 + 2576 / 2, y: -8 + 1416 / 2 };
+        let area = monitor_at(&center, &[primary, right]).unwrap();
+        assert_eq!(area, right);
+        let (x, y) = centred_in(area, 1416, 939);
+        assert_eq!((x, y), (1920 + (2560 - 1416) / 2, (1400 - 939) / 2));
+        assert_eq!(monitor_at(&center, &[primary]), None, "unplugged since");
     }
 }

@@ -510,7 +510,9 @@ pub fn run() {
             // a new process with the payload in argv, which this plugin routes
             // here before closing the duplicate. Forward any payload to the
             // existing instance; otherwise just focus the window (the user
-            // re-launched the app to bring it to the front).
+            // re-launched the app to bring it to the front). An update's
+            // relaunch arrives here when another launch beat it, and the links
+            // it carries are the replaced process's.
             let payloads = commands::deeplink::extract_deep_link_payloads(&args);
             if payloads.is_empty() {
                 commands::chat_window::set_chat_window_visible(app, true);
@@ -520,7 +522,10 @@ pub fn run() {
                     let _ = window.set_focus();
                 }
             } else {
-                commands::deeplink::dispatch_deep_links(app, payloads);
+                commands::deeplink::dispatch_deep_links(
+                    app,
+                    auto_update::resume::without_replayed_links(app, payloads),
+                );
             }
         }));
     } else {

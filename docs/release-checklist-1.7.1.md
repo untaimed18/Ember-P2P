@@ -46,19 +46,27 @@ the chat popped out, and a few peers waiting in the upload queue.
 
 - [ ] After the update the window reopens at the same size and position, on
       the same page, connected to that server, with both search tabs and the
-      chat popped out.
+      chat popped out. Update a second time: the window has not grown.
+- [ ] With the window on a second monitor at a different display scale: it
+      reopens there at the same size, not larger or smaller.
 - [ ] Downloads are in the same states; the paused one is still paused.
 - [ ] The Queue tab shows the earlier waiters once the library has loaded, with
       their waiting time kept.
-- [ ] Repeat maximized, and minimized to the taskbar.
+- [ ] Repeat maximized, on the primary monitor and on a second one: it comes
+      back maximized on the same monitor. Un-maximizing then gives the default
+      size (known gap).
+- [ ] Repeat minimized to the taskbar: it comes back minimized (it shows for a
+      moment first, and on the primary monitor; known gaps).
 - [ ] Repeat hidden in the tray: Ember comes back hidden, with nothing flashing
       onto the desktop, and opening it from the tray shows it maximized if it
-      was.
+      was. Update again without opening it in between: still maximized when
+      opened.
 - [ ] Unplug the monitor the window was on before updating: it opens centred on
       one that is there.
 - [ ] Start Ember by clicking an `ed2k://` link, then update: the new version
       does not ask to add that link again, and a tray-hidden session stays in
-      the tray.
+      the tray. Repeat by opening a `.emulecollection` file from a folder whose
+      path has a space in it.
 
 ## 4. Silent updates (Windows NSIS and AppImage)
 
@@ -105,8 +113,25 @@ try that version silently again.
 - [ ] Let Defender (or another antivirus) block the staged installer.
 - [ ] Kill the installer while it runs.
 - [ ] `update-watchdog.log` in the data folder tells each story, and the
-      `update-watchdog` folder is gone a minute after Ember comes back.
+      `update-watchdog` folder is gone a minute after Ember comes back (within
+      about five minutes after a silent install that failed and restarted
+      Ember).
 - [ ] A normal successful update leaves no watchdog running afterwards.
+
+The watchdog's other paths, where the install itself succeeds:
+
+- [ ] Make the new version's first start fail at its database: hold `ember.db`
+      in the data folder open without sharing from another process during the
+      update, and release it once `update-watchdog.log` says Ember is running
+      again (or that it did not come back, if the failed start was quicker
+      than the watchdog's two-second check). Ember is then started once more,
+      on the new version, and restores the session.
+- [ ] Start Ember by clicking an `ed2k://` link and press Install; the moment
+      the installer's progress window closes, open Ember from the Start menu.
+      Whichever start wins, the link is not offered again.
+- [ ] MSI: press Install and leave the elevation prompt unanswered for more
+      than five minutes, then accept it: the install completes and the old
+      Ember was not started in the meantime.
 
 ## 6. Open questions from the design
 

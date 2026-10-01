@@ -266,13 +266,18 @@ pub fn load_pending_queue(app: &AppHandle) -> Vec<PendingDeepLink> {
 }
 
 /// True if `arg` looks like a deep link we should act on: an `ed2k:` URI
-/// (including browser-encoded `ed2k://%7Cfile%7C…` forms), a path ending
-/// in `.emulecollection`, or an in-app Ember invite / friend code.
+/// (including browser-encoded `ed2k://%7Cfile%7C…` forms), an absolute path
+/// ending in `.emulecollection`, or an in-app Ember invite / friend code.
+///
+/// A relative path is not one the OS hands over for a double-clicked file. It
+/// would be opened against the running Ember's working directory, not the
+/// launcher's, and it is what is left of a path with spaces after the NSIS
+/// installer's relaunch has split it.
 pub fn is_deep_link_payload(arg: &str) -> bool {
     let trimmed = arg.trim();
     let lower = trimmed.to_ascii_lowercase();
     crate::network::ed2k::hash::looks_like_ed2k_uri(trimmed)
-        || lower.ends_with(".emulecollection")
+        || (lower.ends_with(".emulecollection") && Path::new(trimmed).is_absolute())
         || lower.starts_with("ember3:")
         || lower.starts_with("ember2:")
         || lower.starts_with("ember-channel:")
@@ -595,6 +600,26 @@ mod tests {
             payloads,
             vec!["ed2k://|file|movie.avi|1234|0123456789abcdef0123456789abcdef|/".to_string()]
         );
+    }
+
+    #[test]
+    fn only_an_absolute_collection_path_is_a_deep_link() {
+        let absolute = std::env::temp_dir()
+            .join("John Smith")
+            .join("set.emulecollection")
+            .to_string_lossy()
+            .into_owned();
+        let split: Vec<String> = std::iter::once("ember.exe")
+            .chain(absolute.split(' '))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            extract_deep_link_payloads(&["ember.exe".to_string(), absolute.clone()]),
+            vec![absolute]
+        );
+        assert!(extract_deep_link_payloads(&split).is_empty());
+        assert!(!is_deep_link_payload("set.emulecollection"));
+        assert!(!is_deep_link_payload(r"Smith\Downloads\set.emulecollection"));
     }
 
     #[test]
