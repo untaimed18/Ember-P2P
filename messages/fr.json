@@ -3545,6 +3545,8 @@
   "channels_xfer_no_reply": "Pas encore de réponse de {name}",
   "channels_xfer_standard_offer_hint": "Cette personne utilise peut-être une ancienne version d’Ember qui ne peut pas lire les offres privées. Une offre standard permet aux membres qui la relaient de voir le nom et la taille du fichier.",
   "channels_xfer_send_standard_offer": "Envoyer une offre standard",
+  "channels_xfer_no_reply_elsewhere": "Pas encore de réponse pour un fichier que vous avez proposé dans {room}",
+  "channels_xfer_no_reply_elsewhere_unknown": "Pas encore de réponse pour un fichier que vous avez proposé dans un autre salon",
   "error_channels_xfer_self": "Vous ne pouvez pas vous envoyer un fichier",
   "error_channels_xfer_no_member": "Ce membre n’est pas dans ce salon",
   "error_channels_xfer_too_large": "Les fichiers doivent faire entre 1 octet et 2 Go",

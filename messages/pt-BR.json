@@ -3545,6 +3545,8 @@
   "channels_xfer_no_reply": "{name} ainda não respondeu",
   "channels_xfer_standard_offer_hint": "Talvez a pessoa use uma versão antiga do Ember que não lê ofertas privadas. Com uma oferta padrão, os membros que a repassam veem o nome e o tamanho do arquivo.",
   "channels_xfer_send_standard_offer": "Enviar oferta padrão",
+  "channels_xfer_no_reply_elsewhere": "Ainda sem resposta para um arquivo que você ofereceu em {room}",
+  "channels_xfer_no_reply_elsewhere_unknown": "Ainda sem resposta para um arquivo que você ofereceu em outra sala",
   "error_channels_xfer_self": "Você não pode enviar um arquivo para si mesmo",
   "error_channels_xfer_no_member": "Esse membro não está nesta sala",
   "error_channels_xfer_too_large": "Os arquivos devem ter entre 1 byte e 2 GB",

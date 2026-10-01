@@ -18,7 +18,25 @@ with a **Send standard offer** button (`send_channel_transfer_standard_offer`).
 That sends the held offer once, and only while the transfer is still waiting
 and unread. A 1.7.0 recipient ignores it as a repeat; a 1.6 recipient prompts
 on it. A forwarder that drops "seen" can bring the question up but cannot make
-the offer go out.
+the offer go out. Like an incoming offer, the question opens the members pane
+and the transfer drawer, counts on the members button, and shows a toast when
+the room is not on screen.
+
+Sending the standard offer starts the sender's unanswered-offer window again
+(`XFER_OFFER_TTL_SECS` plus 30 s): a 1.6 prompt only starts when the offer
+lands, and the stall cancel the sender sends when it gives up takes that prompt
+down. The standard offer travels through room members only: other transfer
+frames fall back to up to three non-member contacts when no member is
+reachable. In a public room those could read the offer, and since a hand-off
+to them counts as not sent, every retry would have handed it to more of them.
+No plain offer is held for a file over 100 MiB (`V1_6_XFER_MAX_BYTES`), since
+1.6 drops that offer unread: the sender is not asked, and the offer expires
+with the message that members on 1.6 or earlier cannot receive files over
+100 MB.
+
+A 1.7.0 recipient keeps no record of a decline, so a standard offer clicked
+while that recipient's decline is still on its way brings up a second prompt
+there. 1.7.1 remembers declines.
 
 Members proven to read sealed offers are remembered in the database
 (`sealed_offer_readers`, created on first use so the schema stays at 62 and
@@ -27,7 +45,12 @@ Members proven to read sealed offers are remembered in the database
 never asked about. The proof is a frame 1.6.x never sends whose authentication
 names the member: a "seen", sealed offer or sealed stream frame (pairwise
 transfer key), a typing signal or a room friend request (the member's
-signature). Only members on the room's roster are recorded. A 1.7.0 recipient
+signature). Only members on the room's roster are recorded. A public room's
+roster takes new identities for free, so only the 4,096 most recently proven
+members are kept (`SEALED_OFFER_READERS_MAX`); one that drops off is asked
+about again. A proof dated more than a day ahead
+(`SEALED_OFFER_READER_MAX_FUTURE_SECS`) was written while the clock was wrong:
+it counts for nothing, and the next proof replaces it. A 1.7.0 recipient
 never sends "seen", so its sender is asked until that member has typed, sent a
 sealed offer or stream frame, or asked for a friendship in a shared room.
 
@@ -78,6 +101,14 @@ Transfer frames are authenticated pairwise but carry no sequence number. Replays
 of the other end's own frames are contained by the state machines (first offer
 wins, accept once, peer checks), not by cryptography. Consider binding frames to
 a per-transfer counter or phase.
+
+Offers are the visible case. A member an offer was forwarded through can wrap
+it in a fresh gossip envelope once the recipient no longer remembers the
+transfer (`XFER_FINISHED_REMEMBER`, 180 s after it ended or was declined, and
+at once after its prompt expired) and put the prompt up again for a transfer
+the sender has dropped; accepting it only stalls. A replayed sealed offer also
+renews its sender's entry in `sealed_offer_readers`. An offer timestamp under
+the pairwise tag would let the recipient refuse one older than the offer window.
 
 ### 4. Tighter use of claimed public addresses (low)
 

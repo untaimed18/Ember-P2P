@@ -3545,6 +3545,8 @@
   "channels_xfer_no_reply": "{name} 尚未回复",
   "channels_xfer_standard_offer_hint": "对方可能在使用无法读取私密请求的旧版 Ember。发送标准请求后，转发它的成员可以看到文件的名称和大小。",
   "channels_xfer_send_standard_offer": "发送标准请求",
+  "channels_xfer_no_reply_elsewhere": "你在 {room} 中发出的文件请求尚未得到回复",
+  "channels_xfer_no_reply_elsewhere_unknown": "你在另一个房间中发出的文件请求尚未得到回复",
   "error_channels_xfer_self": "不能给自己发送文件",
   "error_channels_xfer_no_member": "该成员不在此房间中",
   "error_channels_xfer_too_large": "文件大小必须在 1 字节到 2 GB 之间",

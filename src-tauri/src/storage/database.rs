@@ -8162,25 +8162,41 @@ impl Database {
     }
 
     /// Record that the room member with Ed25519 key `member_pubkey` (hex)
-    /// proved at `now` that it reads sealed transfer offers, and forget every
-    /// member last proven before `forget_before`.
+    /// proved at `now` that it reads sealed transfer offers. Forget every
+    /// member last proven before `forget_before` or too far after `now` (a
+    /// proof written while our clock was wrong), and all but the
+    /// `keep_at_most` most recently proven.
     pub fn note_sealed_offer_reader(
         &self,
         member_pubkey: &str,
         now: i64,
         forget_before: i64,
+        keep_at_most: usize,
     ) -> anyhow::Result<()> {
+        let future_after = now.saturating_add(
+            crate::network::ember::xfer::SEALED_OFFER_READER_MAX_FUTURE_SECS,
+        );
         let conn = self.conn.lock();
         Self::ensure_sealed_offer_readers_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO sealed_offer_readers (member_pubkey, last_seen) VALUES (?1, ?2)
-             ON CONFLICT(member_pubkey) DO UPDATE SET last_seen = MAX(last_seen, excluded.last_seen)",
-            params![member_pubkey.to_ascii_lowercase(), now],
+             ON CONFLICT(member_pubkey) DO UPDATE SET last_seen =
+                CASE WHEN last_seen > ?3 THEN excluded.last_seen
+                     ELSE MAX(last_seen, excluded.last_seen) END",
+            params![member_pubkey.to_ascii_lowercase(), now, future_after],
         )?;
         tx.execute(
-            "DELETE FROM sealed_offer_readers WHERE last_seen < ?1",
-            params![forget_before],
+            "DELETE FROM sealed_offer_readers WHERE last_seen < ?1 OR last_seen > ?2",
+            params![forget_before, future_after],
+        )?;
+        tx.execute(
+            "DELETE FROM sealed_offer_readers WHERE member_pubkey IN (
+                SELECT member_pubkey FROM sealed_offer_readers
+                 ORDER BY last_seen DESC, member_pubkey ASC
+                 LIMIT -1 OFFSET ?1
+             )",
+            params![keep_at_most as i64],
         )?;
         tx.commit()?;
         Ok(())
@@ -14637,9 +14653,9 @@ mod tests {
         {
             let db = Database::open_at(&path).expect("open db");
             assert_eq!(db.sealed_offer_reader_seen_at(&alice).unwrap(), None);
-            db.note_sealed_offer_reader(&alice, 1_000, 0).unwrap();
-            db.note_sealed_offer_reader(&alice, 900, 0).unwrap();
-            db.note_sealed_offer_reader(&bob, 500, 0).unwrap();
+            db.note_sealed_offer_reader(&alice, 1_000, 0, 16).unwrap();
+            db.note_sealed_offer_reader(&alice, 900, 0, 16).unwrap();
+            db.note_sealed_offer_reader(&bob, 500, 0, 16).unwrap();
             assert_eq!(
                 db.sealed_offer_reader_seen_at(&alice.to_ascii_lowercase()).unwrap(),
                 Some(1_000),
@@ -14649,9 +14665,56 @@ mod tests {
         let db = Database::open_at(&path).expect("reopen db");
         assert_eq!(db.sealed_offer_reader_seen_at(&alice).unwrap(), Some(1_000));
         assert_eq!(db.sealed_offer_reader_seen_at(&bob).unwrap(), Some(500));
-        db.note_sealed_offer_reader(&alice, 2_000, 600).unwrap();
+        db.note_sealed_offer_reader(&alice, 2_000, 600, 16).unwrap();
         assert_eq!(db.sealed_offer_reader_seen_at(&bob).unwrap(), None, "aged out");
         assert_eq!(db.sealed_offer_reader_seen_at(&alice).unwrap(), Some(2_000));
+        drop(db);
+        remove_temp_db(&path);
+    }
+
+    /// A proof written while the clock ran far ahead gives way to the next
+    /// proof, and one nobody renews is forgotten, rather than either counting
+    /// until that date plus the keep time. A little ahead still wins.
+    #[test]
+    fn a_sealed_offer_reader_proven_under_a_fast_clock_is_not_kept() {
+        use crate::network::ember::xfer::SEALED_OFFER_READER_MAX_FUTURE_SECS as AHEAD;
+        let path = temp_db_path("sealed-readers-future");
+        let db = Database::open_at(&path).expect("open db");
+        let (alice, bob, carol) = ("a1".repeat(32), "b0".repeat(32), "c2".repeat(32));
+        let now = 1_000_000;
+        db.note_sealed_offer_reader(&alice, now + AHEAD + 1, 0, 16).unwrap();
+        db.note_sealed_offer_reader(&bob, now + AHEAD + 1, 0, 16).unwrap();
+        db.note_sealed_offer_reader(&carol, now + 60, 0, 16).unwrap();
+
+        db.note_sealed_offer_reader(&alice, now, 0, 16).unwrap();
+        assert_eq!(db.sealed_offer_reader_seen_at(&alice).unwrap(), Some(now), "overwritten");
+        assert_eq!(db.sealed_offer_reader_seen_at(&bob).unwrap(), None, "forgotten");
+        db.note_sealed_offer_reader(&carol, now, 0, 16).unwrap();
+        assert_eq!(db.sealed_offer_reader_seen_at(&carol).unwrap(), Some(now + 60));
+        drop(db);
+        remove_temp_db(&path);
+    }
+
+    /// However many identities prove themselves, only the most recently
+    /// proven are kept.
+    #[test]
+    fn sealed_offer_readers_are_capped_newest_first() {
+        let path = temp_db_path("sealed-readers-cap");
+        let db = Database::open_at(&path).expect("open db");
+        let member = |i: u8| format!("{i:02x}").repeat(32);
+        for i in 0..6u8 {
+            db.note_sealed_offer_reader(&member(i), 1_000 + i as i64, 0, 4).unwrap();
+        }
+        for i in 0..2u8 {
+            assert_eq!(db.sealed_offer_reader_seen_at(&member(i)).unwrap(), None, "oldest {i} made way");
+        }
+        for i in 2..6u8 {
+            assert_eq!(db.sealed_offer_reader_seen_at(&member(i)).unwrap(), Some(1_000 + i as i64));
+        }
+        db.note_sealed_offer_reader(&member(2), 2_000, 0, 4).unwrap();
+        db.note_sealed_offer_reader(&member(9), 2_001, 0, 4).unwrap();
+        assert_eq!(db.sealed_offer_reader_seen_at(&member(2)).unwrap(), Some(2_000), "renewed, so kept");
+        assert_eq!(db.sealed_offer_reader_seen_at(&member(3)).unwrap(), None);
         drop(db);
         remove_temp_db(&path);
     }

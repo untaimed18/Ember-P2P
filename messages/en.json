@@ -3558,6 +3558,8 @@
   "channels_xfer_no_reply": "No reply from {name} yet",
   "channels_xfer_standard_offer_hint": "They may be on an older Ember that cannot read private offers. A standard offer lets the members relaying it see the file's name and size.",
   "channels_xfer_send_standard_offer": "Send standard offer",
+  "channels_xfer_no_reply_elsewhere": "No reply yet to a file you offered in {room}",
+  "channels_xfer_no_reply_elsewhere_unknown": "No reply yet to a file you offered in another room",
   "error_channels_xfer_self": "You cannot send a file to yourself",
   "error_channels_xfer_no_member": "That member is not in this room",
   "error_channels_xfer_too_large": "Files must be between 1 byte and 2 GB",

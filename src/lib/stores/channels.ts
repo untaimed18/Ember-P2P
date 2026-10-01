@@ -687,6 +687,14 @@ export function xferNeedsConsent(xfer: ChannelTransferInfo): boolean {
   return xfer.direction === 'send' && xfer.status === 'offered' && xfer.awaiting_consent === true;
 }
 
+/** Whether an update puts that question up, rather than repeating it. */
+export function xferStartsAsking(
+  prior: ChannelTransferInfo | undefined,
+  next: ChannelTransferInfo,
+): boolean {
+  return xferNeedsConsent(next) && !(prior && xferNeedsConsent(prior));
+}
+
 const TERMINAL_XFER: ReadonlyArray<ChannelTransferInfo['status']> = [
   'complete',
   'declined',
@@ -729,6 +737,21 @@ function toastXferOffer(channelId: string, peerPubkey?: string): void {
     room
       ? m.channels_xfer_offer_elsewhere({ room: room.name })
       : m.channels_xfer_offer_elsewhere_unknown(),
+  );
+}
+
+/** The question about a standard offer, for a user who is not looking at the
+ *  room it is in. No room setting holds it back: it is about the user's own
+ *  file, and unanswered the offer expires unseen by a 1.6 recipient. */
+function toastXferConsent(channelId: string): void {
+  if (isAppVisible() && (channelIsOnScreen(channelId) || get(activeChannelId) === channelId)) {
+    return;
+  }
+  const room = get(channels).find((c) => c.channel_id === channelId);
+  toast(
+    room
+      ? m.channels_xfer_no_reply_elsewhere({ room: room.name })
+      : m.channels_xfer_no_reply_elsewhere_unknown(),
   );
 }
 
@@ -1156,7 +1179,12 @@ export async function initChannelsStore() {
         if (myEpoch !== storeEpoch) return;
         const t = event.payload;
         if (!t?.xfer_id) return;
+        const prior = get(channelTransfers)[t.xfer_id];
         channelTransfers.update((cur) => ({ ...cur, [t.xfer_id]: t }));
+        if (xferStartsAsking(prior, t)) {
+          const channelId = validChannelId(t.channel_id);
+          if (channelId) toastXferConsent(channelId);
+        }
         if (TERMINAL_XFER.includes(t.status)) {
           scheduleXferClear(t.xfer_id, myEpoch);
         }

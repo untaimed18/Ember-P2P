@@ -26,6 +26,7 @@ import {
   totalChannelUnread,
   unreadBadgeTone,
   xferNeedsConsent,
+  xferStartsAsking,
 } from './channels';
 import { listChannels, type ChannelInfo, type ChannelTransferInfo } from '$lib/api/channels';
 
@@ -411,6 +412,14 @@ describe('xferNeedsConsent', () => {
     expect(xferNeedsConsent(sent({ awaiting_consent: false }))).toBe(false);
     expect(xferNeedsConsent(sent({ awaiting_consent: true, status: 'active' }))).toBe(false);
     expect(xferNeedsConsent(sent({ awaiting_consent: true, direction: 'receive' }))).toBe(false);
+  });
+
+  it('puts the question up once, however often it is repeated', () => {
+    const asking = sent({ awaiting_consent: true });
+    expect(xferStartsAsking(undefined, asking)).toBe(true);
+    expect(xferStartsAsking(sent(), asking)).toBe(true);
+    expect(xferStartsAsking(asking, asking)).toBe(false);
+    expect(xferStartsAsking(asking, sent())).toBe(false);
   });
 });
 

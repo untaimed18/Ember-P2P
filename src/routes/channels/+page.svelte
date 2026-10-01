@@ -2263,7 +2263,11 @@
     return () => clearInterval(timer);
   });
 
-  let roomOffersWaiting = $derived(roomTransfers.filter((t) => t.status === 'awaiting').length);
+  /** Offers waiting on this user: one to answer, or their own one asking
+   *  whether to send the standard offer. */
+  let roomOffersWaiting = $derived(
+    roomTransfers.filter((t) => t.status === 'awaiting' || xferNeedsConsent(t)).length,
+  );
   let membersToggleLabel = $derived.by(() => {
     if (membersOpen) return m.channels_hide_members();
     if (roomOffersWaiting === 0) return m.channels_show_members();
@@ -2286,26 +2290,28 @@
   /** A new offer in the room on screen brings the members pane out with the
    *  drawer open, where Accept and Deny are. Not on narrow layouts, where
    *  the pane covers the conversation: there the badge on the toggle says it. */
+  function bringOutXferDrawer() {
+    xferCollapsed = false;
+    if (!membersOpen && typeof window !== 'undefined' && !window.matchMedia(MQ_MAX_LG).matches) {
+      membersOpen = true;
+    }
+  }
   const offersSeen = new Set<string>();
   $effect(() => {
     const fresh = roomTransfers.filter((t) => t.status === 'awaiting' && !offersSeen.has(t.xfer_id));
     if (fresh.length === 0) return;
     for (const t of fresh) offersSeen.add(t.xfer_id);
-    untrack(() => {
-      xferCollapsed = false;
-      if (!membersOpen && typeof window !== 'undefined' && !window.matchMedia(MQ_MAX_LG).matches) {
-        membersOpen = true;
-      }
-    });
+    untrack(bringOutXferDrawer);
   });
 
-  /** The question about a standard offer opens the drawer, where its button is. */
+  /** The question about a standard offer is brought out the same way, since
+   *  its button is in the drawer too. */
   const consentAsked = new Set<string>();
   $effect(() => {
     const fresh = roomTransfers.filter((t) => xferNeedsConsent(t) && !consentAsked.has(t.xfer_id));
     if (fresh.length === 0) return;
     for (const t of fresh) consentAsked.add(t.xfer_id);
-    untrack(() => (xferCollapsed = false));
+    untrack(bringOutXferDrawer);
   });
 </script>
 

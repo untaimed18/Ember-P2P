@@ -3545,6 +3545,8 @@
   "channels_xfer_no_reply": "Ancora nessuna risposta da {name}",
   "channels_xfer_standard_offer_hint": "Potrebbe usare una versione precedente di Ember che non legge le offerte private. Con un’offerta standard, i membri che la inoltrano vedono il nome e la dimensione del file.",
   "channels_xfer_send_standard_offer": "Invia offerta standard",
+  "channels_xfer_no_reply_elsewhere": "Ancora nessuna risposta per un file che hai offerto in {room}",
+  "channels_xfer_no_reply_elsewhere_unknown": "Ancora nessuna risposta per un file che hai offerto in un’altra stanza",
   "error_channels_xfer_self": "Non puoi inviare un file a te stesso",
   "error_channels_xfer_no_member": "Quel membro non è in questa stanza",
   "error_channels_xfer_too_large": "I file devono essere tra 1 byte e 2 GB",

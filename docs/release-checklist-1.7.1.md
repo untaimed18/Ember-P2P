@@ -177,19 +177,29 @@ git diff v1.7.0 -- messages/en.json
 
 - [ ] 1.7.1 to 1.7.1: the recipient's prompt appears at once, and one prompt
       only. The sender's card never shows **Send standard offer**.
-- [ ] 1.7.1 to 1.7.0, a member the sender has not seen type in a room: the
-      recipient's prompt appears at once. After about 10 seconds the sender's
-      card says there is no reply yet and offers **Send standard offer**; the
-      question goes away when the recipient accepts or declines. Clicking it
-      before then sends one standard offer, and the recipient sees no second
-      prompt, whether the first is still open, accepted or finished.
+- [ ] 1.7.1 to 1.7.0, a member the sender has not seen type in a room, a file
+      under 100 MB: the recipient's prompt appears at once. After about 10
+      seconds the sender's card says there is no reply yet and offers **Send
+      standard offer**; the question goes away when the recipient accepts or
+      declines. Clicking it before then sends one standard offer, and the
+      recipient sees no second prompt, whether the first is still open,
+      accepted or finished.
 - [ ] 1.7.1 to 1.7.0 after that member has typed in a room the sender is in
       (also after restarting the sender): no question appears on the sender's
       card.
 - [ ] 1.7.1 to 1.6.x: nothing appears on the recipient's side until the sender
       clicks **Send standard offer** (about 10 seconds after offering); then the
       prompt appears and the transfer completes. Without the click the offer
-      expires unseen.
+      expires unseen. Clicking late, four minutes after offering, still leaves
+      the recipient's prompt up for its full five minutes, and accepting near
+      the end of them completes the transfer.
+- [ ] 1.7.1 to 1.6.x with a file over 100 MB: the sender's card never shows
+      **Send standard offer**, nothing appears on the recipient's side, and
+      the offer expires with the message that members on 1.6 or earlier cannot
+      receive files over 100 MB.
+- [ ] With the members pane closed, the question opens it in a wide window and
+      counts on the members button in a narrow one. On another page, or in
+      another room, it shows a toast naming the room.
 - [ ] A recipient that goes offline before answering: the sender's question
       stays until the transfer ends; clicking it while the member cannot be
       reached says so and leaves the button there to try again.

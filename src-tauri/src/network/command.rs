@@ -3233,7 +3233,7 @@ async fn handle_command_inner(
             // and the user is asked about it if the recipient stays silent.
             let mut send =
                 ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path.clone());
-            if !member_reads_sealed_offers(state, db, &peer) {
+            if ember::xfer::holds_plain_offer(size, member_reads_sealed_offers(state, db, &peer)) {
                 send.hold_plain_offer(
                     ember::channel::encode_xfer_offer(&key, &offer),
                     std::time::Instant::now()
@@ -3599,7 +3599,7 @@ async fn handle_command_inner(
                 )));
                 return;
             }
-            if !send_xfer_frame(socket, state, db, channel_id, peer, &frame).await {
+            if !send_xfer_frame_within_room(socket, state, db, channel_id, peer, &frame).await {
                 if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
                     send.ask_again(frame);
                 }
@@ -3609,7 +3609,8 @@ async fn handle_command_inner(
                 )));
                 return;
             }
-            if let Some(send) = state.xfer_send.get(&xfer_id) {
+            if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
+                send.plain_offer_sent(std::time::Instant::now());
                 emit_xfer_send_update(app_handle, &xfer_id, send);
             }
             let _ = tx.send(Ok(()));

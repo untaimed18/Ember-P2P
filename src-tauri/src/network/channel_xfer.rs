@@ -59,6 +59,34 @@ pub(super) async fn send_xfer_frame(
     peer: [u8; 32],
     plain: &[u8],
 ) -> bool {
+    send_xfer_frame_via(socket, state, db, channel_id, peer, plain, false).await
+}
+
+/// [`send_xfer_frame`] for a frame every member carrying it can read: the
+/// plain offer. Its overlay rung goes through members only, never the
+/// non-member hops the ladder otherwise falls back to. In a public room those
+/// can read it too, and a hand-off to them counts as not sent, so each retry
+/// would give it to more of them.
+pub(super) async fn send_xfer_frame_within_room(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    channel_id: [u8; 16],
+    peer: [u8; 32],
+    plain: &[u8],
+) -> bool {
+    send_xfer_frame_via(socket, state, db, channel_id, peer, plain, true).await
+}
+
+async fn send_xfer_frame_via(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    channel_id: [u8; 16],
+    peer: [u8; 32],
+    plain: &[u8],
+    members_only: bool,
+) -> bool {
     let Some(view) = cached_channel_view(state, db, channel_id) else {
         return false;
     };
@@ -94,7 +122,11 @@ pub(super) async fn send_xfer_frame(
         }
     }
     let roster = channel_member_pubkeys_cached(state, db, channel_id);
-    overlay_forward_channel_gossip(socket, state, &channel_id, &body, &[peer], &roster).await
+    let (hops, via_members) = overlay_channel_hops(state, &[peer], &roster);
+    if members_only && !via_members {
+        return false;
+    }
+    overlay_send_channel_gossip(socket, state, &channel_id, &body, &[peer], &hops, via_members).await
 }
 
 // --- QUIC streams ------------------------------------------------------------
@@ -749,11 +781,13 @@ async fn sync_xfer_streams(
         let Some(send) = state.xfer_send.get_mut(&xfer_id) else {
             continue;
         };
-        send.note_streamed(position);
+        let question_down = send.note_streamed(position);
         if send.progress_step().is_some() {
             let (channel_id, peer, name, size, sent) =
                 (send.channel_id, send.peer, send.name.clone(), send.size, send.bytes_sent());
             emit_xfer_update(app_handle, &xfer_id, &channel_id, &peer, "send", &name, size, sent, "active");
+        } else if question_down {
+            emit_xfer_send_update(app_handle, &xfer_id, send);
         }
     }
 
@@ -1052,7 +1086,8 @@ const SEALED_OFFER_READER_CACHE_CAP: usize = 4096;
 /// Call only for a frame 1.6.x never sends whose authentication names
 /// `member` — its signature, or the pairwise transfer key — so that a member
 /// forwarding it cannot have made it. Only members on the room's roster are
-/// written, so fresh identities cannot fill the table.
+/// written. A public room's roster takes fresh identities for free, so the
+/// table also keeps only the newest [`ember::xfer::SEALED_OFFER_READERS_MAX`].
 pub(super) fn note_sealed_offer_reader(
     state: &mut NetworkState,
     db: &Database,
@@ -1071,15 +1106,19 @@ pub(super) fn note_sealed_offer_reader(
         }
     }
     let now = chrono::Utc::now().timestamp();
-    if state
-        .sealed_offer_readers
-        .get(member)
-        .is_some_and(|at| now.saturating_sub(*at) < SEALED_OFFER_READER_REWRITE_SECS)
-    {
+    if state.sealed_offer_readers.get(member).is_some_and(|at| {
+        ember::xfer::sealed_offer_reader_current(Some(*at), now)
+            && now.saturating_sub(*at) < SEALED_OFFER_READER_REWRITE_SECS
+    }) {
         return;
     }
     let forget_before = now.saturating_sub(ember::xfer::SEALED_OFFER_READER_KEEP_SECS);
-    if let Err(e) = db.note_sealed_offer_reader(&hex::encode(member), now, forget_before) {
+    if let Err(e) = db.note_sealed_offer_reader(
+        &hex::encode(member),
+        now,
+        forget_before,
+        ember::xfer::SEALED_OFFER_READERS_MAX,
+    ) {
         warn!("Ember Transfer: could not remember a member that reads sealed offers: {e}");
         return;
     }
