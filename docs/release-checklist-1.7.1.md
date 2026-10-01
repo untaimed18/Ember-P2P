@@ -300,3 +300,10 @@ git diff v1.7.0 -- messages/en.json
       the log shows no `UDP reader: ... queue full`.
 - [ ] `"quic_shares_udp_port": false` in `config.json` brings back the separate
       socket: the endpoint line shows the TCP port and no "shared".
+- [ ] As a LowID node with one friend relay, start a download with eight or more
+      firewalled sources: the log shows at most two relay attempts through that
+      relay at once, the rest wait or take another relay, and the friend's
+      relay is still listed afterwards (no `dropping relay candidate`).
+- [ ] A relayed LowID download completes whole, and the relay's session ends
+      within seconds of the transfer finishing rather than after its two-minute
+      idle timeout.

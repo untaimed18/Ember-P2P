@@ -124,7 +124,7 @@ const MAX_CONCURRENT_RELAY_SESSIONS: usize = 4;
 const MAX_RELAY_SESSIONS_CEILING: usize = 64;
 /// Sessions one requester may hold at once. Below the default total so that one
 /// friend, however many transfers it has queued, leaves the others a slot.
-const MAX_RELAY_SESSIONS_PER_REQUESTER: usize = 2;
+pub(super) const MAX_RELAY_SESSIONS_PER_REQUESTER: usize = 2;
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const RELAY_MAX_DURATION: Duration = Duration::from_secs(7200);
 /// Age at which cleanup reaps an active session. Past the longest a bridge can
@@ -136,6 +136,9 @@ const RELAY_ACTIVE_BACKSTOP: Duration = Duration::from_secs(RELAY_MAX_DURATION.a
 /// that is still alive has sent something by then.
 const RELAY_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const RELAY_BRIDGE_IDLE_CHECK: Duration = Duration::from_secs(10);
+/// How long an ended bridge waits for each peer to acknowledge what was still
+/// on its way to it.
+const RELAY_BRIDGE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WS_RELAY_FRAME: usize = 16 * 1024;
 
 /// A relay session between two LowID peers through an intermediary.
@@ -1366,12 +1369,32 @@ pub async fn connect_to_peer_relay(
     )
     .await
     .map_err(|_| RelayDialError::unreachable("relay QUIC handshake timed out"))?
-    .map_err(|e| RelayDialError::unreachable(format!("relay QUIC handshake failed: {e}")))?;
+    .map_err(|e| {
+        // A relay refuses a handshake when it is full, but the refusal comes
+        // before any certificate, so anyone at the address can send it: the
+        // relay is passed over for a while and still charged.
+        let refused = matches!(
+            e.downcast_ref::<quinn::ConnectionError>(),
+            Some(quinn::ConnectionError::ConnectionClosed(close))
+                if close.error_code == quinn::TransportErrorCode::CONNECTION_REFUSED
+        );
+        RelayDialError {
+            relay_busy: refused,
+            ..RelayDialError::unreachable(format!("relay QUIC handshake failed: {e}"))
+        }
+    })?;
+    let lost = |reason: String| {
+        if relay_closed_for_capacity(&conn) {
+            RelayDialError::busy(format!("relay at capacity: {reason}"))
+        } else {
+            RelayDialError::unreachable(reason)
+        }
+    };
 
     let (mut send, mut recv) = tokio::time::timeout(RELAY_CONTROL_TIMEOUT, conn.open_bi())
         .await
         .map_err(|_| RelayDialError::unreachable("relay open_bi timed out"))?
-        .map_err(|e| RelayDialError::unreachable(format!("relay open_bi failed: {e}")))?;
+        .map_err(|e| lost(format!("relay open_bi failed: {e}")))?;
 
     let session_id = rand::random::<u32>();
     let request = build_relay_request(
@@ -1389,7 +1412,7 @@ pub async fn connect_to_peer_relay(
     tokio::time::timeout(RELAY_CONTROL_TIMEOUT, send.write_all(&request))
         .await
         .map_err(|_| RelayDialError::unreachable("relay write request timed out"))?
-        .map_err(|e| RelayDialError::unreachable(format!("relay write request: {e}")))?;
+        .map_err(|e| lost(format!("relay write request: {e}")))?;
 
     // Read header first (always 7 bytes: msg_type | session_id | payload_len),
     // then drain the payload by length so we don't desynchronize the
@@ -1400,7 +1423,7 @@ pub async fn connect_to_peer_relay(
     let mut resp_header = [0u8; 7];
     read_relay_control_within(&mut recv, &mut resp_header, "relay read response", RELAY_RESPONSE_TIMEOUT)
         .await
-        .map_err(RelayDialError::unreachable)?;
+        .map_err(lost)?;
     let payload_len = u16::from_le_bytes([resp_header[5], resp_header[6]]) as usize;
     if payload_len > 64 * 1024 {
         return Err(RelayDialError::unreachable(format!(
@@ -1411,7 +1434,7 @@ pub async fn connect_to_peer_relay(
     if payload_len > 0 {
         read_relay_control(&mut recv, &mut payload_buf, "relay read response payload")
             .await
-            .map_err(RelayDialError::unreachable)?;
+            .map_err(lost)?;
     }
     let mut full = Vec::with_capacity(7 + payload_len);
     full.extend_from_slice(&resp_header);
@@ -1922,6 +1945,22 @@ const QUIC_PENDING_PER_IP: usize = 4;
 const QUIC_ACTIVE_PER_PRINCIPAL: usize = 4;
 const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const QUIC_FIRST_STREAM_TIMEOUT: Duration = Duration::from_secs(8);
+/// Close reasons for a connection the accept loop has no room for. It closes
+/// before reading a request, so no REJECT can carry that answer, and 1.7.0
+/// relays send the same bytes.
+const CLOSE_FRIEND_RESERVE: &[u8] = b"friend reserve requires pinned identity";
+const CLOSE_NO_SESSION_CAPACITY: &[u8] = b"no session capacity";
+const CLOSE_PRINCIPAL_CAP: &[u8] = b"active principal session cap reached";
+
+/// Whether the relay closed `conn` for want of room.
+fn relay_closed_for_capacity(conn: &quinn::Connection) -> bool {
+    matches!(
+        conn.close_reason(),
+        Some(quinn::ConnectionError::ApplicationClosed(close))
+            if [CLOSE_FRIEND_RESERVE, CLOSE_NO_SESSION_CAPACITY, CLOSE_PRINCIPAL_CAP]
+                .contains(&close.reason.as_ref())
+    )
+}
 
 enum PreSessionPermit {
     Ordinary(tokio::sync::OwnedSemaphorePermit),
@@ -2453,7 +2492,7 @@ pub async fn run_quic_accept_loop(
                 PreSessionPermit::Ordinary(permit) => permit,
                 PreSessionPermit::HandshakeOverflow(_overflow) => {
                     if !known_friend {
-                        conn.close(0u32.into(), b"friend reserve requires pinned identity");
+                        conn.close(0u32.into(), CLOSE_FRIEND_RESERVE);
                         return;
                     }
                     match reserved_sem.try_acquire_owned() {
@@ -2461,7 +2500,7 @@ pub async fn run_quic_accept_loop(
                         Err(_) => match ordinary_sem.try_acquire_owned() {
                             Ok(permit) => permit,
                             Err(_) => {
-                                conn.close(0u32.into(), b"no session capacity");
+                                conn.close(0u32.into(), CLOSE_NO_SESSION_CAPACITY);
                                 return;
                             }
                         },
@@ -2474,7 +2513,7 @@ pub async fn run_quic_accept_loop(
             };
             let Some(active_session_guard) = try_acquire_active_session(&active_counts, principal)
             else {
-                conn.close(0u32.into(), b"active principal session cap reached");
+                conn.close(0u32.into(), CLOSE_PRINCIPAL_CAP);
                 return;
             };
             // The same shared guard follows handed-off streams into the upload
@@ -2921,20 +2960,33 @@ async fn bridge_relay_request(
     let relay_result = tokio::time::timeout(RELAY_MAX_DURATION, async {
         let mut i2t_limited = init_recv.take(bw_limit);
         let mut t2i_limited = tgt_recv.take(bw_limit);
-        let i2t = copy_yielding_to_file_uploads(
-            &mut i2t_limited,
-            &mut tgt_send,
-            limiter,
-            bw_limit,
-            &moved,
-        );
-        let t2i = copy_yielding_to_file_uploads(
-            &mut t2i_limited,
-            &mut init_send,
-            limiter,
-            bw_limit,
-            &moved,
-        );
+        // Each direction's end is passed on when it is reached, not once both
+        // are: a peer that finishes and waits for the other side to do the same
+        // would otherwise hold the session until the idle timeout.
+        let i2t = async {
+            let copied = copy_yielding_to_file_uploads(
+                &mut i2t_limited,
+                &mut tgt_send,
+                limiter,
+                bw_limit,
+                &moved,
+            )
+            .await?;
+            let _ = tgt_send.finish();
+            Ok::<_, std::io::Error>(copied)
+        };
+        let t2i = async {
+            let copied = copy_yielding_to_file_uploads(
+                &mut t2i_limited,
+                &mut init_send,
+                limiter,
+                bw_limit,
+                &moved,
+            )
+            .await?;
+            let _ = init_send.finish();
+            Ok::<_, std::io::Error>(copied)
+        };
 
         tokio::select! {
             joined = async { tokio::try_join!(i2t, t2i) } => match joined {
@@ -2971,8 +3023,14 @@ async fn bridge_relay_request(
     }
     let total_bytes = moved.load(std::sync::atomic::Ordering::Relaxed);
 
+    // Returning drops both connections, and quinn discards whatever they still
+    // hold unsent, as it did the REJECT in `send_relay_reject`.
     let _ = init_send.finish();
     let _ = tgt_send.finish();
+    let _ = tokio::time::timeout(RELAY_BRIDGE_DRAIN_TIMEOUT, async {
+        tokio::join!(init_send.stopped(), tgt_send.stopped())
+    })
+    .await;
 
     {
         let mut mgr_lock = mgr.lock().await;
@@ -4181,6 +4239,95 @@ mod tests {
         assert!(refused.relay_busy, "{}", refused.reason);
         assert!(!refused.relay_at_fault, "{}", refused.reason);
         relay_task.await.unwrap();
+    }
+
+    /// A relay with no room turns a dial away before any REJECT can be sent:
+    /// by refusing the handshake, which anyone at its address could send and so
+    /// is still charged to it, or by closing the connection the handshake
+    /// proved is its own, which is a busy relay and nothing more.
+    #[tokio::test]
+    async fn a_relay_turning_a_dial_away_for_room_reads_as_busy() {
+        let initiator = loopback_peer().await;
+        let relay = loopback_peer().await;
+        let target = loopback_peer().await;
+        let relay_task = {
+            let endpoint = relay.endpoint.clone();
+            tokio::spawn(async move {
+                endpoint.accept().await.unwrap().refuse();
+                let conn = endpoint.accept().await.unwrap().await.unwrap();
+                conn.close(0u32.into(), CLOSE_PRINCIPAL_CAP);
+            })
+        };
+
+        let refused = request_relay(&initiator, &relay, &target, target.node_id)
+            .await
+            .expect_err("the handshake was refused");
+        assert!(refused.relay_busy && refused.relay_at_fault, "{}", refused.reason);
+        let closed = request_relay(&initiator, &relay, &target, target.node_id)
+            .await
+            .expect_err("the connection was closed");
+        assert!(closed.relay_busy && !closed.relay_at_fault, "{}", closed.reason);
+        relay_task.await.unwrap();
+    }
+
+    /// A direction the target finishes is passed on at once, while the
+    /// initiator's is still open, and what the relay still holds for the
+    /// initiator when the bridge ends arrives instead of going down with the
+    /// connection.
+    #[tokio::test]
+    async fn a_finished_direction_reaches_the_initiator_whole_and_at_once() {
+        const REPLY_LEN: usize = 1024 * 1024;
+        for initiator_finishes_first in [false, true] {
+            let initiator = loopback_peer().await;
+            let relay = loopback_peer().await;
+            let target = loopback_peer().await;
+            let target_task = {
+                let endpoint = target.endpoint.clone();
+                tokio::spawn(async move {
+                    let conn = endpoint.accept().await.unwrap().await.unwrap();
+                    let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                    let mut connect_and_ping = [0u8; 23 + 4];
+                    recv.read_exact(&mut connect_and_ping).await.unwrap();
+                    send.write_all(&vec![0x5A; REPLY_LEN]).await.unwrap();
+                    send.finish().unwrap();
+                    let _ = send.stopped().await;
+                    let _ = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await;
+                })
+            };
+            let mgr = std::sync::Arc::new(tokio::sync::Mutex::new(RelayManager::new()));
+            let relay_task =
+                tokio::spawn(serve_one_relay_request(relay.endpoint.clone(), mgr.clone()));
+
+            let (mut send, mut recv) = request_relay(&initiator, &relay, &target, target.node_id)
+                .await
+                .expect("the relay reached the target");
+            send.write_all(b"ping").await.unwrap();
+            let bridge_ended = async {
+                tokio::time::timeout(Duration::from_secs(10), relay_task)
+                    .await
+                    .expect("the bridge ends once both sides have finished")
+                    .unwrap();
+            };
+            let reply = if initiator_finishes_first {
+                send.finish().unwrap();
+                bridge_ended.await;
+                recv.read_to_end(REPLY_LEN).await
+            } else {
+                let reply = tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(REPLY_LEN))
+                    .await
+                    .expect("the target's end was passed on");
+                send.finish().unwrap();
+                bridge_ended.await;
+                reply
+            };
+            assert_eq!(
+                reply.expect("everything the target sent arrived").len(),
+                REPLY_LEN,
+                "initiator_finishes_first={initiator_finishes_first}"
+            );
+            assert_eq!(mgr.lock().await.total_bytes_relayed(), (4 + REPLY_LEN) as u64);
+            target_task.abort();
+        }
     }
 
     /// With a v3 request the relay bridges only to the node it names: a

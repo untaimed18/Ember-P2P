@@ -310,7 +310,7 @@ pub(in crate::network) async fn on_broker_tick(
                         if refused_us {
                             broker.relay_refused_us(attempt_key, reason).await;
                         } else if relay_busy {
-                            broker.relay_was_busy(attempt_key, reason).await;
+                            broker.relay_was_busy(attempt_key, reason, relay_at_fault).await;
                         } else {
                             broker.relay_failed(attempt_key, reason, relay_at_fault).await;
                         }

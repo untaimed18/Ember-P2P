@@ -42,6 +42,10 @@ const RELAY_REFUSAL_BACKOFF: Duration = Duration::from_secs(3600);
 /// its sessions end and free slots; without it a busy friend relay stays the
 /// first pick and every further source spends an attempt on the same refusal.
 const RELAY_BUSY_BACKOFF: Duration = Duration::from_secs(60);
+/// Attempts one relay is asked to carry at once: the sessions it holds for one
+/// requester. A burst past that found its handshake and session limits, which
+/// cost each source an attempt and could evict the relay as unreachable.
+const MAX_ATTEMPTS_PER_RELAY: usize = super::relay::MAX_RELAY_SESSIONS_PER_REQUESTER;
 /// Prefer fresh candidates when picking a relay; older-but-still-retained
 /// entries remain until `RELAY_CANDIDATE_PRUNE_MAX_AGE`.
 const RELAY_CANDIDATE_PICK_MAX_AGE: Duration = Duration::from_secs(600);
@@ -590,8 +594,9 @@ impl ConnectionBroker {
     }
 
     /// Called when the relay answered that it is at capacity. The attempt fails
-    /// without blaming the relay, which is skipped for [`RELAY_BUSY_BACKOFF`].
-    pub async fn relay_was_busy(&mut self, attempt_key: &str, reason: &str) {
+    /// and the relay is skipped for [`RELAY_BUSY_BACKOFF`], blamed only when
+    /// the answer could have come from someone else at its address.
+    pub async fn relay_was_busy(&mut self, attempt_key: &str, reason: &str, relay_at_fault: bool) {
         if let Some(relay) = self.attempts.get(attempt_key).and_then(|a| a.relay) {
             if let Some(c) = self.relay_candidates.iter_mut().find(|c| {
                 c.ip == relay.0 && c.port == relay.1 && c.attestation.ed25519_pubkey == relay.2
@@ -599,7 +604,7 @@ impl ConnectionBroker {
                 c.busy_until = Some(Instant::now() + RELAY_BUSY_BACKOFF);
             }
         }
-        self.relay_failed(attempt_key, reason, false).await;
+        self.relay_failed(attempt_key, reason, relay_at_fault).await;
     }
 
     /// Time the attempt has left in its current phase, or `None` once it has
@@ -703,6 +708,15 @@ impl ConnectionBroker {
                 && c.port == port
                 && c.attestation.ed25519_pubkey == attestation.ed25519_pubkey
         }) {
+            existing.last_seen = Instant::now();
+            // Copies signed before the relay's latest keep circulating among
+            // friends for their whole lifetime. Taking one back would shorten
+            // the candidate's life, and could drop a capability bit the relay
+            // has since gained or present an attestation a restarted relay no
+            // longer honours.
+            if expires_at_unix <= existing.expires_at_unix {
+                return;
+            }
             // A friend's relay never turns us away for not being its friend, so
             // its `REJECT_AUTH` meant an attestation it has rotated away from,
             // and a new one is worth trying. A stranger's is not cleared:
@@ -715,7 +729,6 @@ impl ConnectionBroker {
             existing.attestation_hash = attestation_hash;
             existing.attestation = attestation;
             existing.ember_hash = ember_hash;
-            existing.last_seen = Instant::now();
             existing.expires_at_unix = expires_at_unix;
             // `failures` deliberately survives a refresh. Gossip re-sends the
             // same set every few ticks, so clearing it here would let a
@@ -809,7 +822,8 @@ impl ConnectionBroker {
             .collect()
     }
 
-    /// Pick the best available relay candidate.
+    /// Pick the best available relay candidate that is not already carrying
+    /// [`MAX_ATTEMPTS_PER_RELAY`] of our attempts.
     ///
     /// A friend's relay first, because a relay carries only its friends'
     /// traffic, then fewest failures, then a relay that has carried a session
@@ -837,6 +851,12 @@ impl ConnectionBroker {
                     && c.expires_at_unix > now_unix
                     && c.refused_until.is_none_or(|until| until <= now)
                     && c.busy_until.is_none_or(|until| until <= now)
+                    && self
+                        .attempts
+                        .values()
+                        .filter(|a| a.relay.is_some_and(|(ip, port, _)| (ip, port) == (c.ip, c.port)))
+                        .count()
+                        < MAX_ATTEMPTS_PER_RELAY
             })
             // Failures rank ahead of everything but friendship. A candidate that
             // has just failed must not keep winning on "seen most recently",
@@ -1722,7 +1742,8 @@ mod tests {
 
     /// A relay at capacity is passed over for a minute, not blamed, and not
     /// asked for the next source in the meantime, which would only spend that
-    /// source's attempt on the same refusal.
+    /// source's attempt on the same refusal. A refused handshake, which anyone
+    /// at the address could send, is passed over the same way but charged.
     #[tokio::test]
     async fn a_busy_relay_is_skipped_briefly_without_blame() {
         let (tx, _rx) = mpsc::channel(16);
@@ -1733,7 +1754,7 @@ mod tests {
         broker.add_relay_candidate(attestation(relay, 4662, unix_now() + 600), Some(friend_hash), None);
 
         assert!(broker.attempt_low_to_low("t1", [1; 16], Ipv4Addr::new(10, 0, 0, 1), 4662, RelayTarget::default(), NatType::Symmetric, None).await);
-        broker.relay_was_busy("t1:10.0.0.1:4662", "at capacity").await;
+        broker.relay_was_busy("t1:10.0.0.1:4662", "at capacity", false).await;
         assert!(broker.pick_relay_candidate().is_none(), "a busy relay is skipped");
         assert_eq!(broker.relay_candidates[0].failures, 0, "being busy is not failing");
         let next = Ipv4Addr::new(10, 0, 0, 2);
@@ -1748,6 +1769,79 @@ mod tests {
         assert!(busy_until > Instant::now() + RELAY_BUSY_BACKOFF - Duration::from_secs(5));
         broker.relay_candidates[0].busy_until = Some(Instant::now());
         assert_eq!(broker.pick_relay_candidate().map(|c| c.ip), Some(relay), "and tried again after");
+
+        assert!(broker.attempt_low_to_low("t3", [3; 16], Ipv4Addr::new(10, 0, 0, 3), 4662, RelayTarget::default(), NatType::Symmetric, None).await);
+        broker.relay_was_busy("t3:10.0.0.3:4662", "handshake refused", true).await;
+        assert!(broker.pick_relay_candidate().is_none(), "a refused handshake is skipped too");
+        assert_eq!(broker.relay_candidates[0].failures, 1, "and counted against the relay");
+    }
+
+    /// One pass over a swarm's firewalled sources starts several attempts at
+    /// once. A relay is asked for no more of them than it holds sessions for
+    /// one requester; the rest go to the next relay, or wait without spending
+    /// a try when there is none, and a slot frees when an attempt ends.
+    #[tokio::test]
+    async fn a_relay_is_given_no_more_attempts_than_it_holds_for_us() {
+        let (tx, _rx) = mpsc::channel(64);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let friend_hash = [0xF1u8; 16];
+        broker.set_friend_hashes(friends(&[friend_hash]));
+        let friend_relay = Ipv4Addr::new(198, 51, 100, 50);
+        let other_relay = Ipv4Addr::new(198, 51, 100, 51);
+        broker.add_relay_candidate(attestation(friend_relay, 4662, unix_now() + 600), Some(friend_hash), None);
+        let source = |n: u8| Ipv4Addr::new(10, 0, 0, n);
+        async fn start(broker: &mut ConnectionBroker, n: u8) -> bool {
+            let source = Ipv4Addr::new(10, 0, 0, n);
+            broker
+                .attempt_low_to_low(&format!("t{n}"), [n; 16], source, 4662, RelayTarget::default(), NatType::Symmetric, None)
+                .await
+        }
+        let relay_of = |broker: &ConnectionBroker, n: u8| {
+            broker.attempts[&format!("t{n}:{}:4662", source(n))].relay.map(|r| r.0)
+        };
+
+        for n in 1..=MAX_ATTEMPTS_PER_RELAY as u8 {
+            assert!(start(&mut broker, n).await);
+            assert_eq!(relay_of(&broker, n), Some(friend_relay));
+        }
+        let spill = MAX_ATTEMPTS_PER_RELAY as u8 + 1;
+        assert!(!start(&mut broker, spill).await, "a full relay is not asked again");
+        assert!(!broker.cooldowns.contains_key(&(source(spill), 4662)));
+
+        broker.add_relay_candidate(attestation(other_relay, 4662, unix_now() + 600), None, None);
+        assert!(start(&mut broker, spill).await);
+        assert_eq!(relay_of(&broker, spill), Some(other_relay), "the next relay takes it");
+
+        broker.relay_failed("t1:10.0.0.1:4662", "source gone", false).await;
+        let after = spill + 1;
+        assert!(start(&mut broker, after).await);
+        assert_eq!(relay_of(&broker, after), Some(friend_relay), "an ended attempt frees its slot");
+    }
+
+    /// Copies of a relay's attestation signed before its latest keep arriving
+    /// from friends that still hold them. One of those must not replace the
+    /// newer copy: it would shorten the candidate's life and could drop the
+    /// relay's pinning bit.
+    #[test]
+    fn an_older_copy_of_an_attestation_does_not_replace_a_newer_one() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut broker = ConnectionBroker::new("http://localhost".into(), tx);
+        let ip = Ipv4Addr::new(198, 51, 100, 60);
+        let fresh = unix_now() + 600;
+        let mut newer = attestation(ip, 4662, fresh + 60);
+        newer.capability_bits |= crate::network::ember::RELAY_ATTESTATION_CAP_PINNED_TARGET;
+        let older = attestation(ip, 4662, fresh);
+
+        broker.add_relay_candidate(newer.clone(), None, None);
+        broker.relay_candidates[0].last_seen = Instant::now() - Duration::from_secs(300);
+        broker.add_relay_candidate(older, None, None);
+
+        let stored = &broker.relay_candidates[0];
+        assert_eq!(broker.relay_candidate_count(), 1);
+        assert_eq!(stored.attestation, newer);
+        assert_eq!(stored.expires_at_unix, fresh + 60);
+        assert_eq!(stored.attestation_hash, crate::network::ember::relay_attestation_hash(&newer));
+        assert!(stored.last_seen.elapsed() < Duration::from_secs(5), "seeing it still counts");
     }
 
     /// A friend's `REJECT_AUTH` answers the attestation the attempt presented.
