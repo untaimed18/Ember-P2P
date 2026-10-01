@@ -306,6 +306,36 @@ pub fn extract_deep_link_payloads(args: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// A second launch's argv as that launch had it, from what the Windows
+/// single-instance plugin delivers: it joins the arguments with `|` and splits
+/// them on `|` again, so a raw `ed2k://|file|…|/` arrives as `ed2k://`,
+/// `file`, …. A link left unfinished takes back the pieces after it, up to one
+/// that is a deep link of its own. Other platforms deliver argv whole, where
+/// no link is unfinished and nothing changes.
+pub fn rejoin_forwarded_args(args: Vec<String>) -> Vec<String> {
+    let mut rejoined: Vec<String> = Vec::with_capacity(args.len());
+    let mut open_link = false;
+    for (index, piece) in args.into_iter().enumerate() {
+        let is_payload = index > 0 && is_deep_link_payload(&piece);
+        if open_link && !is_payload {
+            if let Some(link) = rejoined.last_mut() {
+                link.push('|');
+                link.push_str(&piece);
+            }
+            continue;
+        }
+        open_link = is_payload && ed2k_link_unfinished(&piece);
+        rejoined.push(piece);
+    }
+    rejoined
+}
+
+/// Every complete `ed2k:` link ends in `|/`, however its pipes arrived.
+fn ed2k_link_unfinished(piece: &str) -> bool {
+    use crate::network::ed2k::hash::{looks_like_ed2k_uri, normalize_ed2k_uri};
+    looks_like_ed2k_uri(piece) && !normalize_ed2k_uri(piece).ends_with("|/")
+}
+
 /// Buffer `payloads` for the frontend and emit a wake signal.
 ///
 /// The buffer — not the event payload — is the single source of truth:
@@ -600,6 +630,41 @@ mod tests {
             payloads,
             vec!["ed2k://|file|movie.avi|1234|0123456789abcdef0123456789abcdef|/".to_string()]
         );
+    }
+
+    /// What the Windows single-instance plugin does to a second launch's argv.
+    fn forwarded(args: &[&str]) -> Vec<String> {
+        args.join("|").split('|').map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_link_the_single_instance_plugin_split_at_its_pipes_is_rejoined() {
+        let raw = "ed2k://|file|a b.iso|1024|0123456789ABCDEF0123456789ABCDEF|/";
+        let with_sources = "ed2k://|file|c.iso|2048|FEDCBA9876543210FEDCBA9876543210|/|sources,198.51.100.7:4662|/";
+        let encoded = "ed2k://%7Cfile%7Cd.iso%7C4096%7C00112233445566778899AABBCCDDEEFF%7C/";
+        let mixed = "ed2k://%7Cfile%7Ce#1.iso|8192|00112233445566778899AABBCCDDEEFF|/";
+        let collection = std::env::temp_dir()
+            .join("set.emulecollection")
+            .to_string_lossy()
+            .into_owned();
+        let cases: [&[&str]; 6] = [
+            &["ember.exe", raw],
+            &["ember.exe", with_sources],
+            &["ember.exe", raw, with_sources],
+            &["ember.exe", raw, &collection],
+            &["ember.exe", encoded],
+            &["ember.exe", mixed],
+        ];
+        for args in cases {
+            let owned: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            assert_eq!(rejoin_forwarded_args(forwarded(args)), owned, "{args:?}");
+            assert_eq!(
+                extract_deep_link_payloads(&rejoin_forwarded_args(forwarded(args))),
+                extract_deep_link_payloads(&owned),
+            );
+        }
+        let plain = vec!["ember.exe".to_string()];
+        assert_eq!(rejoin_forwarded_args(plain.clone()), plain);
     }
 
     #[test]

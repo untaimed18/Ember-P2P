@@ -208,6 +208,9 @@ git diff v1.7.0 -- messages/en.json
       256 are read, apart from any lines that are not links; and more than
       256 KiB of text typed or pasted into the box, Cyrillic names included,
       is refused with its size and the limit.
+- [ ] Windows, with Ember running: `start "" "ed2k://|file|test file.iso|1024|<hash>|/"`
+      from a command prompt adds that download under its full name, as a
+      browser click (which sends the pipes as `%7C`) does.
 - [ ] Statistics shows the rate graph filling in; the 1 hour view gains a point
       a minute and keeps its history across a sleep. Setting the system clock
       back a few minutes leaves the 5 minute view whole.

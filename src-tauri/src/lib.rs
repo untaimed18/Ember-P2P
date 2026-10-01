@@ -513,6 +513,7 @@ pub fn run() {
             // re-launched the app to bring it to the front). An update's
             // relaunch arrives here when another launch beat it, and the links
             // it carries are the replaced process's.
+            let args = commands::deeplink::rejoin_forwarded_args(args);
             let payloads = commands::deeplink::extract_deep_link_payloads(&args);
             if payloads.is_empty() {
                 commands::chat_window::set_chat_window_visible(app, true);
