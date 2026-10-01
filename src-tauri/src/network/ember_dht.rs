@@ -24,6 +24,32 @@ pub(super) fn ember_reach_witnesses_independent(a: IpAddr, b: IpAddr) -> bool {
     }
 }
 
+/// What a newly confirmed observed address does to `external_ip`.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ObservedIpAction {
+    Adopt,
+    Reprobe,
+    Keep,
+}
+
+/// The votes fill an empty `external_ip` unless STUN disagrees, but never move
+/// one we hold: STUN decides that, so a confirmed address that differs asks for
+/// a re-probe. Without one an idle node, which nothing else re-probes for, kept
+/// advertising its old address after an IP change. Not while a live HighID
+/// holds it, since STUN does not move that either.
+pub(super) fn observed_ip_action(
+    current: Option<Ipv4Addr>,
+    voted: Ipv4Addr,
+    stun: Option<Ipv4Addr>,
+    highid: Option<Ipv4Addr>,
+) -> ObservedIpAction {
+    match current {
+        None if stun.is_none_or(|stun| stun == voted) => ObservedIpAction::Adopt,
+        Some(current) if current != voted && highid != Some(current) => ObservedIpAction::Reprobe,
+        _ => ObservedIpAction::Keep,
+    }
+}
+
 pub(super) fn load_ember_verified_highwater(path: &std::path::Path) -> EmberVerifiedHighwater {
     crate::security::recover_interrupted_replace(path);
     let Ok(bytes) = std::fs::read(path) else {
@@ -2599,23 +2625,23 @@ pub(super) async fn handle_ember_dht_message(
                     .saturating_add(1);
                 if let Some(confirmed) = state.ember_observed_votes.record_vote(observed, from.ip())
                 {
-                    // Prefer STUN corroboration. If STUN has not produced an
-                    // address yet (Ember-only / STUN failure), accept the
-                    // correlated vote majority. If STUN disagrees, ignore.
                     let stun_ip = state.nat_info.external_addr.and_then(|a| match a.ip() {
                         std::net::IpAddr::V4(v4) => Some(v4),
                         std::net::IpAddr::V6(_) => None,
                     });
-                    if state.external_ip.is_none() {
-                        if let std::net::IpAddr::V4(v4) = confirmed.ip() {
-                            let adopt = match stun_ip {
-                                Some(stun) => stun == v4,
-                                None => true,
-                            };
-                            if adopt {
+                    if let std::net::IpAddr::V4(v4) = confirmed.ip() {
+                        match observed_ip_action(
+                            state.external_ip,
+                            v4,
+                            stun_ip,
+                            live_highid_external_ip(state),
+                        ) {
+                            ObservedIpAction::Adopt => {
                                 set_external_ip(state, Some(v4));
                                 state.stats.external_ip = v4.to_string();
                             }
+                            ObservedIpAction::Reprobe => state.ember_observed_ip_moved = true,
+                            ObservedIpAction::Keep => {}
                         }
                     }
                 }

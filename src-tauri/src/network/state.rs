@@ -805,6 +805,10 @@ pub(super) struct NetworkState {
     /// every replica, so a round that also placed others comes back soon for
     /// the one that did not.
     pub(super) ember_publish_partial: HashSet<([u8; 16], EmberPublishKind)>,
+    /// Files whose keyword rounds have used up their partial retries, so a
+    /// round that loses a key again waits out the full interval. Cleared by a
+    /// round that places every key.
+    pub(super) ember_keyword_retries_spent: HashSet<[u8; 16]>,
     /// Consecutive publish rounds each file has left unconfirmed, driving the
     /// [`EMBER_PUBLISH_MAX_ATTEMPTS`] backoff.
     pub(super) ember_publish_attempts: HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
@@ -1199,6 +1203,9 @@ pub(super) struct NetworkState {
     pub(super) ember_dht_protection: ember::dht::protection::DhtProtection,
     /// Slice 19: observed-IP voting from PONG payloads (NAT self-discovery).
     pub(super) ember_observed_votes: ember::dht::observed::EmberObservedIpVotes,
+    /// Set when the votes confirm an address other than `external_ip`, so the
+    /// event loop asks STUN again even when the activity gate would not.
+    pub(super) ember_observed_ip_moved: bool,
     /// Expected Ember BLAKE3 digests a transfer will enforce at completion
     /// (ed2k -> digest plus the evidence behind it). Seeded from DHT records,
     /// from the row the user clicked, and from locally hashed files; conflicts

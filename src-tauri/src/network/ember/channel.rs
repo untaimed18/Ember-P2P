@@ -989,8 +989,9 @@ pub fn open_with_content_keys<T>(
 }
 
 /// Presence timestamps more than this far ahead of wall clock are dropped.
-/// Same bound DHT store uses for `created_at` (`CLOCK_SKEW_TOLERANCE_SECS`
-/// = 3600): a record that sat in the store can still carry a lying
+/// The DHT store's general `CLOCK_SKEW_TOLERANCE_SECS` (3600), looser than
+/// the 1350 seconds (half the 45-minute TTL) a storer admits a presence
+/// record under: a record that sat in the store can still carry a lying
 /// `last_seen`, and that is what roster eviction sorts on.
 pub const PRESENCE_MAX_FUTURE_SKEW_SECS: i64 = 3600;
 

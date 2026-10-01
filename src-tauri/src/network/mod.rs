@@ -188,6 +188,8 @@ const MAX_FRIEND_RELAY_TICKET_SESSIONS: usize = 8;
 const PERIODIC_SAVE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(300);
 const SHORT_IO_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
 const NAT_PROBE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(20);
+/// Least time between a NAT probe and one asked for by the observed-address votes.
+const OBSERVED_IP_REPROBE_FLOOR: std::time::Duration = std::time::Duration::from_secs(60);
 /// Realistic worst-case STUN/TCP-hold cycle is 79s: 3×(5+8) + 4×(5+5)
 /// (DNS+connect timeouts on three TCP-hold targets then four TCP STUN
 /// servers). The QUIC keep-alive is a parallel DNS lookup (≤5s) plus an
@@ -941,6 +943,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_publish_unplaced: HashMap::new(),
         ember_publish_placed: HashSet::new(),
         ember_publish_partial: HashSet::new(),
+        ember_keyword_retries_spent: HashSet::new(),
         ember_publish_attempts: HashMap::new(),
         ember_publish_pass: EmberPublishPassStats::default(),
         ember_batch_publish: EmberBatchPublisher::default(),
@@ -1044,6 +1047,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_dht,
         ember_dht_protection: ember::dht::protection::DhtProtection::new(),
         ember_observed_votes: ember::dht::observed::EmberObservedIpVotes::new(),
+        ember_observed_ip_moved: false,
         ember_content_hashes: HashMap::new(),
         ember_dht_pending_pings: HashMap::new(),
         ember_dht_pending_finds: HashMap::new(),
@@ -2729,6 +2733,32 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 state.nat_probe_generation,
                 reason,
             ));
+        }
+        // Not gated on activity: an idle node is exactly the one nothing else
+        // re-probes for, and the votes only ask on a change of confirmation.
+        if state.ember_observed_ip_moved
+            && !nat_probe_in_flight
+            && state.nat_info.last_probed.elapsed() >= OBSERVED_IP_REPROBE_FLOOR
+        {
+            state.ember_observed_ip_moved = false;
+            let current = state.external_ip.map(IpAddr::V4);
+            let voted = state
+                .ember_observed_votes
+                .confirmed()
+                .map(|addr| addr.ip())
+                .filter(|ip| Some(*ip) != current);
+            if let Some(voted) = voted {
+                info!("NAT probe: Ember peers confirm {voted}, not our {current:?} — re-probing");
+                nat_probe_in_flight = true;
+                nat_probe_started_at = Some(tokio::time::Instant::now());
+                state.nat_probe_generation = state.nat_probe_generation.saturating_add(1);
+                nat_probe_packet_tx = Some(spawn_nat_probe(
+                    udp_socket.clone(),
+                    nat_probe_result_tx.clone(),
+                    state.nat_probe_generation,
+                    "observed address moved",
+                ));
+            }
         }
 
         tokio::select! {

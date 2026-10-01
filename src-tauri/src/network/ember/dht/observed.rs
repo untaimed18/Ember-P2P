@@ -25,8 +25,10 @@ const VOTE_TTL: Duration = Duration::from_secs(15 * 60);
 /// least-recently-updated entry is dropped.
 const MAX_TRACKED_ADDRS: usize = 64;
 
-/// Reporter nets remembered as having voted for the confirmed address. Only
-/// ever compared against a quorum, so the first few hundred are as good as all.
+/// Reporter nets remembered as having voted for the confirmed address, the
+/// most recent kept when there are more. Keeping the first ones instead left a
+/// long uptime remembering only the nets of its first hours, which are not the
+/// peers that see the address move.
 const MAX_TRACKED_BACKERS: usize = 256;
 
 /// The diversity unit one vote is charged to.
@@ -100,9 +102,9 @@ pub struct EmberObservedIpVotes {
     confirmed_port: Option<u16>,
     /// The most distinct nets that backed [`Self::confirmed`] at once.
     confirmed_peak: usize,
-    /// The nets that have voted for [`Self::confirmed`] while it stood, up to
-    /// [`MAX_TRACKED_BACKERS`].
-    confirmed_backers: HashSet<ReporterNet>,
+    /// The nets that have voted for [`Self::confirmed`] while it stood, and
+    /// when each last did, up to [`MAX_TRACKED_BACKERS`].
+    confirmed_backers: HashMap<ReporterNet, Instant>,
     /// The last confirmation to lapse, for one vote lifetime.
     ///
     /// Honest peers that talk to us constantly rarely need to ask, so their
@@ -222,16 +224,27 @@ impl EmberObservedIpVotes {
         // has strictly more distinct nets.
         if self.confirmed == Some(reported_ip) {
             self.confirmed_peak = self.confirmed_peak.max(new_count);
-            if self.confirmed_backers.len() < MAX_TRACKED_BACKERS {
-                self.confirmed_backers.insert(net);
+            if self.confirmed_backers.len() >= MAX_TRACKED_BACKERS
+                && !self.confirmed_backers.contains_key(&net)
+            {
+                let oldest = self
+                    .confirmed_backers
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(n, _)| *n);
+                if let Some(oldest) = oldest {
+                    self.confirmed_backers.remove(&oldest);
+                }
             }
+            self.confirmed_backers.insert(net, now);
         }
         if quorum && self.confirmed != Some(reported_ip) {
             let rival_nets = || {
                 self.votes
                     .get(&reported_ip)
                     .into_iter()
-                    .flat_map(|v| v.nets.keys())
+                    .flat_map(|v| v.nets.iter())
+                    .map(|(net, (at, _))| (*net, *at))
             };
             let displaces = match self.confirmed {
                 Some(ip) => new_count > self.votes.get(&ip).map_or(0, |v| v.nets.len()),
@@ -239,14 +252,13 @@ impl EmberObservedIpVotes {
                     None => true,
                     Some(lapsed) => {
                         new_count > lapsed.peak
-                            || rival_nets().filter(|n| lapsed.backers.contains(n)).count()
+                            || rival_nets().filter(|(n, _)| lapsed.backers.contains(n)).count()
                                 >= MIN_OBSERVED_IP_VOTES
                     }
                 },
             };
             if displaces {
-                self.confirmed_backers =
-                    rival_nets().copied().take(MAX_TRACKED_BACKERS).collect();
+                self.confirmed_backers = rival_nets().take(MAX_TRACKED_BACKERS).collect();
                 self.confirmed = Some(reported_ip);
                 self.confirmed_port = None;
                 self.confirmed_peak = new_count;
@@ -278,7 +290,7 @@ impl EmberObservedIpVotes {
                 self.lapsed = Some(LapsedConfirmation {
                     addr,
                     peak: self.confirmed_peak,
-                    backers: std::mem::take(&mut self.confirmed_backers),
+                    backers: std::mem::take(&mut self.confirmed_backers).into_keys().collect(),
                     at: now,
                 });
                 self.confirmed_peak = 0;
@@ -562,6 +574,42 @@ mod tests {
             votes.record_vote_at(second, reporter(8, 8, 3), later),
             Some(second),
             "but five nets beat the peak of four"
+        );
+    }
+
+    /// The backers list used to keep the first nets that voted and nothing
+    /// after them, so once a long uptime had filled it the peers still talking
+    /// to us when the address moved were not in it, and the shortcut above
+    /// never fired.
+    #[test]
+    fn the_former_reporters_are_the_most_recent_ones() {
+        let mut votes = EmberObservedIpVotes::new();
+        let first = addr(50, 4672);
+        let second = addr(51, 4672);
+        let t0 = Instant::now();
+        for net in 0..=255u8 {
+            votes.record_vote_at(first, reporter(1, net, 1), t0);
+        }
+        assert_eq!(votes.confirmed(), Some(first));
+
+        // Long after those voted, the peers we talk to now keep it confirmed.
+        let mid = t0 + VOTE_TTL / 2;
+        for net in 0..3u8 {
+            votes.record_vote_at(first, reporter(2, net, 1), mid);
+        }
+        let later = t0 + VOTE_TTL + Duration::from_secs(1);
+        votes.record_vote_at(first, reporter(2, 0, 1), later);
+        assert_eq!(votes.confirmed(), Some(first), "still backed by the newer nets");
+
+        // Then the address moves and those same peers report the new one.
+        let moved = mid + VOTE_TTL + Duration::from_secs(1);
+        votes.record_vote_at(second, reporter(2, 1, 1), moved);
+        votes.record_vote_at(second, reporter(2, 2, 1), moved);
+        assert_eq!(votes.confirmed(), None, "the old address has lapsed");
+        assert_eq!(
+            votes.record_vote_at(second, reporter(2, 0, 1), moved),
+            Some(second),
+            "three of the peers that backed it most recently moved it"
         );
     }
 

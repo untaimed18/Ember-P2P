@@ -2110,6 +2110,7 @@ struct TestSchedule {
     unplaced: HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
     placed: HashSet<([u8; 16], EmberPublishKind)>,
     partial: HashSet<([u8; 16], EmberPublishKind)>,
+    retries_spent: HashSet<[u8; 16]>,
     attempts: HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
     source_at: HashMap<[u8; 16], std::time::Instant>,
     keyword_at: HashMap<[u8; 16], std::time::Instant>,
@@ -2121,6 +2122,7 @@ impl TestSchedule {
             unplaced: &mut self.unplaced,
             placed: &mut self.placed,
             partial: &mut self.partial,
+            retries_spent: &mut self.retries_spent,
             attempts: &mut self.attempts,
             source_at: &mut self.source_at,
             keyword_at: &mut self.keyword_at,
@@ -2335,6 +2337,39 @@ fn a_buddy_endorsement_is_renewed_before_records_stop_naming_it() {
     );
 }
 
+/// One timeout dropped the named buddy from the candidates, so the next
+/// endorsed contact was named and the whole library's firewalled source
+/// records fell due again over a single lost datagram.
+#[test]
+fn the_named_buddy_survives_a_missed_query() {
+    let local = ember::dht::EmberNodeId([0; 16]);
+    let contact = |id: u8, failed_queries: u8| ember::dht::EmberContact {
+        node_id: ember::dht::EmberNodeId([id; 16]),
+        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, id)), 4672),
+        noise_pub: [id; 32],
+        ed25519_pub: [id; 32],
+        last_seen: 1_800_000_000,
+        failed_queries,
+    };
+    let named = Some(ember::dht::EmberNodeId([1; 16]));
+
+    assert!(ember_buddy_candidate(&contact(1, 0), local, named));
+    assert!(ember_buddy_candidate(&contact(1, ember::dht::MAX_FAILED_QUERIES - 1), local, named));
+    assert!(
+        !ember_buddy_candidate(&contact(1, ember::dht::MAX_FAILED_QUERIES), local, named),
+        "not once it would be evicted"
+    );
+    assert!(ember_buddy_candidate(&contact(2, 0), local, named));
+    assert!(
+        !ember_buddy_candidate(&contact(2, 1), local, named),
+        "a contact we have not named still needs a clean record"
+    );
+    let mut unverified = contact(2, 0);
+    unverified.last_seen = 0;
+    assert!(!ember_buddy_candidate(&unverified, local, named));
+    assert!(!ember_buddy_candidate(&contact(0, 0), local, None), "never ourselves");
+}
+
 /// Target lookups keep pace with the queue instead of a fixed two a minute.
 #[test]
 fn target_lookups_scale_with_the_queue() {
@@ -2388,6 +2423,52 @@ fn a_round_that_placed_one_key_is_published_when_its_last_key_fails() {
     assert!(
         staleness_at(now + EMBER_KEYWORD_PARTIAL_RETRY + std::time::Duration::from_secs(1)).is_some(),
         "but after the short retry, not the full interval"
+    );
+}
+
+/// A key storers refuse for as long as the file is shared — a word past the
+/// 150-per-publisher cap because most of the library carries it — used to get
+/// its three short retries back every interval, each republishing the file's
+/// whole keyword set. Once spent they stay spent until every key lands.
+#[test]
+fn a_key_that_never_lands_spends_its_retries_once() {
+    let mut sched = TestSchedule::default();
+    let landed = record_ref(6, 60);
+    let refused = record_ref(6, 61);
+    let file = landed.file_hash;
+    let mut at = std::time::Instant::now();
+    let round = |sched: &mut TestSchedule, at: std::time::Instant, place_both: bool| {
+        track_ember_record_pending(sched.borrow(), landed);
+        track_ember_record_pending(sched.borrow(), refused);
+        assert!(!place_ember_record_pending(sched.borrow(), landed, at));
+        if place_both {
+            assert!(place_ember_record_pending(sched.borrow(), refused, at));
+        } else {
+            assert!(fail_ember_record_pending(sched.borrow(), refused, at));
+        }
+        sched.keyword_at[&file].duration_since(at)
+    };
+
+    for _ in 0..EMBER_PUBLISH_MAX_ATTEMPTS {
+        assert_eq!(round(&mut sched, at, false), EMBER_KEYWORD_PARTIAL_RETRY);
+        at += EMBER_KEYWORD_PARTIAL_RETRY;
+    }
+    assert_eq!(round(&mut sched, at, false), EMBER_KEYWORD_REPUBLISH, "spent");
+
+    at += EMBER_KEYWORD_REPUBLISH;
+    assert_eq!(
+        round(&mut sched, at, false),
+        EMBER_KEYWORD_REPUBLISH,
+        "the next interval does not get them back"
+    );
+
+    at += EMBER_KEYWORD_REPUBLISH;
+    assert_eq!(round(&mut sched, at, true), EMBER_KEYWORD_REPUBLISH);
+    at += EMBER_KEYWORD_REPUBLISH;
+    assert_eq!(
+        round(&mut sched, at, false),
+        EMBER_KEYWORD_PARTIAL_RETRY,
+        "a round that placed every key earns them again"
     );
 }
 
@@ -4345,6 +4426,34 @@ fn stun_may_replace_a_kad_vote_but_not_a_live_highid() {
     assert!(
         should_adopt_stun_external_ip(Some(kad), stun, Some(highid)),
         "HighID that has not yet been applied must not block STUN from replacing KAD"
+    );
+}
+
+/// The votes used to be read only while `external_ip` was empty, so an idle
+/// Ember-only node that changed address kept advertising the old one: nothing
+/// re-probed STUN for it, and its source records named an address storers
+/// refuse under anti-reflection.
+#[test]
+fn a_vote_confirmed_change_of_address_asks_stun_rather_than_moving_it() {
+    let old = Ipv4Addr::new(8, 8, 8, 8);
+    let new = Ipv4Addr::new(9, 9, 9, 9);
+    assert_eq!(observed_ip_action(None, new, None, None), ObservedIpAction::Adopt);
+    assert_eq!(observed_ip_action(None, new, Some(new), None), ObservedIpAction::Adopt);
+    assert_eq!(
+        observed_ip_action(None, new, Some(old), None),
+        ObservedIpAction::Keep,
+        "STUN disagreeing still wins an empty slot"
+    );
+    assert_eq!(
+        observed_ip_action(Some(old), new, Some(old), None),
+        ObservedIpAction::Reprobe,
+        "peers never move an address we hold, but STUN is asked again"
+    );
+    assert_eq!(observed_ip_action(Some(new), new, None, None), ObservedIpAction::Keep);
+    assert_eq!(
+        observed_ip_action(Some(old), new, None, Some(old)),
+        ObservedIpAction::Keep,
+        "a live HighID is not something STUN would move"
     );
 }
 

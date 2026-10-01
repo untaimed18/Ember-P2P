@@ -1552,6 +1552,13 @@ footer.doc-end {
   older than its TTL is expired.
 </p>
 <p>
+  A presence leave tombstone is the exception: it is aged from its own
+  timestamp. It has to outlive every live copy dated before it, and a storer
+  admits those until their timestamp plus the TTL, so a tombstone from a fast
+  clock aged from the storer's clock lapsed first, and a harvested live copy
+  could be stored again and served as present.
+</p>
+<p>
   From 1.7.1 a storer refuses a presence record from a publisher whose clock
   runs 22.5 to 60 minutes fast; 1.7.0 accepted it. Such a node's room presence
   does not reach 1.7.1 storers until its clock is corrected.
@@ -1617,6 +1624,15 @@ footer.doc-end {
   drops junk. The per-node result budget is charged on blobs <em>offered</em>,
   not only those accepted, so a peer that sends nothing but junk still hits
   its own limit.
+</p>
+<p>
+  A responder need not have applied the storer's clock rule (§7.4), so the
+  searcher drops a blob outside its life before it takes a result slot. Its own
+  clock gets the skew tolerance again in each direction: a blob may be dated up
+  to twice <strong>min(1 hour, TTL / 2)</strong> ahead, and be up to its TTL
+  plus that tolerance old. Without the second allowance the searcher's clock
+  error stacked on the publisher's, and a searcher half an hour slow refused
+  most presence records.
 </p>
 
 <!-- ══════════════════════════════════════════════ 8 ══════════════════════════════════════════════ -->
@@ -1765,6 +1781,15 @@ footer.doc-end {
   library is not slammed in one tick after a restart.
 </p>
 <p>
+  A keyword round that placed some of a file’s keys but lost one on every
+  replica counts as published and comes back after 30 minutes, up to three
+  times. After that the file waits out the 12-hour cycle, and gets no further
+  short retries until a round places every key: a key storers refuse for as
+  long as the file is shared, such as a word past the per-publisher cap
+  (§7.5), would otherwise bring the file’s whole keyword set back three times
+  every cycle.
+</p>
+<p>
   The last successful source-publish and keyword-publish are written to
   <code>known.met</code> (<code>0xE4</code> / <code>0xE5</code>). On start, a
   stamp still inside its interval (2 hours for sources, 12 hours for keywords)
@@ -1868,6 +1893,17 @@ footer.doc-end {
   moment honest votes age out. The second admits a genuine address change: the
   same peers now seeing us somewhere else. On a network with no more nets than
   the old peak, the change could not otherwise confirm until the lapse aged out.
+  The backers remembered for that test are the 256 nets that voted most
+  recently, so on a long uptime they are still the peers talking to us when the
+  address moves.
+</p>
+<p>
+  A confirmed address becomes the node’s external address only when it has
+  none, and only if STUN has no reading or agrees. Votes never replace an
+  address already held: a confirmation that differs from it triggers a STUN
+  re-probe, no sooner than a minute after the last one, even on an idle node
+  that would otherwise not probe, and the STUN result decides. A live HighID is
+  left as it is.
 </p>
 
 <h3>11.2 Firewalled publishing and consume</h3>
@@ -2038,10 +2074,13 @@ footer.doc-end {
 <p>
   Identical STORE frames (same publisher signature) collapse for 60 seconds
   so a retransmit storm cannot re-verify the same blob forever. A replay only
-  counts if the store still holds that signature: the cache is never cleared
-  by eviction, and treating a displaced record as a replay made
+  counts if the store still holds that record byte for byte, or a newer copy
+  of it from the same publisher that superseded it (§7.4): the cache is never
+  cleared by eviction, and treating an evicted record as a replay made
   <code>STORE_BATCH</code> set the accepted bit for a replica that was gone,
-  after which the publisher retired the file.
+  after which the publisher retired the file. A superseded copy is still
+  answered as a replay, since the key holds that publisher's newer record for
+  the file; it is not stored again and does not re-arm the cache.
 </p>
 <p>
   Cache size 50,000; swept at most once per TTL. An unconditional size check

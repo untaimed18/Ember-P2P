@@ -202,6 +202,12 @@ fn record_ttl(data: &[u8]) -> Duration {
         _ => KEYWORD_RECORD_TTL,
     }
 }
+
+fn is_presence_departure(data: &[u8]) -> bool {
+    channel_kind_from_data(data) == Some(CHANNEL_KIND_PRESENCE)
+        && channel_flags_from_data(data).is_some_and(|f| f & CHANNEL_FLAG_DEPARTED != 0)
+}
+
 /// How far a record's signed creation timestamp may sit in the future before
 /// we treat it as bogus (clock-skew tolerance between peers).
 const CLOCK_SKEW_TOLERANCE_SECS: i64 = 3600;
@@ -215,18 +221,21 @@ fn skew_tolerance_secs(ttl_secs: i64) -> i64 {
     CLOCK_SKEW_TOLERANCE_SECS.min(ttl_secs / 2)
 }
 
-/// Whether a record body is within its life by the rule a storer admits it
-/// under: not dated past the skew tolerance, and younger than its TTL. Unsigned
-/// fields only, so check the signature separately. `false` for a body too short
-/// to carry a timestamp.
+/// Whether a record body a search was offered is within its life: the rule a
+/// storer admits it under, with the skew tolerance granted once more in each
+/// direction for the searcher's own clock. The storer's bounds alone stacked
+/// that clock's error on the publisher's, so a searcher half an hour slow
+/// refused most presence records and one over an hour slow refused fresh
+/// records of every type. Unsigned fields only, so check the signature
+/// separately. `false` for a body too short to carry a timestamp.
 pub(crate) fn record_is_current(data: &[u8], now_unix: i64) -> bool {
     let Some(created_at) = data.get(105..113).and_then(|b| b.try_into().ok()).map(i64::from_le_bytes)
     else {
         return false;
     };
     let ttl_secs = record_ttl(data).as_secs() as i64;
-    created_at <= now_unix + skew_tolerance_secs(ttl_secs)
-        && now_unix.saturating_sub(created_at).max(0) < ttl_secs
+    let skew = skew_tolerance_secs(ttl_secs);
+    created_at <= now_unix + 2 * skew && now_unix.saturating_sub(created_at) < ttl_secs + skew
 }
 
 /// One record on its way to or from disk.
@@ -1055,7 +1064,18 @@ impl DhtStore {
         // checked above, so this is still in the future. A body dated ahead of
         // our clock is aged from now instead, so the skew we tolerate cannot
         // also lengthen its life past the TTL.
-        let expires_at_unix = created_at.min(now_unix).saturating_add(ttl_secs);
+        //
+        // Except a leave tombstone, which must outlive every live copy dated
+        // before it (see `CHANNEL_PRESENCE_DEPARTED_TTL`). Those are admitted
+        // until their own date plus the TTL, so from a fast clock a tombstone
+        // aged from now lapsed first and a harvested live copy could be stored
+        // again in its place.
+        let aged_from = if is_presence_departure(&data) {
+            created_at
+        } else {
+            created_at.min(now_unix)
+        };
+        let expires_at_unix = aged_from.saturating_add(ttl_secs);
         let incoming_ember = ember_digest_from_record_data(&data);
         let incoming_file = file_hash_from_record_data(&data);
         let record = DhtRecord {
@@ -3942,6 +3962,39 @@ mod tests {
         assert_eq!(
             skew_tolerance_secs(KEYWORD_RECORD_TTL.as_secs() as i64),
             CLOCK_SKEW_TOLERANCE_SECS
+        );
+    }
+
+    /// Ageing a fast clock's tombstone from our clock let it lapse while the
+    /// live record it replaced, admitted until its own date plus the TTL,
+    /// could still be stored again and served as present.
+    #[test]
+    fn a_fast_clocks_tombstone_outlives_the_live_record_it_replaced() {
+        let mut store = DhtStore::new();
+        let (sk, pk) = keypair();
+        let key = [9u8; 16];
+        let presence = |flags: u8, created_at: i64| {
+            let mut data = padded_for(key, &[RECORD_TYPE_CHANNEL, 1]);
+            data[65] = CHANNEL_KIND_PRESENCE;
+            data[66] = flags;
+            stamped(data, pk, created_at)
+        };
+        let ttl = CHANNEL_PRESENCE_TTL.as_secs() as i64;
+        let fast = now_ts() + 20 * 60;
+        let live = presence(0, fast - 5 * 60);
+        assert!(store.store(key, live.clone(), sign(&sk, &live)));
+        assert!(
+            store.get(&key).unwrap()[0].expires_at_unix <= now_ts() + ttl + 1,
+            "a live copy is still aged from our clock"
+        );
+
+        let departed = presence(CHANNEL_FLAG_DEPARTED, fast);
+        assert!(store.store(key, departed.clone(), sign(&sk, &departed)));
+        let held = &store.get(&key).unwrap()[0];
+        assert_eq!(held.data, departed);
+        assert!(
+            held.expires_at_unix >= fast - 5 * 60 + ttl,
+            "the tombstone has to be held for as long as the live copy is admissible"
         );
     }
 

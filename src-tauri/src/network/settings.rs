@@ -202,6 +202,7 @@ pub(super) fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_publish_unplaced.clear();
     state.ember_publish_placed.clear();
     state.ember_publish_partial.clear();
+    state.ember_keyword_retries_spent.clear();
     state.ember_publish_attempts.clear();
     state.ember_publish_pass = EmberPublishPassStats::default();
 

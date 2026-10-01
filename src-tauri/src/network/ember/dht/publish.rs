@@ -1743,6 +1743,16 @@ impl SignedRecord {
         })
     }
 
+    /// Whether a `FOUND_VALUE` blob is still within its life by the storer's
+    /// rule, with slack for the searcher's own clock. A responder is not a
+    /// storer and need not have applied it, so a search checks for itself: an
+    /// expired source record names an address that may belong to someone else
+    /// by now, and an expired keyword record a file its publisher has stopped
+    /// sharing.
+    pub fn value_blob_is_current(blob: &[u8], now_unix: i64) -> bool {
+        blob.len() >= 64 && super::store::record_is_current(&blob[..blob.len() - 64], now_unix)
+    }
+
     /// Whether `blob` carries a signature its embedded publisher key really
     /// made, without building the record.
     ///
@@ -1754,15 +1764,6 @@ impl SignedRecord {
     /// The framing checks mirror [`Self::from_wire`] on purpose: a blob that
     /// would be refused there has to be refused here too, or it wins a result
     /// slot only to be dropped at the far end.
-    /// Whether a `FOUND_VALUE` blob is still within its life by the storer's
-    /// rule. A responder is not a storer and need not have applied it, so a
-    /// search checks for itself: an expired source record names an address
-    /// that may belong to someone else by now, and an expired keyword record a
-    /// file its publisher has stopped sharing.
-    pub fn value_blob_is_current(blob: &[u8], now_unix: i64) -> bool {
-        blob.len() >= 64 && super::store::record_is_current(&blob[..blob.len() - 64], now_unix)
-    }
-
     pub fn value_blob_is_authentic(blob: &[u8]) -> bool {
         if blob.len() < 115 + 64 {
             return false;
@@ -2914,7 +2915,9 @@ mod tests {
     use rand::rngs::OsRng;
 
     /// A searcher applies the storer's clock rule itself: a responder can
-    /// return records it would never have been allowed to store.
+    /// return records it would never have been allowed to store. Its own clock
+    /// gets the skew tolerance again, so its error is not stacked on the
+    /// publisher's.
     #[test]
     fn a_searcher_refuses_expired_and_future_dated_records() {
         let sk = SigningKey::from_bytes(&[0x61; 32]);
@@ -2926,9 +2929,45 @@ mod tests {
             blob
         };
         assert!(SignedRecord::value_blob_is_current(&blob(now - 60), now));
-        assert!(!SignedRecord::value_blob_is_current(&blob(now - 6 * 3600 - 1), now), "past its six-hour TTL");
-        assert!(!SignedRecord::value_blob_is_current(&blob(now + 2 * 3600), now), "beyond the skew tolerance");
+        assert!(
+            SignedRecord::value_blob_is_current(&blob(now + 90 * 60), now),
+            "a fresh record seen by a searcher whose clock is ninety minutes slow"
+        );
+        assert!(
+            SignedRecord::value_blob_is_current(&blob(now - 6 * 3600 - 30 * 60), now),
+            "or one fresh enough at the storer, seen by a fast searcher"
+        );
+        assert!(!SignedRecord::value_blob_is_current(&blob(now - 7 * 3600 - 1), now), "past its TTL and the slack");
+        assert!(!SignedRecord::value_blob_is_current(&blob(now + 2 * 3600 + 1), now), "beyond twice the skew tolerance");
         assert!(!SignedRecord::value_blob_is_current(&[0u8; 80], now), "too short to carry a date");
+    }
+
+    /// The slack scales with the record's life: half an hour slow used to
+    /// refuse three in four presence records, and 45 minutes fast all of them.
+    #[test]
+    fn a_searchers_clock_skew_does_not_cost_it_presence_records() {
+        let channel_id = [0x22; 16];
+        let sk = SigningKey::from_bytes(&[0x62; 32]);
+        let rec = SignedRecord::channel_presence(
+            "nick",
+            channel_id,
+            [0x23; 32],
+            &[0x24; 32],
+            false,
+            0,
+            &[0x25; 32],
+            &sk,
+        );
+        let mut blob = rec.data;
+        blob.extend_from_slice(&rec.signature);
+        let made = rec.timestamp;
+        let ttl = 45 * 60;
+        for age in [0, 5 * 60, 10 * 60] {
+            assert!(SignedRecord::value_blob_is_current(&blob, made + age - 30 * 60), "slow, age {age}");
+            assert!(SignedRecord::value_blob_is_current(&blob, made + age + 45 * 60), "fast, age {age}");
+        }
+        assert!(!SignedRecord::value_blob_is_current(&blob, made - ttl - 1), "a whole life too slow");
+        assert!(!SignedRecord::value_blob_is_current(&blob, made + ttl + ttl / 2), "a life and a half old");
     }
 
     /// A maximum size of zero is how every search path here spells "no limit",

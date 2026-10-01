@@ -53,6 +53,8 @@ pub(super) struct EmberPublishSchedule<'a> {
     pub(super) placed: &'a mut HashSet<([u8; 16], EmberPublishKind)>,
     /// Rounds still in progress in which a key has failed on every replica.
     pub(super) partial: &'a mut HashSet<([u8; 16], EmberPublishKind)>,
+    /// Files whose keyword rounds have used up their partial retries.
+    pub(super) retries_spent: &'a mut HashSet<[u8; 16]>,
     pub(super) attempts: &'a mut HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
     /// When each file's source record next falls due.
     pub(super) source_at: &'a mut HashMap<[u8; 16], std::time::Instant>,
@@ -66,6 +68,7 @@ impl EmberPublishSchedule<'_> {
             unplaced: self.unplaced,
             placed: self.placed,
             partial: self.partial,
+            retries_spent: self.retries_spent,
             attempts: self.attempts,
             source_at: self.source_at,
             keyword_at: self.keyword_at,
@@ -101,22 +104,33 @@ impl EmberPublishSchedule<'_> {
     /// failure, and on a file's first publish that word stayed unsearchable
     /// for twelve hours. Counted against [`EMBER_PUBLISH_MAX_ATTEMPTS`] like a
     /// failed round, so a word that never lands stops being retried.
+    ///
+    /// Stopped for good, not for the one interval: the file stays in
+    /// `retries_spent` until a round places every key. A key storers refuse
+    /// for as long as the file is shared — past the per-publisher cap on a
+    /// word most of the library carries, or under a full key — otherwise
+    /// brought the whole file's keyword set back three times every interval.
     pub(super) fn finish_round(&mut self, slot: ([u8; 16], EmberPublishKind), now: std::time::Instant) -> bool {
         self.unplaced.remove(&slot);
         let partial = self.partial.remove(&slot);
         if !self.placed.remove(&slot) {
             return false;
         }
-        if partial && slot.1 == EmberPublishKind::Keyword {
-            let attempts = self.attempts.entry(slot).or_insert(EmberPublishAttempts {
-                rounds_failed: 0,
-                last_charged: now,
-            });
-            attempts.rounds_failed += 1;
-            attempts.last_charged = now;
-            if attempts.rounds_failed <= EMBER_PUBLISH_MAX_ATTEMPTS {
-                self.keyword_at.insert(slot.0, now + EMBER_KEYWORD_PARTIAL_RETRY);
-                return true;
+        if slot.1 == EmberPublishKind::Keyword {
+            if !partial {
+                self.retries_spent.remove(&slot.0);
+            } else if !self.retries_spent.contains(&slot.0) {
+                let attempts = self.attempts.entry(slot).or_insert(EmberPublishAttempts {
+                    rounds_failed: 0,
+                    last_charged: now,
+                });
+                attempts.rounds_failed += 1;
+                attempts.last_charged = now;
+                if attempts.rounds_failed <= EMBER_PUBLISH_MAX_ATTEMPTS {
+                    self.keyword_at.insert(slot.0, now + EMBER_KEYWORD_PARTIAL_RETRY);
+                    return true;
+                }
+                self.retries_spent.insert(slot.0);
             }
         }
         self.attempts.remove(&slot);
@@ -131,6 +145,7 @@ impl NetworkState {
             unplaced: &mut self.ember_publish_unplaced,
             placed: &mut self.ember_publish_placed,
             partial: &mut self.ember_publish_partial,
+            retries_spent: &mut self.ember_keyword_retries_spent,
             attempts: &mut self.ember_publish_attempts,
             source_at: &mut self.ember_source_publish_at,
             keyword_at: &mut self.ember_keyword_publish_at,
@@ -1871,6 +1886,7 @@ pub(super) fn retract_ember_publish(
             state.ember_publish_partial.remove(&(*file_hash, kind));
             state.ember_publish_attempts.remove(&(*file_hash, kind));
         }
+        state.ember_keyword_retries_spent.remove(file_hash);
         state.ember_published_sources.remove(file_hash);
         state.ember_source_publish_at.remove(file_hash);
         state.ember_source_publish_unix.remove(file_hash);
@@ -2298,9 +2314,8 @@ pub(super) fn ember_source_buddy_choice(
             c.push(extra.clone());
         }
     }
-    c.retain(|x| {
-        x.node_id != state.ember_dht.local_id() && x.failed_queries == 0 && x.is_verified()
-    });
+    let local_id = state.ember_dht.local_id();
+    c.retain(|x| ember_buddy_candidate(x, local_id, state.ember_named_source_buddy));
     c.sort_by_key(|contact| std::cmp::Reverse(contact.last_seen));
     let (live, skipped): (Vec<_>, Vec<_>) = c
         .into_iter()
@@ -2321,6 +2336,25 @@ pub(super) fn ember_source_buddy_choice(
     });
     let named = current.or_else(|| endorsed(&live)).or_else(|| endorsed(&skipped));
     (live, named)
+}
+
+/// Whether `contact` may stand as our buddy.
+///
+/// One unanswered query passes over a newcomer, but not the buddy already
+/// named: it keeps its place until it is about to be evicted. A single lost
+/// datagram used to name another endorsed contact, and a new name makes every
+/// firewalled source record due again.
+pub(super) fn ember_buddy_candidate(
+    contact: &ember::dht::EmberContact,
+    local_id: ember::dht::EmberNodeId,
+    named: Option<ember::dht::EmberNodeId>,
+) -> bool {
+    let tolerated = if named == Some(contact.node_id) {
+        ember::dht::MAX_FAILED_QUERIES - 1
+    } else {
+        0
+    };
+    contact.node_id != local_id && contact.is_verified() && contact.failed_queries <= tolerated
 }
 
 /// Ask the best few candidates to endorse their own endpoints for us.
