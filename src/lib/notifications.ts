@@ -95,10 +95,13 @@ let deliveryUnavailable = false;
  * conversation" test for the unread badge and the in-app toast, and gating the
  * notification on *that* put the second-monitor case straight back — the
  * handler returned before this check was ever consulted.
+ *
+ * The silent-update countdown is drawn in the main window only, so for its
+ * warning the chat window having focus is not the user having seen it.
  */
-function emberIsFocused(): boolean {
+function emberIsFocused(category: NotifyCategory): boolean {
   if (typeof document === 'undefined') return false;
-  if (chatWindowFocused()) return true;
+  if (category !== 'silent_update' && chatWindowFocused()) return true;
   return document.visibilityState === 'visible' && document.hasFocus();
 }
 
@@ -150,7 +153,7 @@ export function shouldNotify(category: NotifyCategory): boolean {
   if (!settings) return false;
   if (!settings.notifications_enabled) return false;
   if (!settings[CATEGORY_SETTING[category]]) return false;
-  if (settings.notifications_only_when_unfocused && emberIsFocused()) return false;
+  if (settings.notifications_only_when_unfocused && emberIsFocused(category)) return false;
   return true;
 }
 

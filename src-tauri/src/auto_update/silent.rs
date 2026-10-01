@@ -30,6 +30,9 @@ use crate::types::TransferStatus;
 
 /// Emitted with a [`SilentUpdateStatus`] whenever it changes.
 pub const STATUS_EVENT: &str = "ember:silent-update";
+/// Emitted when a countdown gives way to a transfer or local work, the one
+/// reason for leaving it that the user is told about.
+pub const BUSY_EVENT: &str = "ember:silent-update-busy";
 /// Tray menu entry shown during the countdown.
 pub const TRAY_CANCEL_ID: &str = "tray_cancel_update";
 
@@ -149,6 +152,9 @@ static INSTALL_NOW: AtomicBool = AtomicBool::new(false);
 /// A command changed the record; the driver should re-read it now.
 static RECORD_DIRTY: AtomicBool = AtomicBool::new(true);
 static LAST_STATUS: parking_lot::Mutex<Option<SilentUpdateStatus>> = parking_lot::Mutex::new(None);
+/// The countdown's tray entry while it is shown. Only touched on the main
+/// thread.
+static TRAY_CANCEL: parking_lot::Mutex<Option<MenuItem<Wry>>> = parking_lot::Mutex::new(None);
 
 /// Keyboard or mouse input in an Ember window, or one of them gaining focus.
 pub fn note_user_activity_now() {
@@ -210,8 +216,11 @@ pub fn transfer_busy(status: &TransferStatus, speed: u64) -> bool {
 
 /// Why the record keeps this version from installing silently right now.
 fn held_by_record(record: &UpdateRecord, version: &str, now_unix: i64) -> Option<Phase> {
+    // An attempt still on record outside an install is one whose launch could
+    // not write down how it went: as good as failed.
     if record.skipped_version.as_deref() == Some(version)
         || record.failed_version.as_deref() == Some(version)
+        || record.attempting.as_ref().is_some_and(|attempt| attempt.to == version)
     {
         return Some(Phase::Held);
     }
@@ -221,11 +230,34 @@ fn held_by_record(record: &UpdateRecord, version: &str, now_unix: i64) -> Option
     None
 }
 
-/// A "Not now" still in force. One further off than a postpone can reach was
-/// stamped under a clock running ahead, and would hold updates until then.
+/// A "Not now" still in force, never further off than one postpone from now.
+/// One beyond that was stamped before the clock stepped back, or by hand; it
+/// still holds, and [`rebased_postpone`] stops it holding for longer.
 fn postponed_until(record: &UpdateRecord, now_unix: i64) -> Option<i64> {
-    record.postponed_until.filter(|until| {
-        *until > now_unix && *until <= now_unix.saturating_add(POSTPONE_SECS + 3600)
+    record
+        .postponed_until
+        .filter(|until| *until > now_unix)
+        .map(|until| until.min(now_unix.saturating_add(POSTPONE_SECS)))
+}
+
+/// What to store in place of a "Not now" further off than a click can reach,
+/// so that it runs out one postpone after it was noticed rather than when wall
+/// time catches up with it.
+fn rebased_postpone(record: &UpdateRecord, now_unix: i64) -> Option<i64> {
+    record
+        .postponed_until
+        .filter(|until| *until > now_unix.saturating_add(POSTPONE_SECS + 3600))
+        .map(|_| now_unix.saturating_add(POSTPONE_SECS))
+}
+
+/// Whether a silent install that failed before anything was stopped failed
+/// because of the update itself: the staged copy had vanished or changed
+/// (antivirus, most likely, which will do it again), which `install_locked`
+/// answers by dropping the copy. `pending` is the updater's state after the
+/// failure.
+fn staged_copy_failed(pending: Option<Option<(String, bool)>>, version: &str) -> bool {
+    pending.is_some_and(|pending| {
+        pending.is_some_and(|(pending, prepared)| pending == version && !prepared)
     })
 }
 
@@ -256,7 +288,11 @@ struct Driver {
     activity: Option<(Instant, Activity)>,
     record: UpdateRecord,
     record_read_at: Option<Instant>,
-    tray_cancel: Option<MenuItem<Wry>>,
+    /// The countdown's tray entry has been asked for.
+    tray_cancel: bool,
+    /// Not installed silently again this session: its install failed for a
+    /// reason that says nothing about the release, or could not be recorded.
+    held_for_session: Option<String>,
     clock: TickClock,
     prepare_failed: bool,
     /// The countdown ran out or "Update now" was pressed, and the install is
@@ -302,7 +338,7 @@ pub fn spawn(app: AppHandle) {
             // Whatever countdown was running went with it; so does its tray
             // entry, which would otherwise stay and postpone on a click.
             COUNTDOWN_LEFT.store(u64::MAX, Ordering::Relaxed);
-            restore_tray_menu(&app);
+            on_main_thread(&app, hide_tray_cancel);
             tokio::time::sleep(RESTART_DELAY).await;
         }
     });
@@ -324,19 +360,23 @@ impl Driver {
         if self.restarting {
             return;
         }
-        self.refresh_tray_labels(app);
         let Some(state) = app.try_state::<AppState>() else {
             return;
         };
+        // Ember is closing: nothing may start an install now.
+        if state.quit_confirmed.load(Ordering::Acquire) || state.bw_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        self.refresh_tray_labels(app);
         let enabled = {
             let config = state.config.read().await;
             config.settings.silent_update_enabled && config.settings.auto_check_updates
         };
         let support = support();
-        self.refresh_record();
         let now = Instant::now();
         let now_ms = chrono::Utc::now().timestamp_millis();
         let now_unix = now_ms.div_euclid(1000);
+        self.refresh_record(now_unix);
 
         if self.clock.woke_from_gap(now, now_ms) {
             // Someone opening the lid is someone at the machine: the quiet
@@ -351,6 +391,7 @@ impl Driver {
 
         if !enabled || support.is_err() {
             self.leave_countdown(app);
+            self.stop_preparing();
             self.phase = Phase::Off;
             self.quiet_since = None;
             self.publish(app, enabled, support, now_unix);
@@ -379,11 +420,10 @@ impl Driver {
         };
         if self.version.as_deref() != Some(version.as_str()) {
             self.leave_countdown(app);
-            self.quiet_since = None;
-            self.version = Some(version.clone());
+            self.start_version(version.clone());
         }
 
-        if let Some(held) = held_by_record(&self.record, &version, now_unix) {
+        if let Some(held) = self.held(&self.record, &version, now_unix) {
             self.leave_countdown(app);
             self.phase = held;
             self.quiet_since = None;
@@ -407,7 +447,7 @@ impl Driver {
 
         if self.record.ready_since.as_ref().is_none_or(|ready| ready.version != version) {
             let since = ReadySince { version: version.clone(), at: now_unix };
-            record::update_stored(|record| record.ready_since = Some(since.clone()));
+            let _ = record::update_stored(|record| record.ready_since = Some(since.clone()));
             self.record.ready_since = Some(since);
         }
 
@@ -430,12 +470,9 @@ impl Driver {
             // is here answers it, and clicking it is input. A transfer that
             // starts moving does.
             if activity.busy() {
-                tracing::info!("Silent update countdown aborted: Ember is busy again");
-                self.leave_countdown(app);
-                self.quiet_since = None;
-                self.phase = Phase::Waiting;
+                self.abort_countdown_busy(app);
             } else {
-                self.update_countdown_tray(ends.saturating_duration_since(now).as_secs());
+                self.update_countdown_tray(app, ends.saturating_duration_since(now).as_secs());
                 self.phase = Phase::Countdown;
             }
             self.publish(app, enabled, support, now_unix);
@@ -464,14 +501,56 @@ impl Driver {
         self.publish(app, enabled, support, now_unix);
     }
 
-    fn refresh_record(&mut self) {
+    fn refresh_record(&mut self, now_unix: i64) {
         let stale = self
             .record_read_at
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
-        if RECORD_DIRTY.swap(false, Ordering::AcqRel) || stale {
-            self.record = record::load_stored();
-            self.record_read_at = Some(Instant::now());
+        if !RECORD_DIRTY.swap(false, Ordering::AcqRel) && !stale {
+            return;
         }
+        self.record_read_at = Some(Instant::now());
+        // Kept as it was when the file cannot be read right now, rather than
+        // replaced by one without its skip or postpone.
+        match record::read_stored() {
+            Ok(record) => self.record = record,
+            Err(error) => tracing::debug!("Silent update: keeping the last record read: {error}"),
+        }
+        if let Some(until) = rebased_postpone(&self.record, now_unix) {
+            let stamped = self.record.postponed_until;
+            let _ = record::update_stored(|record| {
+                if record.postponed_until == stamped {
+                    record.postponed_until = Some(until);
+                }
+            });
+            self.record.postponed_until = Some(until);
+        }
+    }
+
+    /// Why this version is not to install silently right now.
+    fn held(&self, record: &UpdateRecord, version: &str, now_unix: i64) -> Option<Phase> {
+        if self.held_for_session.as_deref() == Some(version) {
+            return Some(Phase::Held);
+        }
+        held_by_record(record, version, now_unix)
+    }
+
+    /// A different release is pending: nothing learned about the last one
+    /// applies to it, including a download of it that failed.
+    fn start_version(&mut self, version: String) {
+        self.quiet_since = None;
+        self.next_prepare_at = None;
+        self.prepare_failed = false;
+        self.version = Some(version);
+    }
+
+    /// Silent updates went off: no background download goes on without them.
+    fn stop_preparing(&mut self) {
+        if let Some(task) = self.prepare_task.take() {
+            tracing::info!("Silent update: switched off; stopping the background download");
+            task.abort();
+        }
+        self.next_prepare_at = None;
+        self.prepare_failed = false;
     }
 
     fn reap_prepare(&mut self, now: Instant) {
@@ -528,27 +607,21 @@ impl Driver {
             self.version.as_deref().unwrap_or("?")
         );
         let label = cancel_label(COUNTDOWN.as_secs());
-        match MenuItem::with_id(app, TRAY_CANCEL_ID, &label, true, None::<&str>) {
-            Ok(item) => {
-                if let Some(tray) = app.tray_by_id("main") {
-                    match crate::build_tray_menu(app, Some(&item)) {
-                        Ok(menu) => {
-                            let _ = tray.set_menu(Some(menu));
-                            self.tray_cancel = Some(item);
-                        }
-                        Err(error) => tracing::warn!("Could not add the tray's cancel entry: {error}"),
-                    }
-                }
-            }
-            Err(error) => tracing::warn!("Could not create the tray's cancel entry: {error}"),
-        }
+        on_main_thread(app, move |app| show_tray_cancel(app, &label));
+        self.tray_cancel = true;
         COUNTDOWN_LEFT.store(COUNTDOWN.as_secs(), Ordering::Relaxed);
     }
 
-    fn update_countdown_tray(&self, secs: u64) {
+    fn update_countdown_tray(&self, app: &AppHandle, secs: u64) {
         COUNTDOWN_LEFT.store(secs, Ordering::Relaxed);
-        if let Some(item) = &self.tray_cancel {
-            let _ = item.set_text(cancel_label(secs));
+        if self.tray_cancel {
+            let label = cancel_label(secs);
+            on_main_thread(app, move |_| {
+                let item = TRAY_CANCEL.lock().clone();
+                if let Some(item) = item {
+                    let _ = item.set_text(label);
+                }
+            });
         }
     }
 
@@ -558,19 +631,23 @@ impl Driver {
         if !crate::tray::take_changed() {
             return;
         }
-        let Some(item) = &self.tray_cancel else {
-            restore_tray_menu(app);
-            return;
-        };
-        let _ = item.set_text(cancel_label(countdown_remaining_secs().unwrap_or(0)));
-        if let Some(tray) = app.tray_by_id("main") {
-            match crate::build_tray_menu(app, Some(item)) {
-                Ok(menu) => {
-                    let _ = tray.set_menu(Some(menu));
+        let label = cancel_label(countdown_remaining_secs().unwrap_or(0));
+        on_main_thread(app, move |app| {
+            let item = TRAY_CANCEL.lock().clone();
+            let Some(item) = item else {
+                restore_tray_menu(app);
+                return;
+            };
+            let _ = item.set_text(label);
+            if let Some(tray) = app.tray_by_id("main") {
+                match crate::build_tray_menu(app, Some(&item)) {
+                    Ok(menu) => {
+                        let _ = tray.set_menu(Some(menu));
+                    }
+                    Err(error) => tracing::warn!("Could not rebuild the tray menu: {error}"),
                 }
-                Err(error) => tracing::warn!("Could not rebuild the tray menu: {error}"),
             }
-        }
+        });
     }
 
     fn leave_countdown(&mut self, app: &AppHandle) {
@@ -579,16 +656,29 @@ impl Driver {
             return;
         }
         COUNTDOWN_LEFT.store(u64::MAX, Ordering::Relaxed);
-        if self.tray_cancel.take().is_some() {
-            restore_tray_menu(app);
+        if std::mem::take(&mut self.tray_cancel) {
+            on_main_thread(app, hide_tray_cancel);
+        }
+    }
+
+    /// A transfer or local work started during the countdown: back to waiting
+    /// for a quiet moment, without counting as a postpone.
+    fn abort_countdown_busy(&mut self, app: &AppHandle) {
+        tracing::info!("Silent update countdown aborted: Ember is busy again");
+        self.leave_countdown(app);
+        self.quiet_since = None;
+        self.phase = Phase::Waiting;
+        if let Err(error) = app.emit(BUSY_EVENT, ()) {
+            tracing::debug!("Could not emit the silent-update busy event: {error}");
         }
     }
 
     /// Install now, unless the countdown's answer changed first. Returns false,
-    /// leaving everything as it was, when a check or a manual install holds
-    /// the updater: waiting for it here would leave nothing on screen to say
-    /// "Not now" with, and a manual install that got there first must not be
-    /// reported next launch as one that happened while the user was away.
+    /// leaving everything as it was, when it cannot tell yet: mostly a check
+    /// or a manual install holding the updater. Waiting for it here would
+    /// leave nothing on screen to say "Not now" with, and a manual install
+    /// that got there first must not be reported next launch as one that
+    /// happened while the user was away.
     async fn install(
         &mut self,
         app: &AppHandle,
@@ -602,11 +692,23 @@ impl Driver {
         let Some(operation) = updater::try_lock_operation(&service) else {
             return false;
         };
+        // A check that finished since this tick looked may have swapped in a
+        // re-published copy of this version, still to be downloaded. The next
+        // tick plans around whatever is pending now.
+        if updater::try_pending_update_state(&service) != Some(Some((version.to_string(), true))) {
+            return false;
+        }
         // Straight from disk, and from the machine, now that nothing else can
         // start an install: a "Not now", a skip or a transfer that arrived
         // since this tick began must win over the clock.
-        let fresh = record::load_stored();
-        if let Some(held) = held_by_record(&fresh, version, now_unix) {
+        let fresh = match record::read_stored() {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                tracing::warn!("Silent update of {version} waits: its record cannot be read ({error})");
+                return false;
+            }
+        };
+        if let Some(held) = self.held(&fresh, version, now_unix) {
             self.record = fresh;
             self.leave_countdown(app);
             self.phase = held;
@@ -615,11 +717,8 @@ impl Driver {
         }
         let activity = observe_activity(state).await;
         if activity.busy() {
-            tracing::info!("Silent update countdown aborted: Ember is busy again");
             self.activity = Some((Instant::now(), activity));
-            self.leave_countdown(app);
-            self.quiet_since = None;
-            self.phase = Phase::Waiting;
+            self.abort_countdown_busy(app);
             self.publish(app, enabled, support, now_unix);
             return true;
         }
@@ -631,12 +730,20 @@ impl Driver {
 
         // Before the hand-off, in the one file this module owns: how the next
         // launch knows this install was tried, even with no resume file.
+        // Without it a failed install looks like none at all and is tried
+        // again, so on a full disk every half hour of idle would end in a
+        // restart that stops every transfer.
         let attempt = Attempt {
             from: app.package_info().version.to_string(),
             to: version.to_string(),
             at: now_unix,
         };
-        record::update_stored(|record| record.attempting = Some(attempt));
+        if let Err(error) = record::update_stored(|record| record.attempting = Some(attempt)) {
+            tracing::warn!("Silent update of {version} not started: the attempt could not be recorded ({error})");
+            let _ = record::update_stored(|record| record.attempting = None);
+            self.hold_after_failure(app, version, enabled, support, now_unix);
+            return true;
+        }
 
         match updater::install_prepared_update(app, &service, operation, ResumeReason::Silent).await {
             // In-process installs (the AppImage) land here; Windows exits inside.
@@ -650,28 +757,45 @@ impl Driver {
                 // resume file holds, and never try this version silently again.
                 tracing::warn!("Silent update of {version} failed after shutdown: {error}");
                 let failed = version.to_string();
-                record::update_stored(|record| record.failed_version = Some(failed));
+                let _ = record::update_stored(|record| record.failed_version = Some(failed));
                 self.restart(app);
             }
             Err(error) => {
-                // Failed before anything was stopped: the staged copy vanished
-                // (antivirus, most likely, which will do it again) or the floor
-                // moved. Nothing restarts, and the version is not tried silently
-                // again, or every tick would download it and count down anew.
+                // Failed before anything was stopped, so nothing restarts. Only
+                // a staged copy that failed marks the version for good; a floor
+                // file that could not be read, or the update superseded, holds
+                // it for this session. Either way it is not tried again now, or
+                // every quiet spell would count down anew.
                 tracing::warn!("Silent update of {version} did not start: {error}");
+                let lasting = staged_copy_failed(updater::try_pending_update_state(&service), version);
                 let failed = version.to_string();
-                record::update_stored(|record| {
+                let _ = record::update_stored(|record| {
                     record.attempting = None;
-                    record.failed_version = Some(failed.clone());
+                    if lasting {
+                        record.failed_version = Some(failed);
+                    }
                 });
-                self.record.attempting = None;
-                self.record.failed_version = Some(failed);
-                self.phase = Phase::Held;
-                self.quiet_since = None;
-                self.publish(app, enabled, support, now_unix);
+                self.hold_after_failure(app, version, enabled, support, now_unix);
             }
         }
         true
+    }
+
+    /// Stop trying `version` silently for this session after an install that
+    /// did not start. Not left to the record alone, which may not have taken it.
+    fn hold_after_failure(
+        &mut self,
+        app: &AppHandle,
+        version: &str,
+        enabled: bool,
+        support: Result<(), Unsupported>,
+        now_unix: i64,
+    ) {
+        self.held_for_session = Some(version.to_string());
+        RECORD_DIRTY.store(true, Ordering::Release);
+        self.phase = Phase::Held;
+        self.quiet_since = None;
+        self.publish(app, enabled, support, now_unix);
     }
 
     /// Ask the event loop to exit and start Ember again, and stop deciding
@@ -730,7 +854,47 @@ fn cancel_label(secs: u64) -> String {
     crate::tray::labels().cancel_update_with(&format_countdown(secs))
 }
 
+/// Run `change` on the main thread without waiting for it. Every tray and menu
+/// call blocks its caller until the main thread has run it, and while Ember
+/// exits the main thread is running the shutdown, which needs the runtime
+/// worker such a call would park.
+fn on_main_thread(app: &AppHandle, change: impl FnOnce(&AppHandle) + Send + 'static) {
+    let handle = app.clone();
+    if let Err(error) = app.run_on_main_thread(move || change(&handle)) {
+        tracing::debug!("Could not reach the main thread to update the tray: {error}");
+    }
+}
+
+/// Put the countdown's "Cancel update" entry above the tray's others. Main
+/// thread only.
+fn show_tray_cancel(app: &AppHandle, label: &str) {
+    let item = match MenuItem::with_id(app, TRAY_CANCEL_ID, label, true, None::<&str>) {
+        Ok(item) => item,
+        Err(error) => {
+            tracing::warn!("Could not create the tray's cancel entry: {error}");
+            return;
+        }
+    };
+    let Some(tray) = app.tray_by_id("main") else {
+        return;
+    };
+    match crate::build_tray_menu(app, Some(&item)) {
+        Ok(menu) => {
+            let _ = tray.set_menu(Some(menu));
+            *TRAY_CANCEL.lock() = Some(item);
+        }
+        Err(error) => tracing::warn!("Could not add the tray's cancel entry: {error}"),
+    }
+}
+
+/// Take the countdown's entry off the tray menu. Main thread only.
+fn hide_tray_cancel(app: &AppHandle) {
+    TRAY_CANCEL.lock().take();
+    restore_tray_menu(app);
+}
+
 /// Put the tray back to its ordinary menu, without a "Cancel update" entry.
+/// Main thread only.
 fn restore_tray_menu(app: &AppHandle) {
     if let Some(tray) = app.tray_by_id("main") {
         if let Ok(menu) = crate::build_tray_menu(app, None) {
@@ -797,7 +961,9 @@ pub fn note_launch_outcome(app: &AppHandle) {
         (None, None) => return,
     };
     let now_unix = chrono::Utc::now().timestamp();
-    record::update_stored(|record| {
+    // Should this not land, the attempt stays on record, which holds the
+    // version all the same.
+    let _ = record::update_stored(|record| {
         record.attempting = None;
         if outcome.installed {
             record.last_success = Some(LastSuccess {
@@ -865,7 +1031,7 @@ pub fn silent_update_postpone() {
 /// The tray's cancel entry does the same as "Not now".
 pub fn postpone() {
     let until = chrono::Utc::now().timestamp() + POSTPONE_SECS;
-    record::update_stored(|record| record.postponed_until = Some(until));
+    let _ = record::update_stored(|record| record.postponed_until = Some(until));
     INSTALL_NOW.store(false, Ordering::Release);
     RECORD_DIRTY.store(true, Ordering::Release);
 }
@@ -875,7 +1041,7 @@ pub fn postpone() {
 #[tauri::command]
 pub fn silent_update_skip(version: String) {
     let version: String = version.chars().take(64).collect();
-    record::update_stored(|record| record.skipped_version = Some(version));
+    let _ = record::update_stored(|record| record.skipped_version = Some(version));
     INSTALL_NOW.store(false, Ordering::Release);
     RECORD_DIRTY.store(true, Ordering::Release);
 }
@@ -883,7 +1049,7 @@ pub fn silent_update_skip(version: String) {
 /// Lift a "Not now" early, from Settings → About.
 #[tauri::command]
 pub fn silent_update_resume() {
-    record::update_stored(|record| record.postponed_until = None);
+    let _ = record::update_stored(|record| record.postponed_until = None);
     RECORD_DIRTY.store(true, Ordering::Release);
 }
 
@@ -958,8 +1124,67 @@ mod tests {
         assert_eq!(held_by_record(&postponed, "1.8.0", NOW), Some(Phase::Postponed));
         assert_eq!(held_by_record(&postponed, "1.8.0", NOW + 61), None, "a postpone runs out");
 
+        let attempted = UpdateRecord {
+            attempting: Some(Attempt { from: "1.7.1".to_string(), to: "1.8.0".to_string(), at: NOW }),
+            ..Default::default()
+        };
+        assert_eq!(
+            held_by_record(&attempted, "1.8.0", NOW),
+            Some(Phase::Held),
+            "an attempt whose launch could not record how it went"
+        );
+        assert_eq!(held_by_record(&attempted, "1.8.1", NOW), None);
+    }
+
+    /// A "Not now" made before the clock stepped back reaches further than a
+    /// click can. It still holds, for one postpone from when it is noticed.
+    #[test]
+    fn a_postpone_beyond_reach_holds_for_one_postpone_from_now() {
+        let behind = UpdateRecord { postponed_until: Some(NOW + POSTPONE_SECS + 2 * 3600), ..Default::default() };
+        assert_eq!(held_by_record(&behind, "1.8.0", NOW), Some(Phase::Postponed));
+        assert_eq!(postponed_until(&behind, NOW), Some(NOW + POSTPONE_SECS));
+        assert_eq!(rebased_postpone(&behind, NOW), Some(NOW + POSTPONE_SECS));
+
         let ahead = UpdateRecord { postponed_until: Some(NOW + 30 * 24 * 3600), ..Default::default() };
-        assert_eq!(held_by_record(&ahead, "1.8.0", NOW), None, "a postpone no click could make");
+        assert_eq!(rebased_postpone(&ahead, NOW), Some(NOW + POSTPONE_SECS));
+
+        let clicked = UpdateRecord { postponed_until: Some(NOW + POSTPONE_SECS), ..Default::default() };
+        assert_eq!(rebased_postpone(&clicked, NOW), None, "an ordinary Not now is left alone");
+        assert_eq!(postponed_until(&clicked, NOW), Some(NOW + POSTPONE_SECS));
+    }
+
+    #[test]
+    fn only_a_staged_copy_that_failed_is_the_update_failing() {
+        let staged = |prepared| Some(Some(("1.8.0".to_string(), prepared)));
+        assert!(staged_copy_failed(staged(false), "1.8.0"), "install_locked dropped the copy");
+        assert!(!staged_copy_failed(staged(true), "1.8.0"), "the floor could not be read");
+        assert!(!staged_copy_failed(Some(None), "1.8.0"), "superseded and dropped");
+        assert!(!staged_copy_failed(None, "1.8.0"), "the updater was busy");
+        assert!(!staged_copy_failed(Some(Some(("1.8.1".to_string(), false))), "1.8.0"));
+    }
+
+    #[test]
+    fn a_new_release_does_not_inherit_the_last_ones_download_failure() {
+        let mut driver = Driver {
+            version: Some("1.8.0".to_string()),
+            prepare_failed: true,
+            next_prepare_at: Some(Instant::now() + PREPARE_RETRY),
+            quiet_since: Some(Instant::now()),
+            ..Default::default()
+        };
+        driver.start_version("1.8.1".to_string());
+        assert_eq!(driver.version.as_deref(), Some("1.8.1"));
+        assert!(!driver.prepare_failed);
+        assert!(driver.next_prepare_at.is_none(), "downloaded at once, not an hour later");
+        assert!(driver.quiet_since.is_none());
+    }
+
+    #[test]
+    fn a_version_held_for_the_session_stays_held_whatever_the_record_says() {
+        let driver = Driver { held_for_session: Some("1.8.0".to_string()), ..Default::default() };
+        let record = UpdateRecord::default();
+        assert_eq!(driver.held(&record, "1.8.0", NOW), Some(Phase::Held));
+        assert_eq!(driver.held(&record, "1.8.1", NOW), None, "the next release is handled normally");
     }
 
     #[test]

@@ -2,7 +2,7 @@ import { get, writable } from 'svelte/store';
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { relaunch } from '@tauri-apps/plugin-process';
 import * as m from '$lib/paraglide/messages';
-import { translateError } from '$lib/i18n';
+import { codedErrorOf, translateError } from '$lib/i18n';
 
 // Shared auto-update state. Both the corner `UpdateNotice` banner and the
 // Settings → About card read and drive this single store, so a check started
@@ -198,6 +198,23 @@ let checkInFlight = false;
  */
 let handoffInFlight = false;
 
+/**
+ * Set once an install or an installer run failed after Ember had stopped its
+ * network services for it. Only a restart brings them back, so the error that
+ * says so must outlast the next automatic check.
+ */
+let servicesStopped = false;
+
+const SERVICES_STOPPED_CODES = new Set([
+  'updater_install_failed_services_stopped',
+  'updater_launch_failed_services_stopped',
+]);
+
+function noteServicesStopped(e: unknown): void {
+  const code = codedErrorOf(e)?.code;
+  if (code && SERVICES_STOPPED_CODES.has(code)) servicesStopped = true;
+}
+
 async function disposePending(): Promise<void> {
   pending = false;
 }
@@ -290,6 +307,7 @@ export async function applyBackgroundCheckResult(result: SecureUpdateCheckResult
   // Mid-install or installed-awaiting-restart: nothing a check found changes
   // what the user is in the middle of.
   if (phase === 'downloading' || phase === 'installing' || phase === 'ready') return;
+  if (phase === 'error' && servicesStopped) return;
   await applyCheckResult(result, true, takeStagedSnapshot());
 }
 
@@ -451,8 +469,11 @@ export async function installUpdate(): Promise<void> {
     onEvent.onmessage = (event) => {
       switch (event.event) {
         case 'Started':
+          // Can come twice: once for a background download this install
+          // waited on, again for the copy it then stages or fetches itself.
           total = event.data.contentLength;
-          updater.update((s) => ({ ...s, phase: 'downloading', total, downloaded: 0 }));
+          downloaded = 0;
+          updater.update((s) => ({ ...s, phase: 'downloading', total, downloaded }));
           break;
         case 'Progress':
           downloaded += event.data.chunkLength;
@@ -471,6 +492,7 @@ export async function installUpdate(): Promise<void> {
     await disposePending();
   } catch (e) {
     retryAction = 'install';
+    noteServicesStopped(e);
     updater.update((s) => ({ ...s, phase: 'error', error: toMessage(e) }));
   } finally {
     installInFlight = false;
@@ -580,6 +602,7 @@ export async function runStagedInstaller(): Promise<void> {
   try {
     await invoke('secure_updater_run_saved_installer');
   } catch (e) {
+    noteServicesStopped(e);
     // `install` would have been wrong here: nothing was checked this session, so
     // `pending` is false and Retry fell through to a fresh check — which offers
     // the same version again and re-downloads the installer already sitting

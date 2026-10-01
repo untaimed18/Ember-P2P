@@ -15,10 +15,15 @@ pub const RECORD_FILE: &str = "silent-update-state.json";
 /// both stamp the file, and two interleaved updates would drop one field.
 static RECORD_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-/// A stamp further ahead than this was written while the clock was wrong. Taken
-/// at face value it would hold off every automatic check until wall time
+/// A stamp further ahead than this was written before the clock stepped back.
+/// Taken at face value it would hold off every automatic check until wall time
 /// caught up — months, for a clock that was set a year out.
-const MAX_FUTURE_SKEW_SECS: i64 = 24 * 3600;
+const MAX_FUTURE_SKEW_SECS: i64 = 5 * 60;
+
+/// The last check this session attempted, in case the record could not take
+/// it: on a full disk the stamp never lands, and the scheduler would check on
+/// every poll.
+static LAST_CHECK_THIS_SESSION: parking_lot::Mutex<Option<i64>> = parking_lot::Mutex::new(None);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateRecord {
@@ -82,46 +87,58 @@ fn record_path(dir: &Path) -> PathBuf {
     dir.join(RECORD_FILE)
 }
 
-/// Read the record, treating a missing or unreadable file as a fresh start.
-/// A corrupt file is not worth surfacing: the worst it costs is one check
-/// earlier than the configured cadence.
-pub fn load(dir: &Path) -> UpdateRecord {
-    match std::fs::read(record_path(dir)) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+/// Read the record. A missing file is a fresh start, and so is one that does
+/// not parse, since nothing in it can be recovered. A file that is there but
+/// cannot be read right now is an error: taking it for a fresh record would
+/// drop its skip, postpone and failed version, and writing one back would make
+/// that permanent.
+fn read(dir: &Path) -> std::io::Result<UpdateRecord> {
+    let path = record_path(dir);
+    // A crash in the middle of a replace leaves the record only under its
+    // backup name, which would otherwise read as no record at all.
+    crate::security::recover_interrupted_replace(&path);
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_else(|error| {
             tracing::warn!("Ignoring an unreadable {RECORD_FILE}: {error}");
             UpdateRecord::default()
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => UpdateRecord::default(),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(UpdateRecord::default()),
         Err(error) => {
             tracing::warn!("Could not read {RECORD_FILE}: {error}");
-            UpdateRecord::default()
+            Err(error)
         }
     }
 }
 
-/// Apply `change` to the stored record and write it back.
-pub fn update(dir: &Path, change: impl FnOnce(&mut UpdateRecord)) {
+/// Read the record, treating a file that cannot be read as a fresh start. For
+/// callers to whom the worst that costs is one check earlier than the cadence.
+pub fn load(dir: &Path) -> UpdateRecord {
     let _guard = RECORD_LOCK.lock();
-    let mut record = load(dir);
+    read(dir).unwrap_or_default()
+}
+
+/// Apply `change` to the stored record and write it back. Nothing is written
+/// when the stored record cannot be read; an error means the change is not on
+/// disk.
+pub fn update(dir: &Path, change: impl FnOnce(&mut UpdateRecord)) -> std::io::Result<()> {
+    let _guard = RECORD_LOCK.lock();
+    let mut record = read(dir)?;
     change(&mut record);
-    let bytes = match serde_json::to_vec_pretty(&record) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::warn!("Could not serialize {RECORD_FILE}: {error}");
-            return;
-        }
-    };
-    if let Err(error) = crate::security::atomic_write(&record_path(dir), &bytes, true) {
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|error| {
+        tracing::warn!("Could not serialize {RECORD_FILE}: {error}");
+        std::io::Error::other(error)
+    })?;
+    crate::security::atomic_write(&record_path(dir), &bytes, true).inspect_err(|error| {
         tracing::warn!("Could not write {RECORD_FILE}: {error}");
-    }
+    })
 }
 
 /// Apply `change` to the record in the data folder.
-pub fn update_stored(change: impl FnOnce(&mut UpdateRecord)) {
-    match crate::storage::paths::ensure_data_dir() {
-        Ok(dir) => update(&dir, change),
-        Err(error) => tracing::warn!("Could not resolve the data folder for {RECORD_FILE}: {error}"),
-    }
+pub fn update_stored(change: impl FnOnce(&mut UpdateRecord)) -> std::io::Result<()> {
+    let dir = crate::storage::paths::ensure_data_dir().inspect_err(|error| {
+        tracing::warn!("Could not resolve the data folder for {RECORD_FILE}: {error}");
+    })?;
+    update(&dir, change)
 }
 
 /// The record in the data folder, or a fresh one if it cannot be read.
@@ -131,11 +148,26 @@ pub fn load_stored() -> UpdateRecord {
         .unwrap_or_default()
 }
 
+/// The record in the data folder, or an error when it is there and cannot be
+/// read right now.
+pub fn read_stored() -> std::io::Result<UpdateRecord> {
+    let dir = crate::storage::paths::ensure_data_dir()?;
+    let _guard = RECORD_LOCK.lock();
+    read(&dir)
+}
+
 /// Stamp an update check as having been attempted now.
 pub fn note_check_attempt() {
-    update_stored(|record| {
-        record.last_check_at = Some(chrono::Utc::now().timestamp());
-    });
+    let now = chrono::Utc::now().timestamp();
+    *LAST_CHECK_THIS_SESSION.lock() = Some(now);
+    let _ = update_stored(|record| record.last_check_at = Some(now));
+}
+
+/// When the last update check was attempted: this session's own stamp once it
+/// has one, which is never older than the record's, else the record's.
+pub fn last_check_at(dir: &Path) -> Option<i64> {
+    let this_session = *LAST_CHECK_THIS_SESSION.lock();
+    this_session.or_else(|| load(dir).last_check_at)
 }
 
 /// Every value `update_check_frequency` may take.
@@ -212,11 +244,13 @@ mod tests {
 
     #[test]
     fn tolerates_a_stamp_slightly_ahead_of_the_clock() {
-        assert!(!check_due(Some(NOW + 3600), NOW, "daily"));
+        assert!(!check_due(Some(NOW + 60), NOW, "daily"));
     }
 
     #[test]
-    fn a_stamp_far_in_the_future_counts_as_never_checked() {
+    fn a_stamp_from_before_the_clock_stepped_back_counts_as_never_checked() {
+        assert!(check_due(Some(NOW + 3600), NOW, "daily"));
+        assert!(check_due(Some(NOW + 20 * 3600), NOW, "hourly"));
         assert!(check_due(Some(NOW + 365 * DAY), NOW, "monthly"));
     }
 
@@ -225,11 +259,51 @@ mod tests {
         let dir = temp_dir("round-trip");
         assert_eq!(load(&dir), UpdateRecord::default());
 
-        update(&dir, |record| record.last_check_at = Some(NOW));
+        update(&dir, |record| record.last_check_at = Some(NOW)).unwrap();
         assert_eq!(load(&dir).last_check_at, Some(NOW));
 
         std::fs::write(dir.join(RECORD_FILE), b"{not json").unwrap();
         assert_eq!(load(&dir), UpdateRecord::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_change_that_could_not_be_written_says_so() {
+        let dir = temp_dir("unwritable").join("missing");
+        assert!(update(&dir, |record| record.last_check_at = Some(NOW)).is_err());
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// A record that cannot be read right now is not an empty one: writing
+    /// back over it would drop its skip, postpone and failed version for good.
+    #[test]
+    fn an_unreadable_record_is_left_as_it_is() {
+        let dir = temp_dir("unreadable");
+        std::fs::create_dir(dir.join(RECORD_FILE)).unwrap();
+        let mut changed = false;
+        assert!(update(&dir, |_| changed = true).is_err());
+        assert!(!changed, "nothing is applied to a record that was never read");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_record_parked_by_an_interrupted_replace_is_read_back() {
+        let dir = temp_dir("interrupted-replace");
+        let parked = UpdateRecord {
+            skipped_version: Some("1.8.0".to_string()),
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.join(format!("{RECORD_FILE}.ember-replace-bak")),
+            serde_json::to_vec(&parked).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(load(&dir), parked);
+
+        update(&dir, |record| record.last_check_at = Some(NOW)).unwrap();
+        let record = load(&dir);
+        assert_eq!(record.skipped_version.as_deref(), Some("1.8.0"));
+        assert_eq!(record.last_check_at, Some(NOW));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

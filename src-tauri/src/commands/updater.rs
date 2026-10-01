@@ -1663,6 +1663,7 @@ async fn prepare_staged(
     match service.pending.lock().await.as_ref() {
         Some(update) if same_artifact(&update.platform, &target.platform) => {
             if update.prepared.is_some() {
+                report_already_staged(target.platform.size, on_event);
                 return Ok(true);
             }
         }
@@ -1670,22 +1671,19 @@ async fn prepare_staged(
     }
 
     let prepared = if read_verified_staged(&target.path, &target.platform, public_key).is_ok() {
-        // Reported the way a download would be, so a progress UI moves on.
-        on_event(UpdateProgress::Started {
-            content_length: target.platform.size,
-        });
-        on_event(UpdateProgress::Progress {
-            chunk_length: target.platform.size,
-        });
-        on_event(UpdateProgress::Finished);
+        report_already_staged(target.platform.size, on_event);
         PreparedArtifact::Staged(target.path.clone())
     } else {
         let track = |event: UpdateProgress| {
             note_download_progress(&service.download_progress, &event);
             on_event(event);
         };
-        let downloaded = download_artifact(&target.platform, public_key, &track).await;
-        service.download_progress.lock().take();
+        let downloaded = {
+            // Also when the download is dropped half way, as a background one
+            // is when silent updates are switched off.
+            let _clear = ClearOnDrop(&service.download_progress);
+            download_artifact(&target.platform, public_key, &track).await
+        };
         let artifact = downloaded?;
         match stage_artifact(&target.path, &artifact) {
             Ok(()) => PreparedArtifact::Staged(target.path.clone()),
@@ -1716,6 +1714,25 @@ async fn prepare_staged(
             }
             Ok(false)
         }
+    }
+}
+
+/// Report an artifact already staged the way a download of it would be, so a
+/// progress UI moves on to installing.
+fn report_already_staged(size: u64, on_event: ProgressSink<'_>) {
+    on_event(UpdateProgress::Started {
+        content_length: size,
+    });
+    on_event(UpdateProgress::Progress { chunk_length: size });
+    on_event(UpdateProgress::Finished);
+}
+
+/// Forgets the download progress it guards when dropped.
+struct ClearOnDrop<'a>(&'a parking_lot::Mutex<Option<(u64, u64)>>);
+
+impl Drop for ClearOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.lock().take();
     }
 }
 
@@ -2209,7 +2226,16 @@ pub async fn secure_updater_handoff_status(
     app: AppHandle,
     service: State<'_, UpdaterService>,
 ) -> Result<Option<UpdateHandoffReport>, String> {
-    let _staging = service.staging.lock().await;
+    // Never waits for the staging lock: a background download holds it for up
+    // to half an hour, and the frontend holds every update check back until
+    // this answers, which every page load asks. Only the cleanup needs it, and
+    // is left for a later load while a download runs.
+    let staging = service.staging.try_lock().ok();
+    let clear = |claim: Option<&HandoffClaim>| {
+        if staging.is_some() {
+            clear_handoff(&app, claim);
+        }
+    };
     let path =
         handoff_path(&app).map_err(|error| public_failure(UpdaterOperation::HandoffCheck, error))?;
     let record = match read_handoff(&path) {
@@ -2218,14 +2244,16 @@ pub async fn secure_updater_handoff_status(
             // Nothing was handed over. Whatever is staged was prepared and never
             // installed; keep it only while it is still an upgrade, so the next
             // preparation can reuse it instead of downloading again.
-            sweep_stale_staged(&app);
+            if staging.is_some() {
+                sweep_stale_staged(&app);
+            }
             return Ok(None);
         }
         Err(error) => {
             // An unreadable marker is not worth surfacing, and keeping it would
             // make every launch retry the same parse.
             tracing::warn!("Discarding an unreadable update hand-off record: {error:#}");
-            clear_handoff(&app, None);
+            clear(None);
             return Ok(None);
         }
     };
@@ -2237,7 +2265,7 @@ pub async fn secure_updater_handoff_status(
             // manifest does not contain. Nothing here can be offered, and keeping
             // it would make every launch repeat the same work.
             tracing::warn!("Discarding an unverifiable update hand-off record: {error:#}");
-            clear_handoff(&app, None);
+            clear(None);
             return Ok(None);
         }
     };
@@ -2251,7 +2279,7 @@ pub async fn secure_updater_handoff_status(
             claim.version,
             app.package_info().version
         );
-        clear_handoff(&app, Some(&claim));
+        clear(Some(&claim));
         return Ok(None);
     }
 
@@ -2259,7 +2287,7 @@ pub async fn secure_updater_handoff_status(
         .timestamp()
         .saturating_sub(record.attempted_at);
     if !(0..=HANDOFF_MAX_AGE_SECS).contains(&age) {
-        clear_handoff(&app, Some(&claim));
+        clear(Some(&claim));
         return Ok(None);
     }
 
@@ -2273,7 +2301,7 @@ pub async fn secure_updater_handoff_status(
                 "Discarding the staged installer for {}: it is below the signed security floor",
                 claim.version
             );
-            clear_handoff(&app, Some(&claim));
+            clear(Some(&claim));
             return Ok(None);
         }
         // No floor, or one we could not read: say nothing and keep the bytes. The
@@ -2334,6 +2362,9 @@ pub async fn secure_updater_run_saved_installer(
     app: AppHandle,
     service: State<'_, UpdaterService>,
 ) -> Result<(), String> {
+    // The operation lock as well, so this and a silent install cannot both shut
+    // Ember down and start an installer.
+    let _operation = service.operation.lock().await;
     let _staging = service.staging.lock().await;
     let path = handoff_path(&app)
         .map_err(|error| public_failure(UpdaterOperation::InstallerLaunch, error))?;
@@ -2395,6 +2426,16 @@ pub async fn secure_updater_run_saved_installer(
             "The staged installer is missing or no longer matches its signature. Check for updates again.",
         )
     })?;
+
+    // As the install path does, while the window and the frontend are still
+    // live: the Ember the installer starts, or the one the user starts after
+    // cancelling it, comes back the way they left this one.
+    crate::auto_update::resume::write_before_install(
+        &app,
+        crate::auto_update::resume::ResumeReason::Manual,
+        &claim.version.to_string(),
+    )
+    .await;
 
     // Same reasoning as the install path: the installer replaces files this
     // process has open, so flush and stop everything we own first.

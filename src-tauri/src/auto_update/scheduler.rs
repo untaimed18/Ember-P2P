@@ -95,7 +95,7 @@ async fn maybe_check(app: &AppHandle) {
             return;
         }
     };
-    let last = record::load(&dir).last_check_at;
+    let last = record::last_check_at(&dir);
     if !record::check_due(last, chrono::Utc::now().timestamp(), &frequency) {
         return;
     }

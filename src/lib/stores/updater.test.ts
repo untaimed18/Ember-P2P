@@ -11,6 +11,7 @@ import { invoke } from '@tauri-apps/api/core';
 import {
   applyBackgroundCheckResult,
   checkUpdateHandoff,
+  installUpdate,
   loadLastBackgroundCheckResult,
   updater,
   type SecureUpdateCheckResult,
@@ -121,5 +122,55 @@ describe('loadLastBackgroundCheckResult', () => {
     invokeMock.mockRejectedValueOnce(new Error('ipc'));
     await loadLastBackgroundCheckResult();
     expect(get(updater)).toEqual(IDLE);
+  });
+});
+
+type ProgressChannel = { onmessage: (event: unknown) => void };
+
+describe('installUpdate', () => {
+  it('starts the count again when a second download starts', async () => {
+    await applyBackgroundCheckResult(found('9.9.9'));
+    const seen: Array<[string, number]> = [];
+    invokeMock.mockImplementationOnce((async (_cmd: string, args: { onEvent: ProgressChannel }) => {
+      const send = (event: unknown) => {
+        args.onEvent.onmessage(event);
+        const s = get(updater);
+        seen.push([s.phase, s.downloaded]);
+      };
+      // A background download it waited on, then the copy it staged.
+      send({ event: 'Started', data: { contentLength: 100 } });
+      send({ event: 'Progress', data: { chunkLength: 60 } });
+      send({ event: 'Started', data: { contentLength: 100 } });
+      send({ event: 'Progress', data: { chunkLength: 100 } });
+      send({ event: 'Finished' });
+    }) as never);
+    await installUpdate();
+    expect(seen).toEqual([
+      ['downloading', 0],
+      ['downloading', 60],
+      ['downloading', 0],
+      ['downloading', 100],
+      ['installing', 100],
+    ]);
+    expect(get(updater).phase).toBe('ready');
+  });
+});
+
+describe('an install that stopped the network', () => {
+  it('keeps saying to restart Ember when the next automatic check arrives', async () => {
+    await applyBackgroundCheckResult(found('9.9.9'));
+    invokeMock.mockRejectedValueOnce(
+      JSON.stringify({
+        __coded: true,
+        code: 'updater_install_failed_services_stopped',
+        message: 'restart Ember to resume transfers',
+      }),
+    );
+    await installUpdate();
+    const failed = get(updater);
+    expect(failed.phase).toBe('error');
+
+    await applyBackgroundCheckResult(found('9.9.9'));
+    expect(get(updater)).toEqual(failed);
   });
 });

@@ -75,17 +75,22 @@ The backend module `src-tauri/src/auto_update/` (`scheduler`, `silent`,
 | `Idle` | No update known | Periodic check finds one → `Preparing` |
 | `Preparing` | Downloading and verifying the artifact | Verified and staged → `Waiting`; failure → retried after an hour |
 | `Waiting` | Update ready; waiting for the idle conditions | Conditions hold continuously for the quiet period → `Countdown` |
-| `Countdown` | 60-second warning on screen | Timer ends or "Update now" → `Installing`; Not now → `Postponed`; Skip → `Held`; a transfer moving → `Waiting` |
+| `Countdown` | 60-second warning on screen | Timer ends or "Update now" → `Installing`; Not now → `Postponed`; Skip → `Held`; a transfer moving, or a sleep → `Waiting` |
 | `Postponed` | User said "Not now" | 24 h pass → `Waiting` |
-| `Held` | Version skipped, or its silent install failed once | A newer release |
-| `Installing` | Resume file written, shutdown running, installer handed off | Process exits (success path), or failure → relaunch current version |
+| `Held` | Version skipped, or its silent install failed once; or, until the next launch, an install that failed for a reason unrelated to the release | A newer release |
+| `Installing` | Resume file written, shutdown running, installer handed off | Process exits (success path); failure after shutdown → relaunch current version; failure before it → `Held` |
 
 Ember persists the scheduler's own record in `silent-update-state.json` in the
 data directory. The record holds `last_check_at`, `postponed_until`,
 `skipped_version`, `failed_version`, `ready_since { version, at }` (for the
-week-long-wait notice) and `last_success { from, to, at }`. Like
-`update-handoff.json`, the file is untrusted: it can only postpone or suppress
-an update, never pick what gets installed.
+week-long-wait notice), `last_success { from, to, at }` and `attempting`
+(below). Like `update-handoff.json`, the file is untrusted: it can only
+postpone or suppress an update, never pick what gets installed. A record that
+is there but cannot be read right now is never taken for an empty one: nothing
+is written over it, and the driver keeps the last record it read, so a
+momentary read error cannot drop a skip or a postpone. One that a crash left
+parked by an interrupted replace is restored before it is read. One that does
+not parse holds nothing to recover and is replaced.
 
 ### Periodic check
 
@@ -95,7 +100,12 @@ under `update_check_frequency` (hourly / daily / weekly / monthly), using
 `last_check_at` from the state file. If one is due, it calls `run_check`, the
 same function behind `secure_updater_check`, sharing `UpdaterService.operation`,
 so it can never race a manual check or install. Every attempt, manual or
-automatic, stamps `last_check_at`.
+automatic, stamps `last_check_at`. The scheduler also keeps the session's own
+last attempt in memory, so a stamp that cannot be written (a full disk) does
+not turn the cadence into a check every five minutes. A stamp more than five
+minutes ahead of the clock was written before the clock stepped back, and
+counts as no check at all rather than holding checks off until wall time
+catches up.
 
 This check runs for **everyone with `auto_check_updates` on**, not only silent
 update users. Without silent updates it only raises the existing "update
@@ -139,7 +149,11 @@ into two steps (`commands/updater.rs`):
    Only one holder of the staging lock ever writes to `updates/`, so a
    background preparation and a manual install never write the same file. An
    **Install** pressed during a background download waits for it, showing that
-   download's progress, and then installs the copy it produced.
+   download's progress, and then installs the copy it produced. The hand-off
+   status query every page load makes never waits for the staging lock, since
+   the frontend holds update checks back until it answers: it reads and
+   verifies without the lock, and leaves its cleanup of the staging folder for
+   a later load while a download holds it.
 2. **`install_locked`** re-checks the persisted security floor, re-reads the
    staged bytes and re-checks their size, hash and signature. Only then does it
    write the Windows `update-handoff.json` record (so the recovery path already
@@ -159,7 +173,11 @@ and signature) keeps what was prepared for it, so an hourly check neither
 re-hashes the staged bundle nor interrupts a countdown. If a download keeps
 failing, it is retried hourly and the ordinary "update available" notice is
 shown meanwhile, so the user can still install it. If a newer release appears
-while one is staged, the scheduler prepares the newer one and discards the old. If the security floor rises past the staged version,
+while one is staged, the scheduler prepares the newer one and discards the old.
+A newer release starts afresh: it is downloaded at once, whatever became of the
+one it replaces, so a hotfix for a release that would not download is not held
+back an hour. Switching silent updates (or update checks) off stops a
+background download that is running. If the security floor rises past the staged version,
 the staged update is dropped, exactly as the manual path does today
 (`updater_pending_below_floor`).
 
@@ -228,6 +246,8 @@ hidden window in front of whatever they are doing.
   existing notification path (`src/lib/notifications.ts`, category
   `silent_update`): "Ember will update in 1 minute. Open Ember or use its tray
   icon to cancel." It follows only the master `notifications_enabled` switch.
+  The popped-out chat window having focus does not count as Ember being
+  focused for this one, since the dialog is drawn only in the main window.
   The notification plugin reports no clicks on desktop, so opening Ember from
   the tray or the taskbar is what brings up the dialog.
 - **Always:** the tray menu gains a **Cancel update (0:45)** item above
@@ -240,23 +260,36 @@ hidden window in front of whatever they are doing.
   `{time}` placeholder exactly once in the cancel label), keeps English for any
   it refuses and until the first arrive, and rebuilds the menu, keeping a
   running countdown's entry. The tray is the one surface that works in every
-  case, including notifications turned off.
+  case, including notifications turned off. The driver never waits for the
+  tray: every tray and menu call blocks until the main thread runs it, and
+  while Ember exits the main thread is running the shutdown, which needs the
+  runtime worker such a call would park. So its tray changes are handed to the
+  main thread without waiting, and once a quit or a shutdown has begun the
+  driver does nothing at all.
 
 The countdown aborts by itself if a transfer starts moving bytes, or local work
 such as hashing starts. It returns to `Waiting` without counting as a
-postpone, and a toast says "Update postponed: Ember is busy again." Input does
-*not* abort it: the dialog is how a user who is there answers it, and clicking
-it is input.
+postpone, and a toast says "Update postponed: Ember is busy again." (the
+backend says so with `ember:silent-update-busy`; a countdown a sleep abandoned
+goes back to `Waiting` without it). Input does *not* abort it: the dialog is how
+a user who is there answers it, and clicking it is input.
 
 When the countdown ends (or **Update now** is pressed), the install starts only
 once it holds the updater's operation lock, taken without waiting. If a check
 or a manual install holds it, the dialog and the tray entry stay up at 0:00 and
 the next tick tries again, so a **Not now** or a transfer arriving meanwhile is
-still honoured. Once the lock is held, the state file is re-read and activity
-sampled again; a postpone, a skip or a busy machine found then wins over the
-clock.
+still honoured. Once the lock is held, the updater is asked again whether this
+version is still staged (a check that finished meanwhile may have swapped in a
+re-published copy, which is downloaded first), the state file is re-read and
+activity sampled again; a postpone, a skip or a busy machine found then wins
+over the clock. A state file that cannot be read right then holds the install
+until it can.
 
-**Not now** (or Escape) postpones for 24 hours. **Skip this version** stops
+**Not now** (or Escape) postpones for 24 hours. A postpone further off than
+that, stamped before the clock stepped back (or written by hand), still holds,
+but is rewritten to end 24 hours after the driver notices it, so a clock that
+moved neither loses the user's answer nor holds updates off for longer than one
+postpone. **Skip this version** stops
 silent installs of that version; the normal "update available" notice still
 shows it, and the next newer release is handled normally. While silent updates
 are going to install an update, the corner "update available" notice stays
@@ -463,13 +496,34 @@ handing over, and a launch with no resume file judges the attempt by the version
 it is running, with the same notice and the same `failed_version`. It is written
 only once the silent install holds the updater's operation lock, so a manual
 **Install** that got there first is never reported as an update that happened
-while the user was away.
+while the user was away. And the install starts only once it is on disk:
+without it a failed install would look like none at all and be tried again, so
+a full disk would turn one failure into a restart, stopping every transfer,
+each time Ember sat idle. When it cannot be written the version is held for the
+rest of the session instead. A launch that cannot write down how the attempt
+went leaves `attempting` in the record, which holds that version just the same.
+
+**Run installer** on the stalled-install notice writes the resume file too
+before it shuts down, so the Ember the installer starts (or the one the user
+starts after cancelling it) comes back the way they left it. It takes the
+updater's operation lock, so it never runs alongside a silent install. It starts
+no watchdog: the installer is interactive and may legitimately take longer than
+the watchdog's five minutes, which would then start the old Ember underneath it.
 
 ### Failure safety
 
 The worst outcome for an unattended update is that Ember closes and nothing
 starts again. It could then sit closed for days, sharing nothing, before the user
 notices. Each path is covered as follows.
+
+**Install fails before anything is stopped.** The staged copy vanished or no
+longer verifies (antivirus, most likely, which will do it again), so the
+install never begins and Ember keeps running. A toast says the version could
+not be installed automatically, and it is never tried silently again
+(`failed_version`). Any other failure at that point, such as a security-floor
+file that cannot be read right now or the update having been superseded, says
+nothing about the release, so it holds the version only until the next launch.
+No watchdog is involved, since nothing was handed over.
 
 **Install call returns an error** (the AppImage rewrite failed, or on Windows the
 plugin could not write the installer out of the bundle). The graceful shutdown
@@ -625,16 +679,25 @@ done; each was its own commit.
 
 ## Testing
 
-**Unit tests (no clock, no network).**
+**Unit tests (no clock, no network).** The driver's tick needs a running app,
+so it is not unit-tested as a whole; the decisions it is built from are.
 
-- Idle predicate, driven by a table of transfer rows and timings:
-  - a download waiting in remote queues counts as idle;
-  - one byte per second of upload counts as busy;
-  - hashing counts as busy;
-  - a hidden window counts as away.
-- The scheduler as a pure state machine with injected time: every transition in
-  the table above, including abort on activity, postpone expiry, skip, the
-  7-day notice, and a newer release arriving while one is staged.
+- Idle predicate (`auto_update::silent`): a download waiting in remote queues
+  counts as idle; a transfer moving bytes, hashing, verifying or completing,
+  an Ember Transfer, local work and throughput at the threshold count as busy;
+  ten minutes without input counts as away.
+- The decisions behind the state table: a skipped, failed or still-attempted
+  version is held and the next release is not; a postpone runs out, and one
+  beyond reach holds for one postpone from now and is rebased; the 7-day
+  notice; a sleep on either clock; a new release resets the download retry;
+  a session hold; which failure before shutdown marks a version for good; an
+  attempt judged by the version that came back.
+- The state file (`auto_update::record`): the check cadence, a stamp ahead of
+  the clock, round trip and corruption, a failed write reported, an unreadable
+  file left alone, an interrupted replace restored.
+- The frontend stores: the busy toast only on the busy event, the warning when
+  an install fails before shutdown, install progress across two downloads,
+  and an install that stopped the network outlasting the next check.
 - Resume file:
   - round trip;
   - stale file ignored but version still compared;
@@ -661,8 +724,10 @@ with a test key.**
   - block it with Defender;
   - kill the installer halfway.
 
-  In each case Ember is running again within 5 minutes on the old version, in
-  the same state, reports the failure, and does not retry.
+  In each case Ember reports the failure and does not retry. Deleting the staged
+  copy stops the install before Ember closes, so it simply keeps running; in the
+  other two Ember is running again within 5 minutes on the old version, in the
+  same state.
 - AppImage update and relaunch. Confirm the relaunch runs the new AppImage, not
   the old mount.
 - `.deb` build shows the switch disabled with its reason.

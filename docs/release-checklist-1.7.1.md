@@ -20,9 +20,11 @@ that fails before tagging rather than after.
 Silent updates act on a real signed release, so these runs need two builds:
 the one under test installed, and a newer one published to a test manifest
 signed with a test key (swap the updater endpoint and public key in a local
-build's `tauri.conf.json`; never ship that build). The session-settle and
-quiet periods are 30 and 10 minutes; plan for waits, or run a local build with
-`SETTLE_PERIOD` and `QUIET_PERIOD` in `auto_update/silent.rs` shortened.
+build's `tauri.conf.json`; never ship that build). The session-settle period
+is 30 minutes, and the quiet period and the away time (no input in any Ember
+window) are 10 minutes each; plan for waits, or run a local build with
+`SETTLE_PERIOD`, `QUIET_PERIOD` and `USER_AWAY_SECS` in `auto_update/silent.rs`
+shortened.
 
 Use a Windows 10 or 11 VM with the NSIS installer, and Ubuntu 22.04 with the
 AppImage.
@@ -85,10 +87,19 @@ the chat popped out, and a few peers waiting in the upload queue.
       the tray shows **Cancel update (m:ss)** and the tooltip counts down, and
       the window is never brought to the front. Cancel from the tray works.
 - [ ] Countdown with notifications turned off: the tray entry still works.
+- [ ] Countdown with the main window in the tray and the popped-out chat
+      window focused: the desktop notification still appears.
 - [ ] A transfer starting mid-countdown aborts it, with the "busy again" toast.
+- [ ] Sleep the machine mid-countdown and wake it: the countdown is gone, with
+      no "busy again" toast.
+- [ ] Quit from the tray mid-countdown: Ember exits within a few seconds, also
+      on a one-core VM, and no install starts.
 - [ ] While the release is downloading in the background, **Check now**
-      answers promptly, and **Install** shows that download's progress and then
-      installs it without downloading it again.
+      answers promptly, also after switching the language (which reloads the
+      page) mid-download, and **Install** shows that download's progress and
+      then installs it without downloading it again.
+- [ ] Turn Silent updates off while the release downloads in the background:
+      the log says the download stopped.
 - [ ] Press **Check now** in Settings a few seconds before the countdown ends:
       the dialog and tray entry stay at 0:00 until the check finishes, and
       **Not now** pressed meanwhile still postpones.
@@ -104,19 +115,29 @@ the chat popped out, and a few peers waiting in the upload queue.
 
 ## 5. Failure drills (Windows)
 
-In each case Ember must be running again within about five minutes, on the old
-version, in the same session state, say the update did not install, and not
-try that version silently again.
-
 - [ ] Delete the staged installer from the data folder's `updates` folder just
-      before the countdown ends.
+      before the countdown ends: Ember never closes, a toast says it could not
+      install the version automatically, Settings > About says it will not
+      install by itself, and no countdown comes back for it, also after a
+      restart. Nothing was handed over, so `update-watchdog.log` has no entry
+      for it.
+
+In each of the next two Ember must be running again within about five minutes,
+on the old version, in the same session state, say the update did not
+install, and not try that version silently again.
+
 - [ ] Let Defender (or another antivirus) block the staged installer.
 - [ ] Kill the installer while it runs.
-- [ ] `update-watchdog.log` in the data folder tells each story, and the
+- [ ] `update-watchdog.log` in the data folder tells both stories, and the
       `update-watchdog` folder is gone a minute after Ember comes back (within
       about five minutes after a silent install that failed and restarted
       Ember).
 - [ ] A normal successful update leaves no watchdog running afterwards.
+- [ ] Fill the disk that holds the data folder, then let a countdown end:
+      Ember does not close, says it could not install the version
+      automatically, and does not count down for it again that session.
+- [ ] After a stalled hand-off, **Run installer** and let the installer finish
+      and start Ember: it opens on the same page and server as before.
 
 The watchdog's other paths, where the install itself succeeds:
 

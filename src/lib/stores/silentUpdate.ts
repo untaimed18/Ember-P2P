@@ -51,6 +51,9 @@ interface UpdateOutcome {
 }
 
 const STATUS_EVENT = 'ember:silent-update';
+/** A countdown gave way to a transfer or local work. Leaving it for any other
+ *  reason, such as the machine sleeping, says nothing. */
+const BUSY_EVENT = 'ember:silent-update-busy';
 
 export const silentUpdate = writable<SilentUpdateStatus | null>(null);
 
@@ -79,20 +82,28 @@ function apply(next: SilentUpdateStatus) {
     // focused window and the user asked for that.
     void notify('silent_update', m.silent_update_notify_title(), m.silent_update_notify_body());
   }
-  if (previous?.phase === 'countdown' && next.phase === 'waiting') {
-    toast(m.silent_update_aborted());
+  if (previous?.phase === 'installing' && next.phase === 'held') {
+    // The install failed before Ember closed, so nothing else will say so.
+    const version = next.version ?? '';
+    whenVisible(() => addToast('warning', m.silent_update_failed({ version }), 0));
   }
 }
 
 /** Load the current state and follow the backend's changes to it. */
 export async function initSilentUpdate(): Promise<UnlistenFn> {
-  const unlisten = await listen<SilentUpdateStatus>(STATUS_EVENT, (event) => apply(event.payload));
+  const [unlistenStatus, unlistenBusy] = await Promise.all([
+    listen<SilentUpdateStatus>(STATUS_EVENT, (event) => apply(event.payload)),
+    listen(BUSY_EVENT, () => toast(m.silent_update_aborted())),
+  ]);
   try {
     apply(await invoke<SilentUpdateStatus>('get_silent_update_status'));
   } catch (e) {
     console.warn('silent update: could not load the status', e);
   }
-  return unlisten;
+  return () => {
+    unlistenStatus();
+    unlistenBusy();
+  };
 }
 
 export function silentUpdateNow(): Promise<void> {
