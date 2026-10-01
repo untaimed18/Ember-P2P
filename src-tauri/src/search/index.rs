@@ -1045,6 +1045,23 @@ impl LocalIndex {
         mutation
     }
 
+    /// Undo `mutation`, which set `shared`, on the rows it flipped that still
+    /// carry that flag. Nothing else is touched, so rows hashed or changed
+    /// meanwhile keep their state.
+    pub fn revert_share_mutation(&mut self, mutation: &ShareMutation, shared: bool) {
+        let keys: HashSet<String> = mutation
+            .pending_paths
+            .iter()
+            .chain(&mutation.hashed_paths)
+            .map(|path| normalize_path_key(path))
+            .collect();
+        for file in &mut self.files {
+            if file.shared == shared && keys.contains(&normalize_path_key(&file.path)) {
+                file.shared = !shared;
+            }
+        }
+    }
+
     /// Restrict (or unrestrict) a batch of paths to mutual friends.
     ///
     /// Deliberately independent of `shared`: scope answers "who may see this",
@@ -1486,6 +1503,31 @@ mod local_index_tests {
             shared_ed2k: false,
             shared_ember: false,
         }
+    }
+
+    /// A share change whose save fails is undone on the rows it flipped alone:
+    /// a row a scan hashed meanwhile, or one another command changed, keeps
+    /// what it has now.
+    #[test]
+    fn reverting_a_share_change_touches_only_the_rows_it_flipped() {
+        let h = |byte: u8| format!("{byte:02x}").repeat(16);
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            file("S/a.bin", &h(1), true, "normal"),
+            file("S/copy-of-a.bin", &h(1), true, "normal"),
+            file("S/b.bin", &h(2), true, "normal"),
+        ]);
+        let mutation = index.set_file_shared_by_path("S/a.bin", false);
+        assert_eq!(mutation.changed_paths, 2);
+        // Meanwhile: another command unshares b, and a scan finishes a new row.
+        index.set_file_shared_by_path("S/b.bin", false);
+        index.add_files(vec![file("S/new.bin", &h(3), false, "normal")]);
+
+        index.revert_share_mutation(&mutation, false);
+        assert!(index.get_by_path("S/a.bin").unwrap().shared);
+        assert!(index.get_by_path("S/copy-of-a.bin").unwrap().shared, "every copy it flipped");
+        assert!(!index.get_by_path("S/b.bin").unwrap().shared, "another command's change stays");
+        assert!(!index.get_by_path("S/new.bin").unwrap().shared, "a row it never flipped");
     }
 
     /// The directory counts behind `has_rows_at_or_under` are patched at every

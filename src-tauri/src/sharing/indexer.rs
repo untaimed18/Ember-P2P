@@ -55,6 +55,9 @@ pub struct DiscoveryResult {
     /// Normalized path after which the next bounded scan should continue.
     /// `None` means this page reached the end of the folder.
     pub next_cursor: Option<String>,
+    /// Subfolders that could not be listed. What they hold is unknown, not
+    /// gone: rows under them must not be reconciled away against this page.
+    pub unreadable: Vec<String>,
 }
 
 /// Whether an allowlist of `normalize_path_key` forms offers the file or
@@ -397,6 +400,44 @@ pub fn still_settling(modified_at: i64, now: i64) -> bool {
         && modified_at <= now.saturating_add(SETTLE_FUTURE_TOLERANCE_SECS)
 }
 
+/// The innermost of `roots` holding `path`, matched the way `path_within_dir`
+/// compares: the root a walk reaches `path` from.
+fn innermost_root<'a>(roots: &'a [String], path: &str) -> Option<&'a Path> {
+    roots
+        .iter()
+        .filter(|root| crate::security::path_within_dir(path, root))
+        .map(Path::new)
+        .max_by_key(|root| root.components().count())
+}
+
+/// The components of `path` below `root`, which holds it, however either is
+/// spelled (`\\?\`, case).
+fn components_below(root: &Path, path: &Path) -> std::path::PathBuf {
+    let display =
+        |path: &Path| std::path::PathBuf::from(crate::commands::share_browser::display_fs_path(path));
+    let depth = display(root).components().count();
+    display(path).components().skip(depth).collect()
+}
+
+/// Whether a folder between a root and the entry `below` it is one Ember files
+/// private receives into, which a walk of the root never enters. The root
+/// itself is not tested: sharing one of those folders on purpose works.
+fn private_receive_dir_on_the_way(below: &Path) -> bool {
+    below.parent().is_some_and(|folders| {
+        folders
+            .components()
+            .any(|folder| crate::sharing::is_private_receive_dir_name(&folder.as_os_str().to_string_lossy()))
+    })
+}
+
+/// Whether the walk of the innermost of `roots` holding the file at `path`
+/// passes through a folder of private receives on the way, so would never
+/// find it. For records re-admitted without a walk.
+pub fn under_private_receive_dir(roots: &[String], path: &Path) -> bool {
+    innermost_root(roots, &path.to_string_lossy())
+        .is_some_and(|root| private_receive_dir_on_the_way(&components_below(root, path)))
+}
+
 /// One path a filesystem event named, resolved for a scoped rescan.
 #[derive(Debug)]
 pub enum ScopedDiscovery {
@@ -428,23 +469,14 @@ impl FileIndexer {
         // paths queued by a share are spelled for display (no `\\?\`, the
         // case the user picked), so the root is matched the way
         // `path_within_dir` compares and the path re-spelled under it.
-        let path_text = path.to_string_lossy();
-        let Some(root) = roots
-            .iter()
-            .filter(|root| crate::security::path_within_dir(&path_text, root))
-            .map(Path::new)
-            .max_by_key(|root| root.components().count())
-        else {
+        let Some(root) = innermost_root(roots, &path.to_string_lossy()) else {
             return ScopedDiscovery::Skip;
         };
-        let display =
-            |path: &Path| std::path::PathBuf::from(crate::commands::share_browser::display_fs_path(path));
-        let depth = display(root).components().count();
-        let below = display(path).components().skip(depth).collect::<std::path::PathBuf>();
+        let below = components_below(root, path);
         let respelled = if below.as_os_str().is_empty() {
             root.to_path_buf()
         } else {
-            root.join(below)
+            root.join(&below)
         };
         let path = respelled.as_path();
         let scope = scopes.for_root(&root.to_string_lossy());
@@ -454,11 +486,11 @@ impl FileIndexer {
         if path == root {
             let result = Self::discover_directory_page_in(&path.to_string_lossy(), None, scope);
             return ScopedDiscovery::Found {
+                partial: result.partial || !result.unreadable.is_empty(),
                 files: result.files,
-                partial: result.partial,
             };
         }
-        if is_excluded_share_location(path) {
+        if private_receive_dir_on_the_way(&below) || is_excluded_share_location(path) {
             return ScopedDiscovery::Removed;
         }
         let key = normalize_path_key(&path.to_string_lossy());
@@ -488,13 +520,16 @@ impl FileIndexer {
             return ScopedDiscovery::Removed;
         }
         if metadata.is_dir() {
-            if scope.is_some_and(|scope| !scope.admits_dir(&key)) {
+            let private = path
+                .file_name()
+                .is_some_and(|name| crate::sharing::is_private_receive_dir_name(&name.to_string_lossy()));
+            if private || scope.is_some_and(|scope| !scope.admits_dir(&key)) {
                 return ScopedDiscovery::Removed;
             }
             let result = Self::discover_directory_page_in(&path.to_string_lossy(), None, scope);
             return ScopedDiscovery::Found {
+                partial: result.partial || !result.unreadable.is_empty(),
                 files: result.files,
-                partial: result.partial,
             };
         }
         if !metadata.is_file()
@@ -547,6 +582,7 @@ impl FileIndexer {
                 partial: true,
                 frontier_trimmed: true,
                 next_cursor: None,
+                unreadable: Vec::new(),
             };
         }
 
@@ -565,6 +601,7 @@ impl FileIndexer {
                     partial: true,
                     frontier_trimmed: true,
                     next_cursor: None,
+                    unreadable: Vec::new(),
                 };
             }
         }
@@ -590,6 +627,7 @@ impl FileIndexer {
                 partial: true,
                 frontier_trimmed: true,
                 next_cursor: None,
+                unreadable: Vec::new(),
             };
         }
 
@@ -604,7 +642,7 @@ impl FileIndexer {
                         "Failed to read shared directory {}: {error}",
                         directory.display()
                     );
-                    return false;
+                    return None;
                 }
             };
             let mut trimmed = false;
@@ -667,9 +705,10 @@ impl FileIndexer {
                     pending.push(Reverse((key, entry_path, false)));
                 }
             }
-            trimmed
+            Some(trimmed)
         };
-        let mut frontier_trimmed = enqueue_children(path, &mut pending);
+        let mut frontier_trimmed = enqueue_children(path, &mut pending).unwrap_or(true);
+        let mut unreadable = Vec::new();
 
         while let Some(Reverse((key, entry_path, is_directory))) = pending.pop() {
             if is_directory {
@@ -686,7 +725,10 @@ impl FileIndexer {
                     saw_before_cursor = true;
                     continue;
                 }
-                frontier_trimmed |= enqueue_children(&entry_path, &mut pending);
+                match enqueue_children(&entry_path, &mut pending) {
+                    Some(trimmed) => frontier_trimmed |= trimmed,
+                    None => unreadable.push(entry_path.to_string_lossy().into_owned()),
+                }
                 continue;
             }
             if is_excluded_share_file_name(&entry_path) {
@@ -753,6 +795,7 @@ impl FileIndexer {
             partial,
             frontier_trimmed,
             next_cursor,
+            unreadable,
         }
     }
 
@@ -1323,6 +1366,35 @@ mod tests {
         assert!(cycles.note_page(&root_str, &gone, Vec::new, std::iter::empty()).is_none());
     }
 
+    /// A subfolder that cannot be listed is reported rather than read as
+    /// empty, and a rescan that meets one is not a listing to reconcile by.
+    #[cfg(unix)]
+    #[test]
+    fn a_subfolder_that_cannot_be_listed_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_tree("unlistable");
+        let locked = root.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("a.bin"), b"x").unwrap();
+        std::fs::write(root.join("b.bin"), b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(&locked).is_ok();
+        let root_str = root.to_string_lossy().to_string();
+        let page = FileIndexer::discover_directory_page_in(&root_str, None, None);
+        let scoped = FileIndexer::discover_scoped_path(
+            std::slice::from_ref(&root_str),
+            &DiscoveryScopes::default(),
+            &root,
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !readable {
+            assert_eq!(page.unreadable, vec![locked.to_string_lossy().to_string()]);
+            assert!(!page.partial, "the rest of the page is still a full listing");
+            assert!(matches!(scoped, ScopedDiscovery::Found { partial: true, .. }));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn recently_written_files_are_left_to_settle() {
         let now = 1_000_000;
@@ -1374,6 +1446,50 @@ mod tests {
             ),
             "a path under no shared root is not ours to reconcile"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Chat attachments and room transfers land in folders inside the download
+    /// folder that a walk of a share holding it never enters. An event there
+    /// must not index what the walk refuses, nor may startup hydration bring
+    /// such a record back; a share of the folder itself still offers it.
+    #[test]
+    fn private_receive_folders_are_refused_below_a_root_but_not_as_one() {
+        let root = scratch_tree("private");
+        let roots = vec![root.to_string_lossy().to_string()];
+        let no_lists = DiscoveryScopes::default();
+        let chat = root.join("x").join(crate::network::chat_attach::CHAT_FILES_DIR);
+        let room = root.join(crate::network::ember::xfer::CHANNEL_FILES_DIR);
+        for folder in [&chat, &room] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("a.jpg"), b"x").unwrap();
+        }
+
+        for path in [chat.join("a.jpg"), chat.clone(), room.join("a.jpg"), room.clone()] {
+            assert!(
+                matches!(
+                    FileIndexer::discover_scoped_path(&roots, &no_lists, &path),
+                    ScopedDiscovery::Removed
+                ),
+                "{}",
+                path.display()
+            );
+        }
+        assert!(under_private_receive_dir(&roots, &chat.join("a.jpg")));
+        assert!(!under_private_receive_dir(&roots, &root.join("x").join("a.jpg")));
+        let page = FileIndexer::discover_directory_page_in(&roots[0], None, None);
+        assert!(page.files.is_empty(), "{:?}", page.files);
+
+        let shared_on_purpose = vec![roots[0].clone(), chat.to_string_lossy().to_string()];
+        match FileIndexer::discover_scoped_path(&shared_on_purpose, &no_lists, &chat.join("a.jpg")) {
+            ScopedDiscovery::Found { files, .. } => assert_eq!(files.len(), 1),
+            other => panic!("a shared Chat Files folder offers its files, got {other:?}"),
+        }
+        match FileIndexer::discover_scoped_path(&shared_on_purpose, &no_lists, &chat) {
+            ScopedDiscovery::Found { files, .. } => assert_eq!(files.len(), 1),
+            other => panic!("a rescan of the shared folder walks it, got {other:?}"),
+        }
+        assert!(!under_private_receive_dir(&shared_on_purpose, &chat.join("a.jpg")));
         let _ = std::fs::remove_dir_all(&root);
     }
 

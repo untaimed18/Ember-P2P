@@ -5352,11 +5352,10 @@ async fn handle_command_inner(
                     Ok(bytes) if bytes.len() == 16 => {
                         let mut hash = [0u8; 16];
                         hash.copy_from_slice(&bytes);
-                        if known_files.find_by_hash(&hash).is_none() {
-                            error =
-                                Some(format!("No known.met record for file hash {file_hash_hex}"));
-                            break;
-                        }
+                        // A file a running scan has just hashed gets its record
+                        // only at that scan's reconcile, which takes its flag
+                        // from the index row; until then the share intent
+                        // below is all that holds the choice.
                         parsed.push((hash, shared));
                     }
                     Ok(bytes) => {
@@ -5377,13 +5376,17 @@ async fn handle_command_inner(
                 return;
             }
             let before = known_files.clone();
+            let mut recorded = false;
             for (hash, shared) in &parsed {
                 if let Some(record) = known_files.find_by_hash_mut(hash) {
                     record.is_shared = *shared;
+                    recorded = true;
                 }
             }
             if !parsed.is_empty() {
-                known_files.mark_dirty();
+                if recorded {
+                    known_files.mark_dirty();
+                }
                 // Ordered by restrictiveness rather than by file, because the
                 // two stores are only consistent if a crash between them leaves
                 // the pair no *less* restrictive than either of them says.
@@ -5423,16 +5426,20 @@ async fn handle_command_inner(
                 // See SetUploadPriorities: persist before acknowledging so
                 // share/unshare cannot appear successful and then revert on
                 // the next application start.
-                let ownership = state.known_met_save_lock.clone().lock_owned().await;
-                let known_path = state.data_dir.join("known.met");
-                let mut snapshot = known_files.clone();
-                let save_result = tokio::task::spawn_blocking(move || {
-                    let _ownership = ownership;
-                    snapshot.save(&known_path)
-                })
-                .await
-                .map_err(|e| format!("known.met share-state save task failed: {e}"))
-                .and_then(|result| result.map_err(|e| e.to_string()));
+                let save_result = if recorded {
+                    let ownership = state.known_met_save_lock.clone().lock_owned().await;
+                    let known_path = state.data_dir.join("known.met");
+                    let mut snapshot = known_files.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ownership = ownership;
+                        snapshot.save(&known_path)
+                    })
+                    .await
+                    .map_err(|e| format!("known.met share-state save task failed: {e}"))
+                    .and_then(|result| result.map_err(|e| e.to_string()))
+                } else {
+                    Ok(())
+                };
                 if let Err(e) = save_result {
                     // Withdraw only the allows that made a previously unshared
                     // file shared. An allow for a file the catalog already had

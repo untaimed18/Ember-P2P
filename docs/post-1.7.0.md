@@ -329,9 +329,29 @@ and folders and the folders that lead to them (`DiscoveryScope` in
 filesystem events. Files never picked are not hashed or indexed, so they do not
 show in the Library. A file unshared from a partial share goes onto the
 folder's withheld list (`withheld_folder_files`), which discovery walks too, so
-it stays in the Library as an unshared file just as in a folder shared whole;
-sharing it again puts it back on the allowlist. Widening a partial share queues
-a scan of what it newly offers.
+the index keeps it as an unshared file just as in a folder shared whole: it
+leaves the Library list, which shows only offered files, and the Library
+explorer lists it as not shared. Sharing a copy of the same content elsewhere
+does not share it; sharing it again from the explorer puts it back on the
+allowlist. Widening a partial share, from the explorer, the folder picker or a
+drop, queues a scan of what it newly offers.
+
+### Unshare a folder inside a listed folder entry
+
+"Unshare folder" on `F:\Music\Live` while a partial share of `F:\` lists
+`F:\Music` unshares the files there now, but the list still offers `Live`, so
+files added to it later are offered and the explorer shows it as shared. A fix
+needs either a per-folder exclusion that discovery, `allowlist_permits` and the
+withheld tidy-up all honour, or the `F:\Music` entry expanded into its contents
+minus `Live`, which changes what new files in `F:\Music` get.
+
+### Withheld lists after unsharing a large partial share
+
+Unsharing a whole partly shared folder withholds every indexed path in it, and
+the list lives in `settings.json`: it is rewritten and fsynced on every
+settings, cursor and intent save, sent to the webview and back, and rescanned
+by `tidy_withheld` on every list edit. Fine for hundreds of files; for a drive
+of them, keep the withheld lists in a store of their own.
 
 ### eMule import: offer eMule's one-folder sharing
 

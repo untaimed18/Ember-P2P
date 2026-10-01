@@ -1437,6 +1437,10 @@ pub fn run() {
                                 // back into the shared and announced index.
                                 let record_path = std::path::Path::new(&record.file_path);
                                 if crate::sharing::indexer::is_excluded_share_file_name(record_path)
+                                    || crate::sharing::indexer::under_private_receive_dir(
+                                        &hydration_folders,
+                                        record_path,
+                                    )
                                     || crate::sharing::indexer::is_excluded_share_location(
                                         record_path,
                                     )
@@ -1561,6 +1565,10 @@ pub fn run() {
                     &mut files_to_hash,
                     &pending_folder_allowlists,
                 );
+                commands::sharing::withhold_unlisted_known_files(
+                    &mut all_discovered,
+                    &pending_folder_allowlists,
+                );
                 commands::sharing::apply_pending_intents(
                     &mut all_discovered,
                     &mut files_to_hash,
@@ -1620,7 +1628,6 @@ pub fn run() {
                 let mut last_known_met_persist = std::time::Instant::now();
                 let mut hashed_since_persist = 0usize;
                 let mut was_cancelled = false;
-                let mut page_complete = true;
 
                 // Same scheduler the folder-add and reload passes use: one read
                 // at a time per physical drive, more only where a drive has
@@ -1796,7 +1803,6 @@ pub fn run() {
                                 break;
                             }
                             tracing::warn!("Startup hash failed for {}: {e}", file.name);
-                            page_complete = false;
                             let mut idx = index_clone.write().await;
                             idx.abandon_hash_placeholder(&file_temp_id);
                             drop(idx);
@@ -1804,7 +1810,6 @@ pub fn run() {
                         }
                         Ok(Err(e)) => {
                             tracing::error!("Startup hash task panicked for {}: {e}", file.name);
-                            page_complete = false;
                             let mut idx = index_clone.write().await;
                             idx.abandon_hash_placeholder(&file_temp_id);
                             drop(idx);
@@ -1817,14 +1822,12 @@ pub fn run() {
                             // it recurred on every launch because the queue is
                             // walked in a stable order — the same failure the
                             // "leaving pending for retry" behaviour was written to
-                            // prevent. Leave the row pending, mark the page
-                            // incomplete so nothing is reconciled away, and move on.
+                            // prevent. Leave the row pending and move on.
                             tracing::warn!(
                                 "Startup hash of {} read nothing for {} min (file may be on cloud storage or locked); leaving pending for retry",
                                 file.name,
                                 commands::sharing::HASH_STALL_TIMEOUT.as_secs() / 60
                             );
-                            page_complete = false;
                             // Drain the abandoned blocking hash and release its
                             // claim only once it really ends. It must hold no
                             // scan lease: the read may be stuck in the kernel
@@ -1863,10 +1866,9 @@ pub fn run() {
                 pipeline.abandon();
                 // A file another pass still held was never hashed here, so this
                 // page is unfinished and nothing may be reconciled away on the
-                // strength of it.
-                if pipeline.skipped() > 0 {
-                    page_complete = false;
-                }
+                // strength of it. One that failed or stalled is retried by the
+                // next walk of the page; see the reload loop.
+                let page_complete = pipeline.skipped() == 0;
 
                 {
                     let mut idx = index_clone.write().await;

@@ -197,6 +197,16 @@ git diff v1.7.0 -- messages/en.json
       list, which shows only offered files; across a reload and a restart the
       Library explorer still lists it as not shared, and sharing it there
       offers it again.
+- [ ] Drop a few files of that partly shared folder on the window and share
+      only them: they are hashed and listed without a reload. Dropping the
+      folder itself shares all of it.
+- [ ] Share the download folder (or its drive): a chat attachment or room file
+      arriving in Chat Files or Channel Files never shows in the Library,
+      before or after a restart. Sharing Chat Files itself still lists its
+      files.
+- [ ] Add a folder and, while it is still hashing, unshare a file that has
+      already appeared: it leaves the Library at once and stays off when the
+      scan ends and after a restart.
 
 ## 9. Room transfers across versions
 

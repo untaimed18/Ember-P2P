@@ -24,6 +24,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::search::index::normalize_path_key;
+use crate::sharing::indexer::{DiscoveryScopes, FileIndexer, ScopedDiscovery};
 
 /// What one reload page covered of one shared folder.
 #[derive(Debug, Clone)]
@@ -143,29 +144,35 @@ pub fn cycles() -> &'static Mutex<PagedCycles> {
 const MAX_RECHECKED: usize = 20_000;
 const RECHECK_BUDGET: Duration = Duration::from_secs(10);
 
-/// Fingerprints of the rows, `(path, size, modified_at)`, whose file is on disk
-/// as the row indexed it. Blocking.
-pub fn still_on_disk(rows: &[(String, u64, i64)]) -> HashSet<u64> {
-    still_on_disk_within(rows, MAX_RECHECKED, Instant::now() + RECHECK_BUDGET)
+/// Fingerprints of the rows, `(path, size, modified_at)`, whose file discovery
+/// under `roots` would find as the row indexed it. A file on disk that the
+/// walk refuses (a private receive folder, off a partial share's list) is not
+/// spared. Blocking.
+pub fn still_on_disk(rows: &[(String, u64, i64)], roots: &[String], scopes: &DiscoveryScopes) -> HashSet<u64> {
+    still_on_disk_within(rows, roots, scopes, MAX_RECHECKED, Instant::now() + RECHECK_BUDGET)
 }
 
-fn still_on_disk_within(rows: &[(String, u64, i64)], max: usize, deadline: Instant) -> HashSet<u64> {
+fn still_on_disk_within(
+    rows: &[(String, u64, i64)],
+    roots: &[String],
+    scopes: &DiscoveryScopes,
+    max: usize,
+    deadline: Instant,
+) -> HashSet<u64> {
     let mut back = HashSet::new();
     for (path, size, modified_at) in rows.iter().take(max) {
         if Instant::now() >= deadline {
             break;
         }
-        let Ok(metadata) = std::fs::symlink_metadata(path) else {
-            continue;
-        };
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|elapsed| elapsed.as_secs() as i64)
-            .unwrap_or(0);
-        if metadata.is_file() && metadata.len() == *size && modified == *modified_at {
-            back.insert(fingerprint(path));
+        let print = fingerprint(path);
+        if let ScopedDiscovery::Found { files, .. } =
+            FileIndexer::discover_scoped_path(roots, scopes, std::path::Path::new(path))
+        {
+            if let [file] = files.as_slice() {
+                if fingerprint(&file.path) == print && file.size == *size && file.modified_at == *modified_at {
+                    back.insert(print);
+                }
+            }
         }
     }
     back
@@ -280,13 +287,50 @@ mod tests {
             (gone, 3, modified),
             (back.clone(), 4, modified),
         ];
+        let roots = vec![dir.to_string_lossy().to_string()];
+        let lists = DiscoveryScopes::default();
 
-        assert_eq!(still_on_disk(&rows), HashSet::from([fingerprint(&back)]));
+        assert_eq!(still_on_disk(&rows, &roots, &lists), HashSet::from([fingerprint(&back)]));
         let changed = vec![(back.clone(), 4, modified), (back.clone(), 3, modified + 7)];
-        assert!(still_on_disk(&changed).is_empty(), "a different file at the path goes");
+        assert!(still_on_disk(&changed, &roots, &lists).is_empty(), "a different file at the path goes");
         assert!(
-            still_on_disk_within(&rows, 0, Instant::now() + RECHECK_BUDGET).is_empty(),
+            still_on_disk_within(&rows, &roots, &lists, 0, Instant::now() + RECHECK_BUDGET).is_empty(),
             "rows past the bound are removed as decided"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The walk never enters a folder of private receives, so a row there is
+    /// one that should never have been indexed and must not be kept.
+    #[test]
+    fn a_file_the_walk_refuses_is_not_spared() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("ember-paged-private-{:016x}", rand::random::<u64>()));
+        let private = dir.join("x").join(crate::network::chat_attach::CHAT_FILES_DIR).join("a.jpg");
+        std::fs::create_dir_all(private.parent().unwrap()).unwrap();
+        std::fs::write(&private, b"abc").unwrap();
+        let modified = std::fs::metadata(&private)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let private = private.to_string_lossy().to_string();
+        let rows = vec![(private.clone(), 3, modified)];
+        let lists = DiscoveryScopes::default();
+
+        let roots = vec![dir.to_string_lossy().to_string()];
+        assert!(still_on_disk(&rows, &roots, &lists).is_empty());
+        let shared_on_purpose = vec![dir
+            .join("x")
+            .join(crate::network::chat_attach::CHAT_FILES_DIR)
+            .to_string_lossy()
+            .to_string()];
+        assert_eq!(
+            still_on_disk(&rows, &shared_on_purpose, &lists),
+            HashSet::from([fingerprint(&private)])
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
