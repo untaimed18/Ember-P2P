@@ -131,7 +131,12 @@ pub(in crate::network) async fn on_buddy_event(
                         let pfs = state
                             .per_file_sources
                             .entry(pd.transfer_id.clone())
-                            .or_insert_with(|| ed2k::sources::PerFileSourceList::new(file_hash));
+                            .or_insert_with(|| {
+                                ed2k::sources::PerFileSourceList::new(
+                                    file_hash,
+                                    state.max_sources_per_file,
+                                )
+                            });
                         if pfs.add_source_full(dest_ip, dest_port, 0) {
                             state.ember_payload_dirty = true;
                         }

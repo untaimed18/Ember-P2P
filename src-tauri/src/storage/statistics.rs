@@ -360,6 +360,22 @@ impl StatsManager {
         self.last_down_snapshot = down;
         self.last_up_snapshot = up;
 
+        // After the clock steps back the history's newer ticks lie ahead of
+        // `now`, where the graph and the windowed rate cannot place them.
+        // Shift them to end just before it, keeping the five minutes intact.
+        if let Some(&(newest, _)) = self.down_rate_history.back() {
+            if now < newest {
+                let shift = newest - (now - 1);
+                for (at, _) in self
+                    .down_rate_history
+                    .iter_mut()
+                    .chain(self.up_rate_history.iter_mut())
+                {
+                    *at -= shift;
+                }
+            }
+        }
+
         // A late tick carries every second since the last one.
         let covered = self
             .down_rate_history
@@ -656,6 +672,38 @@ mod tests {
         mgr.record_rate(start);
         mgr.record_rate(start + 1);
         assert_eq!(mgr.stats.rate_history.minutes.len(), MAX_MINUTE_HISTORY.min(before + 1));
+    }
+
+    /// Ticks stamped before the clock stepped back used to stay ahead of `now`:
+    /// a step of over five minutes left a one-second graph for five minutes,
+    /// a shorter one drew two ticks in each second at the right edge.
+    #[test]
+    fn a_clock_stepping_back_keeps_the_five_minute_graph() {
+        let mut mgr = StatsManager::new();
+        let start: i64 = 1_790_000_040;
+        for i in 0..MAX_RATE_HISTORY as i64 {
+            mgr.session_down_counter.store((i as u64 + 1) * 100, Ordering::Relaxed);
+            mgr.record_rate(start + i);
+        }
+        let steady = |mgr: &StatsManager| {
+            let recent = &mgr.stats.rate_history.recent;
+            assert_eq!(recent.len(), MAX_RATE_HISTORY);
+            assert!(recent.iter().all(|slot| *slot == [100, 0]), "{recent:?}");
+            assert!((mgr.stats.session_down_rate - 100.0).abs() < 1e-6);
+        };
+        steady(&mgr);
+
+        let back_ten_minutes = start + MAX_RATE_HISTORY as i64 - 1 - 600;
+        mgr.session_down_counter
+            .store((MAX_RATE_HISTORY as u64 + 1) * 100, Ordering::Relaxed);
+        mgr.record_rate(back_ten_minutes);
+        assert_eq!(mgr.stats.rate_history.recent_end, back_ten_minutes);
+        steady(&mgr);
+
+        mgr.session_down_counter
+            .store((MAX_RATE_HISTORY as u64 + 2) * 100, Ordering::Relaxed);
+        mgr.record_rate(back_ten_minutes - 60);
+        steady(&mgr);
     }
 
     /// A tick that ran late carries several seconds of bytes: the graph shows

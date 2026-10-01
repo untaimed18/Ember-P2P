@@ -3754,6 +3754,15 @@ fn unshared_purge_hashes<'a>(
     out
 }
 
+/// Whether the library offers `hash` as a completed file. An unshared file
+/// keeps its index row for the Library explorer, and `resolve_upload_file`
+/// refuses it.
+pub(crate) fn index_offers_hash(index: &LocalIndex, hash: &[u8; 16]) -> bool {
+    index
+        .get_by_hash(&hex::encode(hash))
+        .is_some_and(|file| file.shared)
+}
+
 /// Encode the `OP_ASKSHAREDFILESANSWER` payload for a set of shared files:
 /// `<count 4>(<HASH 16><ID 4><PORT 2><1 Tag_set>)[count]`. Pure function
 /// (no I/O, no `&self`) so it's directly unit-testable; the async
@@ -5361,7 +5370,7 @@ impl UploadHandler {
             hashes
                 .iter()
                 .copied()
-                .filter(|h| index.get_by_hash(&hex::encode(h)).is_some())
+                .filter(|h| index_offers_hash(&index, h))
                 .collect()
         };
         // Short-circuit: if every queued file is still shared there is nothing
@@ -8008,6 +8017,29 @@ impl UploadHandler {
         // file hash, reserve a slot, and send OP_ACCEPTUPLOADREQ before the
         // packet loop (peer will follow with OP_REQUESTPARTS).
         if let Some(fh) = push_grant_file_hash {
+            // The waiter's file may have been unshared since it queued, or be
+            // friends-only, which a plain session like this is never served.
+            // eMule drops such a waiter rather than grant it a slot; kept, the
+            // row would be redialled after every backoff.
+            let Some(resolved) = self
+                .resolve_upload_file(
+                    &fh,
+                    PeerFileAccess {
+                        ember_hash: peer_ember_hash,
+                        secure_v2_authenticated,
+                    },
+                )
+                .await
+            else {
+                let mut queue = self.upload_queue.lock().await;
+                queue.retain(|e| {
+                    keep_queue_row_after_slot_grant(&queue_identity, peer_addr.ip(), e)
+                });
+                anyhow::bail!(
+                    "push-grant session {peer_addr}: file {} is not served to this peer",
+                    hex::encode(fh)
+                );
+            };
             let dynamic_slots = self.compute_dynamic_slot_count();
             if !slot_guard.try_activate(dynamic_slots, &queue_identity) {
                 anyhow::bail!("push-grant session {peer_addr}: no free upload slot after dial");
@@ -8033,40 +8065,29 @@ impl UploadHandler {
             last_part_request = std::time::Instant::now();
             let tid = uuid::Uuid::new_v4().to_string();
             transfer_id = Some(tid.clone());
-            if let Some(resolved) = self
-                .resolve_upload_file(
-                    &fh,
-                    PeerFileAccess {
-                        ember_hash: peer_ember_hash,
-                        secure_v2_authenticated,
-                    },
-                )
-                .await
-            {
-                total_size = resolved.size;
-                let _ = self
-                    .upload_event_tx
-                    .send(UploadEvent {
-                        transfer_id: tid,
-                        kind: UploadEventKind::Started {
-                            file_name: resolved.name,
-                            file_hash: hex::encode(fh),
-                            total_size: resolved.size,
-                            peer_addr: peer_addr.to_string(),
-                            peer_name: ul_peer_name.clone(),
-                            client_software: ul_client_software.clone(),
-                            country_code: ul_country_code.clone(),
-                            user_hash: if peer_user_hash != [0u8; 16] {
-                                Some(hex::encode(peer_user_hash))
-                            } else {
-                                None
-                            },
-                            wait_seconds: 0,
-                            ember_hash: peer_ember_hash.map(hex::encode),
+            total_size = resolved.size;
+            let _ = self
+                .upload_event_tx
+                .send(UploadEvent {
+                    transfer_id: tid,
+                    kind: UploadEventKind::Started {
+                        file_name: resolved.name,
+                        file_hash: hex::encode(fh),
+                        total_size: resolved.size,
+                        peer_addr: peer_addr.to_string(),
+                        peer_name: ul_peer_name.clone(),
+                        client_software: ul_client_software.clone(),
+                        country_code: ul_country_code.clone(),
+                        user_hash: if peer_user_hash != [0u8; 16] {
+                            Some(hex::encode(peer_user_hash))
+                        } else {
+                            None
                         },
-                    })
-                    .await;
-            }
+                        wait_seconds: 0,
+                        ember_hash: peer_ember_hash.map(hex::encode),
+                    },
+                })
+                .await;
             info!(
                 "AddUpNextClient: push-grant session ready for {peer_addr} file {}",
                 hex::encode(fh)
@@ -14584,6 +14605,42 @@ mod scoring_tests {
         );
 
         assert!(evict.is_empty(), "nothing orphaned -> nothing purged");
+    }
+
+    /// Unsharing a file keeps its row in the index, so membership alone kept
+    /// its waiters queued and push-granted for a file we refuse to serve.
+    #[test]
+    fn an_unshared_library_row_does_not_keep_its_waiters() {
+        let file = |hash: [u8; 16], shared: bool| crate::types::FileInfo {
+            id: hex::encode(hash),
+            name: format!("{}.bin", hash[0]),
+            path: format!("A/{}.bin", hash[0]),
+            size: 1,
+            hash: hex::encode(hash),
+            aich_hash: String::new(),
+            ember_file_hash: String::new(),
+            extension: "bin".to_string(),
+            modified_at: 0,
+            priority: "normal".to_string(),
+            requests: 0,
+            accepted: 0,
+            bytes_transferred: 0,
+            alltime_requests: 0,
+            alltime_accepted: 0,
+            alltime_transferred: 0,
+            complete_sources: 0,
+            folder: "A".to_string(),
+            shared,
+            friends_only: false,
+            shared_kad: false,
+            shared_ed2k: false,
+            shared_ember: false,
+        };
+        let mut index = LocalIndex::new();
+        index.add_files(vec![file([0x11; 16], true), file([0x22; 16], false)]);
+        assert!(index_offers_hash(&index, &[0x11; 16]));
+        assert!(!index_offers_hash(&index, &[0x22; 16]), "indexed, but unshared");
+        assert!(!index_offers_hash(&index, &[0x33; 16]));
     }
 
     /// Seed an eMule credit record so `get_queue_score` returns a

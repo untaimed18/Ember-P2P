@@ -98,27 +98,26 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 control.pause();
             }
 
-            // Check .part file for actual progress (part files live in Temp subdir)
             let part_path = PathBuf::from(&dl_folder)
                 .join("Temp")
                 .join(format!("{}.part", transfer.id));
-            if part_path.exists() && transfer.total_size > 0 {
-                if let Some((completed_bytes, preview_ready, _)) =
-                    progress_map.get(&transfer.id).copied()
-                {
-                    // `completed_bytes` is the on-disk figure, so it restores
-                    // Completed and drives progress. Transferred takes it as a
-                    // floor only: the real cumulative wire total is in the
-                    // `.part.met` and lands once the resumed download reports
-                    // progress, and claiming a smaller number here would make
-                    // the column jump backwards.
-                    transfer.completed_size = completed_bytes;
-                    transfer.transferred = transfer.transferred.max(completed_bytes);
-                    transfer.progress =
-                        ((completed_bytes as f64 / transfer.total_size as f64) * 100.0)
-                            .min(100.0);
-                    control.set_preview_ready(preview_ready);
-                }
+            // The map has an entry exactly when the `.part` existed and the
+            // size was known as the blocking pool read it. Asking the disk
+            // again here would cost a stat per download on the network loop.
+            if let Some((completed_bytes, preview_ready, _)) =
+                progress_map.get(&transfer.id).copied()
+            {
+                // `completed_bytes` is the on-disk figure, so it restores
+                // Completed and drives progress. Transferred takes it as a
+                // floor only: the real cumulative wire total is in the
+                // `.part.met` and lands once the resumed download reports
+                // progress, and claiming a smaller number here would make
+                // the column jump backwards.
+                transfer.completed_size = completed_bytes;
+                transfer.transferred = transfer.transferred.max(completed_bytes);
+                transfer.progress =
+                    ((completed_bytes as f64 / transfer.total_size as f64) * 100.0).min(100.0);
+                control.set_preview_ready(preview_ready);
             }
 
             // If the app crashed during Verifying/Completing, handle locally

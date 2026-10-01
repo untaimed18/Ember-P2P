@@ -527,6 +527,8 @@ pub(super) struct NetworkState {
     pub(super) aich_recovery_pending: ed2k::transfer::SharedAichPending,
     /// eMule-style persistent source lists per download (survives connection failures)
     pub(super) per_file_sources: HashMap<String, ed2k::sources::PerFileSourceList>,
+    /// Cap for each list in `per_file_sources`, from Max sources per file.
+    pub(super) max_sources_per_file: usize,
     /// KAD search state for active downloads not in pending_downloads.
     /// Tracks (last_kad_search_at, search_count) so we periodically search
     /// for additional sources via KAD even while the download is running.

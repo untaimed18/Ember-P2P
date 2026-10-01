@@ -3037,7 +3037,7 @@
   "error_transfers_known_client_counts_failed": "No se pudo obtener el recuento de clientes conocidos",
   "error_settings_max_download_file_size_invalid": "El tamaño máximo de archivo de descarga debe estar entre 1 y 593 GiB",
   "error_settings_max_friends_invalid": "El número máximo de amigos debe estar entre 1 y 500",
-  "error_settings_max_sources_per_file_invalid": "El número máximo de fuentes por archivo debe estar entre 1 y 2000",
+  "error_settings_max_sources_per_file_invalid": "El número máximo de fuentes por archivo debe estar entre 50 y 2000",
   "error_settings_multisource_retry_rounds_invalid": "Las rondas de reintento multi-fuente deben estar entre 1 y 20",
   "error_settings_nickname_empty": "El apodo no debe estar vacío",
   "error_settings_nickname_too_long": "El apodo debe tener 128 bytes o menos",

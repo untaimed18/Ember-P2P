@@ -311,17 +311,20 @@ pub(in crate::network) async fn on_server_connect_result(
                     )
                     .await,
                 );
+                // This TCP session has never published to this server.
+                // Leftover hashes from a disconnect that skipped
+                // `reset_ed2k_server_session` would make incremental skip the
+                // opening dump entirely, and the last session's packet pacing,
+                // which that reset cannot reach, would hold back this
+                // session's first offer by up to a minute, including one that
+                // comes later because the login had nothing to offer yet.
+                state.offered_ed2k_hashes.clear();
+                *next_offer_packet_at = None;
                 if offer_files.is_empty() {
                     warn!("No files to offer to server after login — check shared folders");
                     *pending_offer_files = None;
                     *pending_offer_signature = None;
                 } else {
-                    // This TCP session has never published to this
-                    // server. Leftover hashes from a disconnect that
-                    // skipped `reset_ed2k_server_session` would make
-                    // incremental skip the opening dump entirely.
-                    state.offered_ed2k_hashes.clear();
-                    *next_offer_packet_at = None;
                     let limit = conn.offer_files_chunk_limit();
                     let signature = offer_files_signature(&offer_files);
                     let incremental =

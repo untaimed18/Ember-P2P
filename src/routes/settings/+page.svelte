@@ -1232,7 +1232,7 @@
     s.max_download_speed = cn(s.max_download_speed, 2_147_483_647, 0);
     s.max_concurrent_downloads = ci(s.max_concurrent_downloads, 1, 50, 3);
     s.max_concurrent_uploads = ci(s.max_concurrent_uploads, 1, 50, 4);
-    s.max_sources_per_file = ci(s.max_sources_per_file, 1, 2000, 1000);
+    s.max_sources_per_file = ci(s.max_sources_per_file, 50, 2000, 400);
     s.max_connections = ci(s.max_connections, 1, 2000, 500);
     // Lower bound 0: that is the documented "no burst gate" value, not an
     // empty box — `numericFields` above already rejects those.
@@ -2932,11 +2932,12 @@
 
             <!-- eMule's `MaxSourcesPerFile` is a knob its users tune for rare
                  files, so it sits here beside the other limits. Applied live
-                 to the source manager on save. -->
+                 on save to every download's source list and the source
+                 cache; the backend floor is 50. -->
             <div class="field-row">
               <div class="field half">
                 <label for="max-sources">{m.settings_max_sources_label()}</label>
-                <input id="max-sources" type="number" min="1" max="2000" bind:value={settings.max_sources_per_file} />
+                <input id="max-sources" type="number" min="50" max="2000" bind:value={settings.max_sources_per_file} />
                 <span class="hint">{m.settings_max_sources_hint()}</span>
               </div>
               <div class="field half">

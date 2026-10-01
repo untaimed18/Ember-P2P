@@ -986,7 +986,7 @@ pub(in crate::network) async fn on_source_retry_tick(
             {
                 let pfs = state.per_file_sources
                     .entry(tid.clone())
-                    .or_insert_with(|| ed2k::sources::PerFileSourceList::new(hash_bytes));
+                    .or_insert_with(|| ed2k::sources::PerFileSourceList::new(hash_bytes, state.max_sources_per_file));
                 let udp_sources = {
                     let sm = source_manager.read().await;
                     sm.get_udp_sources(&hash_bytes)
@@ -1493,11 +1493,11 @@ pub(in crate::network) async fn on_source_retry_tick(
                 debug!("Routing table empty for retry of {tid}, continuing with server-only source refresh");
             }
         }
-        let src_count = {
+        let wants_sources = {
             let sm = source_manager.read().await;
-            sm.source_count(&fh)
+            sm.wants_more_sources(&fh)
         };
-        if src_count < MAX_SOURCES_FOR_UDP {
+        if wants_sources {
             let packets = build_all_getsources_packets(
                 state,
                 &fh,
@@ -1576,7 +1576,7 @@ pub(in crate::network) async fn on_source_retry_tick(
 
     // Active-download LowID callback flush: SX / KAD Type-2 peers
     // are registered without waiting for FoundSources. Without this,
-    // busy files (source_count ≥ MAX_SOURCES_FOR_UDP) never request
+    // busy files (source_count ≥ max_sources_for_udp) never request
     // OP_CALLBACKREQUEST for those LowIDs.
     if !state.low_id && state.server_connected && state.server_connection.is_some() {
         let current_server = state.server_addr.and_then(|addr| match addr.ip() {
@@ -1655,7 +1655,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                         if raw.len() == 16 {
                             let mut fh = [0u8; 16];
                             fh.copy_from_slice(&raw[..16]);
-                            if sm.source_count(&fh) >= MAX_SOURCES_FOR_UDP { continue; }
+                            if !sm.wants_more_sources(&fh) { continue; }
                             active_needing_kad.push((tid.clone(), fh, transfer.total_size));
                         }
                     }
@@ -1758,7 +1758,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                 }
                 // Already saturated with sources — don't spend a DHT
                 // lookup we don't need.
-                if sm.source_count(&fh) >= MAX_SOURCES_FOR_UDP {
+                if !sm.wants_more_sources(&fh) {
                     continue;
                 }
                 out.push((tid, fh));

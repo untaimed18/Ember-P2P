@@ -3037,7 +3037,7 @@
   "error_transfers_known_client_counts_failed": "Impossible d'obtenir le nombre de clients connus",
   "error_settings_max_download_file_size_invalid": "La taille maximale des fichiers téléchargés doit être comprise entre 1 et 593 GiB",
   "error_settings_max_friends_invalid": "Le nombre maximal d'amis doit être compris entre 1 et 500",
-  "error_settings_max_sources_per_file_invalid": "Le nombre maximal de sources par fichier doit être compris entre 1 et 2000",
+  "error_settings_max_sources_per_file_invalid": "Le nombre maximal de sources par fichier doit être compris entre 50 et 2000",
   "error_settings_multisource_retry_rounds_invalid": "Les cycles de nouvelle tentative multisource doivent être compris entre 1 et 20",
   "error_settings_nickname_empty": "Le pseudo ne doit pas être vide",
   "error_settings_nickname_too_long": "Le pseudo doit contenir 128 octets ou moins",

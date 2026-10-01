@@ -487,11 +487,11 @@ pub(in crate::network) async fn on_bootstrap_tick(
 
                 let mut fh = [0u8; 16];
                 fh.copy_from_slice(&hash_bytes);
-                let src_count = {
+                let wants_sources = {
                     let sm = source_manager.read().await;
-                    sm.source_count(&fh)
+                    sm.wants_more_sources(&fh)
                 };
-                if src_count < MAX_SOURCES_FOR_UDP {
+                if wants_sources {
                     let packets = build_all_getsources_packets(
                         state,
                         &fh,

@@ -1127,7 +1127,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                         {
                             let pfs = state.per_file_sources
                                 .entry(transfer_id.clone())
-                                .or_insert_with(|| ed2k::sources::PerFileSourceList::new(fh));
+                                .or_insert_with(|| ed2k::sources::PerFileSourceList::new(fh, state.max_sources_per_file));
                             let is_new = pfs.add_source_with_identity(
                                 cb_src.ip,
                                 cb_src.tcp_port,
@@ -1762,7 +1762,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                     {
                         let pfs = state.per_file_sources
                             .entry(transfer_id.clone())
-                            .or_insert_with(|| ed2k::sources::PerFileSourceList::new(hash_bytes));
+                            .or_insert_with(|| ed2k::sources::PerFileSourceList::new(hash_bytes, state.max_sources_per_file));
                         for (ip_s, port) in &sources {
                             if let Ok(v4) = ip_s.parse::<Ipv4Addr>() {
                                 let udp_port = {

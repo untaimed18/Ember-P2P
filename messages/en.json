@@ -3040,7 +3040,7 @@
   "error_transfers_known_client_counts_failed": "Failed to get known client counts",
   "error_settings_max_download_file_size_invalid": "Max download file size must be between 1 and 593 GiB",
   "error_settings_max_friends_invalid": "Max friends must be between 1 and 500",
-  "error_settings_max_sources_per_file_invalid": "Max sources per file must be between 1 and 2000",
+  "error_settings_max_sources_per_file_invalid": "Max sources per file must be between 50 and 2000",
   "error_settings_multisource_retry_rounds_invalid": "Multi-source retry rounds must be between 1 and 20",
   "error_settings_nickname_empty": "Nickname must not be empty",
   "error_settings_nickname_too_long": "Nickname must be 128 bytes or fewer",

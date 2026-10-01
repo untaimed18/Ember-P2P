@@ -3037,7 +3037,7 @@
   "error_transfers_known_client_counts_failed": "Не удалось получить число известных клиентов",
   "error_settings_max_download_file_size_invalid": "Макс. размер загружаемого файла должен быть от 1 до 593 ГиБ",
   "error_settings_max_friends_invalid": "Макс. друзей должно быть от 1 до 500",
-  "error_settings_max_sources_per_file_invalid": "Макс. источников на файл должно быть от 1 до 2000",
+  "error_settings_max_sources_per_file_invalid": "Макс. источников на файл должно быть от 50 до 2000",
   "error_settings_multisource_retry_rounds_invalid": "Число повторов multi-source должно быть от 1 до 20",
   "error_settings_nickname_empty": "Псевдоним не может быть пустым",
   "error_settings_nickname_too_long": "Псевдоним должен быть не длиннее 128 байт",

@@ -144,7 +144,12 @@ pub(super) async fn handle_epx_sources(
                     let pfs = state
                         .per_file_sources
                         .entry(transfer_id.clone())
-                        .or_insert_with(|| ed2k::sources::PerFileSourceList::new(*file_hash));
+                        .or_insert_with(|| {
+                            ed2k::sources::PerFileSourceList::new(
+                                *file_hash,
+                                state.max_sources_per_file,
+                            )
+                        });
                     if pfs.add_source_full(ip, port, udp_port) {
                         stored_new = true;
                     }
@@ -522,7 +527,7 @@ const _: () = assert!(STARVED_SERVER_REASK_SECS < SERVER_TCP_SRCREQ_INTERVAL_SEC
 /// counting for up to `SOURCE_EXPIRY_SECS`. That matters twice over: it
 /// overstates the swarm in the Sources column by however many peers we are
 /// simultaneously refusing to contact, and the same figure gates every further
-/// lookup against `MAX_SOURCES_FOR_UDP` — so a file whose sources have all died
+/// lookup against `max_sources_for_udp` — so a file whose sources have all died
 /// reads as fully sourced and stops looking for more, which is exactly when it
 /// needs to.
 pub(super) async fn retire_dead_source_from_registry(
@@ -859,18 +864,6 @@ pub(super) async fn send_kad_callback_req(
     }
 }
 
-// Keep eDonkey UDP source lookups protocol-compatible while adapting fanout
-// to runtime conditions so we stay fast without looking like a flooder.
-// eMule: GetMaxSourcePerFileUDP() — keep discovering (server UDP + active KAD
-// re-search) until a file knows this many sources, then stop asking. Raised
-// from 50 to feed the Path B "queue on many sources" model: a popular file is
-// queued on hundreds of peers (connectionless, UDP-reask maintained), so the
-// known-source pool must be allowed to grow well past the old held-connection
-// count. Still well under MAX_SOURCES_PER_FILE (500) / the user's
-// max_sources_per_file (default 400), and the per-channel reask INTERVALS
-// (KAD backoff, 30-min server UDP) remain the politeness gate — not this count.
-pub(super) const MAX_SOURCES_FOR_UDP: usize = 300;
-
 pub(super) const MAX_FAIL_COUNT_FOR_UDP: u32 = 3;
 
 /// Maximum number of UDP source-discovery queries we'll send to a
@@ -1089,7 +1082,9 @@ pub(super) fn inject_source_into_active_transfers(
             let pfs = state
                 .per_file_sources
                 .entry(transfer_id.clone())
-                .or_insert_with(|| ed2k::sources::PerFileSourceList::new(file_hash));
+                .or_insert_with(|| {
+                    ed2k::sources::PerFileSourceList::new(file_hash, state.max_sources_per_file)
+                });
             let already_known = pfs.has_source(v4, source.peer_port);
             if already_known {
                 // Worker may have soft-dropped this peer (no free parts).

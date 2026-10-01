@@ -860,6 +860,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         corruption_blackbox: CorruptionBlackBox::new(),
         aich_recovery_pending: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
         per_file_sources: HashMap::new(),
+        max_sources_per_file: ed2k::sources::max_sources_per_file(settings.max_sources_per_file),
         active_kad_search_state: HashMap::new(),
         udp_discovery_sent: 0,
         udp_discovery_send_errs: 0,

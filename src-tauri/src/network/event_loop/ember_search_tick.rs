@@ -546,7 +546,7 @@ pub(in crate::network) async fn on_ember_search_tick(
                 };
                 for tid in &matching_ids {
                     let pfs = state.per_file_sources.entry(tid.clone()).or_insert_with(
-                        || ed2k::sources::PerFileSourceList::new(fh),
+                        || ed2k::sources::PerFileSourceList::new(fh, state.max_sources_per_file),
                     );
                     let added = pfs.add_source_with_identity(
                         src.ip,

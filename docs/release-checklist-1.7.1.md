@@ -165,8 +165,10 @@ The watchdog's other paths, where the install itself succeeds:
 
 ## 7. Translation review
 
-1.7.1 adds 75 strings and changes three (`settings_auto_check_updates_hint`,
-`settings_skip_compress_video` and its hint), in all eight non-English locales.
+1.7.1 adds 77 strings and changes four (`settings_auto_check_updates_hint`,
+`settings_skip_compress_video` and its hint, and
+`error_settings_max_sources_per_file_invalid`), in all eight non-English
+locales.
 List them with:
 
 ```
@@ -176,9 +178,11 @@ git diff v1.7.0 -- messages/en.json
 - [ ] Silent updates in Settings > About, the countdown dialog, its
       notification, and the done/failed toasts (`settings_silent_update_*`,
       `silent_update_*`).
-- [ ] The new Settings copy: Hourly, Max sources per file, and the reworded
-      video-compression switch (`settings_update_frequency_hourly`,
-      `settings_max_sources_*`, `settings_skip_compress_video*`).
+- [ ] The new Settings copy: Hourly, Max sources per file and its range error,
+      and the reworded video-compression switch
+      (`settings_update_frequency_hourly`, `settings_max_sources_*`,
+      `error_settings_max_sources_per_file_invalid`,
+      `settings_skip_compress_video*`).
 - [ ] The Search "results dropped" line, the folder-scan failure toasts and the
       Ctrl+V shortcut row (`search_results_shed`, `library_scan_failed*`,
       `shortcuts_transfers_paste_links`).
@@ -205,7 +209,13 @@ git diff v1.7.0 -- messages/en.json
       256 KiB of text typed or pasted into the box, Cyrillic names included,
       is refused with its size and the limit.
 - [ ] Statistics shows the rate graph filling in; the 1 hour view gains a point
-      a minute and keeps its history across a sleep.
+      a minute and keeps its history across a sleep. Setting the system clock
+      back a few minutes leaves the 5 minute view whole.
+- [ ] Max sources per file, on a popular download: lowered to 50 and saved, its
+      source count stops growing and works back down toward 50; raised to
+      1000, it can grow past 500. Settings does not accept less than 50.
+- [ ] Unshare a file peers are queued for: they leave the Queue tab within
+      half a minute and do not come back after a restart.
 - [ ] Make a category from a download's Category menu with several rows
       selected: all of them get it, and its chip appears. Its chip narrows the
       list, and Stop All then stops only those. Removing it in Edit categories

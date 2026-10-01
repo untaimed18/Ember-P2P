@@ -768,7 +768,9 @@ pub(super) async fn try_start_pending_download_from_known_sources(
         let pfs = state
             .per_file_sources
             .entry(transfer_id.to_string())
-            .or_insert_with(|| ed2k::sources::PerFileSourceList::new(hash_bytes));
+            .or_insert_with(|| {
+                ed2k::sources::PerFileSourceList::new(hash_bytes, state.max_sources_per_file)
+            });
         let udp_sources = {
             let sm = source_manager.read().await;
             sm.get_udp_sources(&hash_bytes)

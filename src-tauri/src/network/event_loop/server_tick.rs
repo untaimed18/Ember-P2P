@@ -474,7 +474,7 @@ pub(in crate::network) async fn on_server_tick(
                                     // Keeping it out of the registry is the part that
                                     // matters: `source_count` gates every further
                                     // server, KAD and Ember lookup against
-                                    // `MAX_SOURCES_FOR_UDP`, so a LowID user's popular
+                                    // `max_sources_for_udp`, so a LowID user's popular
                                     // file used to accumulate enough undialable rows to
                                     // switch its own discovery off — while the Sources
                                     // column showed hundreds. The visible row below is
@@ -509,7 +509,7 @@ pub(in crate::network) async fn on_server_tick(
                                 for tid in &matching_transfer_ids {
                                     let pfs = state.per_file_sources
                                         .entry(tid.clone())
-                                        .or_insert_with(|| ed2k::sources::PerFileSourceList::new(file_hash));
+                                        .or_insert_with(|| ed2k::sources::PerFileSourceList::new(file_hash, state.max_sources_per_file));
                                     // Identity-only rows: a classic ed2k-server LowID
                                     // entry carries no routable address, so IP and port
                                     // both stay zero and the user hash is the only key

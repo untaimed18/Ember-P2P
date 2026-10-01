@@ -52,7 +52,7 @@ pub(in crate::network) async fn on_server_tcp_source_tick(
     if room > 0 {
         let mut all_downloads: Vec<(String, [u8; 16], u64, usize)> = Vec::new();
 
-        {
+        let udp_cap = {
             let sm = source_manager.read().await;
             for (tid, pd) in &state.pending_downloads {
                 if pd.control.is_cancelled() { continue; }
@@ -65,7 +65,8 @@ pub(in crate::network) async fn on_server_tcp_source_tick(
                     }
                 }
             }
-        }
+            sm.max_sources_for_udp()
+        };
 
         // Also include active downloads
         {
@@ -92,7 +93,7 @@ pub(in crate::network) async fn on_server_tcp_source_tick(
         // any path asked the server for within the per-file floor, and
         // files the explicit asks above already put in this frame.
         all_downloads.retain(|(_, fh, _, sc)| {
-            *sc < MAX_SOURCES_FOR_UDP
+            *sc < udp_cap
                 && server_tcp_srcreq_file_due(&state.server_tcp_srcreq_file_at, fh, srcreq_now)
                 && !frame.iter().any(|(_, queued, _)| queued == fh)
         });

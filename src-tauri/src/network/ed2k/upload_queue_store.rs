@@ -34,8 +34,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use super::upload::{
-    QueueEntry, QueueIdentity, UploadQueueRef, MAX_PURGEQUEUETIME_SECS, MAX_QUEUE_ENTRIES_PER_IP,
-    MAX_UPLOAD_QUEUE_SIZE,
+    index_offers_hash, QueueEntry, QueueIdentity, UploadQueueRef, MAX_PURGEQUEUETIME_SECS,
+    MAX_QUEUE_ENTRIES_PER_IP, MAX_UPLOAD_QUEUE_SIZE,
 };
 use crate::search::index::LocalIndex;
 use crate::sharing::manager::TransferManager;
@@ -118,7 +118,9 @@ fn unix_of(instant: Instant, now: Instant, now_unix: i64) -> i64 {
 }
 
 /// The `Instant` for wall-clock `at`, or `None` when the monotonic clock cannot
-/// reach back that far, as after a reboot.
+/// reach back that far. Only Windows, whose clock counts from boot, has that
+/// floor; elsewhere an `Instant` reaches back past a reboot, and a row from
+/// before one keeps its true age and leaves the purge window on time.
 fn instant_of(at: i64, now: Instant, now_unix: i64) -> Option<Instant> {
     let ago = now_unix.saturating_sub(at).max(0);
     now.checked_sub(Duration::from_secs(ago as u64))
@@ -362,7 +364,7 @@ pub(crate) async fn merge_pending(
         hashes
             .iter()
             .copied()
-            .filter(|h| index.get_by_hash(&hex::encode(h)).is_some())
+            .filter(|h| index_offers_hash(&index, h))
             .collect()
     };
     let downloading: HashSet<[u8; 16]> = {

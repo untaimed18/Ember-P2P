@@ -3037,7 +3037,7 @@
   "error_transfers_known_client_counts_failed": "无法获取已知客户端数量",
   "error_settings_max_download_file_size_invalid": "最大下载文件大小必须在 1 到 593 GiB 之间",
   "error_settings_max_friends_invalid": "最大好友数必须在 1 到 500 之间",
-  "error_settings_max_sources_per_file_invalid": "每个文件的最大源数必须在 1 到 2000 之间",
+  "error_settings_max_sources_per_file_invalid": "每个文件的最大源数必须在 50 到 2000 之间",
   "error_settings_multisource_retry_rounds_invalid": "多源重试轮数必须在 1 到 20 之间",
   "error_settings_nickname_empty": "昵称不能为空",
   "error_settings_nickname_too_long": "昵称不能超过 128 字节",

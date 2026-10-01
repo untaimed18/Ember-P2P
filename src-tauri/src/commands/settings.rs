@@ -696,6 +696,7 @@ const MAX_SHARED_FOLDERS: usize = 512;
 const MAX_URL_LEN: usize = 2 * 1024;
 const MAX_FILENAME_CLEANUPS_LEN: usize = 16 * 1024;
 use crate::bandwidth::MAX_CONFIGURED_SPEED_BPS;
+use crate::network::ed2k::sources::MIN_SOURCES_PER_FILE;
 
 /// Longest download category name, in characters; the menu and the filter chip
 /// show it whole.
@@ -855,7 +856,7 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
     changed |= clamp_assign(&mut settings.download_queue_wait_secs, 60, 14400);
-    changed |= clamp_assign(&mut settings.max_sources_per_file, 1, 2000);
+    changed |= clamp_assign(&mut settings.max_sources_per_file, MIN_SOURCES_PER_FILE, 2000);
     changed |= clamp_assign(&mut settings.max_connections, 1, 2000);
     // 0 is meaningful here — it turns the burst gate off — so it is clamped
     // from above only.
@@ -1108,10 +1109,10 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "Download queue wait must be between 60 and 14400 seconds",
         ));
     }
-    if !(1..=2000).contains(&settings.max_sources_per_file) {
+    if !(MIN_SOURCES_PER_FILE..=2000).contains(&settings.max_sources_per_file) {
         return Err(coded(
             "settings_max_sources_per_file_invalid",
-            "Max sources per file must be between 1 and 2000",
+            format!("Max sources per file must be between {MIN_SOURCES_PER_FILE} and 2000"),
         ));
     }
     if !(1..=2000).contains(&settings.max_connections) {
@@ -3275,6 +3276,22 @@ mod tests {
         };
         assert!(soft_repair_settings(&mut settings));
         assert!(settings.friend_session_encryption);
+    }
+
+    #[test]
+    fn max_sources_per_file_below_the_floor_is_raised_on_load_and_refused_on_save() {
+        let mut settings = AppSettings {
+            max_sources_per_file: 20,
+            ..AppSettings::default()
+        };
+        let err = validate_settings(&settings).expect_err("below the floor must fail");
+        assert!(
+            err.contains("settings_max_sources_per_file_invalid"),
+            "unexpected error: {err}"
+        );
+        assert!(soft_repair_settings(&mut settings));
+        assert_eq!(settings.max_sources_per_file, MIN_SOURCES_PER_FILE);
+        assert!(validate_settings(&settings).is_ok());
     }
 
     #[test]

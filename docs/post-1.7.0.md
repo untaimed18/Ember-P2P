@@ -361,6 +361,22 @@ be shared") and each folder can be unticked, but there is no way to import a
 folder the eMule way. Offer "without subfolders" per imported folder, reusing the
 allowlist.
 
+## Upload queue
+
+### Give up on a waiter whose slot dial fails
+
+A disconnected HighID waiter at the top of the queue is dialled for its slot
+(`try_add_up_next_client` in `ed2k/upload.rs`: three dials at once, 15 seconds
+to connect). A failed dial keeps the row with a 30-second backoff for the rest
+of its hour in the queue, so a peer that went offline is dialled about every 45
+seconds, and nine or more such rows above a reachable waiter keep all three
+dials busy. Rows restored after a restart make this likelier. eMule drops a
+waiter whose slot connection fails. A fix needs `connect_and_serve` to report a
+failed connect apart from a soft end (a slot lost to a connected waiter, a
+refusal), then drop the row or back off longer after each failure. Push-grant
+sessions are plain eD2K, so a waiter for a friends-only file is dropped when
+dialled; leaving such rows to the peer's own re-ask would keep its place.
+
 ## App-wide
 
 ### Chat pop-out polish
