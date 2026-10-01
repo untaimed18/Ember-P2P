@@ -70,6 +70,29 @@ fn queue_shared_file_stats(app_handle: &tauri::AppHandle, stats: SharedFileStats
     });
 }
 
+/// Hashes of library files already reported as missing from known.met.
+static WARNED_NO_KNOWN_RECORD: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
+
+/// Report upload counters known.met had no record to take. A file served from
+/// a download still in progress has none until it completes, which is routine
+/// and arrives with every progress update, so it stays at debug. A completed
+/// library file without one is worth a warning, once per file.
+fn note_no_known_record(index: &LocalIndex, hash_hex: &str, what: &str) {
+    let hash = hash_hex.to_ascii_lowercase();
+    if index.get_by_hash(&hash).is_none() {
+        debug!("{what} for {hash} is a download in progress, with no known.met record yet");
+        return;
+    }
+    let first = WARNED_NO_KNOWN_RECORD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .insert(hash.clone());
+    if first {
+        warn!("{what} for library file {hash} has no known.met record; keeping session stats only");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_upload_event(
     event: UploadEvent,
@@ -145,13 +168,11 @@ pub(in crate::network) async fn on_upload_event(
                 file_hash.copy_from_slice(&bytes);
                 let persisted_alltime = known_files
                     .add_all_time_transferred(&file_hash, uploaded_bytes);
-                if !persisted_alltime {
-                    warn!(
-                        "Upload progress for {hash_hex} has no known.met record; keeping session stats only"
-                    );
-                }
                 {
                     let mut index = local_index.write().await;
+                    if !persisted_alltime {
+                        note_no_known_record(&index, &hash_hex, "Upload progress");
+                    }
                     index.apply_upload_completed_bytes(
                         &hash_hex,
                         uploaded_bytes,
@@ -222,13 +243,11 @@ pub(in crate::network) async fn on_upload_event(
                         inc_requests,
                         inc_accepted,
                     );
-                    if !persisted_alltime {
-                        warn!(
-                            "Upload interest for {file_hash} has no known.met record"
-                        );
-                    }
                     {
                         let mut idx = local_index.write().await;
+                        if !persisted_alltime {
+                            note_no_known_record(&idx, file_hash, "Upload interest");
+                        }
                         idx.apply_upload_share_deltas(
                             file_hash,
                             inc_requests,
