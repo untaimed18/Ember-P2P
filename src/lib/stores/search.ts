@@ -4,7 +4,7 @@ import type { SearchResult } from '$lib/types';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { SearchMethod, SearchFilters, RelationKind } from '$lib/api/search';
 import { cancelSearch, rescoreSearchResults } from '$lib/api/search';
-import { shedWeakestRows } from '$lib/searchOverflow';
+import { rememberShed, shedWeakestRows } from '$lib/searchOverflow';
 import {
   PERSIST_RETRY_LIMITS,
   SEARCH_STORAGE_KEY,
@@ -53,6 +53,10 @@ export type SearchTab = {
   /** Results dropped because the tab reached its cap, least available first.
    *  Shown, so a broad search does not look as if it lost hits for no reason. */
   shed?: number;
+  /** Keys of the dropped results, while the search can still send them
+   *  again: one that comes back is shown and no longer dropped, and one
+   *  dropped twice is counted once. Bounded by `MAX_REMEMBERED_SHED`. */
+  shedKeys?: Set<string>;
 };
 
 /**
@@ -525,10 +529,13 @@ function mergeIntoTab(tab: SearchTab, incoming: SearchResult[]): SearchTab {
     index = new Map<string, number>();
     for (let i = 0; i < results.length; i++) index.set(resultKey(results[i]), i);
   }
+  let shed = tab.shed ?? 0;
+  let shedKeys = tab.shedKeys;
   for (const result of incoming) {
     const key = resultKey(result);
     const at = index.get(key);
     if (at === undefined) {
+      if (shedKeys?.delete(key)) shed -= 1;
       index.set(key, results.length);
       results.push({
         ...result,
@@ -542,15 +549,15 @@ function mergeIntoTab(tab: SearchTab, incoming: SearchResult[]): SearchTab {
       results[at] = mergeResult(results[at], result);
     }
   }
-  let shed = tab.shed ?? 0;
   if (results.length > MAX_TAB_RESULTS) {
-    const before = results.length;
     shedWeakestRows(results, TAB_RESULTS_LOW_WATER);
-    shed += before - results.length;
-    index.clear();
-    for (let i = 0; i < results.length; i++) index.set(resultKey(results[i]), i);
+    const kept = new Map<string, number>();
+    for (let i = 0; i < results.length; i++) kept.set(resultKey(results[i]), i);
+    shedKeys ??= new Set();
+    shed += rememberShed(shedKeys, index.keys(), kept);
+    index = kept;
   }
-  return { ...tab, results, resultIndex: index, shed };
+  return { ...tab, results, resultIndex: index, shed, shedKeys };
 }
 
 function updateTabByRequestId(
@@ -729,7 +736,8 @@ function trimIdleTab(tab: SearchTab, activeId: string | null): SearchTab {
   const resultIndex = new Map<string, number>();
   for (let i = 0; i < results.length; i++) resultIndex.set(resultKey(results[i]), i);
   const shed = (tab.shed ?? 0) + (tab.results.length - results.length);
-  return { ...tab, results, resultIndex, shed };
+  // Finished, so nothing will come back to be told apart.
+  return { ...tab, results, resultIndex, shed, shedKeys: undefined };
 }
 
 function trimIdleTabs(tabs: SearchTab[], activeId: string | null): SearchTab[] {

@@ -1839,6 +1839,8 @@
   "transfers_add_links_found_other": "{count} link trovati.",
   "transfers_add_links_ignored": "Righe saltate perché non sono link a file eD2K: {count}.",
   "transfers_add_links_submit": "Scarica",
+  "transfers_add_links_capped": "Vengono letti solo i primi {max} link. Righe escluse: {count}.",
+  "transfers_add_links_too_long": "Il testo è troppo lungo ({size}, max {max}).",
   "transfers_pasting": "Incollamento…",
   "transfers_col_file_name": "Nome file",
   "transfers_col_size": "Dimensione",

@@ -1839,6 +1839,8 @@
   "transfers_add_links_found_other": "找到 {count} 个链接。",
   "transfers_add_links_ignored": "跳过的非 eD2K 文件链接行：{count}。",
   "transfers_add_links_submit": "下载",
+  "transfers_add_links_capped": "只读取前 {max} 个链接。未读取的行：{count}。",
+  "transfers_add_links_too_long": "文本过长（{size}，上限 {max}）。",
   "transfers_pasting": "粘贴中…",
   "transfers_col_file_name": "文件名",
   "transfers_col_size": "大小",

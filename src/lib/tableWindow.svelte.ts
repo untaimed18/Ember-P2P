@@ -14,8 +14,8 @@ export type TableWindowOptions = {
 /**
  * Renders only the rows of a long table near its viewport, with a spacer row
  * above and below standing in for the rest — the search results' windowing,
- * for any table whose rows are all one height. The sticky header, the column
- * layout and every cell stay as they were.
+ * for any table whose rows are all one height, give or take a fraction of a
+ * pixel. The sticky header, the column layout and every cell stay as they were.
  *
  * Construct it while the component initialises: it sets up its own effects,
  * listening for scrolls and size changes on `scroller` once that is bound.
@@ -39,11 +39,10 @@ export class TableWindow {
     this.#rowHeight = options.rowHeight;
     this.#end = options.minRows;
 
-    // The list, the row height or the elements changed; scrolls and resizes
-    // come through `schedule` instead.
+    // The list or the elements changed; scrolls and resizes come through
+    // `schedule` instead.
     $effect(() => {
       void this.#total();
-      void this.#rowHeight;
       void this.scroller;
       void this.body;
       untrack(() => this.#update());
@@ -62,18 +61,6 @@ export class TableWindow {
         el.removeEventListener('scroll', onScroll);
         ro?.disconnect();
       };
-    });
-
-    // Measured from a rendered row, so font size, locale and zoom cannot put
-    // the spacers out of step with the rows.
-    $effect(() => {
-      void this.start;
-      void this.end;
-      untrack(() => {
-        const row = this.body?.querySelector<HTMLElement>(this.#rowSelector);
-        const measured = row?.getBoundingClientRect().height ?? 0;
-        if (measured > 0 && Math.abs(measured - this.#rowHeight) >= 0.5) this.#rowHeight = measured;
-      });
     });
 
     $effect(() => () => {
@@ -134,6 +121,7 @@ export class TableWindow {
       this.#end = this.#minRows;
       return;
     }
+    this.#measure(body);
     const { start, end } = computeRowWindow({
       total,
       bodyTop: body.getBoundingClientRect().top - scroller.getBoundingClientRect().top,
@@ -142,5 +130,23 @@ export class TableWindow {
     });
     this.#start = start;
     this.#end = end;
+  }
+
+  /**
+   * The row height, from the rows rendered now, so font size, locale and zoom
+   * cannot put the spacers out of step with them.
+   *
+   * Averaged over those rows, and changed only by a pixel or more, because
+   * rows can differ by a fraction of one (a nickname in one, no flag in
+   * another). Taken only when a scroll, a resize or the list moves the window:
+   * remeasuring each window it computes could move it between rows of two
+   * heights forever.
+   */
+  #measure(body: HTMLTableSectionElement): void {
+    const rows = body.querySelectorAll<HTMLElement>(this.#rowSelector);
+    if (rows.length === 0) return;
+    const span = rows[rows.length - 1].getBoundingClientRect().bottom - rows[0].getBoundingClientRect().top;
+    const measured = span / rows.length;
+    if (measured > 0 && Math.abs(measured - this.#rowHeight) >= 1) this.#rowHeight = measured;
   }
 }

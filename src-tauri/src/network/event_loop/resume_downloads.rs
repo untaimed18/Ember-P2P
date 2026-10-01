@@ -433,5 +433,6 @@ pub(in crate::network) async fn resume_incomplete_downloads(
         // Startup rows now occupy the manager and pending network map;
         // renderer admissions may safely continue against the same totals.
         startup_download_admission.take();
+        transfer_manager.write().await.restored = true;
     }
 }

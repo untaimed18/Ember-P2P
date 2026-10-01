@@ -4,7 +4,7 @@
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import AddLinksDialog from '$lib/components/AddLinksDialog.svelte';
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
-  import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
+  import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
@@ -13,7 +13,7 @@
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
     getUploadQueue, getKnownClients, getKnownClientCounts, getDownloadFileDetails,
   } from '$lib/api/transfers';
-  import { findSources, parseEd2kLinks, formatEd2kLink, formatEd2kLinks } from '$lib/api/search';
+  import { distinctLinks, findSources, parseEd2kLinks, formatEd2kLink, formatEd2kLinks } from '$lib/api/search';
   import { startRelatedSearch } from '$lib/relatedSearch';
   import { previewFile } from '$lib/api/preview';
   import { addFriend, getFriends } from '$lib/api/friends';
@@ -2096,7 +2096,8 @@
   let activeCategory = $derived(categoryChips.includes(categoryFilter) ? categoryFilter : '');
   // And is forgotten once the chips are known, or a download filed under it
   // days later would narrow the list, and the bulk actions, by itself.
-  // Not before: until the list and the settings load, no chip exists.
+  // Not before: until the settings load and the backend has restored the last
+  // session's unfinished downloads, a chip that is coming may be missing.
   $effect(() => {
     if (!$transfersLoaded || $appSettings === null) return;
     if (categoryFilter && !categoryChips.includes(categoryFilter)) categoryFilter = '';
@@ -2818,9 +2819,7 @@
       }
     } finally {
       // The backend sends no event for this; show what it accepted right away.
-      if (done.size > 0) {
-        transfers.update((list) => list.map((x) => (done.has(x.id) ? { ...x, category } : x)));
-      }
+      if (done.size > 0) setLocalCategory(done, category);
     }
   }
 
@@ -3404,11 +3403,13 @@
       return;
     }
 
+    // A file pasted twice is one download; its copies count as already listed.
+    const links = distinctLinks(batch.links);
     let queued = 0;
-    let already = 0;
+    let already = batch.links.length - links.length;
     let failed = 0;
     let firstError: unknown;
-    for (const info of batch.links) {
+    for (const info of links) {
       try {
         // Do not pass `info.ember` into startDownload. A pasted link is
         // untrusted; pinning that digest would make the first writer we hear
@@ -3438,15 +3439,15 @@
     // One link on its own keeps the by-name messaging it has always had,
     // including the real error, whether or not it succeeded.
     const ignored = batch.invalid + batch.skipped + failed;
-    if (batch.links.length === 1 && batch.invalid === 0 && batch.skipped === 0) {
+    if (links.length === 1 && batch.invalid === 0 && batch.skipped === 0) {
       if (firstError !== undefined) {
         transferError = toErrorMsg(firstError);
         return;
       }
-      const only = batch.links[0];
-      showInfo(already > 0
-        ? m.transfers_already_in_list({ name: only.name })
-        : m.transfers_queued_from_clipboard({ name: only.name }));
+      const only = links[0];
+      showInfo(queued > 0
+        ? m.transfers_queued_from_clipboard({ name: only.name })
+        : m.transfers_already_in_list({ name: only.name }));
       return;
     }
     showInfo(m.transfers_paste_summary({

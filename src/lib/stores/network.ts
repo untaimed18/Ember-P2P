@@ -457,6 +457,10 @@ export async function initNetworkStore() {
       // same status is how a reconnect to a different server arrives — so every
       // one of these is worth a re-read, not only the transitions.
       if (status) setServerStatus(status, true);
+      // So is the HighID/LowID, which is the last server's until a poll brings
+      // this one's: show none meanwhile, and let the next tick ask at once.
+      networkStats.update((s) => (s.ed2k_low_id == null ? s : { ...s, ed2k_low_id: null }));
+      statsPumpOnNextVisible = true;
     }));
     registered.push(await listen('server-auto-connect-failed', () => {
       toastWarning(m.toast_server_auto_connect_failed());

@@ -165,7 +165,7 @@ The watchdog's other paths, where the install itself succeeds:
 
 ## 7. Translation review
 
-1.7.1 adds 70 strings and changes three (`settings_auto_check_updates_hint`,
+1.7.1 adds 75 strings and changes three (`settings_auto_check_updates_hint`,
 `settings_skip_compress_video` and its hint), in all eight non-English locales.
 List them with:
 
@@ -199,19 +199,28 @@ git diff v1.7.0 -- messages/en.json
 ## 8. Transfers, Statistics and Servers
 
 - [ ] **Add links** on Transfers opens with the clipboard's eD2K links already
-      in the box, counts them as you edit, and queues them.
+      in the box, counts them as you edit, and queues them. The same link
+      pasted three times counts as one; with 300 links it says only the first
+      256 are read, apart from any lines that are not links; and more than
+      256 KiB of text typed or pasted into the box, Cyrillic names included,
+      is refused with its size and the limit.
 - [ ] Statistics shows the rate graph filling in; the 1 hour view gains a point
       a minute and keeps its history across a sleep.
 - [ ] Make a category from a download's Category menu with several rows
       selected: all of them get it, and its chip appears. Its chip narrows the
       list, and Stop All then stops only those. Removing it in Edit categories
-      leaves them uncategorized.
+      leaves them uncategorized. Adding or removing one there leaves focus in
+      the dialog, and Escape still closes it.
+- [ ] Filter Transfers to a built-in chip whose downloads are all unfinished
+      (Video, say), then restart Ember on Transfers, and again through an
+      update: the filter is still on once the downloads are back.
 - [ ] Import a large server.met (1,000+ servers): the Servers list scrolls
       smoothly to the last server, the stripes stay even, and sorting and the
       filter still work.
 - [ ] On a busy install, the Queue and Known Peers tabs scroll through every row
       (Known Peers no longer stops at 1,000), and Trust badges fill in for rows
-      scrolled into view.
+      scrolled into view. Repeat at 200% display scaling, with friends among
+      the known peers: the rows do not jump while scrolling.
 - [ ] Share part of a folder (Library explorer, "Include subfolders" off): only
       those files are hashed and listed. Sharing the rest later picks it up
       without a manual reload. Unsharing one of them takes it off the Library

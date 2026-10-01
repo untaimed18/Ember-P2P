@@ -42,14 +42,27 @@ function row(id: string): Transfer {
   };
 }
 
+/** What the mocked backend answers. A poll reads it when it is sent, and its
+ *  answer waits for `hold` when one is set: a poll still in flight. */
+const backend = {
+  rows: [row('a')],
+  restored: true,
+  hold: null as Promise<void> | null,
+};
+
 vi.mock('$lib/api/transfers', () => ({
-  getTransfersSince: async () => ({
-    epoch: 1,
-    revision: 1,
-    full: true,
-    transfers: [row('a')],
-    removed: [],
-  }),
+  getTransfersSince: async () => {
+    const answer = {
+      epoch: 1,
+      revision: 1,
+      full: true,
+      transfers: backend.rows.map((t) => ({ ...t })),
+      removed: [],
+      restored: backend.restored,
+    };
+    if (backend.hold) await backend.hold;
+    return answer;
+  },
 }));
 
 vi.mock('$lib/api/system', () => ({
@@ -131,5 +144,59 @@ describe('transfer event flushing while the window is hidden', () => {
     expect(activeSources()).toBe(0);
     vi.advanceTimersByTime(500);
     expect(activeSources()).toBe(2);
+  });
+});
+
+describe('the transfers poll', () => {
+  const category = () => get(store.transfers).find((t) => t.id === 'a')?.category;
+
+  beforeEach(() => {
+    fakeDocument.visibilityState = 'visible';
+    vi.stubGlobal('document', fakeDocument);
+    vi.stubGlobal('requestAnimationFrame', () => 1);
+    vi.stubGlobal('cancelAnimationFrame', () => {});
+    backend.rows = [row('a')];
+    backend.restored = true;
+    backend.hold = null;
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    store.cleanupTransferStore();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('calls the list loaded only once the last session is restored', async () => {
+    backend.restored = false;
+    await store.initTransferStore();
+    expect(get(store.transfers)).toHaveLength(1);
+    expect(get(store.transfersLoaded)).toBe(false);
+
+    backend.restored = true;
+    const stop = store.startTransferPoll();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(get(store.transfersLoaded)).toBe(true);
+    stop();
+  });
+
+  it('keeps a category set while a poll was in flight, and takes the next one', async () => {
+    await store.initTransferStore();
+    let release = () => {};
+    backend.hold = new Promise<void>((resolve) => (release = resolve));
+    const stop = store.startTransferPoll();
+
+    vi.setSystemTime(Date.now() + 1);
+    backend.rows = [{ ...row('a'), category: 'Video' }];
+    store.setLocalCategory(new Set(['a']), 'Video');
+    backend.hold = null;
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(category()).toBe('Video');
+
+    backend.rows = [{ ...row('a'), category: 'Audio' }];
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(category()).toBe('Audio');
+    stop();
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { shedWeakestRows } from './searchOverflow';
+import { rememberShed, shedWeakestRows } from './searchOverflow';
 import type { SearchResult } from '$lib/types';
 
 /**
@@ -145,5 +145,29 @@ describe('shedWeakestRows', () => {
     shedWeakestRows(rows, 5);
 
     expect(rows.some((r) => r.file.hash === 'mixed')).toBe(true);
+  });
+});
+
+describe('rememberShed', () => {
+  const kept = (...keys: string[]) => new Map(keys.map((key, i) => [key, i]));
+
+  it('counts the keys an overflow dropped', () => {
+    const shed = new Set<string>();
+    expect(rememberShed(shed, ['a', 'b', 'c', 'd'], kept('a', 'c'))).toBe(2);
+    expect([...shed]).toEqual(['b', 'd']);
+  });
+
+  it('counts a row dropped again only once', () => {
+    // A broad search hears of the same file from server after server, so a
+    // dropped row arriving again and losing again is the ordinary case.
+    const shed = new Set(['b']);
+    expect(rememberShed(shed, ['a', 'b', 'c'], kept('a'))).toBe(1);
+    expect(shed.size).toBe(2);
+  });
+
+  it('forgets the oldest past its bound', () => {
+    const shed = new Set(['old1', 'old2']);
+    expect(rememberShed(shed, ['new1', 'new2'], kept(), 3)).toBe(2);
+    expect([...shed]).toEqual(['old2', 'new1', 'new2']);
   });
 });

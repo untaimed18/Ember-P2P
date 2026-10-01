@@ -1839,6 +1839,8 @@
   "transfers_add_links_found_other": "Найдено ссылок: {count}.",
   "transfers_add_links_ignored": "Пропущено строк без eD2K-ссылки на файл: {count}.",
   "transfers_add_links_submit": "Скачать",
+  "transfers_add_links_capped": "Читаются только первые {max} ссылок. Не прочитано строк: {count}.",
+  "transfers_add_links_too_long": "Текст слишком длинный ({size}, макс. {max}).",
   "transfers_pasting": "Вставка…",
   "transfers_col_file_name": "Имя файла",
   "transfers_col_size": "Размер",

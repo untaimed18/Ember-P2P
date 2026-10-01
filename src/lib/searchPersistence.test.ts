@@ -6,6 +6,7 @@ import {
   buildPersistPayload,
   forPersist,
   parsePersistedSearch,
+  trimPersistPayload,
 } from './searchPersistence';
 import type { SearchTab } from '$lib/stores/search';
 import type { SearchResult } from '$lib/types';
@@ -92,6 +93,27 @@ describe('forPersist', () => {
     const stripped = forPersist(tab('a', PERSIST_MAX_RESULTS + 250));
 
     expect(stripped.results).toHaveLength(PERSIST_MAX_RESULTS);
+  });
+
+  it('counts the rows it leaves out among the dropped ones', () => {
+    // A restored tab shows only what was stored, so the "results dropped" line
+    // has to say so rather than report the tab's own overflow alone.
+    const overflowing = { ...tab('a', PERSIST_MAX_RESULTS + 250), shed: 40, shedKeys: new Set(['x']) };
+    const stripped = forPersist(overflowing);
+
+    expect(stripped.shed).toBe(290);
+    expect(stripped.shedKeys).toBeUndefined();
+    expect(forPersist(tab('b', 3)).shed).toBe(0);
+  });
+
+  it('adds the rows a smaller retry leaves out too', () => {
+    const payload = buildPersistPayload([tab('a', PERSIST_MAX_RESULTS + 250)], 'a');
+    expect(trimPersistPayload(payload, 25).tabs[0].shed).toBe(PERSIST_MAX_RESULTS + 225);
+  });
+
+  it('takes no stored count it cannot add to', () => {
+    const raw = JSON.stringify({ tabs: [{ id: 'a', query: 'q', results: [], shed: 'many' }], activeId: 'a' });
+    expect(parsePersistedSearch(raw).tabs[0].shed).toBe(0);
   });
 
   it('keeps the best-sourced rows rather than the first ones stored', () => {

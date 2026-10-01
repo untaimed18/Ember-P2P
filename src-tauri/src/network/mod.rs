@@ -2193,6 +2193,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     };
     if pending_incomplete_downloads.is_none() {
         startup_download_admission.take();
+        transfer_manager.write().await.restored = true;
     }
     let mut part_progress_task: Option<
         tokio::task::JoinHandle<std::collections::HashMap<String, (u64, bool, bool)>>,

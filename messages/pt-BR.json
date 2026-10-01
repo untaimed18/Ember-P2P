@@ -1839,6 +1839,8 @@
   "transfers_add_links_found_other": "{count} links encontrados.",
   "transfers_add_links_ignored": "Linhas que não são links de arquivo eD2K são ignoradas: {count}.",
   "transfers_add_links_submit": "Baixar",
+  "transfers_add_links_capped": "Só os primeiros {max} links são lidos. Linhas deixadas de fora: {count}.",
+  "transfers_add_links_too_long": "O texto é muito longo ({size}, máx. {max}).",
   "transfers_pasting": "Colando…",
   "transfers_col_file_name": "Nome do Arquivo",
   "transfers_col_size": "Tamanho",

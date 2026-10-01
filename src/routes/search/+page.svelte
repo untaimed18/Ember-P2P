@@ -2994,6 +2994,8 @@
               ...t,
               requestId: freshId,
               results: [],
+              shed: undefined,
+              shedKeys: undefined,
               error: null,
               isSearching: false,
               progress: null,

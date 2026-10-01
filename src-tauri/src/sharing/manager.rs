@@ -322,6 +322,10 @@ pub struct TransferManager {
     queue_generation: u64,
     queue_index: std::sync::Mutex<QueueIndex>,
     revisions: std::sync::Mutex<TransferRevisions>,
+    /// Whether the downloads the last session left unfinished are back in
+    /// the lists. They arrive only once `known.met` and their `.part` files
+    /// have been read, well after the first poll can be answered.
+    pub restored: bool,
 }
 
 /// Declares the closed set of health explanations a download row can show,
@@ -486,6 +490,9 @@ pub struct TransferDelta {
     pub full: bool,
     pub transfers: Vec<Transfer>,
     pub removed: Vec<String>,
+    /// [`TransferManager::restored`]: until it is set, a row the caller has
+    /// not seen yet may still be on its way.
+    pub restored: bool,
 }
 
 struct RowRevision {
@@ -651,6 +658,7 @@ impl TransferManager {
             queue_generation: 0,
             queue_index: std::sync::Mutex::new(QueueIndex::default()),
             revisions: std::sync::Mutex::new(TransferRevisions::new()),
+            restored: false,
         }
     }
 
@@ -2286,6 +2294,7 @@ impl TransferManager {
                 revisions.removed_since(since)
             },
             transfers,
+            restored: self.restored,
         }
     }
 
@@ -3509,6 +3518,19 @@ mod tests {
         let behind = manager.get_transfers_since(Some(base.epoch), base.revision);
         assert_eq!(delta_ids(&behind), ["b"]);
         assert_eq!(behind.removed, ["c"]);
+    }
+
+    #[test]
+    fn a_delta_says_whether_the_last_sessions_downloads_are_back() {
+        let mut manager = TransferManager::new(1);
+        let early = manager.get_transfers_since(None, 0);
+        assert!(!early.restored);
+
+        manager.enqueue(sourced("a", 1));
+        manager.restored = true;
+        let restored = manager.get_transfers_since(Some(early.epoch), early.revision);
+        assert!(restored.restored);
+        assert_eq!(delta_ids(&restored), ["a"]);
     }
 
     #[test]

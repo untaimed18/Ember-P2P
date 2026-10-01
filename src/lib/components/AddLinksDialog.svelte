@@ -7,8 +7,8 @@
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import { inertBackground, trapTabKey } from '$lib/a11y';
-  import { parseEd2kLinks, type Ed2kLinkBatch } from '$lib/api/search';
-  import { formatNumber, readFromClipboard } from '$lib/utils';
+  import { distinctLinks, parseEd2kLinks, type Ed2kLinkBatch } from '$lib/api/search';
+  import { formatBytes, formatNumber, readFromClipboard } from '$lib/utils';
   import { plural } from '$lib/plural';
 
   let {
@@ -25,8 +25,9 @@
 
   const instanceId = Math.random().toString(36).slice(2, 10);
   const encoder = new TextEncoder();
+  const byteLength = (value: string) => encoder.encode(value).length;
   /** The backend caps the paste in UTF-8 bytes, which non-Latin names exceed long before characters. */
-  const overLimit = (value: string) => value.length > maxLength || encoder.encode(value).length > maxLength;
+  const overLimit = (value: string) => value.length > maxLength || byteLength(value) > maxLength;
   let text = $state('');
   let batch = $state<Ed2kLinkBatch | null>(null);
   let dialogEl: HTMLDivElement | undefined = $state(undefined);
@@ -94,8 +95,9 @@
   });
 
   const tooLong = $derived(overLimit(text.trim()));
-  const count = $derived(batch?.links.length ?? 0);
-  const ignored = $derived((batch?.invalid ?? 0) + (batch?.skipped ?? 0));
+  const count = $derived(batch ? distinctLinks(batch.links).length : 0);
+  /** Lines go unread only once the backend's cap is reached, which the links read then fill. */
+  const cap = $derived(batch?.links.length ?? 0);
 
   function close() {
     open = false;
@@ -172,13 +174,14 @@
       ></textarea>
       <div class="add-links-status" aria-live="polite">
         {#if tooLong}
-          <span class="warn">{m.transfers_clipboard_too_long({ length: text.trim().length, max: maxLength })}</span>
+          <span class="warn">{m.transfers_add_links_too_long({ size: formatBytes(byteLength(text.trim())), max: formatBytes(maxLength) })}</span>
         {:else if batch}
           {plural(count, {
             one: m.transfers_add_links_found_one,
             other: () => m.transfers_add_links_found_other({ count: formatNumber(count) }),
-          })}{#if ignored > 0}
-            {' '}{m.transfers_add_links_ignored({ count: formatNumber(ignored) })}{/if}
+          })}{#if batch.invalid > 0}
+            {' '}{m.transfers_add_links_ignored({ count: formatNumber(batch.invalid) })}{/if}{#if batch.skipped > 0}
+            {' '}{m.transfers_add_links_capped({ max: formatNumber(cap), count: formatNumber(batch.skipped) })}{/if}
         {/if}
       </div>
       <div class="dialog-actions">

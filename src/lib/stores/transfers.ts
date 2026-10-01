@@ -288,8 +288,9 @@ interface TransferEventPayload extends StatusEventPayload {
 
 export const transfers = writable<Transfer[]>([]);
 
-/** Whether `transfers` holds the backend's list, not only rows events have
- *  delivered ahead of the first sync. */
+/** Whether `transfers` holds the backend's whole list: not only rows events
+ *  delivered ahead of the first sync, and not a list the backend answered
+ *  before it had restored the last session's unfinished downloads. */
 export const transfersLoaded = writable(false);
 
 /** The upload cap in force (`RuntimeStatus.effective_upload_speed`, bytes/s,
@@ -365,6 +366,16 @@ const reversibleStateEnteredAt = new Map<string, number>();
  */
 const reversibleStateLeftAt = new Map<string, number>();
 const sourceCountsUpdatedAt = new Map<string, number>();
+/** When the page last set each download's category. The backend sends no
+ *  event for it, so a poll already in flight then still carries the old one. */
+const categorySetAt = new Map<string, number>();
+
+/** Show the category the backend has just accepted for these downloads. */
+export function setLocalCategory(ids: ReadonlySet<string>, category: string) {
+  const now = Date.now();
+  for (const id of ids) categorySetAt.set(id, now);
+  transfers.update((list) => list.map((t) => (ids.has(t.id) ? { ...t, category } : t)));
+}
 
 function eventContext(now: number): RowEventContext {
   return { now, reversibleStateEnteredAt, reversibleStateLeftAt, sourceCountsUpdatedAt };
@@ -1004,7 +1015,7 @@ async function runSync(pollStartedAt: number): Promise<void> {
     if (!sticky.has(row.id)) reconciledRows.add(row);
   }
   commitTransfers(next);
-  transfersLoaded.set(true);
+  if (delta.restored) transfersLoaded.set(true);
 }
 
 /**
@@ -1055,8 +1066,12 @@ function mergePolledRow(
   } else if (!preserveFreshEventCounts) {
     sourceCountsUpdatedAt.delete(apiItem.id);
   }
+  const categorySet = categorySetAt.get(apiItem.id);
+  const snapshotPredatesCategory = categorySet != null && categorySet > pollStartedAt;
+  if (categorySet != null && !snapshotPredatesCategory) categorySetAt.delete(apiItem.id);
   const row = snapCompletedDownload({
     ...apiItem,
+    category: snapshotPredatesCategory ? eventItem.category : apiItem.category,
     status,
     ...mergeProgressCounters(apiItem, eventItem),
     speed: mergeSpeed(status, apiItem.speed),
@@ -1082,7 +1097,10 @@ function mergePolledRow(
   return {
     row,
     sticky:
-      snapshotPredatesReversibleEntry || snapshotPredatesReversibleLeave || preserveFreshEventCounts,
+      snapshotPredatesReversibleEntry ||
+      snapshotPredatesReversibleLeave ||
+      preserveFreshEventCounts ||
+      snapshotPredatesCategory,
   };
 }
 
@@ -1132,6 +1150,7 @@ export function forgetTransfer(id: string) {
   reversibleStateEnteredAt.delete(id);
   reversibleStateLeftAt.delete(id);
   sourceCountsUpdatedAt.delete(id);
+  categorySetAt.delete(id);
   missingFromApiSince.delete(id);
   lastApiCompleted.delete(id);
   progressRewindHold.delete(id);
@@ -1160,6 +1179,7 @@ export function cleanupTransferStore() {
   reversibleStateEnteredAt.clear();
   reversibleStateLeftAt.clear();
   sourceCountsUpdatedAt.clear();
+  categorySetAt.clear();
   lastApiCompleted.clear();
   progressRewindHold.clear();
   announcedTerminal.clear();

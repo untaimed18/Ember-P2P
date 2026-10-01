@@ -1839,6 +1839,8 @@
   "transfers_add_links_found_other": "{count} enlaces encontrados.",
   "transfers_add_links_ignored": "Se omiten las líneas que no son enlaces de archivo eD2K: {count}.",
   "transfers_add_links_submit": "Descargar",
+  "transfers_add_links_capped": "Solo se leen los primeros {max} enlaces. Líneas omitidas: {count}.",
+  "transfers_add_links_too_long": "El texto es demasiado largo ({size}, máx. {max}).",
   "transfers_pasting": "Pegando…",
   "transfers_col_file_name": "Nombre de archivo",
   "transfers_col_size": "Tamaño",

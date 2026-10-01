@@ -1839,6 +1839,8 @@
   "transfers_add_links_found_other": "{count} links found.",
   "transfers_add_links_ignored": "Lines that are not eD2K file links are skipped: {count}.",
   "transfers_add_links_submit": "Download",
+  "transfers_add_links_capped": "Only the first {max} links are read. Lines left out: {count}.",
+  "transfers_add_links_too_long": "The text is too long ({size}, at most {max}).",
   "transfers_pasting": "Pasting…",
   "transfers_col_file_name": "File Name",
   "transfers_col_size": "Size",

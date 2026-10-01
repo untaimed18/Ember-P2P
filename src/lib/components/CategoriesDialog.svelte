@@ -2,6 +2,7 @@
   // The user's own download categories: made here, or from a download's
   // Category menu, where the new one is also assigned to the downloads picked.
   import * as m from '$lib/paraglide/messages';
+  import { tick } from 'svelte';
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import { inertBackground, trapTabKey } from '$lib/a11y';
@@ -92,15 +93,19 @@
         open = false;
         return;
       }
-      inputEl?.focus();
     } catch (e: unknown) {
       error = translateError(e, m.transfers_operation_failed());
     }
     busy = false;
+    // Once the controls `busy` disabled are enabled again: a disabled one
+    // cannot take focus, which then went to the page, out of Escape's reach.
+    await tick();
+    inputEl?.focus();
   }
 
   async function remove(category: string) {
     if (busy) return;
+    const index = categories.indexOf(category);
     busy = true;
     error = null;
     try {
@@ -109,6 +114,11 @@
       error = translateError(e, m.transfers_operation_failed());
     }
     busy = false;
+    await tick();
+    // The row now in its place, or the one above when it was the last, or the
+    // name box once none are left; its own button again if the remove failed.
+    const buttons = dialogEl?.querySelectorAll<HTMLButtonElement>('.categories-remove') ?? [];
+    (buttons[Math.min(index, buttons.length - 1)] ?? inputEl)?.focus();
   }
 
   function onKeydown(e: KeyboardEvent) {

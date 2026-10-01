@@ -163,6 +163,17 @@ export async function parseEd2kLinks(text: string): Promise<Ed2kLinkBatch> {
   return invoke('parse_ed2k_links', { text });
 }
 
+/** A batch's links with each file once, the first of its links kept: the
+ *  same file pasted twice is one download. The parser lowercases hashes. */
+export function distinctLinks(links: Ed2kLinkInfo[]): Ed2kLinkInfo[] {
+  const seen = new Set<string>();
+  return links.filter((link) => {
+    if (seen.has(link.hash)) return false;
+    seen.add(link.hash);
+    return true;
+  });
+}
+
 /** Which networks a source ask reached. A `false` leg had nowhere to send it. */
 export type SourceAskOutcome = {
   kad: boolean;

@@ -1839,6 +1839,8 @@
   "transfers_add_links_found_other": "{count} Links gefunden.",
   "transfers_add_links_ignored": "Zeilen ohne eD2K-Dateilink werden übersprungen: {count}.",
   "transfers_add_links_submit": "Herunterladen",
+  "transfers_add_links_capped": "Nur die ersten {max} Links werden gelesen. Ausgelassene Zeilen: {count}.",
+  "transfers_add_links_too_long": "Der Text ist zu lang ({size}, höchstens {max}).",
   "transfers_pasting": "Wird eingefügt…",
   "transfers_col_file_name": "Dateiname",
   "transfers_col_size": "Größe",

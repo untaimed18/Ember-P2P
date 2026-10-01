@@ -118,6 +118,8 @@ export interface TransferDelta {
   full: boolean;
   transfers: Transfer[];
   removed: string[];
+  /** The downloads the last session left unfinished are back in the list. */
+  restored: boolean;
 }
 
 /** Rows changed since `since` of `epoch`. Pass `null`/`0` for a full snapshot. */

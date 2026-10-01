@@ -16,7 +16,9 @@ function fakeTable(rowHeight: number, viewportHeight: number) {
   const body = {
     isConnected: true,
     getBoundingClientRect: () => ({ top: -state.scrollTop }),
-    querySelector: () => ({ getBoundingClientRect: () => ({ height: rowHeight }) }),
+    querySelectorAll: () => [0, 1].map((i) => ({
+      getBoundingClientRect: () => ({ top: i * rowHeight, bottom: (i + 1) * rowHeight }),
+    })),
   } as unknown as HTMLTableSectionElement;
   return {
     scroller,
@@ -79,6 +81,57 @@ describe('TableWindow', () => {
     flushSync();
     expect(win.end).toBe(100);
     expect(win.start).toBeLessThan(100);
+  });
+
+  it('settles when rows differ by a fraction of a pixel', () => {
+    // Known peers with a nickname, or queued peers without a flag, can sit
+    // half a pixel off the rest at 200% scaling. Here rows from 190 on are a
+    // pixel taller: 4000px down, a 20px height puts row 192 first and a 21px
+    // one row 182, so remeasuring after each window could swap between the
+    // two for good.
+    const heightOf = (i: number) => (i >= 190 ? 21 : 20);
+    const state = { scrollTop: 0 };
+    const listeners = new Set<() => void>();
+    const scroller = {
+      clientHeight: 200,
+      getBoundingClientRect: () => ({ top: 0 }),
+      addEventListener: (_: string, fn: () => void) => listeners.add(fn),
+      removeEventListener: (_: string, fn: () => void) => listeners.delete(fn),
+    } as unknown as HTMLElement;
+    let win: TableWindow | undefined;
+    const rendered = () => {
+      const top = -state.scrollTop + (win?.topPad ?? 0);
+      let y = top;
+      return Array.from({ length: (win?.end ?? 0) - (win?.start ?? 0) }, (_, k) => {
+        const height = heightOf((win?.start ?? 0) + k);
+        const rect = { top: y, bottom: y + height, height };
+        y += height;
+        return { getBoundingClientRect: () => rect };
+      });
+    };
+    const body = {
+      isConnected: true,
+      getBoundingClientRect: () => ({ top: -state.scrollTop }),
+      querySelectorAll: () => rendered(),
+    } as unknown as HTMLTableSectionElement;
+    win = mount(() => 1000);
+    win.scroller = scroller;
+    win.body = body;
+    flushSync();
+
+    const scrollTo = (top: number) => {
+      state.scrollTop = top;
+      for (const fn of listeners) fn();
+      flushSync();
+    };
+    expect(() => {
+      for (let i = 0; i < 4; i++) scrollTo(4000);
+    }).not.toThrow();
+    const settled = [win.start, win.end];
+    scrollTo(4000);
+    expect([win.start, win.end]).toEqual(settled);
+    expect(win.start).toBeLessThanOrEqual(4000 / 21);
+    expect(win.end).toBeGreaterThan(4200 / 21);
   });
 
   it('stops listening once its owner is gone', () => {

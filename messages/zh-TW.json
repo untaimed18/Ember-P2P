@@ -1839,6 +1839,8 @@
   "transfers_add_links_found_other": "找到 {count} 個連結。",
   "transfers_add_links_ignored": "略過的非 eD2K 檔案連結行：{count}。",
   "transfers_add_links_submit": "下載",
+  "transfers_add_links_capped": "只讀取前 {max} 個連結。未讀取的行：{count}。",
+  "transfers_add_links_too_long": "文本過長（{size}，上限 {max}）。",
   "transfers_pasting": "貼上中…",
   "transfers_col_file_name": "檔名",
   "transfers_col_size": "大小",
