@@ -127,13 +127,22 @@ for peers that guess it, and `quic_shares_udp_port: false` in `config.json`
 restores the separate socket. The guessers are not only 1.7.0: a relay asked to
 reach a source known only from KAD dials the source's TCP port number, because
 a KAD record has nowhere to carry a QUIC port, and 1.7.1 requesters still ask
-for that. The legacy listener keeps the old socket's UPnP mapping and Windows
-Firewall rule, since those relays dial it from outside the NAT. One cost the
+for that. The legacy listener keeps the old socket's UPnP mapping, Windows
+Firewall rule and mapping keep-alive, since those relays dial it from outside
+the NAT: without UPnP, the keep-alive's datagram from that port is what holds a
+mapping open for them, as it did for the 1.7.0 socket. One cost the
 design did not name: the shared socket cannot set don't-fragment, because Ember
 frames up to 4 KiB rely on fragmentation, so quinn skips path-MTU discovery and
-stays at 1200-byte packets. What remains: the legacy listener can go only once
-nothing dials the TCP port for QUIC, which needs a relay target for KAD-only
-sources first.
+stays at 1200-byte packets. Another: it neither reads a datagram's local
+address nor sets a reply's, as quinn's own socket does, so a reply leaves from
+whatever address the OS routes it from. A peer that dialled one of our other
+addresses drops it, since a QUIC client accepts packets only from the address it
+dialled. Advertised addresses are learned from our own outbound traffic, so
+this takes an asymmetric multi-homed setup, such as a port forward to a second
+network adapter, and KAD and Ember on that socket have always behaved this way.
+`quic_shares_udp_port: false` is the workaround. What remains: the legacy
+listener can go only once nothing dials the TCP port for QUIC, which needs a
+relay target for KAD-only sources first.
 
 **Why:** QUIC listens on its own UDP port. Setups that forward a single port (a
 VPN such as ProtonVPN, many routers) leave it unreachable. 1.7.0 covers this

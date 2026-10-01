@@ -393,6 +393,9 @@ pub(super) struct NetworkState {
     /// The key the shared socket's classifier and the endpoint's connection
     /// ids agree on.
     pub(super) quic_cid_key: Option<ember::udp_mux::CidKey>,
+    /// The listener left on `tcp_port` beside a shared socket (see
+    /// `build_legacy_endpoint`), held for its mapping keep-alive.
+    pub(super) quic_legacy_endpoint: Option<Arc<quinn::Endpoint>>,
     pub(super) upnp_mapped: bool,
     /// IP filter for blocking known-bad ranges (eMule ipfilter.dat compatible)
     pub(super) ip_filter: IpFilter,

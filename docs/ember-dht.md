@@ -830,6 +830,45 @@ against KAD.
   `ember_dht_rate_limited` for the total. The total climbing while the ceiling
   stays flat is pacing; the two climbing together is the case proof-of-work
   would be for.
+- **A replayed `IK_INIT` can take over a crossed dial (deferred from 1.7.1).**
+  A crossed IK dial is settled by static key before anything shows the inbound
+  init is current, and past `HANDSHAKE_REPLAY_TTL` (30 s) a captured `IK_INIT`
+  reads as fresh. Replayed from the peer's address while the higher key has a
+  dial pending to that identity, it makes that node drop its initiator and seal
+  the first message and queue into a session the real peer cannot read. The real
+  `IK_RESP` then finds no pending handshake, and sends go into the unproven
+  session until a liveness fault or `SESSION_TIMEOUT`. With no dial pending the
+  same replay already installs an unproven session that sends go into; that
+  predates the settlement. Either needs a captured init and a way to send from
+  the peer's address, and for the crossing, timing against our dial.
+
+  Not fixed in 1.7.1 because each narrow change found trades this for an honest
+  fault. Keeping the initiator so the real `IK_RESP` can still complete it lets
+  both handshakes complete when our `IK_INIT` reaches the lower key after our
+  reply to its own: it answers the late init, and if that answer arrives before
+  the peer's first frame on the crossing session, our first message and queue
+  reach it twice (nothing above the transport collapses a repeated
+  `CHANNEL_MSG`, `CALLBACK_REQ` or EPX frame), or the peer's frames on the
+  replaced session are lost, its first message among them. A crossing session
+  evicted before it is proven also leaves later sends queued behind an
+  initiator the peer refused.
+
+  The fix is responder-side key confirmation, as WireGuard has: a session we
+  answered is not sent on until it decrypts a frame from the peer.
+  `prepare_outgoing` queues behind an unconfirmed responder session, its first
+  decrypt releases the queue, and when we need that slot we also start our own
+  IK dial, whose validated session replaces it. A crossing then keeps the
+  initiator and its payloads, marked with the crossing session's generation:
+  that session's first decrypt seals them into it and drops the initiator, and
+  an `IK_RESP` that completes the initiator first takes them instead, the first
+  message reaching the peer through its own deferral, so each payload is sealed
+  into one session. An evicted crossing session hands the payloads to a fresh
+  dial, and a second crossing init re-points the marker without sealing again,
+  so a replayer cannot multiply what we send to the address it names. Still to
+  settle there: the peer's frames on a crossing session that a faster
+  `IK_RESP` replaced. The cost is a round trip before the higher key's first
+  message in an honest crossing, and before anything we start on a session a
+  peer opened that has not yet sent us a frame.
 
 ### Product / UX
 

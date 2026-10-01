@@ -822,6 +822,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         quic_shares_udp: false,
         quic_shared_socket,
         quic_cid_key,
+        quic_legacy_endpoint: None,
         upnp_mapped: upnp_success,
         ip_filter,
         banned_ips,

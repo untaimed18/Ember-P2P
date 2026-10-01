@@ -620,6 +620,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
                                 })
                                 .flatten()
                                 .map(std::sync::Arc::new);
+                            state.quic_legacy_endpoint = legacy.clone();
                             // The port UPnP forwards for QUIC. A shared socket
                             // needs none of its own, so a legacy listener gets
                             // the one the old socket had: the relays it exists

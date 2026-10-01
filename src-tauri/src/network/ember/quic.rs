@@ -662,19 +662,24 @@ pub fn build_shared_endpoint(
     Ok(endpoint)
 }
 
-/// A listen-only endpoint on the port QUIC used before it shared the UDP
-/// socket, exactly that port or nothing, for peers that dial it by guessing
-/// instead of reading an advertisement: a 1.7.x relay asked to reach a source
-/// it knows only from KAD dials the source's TCP port number.
+/// An endpoint on the port QUIC used before it shared the UDP socket, exactly
+/// that port or nothing, for peers that dial it by guessing instead of reading
+/// an advertisement: a 1.7.x relay asked to reach a source it knows only from
+/// KAD dials the source's TCP port number.
+///
+/// It dials nothing but the mapping keep-alive, which is what keeps a NAT
+/// mapping open for those relays when UPnP does not forward the port.
 pub fn build_legacy_endpoint(cert_der: &[u8], key_der: &[u8], port: u16) -> anyhow::Result<Endpoint> {
     let server_config = build_server_config(cert_der, key_der)?;
+    let client_config = build_client_config(cert_der, key_der, None)?;
     let socket = bind_tuned_udp(SocketAddr::from(([0, 0, 0, 0], port)))?;
-    let endpoint = Endpoint::new(
+    let mut endpoint = Endpoint::new(
         EndpointConfig::default(),
         Some(server_config),
         socket,
         Arc::new(quinn::TokioRuntime),
     )?;
+    endpoint.set_default_client_config(client_config);
     info!("QUIC legacy endpoint listening on {}", endpoint.local_addr()?);
     Ok(endpoint)
 }
@@ -862,5 +867,22 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    /// The mapping keep-alive holds the legacy listener's NAT mapping open by
+    /// dialling a reflector from it and dropping the attempt, as
+    /// `quic_mapping_keepalive` does.
+    #[tokio::test]
+    async fn the_legacy_endpoint_sends_the_mapping_keepalive_from_its_port() {
+        let (cert, key) = generate_self_signed_cert(&random_secret_key()).unwrap();
+        let legacy = build_legacy_endpoint(&cert, &key, 0).unwrap();
+        let reflector = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        drop(legacy.connect(reflector.local_addr().unwrap(), "stun").unwrap());
+        let mut buf = [0u8; 2048];
+        let (_, from) = tokio::time::timeout(Duration::from_secs(5), reflector.recv_from(&mut buf))
+            .await
+            .expect("the keep-alive datagram arrives")
+            .unwrap();
+        assert_eq!(from.port(), legacy.local_addr().unwrap().port());
     }
 }

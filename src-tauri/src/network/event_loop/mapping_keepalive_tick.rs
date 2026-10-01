@@ -110,13 +110,17 @@ pub(in crate::network) async fn on_mapping_keepalive_tick(
         });
     });
     // A shared socket is the KAD socket, whose mapping the UDP cycle above
-    // already holds.
-    if let Some(quic_ep) = state
-        .connection_broker
-        .as_ref()
-        .filter(|_| !state.quic_shares_udp)
-        .and_then(|b| b.quic_endpoint().cloned())
-    {
+    // already holds. The legacy listener beside it never sends on its own, so
+    // without this a NAT keeps no mapping for the relays that dial it.
+    let quic_ep = if state.quic_shares_udp {
+        state.quic_legacy_endpoint.clone()
+    } else {
+        state
+            .connection_broker
+            .as_ref()
+            .and_then(|b| b.quic_endpoint().cloned())
+    };
+    if let Some(quic_ep) = quic_ep {
         let quic_index = ka_index.wrapping_add(1);
         tokio::spawn(async move {
             ember::mapping_keepalive::quic_mapping_keepalive(quic_ep, quic_index)

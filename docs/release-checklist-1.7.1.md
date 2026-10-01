@@ -217,6 +217,9 @@ git diff v1.7.0 -- messages/en.json
       the source's TCP port number, which the legacy listener answers).
 - [ ] The same KAD-only relay between two 1.7.1 nodes whose TCP and UDP ports
       differ.
+- [ ] That relay again with UPnP off on the source's router, a NAT that keeps
+      the port and does not filter by sender: it still connects, held open by
+      the mapping keep-alive the legacy listener sends from the TCP port.
 - [ ] KAD and Ember DHT keep working through a long QUIC transfer: searches
       answer, the KAD overhead statistic does not jump with the transfer, and
       the log shows no `UDP reader: ... queue full`.
