@@ -760,6 +760,13 @@ impl ServerLink {
     ///
     /// The result arrives later as `ServerEvent::SearchResult`.
     pub fn send_search_expr_bytes(&mut self, expr: &[u8]) -> anyhow::Result<()> {
+        // A server without large-file support cannot parse a 64-bit size
+        // leaf; the UDP sweep leaves such servers out for the same reason.
+        if self.session.server_flags & SRV_TCPFLG_LARGEFILES == 0
+            && crate::network::kad::messages::search_expression_uses_64bit(expr)
+        {
+            anyhow::bail!("server lacks large-file support for a size limit past 4 GiB");
+        }
         info!(
             "Queuing OP_SEARCHREQUEST expression ({} bytes payload)",
             expr.len(),
@@ -1793,25 +1800,25 @@ mod tests {
             Box::new(SearchExpression::String("world".into())),
         );
         let buf = build_search_tree(&expr);
-        assert_eq!(buf[0], 0x00); // AND
-                                  // left leaf
-        assert_eq!(buf[1], 0x01); // STRING
-        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 5);
-        assert_eq!(&buf[4..9], b"hello");
+        assert_eq!(&buf[0..2], &[0x00, 0x00]); // operator, AND
+                                               // left leaf
+        assert_eq!(buf[2], 0x01); // STRING
+        assert_eq!(u16::from_le_bytes([buf[3], buf[4]]), 5);
+        assert_eq!(&buf[5..10], b"hello");
         // right leaf
-        assert_eq!(buf[9], 0x01); // STRING
-        assert_eq!(u16::from_le_bytes([buf[10], buf[11]]), 5);
-        assert_eq!(&buf[12..17], b"world");
+        assert_eq!(buf[10], 0x01); // STRING
+        assert_eq!(u16::from_le_bytes([buf[11], buf[12]]), 5);
+        assert_eq!(&buf[13..18], b"world");
     }
 
     #[test]
     fn search_tree_or_not() {
         // OR("a", NOT("b", "c"))
-        //  [0]  OR
-        //  [1]  STRING leaf "a": 0x01, len_lo, len_hi, 'a'
-        //  [5]  NOT
-        //  [6]  STRING leaf "b": 0x01, len_lo, len_hi, 'b'
-        // [10]  STRING leaf "c": 0x01, len_lo, len_hi, 'c'
+        //  [0]  operator, OR
+        //  [2]  STRING leaf "a": 0x01, len_lo, len_hi, 'a'
+        //  [6]  operator, NOT
+        //  [8]  STRING leaf "b": 0x01, len_lo, len_hi, 'b'
+        // [12]  STRING leaf "c": 0x01, len_lo, len_hi, 'c'
         let expr = SearchExpression::Or(
             Box::new(SearchExpression::String("a".into())),
             Box::new(SearchExpression::Not(
@@ -1820,11 +1827,37 @@ mod tests {
             )),
         );
         let buf = build_search_tree(&expr);
-        assert_eq!(buf[0], 0x01); // OR
-        assert_eq!(buf[1], 0x01); // STRING leaf "a"
-        assert_eq!(buf[5], 0x02); // NOT
-        assert_eq!(buf[6], 0x01); // STRING "b"
-        assert_eq!(buf[10], 0x01); // STRING "c"
+        assert_eq!(&buf[0..2], &[0x00, 0x01]); // OR
+        assert_eq!(buf[2], 0x01); // STRING leaf "a"
+        assert_eq!(&buf[6..8], &[0x00, 0x02]); // NOT
+        assert_eq!(buf[8], 0x01); // STRING "b"
+        assert_eq!(buf[12], 0x01); // STRING "c"
+        assert_eq!(buf.len(), 16);
+    }
+
+    /// The reference tree exists to catch the live encoder drifting, so the
+    /// two must agree on every boolean shape.
+    #[test]
+    fn search_tree_matches_the_live_query_encoder() {
+        use crate::search::query::QueryExpr;
+        let term = |s: &str| QueryExpr::Term(s.to_string());
+        let live = QueryExpr::Or(
+            Box::new(term("aaa")),
+            Box::new(QueryExpr::Not(
+                Box::new(QueryExpr::And(Box::new(term("bbb")), Box::new(term("ccc")))),
+                Box::new(term("ddd")),
+            )),
+        )
+        .to_wire_bytes();
+        let string = |s: &str| Box::new(SearchExpression::String(s.to_string()));
+        let reference = SearchExpression::Or(
+            string("aaa"),
+            Box::new(SearchExpression::Not(
+                Box::new(SearchExpression::And(string("bbb"), string("ccc"))),
+                string("ddd"),
+            )),
+        );
+        assert_eq!(build_search_tree(&reference), live);
     }
 
     #[test]
@@ -1898,11 +1931,11 @@ mod tests {
         );
         let buf = build_search_tree(&expr);
         // Outer AND
-        assert_eq!(buf[0], 0x00);
+        assert_eq!(&buf[0..2], &[0x00, 0x00]);
         // Inner AND
-        assert_eq!(buf[1], 0x00);
+        assert_eq!(&buf[2..4], &[0x00, 0x00]);
         // "linux" string leaf
-        assert_eq!(buf[2], 0x01);
+        assert_eq!(buf[4], 0x01);
         assert!(buf.len() > 25);
     }
 
@@ -2086,7 +2119,10 @@ const ED2K_SEARCH_OP_LESS_EQUAL: u8 = 0x04;
 const ED2K_SEARCH_OP_NOTEQUAL: u8 = 0x05;
 
 // Wire-format node type bytes for the search tree. All read by
-// `write_search_node`, so they are dead only because it is.
+// `write_search_node`, so they are dead only because it is. An operator node
+// is `SEARCH_NODE_OPERATOR` followed by one of the `SEARCH_BOOL_*` bytes.
+#[allow(dead_code)]
+const SEARCH_NODE_OPERATOR: u8 = 0x00;
 #[allow(dead_code)]
 const SEARCH_BOOL_AND: u8 = 0x00;
 #[allow(dead_code)]
@@ -2162,17 +2198,17 @@ fn write_search_node(buf: &mut Vec<u8>, expr: &SearchExpression) {
             buf.extend_from_slice(&bytes[..clamped_len]);
         }
         SearchExpression::And(left, right) => {
-            buf.push(SEARCH_BOOL_AND);
+            buf.extend([SEARCH_NODE_OPERATOR, SEARCH_BOOL_AND]);
             write_search_node(buf, left);
             write_search_node(buf, right);
         }
         SearchExpression::Or(left, right) => {
-            buf.push(SEARCH_BOOL_OR);
+            buf.extend([SEARCH_NODE_OPERATOR, SEARCH_BOOL_OR]);
             write_search_node(buf, left);
             write_search_node(buf, right);
         }
         SearchExpression::Not(left, right) => {
-            buf.push(SEARCH_BOOL_NOT);
+            buf.extend([SEARCH_NODE_OPERATOR, SEARCH_BOOL_NOT]);
             write_search_node(buf, left);
             write_search_node(buf, right);
         }

@@ -2288,7 +2288,11 @@
       searchInvokeSettled.add(requestId);
       clearSearchTimeoutForRequest(requestId);
       flushPendingSearchResults(requestId);
+      // Stop, Clear and a newer search all rotate the tab's id and then cancel,
+      // which is what resolves this invoke — after they pruned the id, so the
+      // `add` above put it back for good.
       if (!get(searchTabs).some((t) => t.requestId === requestId)) {
+        forgetSettledRequest(requestId);
         return;
       }
       if (results && results.length > 0) {
@@ -2299,7 +2303,10 @@
       searchInvokeSettled.add(requestId);
       clearSearchTimeoutForRequest(requestId);
       flushPendingSearchResults(requestId);
-      if (!get(searchTabs).some((t) => t.requestId === requestId)) return;
+      if (!get(searchTabs).some((t) => t.requestId === requestId)) {
+        forgetSettledRequest(requestId);
+        return;
+      }
       const msg = translateError(e, m.search_failed());
       console.error('Search failed:', e);
       patchSearchTabByRequestId(requestId, (tab) => ({
@@ -3003,6 +3010,7 @@
           : t,
       ),
     );
+    if (discardedId != null) forgetSettledRequest(discardedId);
     selectedResultKey = null;
     notes = [];
     spamExplainLoading = false;

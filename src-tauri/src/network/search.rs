@@ -513,7 +513,8 @@ pub(super) struct DhtNotedAvailability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DhtBatchKind {
     /// Records the leg has not handed over before — the cursor-advanced tail
-    /// slice both streaming paths send. Their counts add to the total.
+    /// slice both streaming paths send. Ember's publisher counts add to the
+    /// total; KAD's swarm estimates raise it to the larger.
     Incremental,
     /// A rebuild over every record the walk gathered, which is what the closing
     /// batch of either leg is. It *is* the total, so it replaces rather than
@@ -526,13 +527,14 @@ pub(super) enum DhtBatchKind {
 /// and put the total on each row.
 ///
 /// Both DHT legs convert only the records they have not converted before, so a
-/// batch's `availability` counts that slice and nothing else: a file published
-/// by thirty KAD nodes arrives as a dozen small batches. The UI merges counts
-/// by max, so without a running total the row showed the largest single slice —
-/// three or four sources for a file with thirty — until the leg finished and
-/// pushed its rebuild over everything gathered. Which was correct, and up to a
-/// minute late on a cold routing table. The server legs never had this because
-/// they have kept a running total all along; this is that, for KAD and Ember.
+/// batch's `availability` counts that slice and nothing else: a file thirty
+/// Ember publishers named arrives as a dozen small batches. The UI merges
+/// counts by max, so without a running total the row showed the largest single
+/// slice until the leg finished and pushed its rebuild over everything
+/// gathered — up to a minute late on a cold routing table. The server legs
+/// never had this because they have kept a running total all along; this is
+/// that, for Ember, and the running max for KAD (see the body for why KAD
+/// slices do not add).
 pub(super) fn note_dht_availability(
     active: &mut ActiveSearchRequest,
     results: &mut [SearchResult],
@@ -556,16 +558,24 @@ pub(super) fn note_dht_availability(
             )
         };
         let Some(noted) = noted else { continue };
-        let slot = match r.result_origin.as_str() {
-            crate::search::merge::ORIGIN_KAD => &mut noted.kad,
-            crate::search::merge::ORIGIN_EMBER => &mut noted.ember,
+        // A KAD count is a swarm estimate — the largest `TAG_SOURCES`, or the
+        // publisher addresses seen — and every keyword entry sits on about ten
+        // nodes, so the same publishers come back in slice after slice. Adding
+        // slices counted them once per responder, and the UI's max-merge kept
+        // the overshoot even after the closing rebuild got it right; within a
+        // batch `convert_search_results` already takes the max for this reason.
+        // An Ember slice counts publishers the earlier slices did not (the
+        // streaming path drops the ones already counted), so those add up.
+        let (slot, additive) = match r.result_origin.as_str() {
+            crate::search::merge::ORIGIN_KAD => (&mut noted.kad, false),
+            crate::search::merge::ORIGIN_EMBER => (&mut noted.ember, true),
             // Anything else is a server row (handled by the ed2k total) or an
             // already-merged origin, which no streamed batch carries.
             _ => continue,
         };
         *slot = match kind {
-            DhtBatchKind::Incremental => slot.saturating_add(r.availability),
-            DhtBatchKind::Cumulative => (*slot).max(r.availability),
+            DhtBatchKind::Incremental if additive => slot.saturating_add(r.availability),
+            DhtBatchKind::Incremental | DhtBatchKind::Cumulative => (*slot).max(r.availability),
         }
         .min(MAX_KAD_AVAILABILITY);
         r.availability = r.availability.max(*slot);
@@ -1430,7 +1440,7 @@ pub(super) fn finalize_removed_searches_with_keyword_results(
     app_handle: &tauri::AppHandle,
     removed_sids: &[SearchId],
     released_in_use: &[KadId],
-    preserved_results: &HashMap<SearchId, Vec<kad::messages::SearchResultEntry>>,
+    preserved_results: &HashMap<SearchId, (KadId, Vec<kad::messages::SearchResultEntry>)>,
     rendezvous_target: Option<KadId>,
 ) {
     if !released_in_use.is_empty() {
@@ -1448,13 +1458,11 @@ pub(super) fn finalize_removed_searches_with_keyword_results(
             ..
         }) = state.pending_keyword_searches.remove(sid)
         {
-            if let Some(entries) = preserved_results.get(sid) {
+            if let Some((_, entries)) = preserved_results.get(sid) {
                 if !entries.is_empty() {
                     let mut network_results =
                         convert_search_results(entries, |ip| is_search_source_safe(state, ip));
-                    if !query_expr.is_trivial() {
-                        network_results.retain(|r| query_expr.matches(&r.file.name.to_lowercase()));
-                    }
+                    network_results.retain(|r| query_expr.matches_name(&r.file.name));
                     if let Some(active) = state.active_search_request.as_mut() {
                         if active.request_id == request_id {
                             // Same rebuild as the completion path, reaching the
@@ -1486,7 +1494,7 @@ pub(super) fn finalize_removed_searches_with_keyword_results(
             state.ember_rendezvous_search = None;
             let peers: Vec<KadSource> = preserved_results
                 .get(sid)
-                .map(|entries| {
+                .map(|(_, entries)| {
                     extract_kad_sources(entries)
                         .into_iter()
                         .filter(|s| !is_self_source(s, state))
@@ -1507,11 +1515,11 @@ pub(super) fn finalize_removed_searches_with_keyword_results(
             );
         }
         if let Some((_, tx)) = state.pending_notes_searches.remove(sid) {
-            if let Some(entries) = preserved_results.get(sid) {
-                // Notes conversion forces the searched file hash onto results;
-                // use the first entry id (Kad key) or zeros if empty after filter.
-                let target = entries.first().map(|e| e.id).unwrap_or(KadId([0u8; 16]));
-                let notes = convert_note_search_results(entries, &target);
+            if let Some((target, entries)) = preserved_results.get(sid) {
+                // The searched file hash, as on the completion path. An entry's
+                // id is the note's publisher, which put a stranger's id in the
+                // file-hash field of every note.
+                let notes = convert_note_search_results(entries, target);
                 let _ = tx.send(Ok(notes));
             } else {
                 let _ = tx.send(Err(
@@ -1522,7 +1530,7 @@ pub(super) fn finalize_removed_searches_with_keyword_results(
         // Download-backed FindSource: inject any collected sources before
         // dropping the mapping so capacity eviction does not discard them (S9).
         if let Some((transfer_id, file_hash)) = state.download_source_searches.remove(sid) {
-            if let Some(entries) = preserved_results.get(sid) {
+            if let Some((_, entries)) = preserved_results.get(sid) {
                 let all = extract_kad_sources(entries);
                 let established = ember_established_addrs(state);
                 harvest_ember_noise_keys(

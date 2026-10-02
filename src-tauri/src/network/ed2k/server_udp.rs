@@ -252,7 +252,10 @@ impl ServerUdpSocket {
             packet.push(OP_EDONKEYPROT);
             packet.push(OP_GLOBSEARCHREQ3);
             packet.extend_from_slice(&1u32.to_le_bytes()); // tag count = 1
-            packet.push(0x01 | 0x80); // TAGTYPE_UINT8 | short-name flag
+            // TAGTYPE_UINT8 (0x09) | short-name flag, eMule's 0x89. 0x01 is
+            // TAGTYPE_HASH: the server read 16 bytes for it, swallowing the flag
+            // and most of the search expression.
+            packet.push(0x09 | 0x80);
             packet.push(CT_SERVER_UDPSEARCH_FLAGS);
             packet.push(SRVCAP_UDP_NEWTAGS_LARGEFILES);
             packet.extend_from_slice(search_expr);
@@ -1583,6 +1586,10 @@ mod tests {
         server.udp_flags = SRV_UDPFLG_EXT_GETFILES | SRV_UDPFLG_LARGEFILES;
         let (pkt, _) = ServerUdpSocket::build_global_search_packet(&server, expr, false).unwrap();
         assert_eq!(pkt[1], OP_GLOBSEARCHREQ3);
+        // One tag, short-named TAGTYPE_UINT8 (0x89) CT_SERVER_UDPSEARCH_FLAGS = 1,
+        // then the expression unchanged.
+        assert_eq!(&pkt[2..9], &[1, 0, 0, 0, 0x89, 0x0E, 0x01]);
+        assert_eq!(&pkt[9..], expr);
 
         // 64-bit expression without LARGEFILES → skipped
         server.udp_flags = SRV_UDPFLG_EXT_GETFILES;

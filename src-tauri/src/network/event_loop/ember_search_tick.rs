@@ -774,13 +774,32 @@ pub(in crate::network) async fn on_ember_search_tick(
             // filter: those records have been considered, and not
             // moving the cursor would re-examine them every tick.
             kw.last_streamed_count = gathered;
-            let built = build_ember_keyword_built(
+            // A publisher an earlier slice counted for a file is not counted
+            // again; see `streamed_publishers`. Only what the build counted is
+            // recorded, so a record it refused — forged, under another key,
+            // failing the query — cannot hide that publisher's valid one.
+            let records: Vec<_> = records
+                .into_iter()
+                .filter(|record| {
+                    ember_record_publisher(&record.data)
+                        .is_none_or(|pair| !kw.streamed_publishers.contains(&pair))
+                })
+                .collect();
+            let mut built = build_ember_keyword_built(
                 &records,
                 &kw.keywords,
                 kw.query_expr.as_ref(),
             );
-            for row in &built.results {
+            kw.streamed_publishers
+                .extend(built.counted_publishers.drain(..));
+            for row in &mut built.results {
                 kw.streamed_files.insert(row.file.hash.clone());
+                // A slice's plurality digest is a partial answer, and only the
+                // closing rebuild can say a digest is contested: it does so
+                // with an empty field, which a merge cannot tell from "no
+                // claim" and so would leave the slice's digest pinned — the one
+                // a click enforces at completion. Only that rebuild sets it.
+                row.file.ember_file_hash.clear();
             }
             // Streamed pages deliberately do not seed the enforced
             // digest map. Corroboration is computed per batch, so a

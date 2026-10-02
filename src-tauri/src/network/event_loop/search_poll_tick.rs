@@ -395,13 +395,14 @@ pub(in crate::network) async fn on_search_poll_tick(
                 // Re-apply the full boolean query locally: a Kad
                 // lookup only matches a single keyword hash, so
                 // OR/NOT branches the responding node doesn't store
-                // can slip through. Skipped for a single bare
-                // keyword (already exact). `pending_keywords` still
-                // seeds the spam scorer in the enrich call below.
+                // can slip through. A single bare keyword too: a
+                // keyword is published from the words of the name,
+                // so a row whose name lacks it is a node answering
+                // with something it was never given under that key.
+                // `pending_keywords` still seeds the spam scorer in
+                // the enrich call below.
                 let pending_expr = pending.query_expr.clone();
-                if !pending_expr.is_trivial() {
-                    batch.retain(|r| pending_expr.matches(&r.file.name.to_lowercase()));
-                }
+                batch.retain(|r| pending_expr.matches_name(&r.file.name));
                 let resights = dedup_streamed_batch(
                     &mut state.active_search_request,
                     pending_request_id,
@@ -761,20 +762,14 @@ pub(in crate::network) async fn on_search_poll_tick(
                 let all_results = convert_search_results(&search.results, |ip| {
                     is_search_source_safe(state, ip)
                 });
-                if !query_expr.is_trivial() {
-                    let before = all_results.len();
-                    let filtered: Vec<SearchResult> = all_results
-                        .into_iter()
-                        .filter(|r| query_expr.matches(&r.file.name.to_lowercase()))
-                        .collect();
-                    info!(
-                        "Keyword filter: {before} -> {} results (boolean query)",
-                        filtered.len()
-                    );
-                    filtered
-                } else {
-                    all_results
-                }
+                // Same filter as the streamed batches above.
+                let before = all_results.len();
+                let filtered: Vec<SearchResult> = all_results
+                    .into_iter()
+                    .filter(|r| query_expr.matches_name(&r.file.name))
+                    .collect();
+                info!("Keyword filter: {before} -> {} results", filtered.len());
+                filtered
             } else {
                 Vec::new()
             };

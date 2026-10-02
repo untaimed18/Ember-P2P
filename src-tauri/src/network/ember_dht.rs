@@ -531,6 +531,12 @@ pub(super) struct EmberKeywordSearch {
     /// is about to see. Re-deriving it per tick instead would mean verifying
     /// every gathered signature again once a second.
     pub(super) streamed_files: HashSet<String>,
+    /// `(file hash, publisher key)` of every record a streamed slice has
+    /// counted. A republished record is a new blob, so the blob dedup keeps
+    /// both versions and they can land in different slices; slice counts are
+    /// added up, and counting that publisher twice would stick, since the UI
+    /// merges counts by max. Bounded by the search's result-blob cap.
+    pub(super) streamed_publishers: HashSet<([u8; 16], [u8; 32])>,
 }
 
 /// A batch of Ember DHT keyword results ready to emit (slice 10).

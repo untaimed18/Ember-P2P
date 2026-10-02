@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::network::kad::publish::kad_keyword_lowercase;
 use crate::search::merge::ORIGIN_LOCAL;
 use crate::types::{FileInfo, SearchResult};
 
@@ -302,7 +303,8 @@ impl LocalIndex {
                     None => return Some((idx, 1u32)),
                     Some(expr) => expr,
                 };
-                let name_lower = file.name.to_lowercase();
+                // The terms' lowercaser; see `QueryExpr::matches_name`.
+                let name_lower = kad_keyword_lowercase(&file.name);
                 if !expr.matches(&name_lower) {
                     return None;
                 }

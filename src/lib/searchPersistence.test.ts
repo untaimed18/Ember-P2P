@@ -64,14 +64,13 @@ describe('forPersist', () => {
   });
 
   it('gives up the request id so the next search cannot collide with it', () => {
-    // `newSearchNonce` restarts at 1 on every page load, so a restored tab that
-    // kept its old id would capture the first search made after the restore —
-    // `updateTabByRequestId` matches on exactly this field.
+    // A restored tab that kept its old id could capture a search made after
+    // the restore — `updateTabByRequestId` matches on exactly this field.
     const stripped = forPersist(tab('a'));
 
     expect(stripped.requestId).toBe(RESTORED_REQUEST_ID);
     // Whatever the sentinel is, it must be something a live request can never
-    // be: the nonce counts up from 1 and `validRequestId` rejects `<= 0`.
+    // be: the nonce is positive and `validRequestId` rejects `<= 0`.
     expect(RESTORED_REQUEST_ID).toBeLessThan(1);
   });
 

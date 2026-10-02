@@ -540,7 +540,15 @@ async fn handle_command_inner(
                     kad_skip_phase = Some("KadBusy");
                     break 'kad false;
                 };
-                let Some(primary_keyword) = keywords.iter().max_by_key(|k| k.len()) else {
+                // Longest term every match contains, so the one key walked
+                // holds all of them; only an OR with no shared term falls
+                // back to a key that can see just part of the answer.
+                let required = query_expr.required_terms();
+                let Some(primary_keyword) = required
+                    .iter()
+                    .max_by_key(|k| k.len())
+                    .or_else(|| keywords.iter().max_by_key(|k| k.len()))
+                else {
                     kad_skip_phase = Some("KadBusy");
                     break 'kad false;
                 };
@@ -643,7 +651,9 @@ async fn handle_command_inner(
             // rather than being skipped, which keeps a momentarily empty
             // table from silently dropping the Ember leg of a search.
             if legs.ember && settings.ember_native_enabled {
-                let query = active_request.keywords.join(" ");
+                // Walk a term every match contains when there is one, as the
+                // KAD leg does. Without an OR that is every positive term.
+                let query = ember_walk_query(&active_request.keywords, query_expr.as_ref());
                 let hashed = ember::dht::search::compute_keyword_hashes(&query);
                 if let Some((primary_hash, _)) = hashed.first() {
                     // AND-only: remaining keyword hashes ride on FIND_VALUE so
@@ -712,6 +722,7 @@ async fn handle_command_inner(
                                 min_availability: active_request.min_availability,
                                 last_streamed_count: 0,
                                 streamed_files: HashSet::new(),
+                                streamed_publishers: HashSet::new(),
                             },
                         );
                         active_request.ember_pending = true;

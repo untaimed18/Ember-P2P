@@ -203,7 +203,13 @@ let initialized = false;
 let unlisteners: UnlistenFn[] = [];
 let unsubSettings: Unsubscriber | null = null;
 let lastSpamSettingsKey: string | null = null;
-let searchNonce = 0;
+// Seeded from the clock rather than 0: the backend outlives a webview reload,
+// and a leg still running for the last page's request — an Ember walk emits
+// its closing batch up to a minute on — would otherwise name an id this page
+// is about to hand out again, and stream into that search. Searches are far
+// rarer than milliseconds, so the ids keep rising across reloads, and stay
+// well inside `Number.MAX_SAFE_INTEGER` and the backend's u64.
+let searchNonce = Date.now();
 // Bumped by `cleanupSearchStore`; see the matching comment in
 // `stores/network.ts` for why `initSearchStore` needs to re-check this
 // after its async listener registration before adopting the results.
@@ -582,8 +588,11 @@ export function patchSearchTabByRequestId(requestId: number, fn: (tab: SearchTab
  *  step, which a caller assembling `results` itself would not. */
 export function appendSearchResults(requestId: number, incoming: SearchResult[]) {
   if (!Array.isArray(incoming) || incoming.length === 0) return;
+  const activeId = get(activeSearchTabId);
+  // The invoke reply can land after `search-complete` already trimmed an idle
+  // background tab; the trim applies to what it brings too.
   searchTabs.update((tabs) =>
-    updateTabByRequestId(tabs, requestId, (t) => mergeIntoTab(t, incoming)),
+    updateTabByRequestId(tabs, requestId, (t) => trimIdleTab(mergeIntoTab(t, incoming), activeId)),
   );
 }
 
@@ -1236,6 +1245,12 @@ export function cleanupSearchStore() {
   spamMarkRescorePending = null;
   spamUserOverrides.clear();
   spamFilterEpoch.update((n) => n + 1);
+  // Save the tabs before dropping them, and leave the emptied store unsaved.
+  // The init-failure screen runs this and then offers Retry, which is a
+  // reload: its `pagehide` persisted the empty list, deleting the saved tabs
+  // the reload was going to restore.
+  persistSearch();
   searchTabs.set([]);
   activeSearchTabId.set(null);
+  persistDirty = false;
 }

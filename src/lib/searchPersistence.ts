@@ -40,11 +40,12 @@ export const PERSIST_RETRY_LIMITS = [PERSIST_MAX_RESULTS, 100, 25];
  * The `requestId` a restored tab carries instead of the one it had.
  *
  * This matters more than it looks. `requestId` is a frontend counter
- * (`newSearchNonce`) that restarts at 1 on every page load, while tabs restored
- * from storage still held ids from before the reload — so the first search
- * after a restore would be handed an id a restored tab already had, and
+ * (`newSearchNonce`) that used to restart at 1 on every page load, while tabs
+ * restored from storage still held ids from before the reload — so the first
+ * search after a restore was handed an id a restored tab already had, and
  * `updateTabByRequestId` matches on exactly that. The new search's results
- * would have streamed into the old tab while the new one sat empty.
+ * streamed into the old tab while the new one sat empty. The counter now
+ * starts from the clock, but a restored tab still has no live request.
  *
  * Zero is unmatchable rather than merely unlikely: `newSearchNonce` only ever
  * returns positive integers, and `validRequestId` rejects anything `<= 0`

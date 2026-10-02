@@ -162,9 +162,8 @@ pub(super) async fn try_connect_server(
     Ok((conn, addr))
 }
 
-/// Clear per-session eD2K identity and in-flight TCP search state. Does not
-/// touch `udp_search_queue` (throttled global multi-server search) or the
-/// connection fields.
+/// Clear per-session eD2K identity and in-flight search state. Does not touch
+/// the connection fields.
 pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &tauri::AppHandle) {
     // No session means no server capabilities; leaving the mirror set would
     // have a related search keep planning around a co-share request that can no
@@ -207,6 +206,9 @@ pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &t
         if active.udp_pending {
             active.udp_pending = false;
             state.server_udp_search_age = 0;
+            // With the leg over, every reply is refused; the rest of the
+            // queue would only be sent to be ignored.
+            state.udp_search_queue.clear();
             changed = true;
         }
         if active.server_pending {

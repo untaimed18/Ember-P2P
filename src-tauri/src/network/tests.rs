@@ -1490,26 +1490,47 @@ fn kad_row(hash: &str, availability: u32) -> SearchResult {
     }
 }
 
-/// Both DHT legs hand over only the records they have not converted before,
-/// so the count on a row is that slice's. The row has to carry what the
-/// slices add up to, or the UI's max-merge keeps the biggest single slice.
+fn ember_row(hash: &str, availability: u32) -> SearchResult {
+    SearchResult {
+        result_origin: crate::search::merge::ORIGIN_EMBER.to_string(),
+        availability,
+        ..sample_search_result(hash)
+    }
+}
+
+/// Ember slices count publishers the earlier slices had not, so the row has
+/// to carry what they add up to, or the UI's max-merge keeps the biggest one.
 #[test]
-fn kad_slices_add_up_to_a_running_total_as_they_arrive() {
+fn ember_slices_add_up_to_a_running_total_as_they_arrive() {
     let mut active = sample_active_search_request(1);
-    let mut first = vec![kad_row("hash1", 3)];
+    let mut first = vec![ember_row("hash1", 3)];
     note_dht_availability(&mut active, &mut first, DhtBatchKind::Incremental);
     assert_eq!(first[0].availability, 3);
 
-    let mut second = vec![kad_row("hash1", 5)];
+    let mut second = vec![ember_row("hash1", 5)];
     note_dht_availability(&mut active, &mut second, DhtBatchKind::Incremental);
     assert_eq!(
         second[0].availability, 8,
-        "a file eight KAD nodes published must not read as five"
+        "a file eight Ember publishers named must not read as five"
     );
 
-    let mut third = vec![kad_row("hash1", 2)];
+    let mut third = vec![ember_row("hash1", 2)];
     note_dht_availability(&mut active, &mut third, DhtBatchKind::Incremental);
     assert_eq!(third[0].availability, 10);
+}
+
+/// A KAD slice's count is a swarm estimate, and the same publishers come back
+/// from every node storing their entry, so slices raise the total to the
+/// larger rather than adding: the UI's max-merge would keep an overshoot for
+/// good, even after the closing rebuild.
+#[test]
+fn kad_slices_keep_the_largest_estimate_rather_than_adding() {
+    let mut active = sample_active_search_request(1);
+    for (slice, shown) in [(3, 3), (5, 5), (2, 5)] {
+        let mut batch = vec![kad_row("hash1", slice)];
+        note_dht_availability(&mut active, &mut batch, DhtBatchKind::Incremental);
+        assert_eq!(batch[0].availability, shown);
+    }
 }
 
 /// The closing batch of either leg is a rebuild over every record gathered,
@@ -1519,11 +1540,11 @@ fn kad_slices_add_up_to_a_running_total_as_they_arrive() {
 fn the_closing_rebuild_replaces_the_total_rather_than_doubling_it() {
     let mut active = sample_active_search_request(1);
     for slice in [3, 5, 2] {
-        let mut batch = vec![kad_row("hash1", slice)];
+        let mut batch = vec![ember_row("hash1", slice)];
         note_dht_availability(&mut active, &mut batch, DhtBatchKind::Incremental);
     }
 
-    let mut closing = vec![kad_row("hash1", 10)];
+    let mut closing = vec![ember_row("hash1", 10)];
     note_dht_availability(&mut active, &mut closing, DhtBatchKind::Cumulative);
     assert_eq!(closing[0].availability, 10);
 }
@@ -3715,6 +3736,53 @@ fn ember_keyword_results_honor_boolean_queries() {
     assert_eq!(not_results[0].file.hash, hex::encode(hash_a));
 }
 
+/// The streaming path records these pairs to skip in later slices, so a record
+/// the build refused must not appear: it would hide that publisher's valid one.
+#[test]
+fn ember_build_reports_only_the_publishers_its_counts_include() {
+    let counted = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+    let other_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let off_query = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
+    let file = [0x59u8; 16];
+    let blobs = vec![
+        ember_kw_blob(&counted, "ubuntu", file, 1, "ubuntu.iso"),
+        ember_kw_blob(&other_key, "debian", file, 1, "ubuntu.iso"),
+        ember_kw_blob(&off_query, "ubuntu", file, 1, "ubuntu desktop.iso"),
+    ];
+    let expr = crate::search::query::parse("ubuntu -desktop").expect("parses");
+    let built = build_ember_keyword_built(
+        &held_records(&blobs),
+        &["ubuntu".to_string()],
+        Some(&expr),
+    );
+    assert_eq!(
+        built.counted_publishers,
+        vec![(file, counted.verifying_key().to_bytes())]
+    );
+    assert_eq!(built.results.len(), 1);
+    assert_eq!(built.results[0].availability, 1);
+}
+
+/// With an OR beside a shared term, the walk goes to the shared term — the
+/// longer OR-side words would see only part of the answer — and the result
+/// build must expect records under that same key, or it drops every hit.
+#[test]
+fn ember_or_query_walks_and_keeps_the_term_every_match_contains() {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let hash_a = [0x57u8; 16];
+    let hash_b = [0x58u8; 16];
+    let expr = crate::search::query::parse("ubuntu (desktop OR serverx)").expect("parses");
+    let keywords = expr.positive_terms();
+    assert_eq!(ember_walk_query(&keywords, Some(&expr)), "ubuntu");
+
+    let blobs = vec![
+        ember_kw_blob(&sk, "ubuntu", hash_a, 1, "ubuntu desktop.iso"),
+        ember_kw_blob(&sk, "ubuntu", hash_b, 1, "ubuntu serverx.iso"),
+    ];
+    let results = build_ember_keyword_built(&held_records(&blobs), &keywords, Some(&expr)).results;
+    assert_eq!(results.len(), 2, "both OR sides found under the shared key");
+}
+
 #[test]
 fn ember_keyword_results_ignore_source_and_garbage_blobs() {
     let sk = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]);
@@ -5888,6 +5956,29 @@ fn note_results_keep_requested_file_hash() {
     assert_eq!(results[0].rating, Some(5));
 }
 
+/// Each node storing a note returns it, so one publisher's note arrives once
+/// per responder; it is still one note. An empty entry must not take the
+/// publisher's slot ahead of the real one.
+#[test]
+fn note_results_keep_one_note_per_publisher() {
+    let note = |publisher: u8, comment: &str| SearchResultEntry {
+        id: KadId([publisher; 16]),
+        tags: vec![KadTag {
+            name: TagName::Id(TAG_DESCRIPTION),
+            value: TagValue::String(comment.to_string()),
+        }],
+    };
+    let entries = vec![
+        note(0x22, ""),
+        note(0x22, "Looks good"),
+        note(0x22, "Looks good"),
+        note(0x33, "Fake"),
+    ];
+    let results = convert_note_search_results(&entries, &KadId([0x11; 16]));
+    let comments: Vec<_> = results.iter().map(|r| r.comment.as_deref()).collect();
+    assert_eq!(comments, [Some("Looks good"), Some("Fake")]);
+}
+
 #[test]
 fn search_results_extract_kad_media_tags() {
     let entries = vec![SearchResultEntry {
@@ -5957,6 +6048,48 @@ fn search_results_without_media_leave_field_none() {
     let results = convert_search_results(&entries, |_| true);
     assert_eq!(results.len(), 1);
     assert!(results[0].media.is_none());
+}
+
+/// eMule writes every Kad integer tag at the smallest width that holds it, so
+/// small counts, sizes and media figures arrive as UINT8/UINT16.
+#[test]
+fn kad_results_read_integer_tags_at_any_width() {
+    use crate::network::kad::types::{TAG_COMPLETE_SOURCES, TAG_FILESIZE, TAG_SOURCES};
+    let tag = |id: u8, value: TagValue| KadTag {
+        name: TagName::Id(id),
+        value,
+    };
+    let entries = vec![SearchResultEntry {
+        id: KadId([0x56; 16]),
+        tags: vec![
+            tag(TAG_FILENAME, TagValue::String("song.mp3".to_string())),
+            tag(TAG_FILESIZE, TagValue::Uint16(40_000)),
+            tag(TAG_SOURCES, TagValue::Uint8(5)),
+            tag(TAG_COMPLETE_SOURCES, TagValue::Uint8(3)),
+            tag(TAG_MEDIA_BITRATE, TagValue::Uint8(128)),
+            tag(TAG_MEDIA_LENGTH, TagValue::Uint8(200)),
+        ],
+    }];
+    let results = convert_search_results(&entries, |_| true);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].file.size, 40_000);
+    assert_eq!(results[0].availability, 5);
+    assert_eq!(results[0].file.complete_sources, 3);
+    let media = results[0].media.as_ref().expect("media present");
+    assert_eq!(media.bitrate, Some(128));
+    assert_eq!(media.duration, Some(200));
+}
+
+/// eMule splits an inbound string term on the keyword separators and wants
+/// every word (`SSearchTerm::Evaluate`), not the term as one substring.
+#[test]
+fn inbound_kad_string_term_requires_each_word() {
+    let name = "pink_floyd-the_wall.mp3";
+    let term = |s: &str| KadSearchExpr::String(s.to_string());
+    assert!(matches_search_expr_impl(&term("Pink Floyd"), name, 0, None));
+    assert!(matches_search_expr_impl(&term("wall pink"), name, 0, None));
+    assert!(!matches_search_expr_impl(&term("pink money"), name, 0, None));
+    assert!(!matches_search_expr_impl(&term(" - "), name, 0, None), "no word, no match");
 }
 
 /// Both Kad counts are estimates of one swarm, so neither accumulates with

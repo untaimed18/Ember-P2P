@@ -2126,6 +2126,11 @@ pub(super) async fn handle_udp_packet_inner(
                 _ => None,
             };
 
+            // A completed search is still taken until the poll tick finalizes
+            // it. A node answers in several SEARCH_RES packets, and the first
+            // one from the last pending node is what completes the search: the
+            // rest of its answer arrives a few milliseconds later and used to
+            // be turned away here.
             let mut search_ids: Vec<SearchId> = sender_ip_port
                 .map(|(ip, port)| {
                     state
@@ -2134,7 +2139,6 @@ pub(super) async fn handle_udp_packet_inner(
                         .iter()
                         .filter(|(_, s)| {
                             s.target == target
-                                && !s.completed
                                 && s.search_type.accepts_search_results()
                                 && s.tried.contains_key(&(ip, port))
                         })
@@ -2154,7 +2158,6 @@ pub(super) async fn handle_udp_packet_inner(
                             .iter()
                             .filter(|(_, s)| {
                                 s.target == target
-                                    && !s.completed
                                     && s.search_type.accepts_search_results()
                                     && s.tried.keys().any(|(tip, _)| *tip == ip)
                             })

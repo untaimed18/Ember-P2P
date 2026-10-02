@@ -594,6 +594,37 @@ pub(super) struct EmberKeywordBuilt {
     /// bound. The count travels with the digest so a later or more complete
     /// walk can supersede a pin made on thinner evidence.
     pub(super) corroborated: Vec<([u8; 16], [u8; 32], usize)>,
+    /// `(file hash, publisher key)` of every publisher a row's `availability`
+    /// counts — verified, under the walked key, and past the query filter.
+    pub(super) counted_publishers: Vec<([u8; 16], [u8; 32])>,
+}
+
+/// `(file hash, publisher key)` of a keyword-record value blob, read without
+/// the signature check: [`build_ember_keyword_built`] makes that one anyway.
+pub(super) fn ember_record_publisher(blob: &[u8]) -> Option<([u8; 16], [u8; 32])> {
+    let split = blob.len().checked_sub(64)?;
+    let (data, signature) = blob.split_at(split);
+    let rec =
+        ember::dht::publish::SignedRecord::parse_unverified(data, signature.try_into().ok()?)?;
+    Some((rec.file_hash, rec.publisher_key))
+}
+
+/// The text an Ember keyword search hashes its walk key from: the terms every
+/// match contains when there are any ([`QueryExpr::required_terms`]), else
+/// every positive keyword. The lookup and [`build_ember_keyword_built`] both
+/// take the key from here, because a record under any other key is dropped.
+///
+/// [`QueryExpr::required_terms`]: crate::search::query::QueryExpr::required_terms
+pub(super) fn ember_walk_query(
+    keywords: &[String],
+    query_expr: Option<&crate::search::query::QueryExpr>,
+) -> String {
+    let required = query_expr.map(|e| e.required_terms()).unwrap_or_default();
+    if required.is_empty() {
+        keywords.join(" ")
+    } else {
+        required.join(" ")
+    }
 }
 
 /// Build search rows from Ember DHT keyword `FIND_VALUE` blobs (slice 10).
@@ -648,8 +679,10 @@ pub(super) fn build_ember_keyword_built(
     // length (a stable descending sort keeps the first, `max_by_key` returns
     // the last), which silently dropped every hit for queries like
     // "ubuntu server".
-    let primary_hash = ember::dht::search::compute_keyword_hashes(&keywords.join(" "))
-        .first()
+    let primary_hash = ember::dht::search::compute_keyword_hashes(&ember_walk_query(
+        keywords, query_expr,
+    ))
+    .first()
         .map(|(h, _)| *h);
     // file_hash -> (result, publisher_key -> ember digest votes)
     let mut dedup: HashMap<[u8; 16], (SearchResult, EmberDigestVotes)> = HashMap::new();
@@ -677,7 +710,7 @@ pub(super) fn build_ember_keyword_built(
         // matched the primary keyword, so the rest of the query is applied
         // against the file name here.
         if let Some(expr) = expr {
-            if !expr.matches(&file_name.to_lowercase()) {
+            if !expr.matches_name(&file_name) {
                 continue;
             }
         } else if kw_lower.len() > 1 {
@@ -771,6 +804,7 @@ pub(super) fn build_ember_keyword_built(
     // on click (user-chosen pin, even a plurality of one). Automatic fills
     // of ember_content_hashes still require corroboration.
     let mut corroborated = Vec::new();
+    let mut counted_publishers = Vec::new();
     for (hash, (result, votes)) in dedup.iter_mut() {
         let plurality = majority_ember_digest(votes);
         // A click pins whatever the row carries, so a contested row carries
@@ -801,10 +835,14 @@ pub(super) fn build_ember_keyword_built(
         } else {
             plurality
         };
-        let sources = votes
-            .values()
-            .filter(|vote| vote.digest == [0u8; 32] || Some(vote.digest) == counted)
-            .count() as u32;
+        let before = counted_publishers.len();
+        counted_publishers.extend(
+            votes
+                .iter()
+                .filter(|(_, vote)| vote.digest == [0u8; 32] || Some(vote.digest) == counted)
+                .map(|(publisher, _)| (*hash, *publisher)),
+        );
+        let sources = (counted_publishers.len() - before) as u32;
         result.availability = sources;
         result.file.complete_sources = sources;
         if let Some((digest, responders)) = corroborated_ember_digest_with_count(votes) {
@@ -814,6 +852,7 @@ pub(super) fn build_ember_keyword_built(
     EmberKeywordBuilt {
         results: dedup.into_values().map(|(sr, _)| sr).collect(),
         corroborated,
+        counted_publishers,
     }
 }
 
