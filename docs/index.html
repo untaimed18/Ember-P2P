@@ -1093,7 +1093,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="" width="80" height="80">
-      <h3>Get Ember 1.7.0</h3>
+      <h3>Get Ember 1.7.1</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11, and for x86-64 Linux as a <code>.deb</code> or an AppImage.</p>
       <span class="download-meta">Windows installer &middot; Linux <code>.deb</code> / AppImage &middot; no extra runtimes</span>
       <div class="btn-group">
@@ -1864,6 +1864,92 @@ npm run tauri build</code></pre>
   <section id="releases">
     <h2>Release History</h2>
     <p>Every Ember release, newest first. These are the same notes we publish on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
+
+    <article class="release" id="release-1-7-1">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.1" target="_blank" rel="noopener">Ember v1.7.1</a></h3>
+        <time class="release-date" datetime="2026-10-01">October 1, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.1" target="_blank" rel="noopener"><code>v1.7.1</code></a></p>
+      <div class="release-notes">
+        <p>Ember now keeps itself up to date: it checks for releases while it stays open, can install one by itself while you are away, and comes back the way you left it. One forwarded UDP port now carries everything, room offers no longer show a file&rsquo;s name to the members passing them along, and Transfers gained categories, an Add links box and a rate graph on Statistics. Around that sat another round of audits &mdash; the Ember DHT, relays, sharing, updates and the interface &mdash; and their fixes.</p>
+
+        <h4>Before you upgrade</h4>
+
+        <ul>
+          <li><strong>The Ember DHT wire version is unchanged at version 4,</strong> so 1.7.1, 1.7.0 and every 1.6 release see each other on the overlay normally</li>
+          <li><strong>QUIC now runs on your KAD UDP port.</strong> If you forward ports by hand, that one UDP port now carries everything. Ember still listens on the old QUIC port (your TCP port number, over UDP) for 1.7.0 peers and relays that dial it, so keep that forward if you have one. <code>"quic_shares_udp_port": false</code> in <code>config.json</code> brings back the separate socket</li>
+          <li><strong>Room offers are now private.</strong> A member on 1.6.x, or one on 1.7.0 who has not shown it can read them, may not answer: after 10 seconds your transfer card asks whether to send a standard offer, which lets the members relaying it see the file&rsquo;s name and size. Nothing is sent that way without your click, and files over 100&nbsp;MB cannot go to a 1.6.x member at all</li>
+          <li><strong>Max sources per file now limits each download,</strong> not only the source cache. At the default of 400 a download keeps at most 400 sources, and a saved value below 50 is raised to 50</li>
+          <li><strong>Silent updates are off until you turn them on,</strong> in Settings &gt; About. They work with the Windows installer and the AppImage; <code>.deb</code> and MSI installs show why they cannot</li>
+        </ul>
+
+        <h4>What&rsquo;s New</h4>
+
+        <h5>Updates</h5>
+        <ul>
+          <li><strong>Checks keep running while Ember stays open,</strong> hourly, daily, weekly or monthly, so an Ember left in the tray for weeks still hears about a release</li>
+          <li><strong>Silent updates.</strong> A release downloads in the background and installs only when nothing is moving and nobody has touched Ember for ten minutes. A minute&rsquo;s warning comes first: a dialog in a visible window, a notification and a <strong>Cancel update</strong> entry on the tray otherwise. <strong>Not now</strong> waits a day, <strong>Skip this version</strong> holds it, and a transfer starting stops the countdown</li>
+          <li><strong>Coming back the way you left it.</strong> After an update Ember reopens at the same size and place, maximized, minimized or in the tray, on the same page, server and search tabs, with the chat still popped out, and peers waiting in your upload queue keep their place</li>
+          <li><strong>An installer that never brings Ember back</strong> is covered: Ember starts itself again within about five minutes, on the old version, and says the update did not install</li>
+          <li><strong>The tray menu is in your language</strong></li>
+        </ul>
+
+        <h5>Transfers and Statistics</h5>
+        <ul>
+          <li><strong>Add eD2K links</strong> from a box filled from the clipboard, which counts what it found as you edit, or press <kbd>Ctrl</kbd>+<kbd>V</kbd> on Transfers</li>
+          <li><strong>Your own download categories.</strong> Make one from a download&rsquo;s Category menu, for one row or a whole selection, and filter the list by category with chips; Pause, Resume, Stop, Cancel and Clear completed then act on that category alone</li>
+          <li><strong>A transfer-rate graph on Statistics,</strong> over the last five minutes or the last hour</li>
+          <li><strong>The status bar shows HighID or LowID</strong> while connected, and its speeds open Transfers</li>
+          <li><strong>Long lists scroll smoothly.</strong> Servers, the upload Queue and Known Peers render only the rows on screen, and Known Peers shows every peer instead of stopping at 1,000</li>
+          <li><strong>Max sources per file is in Settings</strong> beside the other limits and applies at once</li>
+        </ul>
+
+        <h5>Rooms and networking</h5>
+        <ul>
+          <li><strong>Room offers are sealed to the member they are for,</strong> so the members relaying one no longer learn the file&rsquo;s name and size</li>
+          <li><strong>One forwarded UDP port is enough.</strong> Behind a VPN or router that forwards a single port, friend file transfers and relayed downloads now go over QUIC instead of the slower TCP fallback</li>
+        </ul>
+
+        <h5>Library and search</h5>
+        <ul>
+          <li><strong>Sharing part of a folder hashes only what you chose,</strong> instead of indexing the whole tree, and a file you unshare from it stays in the Library explorer as not shared</li>
+          <li><strong>Files deleted from a shared folder of more than 100,000 files</strong> stop being offered without a Remove missing</li>
+          <li><strong>A folder scan that fails says so,</strong> and a search tab that drops its least available results at the cap says how many</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <h5>Privacy and security</h5>
+        <ul>
+          <li><strong>Files received in chat or in a room could be shared.</strong> When the download folder sat inside a shared folder, a new file in <strong>Chat Files</strong> or <strong>Channel Files</strong> was picked up by the folder watcher and offered to the network. Those folders are now refused however a file in them is found; sharing one of them on purpose still works. 1.7.0 had the same gap</li>
+          <li><strong>The Ember DHT was audited again.</strong> A peer we merely answered can no longer pin itself onto every lookup, one host can no longer confirm a fake digest or aim every downloader of a popular file at addresses it names, a captured handshake can no longer replay its first message, searches refuse expired and future-dated records, and a few addresses can no longer crowd the neighbourhood of our own ID</li>
+          <li><strong>Relays answer only once they have reached the source,</strong> can be told to bridge only to the node a record names, close a bridge after two idle minutes, and hold at most two sessions for any one requester</li>
+          <li><strong>A peer&rsquo;s goodwill can no longer cancel corrupt-data strikes,</strong> and a waiter for a file you have since unshared or made friends-only is no longer granted an upload slot</li>
+        </ul>
+
+        <h5>Sharing, downloads and uploads</h5>
+        <ul>
+          <li><strong>Partial shares hold.</strong> Unsharing a file while its folder is still hashing works, one unreadable file no longer stops a large folder from moving on, a subfolder that is briefly unreadable keeps its files, and files dropped into a partly shared folder are picked up</li>
+          <li><strong>An <code>ed2k://</code> link with literal <code>|</code> characters</strong> handed to a running Ember on Windows, from a command prompt or another program, arrives whole instead of in pieces</li>
+          <li><strong>A burst of relayed sources no longer gets a working friend relay dropped,</strong> and a relayed transfer delivers its last bytes before the bridge closes</li>
+          <li><strong>Two Ember peers dialling each other at once</strong> connect at once instead of both waiting thirty seconds, and an idle Ember-only node notices when its public address changes</li>
+          <li><strong>On shutdown, <code>server.met</code> and <code>sources.met</code> are saved</strong> before the saves that matter less, so a slow disk no longer costs them</li>
+        </ul>
+
+        <h5>Updates and the interface</h5>
+        <ul>
+          <li><strong>A full disk can no longer turn one failed silent install into a restart every half hour,</strong> Check now answers during a background download, and waking from sleep no longer says Ember is busy again</li>
+          <li><strong><kbd>Ctrl</kbd> letter shortcuts work on non-Latin keyboard layouts,</strong> without taking AltGr text or a Dvorak comma for a letter</li>
+          <li><strong>A category filter survives a restart onto Transfers,</strong> the rate graph stays whole when the clock is set back, and the categories dialog keeps focus where Escape can reach it</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.7.0...v1.7.1" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.7.0...v1.7.1</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-7-0">
       <div class="release-header">
