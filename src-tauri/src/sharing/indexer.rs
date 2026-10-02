@@ -407,6 +407,9 @@ fn subtree_sorts_before_cursor(dir_key: &str, cursor: &str) -> bool {
 thread_local! {
     /// Lets a test walk a directory small enough to create past the cap.
     static FRONTIER_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_PENDING_FRONTIER) };
+    /// Whether [`FileIndexer::refuse_unapproved_root`] asks the registry on
+    /// this thread.
+    static CHECK_APPROVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn frontier_cap() -> usize {
@@ -556,12 +559,14 @@ impl FileIndexer {
     /// reconciled away, and nothing new comes in until it is re-approved.
     ///
     /// `None`, walk it, while there is no registry: before startup installs
-    /// one, and in tests. A missing root is left to the walk, which already
-    /// treats it as unreachable. Blocking.
+    /// one, and in tests that have not opted in. A missing root is left to the
+    /// walk, which already treats it as unreachable. Blocking.
     pub fn refuse_unapproved_root(dir: &str) -> Option<DiscoveryResult> {
         // The registry is process-wide, so one test installing it for its own
-        // roots made every other test's scratch folder unapproved.
-        if cfg!(test) {
+        // roots made every other test's scratch folder unapproved. A test of
+        // this check opts in on its own thread, under the registry's lock.
+        #[cfg(test)]
+        if !CHECK_APPROVAL.with(std::cell::Cell::get) {
             return None;
         }
         let registry = crate::security::filesystem::approved_roots().ok()?;
@@ -1581,6 +1586,48 @@ mod tests {
         assert_eq!(resumed_keys, keys[3..].to_vec());
         assert!(resumed.partial, "a resumed page omits its prefix");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A shared folder is walked only while it is the one approved: not a
+    /// folder never approved, and not another folder put in an approved one's
+    /// place, by the full walk or the watcher's. Refused, a page looks like an
+    /// unreachable folder, so the rows already indexed stay.
+    #[test]
+    fn only_the_approved_folder_at_a_path_is_walked() {
+        let _registry = crate::security::filesystem::test_registry_lock();
+        let base = scratch_tree("approval");
+        let data = base.join("data");
+        let approved = base.join("approved");
+        let other = base.join("other");
+        for dir in [&data, &approved, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(approved.join("a.bin"), b"x").unwrap();
+        std::fs::write(other.join("b.bin"), b"x").unwrap();
+        let approved_str = approved.to_string_lossy().into_owned();
+        let other_str = other.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(&data, std::slice::from_ref(&approved_str))
+            .unwrap();
+        CHECK_APPROVAL.with(|check| check.set(true));
+
+        let page = FileIndexer::discover_root_page_in(&approved_str, None, None);
+        assert_eq!(page.files.len(), 1, "the approved folder is walked");
+        let refused = FileIndexer::discover_root_page_in(&other_str, None, None);
+        assert!(refused.saw_nothing() && refused.partial, "never approved: {refused:?}");
+
+        // Another folder put where the approved one was.
+        std::fs::rename(&approved, base.join("approved-original")).unwrap();
+        std::fs::create_dir_all(&approved).unwrap();
+        std::fs::write(approved.join("stand-in.bin"), b"x").unwrap();
+        let swapped = FileIndexer::discover_root_page_in(&approved_str, None, None);
+        assert!(swapped.saw_nothing(), "a different folder at the path: {swapped:?}");
+        let scoped = FileIndexer::discover_scoped_path(
+            std::slice::from_ref(&approved_str),
+            &DiscoveryScopes::default(),
+            &approved.join("stand-in.bin"),
+        );
+        assert!(matches!(scoped, ScopedDiscovery::Skip), "the watcher's walk refuses it too: {scoped:?}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// More entries that yield no file (empty folders here) than the frontier

@@ -3151,6 +3151,66 @@ fn tidy_withheld(
     changed
 }
 
+/// Paths a share was asked for while hashing that came out of it unshared,
+/// because a share decision recorded for the content (an unshared copy
+/// elsewhere, or fail-closed after a lost catalog) outweighs a pending row's
+/// flag when the hash lands. Sharing a hashed file overrides those, and the
+/// intent was the user's own share: without this it was pruned with the file
+/// unshared, as if the click had not happened. `intents` are the pending
+/// share states; `rows` the index rows they name.
+fn shares_withheld_by_content(
+    intents: &std::collections::HashMap<String, bool>,
+    rows: &LocalIndex,
+) -> Vec<String> {
+    intents
+        .iter()
+        .filter(|(_, shared)| **shared)
+        .filter_map(|(key, _)| rows.get_by_path(key))
+        .filter(|row| {
+            !row.shared
+                && hex::decode(&row.hash)
+                    .ok()
+                    .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+                    .is_some_and(|hash| !crate::storage::share_intent::effective_shared(&hash, true))
+        })
+        .map(|row| row.path.clone())
+        .collect()
+}
+
+/// Share, as a share of the hashed file would, what
+/// [`shares_withheld_by_content`] finds. Best effort, like the prune it runs
+/// in: on failure the file stays unshared and its intent is pruned as usual.
+async fn apply_shares_made_while_hashing(state: &AppState) {
+    let intents = state.config.read().await.settings.pending_share_states.clone();
+    if !intents.values().any(|shared| *shared) {
+        return;
+    }
+    let withheld = shares_withheld_by_content(&intents, &*state.local_index.read().await);
+    if withheld.is_empty() {
+        return;
+    }
+    let offers = crate::sharing::indexer::AllowlistOffers::new(
+        &state.config.read().await.settings.pending_folder_allowlists,
+    );
+    let mutation = {
+        let mut index = state.local_index.write().await;
+        let mut mutation = index.set_shared_by_paths(&withheld, true);
+        keep_unlisted_copies_unshared(&mut index, &mut mutation, &offers, None);
+        mutation
+    };
+    if mutation.changed_paths == 0 {
+        return;
+    }
+    refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+    match persist_share_mutation(state, &mutation, true).await {
+        Ok(()) => info!(
+            "Shared {} file(s) as asked while they were hashing",
+            mutation.changed_paths
+        ),
+        Err(e) => warn!("A share made while hashing could not be applied: {e}"),
+    }
+}
+
 /// Sweep pending share/priority intents whose files are now hashed. A pending
 /// intent is a one-shot handoff from "user changed a file that was still
 /// hashing" to the hash-completion path; once the row is hashed, known.met
@@ -3160,6 +3220,7 @@ fn tidy_withheld(
 /// completed hash pass. Entries whose path has no hashed index row are kept —
 /// they may belong to genuinely pending files in a later scan page.
 pub(crate) async fn prune_pending_intents_for_hashed(state: &AppState) {
+    apply_shares_made_while_hashing(state).await;
     let (hashed_keys, unrestricted_keys, row_hashes) = {
         let index = state.local_index.read().await;
         let mut hashed = HashSet::new();
@@ -8700,6 +8761,53 @@ mod tests {
         let shared = |path: &str| work.needs_hashing.iter().find(|f| f.path == path).unwrap().shared;
         assert!(!shared("C:/L/kept-private.bin"));
         assert!(shared("C:/L/kept-open.bin"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A share asked for while a file hashed is the user's own share of it,
+    /// so a share decision recorded for its content does not undo it once
+    /// the hash lands. Only that: an unshare intent, a row unshared for
+    /// another reason (its content is not withheld), and a row still hashing
+    /// are left as they are.
+    #[test]
+    fn a_share_made_while_hashing_outlasts_the_contents_unshare() {
+        let _lock = crate::storage::share_intent::test_store_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-share-while-hashing-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let store = crate::storage::share_intent::initialize(&base).unwrap();
+        let denied = "a1".repeat(16);
+        let open = "b2".repeat(16);
+        store
+            .set_explicit_batch(&[(<[u8; 16]>::try_from(hex::decode(&denied).unwrap()).unwrap(), false)])
+            .unwrap();
+
+        let row = |path: &str, hash: &str| {
+            let mut file = indexed_file(path, hash);
+            file.shared = false;
+            file
+        };
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            row("C:/L/shared-while-hashing.bin", &denied),
+            row("C:/L/unshared-while-hashing.bin", &denied),
+            row("C:/L/withheld-otherwise.bin", &open),
+            row("C:/L/still-hashing.bin", ""),
+        ]);
+        let key = crate::search::index::normalize_path_key;
+        let intents = std::collections::HashMap::from([
+            (key("C:/L/shared-while-hashing.bin"), true),
+            (key("C:/L/unshared-while-hashing.bin"), false),
+            (key("C:/L/withheld-otherwise.bin"), true),
+            (key("C:/L/still-hashing.bin"), true),
+        ]);
+        assert_eq!(
+            shares_withheld_by_content(&intents, &index),
+            vec!["C:/L/shared-while-hashing.bin".to_string()]
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
