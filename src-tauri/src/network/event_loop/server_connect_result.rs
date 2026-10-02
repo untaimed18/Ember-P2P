@@ -102,7 +102,7 @@ pub(in crate::network) async fn on_server_connect_result(
                 }
             }
             *last_server_activity_at = chrono::Utc::now().timestamp();
-            state.server_connected_at = *last_server_activity_at;
+            state.server_logged_in_at = Some(std::time::Instant::now());
             state.server_addr = Some(addr);
             *shared_server_addr.write().await = Some(addr);
 
@@ -356,11 +356,11 @@ pub(in crate::network) async fn on_server_connect_result(
             // so the first OP_GETSOURCES batch goes out once the server
             // is ready (it already covers every pending + active
             // download). The on-demand warm-start / starved-re-ask
-            // paths below are likewise gated on `server_connected_at`.
+            // paths below are likewise gated on `server_logged_in_at`.
             state.server_tcp_getsources_cursor = 0;
             // A new connection carries no spent credit, so the first
             // frame may go out as soon as the welcome has settled.
-            state.server_tcp_srcreq_next_at = 0;
+            state.server_tcp_srcreq_next_at = None;
             server_tcp_source_timer.reset_after(std::time::Duration::from_secs(
                 SERVER_SOURCE_SETTLE_SECS as u64,
             ));

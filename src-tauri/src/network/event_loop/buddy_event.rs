@@ -345,7 +345,7 @@ pub(in crate::network) async fn on_buddy_event(
             // unsolicited by both reply branches. Not sent while the
             // peer still owes an answer about another file; see
             // `udp_reask_awaits_other_file`.
-            let now_ts = chrono::Utc::now().timestamp();
+            let now_ts = std::time::Instant::now();
             if crate::network::state::udp_reask_awaits_other_file(
                 &state.pending_udp_reasks,
                 (dest_ip, dest_port),

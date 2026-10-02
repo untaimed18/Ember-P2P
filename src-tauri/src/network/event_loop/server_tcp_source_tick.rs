@@ -15,7 +15,7 @@ pub(in crate::network) async fn on_server_tcp_source_tick(
     // paths, so this 4-minute tick is a poll rather than a licence:
     // whichever path last spent the frame sets the floor for all
     // three. See `SERVER_TCP_SRCREQ_INTERVAL_SECS`.
-    let srcreq_now = chrono::Utc::now().timestamp();
+    let srcreq_now = std::time::Instant::now();
     if !server_tcp_srcreq_frame_open(state, srcreq_now) { return; }
 
     // Explicit asks lead the frame, oldest first, as eMule serves

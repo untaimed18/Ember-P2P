@@ -132,7 +132,10 @@ pub(super) struct PendingDownload {
     pub(super) expected_aich: Option<String>,
     pub(super) control: Arc<TransferControl>,
     pub(super) search_count: u32,
-    pub(super) last_search_at: i64,
+    /// When sources were last searched for (`None` = due now). Monotonic: on
+    /// the wall clock a step back held the next search for the length of the
+    /// step.
+    pub(super) last_search_at: Option<std::time::Instant>,
     /// Download priority: 0 = low, 1 = normal, 2 = high
     pub(super) priority: u32,
 }
@@ -155,7 +158,7 @@ pub(super) const MAX_EMBER_PENDING_PROXY_OVERLAY: usize = 256;
 
 /// How long a client `OP_REASKFILEPING` waits for its answer before its
 /// `pending_udp_reasks` entry counts as unanswered.
-pub(super) const UDP_REASK_ANSWER_SECS: i64 = 30;
+const UDP_REASK_ANSWER_SECS: i64 = 30;
 
 /// Whether `key` still awaits the answer to a reask about another file.
 ///
@@ -166,14 +169,20 @@ pub(super) const UDP_REASK_ANSWER_SECS: i64 = 30;
 /// other's row. Leave the second reask due until this one is answered or
 /// stale.
 pub(super) fn udp_reask_awaits_other_file(
-    pending: &HashMap<(Ipv4Addr, u16), ([u8; 16], i64)>,
+    pending: &HashMap<(Ipv4Addr, u16), ([u8; 16], std::time::Instant)>,
     key: (Ipv4Addr, u16),
     file_hash: &[u8; 16],
-    now: i64,
+    now: std::time::Instant,
 ) -> bool {
     pending.get(&key).is_some_and(|(pending_hash, sent_at)| {
-        pending_hash != file_hash && now.saturating_sub(*sent_at) < UDP_REASK_ANSWER_SECS
+        pending_hash != file_hash && !udp_reask_unanswered(*sent_at, now)
     })
+}
+
+/// Whether a reask sent at `sent_at` has gone unanswered for good.
+pub(super) fn udp_reask_unanswered(sent_at: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(sent_at)
+        >= std::time::Duration::from_secs(UDP_REASK_ANSWER_SECS as u64)
 }
 
 pub(super) struct NetworkState {
@@ -478,14 +487,15 @@ pub(super) struct NetworkState {
     pub(super) udp_source_queue: VecDeque<(Vec<u8>, std::net::SocketAddr)>,
     /// Last UDP source request per `(server_ip, server_tcp_port, file_hash)`.
     /// Enforces eMule's 30-minute UDP source reask cadence per server/file.
-    pub(super) server_udp_source_reask_at: HashMap<(String, u16, [u8; 16]), i64>,
+    pub(super) server_udp_source_reask_at: HashMap<(String, u16, [u8; 16]), std::time::Instant>,
     /// Pending client UDP OP_REASKFILEPING context. OP_REASKACK carries no
     /// file hash, so correlate by sender endpoint to update only one file list.
     /// Value is `(file_hash, sent_at)` — the timestamp lets the cap-eviction
     /// pass below drop the oldest (most likely dead/unreachable) entries
     /// instead of nuking every in-flight reask whenever the table fills up.
-    /// See [`udp_reask_awaits_other_file`] before inserting.
-    pub(super) pending_udp_reasks: HashMap<(Ipv4Addr, u16), ([u8; 16], i64)>,
+    /// See [`udp_reask_awaits_other_file`] before inserting. `sent_at` is
+    /// monotonic, so a clock step cannot make an old reask look pending.
+    pub(super) pending_udp_reasks: HashMap<(Ipv4Addr, u16), ([u8; 16], std::time::Instant)>,
     /// Order-independent fingerprint `(entry_count, xor_fold)` of the last
     /// `OP_OFFERFILES` list actually sent from the `SharedFilesChanged`
     /// handler, so a re-fire whose offer set is byte-for-byte identical to
@@ -505,24 +515,19 @@ pub(super) struct NetworkState {
     pub(super) offered_ed2k_hashes: HashSet<[u8; 16]>,
     /// Round-robin cursor for TCP OP_GETSOURCES batching across downloads.
     pub(super) server_tcp_getsources_cursor: usize,
-    /// Earliest unix-second at which another TCP `OP_GETSOURCES` frame may go
+    /// Earliest instant at which another TCP `OP_GETSOURCES` frame may go
     /// out, shared by every path that sends one. eMule's `m_dwNextTCPSrcReq`;
     /// see `SERVER_TCP_SRCREQ_INTERVAL_SECS` for the server-credit accounting
-    /// this protects. 0 means "may send now".
-    pub(super) server_tcp_srcreq_next_at: i64,
-    /// Unix second each file last went out in a TCP `OP_GETSOURCES`, whatever
+    /// this protects. `None` means "may send now". The server source-request
+    /// clocks are monotonic; see `server_tcp_srcreq_frame_open`.
+    pub(super) server_tcp_srcreq_next_at: Option<std::time::Instant>,
+    /// When each file last went out in a TCP `OP_GETSOURCES`, whatever
     /// the path — eMule's per-file `m_LastSearchTime`. Deliberately kept
     /// across server sessions, as eMule's is, so a reconnect does not re-ask
     /// the new server for everything at once. See
     /// `SERVER_TCP_SRCREQ_FILE_REASK_SECS`.
-    pub(super) server_tcp_srcreq_file_at: HashMap<[u8; 16], i64>,
-    /// Downloads that asked for the connected server's sources outside the
-    /// periodic sweep — a new download, Find Sources — as `(transfer_id,
-    /// file_hash, file_size)`, served first by the next frame. eMule's
-    /// `m_localServerReqQueue`: nothing sends `OP_GETSOURCES` on its own, so
-    /// these share the frame budget like every other request.
-    pub(super) server_tcp_srcreq_asks: VecDeque<(String, [u8; 16], u64)>,
-    /// Unix-seconds timestamp of the most recent successful server login.
+    pub(super) server_tcp_srcreq_file_at: HashMap<[u8; 16], std::time::Instant>,
+    /// The most recent successful server login (`None` before the first).
     /// Server source requests (OP_GETSOURCES) are held off until the
     /// connection has settled for `SERVER_SOURCE_SETTLE_SECS` so we don't
     /// blast a burst at the server before it has finished its post-login
@@ -531,8 +536,16 @@ pub(super) struct NetworkState {
     /// loop rather than firing them the instant OP_IDCHANGE arrives; sending
     /// too early risks the server's flood protection silently dropping the
     /// request (and, on some servers, the rest of the session's source
-    /// replies). 0 means "no server connected".
-    pub(super) server_connected_at: i64,
+    /// replies). Also how long the session lasted when it drops. Monotonic:
+    /// on the wall clock a step back closed the source-request frame, and read
+    /// a long session as one that dropped at once, for the length of the step.
+    pub(super) server_logged_in_at: Option<std::time::Instant>,
+    /// Downloads that asked for the connected server's sources outside the
+    /// periodic sweep — a new download, Find Sources — as `(transfer_id,
+    /// file_hash, file_size)`, served first by the next frame. eMule's
+    /// `m_localServerReqQueue`: nothing sends `OP_GETSOURCES` on its own, so
+    /// these share the frame budget like every other request.
+    pub(super) server_tcp_srcreq_asks: VecDeque<(String, [u8; 16], u64)>,
     /// Per-file (hash hex) timestamp of the last *starved* fast re-ask of the
     /// connected server for sources. eMule keeps pulling the connected
     /// server's (growing) source list for a download that has no working
@@ -540,7 +553,7 @@ pub(super) struct NetworkState {
     /// when the initial source set is dead. This map throttles the fast
     /// re-ask to a flood-safe per-file interval (see
     /// `STARVED_SERVER_REASK_SECS`).
-    pub(super) starved_server_reask_at: std::collections::HashMap<String, i64>,
+    pub(super) starved_server_reask_at: std::collections::HashMap<String, std::time::Instant>,
     /// Round-robin cursor for fair KAD search slot distribution across downloads.
     pub(super) kad_source_search_cursor: usize,
     /// Dead source tracking (prevents reconnecting to failing sources)
@@ -556,7 +569,10 @@ pub(super) struct NetworkState {
     /// KAD search state for active downloads not in pending_downloads.
     /// Tracks (last_kad_search_at, search_count) so we periodically search
     /// for additional sources via KAD even while the download is running.
-    pub(super) active_kad_search_state: HashMap<String, (i64, u32)>,
+    /// `(last search, searches so far)`. Monotonic, as is
+    /// `ember_source_search_state`: on the wall clock a step back held each
+    /// download's next search for the length of the step.
+    pub(super) active_kad_search_state: HashMap<String, (std::time::Instant, u32)>,
     /// Senders for injecting new sources into active multi-source downloads
     pub(super) active_source_senders: HashMap<String, mpsc::Sender<DownloadSource>>,
     /// UDP source-discovery diagnostic counters. Surfaced in the
@@ -1025,8 +1041,10 @@ pub(super) struct NetworkState {
     pub(super) antileech: crate::security::antileech::SharedAntiLeechFilter,
     /// Mapping of ed2k file hash → AICH root hash for EPX payload
     pub(super) aich_root_map: HashMap<[u8; 16], [u8; 20]>,
-    /// When each callback placeholder row was inserted (epoch seconds).
-    pub(super) callback_row_pending_since: HashMap<(String, String, u16), i64>,
+    /// When each callback placeholder row was inserted. Monotonic: on the wall
+    /// clock a step back kept a placeholder that would never resolve on screen
+    /// for the length of the step.
+    pub(super) callback_row_pending_since: HashMap<(String, String, u16), std::time::Instant>,
     /// Semaphore limiting concurrent outgoing TCP connections for firewall checks
     pub(super) firewall_connect_semaphore: Arc<tokio::sync::Semaphore>,
     /// Global admission protects both the UDP response and TCP connect-back
@@ -1346,7 +1364,7 @@ pub(super) struct NetworkState {
     /// `active_kad_search_state`: the `search_count` drives the
     /// `ember_source_search_interval` backoff so a long-running download
     /// queries the DHT eagerly at first, then progressively less often.
-    pub(super) ember_source_search_state: HashMap<String, (i64, u32)>,
+    pub(super) ember_source_search_state: HashMap<String, (std::time::Instant, u32)>,
     /// Sources parsed from completed Ember DHT source lookups, awaiting
     /// async injection into the matching downloads (slice 9). The
     /// completion point (`maybe_finish_ember_search`) is synchronous, but

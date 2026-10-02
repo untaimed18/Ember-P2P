@@ -432,7 +432,6 @@ pub(in crate::network) async fn on_bootstrap_tick(
     {
             let pending_count = state.pending_downloads.len();
             info!("KAD connected: triggering source search for {pending_count} pending downloads");
-            let now = chrono::Utc::now().timestamp();
             let mut tids: Vec<String> = state.pending_downloads.keys().cloned().collect();
             let mut kad_started = 0usize;
             let mut kad_capacity_blocked = false;
@@ -508,7 +507,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
                 if did_search {
                     if let Some(pd) = state.pending_downloads.get_mut(&tid) {
                         pd.search_count += 1;
-                        pd.last_search_at = now;
+                        pd.last_search_at = Some(std::time::Instant::now());
                     }
                 }
             }

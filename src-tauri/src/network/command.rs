@@ -1311,7 +1311,6 @@ async fn handle_command_inner(
                 // Queued / add-paused: keep seeds in SourceManager and run
                 // full-network discovery without starting dial workers.
                 if discovery_only {
-                    let now = chrono::Utc::now().timestamp();
                     let pending_priority = {
                         let mgr = transfer_manager.read().await;
                         mgr.get_transfer(&transfer_id)
@@ -1365,11 +1364,17 @@ async fn handle_command_inner(
                             expected_aich: expected_aich.clone(),
                             control,
                             search_count: if kad_search_started { 1 } else { 0 },
-                            last_search_at: if kad_search_started { now } else { 0 },
+                            last_search_at: kad_search_started.then(std::time::Instant::now),
                             priority: pending_priority,
                         },
                     );
-                    queue_server_source_ask(state, &transfer_id, hash_bytes, file_size, now);
+                    queue_server_source_ask(
+                        state,
+                        &transfer_id,
+                        hash_bytes,
+                        file_size,
+                        std::time::Instant::now(),
+                    );
                     if network_ready_for_sources(state) {
                         let packets = build_all_getsources_packets(state, &hash_bytes, file_size);
                         if !packets.is_empty() {
@@ -1532,7 +1537,7 @@ async fn handle_command_inner(
                             expected_aich: expected_aich.clone(),
                             control,
                             search_count: 0,
-                            last_search_at: 0,
+                            last_search_at: None,
                             priority: pending_priority,
                         },
                     );
@@ -1700,7 +1705,6 @@ async fn handle_command_inner(
                 // file stuck. Match the `has_source = false` branch's
                 // behavior so the moment a download starts, every
                 // source-discovery channel is already in flight.
-                let now_ts = chrono::Utc::now().timestamp();
                 let ask = ask_networks_for_sources(
                     socket,
                     state,
@@ -1717,18 +1721,19 @@ async fn handle_command_inner(
                 // re-firing immediately. A leg with nowhere to send this ask
                 // records (now, 0), which lets its sweep retry as soon as that
                 // network is available again.
+                let asked_at = std::time::Instant::now();
                 state
                     .active_kad_search_state
-                    .insert(transfer_id.clone(), (now_ts, u32::from(ask.kad)));
+                    .insert(transfer_id.clone(), (asked_at, u32::from(ask.kad)));
                 state
                     .ember_source_search_state
-                    .insert(transfer_id.clone(), (now_ts, u32::from(ask.ember)));
+                    .insert(transfer_id.clone(), (asked_at, u32::from(ask.ember)));
                 // Empty-seed pending was inserted with search_count=0; stamp the
                 // fan-out so the 5s retry timer does not start a duplicate FindSource.
                 if ask.kad {
                     if let Some(pd) = state.pending_downloads.get_mut(&transfer_id) {
                         pd.search_count = pd.search_count.max(1);
-                        pd.last_search_at = now_ts;
+                        pd.last_search_at = Some(std::time::Instant::now());
                     }
                 }
             } else {
@@ -1850,7 +1855,7 @@ async fn handle_command_inner(
                 // already taken once the download starts moving.
                 state
                     .ember_source_search_state
-                    .insert(transfer_id.clone(), (now, u32::from(ask.ember)));
+                    .insert(transfer_id.clone(), (std::time::Instant::now(), u32::from(ask.ember)));
 
                 // Look up actual priority from the transfer manager if this
                 // is a promoted/re-started download, otherwise default to normal.
@@ -1871,7 +1876,7 @@ async fn handle_command_inner(
                         expected_aich,
                         control,
                         search_count: u32::from(ask.kad),
-                        last_search_at: if ask.kad { now } else { 0 },
+                        last_search_at: ask.kad.then(std::time::Instant::now),
                         priority: pending_priority,
                     },
                 );
@@ -3951,7 +3956,7 @@ async fn handle_command_inner(
                 file_size,
             )
             .await;
-            let now_ts = chrono::Utc::now().timestamp();
+            let asked_at = std::time::Instant::now();
             // Stamp both sweeps so the ask the user just made counts as this
             // round's ask: without it the periodic sweep sees a file it has not
             // asked about recently and immediately asks again, which on a
@@ -3959,14 +3964,14 @@ async fn handle_command_inner(
             // download's turn.
             state
                 .active_kad_search_state
-                .insert(transfer_id.clone(), (now_ts, u32::from(outcome.kad)));
+                .insert(transfer_id.clone(), (asked_at, u32::from(outcome.kad)));
             state
                 .ember_source_search_state
-                .insert(transfer_id.clone(), (now_ts, u32::from(outcome.ember)));
+                .insert(transfer_id.clone(), (asked_at, u32::from(outcome.ember)));
             if outcome.kad {
                 if let Some(pd) = state.pending_downloads.get_mut(&transfer_id) {
                     pd.search_count = pd.search_count.max(1);
-                    pd.last_search_at = now_ts;
+                    pd.last_search_at = Some(std::time::Instant::now());
                 }
             }
             info!(
@@ -4807,7 +4812,7 @@ async fn handle_command_inner(
                                 expected_aich: t.expected_aich.clone(),
                                 control,
                                 search_count: 0,
-                                last_search_at: 0,
+                                last_search_at: None,
                                 priority: priority_str_to_u32(&t.priority),
                             },
                         );

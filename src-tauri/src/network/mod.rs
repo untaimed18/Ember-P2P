@@ -852,10 +852,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         request_offer_files: false,
         offered_ed2k_hashes: HashSet::new(),
         server_tcp_getsources_cursor: 0,
-        server_tcp_srcreq_next_at: 0,
+        server_tcp_srcreq_next_at: None,
         server_tcp_srcreq_file_at: HashMap::new(),
+        server_logged_in_at: None,
         server_tcp_srcreq_asks: VecDeque::new(),
-        server_connected_at: 0,
         starved_server_reask_at: std::collections::HashMap::new(),
         kad_source_search_cursor: 0,
         dead_sources: DeadSourceList::new(),
@@ -2581,7 +2581,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         // run it now. The tick either spends the frame or drops every ask it
         // could not use, so this cannot fire twice for the same line.
         if !state.server_tcp_srcreq_asks.is_empty()
-            && server_tcp_srcreq_frame_open(&state, chrono::Utc::now().timestamp())
+            && server_tcp_srcreq_frame_open(&state, std::time::Instant::now())
         {
             server_tcp_source_timer.reset_immediately();
         }

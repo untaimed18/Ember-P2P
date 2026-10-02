@@ -133,7 +133,7 @@ pub(super) async fn handle_download_event(
     // drop their timestamp entries so the periodic timeout sweep in
     // `source_retry_timer` doesn't keep checking keys that no longer
     // refer to live rows.
-    callback_row_pending_since: &mut HashMap<(String, String, u16), i64>,
+    callback_row_pending_since: &mut HashMap<(String, String, u16), std::time::Instant>,
     status_writes: &Arc<TransferStatusWriteClock>,
 ) {
     match event {

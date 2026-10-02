@@ -233,7 +233,7 @@ pub(in crate::network) async fn on_a4af_tick(
                 // No active download — check pending downloads and reset search timer
                 for pd in state.pending_downloads.values_mut() {
                     if pd.file_hash == target_hex {
-                        pd.last_search_at = 0;
+                        pd.last_search_at = None;
                         break;
                     }
                 }
@@ -351,7 +351,7 @@ pub(in crate::network) async fn on_a4af_tick(
                         let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                         pkt.extend_from_slice(&reask_payload);
                         let addr = SocketAddr::new(v4.into(), moved_udp_port);
-                        let now_ts = chrono::Utc::now().timestamp();
+                        let now_ts = std::time::Instant::now();
                         // Left to the regular reask cycle while the peer
                         // still owes an answer about another file.
                         if crate::network::state::udp_reask_awaits_other_file(

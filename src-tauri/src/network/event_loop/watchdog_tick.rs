@@ -144,7 +144,7 @@ pub(in crate::network) async fn on_watchdog_tick(
         && now.saturating_sub(*last_kad_activity_at) > 180
     {
         for pending in state.pending_downloads.values_mut() {
-            pending.last_search_at = 0;
+            pending.last_search_at = None;
         }
         debug!(
             "Watchdog: no UDP activity for {}s with {} pending downloads; forcing immediate source refresh",

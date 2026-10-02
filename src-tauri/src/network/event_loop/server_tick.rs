@@ -611,7 +611,7 @@ pub(in crate::network) async fn on_server_tick(
                             }
                             for pd in state.pending_downloads.values_mut() {
                                 if pd.file_hash == hash_hex {
-                                    pd.last_search_at = 0;
+                                    pd.last_search_at = None;
                                     debug!("Marked pending download {} for immediate retry (server sources)", pd.transfer_id);
                                 }
                             }
@@ -767,7 +767,7 @@ pub(in crate::network) async fn on_server_tick(
                             }
                             for pd in state.pending_downloads.values_mut() {
                                 if matching_hex.iter().any(|h| h == &pd.file_hash) {
-                                    pd.last_search_at = 0;
+                                    pd.last_search_at = None;
                                 }
                             }
                             for hash_hex in &matching_hex {

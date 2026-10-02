@@ -58,12 +58,11 @@ fn next_requeue_search_count(
 /// `last_search_at` for a re-queued download. The first re-queue after
 /// progress retries at once, as before; later ones wait out the interval
 /// their count earned instead of retrying on the next tick.
-fn requeue_last_search_at(search_count: u32, now: i64) -> i64 {
-    if search_count <= 1 {
-        0
-    } else {
-        now
-    }
+fn requeue_last_search_at(
+    search_count: u32,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    (search_count > 1).then_some(now)
 }
 
 fn note_requeue(transfer_id: &str, prev_pending: Option<u32>, completed_now: u64) -> u32 {
@@ -1053,7 +1052,7 @@ pub(in crate::network) async fn on_download_event(
                     expected_aich: t.expected_aich.clone(),
                     control,
                     search_count,
-                    last_search_at: requeue_last_search_at(search_count, chrono::Utc::now().timestamp()),
+                    last_search_at: requeue_last_search_at(search_count, std::time::Instant::now()),
                     priority: priority_str_to_u32(&t.priority),
                 });
                 info!("Re-queued failed download {} for source retry: {}", transfer_id, error);
@@ -1774,8 +1773,9 @@ mod requeue_tests {
         let second = next_requeue_search_count(None, Some((first, 500)), 500);
         let third = next_requeue_search_count(None, Some((second, 500)), 500);
         assert_eq!((second, third), (2, 3));
-        assert_eq!(requeue_last_search_at(first, 1_000), 0, "first retry is immediate");
-        assert_eq!(requeue_last_search_at(third, 1_000), 1_000, "later ones wait");
+        let now = std::time::Instant::now();
+        assert_eq!(requeue_last_search_at(first, now), None, "first retry is immediate");
+        assert_eq!(requeue_last_search_at(third, now), Some(now), "later ones wait");
     }
 
     #[test]

@@ -228,9 +228,9 @@ pub(super) async fn handle_server_disconnect(
     debug!("Server connection lost: {reason}");
     emit_server_log(app_handle, &format!("Server disconnected: {reason}"));
     if state.server_connected {
-        let session_secs = chrono::Utc::now()
-            .timestamp()
-            .saturating_sub(state.server_connected_at);
+        let session_secs = state
+            .server_logged_in_at
+            .map_or(0, |at| i64::try_from(at.elapsed().as_secs()).unwrap_or(i64::MAX));
         state.server_reconnect_failures =
             reconnect_failures_after_session(state.server_reconnect_failures, session_secs);
         if session_secs < SHORT_SERVER_SESSION_SECS {

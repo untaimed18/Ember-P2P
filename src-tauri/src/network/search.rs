@@ -1575,7 +1575,7 @@ pub(super) fn finalize_removed_searches_with_keyword_results(
                         injected += stats.injected + stats.persisted;
                     }
                     if let Some(pd) = state.pending_downloads.get_mut(&transfer_id) {
-                        pd.last_search_at = 0;
+                        pd.last_search_at = None;
                     }
                     if injected > 0 {
                         info!(

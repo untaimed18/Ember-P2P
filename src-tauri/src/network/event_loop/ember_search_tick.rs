@@ -573,7 +573,6 @@ pub(in crate::network) async fn on_ember_search_tick(
                 }
                 {
                     let mut mgr = transfer_manager.write().await;
-                    let now_ts = chrono::Utc::now().timestamp();
                     for tid in &matching_ids {
                         let ip_s = upload_server::kad_callback_display_key(
                             src.ip,
@@ -605,7 +604,7 @@ pub(in crate::network) async fn on_ember_search_tick(
                         }
                         state.callback_row_pending_since.insert(
                             (tid.clone(), ip_s, src.tcp_port),
-                            now_ts,
+                            std::time::Instant::now(),
                         );
                         if !callback_tids.contains(tid) {
                             callback_tids.push(tid.clone());

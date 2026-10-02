@@ -1400,7 +1400,6 @@ pub(in crate::network) async fn on_search_poll_tick(
                         // `Connecting`, producing duplicate
                         // rows for peers that are already
                         // queued or transferring.
-                        let now_ts = chrono::Utc::now().timestamp();
                         for cb_src in &callback_sources {
                             let ip_s = upload_server::kad_callback_display_key(
                                 cb_src.ip,
@@ -1443,7 +1442,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             // map yet.
                             state.callback_row_pending_since.insert(
                                 (transfer_id.clone(), ip_s, cb_src.tcp_port),
-                                now_ts,
+                                std::time::Instant::now(),
                             );
                         }
                         for dc_src in &direct_callback_sources {
@@ -1472,7 +1471,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             );
                             state.callback_row_pending_since.insert(
                                 (transfer_id.clone(), ip_s, dc_src.tcp_port),
-                                now_ts,
+                                std::time::Instant::now(),
                             );
                         }
                         for ls in &lowid_sources {
@@ -1505,7 +1504,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                                 );
                                 state.callback_row_pending_since.insert(
                                     (transfer_id.clone(), ip_str, ls.ed2k_server_port),
-                                    now_ts,
+                                    std::time::Instant::now(),
                                 );
                             }
                         }
@@ -1623,7 +1622,6 @@ pub(in crate::network) async fn on_search_poll_tick(
                         // match the listed listening port,
                         // so a refreshed placeholder would
                         // duplicate-row the same peer.
-                        let now_ts = chrono::Utc::now().timestamp();
                         for cb_src in &callback_sources {
                             let ip_s = upload_server::kad_callback_display_key(
                                 cb_src.ip,
@@ -1662,7 +1660,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             // map yet.
                             state.callback_row_pending_since.insert(
                                 (transfer_id.clone(), ip_s, cb_src.tcp_port),
-                                now_ts,
+                                std::time::Instant::now(),
                             );
                         }
                         for dc_src in &direct_callback_sources {
@@ -1694,7 +1692,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             );
                             state.callback_row_pending_since.insert(
                                 (transfer_id.clone(), ip_s, dc_src.tcp_port),
-                                now_ts,
+                                std::time::Instant::now(),
                             );
                         }
                         // Parity with the indirect-only branch:
@@ -1741,7 +1739,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             );
                             state.callback_row_pending_since.insert(
                                 (transfer_id.clone(), ip_str, ls.ed2k_server_port),
-                                now_ts,
+                                std::time::Instant::now(),
                             );
                         }
                     }
@@ -2007,7 +2005,6 @@ pub(in crate::network) async fn on_search_poll_tick(
                         // prevention — see parallel blocks
                         // in the pending / pending→active
                         // branches above).
-                        let now_ts = chrono::Utc::now().timestamp();
                         for cb_src in &callback_sources {
                             let ip_s = upload_server::kad_callback_display_key(
                                 cb_src.ip,
@@ -2046,7 +2043,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             // map yet.
                             state.callback_row_pending_since.insert(
                                 (transfer_id.clone(), ip_s, cb_src.tcp_port),
-                                now_ts,
+                                std::time::Instant::now(),
                             );
                         }
                         for dc_src in &direct_callback_sources {
@@ -2078,7 +2075,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             );
                             state.callback_row_pending_since.insert(
                                 (transfer_id.clone(), ip_s, dc_src.tcp_port),
-                                now_ts,
+                                std::time::Instant::now(),
                             );
                         }
                     }

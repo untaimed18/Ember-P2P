@@ -4,6 +4,18 @@
 
 use super::*;
 
+/// Whether `interval` has passed since `at`, as seen by a tick taken at `now`.
+///
+/// The search intervals are whole multiples of this 5 s tick, and the tick's
+/// own jitter can land a stamp a few milliseconds short of one, which an exact
+/// comparison would put off to the next tick. The whole wall-clock seconds
+/// these stamps used to be rounded that gap away; a second of slack does the
+/// same, and no more, for a stamp taken between ticks.
+fn tick_due(at: std::time::Instant, now: std::time::Instant, interval: std::time::Duration) -> bool {
+    const TICK_SLACK: std::time::Duration = std::time::Duration::from_secs(1);
+    now.saturating_duration_since(at) + TICK_SLACK >= interval
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_source_retry_tick(
     udp_socket: &Arc<UdpSocket>,
@@ -30,7 +42,9 @@ pub(in crate::network) async fn on_source_retry_tick(
     pending_lowid_callback_queue: &mut VecDeque<([u8; 16], u32)>,
     transfer_status_writes: &Arc<TransferStatusWriteClock>,
 ) {
-    let now = chrono::Utc::now().timestamp();
+    // One reading for every check and stamp in this tick, so the next tick
+    // measures from the same point in the period.
+    let tick_now = std::time::Instant::now();
     let kad_available = kad_ready_for_sources(state);
     let server_connected = state.server_connected;
 
@@ -85,7 +99,9 @@ pub(in crate::network) async fn on_source_retry_tick(
         let expired_keys: Vec<(String, String, u16)> = state
             .callback_row_pending_since
             .iter()
-            .filter(|(_, &since)| now - since >= KAD_CALLBACK_PLACEHOLDER_TIMEOUT_SECS)
+            .filter(|(_, &since)| {
+                since.elapsed().as_secs() >= KAD_CALLBACK_PLACEHOLDER_TIMEOUT_SECS as u64
+            })
             .map(|(k, _)| k.clone())
             .collect();
         if !expired_keys.is_empty() {
@@ -204,7 +220,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                 let ip_s = upload_server::kad_callback_display_key(job.src_ip, job.user_hash);
                 state.callback_row_pending_since.insert(
                     (job.transfer_id.clone(), ip_s, job.src_port),
-                    now,
+                    std::time::Instant::now(),
                 );
                 info!(
                     "Re-sent KAD CallbackReq to buddy {} for source {}:{} file {}",
@@ -342,7 +358,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                     );
                     state.callback_row_pending_since.insert(
                         (job.transfer_id.clone(), ip_s, job.src_port),
-                        now,
+                        std::time::Instant::now(),
                     );
                 }
             }
@@ -489,8 +505,10 @@ pub(in crate::network) async fn on_source_retry_tick(
                 insufficient_downloads.push((tid.clone(), pd.file_name.clone()));
                 continue;
             }
-            let retry_interval = pending_download_retry_interval(pd.search_count);
-            if now.saturating_sub(pd.last_search_at) >= retry_interval {
+            let retry_interval = std::time::Duration::from_secs(
+                pending_download_retry_interval(pd.search_count).max(0) as u64,
+            );
+            if pd.last_search_at.is_none_or(|at| tick_due(at, tick_now, retry_interval)) {
                 to_retry.push((tid.clone(), pd.priority));
                 if may_start_download_worker(&mgr, tid) {
                     may_start.insert(tid.clone());
@@ -526,7 +544,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                     expected_aich: t.expected_aich.clone(),
                     control,
                     search_count: 0,
-                    last_search_at: 0,
+                    last_search_at: None,
                     priority: priority_str_to_u32(&t.priority),
                 },
             );
@@ -734,7 +752,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                         expected_aich: t.expected_aich.clone(),
                             control,
                             search_count: 0,
-                            last_search_at: 0,
+                            last_search_at: None,
                             priority: priority_str_to_u32(&t.priority),
                         },
                     );
@@ -947,7 +965,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                         expected_aich: t.expected_aich.clone(),
                             control,
                             search_count: 0,
-                            last_search_at: 0,
+                            last_search_at: None,
                             priority: priority_str_to_u32(&t.priority),
                         },
                     );
@@ -1161,12 +1179,12 @@ pub(in crate::network) async fn on_source_retry_tick(
                             state
                                 .download_source_searches
                                 .insert(sid, (tid.clone(), *fh));
-                            let entry = state
+                            let started = tick_now;
+                            state
                                 .active_kad_search_state
                                 .entry(tid.clone())
-                                .or_insert((0, 0));
-                            entry.0 = now;
-                            entry.1 += 1;
+                                .and_modify(|e| *e = (started, e.1 + 1))
+                                .or_insert((started, 1));
                             debug!(
                                 "Warm-start: kicked off initial KAD source search for resumed download {}",
                                 tid
@@ -1188,17 +1206,18 @@ pub(in crate::network) async fn on_source_retry_tick(
             // the periodic source timer (fast-forwarded on connect)
             // sends the initial batch; this on-demand kick would just
             // add to a premature, flood-prone burst.
+            let pace_now = tick_now;
             let tcp_targets: Vec<&(String, [u8; 16], u64)> = targets
                 .iter()
                 .filter(|(_, fh, _)| {
-                    server_tcp_srcreq_file_due(&state.server_tcp_srcreq_file_at, fh, now)
+                    server_tcp_srcreq_file_due(&state.server_tcp_srcreq_file_at, fh, pace_now)
                 })
                 .take(SERVER_TCP_SRCREQ_MAX_PER_FRAME)
                 .collect();
             if !state.low_id
                 && state.server_connection.is_some()
                 && !tcp_targets.is_empty()
-                && server_tcp_srcreq_frame_open(state, now)
+                && server_tcp_srcreq_frame_open(state, pace_now)
             {
                 // Bounded to one frame, and it stops at the first
                 // refusal: resuming a session can warm-start
@@ -1208,9 +1227,9 @@ pub(in crate::network) async fn on_source_retry_tick(
                 // periodic sweep carries whatever this tick does not
                 // reach, which costs nothing but a few seconds of
                 // discovery latency.
-                close_server_tcp_srcreq_frame(state, now);
+                close_server_tcp_srcreq_frame(state, pace_now);
                 for (tid, fh, file_size) in tcp_targets {
-                    match send_server_get_sources(state, fh, *file_size, now) {
+                    match send_server_get_sources(state, fh, *file_size, pace_now) {
                         Ok(bytes) => {
                             if bytes > 0 {
                                 stats_manager.add_overhead(
@@ -1343,7 +1362,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                 // when its own interval allows, but never suppresses
                 // the UDP ping. Gating on it here did two harmful
                 // things: `can_request_sources_for` returns true when
-                // `last_sx_sent == 0`, so a source we had never
+                // `last_sx_sent` is `None`, so a source we had never
                 // source-exchanged with — every row loaded from
                 // `sources.met` — was never reasked at all; and for
                 // the rest the ping stopped once the 40-minute SX
@@ -1354,7 +1373,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                 // TCP reask path only runs for pending ones, so the
                 // deep queue positions the detach model is built to
                 // accumulate were being dropped.
-                let now_ts = chrono::Utc::now().timestamp();
+                let now_ts = std::time::Instant::now();
                 if crate::network::state::udp_reask_awaits_other_file(
                     &state.pending_udp_reasks,
                     (*ip, *udp_port),
@@ -1419,7 +1438,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                         pfs.mark_udp_reask_sent(*orig_ip, *orig_tcp);
                         continue;
                     }
-                    let now_ts = chrono::Utc::now().timestamp();
+                    let now_ts = std::time::Instant::now();
                     if crate::network::state::udp_reask_awaits_other_file(
                         &state.pending_udp_reasks,
                         (ip, udp_port),
@@ -1585,7 +1604,7 @@ pub(in crate::network) async fn on_source_retry_tick(
         if did_search {
             if let Some(pd) = state.pending_downloads.get_mut(&tid) {
                 pd.search_count += 1;
-                pd.last_search_at = now;
+                pd.last_search_at = Some(tick_now);
             }
         }
 
@@ -1669,12 +1688,14 @@ pub(in crate::network) async fn on_source_retry_tick(
             let sm = source_manager.read().await;
             for tid in state.active_source_senders.keys() {
                 if state.pending_downloads.contains_key(tid) { continue; }
-                let (last_at, count) = state.active_kad_search_state
-                    .get(tid)
-                    .copied()
-                    .unwrap_or((0, 0));
-                let interval = active_download_kad_interval(count);
-                if now.saturating_sub(last_at) < interval { continue; }
+                let (last_at, count) = match state.active_kad_search_state.get(tid) {
+                    Some(&(at, count)) => (Some(at), count),
+                    None => (None, 0),
+                };
+                let interval = std::time::Duration::from_secs(
+                    active_download_kad_interval(count).max(0) as u64,
+                );
+                if last_at.is_some_and(|at| !tick_due(at, tick_now, interval)) { continue; }
                 if let Some(transfer) = mgr.get_transfer(tid) {
                     if let Ok(raw) = hex::decode(&transfer.file_hash) {
                         if raw.len() == 16 {
@@ -1703,9 +1724,12 @@ pub(in crate::network) async fn on_source_retry_tick(
                     state.download_source_searches.insert(sid, (tid.clone(), fh));
                     kad_searches_started += 1;
                     active_kad_started += 1;
-                    let entry = state.active_kad_search_state.entry(tid.clone()).or_insert((0, 0));
-                    entry.0 = now;
-                    entry.1 += 1;
+                    let started = tick_now;
+                    let entry = state
+                        .active_kad_search_state
+                        .entry(tid.clone())
+                        .and_modify(|e| *e = (started, e.1 + 1))
+                        .or_insert((started, 1));
                     debug!("Started KAD source search for active download {} (attempt {})", tid, entry.1);
                 } else {
                     warn!(
@@ -1772,13 +1796,13 @@ pub(in crate::network) async fn on_source_retry_tick(
                 else {
                     continue;
                 };
-                let (last_at, count) = state
+                if state
                     .ember_source_search_state
                     .get(&tid)
-                    .copied()
-                    .unwrap_or((0, 0));
-                let interval = ember_source_search_interval(count).as_secs() as i64;
-                if now.saturating_sub(last_at) < interval {
+                    .is_some_and(|&(at, count)| {
+                        !tick_due(at, tick_now, ember_source_search_interval(count))
+                    })
+                {
                     continue;
                 }
                 // Already saturated with sources — don't spend a DHT
@@ -1796,12 +1820,12 @@ pub(in crate::network) async fn on_source_retry_tick(
                 break;
             }
             if start_ember_source_search(udp_socket, state, &tid, fh).await {
-                let entry = state
+                let started = tick_now;
+                state
                     .ember_source_search_state
                     .entry(tid)
-                    .or_insert((0, 0));
-                entry.0 = now;
-                entry.1 += 1;
+                    .and_modify(|e| *e = (started, e.1 + 1))
+                    .or_insert((started, 1));
                 ember_started += 1;
             }
         }
@@ -1818,7 +1842,9 @@ pub(in crate::network) async fn on_source_retry_tick(
     // floor (`SERVER_TCP_SRCREQ_FILE_REASK_SECS`); the
     // STARVED_SERVER_REASK_SECS clock only orders which starved files
     // ride a frame, since the floor is the longer of the two.
-    if state.server_connection.is_some() && server_tcp_srcreq_frame_open(state, now) {
+    let pace_now = tick_now;
+    if state.server_connection.is_some() && server_tcp_srcreq_frame_open(state, pace_now) {
+        let starved_floor = std::time::Duration::from_secs(STARVED_SERVER_REASK_SECS as u64);
         let starved: Vec<(String, [u8; 16], u64)> = {
             let mgr = transfer_manager.read().await;
             let mut out = Vec::new();
@@ -1826,8 +1852,13 @@ pub(in crate::network) async fn on_source_retry_tick(
                 // Pending downloads are already re-asked aggressively
                 // by the loop above; only handle started transfers.
                 if state.pending_downloads.contains_key(tid) { continue; }
-                let last = state.starved_server_reask_at.get(tid).copied().unwrap_or(0);
-                if now.saturating_sub(last) < STARVED_SERVER_REASK_SECS { continue; }
+                if state
+                    .starved_server_reask_at
+                    .get(tid)
+                    .is_some_and(|last| pace_now.saturating_duration_since(*last) < starved_floor)
+                {
+                    continue;
+                }
                 if let Some(transfer) = mgr.get_transfer(tid) {
                     // Starved == no bytes currently flowing.
                     if transfer.speed > 0 { continue; }
@@ -1835,7 +1866,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                         if raw.len() == 16 {
                             let mut fh = [0u8; 16];
                             fh.copy_from_slice(&raw[..16]);
-                            if !server_tcp_srcreq_file_due(&state.server_tcp_srcreq_file_at, &fh, now) {
+                            if !server_tcp_srcreq_file_due(&state.server_tcp_srcreq_file_at, &fh, pace_now) {
                                 continue;
                             }
                             out.push((tid.clone(), fh, transfer.total_size));
@@ -1847,11 +1878,11 @@ pub(in crate::network) async fn on_source_retry_tick(
             out
         };
         if !starved.is_empty() {
-            close_server_tcp_srcreq_frame(state, now);
+            close_server_tcp_srcreq_frame(state, pace_now);
             for (tid, fh, file_size) in &starved {
                 // Stop at the first refusal: the writer queue is full or
                 // the session is broken, and the rest would fare the same.
-                match send_server_get_sources(state, fh, *file_size, now) {
+                match send_server_get_sources(state, fh, *file_size, pace_now) {
                     Ok(bytes) => {
                         if bytes > 0 {
                             stats_manager.add_overhead(
@@ -1875,7 +1906,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                 }
             }
             for (tid, _, _) in &starved {
-                state.starved_server_reask_at.insert(tid.clone(), now);
+                state.starved_server_reask_at.insert(tid.clone(), pace_now);
             }
             // Bound the cooldown map: drop entries for downloads no
             // longer active so a long session can't accumulate them.
@@ -1985,5 +2016,23 @@ pub(in crate::network) async fn on_source_retry_tick(
                 state.friend_xfer_attempts.remove(&key);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tick_due;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_tick_a_few_milliseconds_early_still_counts_as_due() {
+        let t0 = Instant::now();
+        let five = Duration::from_secs(5);
+        // The next 5 s tick, landing slightly early.
+        assert!(tick_due(t0, t0 + Duration::from_millis(4_990), five));
+        assert!(tick_due(t0, t0 + five, five));
+        // A stamp taken mid-period is not let through a whole tick early.
+        assert!(!tick_due(t0, t0 + Duration::from_secs(3), five));
+        assert!(tick_due(t0, t0, Duration::ZERO), "no interval is always due");
     }
 }

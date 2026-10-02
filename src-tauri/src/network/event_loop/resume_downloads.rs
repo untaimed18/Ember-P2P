@@ -374,7 +374,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                         expected_aich: transfer.expected_aich.clone(),
                         control,
                         search_count: 0,
-                        last_search_at: 0,
+                        last_search_at: None,
                         priority: priority_str_to_u32(&transfer.priority),
                     },
                 );
