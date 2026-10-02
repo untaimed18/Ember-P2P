@@ -314,13 +314,7 @@ fn root_share_refused(path: &Path) -> bool {
 }
 
 fn path_has_sensitive_component(path: &Path) -> bool {
-    path.components().any(|component| {
-        if let Component::Normal(seg) = component {
-            is_sensitive_dir_name(&seg.to_string_lossy())
-        } else {
-            false
-        }
-    })
+    crate::sharing::path_has_sensitive_component(path)
 }
 
 pub(crate) fn is_noise_dir_name(name: &str) -> bool {

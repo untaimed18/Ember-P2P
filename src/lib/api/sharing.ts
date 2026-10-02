@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import * as m from '$lib/paraglide/messages';
+import { codedErrorOf } from '$lib/i18n';
 import { withTimeout } from '$lib/utils';
 import type { FileInfo, MediaMetadata } from '$lib/types';
 
@@ -187,9 +188,36 @@ export async function getFolderPriorities(): Promise<Record<string, string>> {
   return invoke('get_folder_priorities');
 }
 
-/** On-demand media metadata for a shared file (null for non-media files). */
-export async function getFileMediaMetadata(filePath: string): Promise<MediaMetadata | null> {
-  return invoke('get_file_media_metadata', { filePath });
+/** How long `getFileMediaMetadata` waits out another file's probe in total. */
+const MEDIA_METADATA_WAIT_MS = 5_000;
+const MEDIA_METADATA_RETRY_MS = 150;
+
+/** On-demand media metadata for a shared file (null for non-media files).
+ *
+ *  The backend probes one file at a time and refuses a second request while
+ *  one runs. Selecting another file while a slow probe (a network drive, say)
+ *  was still reading the last one used to come back as "no metadata" for the
+ *  file now selected, so this waits its turn instead, for a bounded time.
+ *
+ *  `stillWanted` is asked before each retry: a wait for a file the user has
+ *  moved on from would otherwise keep competing for the one slot with the
+ *  file now selected. Unwanted, it resolves null. */
+export async function getFileMediaMetadata(
+  filePath: string,
+  stillWanted: () => boolean = () => true,
+): Promise<MediaMetadata | null> {
+  const deadline = Date.now() + MEDIA_METADATA_WAIT_MS;
+  for (;;) {
+    try {
+      return await invoke<MediaMetadata | null>('get_file_media_metadata', { filePath });
+    } catch (e: unknown) {
+      if (codedErrorOf(e)?.code !== 'sharing_media_request_in_flight' || Date.now() >= deadline) {
+        throw e;
+      }
+      await new Promise((resolve) => setTimeout(resolve, MEDIA_METADATA_RETRY_MS));
+      if (!stillWanted()) return null;
+    }
+  }
 }
 
 /**
@@ -215,6 +243,12 @@ export async function getScanStatus(): Promise<boolean> {
   // "hashing" banner never clears. Deliberately NOT applied to `startScan` /
   // `reloadSharedFiles` — those are legitimately long-running.
   return withTimeout(invoke<boolean>('get_scan_status'), 'get_scan_status', 8_000);
+}
+
+/** Whether hashing is held by a Stop. Kept by the backend, so the Library can
+ *  show its Resume banner again after the page was left and reopened. */
+export async function getHashingPaused(): Promise<boolean> {
+  return withTimeout(invoke<boolean>('get_hashing_paused'), 'get_hashing_paused', 8_000);
 }
 
 export async function getLibraryScanTruncated(): Promise<boolean> {

@@ -1254,21 +1254,40 @@ pub fn run() {
                         (
                             folder.clone(),
                             tokio::task::spawn_blocking(move || {
-                                FileIndexer::discover_directory_page_in(
-                                    &f,
-                                    cursor.as_deref(),
-                                    scope.as_ref(),
-                                )
+                                match FileIndexer::refuse_unapproved_root(&f) {
+                                    Some(refused) => (true, refused),
+                                    None => (
+                                        false,
+                                        FileIndexer::discover_directory_page_in(
+                                            &f,
+                                            cursor.as_deref(),
+                                            scope.as_ref(),
+                                        ),
+                                    ),
+                                }
                             }),
                         )
                     })
                     .collect();
                 let mut all_discovered: Vec<crate::types::FileInfo> = Vec::new();
                 let mut startup_cursor_updates = std::collections::HashMap::new();
+                // Not walked until re-approved, so not filled in from known.met
+                // either: what is at the path now is not what was approved.
+                let mut refused_roots: Vec<String> = Vec::new();
                 for (folder, handle) in discovery_handles {
                     match handle.await {
-                        Ok(result) => {
-                            if result.truncated {
+                        Ok((refused, result)) => {
+                            if refused {
+                                refused_roots.push(folder);
+                                continue;
+                            }
+                            // An unreachable folder (a drive not plugged in)
+                            // says nothing about where its paging stood; a
+                            // `None` here erased the cursor it had.
+                            if result.saw_nothing() {
+                                continue;
+                            }
+                            if result.reached_file_cap() {
                                 tracing::warn!(
                                     "Startup discovery reached the per-folder file cap; some files will wait for a later scan"
                                 );
@@ -1347,8 +1366,14 @@ pub fn run() {
                 // folder default has since changed, matching `set_file_priority`'s
                 // per-file-override contract.
                 let mut new_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let known_lookup = known_list.name_size_lookup();
                 for file in &mut all_discovered {
-                    if let Some(record) = known_list.find_by_path_and_meta(&file.path, file.size, file.modified_at) {
+                    if let Some(record) = known_list.find_by_path_and_meta_in(
+                        &known_lookup,
+                        &file.path,
+                        file.size,
+                        file.modified_at,
+                    ) {
                         let hash = hex::encode(record.file_hash);
                         file.id = hash.clone();
                         file.hash = hash;
@@ -1395,6 +1420,7 @@ pub fn run() {
                         // ordinary entry. ed2k comes out identical either way;
                         // only the missing digests are filled.
                     } else {
+                        commands::sharing::carry_scope_at_path(file, &known_list);
                         new_paths.insert(crate::search::index::normalize_path_key(&file.path));
                         files_to_hash.push(file.clone());
                     }
@@ -1451,6 +1477,7 @@ pub fn run() {
                         .collect::<std::collections::HashSet<_>>();
                     let hydration_records = known_list.all_records().cloned().collect::<Vec<_>>();
                     let hydration_folders = current_shared_folders.clone();
+                    let hydration_refused = refused_roots.clone();
                     let hydration_paths = known_paths.clone();
                     let hydration_allowlists = {
                         let state = startup_app.state::<AppState>();
@@ -1473,6 +1500,9 @@ pub fn run() {
                                         &record.file_path,
                                         &hydration_folders,
                                     )
+                                    || hydration_refused.iter().any(|root| {
+                                        crate::security::path_within_dir(&record.file_path, root)
+                                    })
                                 {
                                     return false;
                                 }
@@ -1603,6 +1633,7 @@ pub fn run() {
                     folder_priorities,
                     pending_share_states,
                     pending_file_priorities,
+                    pending_friends_only,
                     pending_folder_allowlists,
                 ) = {
                     let state = startup_app.state::<AppState>();
@@ -1611,6 +1642,7 @@ pub fn run() {
                         cfg.settings.folder_priorities.clone(),
                         cfg.settings.pending_share_states.clone(),
                         cfg.settings.pending_file_priorities.clone(),
+                        cfg.settings.pending_friends_only.clone(),
                         cfg.settings.pending_folder_allowlists.clone(),
                     )
                 };
@@ -1628,6 +1660,7 @@ pub fn run() {
                     &mut files_to_hash,
                     &pending_share_states,
                     &pending_file_priorities,
+                    &pending_friends_only,
                 );
                 {
                     let mut index = index_clone.write().await;
@@ -1690,6 +1723,9 @@ pub fn run() {
                 // file at a time and leave every other drive idle — the same
                 // waste the reload path was fixed for, on the path that runs
                 // before anything else in the app works.
+                // Paced like the scans' progress: one event per file flooded
+                // the IPC bridge on a cold start of many small files.
+                let mut hash_progress = commands::sharing::HashProgressEmitter::new(&files_to_hash);
                 let mut pipeline = commands::sharing::HashLookahead::new(
                     &files_to_hash,
                     cancel_flag.clone(),
@@ -1728,11 +1764,7 @@ pub fn run() {
 
                     tracing::debug!("Startup hashing {}/{}: {}", hashed + 1, total_to_hash, file.name);
 
-                    let _ = startup_app.emit("file-hash-progress", serde_json::json!({
-                        "current": hashed + 1,
-                        "total": total_to_hash,
-                        "file_name": file.name,
-                    }));
+                    hash_progress.emit(&startup_app, hashed + 1, total_to_hash, &file.name);
 
                     let hash_result = commands::sharing::await_hash(
                         &mut hash_task,
@@ -1759,17 +1791,7 @@ pub fn run() {
                             updated.ember_file_hash = ember_file_hash;
                             updated.size = hashed_size;
                             updated.modified_at = hashed_modified_at;
-                            if let Ok(bytes) = hex::decode(&updated.hash) {
-                                if bytes.len() == 16 {
-                                    let mut hash = [0u8; 16];
-                                    hash.copy_from_slice(&bytes);
-                                    updated.shared =
-                                        storage::share_intent::effective_shared(
-                                            &hash,
-                                            updated.shared,
-                                        );
-                                }
-                            }
+                            commands::sharing::restore_known_hash_flags(&mut updated, &known_list);
                             let still_shared = {
                                 let state = startup_app.state::<AppState>();
                                 let cfg = state.config.read().await;
@@ -1847,7 +1869,7 @@ pub fn run() {
                             commands::sharing::release_in_flight_hash(&file.path, hash_claim);
                         }
                         Ok(Ok(Err(e))) => {
-                            if e.to_string().contains("cancelled") {
+                            if commands::sharing::is_hash_cancellation(&e, &cancel_flag) {
                                 info!("Startup hashing cancelled mid-file");
                                 was_cancelled = true;
                                 let mut idx = index_clone.write().await;
@@ -1936,16 +1958,27 @@ pub fn run() {
                     let app_state = startup_app.state::<AppState>();
                     // Startup always rescans page 1, so its cursor must never
                     // move a reload's further-advanced cursor backward.
-                    if let Err(error) = commands::sharing::persist_scan_cursors(
+                    match commands::sharing::persist_scan_cursors(
                         &app_state,
                         &startup_cursor_updates,
                         true,
                     )
                     .await
                     {
-                        tracing::warn!(
+                        // The later pages came back from known.met, which has
+                        // nothing added to them while Ember was closed; only a
+                        // walk finds that. Queued like a reload's own pages.
+                        Ok(()) if startup_cursor_updates.values().any(Option::is_some) => {
+                            commands::sharing::schedule_chained_scan_page(
+                                startup_app.clone(),
+                                commands::sharing::MAX_CHAINED_SCAN_PAGES - 1,
+                            )
+                            .await;
+                        }
+                        Ok(()) => {}
+                        Err(error) => tracing::warn!(
                             "Startup shared-folder pages were indexed but scan cursors were not saved: {error}"
-                        );
+                        ),
                     }
                 }
                 commands::sharing::refresh_file_cache(&index_clone, &csf).await;
@@ -2228,6 +2261,7 @@ pub fn run() {
             commands::sharing::share_file,
             commands::sharing::unshare_folder,
             commands::sharing::get_scan_status,
+            commands::sharing::get_hashing_paused,
             commands::sharing::get_library_scan_truncated,
             commands::sharing::stop_hashing,
             commands::sharing::preview_stop_hashing,

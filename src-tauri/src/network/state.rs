@@ -260,6 +260,10 @@ pub(super) struct NetworkState {
     /// Serializes every known.met writer, including shutdown, so a timed-out
     /// periodic snapshot cannot rename over a newer authoritative save.
     pub(super) known_met_save_lock: Arc<tokio::sync::Mutex<()>>,
+    /// A change that should not wait for the periodic writer (a friends-only
+    /// download completing): the catalog is saved right after the event, or
+    /// as soon as a save already running finishes.
+    pub(super) known_met_save_soon: bool,
     /// Monotonic generation for async `server.met` writes (latest wins).
     pub(super) server_met_save_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Serializes async `server.met` writers so a superseded snapshot cannot

@@ -4,6 +4,36 @@
 
 use super::*;
 
+/// Tell the user the file catalog could not be read this session.
+///
+/// Until it is, Ember publishes nothing to KAD, eD2K servers or the Ember DHT
+/// and uploads only to friends, so that a friends-only file cannot be offered
+/// as public. That held every session until the file was repaired by hand,
+/// with a log line as the only sign. Delayed like the config and database
+/// notices, so the window has its listeners by then.
+fn notify_catalog_unreadable(app_handle: &tauri::AppHandle) {
+    let app_handle = app_handle.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let _ = app_handle.emit("known-met-unreadable", serde_json::json!({ "reset": false }));
+    });
+}
+
+/// If this session lost the catalog (damaged and set aside, or gone after it
+/// had been seen), sharing now fails closed: nothing is offered unless the
+/// user shared it themselves, which otherwise looked like a Library emptied
+/// for no reason. Asked after the delay: the share-intent store that decides
+/// it is initialized in the background and may not have yet.
+fn notify_catalog_reset_if_lost(app_handle: &tauri::AppHandle) {
+    let app_handle = app_handle.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        if crate::storage::share_intent::fail_closed_this_session() {
+            let _ = app_handle.emit("known-met-unreadable", serde_json::json!({ "reset": true }));
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn apply_deferred_disk_loads(
     state: &mut NetworkState,
@@ -60,6 +90,11 @@ pub(in crate::network) async fn apply_deferred_disk_loads(
                     sync_shared_friends_only_hashes(shared_friends_only_hashes, known_files);
                     or_index_friends_only_from_known(local_index, known_files).await;
                     *known_met_ready = true;
+                    if !known_files.is_authoritative() {
+                        notify_catalog_unreadable(app_handle);
+                    } else {
+                        notify_catalog_reset_if_lost(app_handle);
+                    }
                     // Startup scan often finishes (and no-ops AnnounceFiles)
                     // against the placeholder catalog a few hundred ms
                     // before this absorb. KAD auto-connect is off, so
@@ -143,6 +178,9 @@ pub(in crate::network) async fn apply_deferred_disk_loads(
                     {
                         Ok(Ok(loaded)) => {
                             known_files.absorb_missing_from(loaded);
+                            if !known_files.is_authoritative() {
+                                notify_catalog_unreadable(app_handle);
+                            }
                             sync_shared_friends_only_hashes(
                                 shared_friends_only_hashes,
                                 known_files,
@@ -177,12 +215,14 @@ pub(in crate::network) async fn apply_deferred_disk_loads(
                                  ({load_err}); sharing and publishing stay disabled for this \
                                  session to avoid advertising a friends-only file"
                             );
+                            notify_catalog_unreadable(app_handle);
                         }
                         Err(join_err) => {
                             error!(
                                 "known.met recovery task panicked as well ({join_err}); \
                                  sharing and publishing stay disabled for this session"
                             );
+                            notify_catalog_unreadable(app_handle);
                         }
                     }
                     // A failed deferred read must not turn an enabled

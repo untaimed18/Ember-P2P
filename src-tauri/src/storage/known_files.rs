@@ -1,5 +1,5 @@
 use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -168,8 +168,7 @@ fn prune_hold_active(known_met: &Path, pathless: usize, ceiling: usize) -> bool 
     true
 }
 
-fn quarantined_paths() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
-    use std::collections::HashSet;
+fn quarantined_paths() -> &'static std::sync::Mutex<HashSet<PathBuf>> {
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     SEEN.get_or_init(|| Mutex::new(HashSet::new()))
@@ -391,6 +390,64 @@ pub struct KnownFileList {
     dirty: bool,
     dirty_generation: u64,
     authoritative: bool,
+    /// Forgets asked of the placeholder before the catalog on disk was
+    /// absorbed, replayed over it then: it would otherwise bring every one of
+    /// those paths back. Empty once absorbed.
+    forgets_before_absorb: Vec<PendingForget>,
+}
+
+#[derive(Clone)]
+enum PendingForget {
+    Paths(Vec<String>),
+    Under { root: String, keep_roots: Vec<String> },
+}
+
+/// A catalog's records by file name and size; see
+/// [`KnownFileList::name_size_lookup`].
+pub struct NameSizeLookup<'a> {
+    by_name_size: HashMap<(&'a str, u64), Vec<&'a KnownFileRecord>>,
+}
+
+/// Of `candidates`, all named `name` with `size` bytes, the one record that
+/// is the file modified at `mtime`, or `None` when none or several are.
+///
+/// An exact time wins. Failing that, a time off by FAT's 2-second rounding, or
+/// by exactly an hour, is still the same file when only one record is that
+/// close: the hour is the daylight-saving shift FAT and older NTFS tooling
+/// apply to stored times (eMule corrects the same with
+/// `AdjustNTFSDaylightFileTime`). Without it an archive carried over from eMule
+/// on such a drive was re-hashed in full, which on a multi-terabyte library is
+/// days of disk time.
+fn pick_by_mtime<'a>(
+    candidates: impl Iterator<Item = &'a KnownFileRecord>,
+    name: &str,
+    size: u64,
+    mtime: i64,
+) -> Option<&'a KnownFileRecord> {
+    const FAT_SLACK_SECS: i64 = 2;
+    const DST_SHIFT_SECS: i64 = 3600;
+    let (mut exact, mut exact_count) = (None, 0usize);
+    let (mut near, mut near_count) = (None, 0usize);
+    for record in candidates {
+        let delta = (record.modified_at - mtime).abs();
+        if delta == 0 {
+            exact = Some(record);
+            exact_count += 1;
+        } else if delta <= FAT_SLACK_SECS || (delta - DST_SHIFT_SECS).abs() <= FAT_SLACK_SECS {
+            near = Some(record);
+            near_count += 1;
+        }
+    }
+    let (found, count) = if exact_count > 0 {
+        (exact, exact_count)
+    } else {
+        (near, near_count)
+    };
+    if count > 1 {
+        warn!("known.met: ambiguous match for {name} ({size} bytes, mtime {mtime}); rehashing");
+        return None;
+    }
+    found
 }
 
 impl KnownFileList {
@@ -408,7 +465,105 @@ impl KnownFileList {
             dirty: false,
             dirty_generation: 0,
             authoritative: false,
+            forgets_before_absorb: Vec::new(),
         }
+    }
+
+    /// Forget `paths`, files confirmed gone from them: their path entries,
+    /// and a record's own path where it was one of them. Returns how many
+    /// were known.
+    ///
+    /// Nothing else ever removed a path entry, so every file deleted, moved
+    /// away or dropped with its folder kept one, and kept its record counted
+    /// as in the library, beyond [`Self::prune_unreferenced`]'s reach. The
+    /// record itself stays, as for any file that left the library, until
+    /// that needs the room: a file that comes back still matches it by name,
+    /// size and time.
+    pub fn forget_paths(&mut self, paths: &[String]) -> usize {
+        if !self.authoritative {
+            self.forgets_before_absorb.push(PendingForget::Paths(paths.to_vec()));
+        }
+        self.forget_known_paths(paths)
+    }
+
+    fn forget_known_paths(&mut self, paths: &[String]) -> usize {
+        let mut forgotten = 0;
+        // Records whose own path went while another path still holds their
+        // content. Found in one pass afterwards: searching the index per path
+        // made forgetting a mirrored folder quadratic, on the network task.
+        let mut repoint = HashSet::new();
+        for path in paths {
+            let key = normalize_path_key(path);
+            let Some(entry) = self.path_index.remove(key.as_str()) else {
+                continue;
+            };
+            self.release_path_ref(&entry.hash);
+            if let Some(record) = self.files.get_mut(&entry.hash) {
+                if normalize_path_key(&record.file_path) == key {
+                    record.file_path.clear();
+                    if self.path_refs.contains_key(&entry.hash) {
+                        repoint.insert(entry.hash);
+                    }
+                }
+            }
+            forgotten += 1;
+        }
+        if !repoint.is_empty() {
+            let mut still_at: HashMap<[u8; 16], KnownPathEntry> = HashMap::new();
+            for entry in self.path_index.values() {
+                if repoint.contains(&entry.hash) {
+                    still_at.entry(entry.hash).or_insert_with(|| entry.clone());
+                    if still_at.len() == repoint.len() {
+                        break;
+                    }
+                }
+            }
+            // The copy's own name and time, which startup matches it by.
+            for (hash, entry) in still_at {
+                if let Some(record) = self.files.get_mut(&hash) {
+                    if let Some(name) = Path::new(&entry.path).file_name() {
+                        record.file_name = name.to_string_lossy().into_owned();
+                    }
+                    record.modified_at = entry.modified_at;
+                    record.file_path = entry.path;
+                }
+            }
+        }
+        if forgotten > 0 {
+            self.touch_dirty();
+        }
+        forgotten
+    }
+
+    /// [`Self::forget_paths`] for every known path under `root` that none of
+    /// `keep_roots` still covers: a folder taken out of the library, where a
+    /// subfolder or parent of it can still be shared.
+    pub fn forget_paths_under(&mut self, root: &str, keep_roots: &[String]) -> usize {
+        if !self.authoritative {
+            self.forgets_before_absorb.push(PendingForget::Under {
+                root: root.to_string(),
+                keep_roots: keep_roots.to_vec(),
+            });
+        }
+        self.forget_known_paths_under(root, keep_roots)
+    }
+
+    fn forget_known_paths_under(&mut self, root: &str, keep_roots: &[String]) -> usize {
+        let under = self.known_paths_under(root, keep_roots);
+        self.forget_known_paths(&under)
+    }
+
+    fn known_paths_under(&self, root: &str, keep_roots: &[String]) -> Vec<String> {
+        self.path_index
+            .values()
+            .filter(|entry| {
+                crate::security::path_within_dir(&entry.path, root)
+                    && !keep_roots
+                        .iter()
+                        .any(|keep| crate::security::path_within_dir(&entry.path, keep))
+            })
+            .map(|entry| entry.path.clone())
+            .collect()
     }
 
     /// The only way a `path_index` entry is added or replaced, so `path_refs`
@@ -469,6 +624,14 @@ impl KnownFileList {
     /// So: cumulative fields take the larger value, and fields that are either
     /// known or absent take whichever side actually has one.
     pub fn absorb_missing_from(&mut self, other: Self) {
+        // The placeholder's paths are this session's own observations, made
+        // after any forget it was asked for: a folder removed and added back,
+        // a file deleted and written anew. The replay below leaves them be.
+        let observed: HashSet<String> = if self.forgets_before_absorb.is_empty() {
+            HashSet::new()
+        } else {
+            self.path_index.iter().map(|(key, _)| key.to_string()).collect()
+        };
         for (hash, record) in other.files.into_owned() {
             if let Some(live) = self.files.get_mut(&hash) {
                 // A share-scan that ran before disk load can insert a
@@ -543,6 +706,21 @@ impl KnownFileList {
         // Absorbing a catalog that was actually read off disk is what makes
         // this list safe to write back.
         self.authoritative |= other.authoritative;
+        if self.authoritative {
+            for forget in std::mem::take(&mut self.forgets_before_absorb) {
+                let paths = match forget {
+                    PendingForget::Paths(paths) => paths,
+                    PendingForget::Under { root, keep_roots } => {
+                        self.known_paths_under(&root, &keep_roots)
+                    }
+                };
+                let paths = paths
+                    .into_iter()
+                    .filter(|path| !observed.contains(&normalize_path_key(path)))
+                    .collect::<Vec<_>>();
+                self.forget_known_paths(&paths);
+            }
+        }
     }
 
     /// Parse a `known.met` already read into memory, touching no file.
@@ -1080,7 +1258,10 @@ impl KnownFileList {
         Ok(record)
     }
 
-    /// Look up a known file by path, size, and mtime to skip re-hashing.
+    /// Look up a known file by path, size, and mtime to skip re-hashing. One
+    /// lookup at a time; a pass over many files uses
+    /// [`Self::find_by_path_and_meta_in`].
+    #[cfg(test)]
     pub fn find_by_path_and_meta(
         &self,
         path: &str,
@@ -1121,47 +1302,72 @@ impl KnownFileList {
     /// TODO: persist an inode/NtfsFileID discriminator alongside the record
     /// so ambiguous matches can be resolved without a rehash. Requires a
     /// known.met format-version bump (add a new tag).
+    #[cfg(test)]
     pub fn find_by_name_and_meta(
         &self,
         name: &str,
         size: u64,
         mtime: i64,
     ) -> Option<&KnownFileRecord> {
-        // An exact time wins. Failing that, a time off by FAT's 2-second
-        // rounding, or by exactly an hour, is still the same file when only one
-        // record is that close: the hour is the daylight-saving shift FAT and
-        // older NTFS tooling apply to stored times (eMule corrects the same
-        // with `AdjustNTFSDaylightFileTime`). Without it an archive carried
-        // over from eMule on such a drive was re-hashed in full, which on a
-        // multi-terabyte library is days of disk time.
-        const FAT_SLACK_SECS: i64 = 2;
-        const DST_SHIFT_SECS: i64 = 3600;
-        let (mut exact, mut exact_count) = (None, 0usize);
-        let (mut near, mut near_count) = (None, 0usize);
-        for record in self
-            .files
-            .values()
-            .filter(|r| r.file_name == name && r.file_size == size)
-        {
-            let delta = (record.modified_at - mtime).abs();
-            if delta == 0 {
-                exact = Some(record);
-                exact_count += 1;
-            } else if delta <= FAT_SLACK_SECS || (delta - DST_SHIFT_SECS).abs() <= FAT_SLACK_SECS {
-                near = Some(record);
-                near_count += 1;
+        pick_by_mtime(
+            self.files
+                .values()
+                .filter(|r| r.file_name == name && r.file_size == size),
+            name,
+            size,
+            mtime,
+        )
+    }
+
+    /// The records by file name and size, for a pass that matches many files
+    /// against this catalog. [`Self::find_by_name_and_meta`] walks every
+    /// record, so a scan of N new or changed files against N records cost N²:
+    /// minutes of a blocked worker on the first scan after an eMule import.
+    pub fn name_size_lookup(&self) -> NameSizeLookup<'_> {
+        let mut by_name_size: HashMap<(&str, u64), Vec<&KnownFileRecord>> = HashMap::new();
+        for record in self.files.values() {
+            by_name_size
+                .entry((record.file_name.as_str(), record.file_size))
+                .or_default()
+                .push(record);
+        }
+        NameSizeLookup { by_name_size }
+    }
+
+    /// [`Self::find_by_path_and_meta`] with its fallback answered by `lookup`,
+    /// which must have been built from this catalog.
+    pub fn find_by_path_and_meta_in<'a>(
+        &'a self,
+        lookup: &NameSizeLookup<'a>,
+        path: &str,
+        size: u64,
+        mtime: i64,
+    ) -> Option<&'a KnownFileRecord> {
+        if let Some(entry) = self.path_index.get(normalize_path_key(path).as_str()) {
+            if let Some(record) = self.files.get(&entry.hash) {
+                if entry.size == size && entry.modified_at == mtime {
+                    return Some(record);
+                }
             }
         }
-        let (found, count) = if exact_count > 0 {
-            (exact, exact_count)
-        } else {
-            (near, near_count)
-        };
-        if count > 1 {
-            warn!("known.met: ambiguous match for {name} ({size} bytes, mtime {mtime}); rehashing");
-            return None;
-        }
-        found
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        let candidates = lookup
+            .by_name_size
+            .get(&(name.as_ref(), size))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        pick_by_mtime(candidates.iter().copied(), &name, size, mtime)
+    }
+
+    /// The record last stored for `path`, whatever its size and modified time
+    /// now are. Not an identity (the bytes may have changed since); for what
+    /// the user decided about the file at that path.
+    pub fn record_at_path(&self, path: &str) -> Option<&KnownFileRecord> {
+        let entry = self.path_index.get(normalize_path_key(path).as_str())?;
+        self.files.get(&entry.hash)
     }
 
     /// Of files this catalog did not match, how many it holds a record for
@@ -2417,9 +2623,18 @@ mod tests {
     /// file, unless two records are equally close.
     #[test]
     fn a_near_modified_time_still_finds_the_record() {
+        // Both lookups, the one-at-a-time one and the one a scan builds once,
+        // have to give the same answer for every case below.
         fn find(kf: &KnownFileList, mtime: i64) -> Option<[u8; 16]> {
-            kf.find_by_name_and_meta("movie.mkv", 1024 * 1024, mtime)
-                .map(|r| r.file_hash)
+            let one = kf
+                .find_by_name_and_meta("movie.mkv", 1024 * 1024, mtime)
+                .map(|r| r.file_hash);
+            let lookup = kf.name_size_lookup();
+            let batched = kf
+                .find_by_path_and_meta_in(&lookup, "C:/Elsewhere/movie.mkv", 1024 * 1024, mtime)
+                .map(|r| r.file_hash);
+            assert_eq!(one, batched, "mtime {mtime}");
+            one
         }
         let mut kf = KnownFileList::new();
         kf.files.insert([1; 16], pathless(1, 1_700_000_000));
@@ -2967,6 +3182,80 @@ mod tests {
 
         // Idempotent: a second pass finds nothing left to clear.
         assert_eq!(kf.clear_stale_multipart_aich(), 0);
+    }
+
+    /// A path a file is gone from stops counting its record as in the
+    /// library. Another path holding the content still does, and becomes the
+    /// record's own; with none left the record stays, pathless.
+    #[test]
+    fn a_forgotten_path_stops_counting_its_record_as_in_the_library() {
+        let mut kf = KnownFileList::new();
+        kf.mark_authoritative_for_tests();
+        let first = sample_record();
+        let hash = first.file_hash;
+        kf.add_or_update(first);
+        let mut second = sample_record();
+        second.file_path = "C:/Library/copy.mkv".to_string();
+        kf.add_or_update(second);
+
+        assert_eq!(kf.forget_paths(&["C:/Library/movie.mkv".to_string()]), 1);
+        assert!(kf.record_at_path("C:/Library/movie.mkv").is_none());
+        assert!(kf.record_at_path("C:/Library/copy.mkv").is_some());
+        assert_eq!(kf.find_by_hash(&hash).unwrap().file_path, "C:/Library/copy.mkv");
+        assert!(kf.path_refs.contains_key(&hash));
+
+        let forgotten = kf.forget_paths(&[
+            "C:/Library/copy.mkv".to_string(),
+            "C:/Library/never-known.mkv".to_string(),
+        ]);
+        assert_eq!(forgotten, 1);
+        assert!(kf.find_by_hash(&hash).unwrap().file_path.is_empty());
+        assert!(!kf.path_refs.contains_key(&hash), "now within the pruning's reach");
+    }
+
+    #[test]
+    fn a_removed_folder_forgets_what_no_other_root_still_shares() {
+        let mut kf = KnownFileList::new();
+        kf.mark_authoritative_for_tests();
+        for (byte, path) in [(1u8, "C:/Music/a.mp3"), (2, "C:/Music/Live/b.mp3"), (3, "C:/Films/c.mkv")] {
+            let mut record = sample_record();
+            record.file_hash = [byte; 16];
+            record.file_path = path.to_string();
+            kf.add_or_update(record);
+        }
+        assert_eq!(kf.forget_paths_under("C:/Music", &["C:/Music/Live".to_string()]), 1);
+        assert!(kf.record_at_path("C:/Music/a.mp3").is_none());
+        assert!(kf.record_at_path("C:/Music/Live/b.mp3").is_some(), "still shared by its own root");
+        assert!(kf.record_at_path("C:/Films/c.mkv").is_some());
+    }
+
+    /// The network task's list is a placeholder until the catalog on disk is
+    /// absorbed, and absorbing it brought back every path forgotten before.
+    #[test]
+    fn a_forget_before_the_catalog_loads_still_applies_to_it() {
+        let mut disk = KnownFileList::new();
+        disk.add_or_update(sample_record());
+        let mut in_folder = sample_record();
+        in_folder.file_hash = [7; 16];
+        in_folder.file_path = "C:/Music/x.mp3".to_string();
+        disk.add_or_update(in_folder);
+        let mut back = sample_record();
+        back.file_hash = [8; 16];
+        back.file_path = "C:/Music/back.mp3".to_string();
+        disk.add_or_update(back.clone());
+        disk.mark_authoritative_for_tests();
+
+        let mut live = KnownFileList::new();
+        live.forget_paths(&["C:/Library/movie.mkv".to_string()]);
+        live.forget_paths_under("C:/Music", &[]);
+        // The folder is added back and this file seen again before the load.
+        live.add_or_update(back);
+        live.absorb_missing_from(disk);
+        assert!(live.record_at_path("C:/Library/movie.mkv").is_none());
+        assert!(live.record_at_path("C:/Music/x.mp3").is_none());
+        assert!(live.record_at_path("C:/Music/back.mp3").is_some(), "seen since; not forgotten");
+        assert!(live.find_by_hash(&[0x42; 16]).is_some(), "the records come in, without the paths");
+        assert!(live.forgets_before_absorb.is_empty());
     }
 
     #[test]

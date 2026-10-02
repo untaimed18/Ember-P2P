@@ -90,6 +90,33 @@ pub struct ShareMutation {
     pub hashed_paths: Vec<String>,
 }
 
+/// What [`LocalIndex::set_priority_by_paths`] changed.
+#[derive(Debug, Default)]
+pub struct PriorityBatch {
+    /// Rows changed, every copy counted.
+    pub changed: usize,
+    /// Each changed content hash once, for `known.met`.
+    pub hashes: Vec<String>,
+    /// Requested paths whose content changed, to clear their pending intents.
+    pub hashed_paths: Vec<String>,
+    /// Requested paths still hashing that changed, to record as intents.
+    pub pending_paths: Vec<String>,
+    /// The changed rows as they were, for [`LocalIndex::revert_user_fields`].
+    pub undo: Vec<UserFieldsUndo>,
+    /// The changed hashed rows as they were, to put their priority back in
+    /// `known.met` if the change cannot be completed.
+    pub before_rows: Vec<FileInfo>,
+}
+
+/// One row's priority and friends-only scope before and after a mutation; see
+/// [`LocalIndex::user_fields_changed_since`].
+#[derive(Debug, Clone)]
+pub struct UserFieldsUndo {
+    key: String,
+    before: (String, bool),
+    after: (String, bool),
+}
+
 /// Windows filesystems are (by default) case-insensitive; indexing a path that
 /// arrived from the watcher in one casing and lookups that arrive from the UI
 /// in another would spuriously miss. Lowercase the path on Windows; preserve
@@ -398,13 +425,6 @@ impl LocalIndex {
         &self.files
     }
 
-    /// Restore a previously captured snapshot when a cross-component
-    /// persistence transaction fails after an optimistic in-memory mutation.
-    pub fn restore_snapshot(&mut self, files: Vec<FileInfo>) {
-        self.files = files;
-        self.rebuild_indices();
-    }
-
     /// Replace a pending discovery row with its completed identity while
     /// retaining the *current* user-controlled state. Share/priority edits can
     /// arrive while hashing is in progress, so cloning the stale discovery
@@ -419,7 +439,13 @@ impl LocalIndex {
     ) -> Option<FileInfo> {
         let pos = self.position_by_id(pending_id)?;
         let pending = self.swap_remove_indexed(pos)?;
-        completed.shared = pending.shared;
+        // Both sides can restrict, and the stricter wins. `completed` carries
+        // what the content's hash says — an unshare or friends-only choice
+        // made under another path, or fail-closed after a lost known.met —
+        // and a pending row is discovered shared and unrestricted by default,
+        // so taking the pending row's flags alone re-published a file the
+        // user had withheld the moment it was renamed, moved or copied.
+        completed.shared = pending.shared && completed.shared;
         completed.priority = pending.priority;
         completed.bytes_transferred = pending.bytes_transferred;
         completed.requests = pending.requests;
@@ -432,7 +458,7 @@ impl LocalIndex {
         // hashing, so a restriction applied during that window has to survive
         // completion or it is silently discarded at the moment the file becomes
         // servable.
-        completed.friends_only = pending.friends_only;
+        completed.friends_only = pending.friends_only || completed.friends_only;
         self.add_file_no_rebuild(completed.clone());
         Some(completed)
     }
@@ -727,6 +753,16 @@ impl LocalIndex {
         }
     }
 
+    /// The rows holding `hash_hex`, looked up the way the upload counters
+    /// above apply their deltas.
+    pub fn files_with_hash<'a>(&'a self, hash_hex: &str) -> impl Iterator<Item = &'a FileInfo> {
+        self.hash_map
+            .get(hash_hex)
+            .into_iter()
+            .flatten()
+            .filter_map(|&i| self.files.get(i))
+    }
+
     /// Update the known complete-source count for a file (from SourceManager periodic sync).
     pub fn update_complete_sources(&mut self, hash_hex: &str, count: u32) {
         if let Some(indices) = self.hash_map.get(hash_hex).cloned() {
@@ -790,6 +826,72 @@ impl LocalIndex {
             }
         }
         changed
+    }
+
+    /// [`Self::set_file_priority_by_path_count`] for many paths in one pass.
+    ///
+    /// Calling that per path scanned the whole library for each one, under the
+    /// index write lock: selecting 10k files of a 100k library and setting a
+    /// priority was a billion row visits while every reader waited. The rules
+    /// are the same: a hashed path changes every copy of its content, a pending
+    /// one only itself.
+    pub fn set_priority_by_paths(&mut self, paths: &[String], priority: &str) -> PriorityBatch {
+        let mut hashes: HashSet<String> = HashSet::new();
+        let mut pending_keys: HashSet<String> = HashSet::new();
+        let mut requested_hashed: Vec<(String, String)> = Vec::new();
+        let mut requested_pending: Vec<String> = Vec::new();
+        for path in paths {
+            let Some(row) = self.get_by_path(path) else {
+                continue;
+            };
+            if row.hash.is_empty() {
+                pending_keys.insert(normalize_path_key(path));
+                requested_pending.push(path.clone());
+            } else {
+                hashes.insert(row.hash.clone());
+                requested_hashed.push((path.clone(), row.hash.clone()));
+            }
+        }
+        let mut batch = PriorityBatch::default();
+        let mut changed_hashes: HashSet<String> = HashSet::new();
+        let mut changed_pending: HashSet<String> = HashSet::new();
+        for file in &mut self.files {
+            if file.priority == priority {
+                continue;
+            }
+            let key = if file.hash.is_empty() {
+                let key = normalize_path_key(&file.path);
+                if !pending_keys.contains(&key) {
+                    continue;
+                }
+                changed_pending.insert(key.clone());
+                key
+            } else if hashes.contains(&file.hash) {
+                changed_hashes.insert(file.hash.clone());
+                batch.before_rows.push(file.clone());
+                normalize_path_key(&file.path)
+            } else {
+                continue;
+            };
+            batch.undo.push(UserFieldsUndo {
+                key,
+                before: (file.priority.clone(), file.friends_only),
+                after: (priority.to_string(), file.friends_only),
+            });
+            file.priority = priority.to_string();
+            batch.changed += 1;
+        }
+        for (path, hash) in requested_hashed {
+            if changed_hashes.contains(&hash) {
+                batch.hashed_paths.push(path);
+            }
+        }
+        batch.hashes = changed_hashes.into_iter().collect();
+        batch.pending_paths = requested_pending
+            .into_iter()
+            .filter(|path| changed_pending.contains(&normalize_path_key(path)))
+            .collect();
+        batch
     }
 
     /// Apply `priority` to every file that lives under `folder` (the folder
@@ -1060,6 +1162,48 @@ impl LocalIndex {
         for file in &mut self.files {
             if file.shared == shared && keys.contains(&normalize_path_key(&file.path)) {
                 file.shared = !shared;
+            }
+        }
+    }
+
+    /// The rows whose priority or friends-only scope differ from `before`, a
+    /// copy of the rows taken just ahead of a mutation: what
+    /// [`Self::revert_user_fields`] needs to undo that mutation alone.
+    pub fn user_fields_changed_since(&self, before: &[FileInfo]) -> Vec<UserFieldsUndo> {
+        let prior: HashMap<String, (&str, bool)> = before
+            .iter()
+            .map(|f| (normalize_path_key(&f.path), (f.priority.as_str(), f.friends_only)))
+            .collect();
+        self.files
+            .iter()
+            .filter_map(|f| {
+                let key = normalize_path_key(&f.path);
+                let (priority, friends_only) = *prior.get(&key)?;
+                (priority != f.priority || friends_only != f.friends_only).then(|| UserFieldsUndo {
+                    key,
+                    before: (priority.to_string(), friends_only),
+                    after: (f.priority.clone(), f.friends_only),
+                })
+            })
+            .collect()
+    }
+
+    /// Put back what [`Self::user_fields_changed_since`] recorded, on rows that
+    /// still hold the value the mutation set. Unlike restoring a whole copy,
+    /// this keeps everything else that happened meanwhile: rows a scan hashed
+    /// (which keep their path), upload counters, other commands' changes.
+    pub fn revert_user_fields(&mut self, undo: &[UserFieldsUndo]) {
+        let by_key: HashMap<&str, &UserFieldsUndo> =
+            undo.iter().map(|u| (u.key.as_str(), u)).collect();
+        for file in &mut self.files {
+            let Some(u) = by_key.get(normalize_path_key(&file.path).as_str()) else {
+                continue;
+            };
+            if file.priority == u.after.0 {
+                file.priority = u.before.0.clone();
+            }
+            if file.friends_only == u.after.1 {
+                file.friends_only = u.before.1;
             }
         }
     }
@@ -1530,6 +1674,78 @@ mod local_index_tests {
         assert!(index.get_by_path("S/copy-of-a.bin").unwrap().shared, "every copy it flipped");
         assert!(!index.get_by_path("S/b.bin").unwrap().shared, "another command's change stays");
         assert!(!index.get_by_path("S/new.bin").unwrap().shared, "a row it never flipped");
+    }
+
+    /// One pass applies what a call per path did: a hashed path moves every
+    /// copy of its content, a pending one itself, and an unknown path nothing.
+    #[test]
+    fn a_priority_batch_changes_what_one_call_per_path_did() {
+        let h = |byte: u8| format!("{byte:02x}").repeat(16);
+        let mut index = LocalIndex::new();
+        let mut pending = file("S/pending.bin", "", true, "normal");
+        pending.id = "pending:S/pending.bin".to_string();
+        index.add_files(vec![
+            file("S/a.bin", &h(1), true, "normal"),
+            file("T/copy-of-a.bin", &h(1), true, "normal"),
+            file("S/b.bin", &h(2), true, "normal"),
+            pending,
+        ]);
+        let batch = index.set_priority_by_paths(
+            &["S/a.bin".into(), "S/pending.bin".into(), "S/missing.bin".into()],
+            "high",
+        );
+        assert_eq!(batch.changed, 3);
+        assert_eq!(batch.hashes, vec![h(1)]);
+        assert_eq!(batch.hashed_paths, vec!["S/a.bin".to_string()]);
+        assert_eq!(batch.pending_paths, vec!["S/pending.bin".to_string()]);
+        assert_eq!(batch.before_rows.len(), 2, "both copies, as they were");
+        assert!(batch.before_rows.iter().all(|row| row.priority == "normal"));
+        assert_eq!(index.get_by_path("T/copy-of-a.bin").unwrap().priority, "high");
+        assert_eq!(index.get_by_path("S/b.bin").unwrap().priority, "normal");
+
+        index.revert_user_fields(&batch.undo);
+        for path in ["S/a.bin", "T/copy-of-a.bin", "S/pending.bin"] {
+            assert_eq!(index.get_by_path(path).unwrap().priority, "normal", "{path}");
+        }
+    }
+
+    /// A priority change whose save fails is undone on the rows it changed,
+    /// and only in that field. Restoring a whole copy of the index instead put
+    /// a row the scan had hashed since back to pending, and lost counters.
+    #[test]
+    fn reverting_a_priority_change_keeps_what_happened_since() {
+        let h = |byte: u8| format!("{byte:02x}").repeat(16);
+        let mut index = LocalIndex::new();
+        let mut pending = file("S/pending.bin", "", true, "normal");
+        pending.id = "pending:S/pending.bin".to_string();
+        index.add_files(vec![
+            pending,
+            file("S/b.bin", &h(2), true, "normal"),
+            file("S/c.bin", &h(3), true, "normal"),
+        ]);
+        let before = index.all_files().to_vec();
+        index.set_file_priority_by_path("S/pending.bin", "high");
+        index.set_file_priority_by_path("S/b.bin", "high");
+        let undo = index.user_fields_changed_since(&before);
+        assert_eq!(undo.len(), 2);
+
+        // Meanwhile: the scan finishes the pending row, b uploads, and
+        // another command changes c.
+        let finished = index
+            .finalize_pending_hash("pending:S/pending.bin", file("S/pending.bin", &h(1), true, "normal"))
+            .expect("pending row still there");
+        assert_eq!(finished.priority, "high");
+        index.apply_upload_completed_bytes(&h(2), 500, true);
+        index.set_file_priority_by_path("S/c.bin", "low");
+
+        index.revert_user_fields(&undo);
+        let done = index.get_by_path("S/pending.bin").unwrap();
+        assert_eq!(done.hash, h(1), "the scan's result stays");
+        assert_eq!(done.priority, "normal");
+        let b = index.get_by_path("S/b.bin").unwrap();
+        assert_eq!(b.priority, "normal");
+        assert_eq!(b.bytes_transferred, 500, "counters stay");
+        assert_eq!(index.get_by_path("S/c.bin").unwrap().priority, "low", "not this mutation's");
     }
 
     /// The directory counts behind `has_rows_at_or_under` are patched at every
@@ -2005,6 +2221,25 @@ mod local_index_tests {
         assert!(index.get_by_path("A/pending.bin").is_some());
         assert!(!index.get_by_path("A/pending.bin").unwrap().shared);
         assert_eq!(index.get_by_path("A/pending.bin").unwrap().priority, "high");
+    }
+
+    /// The other direction: the pending row is untouched, but the content it
+    /// turns out to be was unshared or restricted under another path. The
+    /// completed row's flags, which carry that, must survive the merge.
+    #[test]
+    fn finalize_pending_hash_keeps_what_the_hash_says() {
+        let mut index = LocalIndex::new();
+        let mut pending = file("B/renamed.bin", "", true, "normal");
+        pending.id = "pending:B/renamed.bin".to_string();
+        index.add_file(pending);
+
+        let mut completed = file("B/renamed.bin", "dddddddddddddddddddddddddddddddd", false, "normal");
+        completed.friends_only = true;
+        let finalized = index
+            .finalize_pending_hash("pending:B/renamed.bin", completed)
+            .expect("pending row should still exist");
+        assert!(!finalized.shared, "an unshared hash stays unshared under its new path");
+        assert!(finalized.friends_only, "a restriction follows the content");
     }
 
     #[test]

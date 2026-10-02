@@ -299,6 +299,7 @@
     let unlistenClose: UnlistenFn | null = null;
     let unlistenConfigCorrupt: UnlistenFn | null = null;
     let unlistenDbCorrupt: UnlistenFn | null = null;
+    let unlistenKnownMet: UnlistenFn | null = null;
     let unlistenPolicyReset: UnlistenFn | null = null;
     let unlistenFoldersAdded: UnlistenFn | null = null;
     let unlistenFoldersFailed: UnlistenFn | null = null;
@@ -366,6 +367,14 @@
     })
       .then((fn) => { if (mounted) unlistenDbCorrupt = fn; else fn(); })
       .catch((e) => console.error('Failed to register db-corrupt listener:', e));
+
+    // known.met could not be read: nothing is published and only friends are
+    // uploaded to this session, which used to show nowhere but the log.
+    listen<{ reset?: boolean } | null>('known-met-unreadable', (event) => {
+      toastWarning(event.payload?.reset ? m.layout_known_met_reset() : m.layout_known_met_unreadable());
+    })
+      .then((fn) => { if (mounted) unlistenKnownMet = fn; else fn(); })
+      .catch((e) => console.error('Failed to register known-met listener:', e));
 
     // An eMule import staged before this launch was applied during startup.
     // Marked seen as it is read, so the notice shows once; the full report
@@ -706,6 +715,7 @@
       if (unlistenClose) unlistenClose();
       if (unlistenConfigCorrupt) unlistenConfigCorrupt();
       if (unlistenDbCorrupt) unlistenDbCorrupt();
+      if (unlistenKnownMet) unlistenKnownMet();
       if (unlistenPolicyReset) unlistenPolicyReset();
       if (unlistenFoldersAdded) unlistenFoldersAdded();
       if (unlistenFoldersFailed) unlistenFoldersFailed();

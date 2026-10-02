@@ -77,7 +77,7 @@ pub(super) use self::friend_relay_ticket_result::on_friend_relay_ticket_poll_res
 pub(super) use self::kad_callback::on_kad_callback_conn;
 pub(super) use self::kad_process_tick::on_kad_process_tick;
 pub(super) use self::kad_publish_tick::on_kad_publish_tick;
-pub(super) use self::known_met_save_tick::on_known_met_save_tick;
+pub(super) use self::known_met_save_tick::{on_known_met_save_tick, start_known_met_save};
 pub(super) use self::mapping_keepalive_tick::on_mapping_keepalive_tick;
 pub(super) use self::nat_probe_result::on_nat_probe_result;
 pub(super) use self::nodes_save_tick::on_nodes_save_tick;

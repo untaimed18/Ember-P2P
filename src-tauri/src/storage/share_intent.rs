@@ -273,7 +273,7 @@ impl ShareIntentStore {
     pub fn enter_fail_closed(&self) -> io::Result<()> {
         self.mutate(|state| {
             state.catalog_seen = true;
-            state.fail_closed = true;
+            note_fail_closed_entered(state);
             Ok(())
         })?;
         FORCE_UNSHARED.store(false, Ordering::Release);
@@ -435,7 +435,7 @@ fn absorb_known_catalog(data_dir: &Path, state: &mut PersistedShareIntent) {
         }
         Ok(_) => {
             if state.catalog_seen {
-                state.fail_closed = true;
+                note_fail_closed_entered(state);
             }
         }
         Err(error) => {
@@ -446,10 +446,28 @@ fn absorb_known_catalog(data_dir: &Path, state: &mut PersistedShareIntent) {
             // feature's first migration run.
             if known_existed || state.catalog_seen {
                 state.catalog_seen = true;
-                state.fail_closed = true;
+                note_fail_closed_entered(state);
             }
         }
     }
+}
+
+/// Set once this process has put sharing into fail-closed mode, for the
+/// notice that tells the user why their files are unshared.
+static FAIL_CLOSED_THIS_SESSION: AtomicBool = AtomicBool::new(false);
+
+fn note_fail_closed_entered(state: &mut PersistedShareIntent) {
+    if !state.fail_closed {
+        FAIL_CLOSED_THIS_SESSION.store(true, Ordering::Release);
+    }
+    state.fail_closed = true;
+}
+
+/// Whether this process lost the file catalog (damaged, or gone after it had
+/// been seen) and so began failing closed: no file is offered unless the user
+/// shared it themselves. Not set by a store already failing closed at launch.
+pub fn fail_closed_this_session() -> bool {
+    FAIL_CLOSED_THIS_SESSION.load(Ordering::Acquire)
 }
 
 fn persisted_store(

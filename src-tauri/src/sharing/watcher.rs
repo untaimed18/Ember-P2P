@@ -562,6 +562,21 @@ impl SharedFoldersWatcher {
             // installed while we were probing. `apply_watches` re-reads the
             // list itself once its probes are done.
             self.apply_watches(&desired);
+            // A watch reports changes from now on, not what the folder holds:
+            // one offline at launch was never indexed, and one that went away
+            // missed whatever changed meanwhile. Scan the newly watched roots,
+            // as `start` does for the first watches.
+            let returned: Vec<PathBuf> = self
+                .watched
+                .lock()
+                .iter()
+                .filter(|path| !watched_now.contains(*path))
+                .cloned()
+                .collect();
+            if !returned.is_empty() {
+                self.pending.lock().note_paths(returned);
+                let _ = self.reload_tx.try_send(());
+            }
         }
     }
 

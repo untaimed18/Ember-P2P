@@ -103,6 +103,7 @@ const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     "folder_priorities",
     "pending_share_states",
     "pending_file_priorities",
+    "pending_friends_only",
     "pending_folder_allowlists",
     "withheld_folder_files",
     "shared_folder_scan_cursors",
@@ -671,6 +672,9 @@ fn prune_removed_shared_folder_state(
         .pending_file_priorities
         .retain(|path, _| !is_under_removed_root(path));
     settings
+        .pending_friends_only
+        .retain(|path| !is_under_removed_root(path));
+    settings
         .pending_folder_allowlists
         .retain(|folder, _| !is_under_removed_root(folder));
     settings
@@ -913,15 +917,11 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         let canonical = path.canonicalize().ok();
         let scan_paths = std::iter::once(path.to_path_buf()).chain(canonical);
         for scan_path in scan_paths {
-            for component in scan_path.components() {
-                if let std::path::Component::Normal(seg) = component {
-                    if crate::sharing::is_sensitive_dir_name(&seg.to_string_lossy()) {
-                        tracing::warn!(
-                            "Removing shared folder with sensitive path segment on load: {folder}"
-                        );
-                        return false;
-                    }
-                }
+            if crate::sharing::path_has_sensitive_component(&scan_path) {
+                tracing::warn!(
+                    "Removing shared folder with sensitive path segment on load: {folder}"
+                );
+                return false;
             }
         }
         true
@@ -1225,16 +1225,12 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         let canonical = path.canonicalize().ok();
         let scan_paths = std::iter::once(path.to_path_buf()).chain(canonical);
         for scan_path in scan_paths {
-            for component in scan_path.components() {
-                if let std::path::Component::Normal(seg) = component {
-                    if crate::sharing::is_sensitive_dir_name(&seg.to_string_lossy()) {
-                        return Err(coded_ctx(
-                            "settings_download_folder_system_dir",
-                            "Cannot use system directory as download folder",
-                            &settings.download_folder,
-                        ));
-                    }
-                }
+            if crate::sharing::path_has_sensitive_component(&scan_path) {
+                return Err(coded_ctx(
+                    "settings_download_folder_system_dir",
+                    "Cannot use system directory as download folder",
+                    &settings.download_folder,
+                ));
             }
         }
     }
@@ -1294,16 +1290,12 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         let canonical = path.canonicalize().ok();
         let scan_paths = std::iter::once(path.to_path_buf()).chain(canonical.clone());
         for scan_path in scan_paths {
-            for component in scan_path.components() {
-                if let std::path::Component::Normal(seg) = component {
-                    if crate::sharing::is_sensitive_dir_name(&seg.to_string_lossy()) {
-                        return Err(coded_ctx(
-                            "settings_shared_folder_system_dir",
-                            "Cannot share system directory",
-                            folder,
-                        ));
-                    }
-                }
+            if crate::sharing::path_has_sensitive_component(&scan_path) {
+                return Err(coded_ctx(
+                    "settings_shared_folder_system_dir",
+                    "Cannot share system directory",
+                    folder,
+                ));
             }
         }
         // Refuse Ember's own data directory (or a parent that covers it).

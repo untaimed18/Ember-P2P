@@ -282,6 +282,26 @@ pub(in crate::network) async fn on_download_event(
                 .filter(|name| !name.is_empty())
                 .unwrap_or(sanitized_name);
             let now = chrono::Utc::now().timestamp();
+            // The file's own modification time, read as discovery reads it.
+            // `Completed` arrives after a full-file verification and the move,
+            // so the clock is ahead of the file by however long those took;
+            // recorded as `now`, neither the path lookup nor the name fallback
+            // matched it, and every completed download in a shared folder was
+            // read again in full at the next scan.
+            let completed_mtime = {
+                let path = completed_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    std::fs::symlink_metadata(&path)
+                        .ok()
+                        .and_then(|meta| meta.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                })
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(now)
+            };
 
             if let Ok(hash_bytes) = hex::decode(&file_hash) {
                 if hash_bytes.len() == 16 {
@@ -390,7 +410,7 @@ pub(in crate::network) async fn on_download_event(
                             }
                             ember_hex
                         },
-                        modified_at: now,
+                        modified_at: completed_mtime,
                         // The dropped `_transferred` field on the
                         // completed-download snapshot is this
                         // transfer's *downloaded* byte count, not
@@ -468,6 +488,17 @@ pub(in crate::network) async fn on_download_event(
                     known_files.add_or_update(record.clone());
                     if completed_friends_only {
                         sync_shared_friends_only_hashes(shared_friends_only_hashes, known_files);
+                        // Saved now, as `SetFilesFriendsOnly` does, rather than
+                        // by the 120s writer: until then nothing else holds the
+                        // restriction, and a crash in between had the file,
+                        // already in a shared folder, rehashed as public and
+                        // published on the next start.
+                        //
+                        // Started by the loop right after this event, through
+                        // the periodic writer's own path, or the moment a save
+                        // already running reports back. Waiting for the lock
+                        // here stalled every network event behind that save.
+                        state.known_met_save_soon = true;
                     }
 
                     // Auto-share completed download (eMule: CPartFile::PerformFileCompleteEnd)
@@ -486,7 +517,7 @@ pub(in crate::network) async fn on_download_event(
                         aich_hash: record.aich_hash.clone(),
                         ember_file_hash: record.ember_file_hash.clone(),
                         extension: ext,
-                        modified_at: now,
+                        modified_at: completed_mtime,
                         priority: existing
                             .as_ref()
                             .map(|record| {

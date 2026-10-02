@@ -1711,6 +1711,12 @@ pub struct AppSettings {
     /// separately from folder defaults because an explicit action must win.
     #[serde(default)]
     pub pending_file_priorities: std::collections::HashMap<String, String>,
+    /// Files restricted to friends while they were still hashing. Normalized
+    /// paths. Until the hash lands nothing else holds the restriction, so a
+    /// restart in between brought the file up public; applied like the two
+    /// above, and dropped once `known.met` has the record.
+    #[serde(default)]
+    pub pending_friends_only: std::collections::HashSet<String>,
     /// Folders shared by dropping specific files: later newly-seen files in
     /// that folder stay unshared until chosen. Keys are normalized folder
     /// paths; values are the normalized file paths that should be shared.
@@ -2298,6 +2304,7 @@ impl Default for AppSettings {
             folder_priorities: std::collections::HashMap::new(),
             pending_share_states: std::collections::HashMap::new(),
             pending_file_priorities: std::collections::HashMap::new(),
+            pending_friends_only: std::collections::HashSet::new(),
             pending_folder_allowlists: std::collections::HashMap::new(),
             withheld_folder_files: std::collections::HashMap::new(),
             shared_folder_scan_cursors: std::collections::HashMap::new(),

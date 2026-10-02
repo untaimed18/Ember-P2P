@@ -1,5 +1,4 @@
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
@@ -12,6 +11,16 @@ use crate::types::FileInfo;
 pub struct FileIndexer;
 
 const MAX_DISCOVERED_FILES: usize = 100_000;
+/// eMule's `MAX_EMULE_FILE_SIZE`: 256 GiB, the largest file eD2K can carry.
+const MAX_EMULE_FILE_SIZE: u64 = 0x40_0000_0000;
+
+/// Whether discovery offers a file of `size` bytes. eMule's shared walk skips
+/// both ends (`CSharedFileList`): an empty file is the same 31D6CFE0… hash for
+/// every one of them, offered to servers as if it were content, and past
+/// 256 GiB no eD2K client can transfer it.
+fn shareable_size(size: u64) -> bool {
+    size > 0 && size <= MAX_EMULE_FILE_SIZE
+}
 /// Upper bound on the directory frontier (`pending`) during discovery.
 ///
 /// `MAX_DISCOVERED_FILES` bounds the returned page, but the globally sorted
@@ -39,8 +48,9 @@ pub struct DirectoryMeasure {
 #[derive(Debug, Default)]
 pub struct DiscoveryResult {
     pub files: Vec<FileInfo>,
-    /// The folder holds more than `MAX_DISCOVERED_FILES`, so this page stopped
-    /// at the cap. This is the only condition worth telling the user about.
+    /// This page stopped short of the folder's end and `next_cursor` resumes
+    /// after it: at the file cap, or at the frontier's gap. Only the first is
+    /// worth telling the user about; see [`Self::reached_file_cap`].
     pub truncated: bool,
     /// This page does not represent the whole folder — either it hit the cap or
     /// it resumed from a cursor and therefore skipped everything before it.
@@ -58,6 +68,21 @@ pub struct DiscoveryResult {
     /// Subfolders that could not be listed. What they hold is unknown, not
     /// gone: rows under them must not be reconciled away against this page.
     pub unreadable: Vec<String>,
+}
+
+impl DiscoveryResult {
+    /// The folder holds more than `MAX_DISCOVERED_FILES`, so this page
+    /// stopped at the cap: the "only the first N files" notice. A page that
+    /// stopped at the frontier's gap is truncated too, with fewer.
+    pub fn reached_file_cap(&self) -> bool {
+        self.truncated && self.files.len() >= MAX_DISCOVERED_FILES
+    }
+
+    /// Nothing of the folder was seen: it could not be read, or was refused.
+    /// Such a page says nothing about where its paging stands.
+    pub fn saw_nothing(&self) -> bool {
+        self.frontier_trimmed && self.files.is_empty() && self.next_cursor.is_none()
+    }
 }
 
 /// Whether an allowlist of `normalize_path_key` forms offers the file or
@@ -339,12 +364,8 @@ fn canonical_data_dir() -> &'static Path {
 /// True when any component of `path` is a directory discovery refuses to
 /// descend into, or the path lives under our own data directory.
 pub fn is_excluded_share_location(path: &Path) -> bool {
-    for component in path.components() {
-        if let std::path::Component::Normal(name) = component {
-            if crate::sharing::is_index_skip_dir_name(&name.to_string_lossy()) {
-                return true;
-            }
-        }
+    if crate::sharing::path_has_index_skip_component(path) {
+        return true;
     }
     let data_canon = canonical_data_dir();
     if let Ok(canonical) = path.canonicalize() {
@@ -380,6 +401,48 @@ fn walk_skips_metadata(_metadata: &std::fs::Metadata) -> bool {
 /// cursor is past the directory and not inside it.
 fn subtree_sorts_before_cursor(dir_key: &str, cursor: &str) -> bool {
     cursor > dir_key && !cursor.starts_with(dir_key)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lets a test walk a directory small enough to create past the cap.
+    static FRONTIER_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_PENDING_FRONTIER) };
+}
+
+fn frontier_cap() -> usize {
+    #[cfg(test)]
+    {
+        FRONTIER_CAP.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        MAX_PENDING_FRONTIER
+    }
+}
+
+/// Queue a discovery entry, keeping the frontier at [`MAX_PENDING_FRONTIER`]
+/// by letting the largest key go, and lowering `dropped_floor` to the smallest
+/// key let go so far: the walk must not emit anything at or past it.
+fn insert_bounded(
+    pending: &mut BTreeMap<String, (std::path::PathBuf, bool)>,
+    dropped_floor: &mut Option<String>,
+    key: String,
+    path: std::path::PathBuf,
+    is_directory: bool,
+) {
+    let dropped = if pending.len() < frontier_cap() {
+        pending.insert(key, (path, is_directory));
+        return;
+    } else if pending.last_key_value().is_some_and(|(largest, _)| *largest > key) {
+        let (largest, _) = pending.pop_last().expect("the frontier is full");
+        pending.insert(key, (path, is_directory));
+        largest
+    } else {
+        key
+    };
+    if dropped_floor.as_ref().is_none_or(|floor| dropped < *floor) {
+        *dropped_floor = Some(dropped);
+    }
 }
 
 /// How long a file has to go unmodified before a rescan hashes it. Another
@@ -452,7 +515,80 @@ pub enum ScopedDiscovery {
     Skip,
 }
 
+/// The AICH top-up's MD4 found a file whose bytes are not the content
+/// `known.met` files it under, although its size and modification time are
+/// unchanged (an editor that rewrites in place and keeps the time). Carries
+/// what the read computed, so the row can take its real identity instead of
+/// going on advertising one its bytes no longer match.
+#[derive(Debug)]
+pub struct ContentChanged {
+    pub path: String,
+    pub stored_ed2k: String,
+    pub ed2k: String,
+    pub aich: String,
+    /// Only when this read was asked for it; the stored one describes the old
+    /// content, so `None` means "not known yet", not "keep the record's".
+    pub ember: Option<String>,
+    pub part_hashes: Vec<[u8; 16]>,
+    pub size: u64,
+    pub modified_at: i64,
+}
+
+impl std::fmt::Display for ContentChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} hashes to {} but known.met has {}",
+            self.path, self.ed2k, self.stored_ed2k
+        )
+    }
+}
+
+impl std::error::Error for ContentChanged {}
+
 impl FileIndexer {
+    /// The refusal for a shared root whose approval no longer matches what
+    /// sits at the path: another drive under the same letter or mount point,
+    /// or the folder swapped for a link to somewhere else. Uploads already
+    /// refused such a root, but discovery walked it, so whatever had taken its
+    /// place was hashed and announced before anything was asked. Shaped like
+    /// an unreachable root, so its existing rows are kept rather than
+    /// reconciled away, and nothing new comes in until it is re-approved.
+    ///
+    /// `None`, walk it, while there is no registry: before startup installs
+    /// one, and in tests. A missing root is left to the walk, which already
+    /// treats it as unreachable. Blocking.
+    pub fn refuse_unapproved_root(dir: &str) -> Option<DiscoveryResult> {
+        // The registry is process-wide, so one test installing it for its own
+        // roots made every other test's scratch folder unapproved.
+        if cfg!(test) {
+            return None;
+        }
+        let registry = crate::security::filesystem::approved_roots().ok()?;
+        let path = Path::new(dir);
+        if std::fs::symlink_metadata(path).is_err() {
+            return None;
+        }
+        let error = registry.verify_root(path).err()?;
+        warn!("Not scanning shared folder {dir} until it is re-approved: {error}");
+        Some(DiscoveryResult {
+            partial: true,
+            frontier_trimmed: true,
+            ..DiscoveryResult::default()
+        })
+    }
+
+    /// [`Self::discover_directory_page_in`] for a shared root, refused while
+    /// the root is not approved; see [`Self::refuse_unapproved_root`].
+    pub fn discover_root_page_in(
+        root: &str,
+        cursor: Option<&str>,
+        scope: Option<&DiscoveryScope>,
+    ) -> DiscoveryResult {
+        Self::refuse_unapproved_root(root)
+            .unwrap_or_else(|| Self::discover_directory_page_in(root, cursor, scope))
+    }
+
     /// Resolve one event path under `roots` the way a full walk of its root
     /// would see it. Blocking.
     ///
@@ -472,6 +608,11 @@ impl FileIndexer {
         let Some(root) = innermost_root(roots, &path.to_string_lossy()) else {
             return ScopedDiscovery::Skip;
         };
+        // Neither found nor removed: an unapproved root is unreachable until
+        // re-approved, as for a full pass.
+        if Self::refuse_unapproved_root(&root.to_string_lossy()).is_some() {
+            return ScopedDiscovery::Skip;
+        }
         let below = components_below(root, path);
         let respelled = if below.as_os_str().is_empty() {
             root.to_path_buf()
@@ -539,6 +680,7 @@ impl FileIndexer {
             return ScopedDiscovery::Removed;
         }
         match Self::discover_file(path) {
+            Ok(info) if !shareable_size(info.size) => ScopedDiscovery::Removed,
             Ok(info) => ScopedDiscovery::Found {
                 files: vec![info],
                 partial: false,
@@ -615,8 +757,18 @@ impl FileIndexer {
         // tree no longer carries, for the same reason) — it produces a globally
         // ordered stream, which is what makes an early page cutoff safe without
         // dropping files between cursor pages.
-        let mut pending: BinaryHeap<Reverse<(String, std::path::PathBuf, bool)>> =
-            BinaryHeap::new();
+        //
+        // Ordered like a min-heap but bounded from the top: at the frontier cap
+        // the largest key is the one let go, so what stays is always the
+        // smallest keys seen, and `dropped_floor` marks where the first gap
+        // begins. Nothing at or past it is emitted, so a page never skips an
+        // entry it should have listed; it ends just before, truncated, and the
+        // next page resumes from its cursor. Stopping the read at the cap
+        // instead lost every entry of a 200k+ folder past the cap, on every
+        // page, for good, and marked each such page trimmed, so the paged
+        // cycle that removes deleted files could never complete.
+        let mut pending: BTreeMap<String, (std::path::PathBuf, bool)> = BTreeMap::new();
+        let mut dropped_floor: Option<String> = None;
         // A root that exists but cannot be listed (a network share dropping,
         // access revoked) is as unreachable as a missing one.
         if let Err(error) = std::fs::read_dir(path) {
@@ -631,10 +783,12 @@ impl FileIndexer {
             };
         }
 
+        // Returns false when `directory` cannot be listed.
         let enqueue_children = |directory: &Path,
-                                pending: &mut BinaryHeap<
-            Reverse<(String, std::path::PathBuf, bool)>,
-        >| {
+                                pending: &mut BTreeMap<String, (std::path::PathBuf, bool)>,
+                                dropped_floor: &mut Option<String>,
+                                saw_before_cursor: &mut bool|
+         -> bool {
             let entries = match std::fs::read_dir(directory) {
                 Ok(entries) => entries,
                 Err(error) => {
@@ -642,17 +796,10 @@ impl FileIndexer {
                         "Failed to read shared directory {}: {error}",
                         directory.display()
                     );
-                    return None;
+                    return false;
                 }
             };
-            let mut trimmed = false;
             for entry in entries {
-                if pending.len() >= MAX_PENDING_FRONTIER {
-                    // Stop growing the frontier; the caller marks the page
-                    // `partial` so nothing is reconciled away against it.
-                    trimmed = true;
-                    break;
-                }
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
@@ -696,21 +843,44 @@ impl FileIndexer {
                         }
                     }
                     key.push(std::path::MAIN_SEPARATOR);
-                    pending.push(Reverse((key, entry_path, true)));
+                    // Skipped here rather than when popped: queued, entries
+                    // before the cursor took frontier room on every resumed
+                    // page, crowding out the ones the page resumed for.
+                    if cursor.is_some_and(|value| subtree_sorts_before_cursor(&key, value)) {
+                        *saw_before_cursor = true;
+                        continue;
+                    }
+                    insert_bounded(pending, dropped_floor, key, entry_path, true);
                 } else if file_type.is_file() {
                     let key = normalize_path_key(&entry_path.to_string_lossy());
                     if scope.is_some_and(|scope| !scope.admits_file(&key)) {
                         continue;
                     }
-                    pending.push(Reverse((key, entry_path, false)));
+                    if cursor.is_some_and(|value| key.as_str() <= value) {
+                        *saw_before_cursor = true;
+                        continue;
+                    }
+                    insert_bounded(pending, dropped_floor, key, entry_path, false);
                 }
             }
-            Some(trimmed)
+            true
         };
-        let mut frontier_trimmed = enqueue_children(path, &mut pending).unwrap_or(true);
+        let mut frontier_trimmed =
+            !enqueue_children(path, &mut pending, &mut dropped_floor, &mut saw_before_cursor);
         let mut unreadable = Vec::new();
+        let mut stopped_at_gap = false;
+        // The last entry this page dealt with, emitted or not. Where a page
+        // stops at the gap, its cursor: an emitted file alone cannot be, as a
+        // run of entries that emit nothing (empty folders, zero-byte files)
+        // longer than the frontier would end every page before its first
+        // file, and with no cursor each scan restarted and stopped there.
+        let mut last_processed: Option<String> = None;
 
-        while let Some(Reverse((key, entry_path, is_directory))) = pending.pop() {
+        while let Some((key, (entry_path, is_directory))) = pending.pop_first() {
+            if dropped_floor.as_ref().is_some_and(|floor| key >= *floor) {
+                stopped_at_gap = true;
+                break;
+            }
             if is_directory {
                 // A full page cannot take more files, so descending further only
                 // grows the frontier. Stop and report the cap: the next scan
@@ -725,13 +895,19 @@ impl FileIndexer {
                     saw_before_cursor = true;
                     continue;
                 }
-                match enqueue_children(&entry_path, &mut pending) {
-                    Some(trimmed) => frontier_trimmed |= trimmed,
-                    None => unreadable.push(entry_path.to_string_lossy().into_owned()),
+                if !enqueue_children(
+                    &entry_path,
+                    &mut pending,
+                    &mut dropped_floor,
+                    &mut saw_before_cursor,
+                ) {
+                    unreadable.push(entry_path.to_string_lossy().into_owned());
                 }
+                last_processed = Some(key);
                 continue;
             }
             if is_excluded_share_file_name(&entry_path) {
+                last_processed = Some(key);
                 continue;
             }
             // Decided on the key the entry was queued under, before any stat:
@@ -753,6 +929,7 @@ impl FileIndexer {
                 break;
             }
             match Self::discover_file(&entry_path) {
+                Ok(info) if !shareable_size(info.size) => {}
                 Ok(info) => {
                     debug!("Discovered: {}", info.name);
                     files.push(info);
@@ -761,6 +938,13 @@ impl FileIndexer {
                     warn!("Failed to discover {}: {error}", entry_path.display());
                 }
             }
+            last_processed = Some(key);
+        }
+        // Emptied without reaching the gap: everything kept emitted nothing
+        // (empty folders, excluded names), and what was let go is still
+        // unvisited. Not a complete listing.
+        if pending.is_empty() && dropped_floor.is_some() && !truncated {
+            stopped_at_gap = true;
         }
 
         // A non-initial page necessarily omits every entry before its cursor,
@@ -772,17 +956,28 @@ impl FileIndexer {
         // folder, costing an extra full re-walk before the cursor could reset.
         // A trimmed frontier also means entries were never visited, so the page
         // is not an authoritative listing of the folder either.
-        let partial = truncated || frontier_trimmed || (cursor.is_some() && saw_before_cursor);
-        let next_cursor = truncated
-            .then(|| files.last().map(|file| normalize_path_key(&file.path)))
-            .flatten();
-        if frontier_trimmed {
+        if stopped_at_gap {
+            if last_processed.is_none() {
+                // No cursor to resume from: fall back to what a full frontier
+                // always meant, a page that settles nothing.
+                frontier_trimmed = true;
+            } else {
+                truncated = true;
+            }
             warn!(
-                "Discovery in {dir} hit the {MAX_PENDING_FRONTIER}-entry traversal \
-                 limit; this page is partial"
+                "Discovery in {dir} held more than {MAX_PENDING_FRONTIER} pending entries; \
+                 this page ends before the first one it had to let go"
             );
         }
-        if truncated {
+        let partial = truncated || frontier_trimmed || (cursor.is_some() && saw_before_cursor);
+        let next_cursor = if stopped_at_gap {
+            last_processed
+        } else {
+            truncated
+                .then(|| files.last().map(|file| normalize_path_key(&file.path)))
+                .flatten()
+        };
+        if truncated && !stopped_at_gap {
             warn!(
                 "Discovery page in {dir} reached file cap {MAX_DISCOVERED_FILES}; a later scan resumes after {}",
                 next_cursor.as_deref().unwrap_or_default()
@@ -884,7 +1079,9 @@ impl FileIndexer {
                     }
                     stack.push(entry_path);
                 } else if file_type.is_file() {
-                    if is_excluded_share_file_name(&entry_path) {
+                    if is_excluded_share_file_name(&entry_path)
+                        || metadata.as_ref().is_some_and(|metadata| !shareable_size(metadata.len()))
+                    {
                         continue;
                     }
                     measure.files += 1;
@@ -1061,12 +1258,27 @@ impl FileIndexer {
                 &mut file, want, cancelled, progress,
             )?;
             if digests.ed2k != known_ed2k {
-                anyhow::bail!(
-                    "refusing to record an AICH root for {}: contents hash to {} but known.met has {}",
-                    path.display(),
-                    digests.ed2k,
-                    known_ed2k
-                );
+                // Nothing is recorded against the old id, but the file is not
+                // left advertising it either: the caller gets what the bytes
+                // actually are, and the size and time they were read at.
+                let after = std::fs::symlink_metadata(path)?;
+                let after_modified = after.modified().ok();
+                if before.len() != after.len() || before_modified != after_modified {
+                    anyhow::bail!("file changed while hashing: {}", path.display());
+                }
+                return Err(anyhow::Error::new(ContentChanged {
+                    path: path.display().to_string(),
+                    stored_ed2k: known_ed2k,
+                    ed2k: digests.ed2k,
+                    aich: digests.aich.map(hex::encode).unwrap_or_default(),
+                    ember: digests.ember.map(hex::encode),
+                    part_hashes: digests.part_hashes,
+                    size: after.len(),
+                    modified_at: after_modified
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_secs() as i64)
+                        .unwrap_or(0),
+                }));
             }
             (
                 digests.aich.map(hex::encode).unwrap_or(known_aich),
@@ -1104,6 +1316,30 @@ impl FileIndexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full frontier keeps the smallest keys, whatever order they arrive
+    /// in, and remembers the smallest it let go: the walk stops there, so a
+    /// page ends at a gap instead of skipping over it.
+    #[test]
+    fn a_full_frontier_keeps_the_smallest_keys_and_marks_the_gap() {
+        let mut pending = BTreeMap::new();
+        let mut floor = None;
+        for i in (0..MAX_PENDING_FRONTIER).rev() {
+            insert_bounded(&mut pending, &mut floor, format!("k{:07}", i + 10), "p".into(), false);
+        }
+        assert!(floor.is_none(), "nothing let go below the cap");
+
+        let largest = format!("k{:07}", MAX_PENDING_FRONTIER - 1 + 10);
+        insert_bounded(&mut pending, &mut floor, "k0000001".to_string(), "p".into(), false);
+        assert_eq!(pending.len(), MAX_PENDING_FRONTIER);
+        assert!(pending.contains_key("k0000001"), "a smaller key displaces the largest");
+        assert!(!pending.contains_key(&largest));
+        assert_eq!(floor.as_deref(), Some(largest.as_str()));
+
+        insert_bounded(&mut pending, &mut floor, "z".to_string(), "p".into(), false);
+        assert!(!pending.contains_key("z"), "a key past every queued one is let go itself");
+        assert_eq!(floor.as_deref(), Some(largest.as_str()), "the floor is the smallest let go");
+    }
 
     /// The digest the migration writes is what a download later verifies
     /// against, so the short-cut pass has to agree with the full one byte for
@@ -1217,10 +1453,18 @@ mod tests {
             &flag,
             &AtomicU64::new(0),
         );
-        assert!(
-            refused.is_err(),
-            "an AICH root must never be recorded against contents that hash to something else"
+        let refused = refused.expect_err(
+            "an AICH root must never be recorded against contents that hash to something else",
         );
+        // But what the bytes are comes back, so the row can stop advertising
+        // an id they no longer have.
+        let changed = refused
+            .downcast_ref::<ContentChanged>()
+            .expect("a mismatch reports the content it found");
+        assert_eq!(changed.ed2k, ed2k);
+        assert_eq!(changed.aich, aich);
+        assert_eq!(changed.part_hashes, parts);
+        assert_eq!(changed.ember, None, "not asked for, so not known");
 
         // A root recovered on its own must hand the stored digest back
         // untouched, not blank it. The scan consumer assigns this tuple
@@ -1336,6 +1580,39 @@ mod tests {
             resumed.files.iter().map(|f| normalize_path_key(&f.path)).collect();
         assert_eq!(resumed_keys, keys[3..].to_vec());
         assert!(resumed.partial, "a resumed page omits its prefix");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// More entries that yield no file (empty folders here) than the frontier
+    /// holds, ahead of the only file. No page may claim to be the whole
+    /// folder before reaching it, and each must resume past the last; one
+    /// that ended with no cursor sent every scan back to the start.
+    #[test]
+    fn a_run_of_empty_entries_longer_than_the_frontier_is_paged_past() {
+        let root = scratch_tree("gap");
+        for i in 0..10 {
+            std::fs::create_dir_all(root.join(format!("e{i}"))).unwrap();
+        }
+        std::fs::write(root.join("f.bin"), b"x").unwrap();
+        let root_str = root.to_string_lossy().to_string();
+        FRONTIER_CAP.with(|cap| cap.set(4));
+
+        let mut cursor: Option<String> = None;
+        let mut found = false;
+        for _ in 0..10 {
+            let page = FileIndexer::discover_directory_page_in(&root_str, cursor.as_deref(), None);
+            if !page.files.is_empty() {
+                assert!(page.files.iter().all(|f| f.path.ends_with("f.bin")));
+                found = true;
+                break;
+            }
+            assert!(page.partial, "a page short of the file is not the whole folder");
+            let next = page.next_cursor.expect("a page that stops early says where to resume");
+            assert!(cursor.as_ref().is_none_or(|previous| next > *previous), "pages move forward");
+            cursor = Some(next);
+        }
+        FRONTIER_CAP.with(|cap| cap.set(MAX_PENDING_FRONTIER));
+        assert!(found, "the file after the run is reached");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -5338,13 +5338,13 @@ async fn handle_command_inner(
                 };
                 let mut hash = [0u8; 16];
                 hash.copy_from_slice(&hash_bytes);
-                if known_files.find_by_hash(&hash).is_none() {
-                    let _ = tx.send(Err(format!(
-                        "No known.met record for file hash {file_hash_hex}"
-                    )));
-                    return;
+                // A file a running scan has just hashed gets its record only at
+                // that scan's reconcile, which seeds the priority from the
+                // index row the command already changed. Refusing it failed
+                // the whole batch for every file hashed since the scan began.
+                if known_files.find_by_hash(&hash).is_some() {
+                    parsed.push(hash);
                 }
-                parsed.push(hash);
             }
             if !parsed.is_empty() {
                 let before = known_files.clone();
@@ -5653,6 +5653,16 @@ async fn handle_command_inner(
             let _ = tx.send(result);
         }
 
+        NetworkCommand::ForgetKnownPaths { paths } => {
+            let forgotten = known_files.forget_paths(&paths);
+            debug!("known.met forgot {forgotten} of {} gone paths", paths.len());
+        }
+
+        NetworkCommand::ForgetKnownPathsUnder { root, keep_roots } => {
+            let forgotten = known_files.forget_paths_under(&root, &keep_roots);
+            debug!("known.met forgot {forgotten} paths under a removed folder");
+        }
+
         NetworkCommand::SetFilesFriendsOnly { updates, tx } => {
             let mut parsed = Vec::with_capacity(updates.len());
             let mut error = None;
@@ -5661,11 +5671,10 @@ async fn handle_command_inner(
                     Ok(bytes) if bytes.len() == 16 => {
                         let mut hash = [0u8; 16];
                         hash.copy_from_slice(&bytes);
-                        if known_files.find_by_hash(&hash).is_none() {
-                            error =
-                                Some(format!("No known.met record for file hash {file_hash_hex}"));
-                            break;
-                        }
+                        // No record yet: a file a running scan has just hashed.
+                        // Its reconcile ORs in the index row's scope, which the
+                        // command already set, and both upload and publishing
+                        // read that row meanwhile; see `SetUploadPriorities`.
                         parsed.push((hash, friends_only));
                     }
                     Ok(bytes) => {
@@ -5686,12 +5695,16 @@ async fn handle_command_inner(
                 return;
             }
             let before = known_files.clone();
+            let mut unrecorded = Vec::new();
             for (hash, friends_only) in &parsed {
                 if let Some(record) = known_files.find_by_hash_mut(hash) {
                     record.friends_only = *friends_only;
+                } else {
+                    unrecorded.push(hex::encode(hash));
                 }
             }
-            if !parsed.is_empty() {
+            // Nothing to save when no hash had a record.
+            if parsed.len() > unrecorded.len() {
                 known_files.mark_dirty();
                 // Persist before acknowledging, exactly as SetFilesShared
                 // does. Restricting a file to friends is a privacy decision:
@@ -5726,7 +5739,7 @@ async fn handle_command_inner(
                 }
             }
             sync_shared_friends_only_hashes(shared_friends_only_hashes, known_files);
-            let _ = tx.send(Ok(parsed.len()));
+            let _ = tx.send(Ok(unrecorded));
         }
 
         NetworkCommand::UnpublishEmberFiles { file_hashes, tx } => {
@@ -6179,12 +6192,8 @@ async fn handle_command_inner(
             file_hash,
             rating,
             comment,
+            tx,
         } => {
-            state.comment_manager.write().await.set_our_comment(
-                &file_hash,
-                rating,
-                comment.clone(),
-            );
             // `save_file_comment` is a synchronous `rusqlite` write behind
             // `Database`'s `Mutex<Connection>`, so calling it on this thread
             // held the runtime worker running this loop for however long
@@ -6200,15 +6209,34 @@ async fn handle_command_inner(
             // the right answer was gone.
             let comment_db = db.clone();
             let comment_hash = file_hash.clone();
+            let saved_comment = comment.clone();
             let saved = tokio::task::spawn_blocking(move || {
-                if let Err(e) = comment_db.save_file_comment(&comment_hash, rating, &comment) {
-                    warn!("Failed to save comment for {comment_hash}: {e}");
-                }
+                comment_db.save_file_comment(&comment_hash, rating, &saved_comment)
             })
             .await;
-            if let Err(e) = saved {
-                warn!("Comment persistence task for {file_hash} failed: {e}");
-            }
+            // Reported rather than only logged: the Library shows "Saved" on
+            // success, and a comment that never reached the database is gone
+            // after a restart. Taken into memory only once saved, so what the
+            // app shows and shares is what a restart will have.
+            let result = match saved {
+                Ok(Ok(())) => {
+                    state
+                        .comment_manager
+                        .write()
+                        .await
+                        .set_our_comment(&file_hash, rating, comment);
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    warn!("Failed to save comment for {file_hash}: {e}");
+                    Err(format!("Failed to save comment: {e}"))
+                }
+                Err(e) => {
+                    warn!("Comment persistence task for {file_hash} failed: {e}");
+                    Err(format!("Comment persistence task failed: {e}"))
+                }
+            };
+            let _ = tx.send(result);
         }
 
         NetworkCommand::GetFileComments { file_hash, tx } => {

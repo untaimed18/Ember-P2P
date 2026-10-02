@@ -3512,6 +3512,73 @@ impl AbuseTracker {
     }
 }
 
+/// How many clients wait in the upload queue for each file, which is what an
+/// Auto priority goes by. Counted on first use, so a queue whose files have
+/// no Auto priority costs nothing.
+pub(crate) struct QueuedPerFile<'q> {
+    queue: &'q [QueueEntry],
+    counts: std::cell::OnceCell<HashMap<[u8; 16], usize>>,
+}
+
+fn count_files(file_hashes: impl Iterator<Item = [u8; 16]>) -> HashMap<[u8; 16], usize> {
+    let mut counts = HashMap::new();
+    for file_hash in file_hashes {
+        *counts.entry(file_hash).or_insert(0) += 1;
+    }
+    counts
+}
+
+impl QueuedPerFile<'static> {
+    /// From the file of each queued row, for a caller holding a copy of the
+    /// queue rather than the queue.
+    pub(crate) fn of_files(file_hashes: impl Iterator<Item = [u8; 16]>) -> Self {
+        let counts = std::cell::OnceCell::new();
+        let _ = counts.set(count_files(file_hashes));
+        Self { queue: &[], counts }
+    }
+}
+
+impl<'q> QueuedPerFile<'q> {
+    pub(crate) fn new(queue: &'q [QueueEntry]) -> Self {
+        Self {
+            queue,
+            counts: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn count(&self, file_hash: &[u8; 16]) -> usize {
+        self.counts().get(file_hash).copied().unwrap_or(0)
+    }
+
+    fn counts(&self) -> &HashMap<[u8; 16], usize> {
+        self.counts
+            .get_or_init(|| count_files(self.queue.iter().map(|entry| entry.file_hash)))
+    }
+
+    /// The priority a file of `priority` is scored at; see
+    /// [`effective_priority`].
+    fn resolve<'p>(&self, priority: &'p str, file_hash: &[u8; 16]) -> &'p str {
+        if priority == "auto" {
+            effective_priority(priority, self.count(file_hash))
+        } else {
+            priority
+        }
+    }
+}
+
+/// eMule's Auto upload priority (`CKnownFile::UpdateAutoUpPriority`): Low
+/// with more than 20 clients queued for the file, Normal with more than one,
+/// High otherwise, so a file few people want gets to them sooner. Scored as
+/// Normal before, whatever its demand. Other priorities are as set.
+pub(crate) fn effective_priority(priority: &str, queued: usize) -> &str {
+    match priority {
+        "auto" if queued > 20 => "low",
+        "auto" if queued > 1 => "normal",
+        "auto" => "high",
+        other => other,
+    }
+}
+
 /// eMule file priority to score multiplier, matching GetFilePrioAsNumber()/10.
 pub(crate) fn priority_weight(priority: &str) -> f64 {
     match priority {
@@ -3552,9 +3619,11 @@ fn peer_ip_u32(current_addr: Option<SocketAddr>) -> u32 {
 /// eMule `GetCombinedFilePrioAndCredit` — wait-independent soft-zone ranking:
 /// `10 * credit_ratio * GetFilePrioAsNumber()`. Friends with a verified friend
 /// slot bypass soft-zone checks entirely (caller responsibility).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn combined_file_prio_and_credit(
     cm: &CreditManager,
     idx: &LocalIndex,
+    queued: &QueuedPerFile<'_>,
     user_hash: &[u8; 16],
     file_hash: [u8; 16],
     peer_ip: u32,
@@ -3563,7 +3632,7 @@ pub(crate) fn combined_file_prio_and_credit(
 ) -> f64 {
     let prio_num = idx
         .get_by_hash(&hex::encode(file_hash))
-        .map(|f| file_prio_as_number(&f.priority))
+        .map(|f| file_prio_as_number(queued.resolve(&f.priority, &file_hash)))
         .unwrap_or(7) as f64;
     // BadGuy short-circuit via eMule path (same as score_queue_entry).
     if matches!(
@@ -3591,7 +3660,8 @@ pub(crate) fn soft_zone_should_admit(
 /// Consistent eMule-style queue score for a single entry.
 /// All code paths that compare or rank queue entries MUST use this function
 /// to avoid scoring asymmetry (eMule version penalty, friend slot, download
-/// bonus).  `cm` provides credit ratio; `idx` provides file priority.
+/// bonus).  `cm` provides credit ratio; `idx` provides file priority, and
+/// `queued` the demand an Auto priority resolves by.
 ///
 /// Phase 3 routing: when the peer has advertised an Ed25519 pubkey AND
 /// completed full proof-of-possession on the session (`ember_verified`),
@@ -3603,9 +3673,11 @@ pub(crate) fn soft_zone_should_admit(
 /// the challenge-response — continue using the legacy
 /// `CreditManager::get_queue_score`, keeping the network-wide credit
 /// compatibility story intact.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn score_queue_entry(
     cm: &CreditManager,
     idx: &LocalIndex,
+    queued: &QueuedPerFile<'_>,
     user_hash: &[u8; 16],
     file_hash: [u8; 16],
     wait_secs: u64,
@@ -3617,7 +3689,7 @@ pub(crate) fn score_queue_entry(
 ) -> f64 {
     score_queue_entry_with_prio(
         cm,
-        file_priority_weight(idx, file_hash),
+        file_priority_weight(idx, queued, file_hash),
         user_hash,
         wait_secs,
         current_addr,
@@ -3633,9 +3705,13 @@ pub(crate) fn score_queue_entry(
 /// Queue rows cluster on a handful of files, so [`compute_queue_rank`] — which
 /// scores every row — resolves each distinct hash once and reuses the weight
 /// rather than paying a `hex::encode` allocation and an index lookup per row.
-pub(crate) fn file_priority_weight(idx: &LocalIndex, file_hash: [u8; 16]) -> f64 {
+pub(crate) fn file_priority_weight(
+    idx: &LocalIndex,
+    queued: &QueuedPerFile<'_>,
+    file_hash: [u8; 16],
+) -> f64 {
     idx.get_by_hash(&hex::encode(file_hash))
-        .map(|f| priority_weight(&f.priority))
+        .map(|f| priority_weight(queued.resolve(&f.priority, &file_hash)))
         .unwrap_or(0.7)
 }
 
@@ -3720,13 +3796,14 @@ pub(crate) fn compute_queue_rank(
     // `hex::encode` allocations for a single rank query, and a UDP re-ask
     // triggers one of those per datagram.
     let mut prio_cache: HashMap<[u8; 16], f64> = HashMap::new();
+    let queued = QueuedPerFile::new(queue);
     for entry in queue.iter() {
         if entry.identity == *my_identity {
             continue;
         }
         let file_prio = *prio_cache
             .entry(entry.file_hash)
-            .or_insert_with(|| file_priority_weight(idx, entry.file_hash));
+            .or_insert_with(|| file_priority_weight(idx, &queued, entry.file_hash));
         let es = score_queue_entry_with_prio(
             cm,
             file_prio,
@@ -3757,12 +3834,13 @@ pub(crate) fn compute_queue_ranks(
     queue: &[QueueEntry],
 ) -> Vec<u16> {
     let mut prio_cache: HashMap<[u8; 16], f64> = HashMap::new();
+    let queued = QueuedPerFile::new(queue);
     let scores: Vec<f64> = queue
         .iter()
         .map(|entry| {
             let file_prio = *prio_cache
                 .entry(entry.file_hash)
-                .or_insert_with(|| file_priority_weight(idx, entry.file_hash));
+                .or_insert_with(|| file_priority_weight(idx, &queued, entry.file_hash));
             score_queue_entry_with_prio(
                 cm,
                 file_prio,
@@ -4046,6 +4124,7 @@ pub(crate) async fn udp_queue_rank_for_peer(
     let my_score = score_queue_entry(
         &cm,
         &idx,
+        &QueuedPerFile::new(&queue),
         &target.user_hash,
         target.file_hash,
         target.join_time.elapsed().as_secs(),
@@ -5864,6 +5943,7 @@ impl UploadHandler {
 
             let mut best_connected_score = f64::MIN;
             let mut best_dial: Option<(QueueEntry, f64)> = None;
+            let queued = QueuedPerFile::new(&queue);
 
             for e in queue.iter() {
                 if e.last_request.elapsed().as_secs() >= MAX_PURGEQUEUETIME_SECS {
@@ -5872,6 +5952,7 @@ impl UploadHandler {
                 let score = score_queue_entry(
                     &cm,
                     &idx,
+                    &queued,
                     &e.user_hash,
                     e.file_hash,
                     e.join_time.elapsed().as_secs(),
@@ -8725,12 +8806,13 @@ impl UploadHandler {
                                 let mut best_identity = None;
                                 let mut best_join: Option<std::time::Instant> = None;
                                 let mut best_score = f64::MIN;
+                                let queued = QueuedPerFile::of_files(queue_snapshot.iter().map(|row| row.4));
                                 for &(_i, ref identity, current_addr, join_time, file_hash, ref user_hash, emule_version, is_friend_slot, ref ember_pubkey, ember_verified) in &queue_snapshot {
                                     if current_addr.is_none() {
                                         continue;
                                     }
                                     let score = score_queue_entry(
-                                        &cm, &idx_snap, user_hash, file_hash,
+                                        &cm, &idx_snap, &queued, user_hash, file_hash,
                                         join_time.elapsed().as_secs(), current_addr,
                                         emule_version, is_friend_slot,
                                         ember_pubkey.as_ref(), ember_verified,
@@ -8904,7 +8986,7 @@ impl UploadHandler {
                                 // the peer's CHALLENGE/RESPONSE arrives.
                                 let ember_verified = secure_v2_authenticated;
                                 let my_score = score_queue_entry(
-                                    &cm, &idx_snap, &peer_user_hash,
+                                    &cm, &idx_snap, &QueuedPerFile::new(&queue), &peer_user_hash,
                                     current_file_hash.unwrap_or([0u8; 16]),
                                     queue_join_time.elapsed().as_secs(),
                                     Some(peer_addr), hello_caps.emule_version_byte,
@@ -9653,6 +9735,7 @@ impl UploadHandler {
                             let mut best_ready_needs_dial = false;
                             let mut best_low_identity: Option<QueueIdentity> = None;
                             let mut best_low_score = f64::MIN;
+                            let queued = QueuedPerFile::of_files(queue_snapshot.iter().map(|row| row.4));
                             for &(
                                 _i,
                                 ref identity,
@@ -9673,6 +9756,7 @@ impl UploadHandler {
                                 let score = score_queue_entry(
                                     &cm,
                                     &idx_snap,
+                                    &queued,
                                     user_hash,
                                     file_hash,
                                     join_time.elapsed().as_secs(),
@@ -9891,7 +9975,7 @@ impl UploadHandler {
                                 queue[pos].ember_pubkey = hello_caps.ember_pubkey;
                             }
                             let my_score = score_queue_entry(
-                                &cm, &idx_snap, &peer_user_hash,
+                                &cm, &idx_snap, &QueuedPerFile::new(&queue), &peer_user_hash,
                                 current_file_hash.unwrap_or([0u8; 16]),
                                 queue[pos].join_time.elapsed().as_secs(),
                                 Some(peer_addr), hello_caps.emule_version_byte,
@@ -9943,9 +10027,11 @@ impl UploadHandler {
                             let new_fh = current_file_hash.unwrap_or([0u8; 16]);
                             let ember_verified = secure_v2_authenticated;
                             let peer_ip = peer_ip_u32(Some(peer_addr));
+                            let queued = QueuedPerFile::new(&queue);
                             let new_combined = combined_file_prio_and_credit(
                                 &cm,
                                 &idx_snap,
+                                &queued,
                                 &peer_user_hash,
                                 new_fh,
                                 peer_ip,
@@ -9961,6 +10047,7 @@ impl UploadHandler {
                                         combined_file_prio_and_credit(
                                             &cm,
                                             &idx_snap,
+                                            &queued,
                                             &e.user_hash,
                                             e.file_hash,
                                             peer_ip_u32(e.current_addr.or_else(|| {
@@ -9976,9 +10063,16 @@ impl UploadHandler {
                             if soft_zone_should_admit(is_verified_friend, new_combined, avg_combined)
                             {
                                 let join_time = queue_join_time;
+                                // Ranked as the queue it is joining, newcomer
+                                // counted, so this first rank agrees with the
+                                // ones its re-asks get.
+                                let queued = QueuedPerFile::of_files(
+                                    queue.iter().map(|e| e.file_hash).chain(std::iter::once(new_fh)),
+                                );
                                 let new_score = score_queue_entry(
                                     &cm,
                                     &idx_snap,
+                                    &queued,
                                     &peer_user_hash,
                                     new_fh,
                                     0,
@@ -9996,6 +10090,7 @@ impl UploadHandler {
                                     let es = score_queue_entry(
                                         &cm,
                                         &idx_snap,
+                                        &queued,
                                         &e.user_hash,
                                         e.file_hash,
                                         e.join_time.elapsed().as_secs(),
@@ -10046,7 +10141,7 @@ impl UploadHandler {
                                 ember_verified,
                             ));
                             let my_score = score_queue_entry(
-                                &cm, &idx_snap, &peer_user_hash, new_fh,
+                                &cm, &idx_snap, &QueuedPerFile::new(&queue), &peer_user_hash, new_fh,
                                 0, Some(peer_addr), hello_caps.emule_version_byte,
                                 friend_slot_priority,
                                 hello_caps.ember_pubkey.as_ref(), ember_verified,
@@ -11342,8 +11437,9 @@ impl UploadHandler {
                             // priority only counts when PoP has landed
                             // on this session.
                             let ember_verified = secure_v2_authenticated;
+                            let queued = QueuedPerFile::new(&queue);
                             let my_score = score_queue_entry(
-                                &cm, &idx_snap, &peer_user_hash, my_fh,
+                                &cm, &idx_snap, &queued, &peer_user_hash, my_fh,
                                 uploading_score_wait_secs(
                                     queue_wait_at_grant,
                                     session_start.map(|t| t.elapsed()),
@@ -11364,7 +11460,7 @@ impl UploadHandler {
                                     continue;
                                 }
                                 let score = score_queue_entry(
-                                    &cm, &idx_snap, &entry.user_hash, entry.file_hash,
+                                    &cm, &idx_snap, &queued, &entry.user_hash, entry.file_hash,
                                     entry.join_time.elapsed().as_secs(), entry.current_addr,
                                     entry.emule_version, entry.is_friend_slot,
                                     entry.ember_pubkey.as_ref(), entry.ember_verified,
@@ -11602,9 +11698,11 @@ impl UploadHandler {
                                 let new_fh = current_file_hash.unwrap_or([0u8; 16]);
                                 let ember_verified = secure_v2_authenticated;
                                 let peer_ip = peer_ip_u32(Some(peer_addr));
+                                let queued = QueuedPerFile::new(&queue);
                                 let new_combined = combined_file_prio_and_credit(
                                     &cm,
                                     &idx_snap,
+                                    &queued,
                                     &peer_user_hash,
                                     new_fh,
                                     peer_ip,
@@ -11620,6 +11718,7 @@ impl UploadHandler {
                                             combined_file_prio_and_credit(
                                                 &cm,
                                                 &idx_snap,
+                                                &queued,
                                                 &e.user_hash,
                                                 e.file_hash,
                                                 peer_ip_u32(e.current_addr.or_else(|| {
@@ -14880,6 +14979,7 @@ mod scoring_tests {
         let emule_score = score_queue_entry(
             &cm,
             &idx,
+            &QueuedPerFile::new(&[]),
             &user_hash,
             [0u8; 16],
             300,
@@ -14892,6 +14992,7 @@ mod scoring_tests {
         let ember_score = score_queue_entry(
             &cm,
             &idx,
+            &QueuedPerFile::new(&[]),
             &user_hash,
             [0u8; 16],
             300,
@@ -14928,6 +15029,7 @@ mod scoring_tests {
         let scored_without_verification = score_queue_entry(
             &cm,
             &idx,
+            &QueuedPerFile::new(&[]),
             &user_hash,
             [0u8; 16],
             300,
@@ -14940,6 +15042,7 @@ mod scoring_tests {
         let emule_only = score_queue_entry(
             &cm,
             &idx,
+            &QueuedPerFile::new(&[]),
             &user_hash,
             [0u8; 16],
             300,
@@ -14970,6 +15073,7 @@ mod scoring_tests {
         let with_none = score_queue_entry(
             &cm,
             &idx,
+            &QueuedPerFile::new(&[]),
             &user_hash,
             [0u8; 16],
             300,
@@ -14982,6 +15086,7 @@ mod scoring_tests {
         let baseline = score_queue_entry(
             &cm,
             &idx,
+            &QueuedPerFile::new(&[]),
             &user_hash,
             [0u8; 16],
             300,
@@ -15015,6 +15120,7 @@ mod scoring_tests {
         let ember_friend_score = score_queue_entry(
             &cm,
             &idx,
+            &QueuedPerFile::new(&[]),
             &user_hash,
             [0u8; 16],
             300,
@@ -15027,6 +15133,7 @@ mod scoring_tests {
         let emule_friend_score = score_queue_entry(
             &cm,
             &idx,
+            &QueuedPerFile::new(&[]),
             &user_hash,
             [0u8; 16],
             300,
@@ -15070,6 +15177,7 @@ mod scoring_tests {
         let score = score_queue_entry(
             &cm,
             &idx,
+            &QueuedPerFile::new(&[]),
             &user_hash,
             [0u8; 16],
             300,
@@ -15123,6 +15231,7 @@ mod scoring_tests {
         let good = score_queue_entry(
             &cm,
             &idx,
+            &QueuedPerFile::new(&[]),
             &good_user,
             [0u8; 16],
             300,
@@ -15135,6 +15244,7 @@ mod scoring_tests {
         let bad = score_queue_entry(
             &cm,
             &idx,
+            &QueuedPerFile::new(&[]),
             &bad_user,
             [0u8; 16],
             300,
@@ -15178,7 +15288,16 @@ mod scoring_tests {
         let user = [0xABu8; 16];
         seed_emule_credits(&mut cm, user);
         let peer_ip = u32::from_be_bytes([10, 0, 0, 1]);
-        let low = combined_file_prio_and_credit(&cm, &idx, &user, [0u8; 16], peer_ip, None, false);
+        let low = combined_file_prio_and_credit(
+            &cm,
+            &idx,
+            &QueuedPerFile::new(&[]),
+            &user,
+            [0u8; 16],
+            peer_ip,
+            None,
+            false,
+        );
         // Unknown file → prio 7 → combined = 10 * ratio * 7
         assert!(
             low > 0.0,
@@ -15271,6 +15390,7 @@ mod scoring_tests {
             score_queue_entry(
                 &cm,
                 &idx,
+                &QueuedPerFile::new(&[]),
                 &[0xEEu8; 16],
                 [1u8; 16],
                 0,
@@ -15283,6 +15403,73 @@ mod scoring_tests {
         };
         assert_eq!(scored(true), 268_435_455.0);
         assert!(scored(false) < 268_435_455.0);
+    }
+
+    /// eMule's `UpdateAutoUpPriority`: an Auto file is scored High while at
+    /// most one client waits for it, Normal up to 20, Low past that. It was
+    /// scored Normal whatever its demand.
+    #[test]
+    fn an_auto_priority_follows_how_many_wait_for_the_file() {
+        for (queued, expected) in [(0, "high"), (1, "high"), (2, "normal"), (20, "normal"), (21, "low")] {
+            assert_eq!(effective_priority("auto", queued), expected, "{queued} queued");
+        }
+        assert_eq!(effective_priority("release", 50), "release", "only Auto moves");
+
+        let auto_hash = [7u8; 16];
+        let mut index = LocalIndex::new();
+        index.add_files(vec![crate::types::FileInfo {
+            id: hex::encode(auto_hash),
+            name: "auto.bin".to_string(),
+            path: "A/auto.bin".to_string(),
+            size: 1,
+            hash: hex::encode(auto_hash),
+            aich_hash: String::new(),
+            ember_file_hash: String::new(),
+            extension: "bin".to_string(),
+            modified_at: 0,
+            priority: "auto".to_string(),
+            requests: 0,
+            accepted: 0,
+            bytes_transferred: 0,
+            alltime_requests: 0,
+            alltime_accepted: 0,
+            alltime_transferred: 0,
+            complete_sources: 0,
+            folder: "A".to_string(),
+            shared: true,
+            friends_only: false,
+            shared_kad: false,
+            shared_ed2k: false,
+            shared_ember: false,
+        }]);
+        let caps = PeerCapabilities {
+            tcp_port: 4662,
+            ..PeerCapabilities::default()
+        };
+        let queue_of = |waiting: u8| -> Vec<QueueEntry> {
+            (0..waiting)
+                .map(|n| {
+                    let addr: SocketAddr = format!("8.8.{n}.1:4662").parse().unwrap();
+                    queue_entry_from_hello(
+                        QueueIdentity::UserHash([n; 16]),
+                        addr,
+                        [n; 16],
+                        auto_hash,
+                        std::time::Instant::now(),
+                        &caps,
+                        false,
+                        false,
+                    )
+                })
+                .collect()
+        };
+        for (waiting, weight) in [(1u8, 0.9), (2, 0.7), (21, 0.6)] {
+            let queue = queue_of(waiting);
+            let queued = QueuedPerFile::new(&queue);
+            assert_eq!(file_priority_weight(&index, &queued, auto_hash), weight, "{waiting} waiting");
+            let copied = QueuedPerFile::of_files(queue.iter().map(|entry| entry.file_hash));
+            assert_eq!(file_priority_weight(&index, &copied, auto_hash), weight, "copy, {waiting} waiting");
+        }
     }
 
     #[test]
@@ -15328,6 +15515,7 @@ mod scoring_tests {
             let score = score_queue_entry(
                 &cm,
                 &idx,
+                &QueuedPerFile::new(&queue),
                 &entry.user_hash,
                 entry.file_hash,
                 entry.join_time.elapsed().as_secs(),

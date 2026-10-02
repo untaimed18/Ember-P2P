@@ -3,7 +3,7 @@
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
   import { formatSize, formatNumber, formatDateTime, formatDateWithYear as formatDate } from '$lib/utils';
-  import { onMount, onDestroy, untrack } from 'svelte';
+  import { onMount, onDestroy, tick, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
 
   type SortField =
@@ -473,9 +473,17 @@
     if (col.sortField) toggleSort(col.sortField);
   }
 
-  function onRowKeydown(event: KeyboardEvent, file: FileInfo) {
+  function onRowKeydown(event: KeyboardEvent, focused: FileInfo) {
     // Do not replace a checkbox's own native keyboard behavior.
     if (event.target !== event.currentTarget) return;
+    // The arrow keys move the selection, not focus, so focus can sit on the
+    // row clicked earlier while another is selected. These keys act on the
+    // selected row, the one the user can see is current; acting on the
+    // focused one opened, checked or offered a menu for a different file.
+    const file =
+      selectedPath && selectedPath !== focused.path
+        ? (sortedFiles.find((f) => f.path === selectedPath) ?? focused)
+        : focused;
     if (event.key === 'Enter') {
       event.preventDefault();
       event.stopPropagation();
@@ -492,7 +500,14 @@
     if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
       event.preventDefault();
       event.stopPropagation();
-      const row = event.currentTarget;
+      // Beside the row the menu is for; the focused row when that one is
+      // scrolled out of the rendered window.
+      const focusedRow = event.currentTarget;
+      const selectedRow =
+        file !== focused && focusedRow instanceof HTMLElement
+          ? focusedRow.parentElement?.querySelector('tr.selected')
+          : null;
+      const row = selectedRow ?? focusedRow;
       const rect = row instanceof HTMLElement ? row.getBoundingClientRect() : null;
       onRowContextMenu(
         new MouseEvent('contextmenu', {
@@ -615,7 +630,16 @@
                 <input
                   type="checkbox"
                   checked={checkedPaths.has(file.path)}
-                  onclick={(e) => { e.stopPropagation(); onToggleCheck(file.path, e.shiftKey); }}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    const box = e.currentTarget;
+                    onToggleCheck(file.path, e.shiftKey);
+                    // A Shift range only adds, so a checked box Shift-clicked
+                    // stays checked in state while the browser has already
+                    // unticked it, and the binding writes nothing when the value
+                    // has not changed. Put the box back to what state says.
+                    void tick().then(() => { box.checked = checkedPaths.has(file.path); });
+                  }}
                   aria-label={m.library_select_file({ name: file.name })}
                 />
               </td>

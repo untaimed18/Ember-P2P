@@ -56,6 +56,69 @@ pub fn is_sensitive_dir_name(name: &str) -> bool {
     SENSITIVE_DIR_NAMES.contains(&lower.as_str())
 }
 
+/// The user's home folder, as written and as resolved.
+fn home_prefixes() -> &'static [std::path::PathBuf] {
+    static HOME: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let Some(home) = directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+        else {
+            return Vec::new();
+        };
+        let mut prefixes = vec![home.clone()];
+        if let Ok(resolved) = home.canonicalize() {
+            if resolved != home {
+                prefixes.push(resolved);
+            }
+        }
+        prefixes
+    })
+}
+
+/// `path` below `home`. Windows paths are case-insensitive, and a path that
+/// was not canonicalized (`c:\users\…`) is still the same home folder.
+fn strip_home<'a>(path: &'a std::path::Path, home: &std::path::Path) -> Option<&'a std::path::Path> {
+    if cfg!(windows) {
+        let mut rest = path.components();
+        for want in home.components() {
+            if !rest.next()?.as_os_str().eq_ignore_ascii_case(want.as_os_str()) {
+                return None;
+            }
+        }
+        Some(rest.as_path())
+    } else {
+        path.strip_prefix(home).ok()
+    }
+}
+
+/// Whether a directory of `path` matches `refused`, not counting the
+/// directories that lead to the user's home folder.
+///
+/// On Fedora Atomic and its relatives (Silverblue, Kinoite, Bazzite, Bluefin)
+/// `/home` links to `/var/home`, so every resolved path under home passed
+/// through `var`: nothing in home could be shared, browsed to or used as the
+/// download folder. The way to the home folder is the user's own; what lies
+/// under it is still checked.
+fn path_has_component(path: &std::path::Path, refused: fn(&str) -> bool) -> bool {
+    let below_home = home_prefixes()
+        .iter()
+        .find_map(|home| strip_home(path, home));
+    below_home.unwrap_or(path).components().any(|component| {
+        matches!(component, std::path::Component::Normal(name) if refused(&name.to_string_lossy()))
+    })
+}
+
+/// A directory of `path` is a [`SENSITIVE_DIR_NAMES`] name; see
+/// [`path_has_component`] for the home folder.
+pub fn path_has_sensitive_component(path: &std::path::Path) -> bool {
+    path_has_component(path, is_sensitive_dir_name)
+}
+
+/// A directory of `path` is one indexing does not descend into; see
+/// [`path_has_component`] for the home folder.
+pub fn path_has_index_skip_component(path: &std::path::Path) -> bool {
+    path_has_component(path, is_index_skip_dir_name)
+}
+
 /// More per-user credential stores, skipped when indexing walks a shared tree
 /// but, unlike [`SENSITIVE_DIR_NAMES`], not refused as parts of a configured
 /// path: settings validation resets the whole config over such a path, and
@@ -212,6 +275,18 @@ pub(crate) fn volume_key(path: &std::path::Path) -> Option<String> {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn the_home_folder_is_found_whatever_its_spelling() {
+        let (home, inside, beside) = if cfg!(windows) {
+            (r"C:\Users\Dev", r"c:\users\dev\Music\a.mp3", r"C:\Users\Devon\a.mp3")
+        } else {
+            ("/home/dev", "/home/dev/Music/a.mp3", "/home/devon/a.mp3")
+        };
+        let rest = strip_home(Path::new(inside), Path::new(home)).expect("under home");
+        assert_eq!(rest, Path::new("Music").join("a.mp3"));
+        assert!(strip_home(Path::new(beside), Path::new(home)).is_none());
+    }
 
     #[test]
     fn a_folder_is_not_a_volume_root() {

@@ -28,15 +28,19 @@ pub async fn set_file_comment(
             "Comment too long (max 4096 bytes, matching eMule limit)",
         ));
     }
+    let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
         .try_send(NetworkCommand::SetFileComment {
             file_hash,
             rating,
             comment,
+            tx,
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    Ok(())
+    await_reply(rx, "comments_save_failed", "Failed to save comment")
+        .await?
+        .map_err(|e| coded_ctx("comments_save_failed", "Failed to save comment", e))
 }
 
 #[tauri::command]

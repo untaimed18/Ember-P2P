@@ -364,6 +364,8 @@ pub enum NetworkCommand {
         file_hash: String,
         rating: u8,
         comment: String,
+        /// Answered once the comment is in the database.
+        tx: oneshot::Sender<Result<(), String>>,
     },
     /// Atomically validates and applies a batch of share-state changes to the
     /// in-memory known.met catalog, then acknowledges central processing.
@@ -374,7 +376,19 @@ pub enum NetworkCommand {
     /// Persist the friends-only scope for a batch of content hashes.
     SetFilesFriendsOnly {
         updates: Vec<(String, bool)>,
-        tx: oneshot::Sender<Result<usize, String>>,
+        /// The hashes known.met had no record for, which this did not save.
+        tx: oneshot::Sender<Result<Vec<String>, String>>,
+    },
+    /// Files confirmed gone from these paths (deleted, or found missing from
+    /// a folder that is there): known.met forgets the paths.
+    ForgetKnownPaths {
+        paths: Vec<String>,
+    },
+    /// A folder taken out of the library: known.met forgets the paths under
+    /// `root` that none of `keep_roots` still shares.
+    ForgetKnownPathsUnder {
+        root: String,
+        keep_roots: Vec<String>,
     },
     /// Offer one of our shared files to a friend over their live session.
     OfferFileToFriend {

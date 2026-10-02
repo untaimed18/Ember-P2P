@@ -771,6 +771,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         pending_downloads: HashMap::new(),
         data_dir: data_dir.clone(),
         known_met_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+        known_met_save_soon: false,
         server_met_save_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         server_met_save_lock: Arc::new(std::sync::Mutex::new(())),
         nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -3027,6 +3028,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &upload_queue_handle,
                 )
                 .await;
+                if state.known_met_save_soon {
+                    start_known_met_save(
+                        &mut state,
+                        &mut known_files,
+                        &mut known_met_save_in_flight,
+                        &known_met_save_result_tx,
+                        &mut known_met_save_started_at,
+                    );
+                }
             }
 
             // Upload events from the peer-to-peer upload listener
@@ -4196,6 +4206,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         known_files.mark_save_failed();
                         error!("Failed to save known.met: {e}");
                     }
+                }
+                if state.known_met_save_soon {
+                    start_known_met_save(
+                        &mut state,
+                        &mut known_files,
+                        &mut known_met_save_in_flight,
+                        &known_met_save_result_tx,
+                        &mut known_met_save_started_at,
+                    );
                 }
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
