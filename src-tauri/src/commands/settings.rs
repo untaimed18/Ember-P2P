@@ -2161,6 +2161,20 @@ pub async fn download_ipfilter(
 
 #[tauri::command]
 pub fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
+    if !crate::tray::reachable() {
+        // Hidden with no visible tray icon, the window could not be reached
+        // again; minimized, it stays on the taskbar and in the window switcher.
+        if let Some(window) = app.get_webview_window("main") {
+            window.minimize().map_err(|e| {
+                coded_ctx(
+                    "settings_hide_window_failed",
+                    "Failed to hide main window",
+                    e,
+                )
+            })?;
+        }
+        return Ok(());
+    }
     crate::commands::chat_window::set_chat_window_visible(&app, false);
     if let Some(window) = app.get_webview_window("main") {
         window.hide().map_err(|e| {

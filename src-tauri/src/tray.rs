@@ -6,8 +6,134 @@
 //! then. The menu itself is rebuilt by the silent-update driver, which owns the
 //! countdown's "Cancel update" entry and so is the one place that knows whether
 //! to keep it.
+//!
+//! It also answers whether the icon can be seen at all, which decides whether
+//! "close to tray" may hide the window or has to minimize it instead.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+
+static BUILT: AtomicBool = AtomicBool::new(false);
+
+/// Record whether the tray icon was created, and on Linux start watching for a
+/// panel that shows it. Call once, after building the icon.
+pub fn note_built(built: bool) {
+    BUILT.store(built, Ordering::Release);
+    #[cfg(target_os = "linux")]
+    if built {
+        host::watch();
+    }
+}
+
+/// Whether a hidden window could be brought back through the tray icon.
+///
+/// On Linux a built icon is not a visible one: libayatana-appindicator creates
+/// it whether or not anything is there to draw it, and stock GNOME has no
+/// StatusNotifier host. Hiding the only window there left Ember running with no
+/// way back short of launching it again.
+pub fn reachable() -> bool {
+    if !BUILT.load(Ordering::Acquire) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        host::present()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+/// Watches the session bus for a StatusNotifier host.
+///
+/// A panel that only offers the older XEmbed tray is not seen here, so on one
+/// of those "close to tray" minimizes. That is the safe way to be wrong: a
+/// minimized window is still on the taskbar, a hidden one is nowhere.
+#[cfg(target_os = "linux")]
+mod host {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use zbus::blocking::Connection;
+    use zbus::zvariant::Value;
+
+    static PRESENT: AtomicBool = AtomicBool::new(false);
+    /// A panel can come and go during a session (the GNOME extension switched
+    /// on, plasmashell restarting), so the answer is refreshed on this cadence
+    /// rather than taken once.
+    const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+    /// How long startup waits for the first answer before showing the window.
+    /// Past this the window is shown normally rather than left in a tray that
+    /// may not exist.
+    const FIRST_PROBE_WAIT: Duration = Duration::from_secs(1);
+
+    pub(super) fn present() -> bool {
+        PRESENT.load(Ordering::Acquire)
+    }
+
+    pub(super) fn watch() {
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("ember-tray-host".to_string())
+            .spawn(move || {
+                let mut connection = None;
+                let mut first_tx = Some(first_tx);
+                let mut last = None;
+                loop {
+                    let present = probe(&mut connection);
+                    PRESENT.store(present, Ordering::Release);
+                    if last != Some(present) {
+                        if present {
+                            tracing::info!("A system tray host is showing Ember's icon");
+                        } else {
+                            tracing::info!(
+                                "No system tray host is showing Ember's icon; \
+                                 closing to the tray minimizes the window instead"
+                            );
+                        }
+                        last = Some(present);
+                    }
+                    if let Some(tx) = first_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    std::thread::sleep(PROBE_INTERVAL);
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                let _ = first_rx.recv_timeout(FIRST_PROBE_WAIT);
+            }
+            Err(e) => tracing::warn!("Could not start the tray-host probe ({e})"),
+        }
+    }
+
+    fn probe(connection: &mut Option<Connection>) -> bool {
+        if connection.is_none() {
+            *connection = Connection::session().ok();
+        }
+        let Some(bus) = connection.as_ref() else {
+            return false;
+        };
+        let reply = bus.call_method(
+            Some("org.kde.StatusNotifierWatcher"),
+            "/StatusNotifierWatcher",
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("org.kde.StatusNotifierWatcher", "IsStatusNotifierHostRegistered"),
+        );
+        match reply {
+            Ok(reply) => matches!(reply.body().deserialize::<Value<'_>>(), Ok(Value::Bool(true))),
+            Err(zbus::Error::MethodError(name, _, _)) => !matches!(
+                name.as_str(),
+                "org.freedesktop.DBus.Error.ServiceUnknown"
+                    | "org.freedesktop.DBus.Error.NameHasNoOwner"
+            ),
+            Err(_) => {
+                *connection = None;
+                false
+            }
+        }
+    }
+}
 
 /// Where the countdown goes in [`TrayLabels::cancel_update`].
 pub const TIME_PLACEHOLDER: &str = "{time}";

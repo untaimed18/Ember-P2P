@@ -336,6 +336,61 @@ fn ed2k_link_unfinished(piece: &str) -> bool {
     looks_like_ed2k_uri(piece) && !normalize_ed2k_uri(piece).ends_with("|/")
 }
 
+/// Whether a Linux launch should make itself the `ed2k://` handler, given the
+/// desktop entry `xdg-mime` reports for the scheme now.
+///
+/// Only when nothing handles it, or when the handler is one of Ember's own
+/// entries: the one the plugin writes, rewritten so it follows an AppImage
+/// that has moved, or the `.deb`'s, whose `Exec` carries no `%u` for the link.
+/// The plugin's `register` runs `xdg-mime default`, so claiming on every launch
+/// took the scheme back from whichever client the user had chosen since.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn should_claim_scheme(current_default: &str, own_entries: &[&str]) -> bool {
+    let current = current_default.trim();
+    current.is_empty() || own_entries.contains(&current)
+}
+
+/// Register `ed2k://` with the desktop unless another handler already has it.
+///
+/// Linux has no installer step to do this, unlike NSIS/MSI on Windows.
+#[cfg(target_os = "linux")]
+pub fn register_scheme_unless_taken(app: &AppHandle) {
+    use tauri_plugin_deep_link::DeepLinkExt;
+    // The plugin names its entry after the executable, in the same way; the
+    // bundler names the package's after the product.
+    let bundle_entry = format!(
+        "{}.desktop",
+        app.config().product_name.as_deref().unwrap_or("Ember")
+    );
+    let own_handler = match tauri::utils::platform::current_exe() {
+        Ok(exe) => match exe.file_name() {
+            Some(name) => format!("{}-handler.desktop", name.to_string_lossy()),
+            None => return,
+        },
+        Err(e) => {
+            tracing::warn!("Not registering ed2k:// links: no executable path ({e})");
+            return;
+        }
+    };
+    // An `xdg-mime` that cannot run reads as "no handler"; `register_all`
+    // needs it too, and reports that failure itself.
+    let current = std::process::Command::new("xdg-mime")
+        .args(["query", "default", "x-scheme-handler/ed2k"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    if !should_claim_scheme(&current, &[own_handler.as_str(), bundle_entry.as_str()]) {
+        tracing::info!(
+            "Leaving ed2k:// links with {}, the handler already chosen",
+            current.trim()
+        );
+        return;
+    }
+    if let Err(e) = app.deep_link().register_all() {
+        tracing::warn!("Failed to register ed2k:// deep link scheme: {e}");
+    }
+}
+
 /// Buffer `payloads` for the frontend and emit a wake signal.
 ///
 /// The buffer — not the event payload — is the single source of truth:
@@ -537,6 +592,29 @@ pub async fn open_pending_collection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_claims_ed2k_only_when_unowned_or_already_ours() {
+        let ours = ["ember-handler.desktop", "Ember.desktop"];
+        assert!(should_claim_scheme("", &ours), "no handler yet");
+        assert!(should_claim_scheme("\n", &ours), "xdg-mime prints a bare newline for none");
+        assert!(
+            should_claim_scheme("ember-handler.desktop\n", &ours),
+            "our own entry is refreshed so a moved AppImage still opens"
+        );
+        assert!(
+            should_claim_scheme("Ember.desktop\n", &ours),
+            "the .deb's entry is Ember's too, and its Exec has no %u for the link"
+        );
+        assert!(
+            !should_claim_scheme("amule.desktop\n", &ours),
+            "a client the user chose keeps the scheme"
+        );
+        assert!(
+            !should_claim_scheme("ember-handler.desktop.bak\n", &ours),
+            "only an exact entry name counts as ours"
+        );
+    }
 
     #[test]
     fn previews_sanitize_and_classify_confirmation_details() {

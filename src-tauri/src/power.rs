@@ -19,6 +19,15 @@
 //! OS thread owns the state for the process's lifetime and mirrors an atomic
 //! that callers flip.
 //!
+//! On Linux the inhibitor is a D-Bus lease, and the same thread holds it. The
+//! desktop portal's `Inhibit` with the suspend flag is asked first: GNOME,
+//! KDE, Cinnamon and the other portal backends map it onto their own idle
+//! suspend, which is the same "the idle timer may not sleep the machine" a
+//! Windows `ES_SYSTEM_REQUIRED` request means, and a suspend the user chooses
+//! from the menu still goes through. Without a portal, a logind `sleep` block
+//! lock is taken instead; that one also refuses an unprivileged manual
+//! suspend, which is why it is only the fallback.
+//!
 //! [`SetThreadExecutionState`]: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setthreadexecutionstate
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,11 +46,11 @@ const REASSERT_INTERVAL: Duration = Duration::from_secs(60);
 /// Whether this build can actually hold a sleep inhibitor.
 ///
 /// The UI asks so it can disable the toggle rather than offer a switch that
-/// does nothing. Linux would want an org.freedesktop.login1 `Inhibit` lease
-/// over D-Bus, which is a dependency this tree does not carry and a daemon that
-/// may not be running; until then the honest answer there is "no".
+/// does nothing. On Linux this only says an implementation exists: a session
+/// with neither a portal nor logind refuses every request, and that shows up
+/// as [`WakeLock::is_held`] staying false, not here.
 pub const fn supported() -> bool {
-    cfg!(windows)
+    cfg!(any(windows, target_os = "linux"))
 }
 
 /// A held-or-released system sleep inhibitor.
@@ -234,7 +243,135 @@ fn apply(keep_awake: bool) -> bool {
     previous != 0
 }
 
-#[cfg(not(windows))]
+/// Take or drop this thread's inhibitor lease. Returns whether the session
+/// accepted it.
+///
+/// The lease lives in a thread-local because only the owning thread calls
+/// this, and dropping it is what releases it.
+#[cfg(target_os = "linux")]
+fn apply(keep_awake: bool) -> bool {
+    use std::cell::RefCell;
+    thread_local! {
+        static HELD: RefCell<Option<linux::Inhibitor>> = const { RefCell::new(None) };
+    }
+    HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        if !keep_awake {
+            if let Some(inhibitor) = held.take() {
+                inhibitor.release();
+            }
+            return true;
+        }
+        if held.is_some() {
+            return true;
+        }
+        match linux::Inhibitor::acquire() {
+            Ok(inhibitor) => {
+                tracing::debug!("Sleep inhibitor taken through {}", inhibitor.backend());
+                *held = Some(inhibitor);
+                true
+            }
+            Err(error) => {
+                static FIRST: std::sync::Once = std::sync::Once::new();
+                let mut first = false;
+                FIRST.call_once(|| first = true);
+                if first {
+                    tracing::warn!("No sleep inhibitor available in this session: {error}");
+                } else {
+                    tracing::debug!("No sleep inhibitor available: {error}");
+                }
+                false
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::collections::HashMap;
+    use zbus::blocking::Connection;
+    use zbus::zvariant::{OwnedFd, OwnedObjectPath, Value};
+
+    const WHO: &str = "Ember";
+    const WHY: &str = "Transfers in progress";
+    /// `org.freedesktop.portal.Inhibit` flag for "suspending the session or
+    /// computer". Idle (8) is left out on purpose: that one also keeps the
+    /// screen from blanking.
+    const PORTAL_SUSPEND: u32 = 4;
+
+    pub(super) enum Inhibitor {
+        /// The portal ends the inhibition when the request is closed or this
+        /// connection goes away, so the connection is the lease.
+        Portal {
+            connection: Connection,
+            request: OwnedObjectPath,
+        },
+        /// logind holds the lock for as long as this descriptor is open.
+        Logind(#[allow(dead_code)] OwnedFd),
+    }
+
+    impl Inhibitor {
+        pub(super) fn acquire() -> zbus::Result<Self> {
+            match portal() {
+                Ok(inhibitor) => Ok(inhibitor),
+                Err(portal_error) => logind().map_err(|logind_error| {
+                    zbus::Error::Failure(format!(
+                        "desktop portal: {portal_error}; logind: {logind_error}"
+                    ))
+                }),
+            }
+        }
+
+        pub(super) fn backend(&self) -> &'static str {
+            match self {
+                Self::Portal { .. } => "the desktop portal",
+                Self::Logind(_) => "logind",
+            }
+        }
+
+        pub(super) fn release(self) {
+            if let Self::Portal { connection, request } = &self {
+                let _ = connection.call_method(
+                    Some("org.freedesktop.portal.Desktop"),
+                    request.as_ref(),
+                    Some("org.freedesktop.portal.Request"),
+                    "Close",
+                    &(),
+                );
+            }
+        }
+    }
+
+    fn portal() -> zbus::Result<Inhibitor> {
+        let connection = Connection::session()?;
+        let mut options: HashMap<&str, Value<'_>> = HashMap::new();
+        options.insert("reason", Value::from(WHY));
+        let reply = connection.call_method(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            Some("org.freedesktop.portal.Inhibit"),
+            "Inhibit",
+            &("", PORTAL_SUSPEND, options),
+        )?;
+        let request: OwnedObjectPath = reply.body().deserialize()?;
+        Ok(Inhibitor::Portal { connection, request })
+    }
+
+    fn logind() -> zbus::Result<Inhibitor> {
+        let connection = Connection::system()?;
+        let reply = connection.call_method(
+            Some("org.freedesktop.login1"),
+            "/org/freedesktop/login1",
+            Some("org.freedesktop.login1.Manager"),
+            "Inhibit",
+            &("sleep", WHO, WHY, "block"),
+        )?;
+        let fd: OwnedFd = reply.body().deserialize()?;
+        Ok(Inhibitor::Logind(fd))
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn apply(_keep_awake: bool) -> bool {
     // No implementation on this platform (see `supported`). Reported as
     // accepted so the owning thread — which is never spawned here anyway —
@@ -300,7 +437,21 @@ mod tests {
             );
             return;
         }
-        std::thread::sleep(POLL_INTERVAL + Duration::from_millis(250));
+        if cfg!(target_os = "linux") {
+            // Whether the session grants one depends on the host: a desktop has
+            // a portal, a CI runner or container may have neither it nor
+            // logind. A refusal must read as not held, which `effective`
+            // already guarantees, so only a grant is followed through.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !lock.is_held() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if !lock.is_held() {
+                return;
+            }
+        } else {
+            std::thread::sleep(POLL_INTERVAL + Duration::from_millis(250));
+        }
         assert!(lock.is_held(), "an accepted request has to read as held");
 
         lock.set(false);

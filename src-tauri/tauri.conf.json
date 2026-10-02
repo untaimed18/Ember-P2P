@@ -77,6 +77,7 @@
         ],
         "name": "eMule Collection",
         "description": "eMule Collection",
+        "mimeType": "application/x-emulecollection",
         "role": "Viewer"
       }
     ],
@@ -98,8 +99,12 @@
         "section": "net",
         "depends": [
           "xdg-utils",
-          "desktop-file-utils"
-        ]
+          "desktop-file-utils",
+          "shared-mime-info"
+        ],
+        "files": {
+          "/usr/share/mime/packages/ember.xml": "linux/ember-mime.xml"
+        }
       }
     }
   }

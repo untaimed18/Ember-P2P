@@ -115,6 +115,52 @@ fn repair_legacy_data_acls(data_dir: &std::path::Path) {
     }
 }
 
+/// Raise the soft open-file limit toward the hard one.
+///
+/// Every peer connection, `.part` file and database handle is a descriptor,
+/// `max_connections` allows up to 2000, and the soft limit a Linux desktop
+/// session starts with is commonly 1024. Running out shows up as `EMFILE` on
+/// accepts and on opening a download, long before the connection cap. Capped
+/// rather than taken to the hard limit, which can be in the millions, because
+/// every child process (`xdg-open`, the media player) inherits it.
+#[cfg(target_os = "linux")]
+fn raise_open_file_limit() {
+    const WANTED: libc::rlim_t = 65_536;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` only writes the struct it is handed.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        tracing::warn!(
+            "Could not read the open-file limit: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let target = WANTED.min(limit.rlim_max);
+    if limit.rlim_cur >= target {
+        return;
+    }
+    let raised = libc::rlimit {
+        rlim_cur: target,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: `setrlimit` only reads the struct it is handed.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+        tracing::info!(
+            "Raised the open-file limit from {} to {target}",
+            limit.rlim_cur
+        );
+    } else {
+        tracing::warn!(
+            "Could not raise the open-file limit from {}: {}",
+            limit.rlim_cur,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 /// The tray icon's menu, in the language the frontend last sent (`tray`).
 /// `cancel` is the silent-update countdown's "Cancel update" entry, shown above
 /// the others while the countdown runs.
@@ -491,6 +537,9 @@ pub fn run() {
         std::env::consts::ARCH,
     );
 
+    #[cfg(target_os = "linux")]
+    raise_open_file_limit();
+
     // Multi-instance harness path: when `EMBER_DATA_DIR` is set, every
     // launched process is meant to be an *isolated* node (own config,
     // identity, database, downloads). The `tauri-plugin-single-instance`
@@ -590,15 +639,18 @@ pub fn run() {
             // only needed for dev builds, which aren't installed and so have no
             // installer to register the scheme — hence the `debug_assertions`
             // gate on Windows. Linux has no standard installer-side mechanism,
-            // so it registers at runtime there. macOS reads the association
-            // from the bundle's Info.plist and needs neither path.
-            #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
+            // so it registers at runtime there, but only while no other client
+            // holds the scheme. macOS reads the association from the bundle's
+            // Info.plist and needs neither path.
+            #[cfg(all(debug_assertions, windows))]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 if let Err(e) = app.deep_link().register_all() {
                     tracing::warn!("Failed to register ed2k:// deep link scheme: {e}");
                 }
             }
+            #[cfg(target_os = "linux")]
+            commands::deeplink::register_scheme_unless_taken(&app_handle);
 
             // Show the running version in the main window title so users
             // can confirm which build they're on at a glance (matches the
@@ -1134,6 +1186,7 @@ pub fn run() {
                     return Err(e.into());
                 }
             }
+            tray::note_built(tray_available);
 
             // The window is created hidden (`tauri.conf.json`) and shown here,
             // once the tray exists, so a session an update restart left in the
@@ -1144,7 +1197,7 @@ pub fn run() {
             auto_update::resume::show_main_window(
                 &app_handle,
                 resume_window.as_ref(),
-                tray_available,
+                tray::reachable(),
                 settings.launch_maximized,
             );
             auto_update::silent::spawn(app_handle.clone());
@@ -2493,6 +2546,13 @@ pub fn run() {
                 }
                 "tray" => {
                     api.prevent_close();
+                    if !tray::reachable() {
+                        // Nothing would show the icon that brings it back.
+                        if let Err(e) = window.minimize() {
+                            tracing::warn!("Failed to minimize window for close-to-tray: {e}");
+                        }
+                        return;
+                    }
                     commands::chat_window::set_chat_window_visible(app_handle, false);
                     if let Err(e) = window.hide() {
                         tracing::warn!("Failed to hide window for close-to-tray: {e}");

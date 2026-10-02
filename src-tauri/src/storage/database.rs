@@ -786,8 +786,9 @@ impl Database {
                     Err(e) => {
                         warn!(
                             "Chat history is locked: the key at {} could not be recovered \
-                             ({e}). Restore it under the original Windows account, or from \
-                             backup. Nothing has been rotated or deleted.",
+                             ({e}). Restore it under the original Windows account, unlock \
+                             the login keyring on Linux, or restore from backup. Nothing has \
+                             been rotated or deleted.",
                             key_path.display()
                         );
                         return Ok(None);

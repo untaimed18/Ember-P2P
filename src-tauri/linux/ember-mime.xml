@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Installed by the .deb into /usr/share/mime/packages. The bundler writes the
+     MIME type into Ember.desktop but no definition for it, so without this a
+     file manager never typed an .emulecollection as anything Ember opens. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-emulecollection">
+    <comment>eMule Collection</comment>
+    <glob pattern="*.emulecollection"/>
+  </mime-type>
+</mime-info>

@@ -1800,7 +1800,7 @@ pub struct AppSettings {
     /// an overnight download is not cut off by the OS idle timer. The display
     /// is left alone — only sleep is deferred, and only while there is work.
     ///
-    /// Honored on Windows; see [`crate::power::supported`]. The Settings
+    /// Honored on Windows and Linux; see [`crate::power::supported`]. The Settings
     /// toggle is disabled where no inhibitor exists rather than offering a
     /// switch that does nothing.
     #[serde(default = "default_true")]

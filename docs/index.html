@@ -1112,7 +1112,7 @@
     </div>
 
     <h3>Supported Operating Systems</h3>
-    <p>Windows 10 and Windows 11. On Linux, x86-64 distributions with glibc 2.35 or newer (Ubuntu 22.04 and later, Debian 12 and later, and their derivatives), as a <code>.deb</code> or an AppImage. The AppImage needs FUSE &mdash; <code>libfuse2</code> on Ubuntu 22.04 &mdash; to start.</p>
+    <p>Windows 10 and Windows 11. On Linux, x86-64 distributions with glibc 2.35 or newer (Ubuntu 22.04 and later, Debian 12 and later, and their derivatives), as a <code>.deb</code> or an AppImage. The AppImage needs FUSE 2 to start &mdash; <code>libfuse2</code> on Ubuntu 22.04, <code>libfuse2t64</code> on Ubuntu 24.04 and Debian 13 &mdash; so on those the <code>.deb</code> is the simpler choice.</p>
 
     <h3>Requirements</h3>
     <p>No external runtimes needed. No Java, no .NET, no browser engine download. Ember ships everything it needs in a single installer.</p>
@@ -1226,7 +1226,7 @@
     <ul>
       <li><strong>First-Time Setup Wizard</strong> &mdash; Guided configuration on first launch: nickname, download folder, ports, speed limits, and theme, plus a summary of the networks Ember joins on its own.</li>
       <li><strong>Clean UI</strong> &mdash; Modern, responsive interface with real-time transfer monitoring and inline search filtering.</li>
-      <li><strong>Close to System Tray</strong> &mdash; Choose what the title-bar close button does &mdash; ask each time, minimize to tray, or exit. The tray icon stays available either way, so you can reopen Ember from there.</li>
+      <li><strong>Close to System Tray</strong> &mdash; Choose what the title-bar close button does &mdash; ask each time, minimize to tray, or exit. The tray icon stays available either way, so you can reopen Ember from there. On a Linux desktop with nothing to show the icon, such as stock GNOME without the AppIndicator extension, closing to the tray minimizes the window instead.</li>
       <li><strong>Keyboard Shortcuts</strong> &mdash; Press <strong>?</strong> for a shortcut cheat sheet, Alt+1&ndash;9 then Alt+0 to jump straight to the first ten sidebar pages, and Ctrl+, to open Settings.</li>
       <li><strong>Backup &amp; Restore</strong> &mdash; Settings &gt; Backup saves your whole profile to a single passphrase-encrypted <code>.emberbackup</code> file: identity and SecIdent keys, upload credits, settings, shared-folder list, known files, friends, chat history, transfer list, server and Kad contacts, IP filter, and learned spam data. The files you share and part-finished downloads are <em>not</em> included, so a backup stays small. Encryption is mandatory because the archive contains your private keys, and a lost passphrase cannot be recovered. Your identity keys are unwrapped from Windows DPAPI into the encrypted archive and re-wrapped for whichever Windows account restores them, so a restore on a new machine keeps your user hash, credits and friendships instead of silently rotating them. Restores are prepared immediately and applied while Ember next starts (the files being replaced are in use while it runs); the replaced originals are kept in a <code>pre-restore-&lt;timestamp&gt;</code> folder beside them, and a pending restore can be discarded from the same screen before it is applied. A restore that has sat waiting for more than a month is dropped rather than applied on top of the profile you have been using since; the backup file is untouched, so you can simply import it again. Two things to expect after restoring onto a <em>different</em> machine: shared and download folders need re-approving in Settings, and if the backup carried the database without <code>chat-history.key</code>, existing chat history stays sealed.</li>
       <li><strong>Statistics</strong> &mdash; Session and cumulative transfer statistics, connection uptime, network health indicators, and a peer reputation snapshot.</li>
@@ -1711,7 +1711,7 @@ npm run tauri dev
 
 # Build for production
 npm run tauri build</code></pre>
-    <p>On Windows the production build produces NSIS and MSI installers in <code>src-tauri/target/release/bundle/</code>. A Linux build from the same tree produces a <code>.deb</code> and an AppImage locally, but official releases and in-app updates are Windows-only.</p>
+    <p>On Windows the production build produces NSIS and MSI installers in <code>src-tauri/target/release/bundle/</code>. A Linux build from the same tree produces the same <code>.deb</code> and AppImage the official release publishes, unsigned.</p>
 
     <h3>Project Structure</h3>
     <table class="doc-table">
@@ -1830,7 +1830,7 @@ npm run tauri build</code></pre>
         Does Ember work on macOS or Linux?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
-      <div class="faq-a">Currently, official releases are Windows-only (Windows 10/11). However, the underlying stack (Tauri + Rust) is cross-platform, and community builds for other platforms may become available in the future.</div>
+      <div class="faq-a">Linux, yes: every release ships for x86-64 Linux as a <code>.deb</code> and an AppImage, and both update themselves from inside Ember. macOS has no official build. The stack (Tauri + Rust) is cross-platform, so one may follow.</div>
     </div>
 
     <div class="faq-item">

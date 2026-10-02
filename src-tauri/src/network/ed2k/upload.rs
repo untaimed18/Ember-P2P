@@ -14499,6 +14499,18 @@ mod unique_served_tests {
         )
     }
 
+    /// A shared folder in this platform's own form (`C:\A\Music`, `/c/A/Music`),
+    /// since the label is its last component as the OS splits it.
+    fn share_path(drive: char, parts: &[&str]) -> String {
+        let mut path = if cfg!(windows) {
+            std::path::PathBuf::from(format!("{drive}:\\"))
+        } else {
+            std::path::PathBuf::from(format!("/{}", drive.to_ascii_lowercase()))
+        };
+        path.extend(parts);
+        path.to_string_lossy().into_owned()
+    }
+
     fn decode_dir_labels(buf: &[u8]) -> Vec<String> {
         let count = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
         let mut rest = &buf[4..];
@@ -14519,7 +14531,7 @@ mod unique_served_tests {
     fn dir_browse_list_is_capped_and_overflow_stays_reachable() {
         let max = MAX_DIR_BROWSE_ANSWERS_PER_SESSION as usize;
         let files: Vec<_> = (0..max + 50)
-            .map(|i| browse_entry(&format!("C:\\Share\\dir{i}"), &format!("f{i}")))
+            .map(|i| browse_entry(&share_path('C', &["Share", &format!("dir{i}")]), &format!("f{i}")))
             .collect();
         let listing = DirBrowseListing::build(files, true, max);
 
@@ -14542,10 +14554,10 @@ mod unique_served_tests {
     #[test]
     fn dir_browse_list_under_cap_is_one_entry_per_label() {
         let files = vec![
-            browse_entry("C:\\A\\Music", "a"),
-            browse_entry("D:\\B\\Music", "b"),
-            browse_entry("C:\\Videos", "c"),
-            browse_entry("C:\\A\\Music", "d"),
+            browse_entry(&share_path('C', &["A", "Music"]), "a"),
+            browse_entry(&share_path('D', &["B", "Music"]), "b"),
+            browse_entry(&share_path('C', &["Videos"]), "c"),
+            browse_entry(&share_path('C', &["A", "Music"]), "d"),
         ];
         let listing = DirBrowseListing::build(files, true, 256);
         assert_eq!(decode_dir_labels(&listing.encode_dirs()), ["Music", "Videos"]);
@@ -14558,7 +14570,10 @@ mod unique_served_tests {
     /// request never lands on a different folder that folds onto it.
     #[test]
     fn dir_browse_lookup_matches_the_label_the_peer_was_sent() {
-        let files = vec![browse_entry("C:\\Música", "x"), browse_entry("C:\\M_sica", "y")];
+        let files = vec![
+            browse_entry(&share_path('C', &["Música"]), "x"),
+            browse_entry(&share_path('C', &["M_sica"]), "y"),
+        ];
 
         let folded = DirBrowseListing::build(files.clone(), false, 256);
         assert_eq!(decode_dir_labels(&folded.encode_dirs()), ["M_sica"]);

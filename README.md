@@ -297,7 +297,7 @@ Ember's own additions — the [Ember Network](#ember-network) overlay and the [E
 - **Bulk Transfer Actions** — Pause, resume, stop or cancel many downloads at once via checkbox selection or the Pause/Resume/Stop/Cancel All commands; finished and failed rows can be selected and removed from the list together, keeping the files.
 - **Upload Speed Sense (USS)** — Optionally adjusts upload speed from network latency to prevent congestion. Requires an upload speed limit to be set.
 - **Bandwidth Schedule** — A weekday timetable of upload/download caps (Settings → Bandwidth): full speed overnight, throttled during work hours, whatever the week needs. Windows may cross midnight, the first rule whose times match is the one that applies, and the manual limits apply whenever none does. Off by default; when a window is open, Settings names the rule in force and until when.
-- **Keep Awake During Transfers** — Defers OS sleep while a transfer is actually moving, so an overnight download is not cut off by the idle timer. The screen still turns off, stalled transfers do not count, and sleep resumes the moment the work stops. Windows only.
+- **Keep Awake During Transfers** — Defers OS sleep while a transfer is actually moving, so an overnight download is not cut off by the idle timer. The screen still turns off, stalled transfers do not count, and sleep resumes the moment the work stops. On Linux it goes through the desktop portal (GNOME, KDE, Cinnamon and others), or logind where there is none, and a sleep you choose from the menu still happens.
 - **AICH** — Part-level hash verification and recovery for corrupted chunks.
 
 ### Search & library
@@ -328,7 +328,7 @@ Ember's own additions — the [Ember Network](#ember-network) overlay and the [E
 - **First-Time Setup Wizard** — Guided configuration on first launch: nickname, download folder, ports, speed limits, and theme, plus a summary of the networks Ember joins on its own.
 - **Backup & Restore** — Save your profile to a single passphrase-encrypted `.emberbackup` file and restore it on another machine or after a reinstall (Settings → Backup). Covers identity and SecIdent keys, credits, settings, shared-folder list, known files, friends, chat history, transfers, server/Kad contacts, IP filter and learned spam data; excludes the shared files themselves and part-finished downloads. Identity keys are DPAPI-unwrapped into the encrypted archive and re-wrapped for the restoring Windows account, so a restore keeps your user hash, credits and friendships. Restores are staged and applied during the next launch, with the replaced files preserved in a `pre-restore-<timestamp>` folder.
 - **Desktop Notifications** — Optional system notifications for a finished or failed download, a friend coming online, a friend's message or file offer, a friend request, and room messages (that last one off by default). Each category switches off on its own, and by default they only appear while Ember is not the focused window — so they cover exactly the moments the in-app toasts and badges cannot.
-- **Close to Tray** — Choose what the title-bar X does: ask each time, minimize to tray, or exit. The tray icon stays available either way, and its tooltip carries the current up/down rates.
+- **Close to Tray** — Choose what the title-bar X does: ask each time, minimize to tray, or exit. The tray icon stays available either way, and its tooltip carries the current up/down rates. On a Linux desktop with nothing to show the icon (stock GNOME without the AppIndicator extension), closing to the tray minimizes the window instead of hiding it.
 - **Keyboard Shortcuts** — `?` opens a shortcut cheat sheet, Alt+1–9 then Alt+0 jump to the first ten sidebar pages, and Ctrl+, opens Settings.
 - **Statistics** — Session and cumulative transfer statistics, connection uptime, network health indicators, and a peer reputation snapshot.
 - **Internationalization** — UI strings via Paraglide (`en`, `es`, `fr`, `pt-BR`, `de`, `zh-CN`, `it`, `ru`, `zh-TW`), with a Settings language picker whose **System** option follows the OS locale; see [docs/i18n.md](docs/i18n.md).
@@ -341,7 +341,7 @@ Ember's own additions — the [Ember Network](#ember-network) overlay and the [E
 Ember ships for **Windows 10 and Windows 11**, and for **x86-64 Linux** as a `.deb` and an AppImage. No external runtimes are required — no Java, no .NET, no separate browser engine download.
 
 1. Download the latest release from the [Releases page](https://github.com/untaimed18/Ember-P2P/releases).
-2. Run the installer (`.exe` on Windows). On Linux, install the `.deb` with your package manager, or mark the AppImage executable and run it. Both update themselves in place from inside Ember, using the format you installed; the AppImage needs FUSE (`libfuse2` on Ubuntu 22.04) to start at all.
+2. Run the installer (`.exe` on Windows). On Linux, install the `.deb` with your package manager, or mark the AppImage executable and run it. Both update themselves in place from inside Ember, using the format you installed; the AppImage needs FUSE 2 to start at all — `libfuse2` on Ubuntu 22.04, `libfuse2t64` on Ubuntu 24.04 and Debian 13 — so on those prefer the `.deb`.
 3. On first launch, the **Setup Wizard** walks you through essential settings — nickname, download folder, ports, speed limits, and theme.
 4. **KAD connects on its own** every launch, so there is nothing to press. eD2K servers are separate: connect from the eD2K Servers page, or enable Auto-Connect Server in Settings so Ember rejoins your last one on launch. A community `server.met` list can be downloaded from emule-security.org on first run.
 5. The [Ember Network](#ember-network) needs no connect step either — it is on by default and joins on its own, finding its first peers *through* KAD.
@@ -388,7 +388,7 @@ sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
   xdg-utils desktop-file-utils
 ```
 
-A Linux build from this tree produces the same `.deb` and AppImage the release publishes, built on Ubuntu 22.04 for its glibc baseline — an AppImage bundles everything except glibc, so it runs on that release or newer and nothing older. The AppImage needs FUSE (`libfuse2` on Ubuntu 22.04); if it fails to start, run it with `APPIMAGE_EXTRACT_AND_RUN=1`. Ctrl++ / Ctrl+- zoom the UI if the compositor's display scale is not applied.
+A Linux build from this tree produces the same `.deb` and AppImage the release publishes, built on Ubuntu 22.04 for its glibc baseline — an AppImage bundles everything except glibc, so it runs on that release or newer and nothing older. The AppImage needs FUSE 2 (`libfuse2` on Ubuntu 22.04, `libfuse2t64` on Ubuntu 24.04 and Debian 13); if it fails to start, run it with `APPIMAGE_EXTRACT_AND_RUN=1`. A large shared library can exceed the kernel's inotify watch limit, which turns off live tracking for that folder until it is raised (`sudo sysctl fs.inotify.max_user_watches=524288`). Ctrl++ / Ctrl+- zoom the UI if the compositor's display scale is not applied.
 
 #### Development
 
