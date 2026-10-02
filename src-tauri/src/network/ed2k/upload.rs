@@ -641,7 +641,7 @@ struct OutboundServeState {
     /// starts with this file and has already sent `OP_ACCEPTUPLOADREQ`.
     push_grant_file_hash: Option<[u8; 16]>,
     /// See [`ConnectServeRequest::push_grant_accepted`].
-    push_grant_accepted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    push_grant_accepted: Option<Arc<PushGrantSignal>>,
     /// Set when this dial negotiated Noise IK for
     /// [`ConnectServeRequest::secure_friend_ember_hash`]. Unlike every other
     /// outbound dial — which learns the peer's Ember hash only from an
@@ -675,10 +675,10 @@ pub struct ConnectServeRequest {
     /// handshake we send `OP_ACCEPTUPLOADREQ` and seed the file hash so the
     /// peer can start `OP_REQUESTPARTS` without another `STARTUPLOADREQ`.
     pub push_grant_file_hash: Option<[u8; 16]>,
-    /// Set to `true` once `OP_ACCEPTUPLOADREQ` is sent for a push-grant so the
+    /// Marked accepted once `OP_ACCEPTUPLOADREQ` is sent for a push-grant so the
     /// caller can distinguish pre-grant dial failures (restore seniority) from
     /// post-grant session errors (do not restore).
-    pub push_grant_accepted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub push_grant_accepted: Option<Arc<PushGrantSignal>>,
     /// When `Some(ember_hash)`, this dial answers a friend's
     /// `OP_EMBER_XFER_REQ`: negotiate a Noise IK secure stream against that
     /// expected identity instead of RC4 obfuscation, so the friend can route
@@ -688,6 +688,61 @@ pub struct ConnectServeRequest {
     /// transfer that silently downgraded would lose exactly the identity
     /// binding the routing depends on.
     pub secure_friend_ember_hash: Option<[u8; 16]>,
+}
+
+/// Grant outcome of an `AddUpNextClient` push-grant dial, shared by
+/// `try_add_up_next_client` and the session it starts.
+///
+/// The dial's place under [`MAX_PUSH_GRANT_DIALS`] is given back as soon as the
+/// dial is resolved: at `OP_ACCEPTUPLOADREQ`, or when the session ends without
+/// one. `connect_and_serve` returns only when the whole session is over, so a
+/// place held until then let three long uploads stop every other disconnected
+/// HighID waiter from being dialed while slots stood free.
+#[derive(Debug)]
+pub struct PushGrantSignal {
+    accepted: std::sync::atomic::AtomicBool,
+    dial_released: std::sync::atomic::AtomicBool,
+    dials: Arc<std::sync::atomic::AtomicUsize>,
+    /// The waiter's user hash. The dialed address is remembered from its last
+    /// contact and may belong to another client by now.
+    waiter_user_hash: Option<[u8; 16]>,
+}
+
+impl PushGrantSignal {
+    /// Takes over one place the caller has already added to `dials`.
+    fn new(dials: Arc<std::sync::atomic::AtomicUsize>, waiter_user_hash: Option<[u8; 16]>) -> Self {
+        Self {
+            accepted: std::sync::atomic::AtomicBool::new(false),
+            dial_released: std::sync::atomic::AtomicBool::new(false),
+            dials,
+            waiter_user_hash,
+        }
+    }
+
+    fn answered_by_waiter(&self, peer_user_hash: &[u8; 16]) -> bool {
+        self.waiter_user_hash.is_none_or(|h| h == *peer_user_hash)
+    }
+
+    fn mark_accepted(&self) {
+        self.accepted.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.release_dial();
+    }
+
+    fn accepted(&self) -> bool {
+        self.accepted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn release_dial(&self) {
+        if !self.dial_released.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            self.dials.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for PushGrantSignal {
+    fn drop(&mut self) {
+        self.release_dial();
+    }
 }
 
 struct UploadSlotGuard {
@@ -3690,6 +3745,55 @@ pub(crate) fn compute_queue_rank(
     rank
 }
 
+/// [`compute_queue_rank`] for every row at once, in `queue` order.
+///
+/// Calling that per row scores the whole queue for each one: some 39 million
+/// scores at `HARD_UPLOAD_QUEUE_SIZE`, which the Queued tab's snapshot paid on
+/// every poll. This scores each row once and sorts. Rows tied on both score
+/// and join time share a rank, as they do there.
+pub(crate) fn compute_queue_ranks(
+    cm: &CreditManager,
+    idx: &LocalIndex,
+    queue: &[QueueEntry],
+) -> Vec<u16> {
+    let mut prio_cache: HashMap<[u8; 16], f64> = HashMap::new();
+    let scores: Vec<f64> = queue
+        .iter()
+        .map(|entry| {
+            let file_prio = *prio_cache
+                .entry(entry.file_hash)
+                .or_insert_with(|| file_priority_weight(idx, entry.file_hash));
+            score_queue_entry_with_prio(
+                cm,
+                file_prio,
+                &entry.user_hash,
+                entry.join_time.elapsed().as_secs(),
+                entry.current_addr,
+                entry.emule_version,
+                entry.is_friend_slot,
+                entry.ember_pubkey.as_ref(),
+                entry.ember_verified,
+            )
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..queue.len()).collect();
+    order.sort_by(|&a, &b| {
+        scores[b]
+            .total_cmp(&scores[a])
+            .then(queue[a].join_time.cmp(&queue[b].join_time))
+    });
+    let mut ranks = vec![0u16; queue.len()];
+    let mut group_start = 0;
+    for pos in 0..order.len() {
+        let (lead, row) = (order[group_start], order[pos]);
+        if scores[row] != scores[lead] || queue[row].join_time != queue[lead].join_time {
+            group_start = pos;
+        }
+        ranks[row] = u16::try_from(group_start + 1).unwrap_or(u16::MAX);
+    }
+    ranks
+}
+
 /// eMule MAX_PURGEQUEUETIME: 1 hour in seconds
 pub(crate) const MAX_PURGEQUEUETIME_SECS: u64 = 3600;
 
@@ -5850,13 +5954,17 @@ impl UploadHandler {
         }
         self.push_grant_dials
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let waiter_user_hash = (entry.user_hash != [0u8; 16]).then_some(entry.user_hash);
+        let grant_accepted = Arc::new(PushGrantSignal::new(
+            self.push_grant_dials.clone(),
+            waiter_user_hash,
+        ));
 
         let identity = entry.identity.clone();
-        let grant_accepted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let req = ConnectServeRequest {
             peer_addr,
             crypt_options: entry.crypt_options,
-            user_hash: (entry.user_hash != [0u8; 16]).then_some(entry.user_hash),
+            user_hash: waiter_user_hash,
             push_grant_file_hash: Some(entry.file_hash),
             push_grant_accepted: Some(grant_accepted.clone()),
             secure_friend_ember_hash: None,
@@ -5871,14 +5979,12 @@ impl UploadHandler {
         // to let the cap block: `CUploadQueue::AddUpNextClient` dials with
         // `TryToConnect(true)` (`UploadQueue.cpp:208`) where the download path
         // passes `false` (`DownloadClient.cpp:209`). Same intent here, but
-        // bounded rather than unlimited — `MAX_PUSH_GRANT_DIALS` already caps
-        // how many of these can be in flight, so that is exactly the headroom
-        // this needs and no more.
+        // bounded rather than unlimited: the pool runs at most
+        // `MAX_PUSH_GRANT_DIALS` over its ceiling for these, however many
+        // granted sessions are still holding their permits.
         let Some(conn_permit) =
             super::multi_source::try_acquire_listener_conn(MAX_PUSH_GRANT_DIALS)
         else {
-            self.push_grant_dials
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             self.push_grant_in_flight.lock().await.remove(&identity);
             return;
         };
@@ -5894,8 +6000,6 @@ impl UploadHandler {
         };
         if !per_ip_reserved {
             drop(conn_permit);
-            self.push_grant_dials
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             self.push_grant_in_flight.lock().await.remove(&identity);
             debug!("AddUpNextClient: dropping dial to {peer_addr}: per-IP limit reached");
             return;
@@ -5904,18 +6008,14 @@ impl UploadHandler {
             ConnectionAdmissionGuard::new(conn_permit, self.ip_connection_counts.clone(), ip);
 
         let result = self.connect_and_serve(req).await;
-        self.push_grant_dials
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        grant_accepted.release_dial();
         self.push_grant_in_flight.lock().await.remove(&identity);
 
-        let accepted = grant_accepted.load(std::sync::atomic::Ordering::Relaxed);
-        if accepted {
-            // Granted: drop waiting-list seniority unless a different IP
-            // still owns the bind. Same-IP advertised-port mismatch is a
-            // NAT rebind of the peer that just got the slot.
-            let mut queue = self.upload_queue.lock().await;
-            queue.retain(|e| keep_queue_row_after_slot_grant(&identity, peer_addr.ip(), e));
-        } else {
+        // A grant's waiting row was dropped by `run_session` when it accepted.
+        // `connect_and_serve` returns only once the whole session is over, so
+        // any row of this identity now is a later one, such as the re-queue
+        // after a slot rotation, and must stay.
+        if !grant_accepted.accepted() {
             // No grant, whether the dial failed or the session ended softly.
             // Back off either way: the row is still the top scorer, so without
             // this the 1 s slot tick redials it and starves everyone below.
@@ -6102,7 +6202,7 @@ impl UploadHandler {
         secure_peer: Option<super::secure_stream::SecurePeerIdentity>,
         obf_enabled: bool,
         push_grant_file_hash: Option<[u8; 16]>,
-        push_grant_accepted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        push_grant_accepted: Option<Arc<PushGrantSignal>>,
     ) -> anyhow::Result<()> {
         {
             // Outbound Hello (we initiate: send OP_HELLO, expect OP_HELLOANSWER).
@@ -6355,7 +6455,7 @@ impl UploadHandler {
         // `None` for inbound.
         let mut outbound_first_packet: Option<(u8, u8, Vec<u8>)> = None;
         let mut push_grant_file_hash: Option<[u8; 16]> = None;
-        let mut push_grant_accepted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
+        let mut push_grant_accepted: Option<Arc<PushGrantSignal>> = None;
         let mut secure_v2_peer: Option<super::secure_stream::SecurePeerIdentity> = None;
         let mut handed_over = false;
         let (mut reader, mut writer, hello_data, peer_user_hash, mut hello_caps) = match init {
@@ -7976,6 +8076,14 @@ impl UploadHandler {
         // flag and terminates the connection, letting all the normal
         // cleanup (slot guard drop, queue retain, completion event) run.
         let mut user_cancelled = false;
+        // The transfer id last seen in `transfer_manager.active`. `Started`
+        // reaches the manager through the network loop, so a row missing
+        // before it was ever seen is not registered yet, not cancelled.
+        let mut registered_transfer_id: Option<String> = None;
+        // Wire bytes of the current OP_REQUESTPARTS batch not yet credited to
+        // the peer. A `?` mid-batch skips the batch's flush, so the teardown
+        // credits what is left here.
+        let mut unflushed_credit_bytes: u64 = 0;
         let mut slot_guard = UploadSlotGuard::new(
             self.active_count.clone(),
             self.slot_notify.clone(),
@@ -8017,6 +8125,15 @@ impl UploadHandler {
         // file hash, reserve a slot, and send OP_ACCEPTUPLOADREQ before the
         // packet loop (peer will follow with OP_REQUESTPARTS).
         if let Some(fh) = push_grant_file_hash {
+            if push_grant_accepted
+                .as_ref()
+                .is_some_and(|signal| !signal.answered_by_waiter(&peer_user_hash))
+            {
+                anyhow::bail!(
+                    "push-grant session {peer_addr}: answered by user {}, not the waiter dialed",
+                    crate::security::short_hash(&peer_user_hash)
+                );
+            }
             // The waiter's file may have been unshared since it queued, or be
             // friends-only, which a plain session like this is never served.
             // eMule drops such a waiter rather than grant it a slot; kept, the
@@ -8046,21 +8163,29 @@ impl UploadHandler {
             }
             current_file_hash = Some(fh);
             write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_ACCEPTUPLOADREQ, &[]).await?;
-            if let Some(flag) = push_grant_accepted.as_ref() {
-                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(signal) = push_grant_accepted.as_ref() {
+                signal.mark_accepted();
             }
             // Drop waiting-list entry now that the slot is granted (eMule
             // RemoveFromWaitingQueue before/at AcceptUploadReq). A different
             // IP still bound to this identity keeps its row; a same-IP
             // advertised-port mismatch is this peer's NAT rebind.
-            {
+            // The row's wait is what this dial granted, so it is read before
+            // the row goes and shown as Waited like any other grant.
+            let granted_join_time = {
                 let mut queue = self.upload_queue.lock().await;
+                let mut earliest: Option<std::time::Instant> = None;
                 queue.retain(|e| {
-                    keep_queue_row_after_slot_grant(&queue_identity, peer_addr.ip(), e)
+                    let keep = keep_queue_row_after_slot_grant(&queue_identity, peer_addr.ip(), e);
+                    if !keep {
+                        earliest = Some(earliest.map_or(e.join_time, |t| t.min(e.join_time)));
+                    }
+                    keep
                 });
-            }
+                earliest
+            };
             self.record_share_accepted(&fh).await;
-            queue_wait_at_grant = 0;
+            queue_wait_at_grant = granted_join_time.map_or(0, |t| t.elapsed().as_secs());
             session_start = Some(std::time::Instant::now());
             last_part_request = std::time::Instant::now();
             let tid = uuid::Uuid::new_v4().to_string();
@@ -8083,7 +8208,7 @@ impl UploadHandler {
                         } else {
                             None
                         },
-                        wait_seconds: 0,
+                        wait_seconds: queue_wait_at_grant,
                         ember_hash: peer_ember_hash.map(hex::encode),
                     },
                 })
@@ -8712,10 +8837,17 @@ impl UploadHandler {
                                             // are NOT in the shared index, so an index-only lookup
                                             // returned None and the Uploading list showed a blank
                                             // File column for partial-file seeds.
-                                            let file_name = self
+                                            // `total_size` follows only OP_SETREQFILEID, so a
+                                            // file named by OP_REQUESTFILENAME or
+                                            // OP_STARTUPLOADREQ alone would keep the previous
+                                            // file's size.
+                                            let resolved = self
                                                 .resolve_upload_file(&hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated })
-                                                .await
-                                                .map(|rf| rf.name);
+                                                .await;
+                                            if let Some(rf) = &resolved {
+                                                total_size = rf.size;
+                                            }
+                                            let file_name = resolved.map(|rf| rf.name);
 
                                             let _ = self
                                                 .upload_event_tx
@@ -8898,10 +9030,16 @@ impl UploadHandler {
                         // actually bound. A refused key must not reset a
                         // verified peer's state to `Needed` — that alone
                         // would let a stranger knock an established identity
-                        // out of `Verified` on demand.
+                        // out of `Verified` on demand. The same goes for the
+                        // key already bound, which is public: the peer hands
+                        // it to anyone who asks, and once `Needed`, one bad
+                        // signature makes the record `Failed`.
+                        let was_verified = cm
+                            .get_record(&peer_user_hash)
+                            .is_some_and(|r| r.ident_state == super::credits::IdentState::Verified);
                         let key_bound = cm
                             .set_public_key(peer_user_hash, payload[1..1 + key_len].to_vec());
-                        if key_bound {
+                        if key_bound && !was_verified {
                             cm.set_ident_state(peer_user_hash, super::credits::IdentState::Needed);
                         }
                         drop(cm);
@@ -9360,8 +9498,11 @@ impl UploadHandler {
                     // OP_END_OF_DOWNLOAD path below — makes the stranded
                     // first row snap to "Complete" with the full file size
                     // even though zero bytes went out on it. Re-ack and keep
-                    // the existing session intact instead.
-                    if slot_guard.is_active() && transfer_id.is_some() {
+                    // the existing session intact instead. This holds after a
+                    // mid-slot file switch as well, when `transfer_id` is None:
+                    // scoring a slot holder could queue it while it keeps the
+                    // slot, and the next OP_REQUESTPARTS mints the new row.
+                    if slot_guard.is_active() {
                         write_packet_async(
                             &mut writer,
                             OP_EDONKEYHEADER,
@@ -9983,10 +10124,15 @@ impl UploadHandler {
                         // files served from an in-progress download (a `.part` under Temp,
                         // absent from the shared index) report their name instead of a blank
                         // File column in the Uploading list.
-                        let file_name = self
+                        // As at the queue promotion grant: `total_size` must be
+                        // this file's, not one named earlier on the session.
+                        let resolved = self
                             .resolve_upload_file(&hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated })
-                            .await
-                            .map(|rf| rf.name);
+                            .await;
+                        if let Some(rf) = &resolved {
+                            total_size = rf.size;
+                        }
+                        let file_name = resolved.map(|rf| rf.name);
 
                         let _ = self.upload_event_tx.send(UploadEvent {
                             transfer_id: tid,
@@ -10523,9 +10669,13 @@ impl UploadHandler {
                         // rows in the UI queue.
                         if let Some(tid) = &transfer_id {
                             let mgr = self.transfer_manager.read().await;
-                            let cancelled = !mgr.active.contains_key(tid);
+                            let present = mgr.active.contains_key(tid);
                             drop(mgr);
-                            if cancelled {
+                            let seen = registered_transfer_id.as_deref() == Some(tid.as_str());
+                            if present && !seen {
+                                registered_transfer_id = Some(tid.clone());
+                            }
+                            if !present && seen {
                                 info!("Upload {tid} cancelled by user, ending session");
                                 user_cancelled = true;
                                 break;
@@ -10799,6 +10949,8 @@ impl UploadHandler {
                                 rate_tracker.record_send(chunk_len as u64);
                                 batch_credited_bytes =
                                     batch_credited_bytes.saturating_add(chunk_len as u64);
+                                unflushed_credit_bytes =
+                                    unflushed_credit_bytes.saturating_add(chunk_len as u64);
 
                                 if let Some(tid) = &transfer_id {
                                     let should_emit = match last_progress_emit {
@@ -10917,6 +11069,8 @@ impl UploadHandler {
                             rate_tracker.record_send(chunk_len as u64);
                             batch_credited_bytes =
                                 batch_credited_bytes.saturating_add(chunk_len as u64);
+                            unflushed_credit_bytes =
+                                unflushed_credit_bytes.saturating_add(chunk_len as u64);
 
                             if let Some(tid) = &transfer_id {
                                 let should_emit = match last_progress_emit {
@@ -10975,6 +11129,7 @@ impl UploadHandler {
                     // (see inside the loop above) and showed up as real
                     // contention under multi-slot uploads.
                     if batch_credited_bytes > 0 {
+                        unflushed_credit_bytes = 0;
                         {
                             let mut cm = self.credit_manager.write().await;
                             cm.add_uploaded(peer_user_hash, batch_credited_bytes);
@@ -11276,6 +11431,9 @@ impl UploadHandler {
                             let mut cm = self.credit_manager.write().await;
                             cm.record_ember_session(pk, uploaded, session_secs, completed, verified);
                         }
+                        // Cleared before the write: if it fails, the teardown
+                        // must not record this session a second time.
+                        session_start = None;
                         write_packet_async(
                             &mut writer,
                             OP_EDONKEYHEADER,
@@ -11309,7 +11467,10 @@ impl UploadHandler {
                         transfer_id = None;
 
                         slot_guard.deactivate();
-                        session_start = None;
+                        // The wait that won this slot is spent. Re-queued on the
+                        // old join time, the peer outscores every waiter that
+                        // joined after it and takes back the slot it just gave up.
+                        queue_join_time = std::time::Instant::now();
                         // Reset the session byte counters, exactly as the
                         // cancel / end-of-download teardown below does. Left
                         // set, the outer idle gate (`slot_guard.is_active() ||
@@ -11569,6 +11730,9 @@ impl UploadHandler {
                         }).await;
                     }
                     slot_guard.deactivate();
+                    // As on rotation: a later OP_STARTUPLOADREQ on this session
+                    // queues from now, not from before the slot it just used.
+                    queue_join_time = std::time::Instant::now();
                     transfer_id = None;
                     uploaded = 0;
                     uploaded_wire = 0;
@@ -11978,7 +12142,11 @@ impl UploadHandler {
                                     self.note_abusive_request(peer_addr.ip()).await;
                                     continue;
                                 }
-                                let (computed_md4, computed_aich) = tokio::task::spawn_blocking(move || {
+                                // A read failure (a range lock, a pulled drive, a
+                                // truncated file) skips the answer, as the legacy
+                                // and AICH handlers do, rather than ending the
+                                // session and any slot it holds.
+                                let hashed = tokio::task::spawn_blocking(move || {
                                     let md4 = if compute_md4 {
                                         if is_partial {
                                             let tracker = super::part_tracker::PartTracker::new(file_size, &path);
@@ -12006,7 +12174,14 @@ impl UploadHandler {
                                         None
                                     };
                                     Ok::<_, anyhow::Error>((md4, aich))
-                                }).await??;
+                                }).await?;
+                                let (computed_md4, computed_aich) = match hashed {
+                                    Ok(pair) => pair,
+                                    Err(e) => {
+                                        warn!("Failed to compute HashSet2 for {file_name}: {e}");
+                                        continue;
+                                    }
+                                };
                                 if let Some(ref hashes) = computed_md4 {
                                     if !is_partial {
                                         self.part_hash_cache
@@ -13625,6 +13800,14 @@ impl UploadHandler {
         self.slot_rates.lock().remove(&peer_addr);
         session_row_guard.disarm();
 
+        if unflushed_credit_bytes > 0 {
+            let mut cm = self.credit_manager.write().await;
+            cm.add_uploaded(peer_user_hash, unflushed_credit_bytes);
+            if let Some(pk) = hello_caps.ember_pubkey {
+                cm.add_ember_uploaded(pk, unflushed_credit_bytes, secure_v2_authenticated);
+            }
+        }
+
         // slot_guard Drop handles upload slot release automatically
 
         // Ember session reliability/speed bookkeeping for the
@@ -15085,6 +15268,65 @@ mod scoring_tests {
         };
         assert_eq!(scored(true), 268_435_455.0);
         assert!(scored(false) < 268_435_455.0);
+    }
+
+    #[test]
+    fn batch_queue_ranks_match_the_per_row_rank() {
+        use std::time::Duration;
+
+        let cm = CreditManager::new();
+        let idx = LocalIndex::new();
+        let caps = PeerCapabilities {
+            tcp_port: 4662,
+            ..PeerCapabilities::default()
+        };
+        let now = std::time::Instant::now();
+        let tied_join = now - Duration::from_secs(600);
+        let rows: Vec<(u8, u64, bool)> = vec![
+            (1, 120, false),
+            (2, 3_000, false),
+            (3, 600, false),
+            (4, 600, false),
+            (5, 0, true),
+            (6, 45, false),
+        ];
+        let queue: Vec<QueueEntry> = rows
+            .iter()
+            .map(|&(n, waited, friend)| {
+                let addr: SocketAddr = format!("8.8.8.{n}:4662").parse().unwrap();
+                let join = if waited == 600 { tied_join } else { now - Duration::from_secs(waited) };
+                queue_entry_from_hello(
+                    QueueIdentity::UserHash([n; 16]),
+                    addr,
+                    [n; 16],
+                    [7u8; 16],
+                    join,
+                    &caps,
+                    friend,
+                    false,
+                )
+            })
+            .collect();
+
+        let ranks = compute_queue_ranks(&cm, &idx, &queue);
+        for (entry, &rank) in queue.iter().zip(&ranks) {
+            let score = score_queue_entry(
+                &cm,
+                &idx,
+                &entry.user_hash,
+                entry.file_hash,
+                entry.join_time.elapsed().as_secs(),
+                entry.current_addr,
+                entry.emule_version,
+                entry.is_friend_slot,
+                entry.ember_pubkey.as_ref(),
+                entry.ember_verified,
+            );
+            let one = compute_queue_rank(&cm, &idx, &queue, &entry.identity, score, entry.join_time);
+            assert_eq!(rank, one, "row {:?}", entry.identity);
+        }
+        assert_eq!(ranks[4], 1, "the friend slot leads");
+        assert_eq!(ranks[2], ranks[3], "an exact tie shares its rank");
     }
 
     /// eMule refuses to send `OP_QUEUERANKING` to a client that never proved it

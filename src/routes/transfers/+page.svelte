@@ -3172,7 +3172,9 @@
   }
   async function ctxAction(action: string, extra?: string) {
     if (!ctxMenu) return;
-    const t = ctxMenu.transfer;
+    // The row the menu was drawn from, which can have gained fields (an Ember
+    // hash, say) since the right-click.
+    const t = ctxTransfer ?? ctxMenu.transfer;
     closeCtx();
     try {
       switch (action) {

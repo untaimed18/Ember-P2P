@@ -15,12 +15,18 @@ pub enum UssState {
 
 const MAX_PING_HISTORY: usize = 50;
 const BASELINE_SAMPLES: usize = 5;
+/// Samples the congestion check takes its median over. The ping host answers
+/// one KADEMLIA2_PING per 31.5 s (`uss_ping_tick`), so a median over the whole
+/// history spanned some 26 minutes and took a quarter of an hour to notice
+/// congestion or its end.
+const MONITOR_WINDOW: usize = 5;
 const FAST_REACTION_SECS: u64 = 60;
 /// How long the quiet-baseline phase may hold uploads at `min_upload`.
 ///
-/// The network loop pings the selected KAD host every 2s, so `BASELINE_SAMPLES`
-/// normally completes in ~10s; 60s covers a host rotation (3 missed pongs) plus
-/// reselection with room to spare. Past it we stop throttling, because the RTT
+/// The ping host takes one KAD ping per 31.5 s, so `BASELINE_SAMPLES` needs
+/// about two minutes; holding uploads at `min_upload` that long on every enable
+/// costs more than a baseline read at the cap, which the Monitoring ratchet
+/// pulls down later. Past it we stop throttling, also because the RTT
 /// feed can be *permanently* empty and nothing else notices: samples only exist
 /// while a USS ping host is selected, and none ever is when KAD is disabled,
 /// bootstrap failed, no contact verifies behind a restrictive NAT, or the user
@@ -58,6 +64,13 @@ pub struct UploadSpeedSense {
     /// configured cap instead of `min_upload`. Not a latch — `record_ping`
     /// still promotes to `Monitoring` if samples show up later.
     baseline_stalled: bool,
+    /// The host `ping_history` and the baseline were measured against. RTTs to
+    /// another host follow another path and are not comparable with them.
+    ping_host: Option<std::net::SocketAddr>,
+    /// A sample arrived since the limit last moved. `compute_limit` runs every
+    /// second and samples come every 31.5 s, so stepping on every call moved
+    /// the cap 30 times on one measurement: to the floor in about 11 s.
+    fresh_sample: bool,
 }
 
 impl UploadSpeedSense {
@@ -77,6 +90,8 @@ impl UploadSpeedSense {
             start_time: None,
             prepare_started: None,
             baseline_stalled: false,
+            ping_host: None,
+            fresh_sample: false,
         }
     }
 
@@ -93,6 +108,8 @@ impl UploadSpeedSense {
             self.prepare_started = Some(Instant::now());
             self.baseline_stalled = false;
             self.ping_history.clear();
+            self.ping_host = None;
+            self.fresh_sample = false;
             // Measure baseline under light load (see `compute_limit` while
             // Preparing). After the baseline is ready we jump to the full cap
             // and throttle from there — matching eMule's prepare→monitor flow.
@@ -108,6 +125,8 @@ impl UploadSpeedSense {
         self.prepare_started = None;
         self.baseline_stalled = false;
         self.ping_history.clear();
+        self.ping_host = None;
+        self.fresh_sample = false;
         if was_enabled {
             info!("USS disabled");
         }
@@ -119,13 +138,28 @@ impl UploadSpeedSense {
 
     /// Record a real KAD Ping/Pong RTT measurement in milliseconds.
     /// Transitions from Preparing to Monitoring once enough samples establish a baseline.
-    pub fn record_ping(&mut self, latency_ms: f64) {
+    pub fn record_ping(&mut self, host: std::net::SocketAddr, latency_ms: f64) {
         if !self.enabled {
             return;
         }
 
         if !latency_ms.is_finite() || latency_ms <= 0.0 || latency_ms > 30_000.0 {
             return;
+        }
+
+        if self.ping_host != Some(host) {
+            if self.ping_host.is_some() {
+                // Judged against the old host's baseline, a farther host reads
+                // as congestion on an idle link for as long as it is pinged.
+                // Monitoring holds the current limit until this host has a
+                // baseline of its own.
+                self.ping_history.clear();
+                if self.state == UssState::Monitoring {
+                    self.initial_ping_ms = 0.0;
+                }
+                debug!("USS: ping host changed to {host}; measuring a new baseline");
+            }
+            self.ping_host = Some(host);
         }
 
         self.ping_history.push_back(latency_ms);
@@ -157,6 +191,17 @@ impl UploadSpeedSense {
                 if was_stalled { ", after fallback" } else { "" }
             );
         } else if self.state == UssState::Monitoring
+            && self.initial_ping_ms == 0.0
+            && self.ping_history.len() >= BASELINE_SAMPLES
+        {
+            // Measured at the running limit rather than at `min_upload`, so it
+            // may read high; the ratchet below pulls it down.
+            self.initial_ping_ms = self.compute_min();
+            info!(
+                "USS: Baseline RTT for ping host {host}: {:.1}ms",
+                self.initial_ping_ms
+            );
+        } else if self.state == UssState::Monitoring
             && self.initial_ping_ms > 0.0
             && self.ping_history.len() >= BASELINE_SAMPLES
         {
@@ -186,6 +231,9 @@ impl UploadSpeedSense {
                     self.initial_ping_ms
                 );
             }
+        }
+        if self.state == UssState::Monitoring {
+            self.fresh_sample = true;
         }
     }
 
@@ -232,14 +280,15 @@ impl UploadSpeedSense {
             return None;
         }
 
-        if self.ping_history.len() < 3 {
+        if self.ping_history.len() < 3 || !self.fresh_sample {
             return Some(
                 self.current_limit
                     .clamp(self.min_upload, self.effective_max()),
             );
         }
+        self.fresh_sample = false;
 
-        let current_ping = self.compute_median();
+        let current_ping = self.compute_recent_median();
         let target_ping = self.initial_ping_ms * self.ping_tolerance;
 
         let is_fast_reaction = self
@@ -302,11 +351,17 @@ impl UploadSpeedSense {
         }
     }
 
-    fn compute_median(&self) -> f64 {
+    fn compute_recent_median(&self) -> f64 {
         if self.ping_history.is_empty() {
             return 0.0;
         }
-        let mut sorted: Vec<f64> = self.ping_history.iter().copied().collect();
+        let mut sorted: Vec<f64> = self
+            .ping_history
+            .iter()
+            .rev()
+            .take(MONITOR_WINDOW)
+            .copied()
+            .collect();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mid = sorted.len() / 2;
         if sorted.len().is_multiple_of(2) {
@@ -358,7 +413,20 @@ fn sanitize_min_upload(min_upload: u64, max_upload: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
     use std::time::Duration;
+
+    fn host_a() -> SocketAddr {
+        "192.0.2.1:4672".parse().unwrap()
+    }
+
+    fn host_b() -> SocketAddr {
+        "198.51.100.7:4672".parse().unwrap()
+    }
+
+    fn ping(uss: &mut UploadSpeedSense, ms: f64) {
+        uss.record_ping(host_a(), ms);
+    }
 
     /// Pretend the quiet-baseline phase started before its deadline.
     fn expire_prepare_deadline(uss: &mut UploadSpeedSense) {
@@ -375,7 +443,7 @@ mod tests {
         assert_eq!(uss.compute_limit(), Some(uss.min_upload));
 
         for _ in 0..BASELINE_SAMPLES {
-            uss.record_ping(40.0);
+            ping(&mut uss, 40.0);
         }
         assert_eq!(uss.state(), UssState::Monitoring);
         assert!((uss.initial_ping_ms - 40.0).abs() < f64::EPSILON);
@@ -387,11 +455,11 @@ mod tests {
     fn baseline_uses_lowest_sample() {
         let mut uss = UploadSpeedSense::new(0, 100_000);
         uss.enable();
-        uss.record_ping(80.0);
-        uss.record_ping(50.0);
-        uss.record_ping(60.0);
-        uss.record_ping(55.0);
-        uss.record_ping(90.0);
+        ping(&mut uss, 80.0);
+        ping(&mut uss, 50.0);
+        ping(&mut uss, 60.0);
+        ping(&mut uss, 55.0);
+        ping(&mut uss, 90.0);
         assert_eq!(uss.state(), UssState::Monitoring);
         assert!((uss.initial_ping_ms - 50.0).abs() < f64::EPSILON);
     }
@@ -401,12 +469,12 @@ mod tests {
         let mut uss = UploadSpeedSense::new(0, 100_000);
         uss.enable();
         for _ in 0..BASELINE_SAMPLES {
-            uss.record_ping(50.0);
+            ping(&mut uss, 50.0);
         }
         assert!((uss.initial_ping_ms - 50.0).abs() < f64::EPSILON);
 
         // One quieter spike must not permanently lower the baseline.
-        uss.record_ping(10.0);
+        ping(&mut uss, 10.0);
         assert!(
             (uss.initial_ping_ms - 50.0).abs() < f64::EPSILON,
             "baseline moved to {} after a single quiet sample",
@@ -415,7 +483,7 @@ mod tests {
 
         // A sustained quieter window (last BASELINE_SAMPLES all lower) may.
         for _ in 0..BASELINE_SAMPLES {
-            uss.record_ping(30.0);
+            ping(&mut uss, 30.0);
         }
         assert!((uss.initial_ping_ms - 30.0).abs() < f64::EPSILON);
     }
@@ -425,11 +493,11 @@ mod tests {
         let mut uss = UploadSpeedSense::new(0, 100_000);
         uss.enable();
         for _ in 0..BASELINE_SAMPLES {
-            uss.record_ping(40.0);
+            ping(&mut uss, 40.0);
         }
         // Force an immediate overshoot well above target (40 * 2.0 = 80).
         for _ in 0..5 {
-            uss.record_ping(400.0);
+            ping(&mut uss, 400.0);
         }
         let before = uss.current_limit;
         let after = uss.compute_limit().unwrap();
@@ -443,7 +511,7 @@ mod tests {
         let mut uss = UploadSpeedSense::new(0, 100_000);
         uss.enable();
         for _ in 0..BASELINE_SAMPLES {
-            uss.record_ping(40.0);
+            ping(&mut uss, 40.0);
         }
         assert_eq!(uss.current_limit, 100_000);
         uss.set_limits(0, 20_000);
@@ -474,8 +542,8 @@ mod tests {
         let mut uss = UploadSpeedSense::new(0, 1_000_000);
         uss.enable();
         // A host answered a couple of pings, then went away.
-        uss.record_ping(40.0);
-        uss.record_ping(42.0);
+        ping(&mut uss, 40.0);
+        ping(&mut uss, 42.0);
         assert_eq!(uss.compute_limit(), Some(100_000));
         expire_prepare_deadline(&mut uss);
         assert_eq!(uss.compute_limit(), Some(1_000_000));
@@ -483,7 +551,7 @@ mod tests {
         // The fallback must not latch USS off: enough samples still promote to
         // Monitoring and hand control of the cap back to RTT.
         for _ in 0..BASELINE_SAMPLES {
-            uss.record_ping(40.0);
+            ping(&mut uss, 40.0);
         }
         assert_eq!(uss.state(), UssState::Monitoring);
         assert!(!uss.baseline_stalled);
@@ -495,7 +563,7 @@ mod tests {
         let mut uss = UploadSpeedSense::new(0, 1_000_000);
         uss.enable();
         for _ in 0..BASELINE_SAMPLES {
-            uss.record_ping(40.0);
+            ping(&mut uss, 40.0);
         }
         assert_eq!(uss.state(), UssState::Monitoring);
         // An expired-looking start time must not disturb an established
@@ -503,5 +571,75 @@ mod tests {
         expire_prepare_deadline(&mut uss);
         assert!(!uss.baseline_stalled);
         assert_eq!(uss.compute_limit(), Some(1_000_000));
+    }
+
+    #[test]
+    fn one_sample_moves_the_limit_once() {
+        let mut uss = UploadSpeedSense::new(0, 1_000_000);
+        uss.enable();
+        for _ in 0..BASELINE_SAMPLES {
+            ping(&mut uss, 40.0);
+        }
+        assert_eq!(uss.compute_limit(), Some(1_000_000));
+        for _ in 0..MONITOR_WINDOW {
+            ping(&mut uss, 400.0);
+        }
+        let first = uss.compute_limit().unwrap();
+        assert!(first < 1_000_000);
+        for _ in 0..30 {
+            assert_eq!(
+                uss.compute_limit(),
+                Some(first),
+                "no new sample, so no new step"
+            );
+        }
+        ping(&mut uss, 400.0);
+        assert!(uss.compute_limit().unwrap() < first);
+    }
+
+    #[test]
+    fn congestion_ending_is_seen_within_the_recent_window() {
+        let mut uss = UploadSpeedSense::new(0, 1_000_000);
+        uss.enable();
+        for _ in 0..BASELINE_SAMPLES {
+            ping(&mut uss, 40.0);
+        }
+        for _ in 0..30 {
+            ping(&mut uss, 400.0);
+            uss.compute_limit();
+        }
+        let throttled = uss.current_limit;
+        for _ in 0..MONITOR_WINDOW {
+            ping(&mut uss, 40.0);
+        }
+        assert!(
+            uss.compute_limit().unwrap() > throttled,
+            "a quiet window must start the climb back, whatever older samples say"
+        );
+    }
+
+    #[test]
+    fn a_new_ping_host_gets_its_own_baseline() {
+        let mut uss = UploadSpeedSense::new(0, 1_000_000);
+        uss.enable();
+        for _ in 0..BASELINE_SAMPLES {
+            ping(&mut uss, 25.0);
+        }
+        assert_eq!(uss.compute_limit(), Some(1_000_000));
+
+        // A farther host on an idle link: four times the old baseline.
+        for _ in 0..BASELINE_SAMPLES {
+            uss.record_ping(host_b(), 100.0);
+            let limit = uss.compute_limit();
+            assert!(
+                limit.is_none() || limit == Some(1_000_000),
+                "held while re-baselining, got {limit:?}"
+            );
+        }
+        assert!((uss.initial_ping_ms - 100.0).abs() < f64::EPSILON);
+        for _ in 0..10 {
+            uss.record_ping(host_b(), 110.0);
+            assert_eq!(uss.compute_limit(), Some(1_000_000), "not congestion for this host");
+        }
     }
 }

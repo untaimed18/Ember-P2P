@@ -70,6 +70,7 @@
     endTimeValueToMinutes,
     hasDay,
     isOvernight,
+    MAX_CONFIGURED_SPEED_BPS,
     minutesToTimeValue,
     newScheduleRule,
     ruleProblem,
@@ -1228,8 +1229,11 @@
     // (eMule has always allowed this too). This matters for users on a
     // VPN that only forwards a single port for both protocols. The only
     // thing we still require is that the port is in the 1-65535 range.
-    s.max_upload_speed = cn(s.max_upload_speed, 2_147_483_647, 0);
-    s.max_download_speed = cn(s.max_download_speed, 2_147_483_647, 0);
+    s.max_upload_speed = cn(s.max_upload_speed, MAX_CONFIGURED_SPEED_BPS, 0);
+    // The clearing effect waits for the cap field to lose focus, and a save
+    // can arrive before it does.
+    if (s.max_upload_speed === 0) s.uss_enabled = false;
+    s.max_download_speed = cn(s.max_download_speed, MAX_CONFIGURED_SPEED_BPS, 0);
     s.max_concurrent_downloads = ci(s.max_concurrent_downloads, 1, 50, 3);
     s.max_concurrent_uploads = ci(s.max_concurrent_uploads, 1, 50, 4);
     s.max_sources_per_file = ci(s.max_sources_per_file, 50, 2000, 400);
@@ -2262,10 +2266,20 @@
     });
   });
 
+  // Focus is inside the upload cap field. Emptying it to retype a value, or
+  // typing the "0" of "0.5", reads as 0 for a keystroke.
+  let uploadCapEditing = $state(false);
+
   // USS needs a non-zero upload cap. Clear the flag when the user switches
-  // to Unlimited so save can't persist an inert/invalid combo.
+  // to Unlimited so save can't persist an inert/invalid combo. Not while the
+  // cap is being typed: the passing 0 would turn USS off for good.
   $effect(() => {
-    if (settings && settings.max_upload_speed === 0 && settings.uss_enabled) {
+    if (
+      settings &&
+      settings.max_upload_speed === 0 &&
+      settings.uss_enabled &&
+      !uploadCapEditing
+    ) {
       settings.uss_enabled = false;
       // A config that already violated the invariant on disk makes this clear
       // ours, not an edit: `onMount` snapshots `originalSettings` before
@@ -3285,7 +3299,11 @@
               </span>
             </div>
           {/if}
-          <div class="field">
+          <div
+            class="field"
+            onfocusin={() => (uploadCapEditing = true)}
+            onfocusout={() => (uploadCapEditing = false)}
+          >
             <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} />
           </div>
           <div class="field">

@@ -2455,7 +2455,7 @@ pub(super) async fn handle_udp_packet_inner(
                         if queue.len() >= 128 {
                             queue.pop_front();
                         }
-                        queue.push_back(rtt_ms);
+                        queue.push_back(crate::bandwidth::UssRttSample { host: from, rtt_ms });
                         state.uss_missed_pongs = 0;
                         debug!("USS RTT from {from}: {rtt_ms:.1}ms");
                     }

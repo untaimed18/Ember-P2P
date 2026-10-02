@@ -573,7 +573,14 @@ function applyProgress(existing: Transfer, p: ProgressPayload): Transfer {
     ...(p.upload_time != null ? { upload_time: p.upload_time } : {}),
     ...(p.up_part_status != null ? { up_part_status: p.up_part_status } : {}),
     ...(p.up_part_count != null ? { up_part_count: p.up_part_count } : {}),
-    ...(p.up_peer_part_status != null ? { up_peer_part_status: p.up_peer_part_status } : {}),
+    // Mirrored, absent included: the backend sets the row's bitmap from each
+    // upload progress event and clears it when the peer's file no longer
+    // matches, and a cleared value is left out of the payload.
+    ...(isUpload
+      ? { up_peer_part_status: p.up_peer_part_status ?? undefined }
+      : p.up_peer_part_status != null
+        ? { up_peer_part_status: p.up_peer_part_status }
+        : {}),
   };
 }
 

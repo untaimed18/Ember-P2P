@@ -3739,15 +3739,27 @@ async fn handle_command_inner(
             let _ = tx.send(true);
         }
         NetworkCommand::GetUploadQueueSnapshot { tx } => {
-            let snap = upload_queue_snapshot(
-                upload_queue,
-                credit_manager,
-                local_index,
-                friend_hashes,
-                geoip,
-            )
-            .await;
-            let _ = tx.send(snap);
+            // Off the network task, as for the Known Clients snapshot below:
+            // it scores up to `HARD_UPLOAD_QUEUE_SIZE` rows and the Transfers
+            // page polls it.
+            let upload_queue = upload_queue.clone();
+            let credit_manager = credit_manager.clone();
+            let local_index = local_index.clone();
+            let transfer_manager = transfer_manager.clone();
+            let friend_hashes = friend_hashes.clone();
+            let geoip = geoip.clone();
+            tokio::spawn(async move {
+                let snap = upload_queue_snapshot(
+                    &upload_queue,
+                    &credit_manager,
+                    &local_index,
+                    &transfer_manager,
+                    &friend_hashes,
+                    &geoip,
+                )
+                .await;
+                let _ = tx.send(snap);
+            });
         }
 
         NetworkCommand::GetKnownClientsSnapshot { tx } => {

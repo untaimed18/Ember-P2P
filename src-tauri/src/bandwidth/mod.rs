@@ -20,8 +20,15 @@ use std::sync::{atomic::AtomicBool, Arc, Mutex};
 /// they both end up in.
 pub const MAX_CONFIGURED_SPEED_BPS: u64 = 100 * 1024 * 1024 * 1024;
 
+/// One KAD Ping/Pong round trip to the USS ping host.
+#[derive(Debug, Clone, Copy)]
+pub struct UssRttSample {
+    pub host: std::net::SocketAddr,
+    pub rtt_ms: f64,
+}
+
 /// Shared RTT samples from the network loop (KAD Ping/Pong) to the limiter loop (USS).
-pub type UssRttQueue = Arc<Mutex<VecDeque<f64>>>;
+pub type UssRttQueue = Arc<Mutex<VecDeque<UssRttSample>>>;
 
 /// Shared flag: whether USS is enabled by the user.
 pub type UssEnabledFlag = Arc<AtomicBool>;

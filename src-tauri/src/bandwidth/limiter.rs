@@ -656,10 +656,10 @@ pub async fn start_token_refill(
         if let Ok(mut queue) = uss_rtt_queue.try_lock() {
             let mut drained = 0;
             while drained < 64 {
-                let Some(rtt_ms) = queue.pop_front() else {
+                let Some(sample) = queue.pop_front() else {
                     break;
                 };
-                uss.record_ping(rtt_ms);
+                uss.record_ping(sample.host, sample.rtt_ms);
                 drained += 1;
             }
             // Drop stale backlog rather than applying minutes-old RTTs.
