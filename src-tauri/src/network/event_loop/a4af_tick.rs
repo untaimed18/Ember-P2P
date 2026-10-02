@@ -41,6 +41,15 @@ pub(in crate::network) async fn on_a4af_tick(
         }
         swap_files.push((tid.clone(), pfs.file_hash));
     }
+    // Only downloads that may run: Pause and Stop keep `per_file_sources`,
+    // and a queued row cannot dial. Included, a stopped file with no active
+    // source read as starved and won the first swap, taking a source from a
+    // download that was running and sending a reask for the stopped file. As
+    // in eMule, a file that is not downloading does not take part.
+    {
+        let mgr = transfer_manager.read().await;
+        swap_files.retain(|(tid, _)| may_start_download_worker(&mgr, tid));
+    }
 
     for (tid, hash) in &swap_files {
         let active_sources = state.active_source_senders
@@ -342,14 +351,24 @@ pub(in crate::network) async fn on_a4af_tick(
                         let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                         pkt.extend_from_slice(&reask_payload);
                         let addr = SocketAddr::new(v4.into(), moved_udp_port);
+                        let now_ts = chrono::Utc::now().timestamp();
+                        // Left to the regular reask cycle while the peer
+                        // still owes an answer about another file.
+                        if crate::network::state::udp_reask_awaits_other_file(
+                            &state.pending_udp_reasks,
+                            (v4, moved_udp_port),
+                            &swap.to_file,
+                            now_ts,
+                        ) {
+                            continue;
+                        }
                         // Both reply branches resolve the file through
                         // this map, so a reask that skips it has its
                         // answer discarded as unsolicited — the queue
                         // rank and state this swap just asked for.
-                        state.pending_udp_reasks.insert(
-                            (v4, moved_udp_port),
-                            (swap.to_file, chrono::Utc::now().timestamp()),
-                        );
+                        state
+                            .pending_udp_reasks
+                            .insert((v4, moved_udp_port), (swap.to_file, now_ts));
                         let _ = udp_socket.send_to(&pkt, addr).await;
                     }
                 }

@@ -2031,11 +2031,8 @@
       case 'total_size': cmp = a.total_size - b.total_size; break;
       case 'transferred': cmp = a.transferred - b.transferred; break;
       case 'completed_size': cmp = (a.completed_size || 0) - (b.completed_size || 0); break;
-      case 'speed': {
-        const la = liveSpeed(a), lb = liveSpeed(b);
-        cmp = (la > 0 ? la : a.speed) - (lb > 0 ? lb : b.speed);
-        break;
-      }
+      // The rate the cell prints; see `displaySpeed`.
+      case 'speed': cmp = displaySpeed(a) - displaySpeed(b); break;
       case 'progress': cmp = a.progress - b.progress; break;
       case 'sources': cmp = a.sources - b.sources; break;
       case 'priority': cmp = (priorityOrder[a.priority] ?? 2) - (priorityOrder[b.priority] ?? 2); break;
@@ -3635,7 +3632,13 @@
     selectedDownloadIds = selectedDownloadIds.filter((id) => !idSet.has(id));
     if (lastClickedDlId && idSet.has(lastClickedDlId)) lastClickedDlId = null;
     const failed: { id: string; name: string; error: string }[] = [];
-    const results = await mapSettledWithLimit(ids, REMOVE_CONCURRENCY, (id) => removeTransfer(id));
+    // Re-marked as each call starts: the backend drops a row only then, and a
+    // large batch reaches its later rows after the 10 s tombstone set above
+    // has lapsed, so a poll put them back until their own remove landed.
+    const results = await mapSettledWithLimit(ids, REMOVE_CONCURRENCY, (id) => {
+      markDownloadRemoved(id);
+      return removeTransfer(id);
+    });
     results.forEach((r, i) => {
       if (r.status === 'rejected') {
         failed.push({ id: ids[i], name: byId.get(ids[i]) ?? '', error: toErrorMsg(r.reason) });
@@ -6415,6 +6418,10 @@
   danger={true}
   onconfirm={async () => {
     const id = confirmCancel.id;
+    // Re-read: a download can finish while the dialog is open, and the
+    // backend still cancels a finished row, recording it in the download
+    // history as cancelled over its completed entry.
+    if ($transfers.some((x) => x.id === id && isFinished(x))) return;
     let snapshot: Transfer | undefined;
     transfers.update((list) => {
       snapshot = list.find((x) => x.id === id);
@@ -6517,8 +6524,16 @@
   confirmLabel={m.transfers_confirm_batch_cancel_label()}
   danger={true}
   onconfirm={async () => {
-    const ids = confirmBatchCancel.ids; const idSet = new Set(ids);
-    const removeIds = confirmBatchCancel.removeIds;
+    // As for a single cancel: rows that finished while the dialog was open
+    // are removed from the list like the finished rows already in it, not
+    // cancelled.
+    const finishedNow = new Set($transfers.filter((x) => isFinished(x)).map((x) => x.id));
+    const ids = confirmBatchCancel.ids.filter((id) => !finishedNow.has(id));
+    const idSet = new Set(ids);
+    const removeIds = [
+      ...confirmBatchCancel.removeIds,
+      ...confirmBatchCancel.ids.filter((id) => finishedNow.has(id)),
+    ];
     let snapshots: Transfer[] = [];
     // Optimistic remove — same rationale as single cancel above.
     transfers.update((list) => {

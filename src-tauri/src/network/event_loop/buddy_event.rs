@@ -342,11 +342,21 @@ pub(in crate::network) async fn on_buddy_event(
             pkt.extend_from_slice(&reask_payload);
             // Register like the source-timer senders do: an answer to
             // a reask that is not in this map is dropped as
-            // unsolicited by both reply branches.
-            state.pending_udp_reasks.insert(
+            // unsolicited by both reply branches. Not sent while the
+            // peer still owes an answer about another file; see
+            // `udp_reask_awaits_other_file`.
+            let now_ts = chrono::Utc::now().timestamp();
+            if crate::network::state::udp_reask_awaits_other_file(
+                &state.pending_udp_reasks,
                 (dest_ip, dest_port),
-                (file_hash, chrono::Utc::now().timestamp()),
-            );
+                &file_hash,
+                now_ts,
+            ) {
+                return;
+            }
+            state
+                .pending_udp_reasks
+                .insert((dest_ip, dest_port), (file_hash, now_ts));
             let _ = udp_socket.send_to(&pkt, addr).await;
             debug!("Sent UDP reask to {}:{} via buddy relay for file {}", dest_ip, dest_port, hash_hex);
         }

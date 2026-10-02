@@ -739,10 +739,24 @@ impl PerFileSourceList {
             // Tier 1: nothing is permanently parked, so fall back to the
             // worst-performing row — but only one that has actually earned it.
             .or_else(|| {
+                // The live states are excluded by state, not left to the
+                // count: one Permanent failure adds 4 and a queue rank takes
+                // back only 1, and a redial keeps the count, so a row near the
+                // front of a peer's queue, or connecting, still qualified.
+                let live = |s: &DownloadSourceEntry| {
+                    matches!(
+                        s.state,
+                        DownloadSourceState::Connecting
+                            | DownloadSourceState::OnQueue { .. }
+                            | DownloadSourceState::Downloading
+                            | DownloadSourceState::WaitCallbackKad
+                            | DownloadSourceState::FriendConnect
+                    )
+                };
                 self.sources
                     .iter()
                     .enumerate()
-                    .filter(|(_, s)| s.fail_count >= 3)
+                    .filter(|(_, s)| s.fail_count >= 3 && !live(s))
                     .max_by_key(|(_, s)| s.fail_count)
                     .map(|(i, _)| i)
             })

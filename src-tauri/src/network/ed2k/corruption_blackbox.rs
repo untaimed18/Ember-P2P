@@ -380,12 +380,12 @@ impl CorruptionBlackBox {
         if let Some(blocks) = self.records.get(file_hash) {
             for block in blocks {
                 // Aggregates carry a synthetic range, so naming them here
-                // would attribute bytes to an IP that never sent them.
-                if !block.verified
-                    && !block.aggregate
-                    && block.start < end
-                    && block.end > start
-                {
+                // would attribute bytes to an IP that never sent them. Blocks
+                // already blamed are history too: `record_data` lays the
+                // re-fetch beside them rather than over them, so counting them
+                // made every later failure of the part look shared, and
+                // nobody was blamed for it again.
+                if block.is_live_range() && block.start < end && block.end > start {
                     ips.insert(block.ip);
                 }
             }

@@ -793,6 +793,19 @@ pub(super) async fn handle_udp_packet_inner(
                     // 29 minutes, for as long as the download ran. `QUEUEFULL` is
                     // deliberately excluded: that peer *has* the file.
                     if !is_banned && opcode != ed2k::messages::OP_QUEUEFULL_UDP {
+                        // And `RemoveSource`, as the comment above says eMule
+                        // does. The dead-source entry lapses after 45 minutes,
+                        // and a `Failed` row is still due for a UDP reask, so a
+                        // row kept here was asked the same question again about
+                        // once an hour. A later discovery may add it back.
+                        if let Some(pfs) = state
+                            .per_file_sources
+                            .values_mut()
+                            .find(|pfs| pfs.file_hash == file_hash)
+                        {
+                            pfs.sources
+                                .retain(|src| !(src.ip == v4 && src.udp_port == from.port()));
+                        }
                         for tcp_port in tcp_ports {
                             state
                                 .dead_sources

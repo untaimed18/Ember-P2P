@@ -414,11 +414,10 @@ pub(in crate::network) async fn on_cleanup_tick(
             // than one about to. Evicting by age instead of
             // clearing the whole table preserves correlation for
             // every reask sent in roughly the last reask cycle.
-            const MAX_PENDING_UDP_REASK_AGE_SECS: i64 = 30;
             let now = chrono::Utc::now().timestamp();
-            state
-                .pending_udp_reasks
-                .retain(|_, (_, sent_at)| now.saturating_sub(*sent_at) < MAX_PENDING_UDP_REASK_AGE_SECS);
+            state.pending_udp_reasks.retain(|_, (_, sent_at)| {
+                now.saturating_sub(*sent_at) < crate::network::state::UDP_REASK_ANSWER_SECS
+            });
             // Pathological fallback: if a flood of reasks was sent
             // inside the same age window and age-based eviction
             // couldn't bring the table back under budget, fall

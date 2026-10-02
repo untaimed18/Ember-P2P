@@ -153,6 +153,29 @@ pub(super) struct EmberPendingProxyOverlay {
 pub(super) const EMBER_PROXY_OVERLAY_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 pub(super) const MAX_EMBER_PENDING_PROXY_OVERLAY: usize = 256;
 
+/// How long a client `OP_REASKFILEPING` waits for its answer before its
+/// `pending_udp_reasks` entry counts as unanswered.
+pub(super) const UDP_REASK_ANSWER_SECS: i64 = 30;
+
+/// Whether `key` still awaits the answer to a reask about another file.
+///
+/// The answers (`OP_REASKACK`, `OP_FILENOTFOUND`, `OP_QUEUEFULL`) name no
+/// file, so a second reask to the same peer replaced the first one's entry and
+/// the first answer was credited to the second file: a healthy source written
+/// off for a file it still had, or one file's rank and part bitmap put on the
+/// other's row. Leave the second reask due until this one is answered or
+/// stale.
+pub(super) fn udp_reask_awaits_other_file(
+    pending: &HashMap<(Ipv4Addr, u16), ([u8; 16], i64)>,
+    key: (Ipv4Addr, u16),
+    file_hash: &[u8; 16],
+    now: i64,
+) -> bool {
+    pending.get(&key).is_some_and(|(pending_hash, sent_at)| {
+        pending_hash != file_hash && now.saturating_sub(*sent_at) < UDP_REASK_ANSWER_SECS
+    })
+}
+
 pub(super) struct NetworkState {
     pub(super) local_id: KadId,
     pub(super) user_hash: [u8; 16],
@@ -461,6 +484,7 @@ pub(super) struct NetworkState {
     /// Value is `(file_hash, sent_at)` — the timestamp lets the cap-eviction
     /// pass below drop the oldest (most likely dead/unreachable) entries
     /// instead of nuking every in-flight reask whenever the table fills up.
+    /// See [`udp_reask_awaits_other_file`] before inserting.
     pub(super) pending_udp_reasks: HashMap<(Ipv4Addr, u16), ([u8; 16], i64)>,
     /// Order-independent fingerprint `(entry_count, xor_fold)` of the last
     /// `OP_OFFERFILES` list actually sent from the `SharedFilesChanged`

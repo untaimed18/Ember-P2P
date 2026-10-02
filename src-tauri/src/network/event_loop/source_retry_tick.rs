@@ -454,6 +454,8 @@ pub(in crate::network) async fn on_source_retry_tick(
     }
 
     let mut to_retry: Vec<(String, u32)> = Vec::new();
+    // Retried for discovery either way; only these may get a worker below.
+    let mut may_start: HashSet<String> = HashSet::new();
     let mut insufficient_downloads: Vec<(String, String)> = Vec::new();
 
     let dl_dir = PathBuf::from(&settings.download_folder);
@@ -490,6 +492,9 @@ pub(in crate::network) async fn on_source_retry_tick(
             let retry_interval = pending_download_retry_interval(pd.search_count);
             if now.saturating_sub(pd.last_search_at) >= retry_interval {
                 to_retry.push((tid.clone(), pd.priority));
+                if may_start_download_worker(&mgr, tid) {
+                    may_start.insert(tid.clone());
+                }
             }
         }
     }
@@ -563,6 +568,9 @@ pub(in crate::network) async fn on_source_retry_tick(
     for (tid, _) in &to_retry {
         if let Some(pfs) = state.per_file_sources.get_mut(tid) {
             pfs.purge_dead_sources();
+            if !may_start.contains(tid) {
+                continue;
+            }
             let sm_guard = source_manager.read().await;
             let ready = pfs.sources_ready_for_reask_with_reputation(
                 |ip, port| {
@@ -610,7 +618,7 @@ pub(in crate::network) async fn on_source_retry_tick(
     {
         let sm = source_manager.read().await;
         for (tid, _) in &to_retry {
-            if started_from_persistent.contains(tid) { continue; }
+            if started_from_persistent.contains(tid) || !may_start.contains(tid) { continue; }
             if let Some(pd) = state.pending_downloads.get(tid) {
                 if let Ok(hash_bytes) = hex::decode(&pd.file_hash) {
                     if hash_bytes.len() == 16 {
@@ -1346,6 +1354,15 @@ pub(in crate::network) async fn on_source_retry_tick(
                 // TCP reask path only runs for pending ones, so the
                 // deep queue positions the detach model is built to
                 // accumulate were being dropped.
+                let now_ts = chrono::Utc::now().timestamp();
+                if crate::network::state::udp_reask_awaits_other_file(
+                    &state.pending_udp_reasks,
+                    (*ip, *udp_port),
+                    &fh,
+                    now_ts,
+                ) {
+                    continue;
+                }
                 let addr = SocketAddr::new((*ip).into(), *udp_port);
                 let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                 pkt.extend_from_slice(&reask_payload);
@@ -1354,7 +1371,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                 sm.mark_asked(&fh, *ip, *tcp_port);
                 state
                     .pending_udp_reasks
-                    .insert((*ip, *udp_port), (fh, chrono::Utc::now().timestamp()));
+                    .insert((*ip, *udp_port), (fh, now_ts));
                 to_send.push((addr, pkt));
                 sent_this_tick.insert((*ip, *tcp_port));
                 sent += 1;
@@ -1402,6 +1419,15 @@ pub(in crate::network) async fn on_source_retry_tick(
                         pfs.mark_udp_reask_sent(*orig_ip, *orig_tcp);
                         continue;
                     }
+                    let now_ts = chrono::Utc::now().timestamp();
+                    if crate::network::state::udp_reask_awaits_other_file(
+                        &state.pending_udp_reasks,
+                        (ip, udp_port),
+                        &pfs.file_hash,
+                        now_ts,
+                    ) {
+                        continue;
+                    }
                     // Not gated on the source-exchange cooldown —
                     // see the SourceManager pass above. This pass
                     // is the one that maintains queue position for
@@ -1419,10 +1445,9 @@ pub(in crate::network) async fn on_source_retry_tick(
                     if (ip, tcp_port) != (*orig_ip, *orig_tcp) {
                         pfs.mark_udp_reask_sent(ip, tcp_port);
                     }
-                    state.pending_udp_reasks.insert(
-                        (ip, udp_port),
-                        (pfs.file_hash, chrono::Utc::now().timestamp()),
-                    );
+                    state
+                        .pending_udp_reasks
+                        .insert((ip, udp_port), (pfs.file_hash, now_ts));
                     to_send.push((addr, pkt));
                     sent_this_tick.insert((ip, tcp_port));
                     pfs_sent += 1;

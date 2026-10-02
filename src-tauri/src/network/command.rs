@@ -935,8 +935,14 @@ async fn handle_command_inner(
             // hint additionally outlives the friendship, so a stale one could
             // park a stranger's source as the friend's; the status clock's map
             // is inert once the row is gone but grew for the process lifetime.
+            // Only once the row is gone: a stopped row keeps it, or a status
+            // write still queued from before the Stop ("searching") lands
+            // after "stopped" unchallenged and the download restarts itself
+            // on the next launch.
             state.transfer_friend_hint.remove(&transfer_id);
-            transfer_status_write_clock().forget(&transfer_id);
+            if deleting {
+                transfer_status_write_clock().forget(&transfer_id);
+            }
 
             if removed_pending.is_some() || !search_ids.is_empty() {
                 info!(

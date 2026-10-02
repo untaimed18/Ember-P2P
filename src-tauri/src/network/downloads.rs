@@ -588,6 +588,26 @@ pub(super) fn emit_transfer_health(app_handle: &tauri::AppHandle, update: &Trans
     );
 }
 
+/// Whether a pending download may get a dial worker now.
+///
+/// Only rows actively waiting for sources or slots: in the active map
+/// (promoted). Queued-in-queue rows sit in `pending_downloads` for discovery
+/// and wait for `promote_next`; starting one runs it past Max concurrent
+/// downloads while the UI still reads Queued. Paused / Stopped / Insufficient /
+/// terminal must never dial from a stale pending. Queued-in-active is a
+/// promoted row that still needs a worker (T2 promote-after-insufficient).
+pub(super) fn may_start_download_worker(mgr: &TransferManager, transfer_id: &str) -> bool {
+    mgr.active.get(transfer_id).is_some_and(|t| {
+        matches!(
+            t.status,
+            TransferStatus::Searching
+                | TransferStatus::Active
+                | TransferStatus::Hashing
+                | TransferStatus::Queued
+        )
+    })
+}
+
 pub(super) async fn try_start_pending_download_from_known_sources(
     state: &mut NetworkState,
     transfer_id: &str,
@@ -630,25 +650,8 @@ pub(super) async fn try_start_pending_download_from_known_sources(
         }
     }
 
-    // Only start transfers that are actively waiting for sources / slots.
-    // Must be in the active map (promoted). Queued-in-queue waits for
-    // promote_next; Paused / Stopped / Insufficient / terminal must never
-    // dial from a stale pending. Queued-in-active is a promoted row that
-    // still needs a worker (T2 promote-after-insufficient).
-    {
-        let mgr = transfer_manager.read().await;
-        let allowed = mgr.active.get(transfer_id).is_some_and(|t| {
-            matches!(
-                t.status,
-                TransferStatus::Searching
-                    | TransferStatus::Active
-                    | TransferStatus::Hashing
-                    | TransferStatus::Queued
-            )
-        });
-        if !allowed {
-            return false;
-        }
+    if !may_start_download_worker(&*transfer_manager.read().await, transfer_id) {
+        return false;
     }
 
     let Some(pending) = state.pending_downloads.remove(transfer_id) else {

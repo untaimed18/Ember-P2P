@@ -427,10 +427,23 @@ pub(super) fn expire_outstanding_ranges(outstanding: &mut Vec<OutstandingRange>)
 }
 
 pub(super) fn refresh_outstanding_range(outstanding: &mut [OutstandingRange], pkt_start: u64) {
-    if let Some(r) = outstanding
-        .iter_mut()
+    if let Some(start) = outstanding
+        .iter()
         .find(|r| pkt_start >= r.start && pkt_start < r.end)
+        .map(|r| r.start)
     {
+        touch_queued_from(outstanding, start);
+    }
+}
+
+/// Refresh every range from `start` on. Uploaders serve requests in order and
+/// ours ascend through the part, so the ranges after the one being sent are
+/// waiting their turn, not dropped. Timed from the request alone, the second
+/// of two blocks at 4 KB/s expired before its first byte (~45 s in), and each
+/// expiry re-requested more than the peer could ever deliver. Ranges before
+/// `start` the peer has skipped, and keep their own deadline.
+fn touch_queued_from(outstanding: &mut [OutstandingRange], start: u64) {
+    for r in outstanding.iter_mut().filter(|r| r.start >= start) {
         r.touch();
     }
 }
@@ -452,6 +465,7 @@ pub(super) fn take_completed_outstanding_range(
         .position(|r| pkt_start >= r.start && pkt_start < r.end && pkt_end == r.end)
     {
         outstanding.swap_remove(i);
+        touch_queued_from(outstanding, pkt_end);
         true
     } else {
         refresh_outstanding_range(outstanding, pkt_start);
@@ -941,7 +955,8 @@ pub enum DownloadEvent {
         part_end: u64,
         sender_user_hash: Option<[u8; 16]>,
     },
-    /// A part failed its MD4 hash check.
+    /// A part failed its MD4 hash check, or AICH recovery narrowed one to a
+    /// bad 180 KiB block, which is then the range reported.
     PartCorrupted {
         file_hash: [u8; 16],
         part_start: u64,
@@ -1411,6 +1426,11 @@ mod tests {
         let cases: &[(&str, SourceFailureKind, TransferFailureCode)] = &[
             ("download cancelled by user", Transient, C::Cancelled),
             ("peer does not have the file", Permanent, C::RemoteMissingFile),
+            (
+                "peer does not have the file any more (FileNotFound during transfer)",
+                Permanent,
+                C::RemoteMissingFile,
+            ),
             ("FileReqAnsNoFil", Permanent, C::RemoteMissingFile),
             (EMBER_BLAKE3_MISMATCH_MSG, Permanent, C::EmberContentHashMismatch),
             (
@@ -1514,6 +1534,7 @@ mod tests {
             "stage:queue_detached queue wait exceeded 1800s (rank Some(42))",
             "stage:queue_wait timed out waiting for upload slot after 1800s",
             "peer has no free upload slots (OutOfPartReqs)",
+            "peer ended our upload slot (OutOfPartReqs)",
             "peer revoked upload slot (QueueFull during transfer)",
             "peer put us back in queue at rank 7 during transfer",
         ] {
@@ -1614,14 +1635,14 @@ mod tests {
     fn hashset2_aich_pins_when_it_matches_the_expected_root() {
         let expected = [0x11u8; 20];
         let mut pinned = None;
-        consider_hashset2_aich_pin(&mut pinned, Some(expected), None, 0, expected);
+        consider_hashset2_aich_pin(&mut pinned, Some(expected), None, "", expected);
         assert_eq!(pinned, Some(expected));
     }
 
     #[test]
     fn hashset2_aich_does_not_first_wins_without_expected_or_votes() {
         let mut pinned = None;
-        consider_hashset2_aich_pin(&mut pinned, None, None, 0, [0xAAu8; 20]);
+        consider_hashset2_aich_pin(&mut pinned, None, None, "", [0xAAu8; 20]);
         assert!(pinned.is_none());
     }
 
@@ -1629,15 +1650,16 @@ mod tests {
     fn hashset2_aich_requires_two_sources_when_expected_is_unknown() {
         let root = [0xBBu8; 20];
         let mut pinned = None;
-        let mut votes: HashMap<[u8; 20], HashSet<usize>> = HashMap::new();
-        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), 0, root);
+        let mut votes: HashMap<[u8; 20], HashSet<String>> = HashMap::new();
+        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), "203.0.113.5", root);
         assert!(pinned.is_none());
-        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), 0, root);
+        // A reconnect gets a new worker index but is still the same peer.
+        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), "203.0.113.5", root);
         assert!(
             pinned.is_none(),
             "the same source repeating a root is still one vote"
         );
-        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), 1, root);
+        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), "198.51.100.9", root);
         assert_eq!(pinned, Some(root));
     }
 
@@ -1645,19 +1667,19 @@ mod tests {
     fn hashset2_aich_ignores_a_conflicting_root_when_expected_is_known() {
         let expected = [0x11u8; 20];
         let mut pinned = None;
-        let mut votes: HashMap<[u8; 20], HashSet<usize>> = HashMap::new();
+        let mut votes: HashMap<[u8; 20], HashSet<String>> = HashMap::new();
         consider_hashset2_aich_pin(
             &mut pinned,
             Some(expected),
             Some(&mut votes),
-            0,
+            "203.0.113.5",
             [0xFFu8; 20],
         );
         consider_hashset2_aich_pin(
             &mut pinned,
             Some(expected),
             Some(&mut votes),
-            1,
+            "198.51.100.9",
             [0xFFu8; 20],
         );
         assert!(pinned.is_none());
@@ -1914,6 +1936,54 @@ mod tests {
         assert_eq!(out, &data[..]);
         // ...and the receive loop's structural validation must accept it.
         assert!(s < e && e <= FILE_SIZE && out.len() == (e - s) as usize);
+    }
+
+    #[test]
+    fn a_duplicate_of_a_full_length_name_still_fits() {
+        let dir = std::path::Path::new("Downloads");
+        // `sanitize_filename` clamps to 255 bytes; the duplicate must not
+        // grow past that.
+        let ascii = format!("{}.mkv", "a".repeat(251));
+        assert_eq!(ascii.len(), 255);
+        let wide = format!("{}.mkv", "é".repeat(125));
+        for name in [ascii, wide] {
+            for suffix in [1, 42, 10_000] {
+                let candidate = dedup_candidate(&dir.join(&name), suffix);
+                let file_name = candidate.file_name().unwrap().to_str().unwrap();
+                assert!(file_name.len() <= 255, "{} bytes", file_name.len());
+                assert!(file_name.ends_with(&format!(" ({suffix}).mkv")));
+            }
+        }
+        // Short names are untouched.
+        assert_eq!(
+            dedup_candidate(&dir.join("movie.mkv"), 2),
+            dir.join("movie (2).mkv")
+        );
+    }
+
+    #[test]
+    fn a_block_queued_behind_the_one_arriving_does_not_expire() {
+        let mut outstanding = Vec::new();
+        push_outstanding_batch(&mut outstanding, &[(0, 100), (100, 200), (200, 300)]);
+        for r in &mut outstanding {
+            r.expires_at = std::time::Instant::now();
+        }
+        // Data for the middle block: it and the one queued after it are
+        // live; the one before it the peer skipped keeps its deadline.
+        refresh_outstanding_range(&mut outstanding, 150);
+        let now = std::time::Instant::now();
+        let live = |start: u64| outstanding.iter().find(|r| r.start == start).unwrap().expires_at > now;
+        assert!(!live(0));
+        assert!(live(100));
+        assert!(live(200));
+
+        // Completing a block refreshes the ones behind it as well.
+        for r in &mut outstanding {
+            r.expires_at = std::time::Instant::now();
+        }
+        assert!(take_completed_outstanding_range(&mut outstanding, 100, 200));
+        let now = std::time::Instant::now();
+        assert!(outstanding.iter().find(|r| r.start == 200).unwrap().expires_at > now);
     }
 
     #[test]
@@ -2318,50 +2388,21 @@ impl Ed2kDownload {
             }
         }
 
-        let mut completed_path_out: Option<String> = None;
-        let mut verified_part_hashes: Vec<[u8; 16]> = Vec::new();
-        match self
-            .download_from_streams(
-                &mut *reader,
-                &mut *writer,
-                peer_user_hash,
-                // Same as multi-source EstablishedStream: format file requests
-                // from the peer's Hello caps, not PeerCapabilities::default()
-                // (ext_ver=0), or modern peers short-read and FIN.
-                peer_caps,
-                &event_tx,
-                emule_info_done,
-                &mut completed_path_out,
-                &mut verified_part_hashes,
-            )
-            .await
-        {
-            Ok(_) => {
-                let _ = event_tx
-                    .send(DownloadEvent::Completed {
-                        transfer_id: self.transfer_id.clone(),
-                        final_path: completed_path_out,
-                        // Computed by the final verification, which had to read
-                        // the file anyway. This path never gets a peer-supplied
-                        // hashset, so without these the completion handler read
-                        // the whole file again to recompute them.
-                        part_hashes: verified_part_hashes,
-                        // `download_from_streams` only reaches `Ok` after its
-                        // internal Ember BLAKE3 check passed (or there was
-                        // none to run) — reflect the latter case here from
-                        // whether we had a hash to check in the first place.
-                        ember_verified: self.ember_file_hash != [0u8; 32],
-                    })
-                    .await;
-                Ok(())
-            }
-            Err(e) => {
-                // Propagate Err so the spawn site emits Failed once. Emitting
-                // here and returning Ok made Result look successful while the
-                // transfer had already failed on the event channel.
-                Err(e)
-            }
-        }
+        // `Completed` is sent by `download_from_streams` itself, from a task an
+        // abort cannot drop. An `Err` propagates so the spawn site emits Failed
+        // once.
+        self.download_from_streams(
+            &mut *reader,
+            &mut *writer,
+            peer_user_hash,
+            // Same as multi-source EstablishedStream: format file requests
+            // from the peer's Hello caps, not PeerCapabilities::default()
+            // (ext_ver=0), or modern peers short-read and FIN.
+            peer_caps,
+            &event_tx,
+            emule_info_done,
+        )
+        .await
     }
 
     async fn download_from_streams(
@@ -2372,15 +2413,6 @@ impl Ed2kDownload {
         initial_caps: PeerCapabilities,
         event_tx: &mpsc::Sender<DownloadEvent>,
         skip_emule_info: bool,
-        // Set to the real on-disk destination once the `.part` is moved to
-        // its final location, so the caller's `Completed` event can carry
-        // the deduplicated path instead of letting Open/Reveal reconstruct
-        // (and mis-resolve) it from the file name.
-        completed_path_out: &mut Option<String>,
-        // Set to the part hashes the final verification computed, so the
-        // completion handler can record them in known.met without reading the
-        // whole file again to derive what this pass already produced.
-        part_hashes_out: &mut Vec<[u8; 16]>,
     ) -> anyhow::Result<()> {
         let mut peer_supports_large_files = initial_caps.supports_large_files;
         let mut peer_supports_multipacket = initial_caps.supports_multi_packet;
@@ -3999,7 +4031,7 @@ impl Ed2kDownload {
         // Apply an AICH root harvested from the MultiPacket answer. Same voting
         // rule as the HashSet2 root, so an unverified single source cannot pin.
         if let Some(root) = mp_aich_root {
-            consider_hashset2_aich_pin(&mut aich_master_hash, self.expected_aich_master, None, 0, root);
+            consider_hashset2_aich_pin(&mut aich_master_hash, self.expected_aich_master, None, "", root);
         }
         if aich_master_hash.is_some() {
             debug!(
@@ -4069,7 +4101,7 @@ impl Ed2kDownload {
                                                 &mut aich_master_hash,
                                                 self.expected_aich_master,
                                                 None,
-                                                0,
+                                                "",
                                                 root,
                                             );
                                             if aich_master_hash == Some(root) {
@@ -4725,7 +4757,6 @@ impl Ed2kDownload {
         // simultaneously based on connection speed, keeping the peer's upload pipe full.
         const MAX_BLOCKS_PER_REQUEST: usize = 3;
         let max_part_rounds = self.ed2k_limits.part_retry_rounds;
-        let mut peer_out_of_parts = false;
         let mut measured_speed: u64 = 0;
         let mut speed_measure_start = std::time::Instant::now();
         let mut speed_measure_bytes: u64 = 0;
@@ -4783,9 +4814,6 @@ impl Ed2kDownload {
             }
 
             for part_idx in needed {
-                if peer_out_of_parts {
-                    break;
-                }
                 self.check_control().await?;
                 let mut aich_recovery_data: Option<([u8; 20], Vec<u8>)> = None;
 
@@ -4881,9 +4909,6 @@ impl Ed2kDownload {
 
                 // Receive loop: process blocks and refill pipeline as requests complete
                 while total_received < total_sent_bytes {
-                    if peer_out_of_parts {
-                        break;
-                    }
                     self.check_control().await?;
 
                     // Periodic EPX re-send: if payload has been rebuilt and 5min elapsed
@@ -5399,9 +5424,27 @@ impl Ed2kDownload {
                             }
                         }
                         (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
-                            info!("Peer session limit reached (OutOfPartReqs), will re-queue");
-                            peer_out_of_parts = true;
-                            break;
+                            // The uploader rotated us out and took the slot
+                            // back. This path has no in-session re-queue, and
+                            // carrying on sent the next round's requests into
+                            // a slot we no longer held: every retry round went
+                            // in milliseconds and the source was failed with a
+                            // penalty. End as the queue state it is, like
+                            // OP_QUEUEFULL above.
+                            info!("Peer session limit reached (OutOfPartReqs), ending the session to re-queue");
+                            self.emit_source_detail_parts(
+                                event_tx,
+                                "queued",
+                                None,
+                                0,
+                                0,
+                                &client_software_label,
+                                &peer_name_label,
+                                src_avail_parts,
+                                src_total_parts,
+                            )
+                            .await;
+                            anyhow::bail!("peer ended our upload slot (OutOfPartReqs)");
                         }
                         (OP_EMULEPROT, OP_QUEUEFULL) if payload.is_empty() => {
                             self.file_req_overhead.record_download(6u64);
@@ -5463,7 +5506,7 @@ impl Ed2kDownload {
                         }
                         (OP_EDONKEYHEADER, OP_FILEREQANSNOFIL) => {
                             anyhow::bail!(
-                                "peer no longer has the file (FileNotFound during transfer)"
+                                "peer does not have the file any more (FileNotFound during transfer)"
                             );
                         }
                         (OP_EMULEPROT, OP_PUBLICKEY) if !payload.is_empty() => {
@@ -5870,10 +5913,6 @@ impl Ed2kDownload {
                     }
                 }
 
-                if peer_out_of_parts {
-                    continue;
-                }
-
                 // Guard against duplicate/overlapping blocks that satisfied the
                 // byte budget without actually closing all gaps in this part.
                 {
@@ -6176,9 +6215,6 @@ impl Ed2kDownload {
                 // download loop on fsync.
                 super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
             }
-
-            // If peer ended the session, reset flag for next retry round
-            peer_out_of_parts = false;
         }
 
         // Signal the uploader that we're done downloading from them. eMule
@@ -6274,6 +6310,7 @@ impl Ed2kDownload {
             })
         });
         let job_cancel = verify_cancel.clone();
+        let expected_ed2k = expected_hash.clone();
         let verified_result = match tokio::task::spawn_blocking(move || {
             let allowed = vec![verify_root.to_string_lossy().into_owned()];
             // Tell the library scheduler this drive is busy. It rations reads
@@ -6298,7 +6335,8 @@ impl Ed2kDownload {
                 },
                 job_cancel.as_ref(),
             )?;
-            if let Some(got) = digests.ember {
+            // Only once the ed2k hash matched; see the multi-source worker.
+            if let Some(got) = digests.ember.filter(|_| digests.ed2k == expected_ed2k) {
                 if got != ember_expected {
                     anyhow::bail!(
                         "ember blake3 mismatch: expected={} got={}",
@@ -6448,30 +6486,52 @@ impl Ed2kDownload {
         // reset for multi-part files).
         tracker.mark_file_hash_verified();
         seal_control_rename(&self.control, &mut tracker);
+        // As in the multi-source worker: stopped after verification, the
+        // verified `.part` stays put and the next run completes it.
+        if self.control.is_cancelled() {
+            anyhow::bail!("cancelled by user");
+        }
         let final_path = completed_dir.join(completed_download_name(
             tracker.file_name(),
             &self.file_name,
         ));
-        {
-            let pp = part_path.clone();
-            let fp = final_path.clone();
-            let root = self.download_dir.clone();
+        let pp = part_path.clone();
+        let root = self.download_dir.clone();
+        let met_roots = vec![self.download_dir.to_string_lossy().into_owned()];
+        let finish_tx = event_tx.clone();
+        let finish_id = self.transfer_id.clone();
+        // `download_from_streams` only gets here after its Ember BLAKE3 check
+        // passed (or there was none to run).
+        let ember_verified = self.ember_file_hash != [0u8; 32];
+        // Spawned so that an abort (Pause, Stop) landing during the move, which
+        // `abort` cannot stop, does not drop the sidecar delete and `Completed`
+        // after it. See the multi-source worker.
+        let finish = tokio::spawn(async move {
             let actual_final = tokio::task::spawn_blocking(move || {
-                move_part_to_final_approved(&pp, &fp, &root, &verified_identity)
+                move_part_to_final_approved(&pp, &final_path, &root, &verified_identity)
             })
             .await
             .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
-            *completed_path_out = Some(actual_final.to_string_lossy().into_owned());
-        }
-        // The verification above computed these as a by-product of the pass it
-        // had to make anyway. Without handing them over, the completion handler
-        // read the whole file a second time to recompute exactly these values
-        // for known.met — every time, because this path never obtains a
-        // peer-supplied hashset.
-        *part_hashes_out = verified_part_hashes;
-        tracker.delete_met(&[self.download_dir.to_string_lossy().into_owned()]);
-
-        Ok(())
+            tracker.delete_met(&met_roots);
+            let _ = finish_tx
+                .send(DownloadEvent::Completed {
+                    transfer_id: finish_id,
+                    // The real on-disk destination, deduplicated by the move,
+                    // so Open/Reveal need not reconstruct it from the name.
+                    final_path: Some(actual_final.to_string_lossy().into_owned()),
+                    // Computed by the final verification, which had to read
+                    // the file anyway. This path never gets a peer-supplied
+                    // hashset, so without these the completion handler read
+                    // the whole file again to recompute them.
+                    part_hashes: verified_part_hashes,
+                    ember_verified,
+                })
+                .await;
+            Ok::<(), anyhow::Error>(())
+        });
+        finish
+            .await
+            .map_err(|e| anyhow::anyhow!("completion task: {e}"))?
     }
 
     async fn acquire_download_bandwidth(&self, bytes: u64) -> anyhow::Result<()> {
@@ -6796,11 +6856,24 @@ fn dedup_candidate(base: &std::path::Path, suffix: u32) -> std::path::PathBuf {
     let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = base.extension().and_then(|s| s.to_str());
     let parent = base.parent().unwrap_or(base);
-    if let Some(ext) = ext {
-        parent.join(format!("{stem} ({suffix}).{ext}"))
-    } else {
-        parent.join(format!("{stem} ({suffix})"))
+    let tail = match ext {
+        Some(ext) => format!(" ({suffix}).{ext}"),
+        None => format!(" ({suffix})"),
+    };
+    // `sanitize_filename` lets a name reach the 255-byte limit, so the
+    // suffix has to come out of the stem: past it the link fails with an
+    // error that is not `AlreadyExists`, and completion failed and re-verified
+    // the whole file on every retry. 255 UTF-8 bytes is never more than
+    // NTFS's 255 UTF-16 units.
+    const MAX_NAME_BYTES: usize = 255;
+    let mut end = stem.len().min(MAX_NAME_BYTES.saturating_sub(tail.len()));
+    while end > 0 && !stem.is_char_boundary(end) {
+        end -= 1;
     }
+    // Windows drops trailing dots and spaces, as `sanitize_filename` notes.
+    let stem = stem[..end].trim_end_matches(['.', ' ']);
+    let stem = if stem.is_empty() { "file" } else { stem };
+    parent.join(format!("{stem}{tail}"))
 }
 
 fn copy_exclusive(
@@ -6974,14 +7047,16 @@ pub(crate) fn verify_hashset(
 /// Whole-file ed2k still gates completion, but a first-wins pin poisons
 /// recovery: later AICH answers are ignored if they disagree with the pin.
 /// Catalog `expected` is enough on its own. Otherwise a single source is
-/// not: two distinct `src_idx` values must advertise the same root. When
-/// `expected` is already known, a conflicting HashSet2 root is ignored even
-/// if several sources repeat it.
+/// not: two distinct peer addresses must advertise the same root. Keyed on
+/// the address rather than the worker's index, which is new each time a peer
+/// is re-injected or calls back, so one client voted twice by reconnecting
+/// and pinned a root nothing could replace. When `expected` is already known,
+/// a conflicting HashSet2 root is ignored even if several sources repeat it.
 pub(super) fn consider_hashset2_aich_pin(
     pinned: &mut Option<[u8; 20]>,
     expected: Option<[u8; 20]>,
-    votes: Option<&mut HashMap<[u8; 20], HashSet<usize>>>,
-    src_idx: usize,
+    votes: Option<&mut HashMap<[u8; 20], HashSet<String>>>,
+    voter: &str,
     root: [u8; 20],
 ) {
     if pinned.is_some() {
@@ -6997,7 +7072,7 @@ pub(super) fn consider_hashset2_aich_pin(
     let Some(votes) = votes else {
         return;
     };
-    votes.entry(root).or_default().insert(src_idx);
+    votes.entry(root).or_default().insert(voter.to_string());
     if votes.get(&root).map(|s| s.len()).unwrap_or(0) >= 2 {
         *pinned = Some(root);
     }

@@ -370,10 +370,103 @@ async fn persist_transfer_statuses(state: &AppState, statuses: Vec<(String, Stri
     }
 }
 
+/// The ids among `ids` with no source discovery running before a resume: a
+/// queued row Stop or a full disk ended (both drop its pending download and
+/// its control), or an active row with no worker that the resume may park in
+/// the queue when the cap is full (see `TransferManager::resume`). A paused
+/// queued row is not one: its pending download survives the pause.
+fn rows_needing_discovery(
+    manager: &crate::sharing::manager::TransferManager,
+    ids: &[String],
+) -> Vec<String> {
+    ids.iter()
+        .filter(|id| {
+            manager.queue.iter().any(|t| {
+                &t.id == *id
+                    && matches!(t.status, TransferStatus::Stopped | TransferStatus::Insufficient)
+            }) || manager.active.get(id.as_str()).is_some_and(|t| {
+                matches!(t.status, TransferStatus::Paused | TransferStatus::Insufficient)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Source discovery for rows a resume left waiting in the queue, as a newly
+/// queued download gets: without it they read Searching or Queued and searched
+/// for nothing until a slot freed, then started from a cold source list.
+/// Rows the resume promoted or restarted are skipped; they get a worker.
+async fn start_queued_discovery(state: &AppState, candidates: &[String]) {
+    for id in candidates {
+        let (transfer, control) = {
+            let mut manager = state.transfer_manager.write().await;
+            let Some(transfer) = manager
+                .queue
+                .iter()
+                .find(|t| {
+                    &t.id == id
+                        && matches!(t.status, TransferStatus::Searching | TransferStatus::Queued)
+                })
+                .cloned()
+            else {
+                continue;
+            };
+            let control = match manager.get_control(id) {
+                Some(control) => control,
+                None => {
+                    let control = TransferControl::new();
+                    manager.register_control(id, control.clone());
+                    control
+                }
+            };
+            (transfer, control)
+        };
+        if let Err(e) = bounded_send(
+            &state.network_tx,
+            NetworkCommand::StartDownload {
+                file_hash: transfer.file_hash.clone(),
+                file_name: transfer.file_name.clone(),
+                file_size: transfer.total_size,
+                peer_ip: parse_peer_ip(&transfer.peer_id),
+                peer_port: parse_peer_port(&transfer.peer_id),
+                extra_sources: Vec::new(),
+                ember_file_hash: transfer.ember_file_hash.clone().unwrap_or_default(),
+                expected_aich: transfer.expected_aich.clone(),
+                transfer_id: transfer.id.clone(),
+                control,
+                friend_ember_hash: None,
+                discovery_only: true,
+            },
+        )
+        .await
+        {
+            tracing::warn!("Failed to restart source discovery for queued {}: {e}", transfer.id);
+        }
+    }
+}
+
 pub(crate) async fn start_promoted_downloads(state: &AppState, promoted: &[Transfer]) {
     for transfer in promoted {
         let control = {
             let mut manager = state.transfer_manager.write().await;
+            // Re-read under the lock. A batch collects every row its earlier
+            // items promoted, including ones a later item then cancels or
+            // stops, and a single cancel can land between a promotion and this
+            // call. Started anyway, such a row ran a hidden worker outside the
+            // concurrency cap, and with no source `StartDownload` saved the
+            // cancelled row back to the database.
+            let startable = manager.active.get(&transfer.id).is_some_and(|t| {
+                matches!(
+                    t.status,
+                    TransferStatus::Searching
+                        | TransferStatus::Queued
+                        | TransferStatus::Active
+                        | TransferStatus::Hashing
+                )
+            });
+            if !startable {
+                continue;
+            }
             // Cancel any control already registered for this transfer before
             // replacing it. A previous worker generation's per-source tasks are
             // detached `tokio::spawn`s that hold a clone of that old control and
@@ -778,6 +871,9 @@ pub async fn start_download(
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err(coded("transfers_invalid_file_hash", "Invalid file hash"));
     }
+    // Rows, the duplicate check and source-exchange matching all compare the
+    // lowercase hex `hex::encode` writes.
+    let file_hash = file_hash.to_ascii_lowercase();
     // Best-effort: a malformed value here shouldn't fail the whole download
     // (it only affects up-front identity-seeding, not correctness), so we
     // log and fall back to `None` instead of rejecting the request.
@@ -1187,9 +1283,10 @@ pub async fn resume_transfers_batch(
     // which `active_download_count` *does* count, so the cap is oversubscribed
     // and the transfer never dials again: the retry timer only walks
     // `pending_downloads`.
-    let outcome = {
+    let (outcome, rediscover) = {
         let mut manager = state.transfer_manager.write().await;
-        manager.resume_many(&transfer_ids, true)
+        let rediscover = rows_needing_discovery(&manager, &transfer_ids);
+        (manager.resume_many(&transfer_ids, true), rediscover)
     };
     emit_transfer_statuses(&app, &outcome.statuses);
     persist_transfer_statuses(
@@ -1211,6 +1308,7 @@ pub async fn resume_transfers_batch(
         }
     }
     start_promoted_downloads(&state, &to_start).await;
+    start_queued_discovery(&state, &rediscover).await;
     Ok(())
 }
 
@@ -1641,8 +1739,9 @@ pub async fn resume_transfer(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
-    let (was_active_resumable, promoted) = {
+    let (was_active_resumable, promoted, rediscover) = {
         let mut manager = state.transfer_manager.write().await;
+        let rediscover = rows_needing_discovery(&manager, std::slice::from_ref(&transfer_id));
         // An active row in Paused *or* Insufficient won't be returned by
         // `resume()` as "promoted" (it never left the active map), so the
         // caller must restart its worker explicitly. Stopped rows live in the
@@ -1657,11 +1756,16 @@ pub async fn resume_transfer(
                 )
             })
             .unwrap_or(false);
-        if manager.get_control(&transfer_id).is_none() {
+        // Only for a row Resume can act on. A finished or unknown id kept a
+        // control nothing ever removed, and `get_all` then read that row's
+        // `preview_ready` from it.
+        let resumable_row = manager.active.contains_key(&transfer_id)
+            || manager.queue.iter().any(|t| t.id == transfer_id);
+        if resumable_row && manager.get_control(&transfer_id).is_none() {
             manager.register_control(&transfer_id, TransferControl::new());
         }
         let promoted = manager.resume(&transfer_id);
-        (was_active_resumable, promoted)
+        (was_active_resumable, promoted, rediscover)
     };
     let status = {
         let manager = state.transfer_manager.read().await;
@@ -1686,6 +1790,7 @@ pub async fn resume_transfer(
     } else {
         start_promoted_downloads(&state, &promoted).await;
     }
+    start_queued_discovery(&state, &rediscover).await;
     Ok(())
 }
 
@@ -2260,7 +2365,7 @@ pub async fn resume_all_transfers(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let outcome = {
+    let (outcome, rediscover) = {
         let mut manager = state.transfer_manager.write().await;
         // Every active row goes through `resume`, not only paused ones, so
         // each live control is resumed as before.
@@ -2276,7 +2381,8 @@ pub async fn resume_all_transfers(
             .cloned()
             .chain(queued_ids.map(|t| t.id.clone()))
             .collect();
-        manager.resume_many(&resume_ids, false)
+        let rediscover = rows_needing_discovery(&manager, &resume_ids);
+        (manager.resume_many(&resume_ids, false), rediscover)
     };
     let resumed: Vec<(String, TransferStatus)> = outcome
         .statuses
@@ -2309,6 +2415,7 @@ pub async fn resume_all_transfers(
         }
     }
     start_promoted_downloads(&state, &to_start).await;
+    start_queued_discovery(&state, &rediscover).await;
     Ok(())
 }
 
