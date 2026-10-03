@@ -126,19 +126,40 @@ impl BandwidthLimiter {
         PriorityUpload { limiter: self }
     }
 
-    /// Spends the reserve only: the shared bucket is the slots' share, and
-    /// racing them for it whenever the reserve runs dry leaves them next to
-    /// nothing.
+    /// Spends the reserve, and from the shared bucket only what sits above a
+    /// quarter of the cap. The shared bucket is the slots' share, and racing
+    /// them for it whenever the reserve runs dry leaves them next to nothing;
+    /// but slots that are parked on it drain every refill, so a balance above
+    /// that floor is one they are leaving unspent, and without it a chat file
+    /// with the slots idle could never use more than the reserve's share.
     async fn acquire_priority_upload(&self, bytes: u64) -> bool {
-        if self.max_upload_rate.load(Ordering::Relaxed) == 0 {
-            self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
-            return true;
-        }
-        if !self
-            .drain_tokens(&self.priority_tokens, bytes, &self.max_upload_rate)
-            .await
-        {
-            return false;
+        let start = std::time::Instant::now();
+        let mut warned_slow = false;
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let max = self.max_upload_rate.load(Ordering::Relaxed);
+            if max == 0 {
+                break;
+            }
+            let mut took = take_tokens(&self.priority_tokens, remaining);
+            if took < remaining {
+                took += take_tokens_above(&self.upload_tokens, remaining - took, (max / 4).max(1));
+            }
+            remaining -= took;
+            if took == 0 {
+                if !self.refill_alive.load(Ordering::Acquire) {
+                    return false;
+                }
+                tokio::time::timeout(Duration::from_millis(25), self.refill_notify.notified())
+                    .await
+                    .ok();
+                if !warned_slow && start.elapsed() > Duration::from_secs(60) {
+                    warned_slow = true;
+                    tracing::warn!(
+                        "acquire_priority_upload: waited >60s for bandwidth tokens (remaining={remaining})"
+                    );
+                }
+            }
         }
         self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
         true
@@ -649,6 +670,23 @@ fn take_tokens(pool: &AtomicU64, max: u64) -> u64 {
     }
 }
 
+/// [`take_tokens`], leaving at least `floor` in `pool`.
+fn take_tokens_above(pool: &AtomicU64, max: u64, floor: u64) -> u64 {
+    loop {
+        let current = pool.load(Ordering::Acquire);
+        let take = max.min(current.saturating_sub(floor));
+        if take == 0 {
+            return 0;
+        }
+        if pool
+            .compare_exchange_weak(current, current - take, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return take;
+        }
+    }
+}
+
 fn priority_reserve_cap(max_upload: u64) -> u64 {
     (max_upload.saturating_mul(PRIORITY_UPLOAD_PERCENT) / 100 / PRIORITY_RESERVE_DIVISOR).max(1)
 }
@@ -660,7 +698,7 @@ pub struct PriorityUpload<'a> {
 }
 
 impl PriorityUpload<'_> {
-    /// [`BandwidthLimiter::acquire_upload`], spending only the reserve.
+    /// [`BandwidthLimiter::acquire_upload`], spending the reserve first.
     pub async fn acquire(&self, bytes: u64) -> bool {
         self.limiter.acquire_priority_upload(bytes).await
     }
@@ -966,6 +1004,28 @@ mod tests {
             .expect("the slots spend their share while the priority stream is starved");
     }
 
+    /// With no slot spending it, the shared bucket fills past the floor busy
+    /// slots keep it under, and a priority upload may take what is above it
+    /// rather than leave a fifth of the uplink idle.
+    #[tokio::test]
+    async fn a_priority_upload_takes_what_idle_slots_leave_above_the_floor() {
+        let bw = BandwidthLimiter::new(10_000, 0);
+        let priority = bw.priority_upload();
+        assert_eq!(bw.available_upload_tokens(), 10_000);
+
+        tokio::time::timeout(Duration::from_millis(100), priority.acquire(7_500))
+            .await
+            .expect("the unspent shared balance above the floor covers the request");
+        assert_eq!(
+            bw.available_upload_tokens(),
+            2_500,
+            "a quarter of the cap is left for slots that start asking"
+        );
+        let starved =
+            tokio::time::timeout(Duration::from_millis(100), priority.acquire(1)).await;
+        assert!(starved.is_err(), "the floor itself is not spare");
+    }
+
     /// A request bigger than the reserve can ever hold completes by draining
     /// it across refills.
     #[tokio::test]
@@ -997,6 +1057,7 @@ mod tests {
         assert_eq!(unlimited.total_uploaded(), 1_000_000);
 
         let bw = BandwidthLimiter::new(10_000, 0);
+        assert_eq!(bw.try_take_upload(10_000), 10_000);
         let priority = bw.priority_upload();
         bw.stop_refill_for_test();
         let ok = tokio::time::timeout(Duration::from_secs(2), priority.acquire(1_000))
