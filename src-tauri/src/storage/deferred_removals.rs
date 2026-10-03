@@ -83,6 +83,11 @@ fn retry_at(db: &Database, folders: &DownloadFolders, now: i64) {
         }
     };
     if pending.is_empty() {
+        // Nothing waits on any folder now, so none of their clocks may carry
+        // over to a removal queued later for the same folder.
+        if let Err(e) = db.deferred_folders_unreachable_since(&[], now) {
+            tracing::warn!("Could not forget the folders removals waited for: {e}");
+        }
         return;
     }
     let roots = folders.roots();
