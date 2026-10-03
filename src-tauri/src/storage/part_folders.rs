@@ -18,10 +18,11 @@ use std::time::Duration;
 /// unbounded number of them.
 pub const MAX_PREVIOUS_DOWNLOAD_FOLDERS: usize = 16;
 
-/// How long startup waits for the earlier download folders to be listed. An
-/// offline network share can hold `read_dir` for tens of seconds, and this
-/// runs before the window exists.
-const STARTUP_LISTING_BUDGET: Duration = Duration::from_secs(2);
+/// How long startup waits for the download folders to be listed. An offline
+/// network share can hold `read_dir` for tens of seconds, and this runs
+/// before the window exists. A folder that has not answered by then is
+/// unknown, never empty.
+pub(crate) const STARTUP_LISTING_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DownloadFolders {
@@ -43,32 +44,80 @@ pub enum PartLocation {
     Absent { unreachable: Vec<PathBuf> },
 }
 
-/// Where each download's part files were last found or opened, this session
-/// or (restored from the database's record) the last. Read by the network
-/// loop, which must not touch the disk to answer.
-fn located() -> &'static parking_lot::Mutex<HashMap<String, PathBuf>> {
-    static LOCATED: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, PathBuf>>> =
-        std::sync::OnceLock::new();
+/// What this run knows about where part files are. Read by the network loop,
+/// which must not touch the disk to answer.
+#[derive(Default)]
+struct Located {
+    /// Where each download's part files were last found or opened, this
+    /// session or (restored from the database's record) the last.
+    folders: HashMap<String, PathBuf>,
+    /// Downloads with progress that startup found in no folder it could look
+    /// at, with no record of one it could: any earlier folder that cannot be
+    /// looked at may hold them.
+    unplaced: HashSet<String>,
+    /// Other part file owners this run created files for.
+    owners: HashSet<String>,
+}
+
+fn located() -> &'static parking_lot::Mutex<Located> {
+    static LOCATED: std::sync::OnceLock<parking_lot::Mutex<Located>> = std::sync::OnceLock::new();
     LOCATED.get_or_init(Default::default)
 }
 
 /// Remember that this download's part files are in `folder`.
 pub fn note_located(transfer_id: &str, folder: &Path) {
-    located()
-        .lock()
+    let mut located = located().lock();
+    located.unplaced.remove(transfer_id);
+    located
+        .folders
         .insert(transfer_id.to_string(), folder.to_path_buf());
+}
+
+/// Remember that this download has progress in a folder nothing could name.
+pub fn note_unplaced(transfer_id: &str) {
+    located().lock().unplaced.insert(transfer_id.to_string());
+}
+
+fn is_unplaced(transfer_id: &str) -> bool {
+    located().lock().unplaced.contains(transfer_id)
+}
+
+/// Remember that this run creates part files for `owner`, a room transfer's
+/// `ember-xfer-<hex>`.
+pub fn note_part_owner(owner: &str) {
+    located().lock().owners.insert(owner.to_string());
+}
+
+/// Whether this run created, found or is holding part files for `owner`.
+/// The startup orphan sweep never removes those, whatever their dates say.
+pub fn known_this_run(owner: &str) -> bool {
+    let located = located().lock();
+    located.folders.contains_key(owner)
+        || located.unplaced.contains(owner)
+        || located.owners.contains(owner)
 }
 
 /// The folder this download's part files were last found in. Non-blocking.
 pub fn located_folder(transfer_id: &str) -> Option<PathBuf> {
-    located().lock().get(transfer_id).cloned()
+    located().lock().folders.get(transfer_id).cloned()
+}
+
+/// Whether `folder` may hold this download's part files as far as this run
+/// knows: they were last there, or the download is unplaced. Non-blocking.
+pub fn may_hold_parts(transfer_id: &str, folder: &Path) -> bool {
+    let located = located().lock();
+    located.unplaced.contains(transfer_id)
+        || located
+            .folders
+            .get(transfer_id)
+            .is_some_and(|known| same_path(known, folder))
 }
 
 /// Whether `folder` can be looked at: it exists, or it is gone from a volume
 /// that is still there. Only the volume decides — the drive or share root on
 /// Windows, the mount point elsewhere — so a folder the user deleted, parents
 /// and all, is not taken for an unplugged drive.
-fn folder_reachable(folder: &Path) -> bool {
+pub(crate) fn folder_reachable(folder: &Path) -> bool {
     #[cfg(test)]
     if unplugged_volumes()
         .lock()
@@ -182,7 +231,8 @@ impl DownloadFolders {
     }
 
     /// The first folder, current first, whose `Temp` holds this download's
-    /// `.part` or `.part.met`. Blocking.
+    /// `.part` or `.part.met`. One where asking failed for another reason
+    /// than the file not being there could hold them. Blocking.
     pub fn locate_part(&self, transfer_id: &str) -> PartLocation {
         let names = [
             format!("{transfer_id}.part"),
@@ -191,14 +241,18 @@ impl DownloadFolders {
         let mut unreachable = Vec::new();
         for folder in self.all() {
             let temp = folder.join("Temp");
-            if names
-                .iter()
-                .any(|name| std::fs::symlink_metadata(temp.join(name)).is_ok())
-            {
-                note_located(transfer_id, folder);
-                return PartLocation::Found(folder.to_path_buf());
+            let mut unknown = false;
+            for name in &names {
+                match std::fs::symlink_metadata(temp.join(name)) {
+                    Ok(_) => {
+                        note_located(transfer_id, folder);
+                        return PartLocation::Found(folder.to_path_buf());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => unknown = true,
+                }
             }
-            if !folder_reachable(folder) {
+            if unknown || !folder_reachable(folder) {
                 unreachable.push(folder.to_path_buf());
             }
         }
@@ -233,26 +287,33 @@ impl DownloadFolders {
     /// Starting such a download in the current folder would begin a second
     /// `.part` from zero, and once the drive came back the current folder's
     /// copy would win and strand the real progress. A download found nowhere
-    /// whose folder is not offline, or is not known, starts over in the
-    /// current folder. Blocking.
+    /// waits for the folder it was last in while that one cannot be reached,
+    /// and an unplaced one ([`note_unplaced`]) for any that cannot; it starts
+    /// over in the current folder once its folder answers without its part
+    /// files, or when it never had progress. Blocking.
     pub fn folder_to_resume_in(&self, transfer_id: &str) -> Result<PathBuf, PathBuf> {
         if self.previous.is_empty() {
             return Ok(self.current.clone());
         }
-        match self.locate_part(transfer_id) {
-            PartLocation::Found(folder) => Ok(folder),
-            PartLocation::Absent { unreachable } => {
-                let last_seen = located_folder(transfer_id);
-                let holding = last_seen.and_then(|last_seen| {
-                    unreachable.into_iter().find(|folder| {
-                        same_folder(&folder.to_string_lossy(), &last_seen.to_string_lossy())
-                    })
-                });
-                match holding {
-                    Some(folder) => Err(folder),
-                    None => Ok(self.current.clone()),
-                }
-            }
+        let unreachable = match self.locate_part(transfer_id) {
+            PartLocation::Found(folder) => return Ok(folder),
+            PartLocation::Absent { unreachable } => unreachable,
+        };
+        let Some(first_unreachable) = unreachable.first() else {
+            return Ok(self.current.clone());
+        };
+        let last_seen = located_folder(transfer_id)
+            .filter(|last_seen| self.all().any(|folder| same_path(folder, last_seen)));
+        match last_seen {
+            Some(last_seen) => match unreachable
+                .iter()
+                .find(|folder| same_path(folder, &last_seen))
+            {
+                Some(folder) => Err(folder.clone()),
+                None => Ok(self.current.clone()),
+            },
+            None if is_unplaced(transfer_id) => Err(first_unreachable.clone()),
+            None => Ok(self.current.clone()),
         }
     }
 }
@@ -285,43 +346,62 @@ fn holds_parts(folder: &Path, keep: impl Fn(&str) -> bool) -> bool {
                 .and_then(part_owner)
                 .is_some_and(&keep)
         }),
-        Err(_) => !folder_reachable(folder),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => !folder_reachable(folder),
+        Err(_) => true,
     }
 }
 
-/// The owners of the part files in `folder`'s `Temp`, or `None` when the
-/// folder cannot be reached. Blocking.
-fn part_owners(folder: &Path) -> Option<HashSet<String>> {
+/// The names of the `.part` and `.part.met` files in `folder`'s `Temp`, or
+/// `None` when they cannot be known: the folder cannot be reached, or
+/// listing it failed for another reason than its `Temp` not being there.
+/// Blocking.
+pub(crate) fn part_names(folder: &Path) -> Option<HashSet<String>> {
     match std::fs::read_dir(folder.join("Temp")) {
         Ok(entries) => Some(
             entries
                 .flatten()
-                .filter_map(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
-                        .and_then(part_owner)
-                        .map(str::to_string)
-                })
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| part_owner(name).is_some())
                 .collect(),
         ),
-        Err(_) => folder_reachable(folder).then(HashSet::new),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            folder_reachable(folder).then(HashSet::new)
+        }
+        Err(_) => None,
     }
 }
 
-/// What startup learns about a download folder: the owners of the part files
-/// in its `Temp` (`None`: it cannot be reached) and what it resolves to
-/// (`None`: unknown).
+/// Whether `names`, from [`part_names`], hold a `.part` or `.part.met` of
+/// `transfer_id`.
+pub(crate) fn names_hold(names: &HashSet<String>, transfer_id: &str) -> bool {
+    names.contains(&format!("{transfer_id}.part"))
+        || names.contains(&format!("{transfer_id}.part.met"))
+}
+
+/// What startup learns about a download folder: the [`part_names`] in its
+/// `Temp` (`None`: unknown) and what it resolves to (`None`: unknown).
 #[derive(Clone, Debug, Default)]
 struct FolderListing {
-    owners: Option<HashSet<String>>,
+    parts: Option<HashSet<String>>,
     canonical: Option<PathBuf>,
 }
 
-/// Each folder's [`FolderListing`], read in parallel. A folder that has not
-/// answered within `budget` counts as unreachable; its thread is left to
-/// finish on its own.
-fn list_folders_within(folders: &[PathBuf], budget: Duration) -> Vec<FolderListing> {
+impl FolderListing {
+    fn read(folder: &Path) -> Self {
+        Self {
+            parts: part_names(folder),
+            canonical: folder.canonicalize().ok(),
+        }
+    }
+}
+
+/// `probe` of each folder, run in parallel. One that has not answered within
+/// `budget` is `None`; its thread is left to finish on its own.
+pub(crate) fn probe_within<T: Send + 'static>(
+    folders: &[PathBuf],
+    budget: Duration,
+    probe: fn(&Path) -> T,
+) -> Vec<Option<T>> {
     let (tx, rx) = std::sync::mpsc::channel();
     for (index, folder) in folders.iter().enumerate() {
         let tx = tx.clone();
@@ -329,31 +409,40 @@ fn list_folders_within(folders: &[PathBuf], budget: Duration) -> Vec<FolderListi
         let spawned = std::thread::Builder::new()
             .name("ember-part-folder-listing".into())
             .spawn(move || {
-                let listing = FolderListing {
-                    owners: part_owners(&folder),
-                    canonical: folder.canonicalize().ok(),
-                };
-                let _ = tx.send((index, listing));
+                let _ = tx.send((index, probe(&folder)));
             });
         if let Err(e) = spawned {
             tracing::warn!("Could not list {}: {e}", folders[index].display());
         }
     }
     drop(tx);
-    let mut listings = vec![FolderListing::default(); folders.len()];
+    let mut probed: Vec<Option<T>> = folders.iter().map(|_| None).collect();
     let deadline = std::time::Instant::now() + budget;
     while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
         match rx.recv_timeout(left) {
-            Ok((index, listing)) => listings[index] = listing,
+            Ok((index, value)) => probed[index] = Some(value),
             Err(_) => break,
         }
     }
-    listings
+    probed
 }
 
-fn same_folder(a: &str, b: &str) -> bool {
-    crate::commands::settings::normalized_path_components(Path::new(a))
-        == crate::commands::settings::normalized_path_components(Path::new(b))
+/// Each folder's [`FolderListing`], read in parallel; one that has not
+/// answered within `budget` is unknown.
+fn list_folders_within(folders: &[PathBuf], budget: Duration) -> Vec<FolderListing> {
+    probe_within(folders, budget, FolderListing::read)
+        .into_iter()
+        .map(Option::unwrap_or_default)
+        .collect()
+}
+
+pub(crate) fn same_folder(a: &str, b: &str) -> bool {
+    same_path(Path::new(a), Path::new(b))
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    crate::commands::settings::normalized_path_components(a)
+        == crate::commands::settings::normalized_path_components(b)
 }
 
 /// The previous download folders once the download folder moves from
@@ -396,44 +485,65 @@ pub struct UnfinishedDownloads {
 
 /// The previous download folders still needed, given `listings[i]` for
 /// `folders[i]`. `folders[0]` is the current folder and the rest are the
-/// previous ones, in order.
+/// previous ones, in order. `awaiting_cleanup` are folders holding files a
+/// Cancel or a completion could not remove yet.
 ///
 /// A folder that can be listed is kept while it holds a part file of an
 /// unfinished download, or an orphan the startup sweep is about to remove
 /// from it — forgotten first, the folder would lose its approval and the
 /// orphan, which can be a whole file whose removal failed after completion,
-/// would stay behind for good. One that cannot be listed is kept only while
-/// an unfinished download with progress in none of the folders that can was
-/// last recorded in it.
+/// would stay behind for good. One whose part files are unknown — it cannot
+/// be reached, or did not answer in time — is kept while an unfinished
+/// download with progress in none of the folders that were listed may be in
+/// it: the one its `.part` was last recorded in, or, when that is not one of
+/// these folders, any of them.
 fn retain_needed(
     folders: &[PathBuf],
     listings: &[FolderListing],
     unfinished: &UnfinishedDownloads,
+    awaiting_cleanup: &[String],
 ) -> Vec<String> {
-    let listed: Vec<&HashSet<String>> = listings
-        .iter()
-        .filter_map(|listing| listing.owners.as_ref())
-        .collect();
-    let stranded_in: Vec<&str> = unfinished
-        .with_progress
-        .iter()
-        .filter(|(id, _)| !listed.iter().any(|owners| owners.contains(*id)))
-        .map(|(_, recorded)| recorded.as_str())
-        .filter(|recorded| !recorded.is_empty())
-        .collect();
+    let listed = |id: &str| {
+        listings
+            .iter()
+            .filter_map(|listing| listing.parts.as_ref())
+            .any(|names| names_hold(names, id))
+    };
+    let mut recorded_in = HashSet::new();
+    let mut anywhere = false;
+    for (id, recorded) in &unfinished.with_progress {
+        if listed(id) {
+            continue;
+        }
+        match folders
+            .iter()
+            .position(|folder| same_folder(&folder.to_string_lossy(), recorded))
+        {
+            Some(index) => {
+                recorded_in.insert(index);
+            }
+            None => anywhere = true,
+        }
+    }
     folders
         .iter()
         .zip(listings)
+        .enumerate()
         .skip(1)
-        .filter(|(folder, listing)| match &listing.owners {
-            Some(owners) => owners
+        .filter(|(index, (folder, listing))| {
+            let folder = folder.to_string_lossy();
+            awaiting_cleanup
                 .iter()
-                .any(|id| unfinished.ids.contains(id) || swept_owner(id)),
-            None => stranded_in
-                .iter()
-                .any(|recorded| same_folder(recorded, &folder.to_string_lossy())),
+                .any(|pending| same_folder(pending, &folder))
+                || match &listing.parts {
+                    Some(names) => names
+                        .iter()
+                        .filter_map(|name| part_owner(name))
+                        .any(|id| unfinished.ids.contains(id) || swept_owner(id)),
+                    None => anywhere || recorded_in.contains(index),
+                }
         })
-        .map(|(folder, _)| folder.to_string_lossy().into_owned())
+        .map(|(_, (folder, _))| folder.to_string_lossy().into_owned())
         .collect()
 }
 
@@ -478,6 +588,9 @@ pub fn forget_finished_previous_folders(
     db: &crate::storage::database::Database,
     config: &mut crate::storage::config::AppConfig,
 ) {
+    if let Err(e) = db.forget_finished_part_folders() {
+        tracing::warn!("Could not forget the part folders of finished downloads: {e}");
+    }
     let previous = &config.settings.previous_download_folders;
     if previous.is_empty() {
         return;
@@ -499,11 +612,19 @@ pub fn forget_finished_previous_folders(
     let kept = match (
         db.incomplete_downloads_owning_partials(),
         db.incomplete_downloads_with_progress(),
+        db.deferred_file_removals(),
     ) {
-        (Ok(ids), Ok(with_progress)) => {
-            retain_needed(&folders, &listings, &UnfinishedDownloads { ids, with_progress })
+        (Ok(ids), Ok(with_progress), Ok(deferred)) => {
+            let awaiting_cleanup: Vec<String> =
+                deferred.into_iter().map(|(_, folder)| folder).collect();
+            retain_needed(
+                &folders,
+                &listings,
+                &UnfinishedDownloads { ids, with_progress },
+                &awaiting_cleanup,
+            )
         }
-        (Err(e), _) | (_, Err(e)) => {
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
             tracing::warn!(
                 "Keeping earlier download folders: unfinished downloads unreadable ({e})"
             );
@@ -643,11 +764,29 @@ mod tests {
             "its progress is on the drive that is not connected"
         );
 
-        let restored_unrecorded = uuid();
+        let never_started = uuid();
         assert_eq!(
-            folders.folder_to_resume_in(&restored_unrecorded),
+            folders.folder_to_resume_in(&never_started),
             Ok(PathBuf::from(&new)),
-            "with no record of where it was, it starts over rather than wait for any drive"
+            "with no progress anywhere, nothing is waited for"
+        );
+
+        let unplaced = uuid();
+        note_unplaced(&unplaced);
+        assert_eq!(
+            folders.folder_to_resume_in(&unplaced),
+            Err(PathBuf::from(&offline)),
+            "progress with no record of where it is waits for the drives that are not there"
+        );
+        assert!(known_this_run(&unplaced));
+
+        let recorded_nowhere_known = uuid();
+        note_located(&recorded_nowhere_known, &scratch.0.join("forgotten"));
+        note_unplaced(&recorded_nowhere_known);
+        assert_eq!(
+            folders.folder_to_resume_in(&recorded_nowhere_known),
+            Err(PathBuf::from(&offline)),
+            "a record of a folder that is no longer a download folder says nothing"
         );
 
         let seen_in_current = uuid();
@@ -849,60 +988,97 @@ mod tests {
         let listings = list_folders_within(&folders, Duration::from_secs(5));
 
         assert_eq!(
-            retain_needed(&folders, &listings, &unfinished(&[&live], &[(&live, &path(1))])),
+            retain_needed(&folders, &listings, &unfinished(&[&live], &[(&live, &path(1))]), &[]),
             vec![path(1), path(2)],
             "the orphan's folder stays approved until the startup sweep has removed it"
         );
         assert_eq!(
-            retain_needed(&folders, &listings, &unfinished(&[], &[])),
+            retain_needed(&folders, &listings, &unfinished(&[], &[]), &[]),
             vec![path(1), path(2)],
             "with nothing unfinished, every part file is an orphan, and its folder is kept \
              for the sweep"
         );
+        assert_eq!(
+            retain_needed(&folders, &listings, &unfinished(&[], &[]), &[path(3)]),
+            vec![path(1), path(2), path(3)],
+            "a folder with files a Cancel could not remove yet is kept until they are"
+        );
     }
 
     #[test]
-    fn startup_keeps_an_offline_folder_only_for_progress_recorded_on_it() {
+    fn startup_keeps_an_offline_folder_for_progress_that_may_be_on_it() {
         let scratch = Scratch::new();
-        let (here, elsewhere, unrecorded) = (uuid(), uuid(), uuid());
-        let folders = folders(&scratch, &["current", "offline:old", "offline:older"]);
+        let (here, elsewhere, unrecorded, gone) = (uuid(), uuid(), uuid(), uuid());
+        let folders = folders(&scratch, &["current", "offline:old", "offline:older", "listed"]);
         let path = |i: usize| folders[i].to_string_lossy().into_owned();
         touch(&path(0), &format!("{here}.part"));
         let listings = list_folders_within(&folders, Duration::from_secs(5));
-        assert_eq!(listings[1].owners, None);
+        assert_eq!(listings[1].parts, None);
+        let retain = |unfinished: UnfinishedDownloads| {
+            retain_needed(&folders, &listings, &unfinished, &[])
+        };
 
         assert!(
-            retain_needed(&folders, &listings, &unfinished(&[&here], &[(&here, &path(1))]))
-                .is_empty(),
+            retain(unfinished(&[&here], &[(&here, &path(1))])).is_empty(),
             "every download with progress is accounted for elsewhere"
         );
         assert!(
-            retain_needed(
-                &folders,
-                &listings,
-                &unfinished(&[&here, &elsewhere], &[(&here, &path(0))])
-            )
-            .is_empty(),
+            retain(unfinished(&[&here, &elsewhere], &[(&here, &path(0))])).is_empty(),
             "a download with no bytes yet cannot be stranded"
         );
         assert_eq!(
-            retain_needed(
-                &folders,
-                &listings,
-                &unfinished(&[&elsewhere], &[(&elsewhere, &path(1))])
-            ),
+            retain(unfinished(&[&elsewhere], &[(&elsewhere, &path(1))])),
             vec![path(1)],
             "progress found in no reachable folder is waited for on the folder it was in"
         );
-        assert!(
-            retain_needed(
-                &folders,
-                &listings,
-                &unfinished(&[&unrecorded], &[(&unrecorded, "")])
-            )
-            .is_empty(),
-            "progress with no folder on record holds none"
+        assert_eq!(
+            retain(unfinished(&[&unrecorded], &[(&unrecorded, "")])),
+            vec![path(1), path(2)],
+            "progress with no folder on record may be on any folder that did not answer"
         );
+        assert_eq!(
+            retain(unfinished(&[&unrecorded], &[(&unrecorded, "/no/longer/a/folder")])),
+            vec![path(1), path(2)],
+            "nor with a record of a folder that is not one of them"
+        );
+        assert!(
+            retain(unfinished(&[&gone], &[(&gone, &path(3))])).is_empty(),
+            "its recorded folder answered without it: the progress is gone, nothing is held"
+        );
+    }
+
+    /// A slow drive that has not spun up within the budget is unknown, not
+    /// empty, so the download recorded on it is not forgotten.
+    #[test]
+    fn a_folder_that_does_not_answer_in_time_is_unknown() {
+        let slow = |_: &Path| {
+            std::thread::sleep(Duration::from_millis(500));
+            Some(HashSet::<String>::new())
+        };
+        let probed = probe_within(&[PathBuf::from("slow")], Duration::from_millis(20), slow);
+        assert!(probed[0].is_none());
+
+        let scratch = Scratch::new();
+        let (current, slow_drive) = (scratch.folder("current"), scratch.folder("slow"));
+        let folders = [PathBuf::from(&current), PathBuf::from(&slow_drive)];
+        let listings = [FolderListing::read(&folders[0]), FolderListing::default()];
+        let id = uuid();
+        assert_eq!(
+            retain_needed(&folders, &listings, &unfinished(&[&id], &[(&id, &slow_drive)]), &[]),
+            vec![slow_drive]
+        );
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_listed_is_unknown_not_empty() {
+        let scratch = Scratch::new();
+        let broken = scratch.0.join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("Temp"), b"not a folder").unwrap();
+        assert_eq!(part_names(&broken), None);
+        let deleted = scratch.0.join("deleted");
+        assert_eq!(part_names(&deleted), Some(HashSet::new()), "no Temp on a present volume");
+        assert!(holds_parts(&broken, |_| false), "kept on a folder change, too");
     }
 
     /// The config load checks only the text; what an earlier folder resolves
@@ -915,7 +1091,7 @@ mod tests {
             ("/srv/ember-now", "/srv/ember-old", "/etc/ember", "/")
         };
         let listing = |canonical: Option<&str>| FolderListing {
-            owners: Some(HashSet::new()),
+            parts: Some(HashSet::new()),
             canonical: canonical.map(PathBuf::from),
         };
         let folders: Vec<PathBuf> = ["current", "old", "offline", "alias", "link", "drive"]

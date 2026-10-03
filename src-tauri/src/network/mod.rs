@@ -180,19 +180,30 @@ fn relay_ticket_next_round_delay(
         .saturating_duration_since(completed_at)
 }
 
-/// What the download whose `.part` stem a completion copy carries finished
-/// as. Chat and room transfers have no hash on record to check a copy by.
-fn expected_finished_file(
+/// Whose the completion copy carrying `.part` stem `stem` is, given the
+/// downloads `unfinished` at startup (`None`: unknown, so any download may
+/// be). Chat and room transfers have no hash on record to check a copy by.
+fn completion_copy_owner(
     db: &Database,
+    unfinished: Option<&HashSet<String>>,
     stem: &str,
-) -> Option<ed2k::transfer::ExpectedFinishedFile> {
-    uuid::Uuid::parse_str(stem).ok()?;
-    let (name, ed2k_hash, size) = db.download_identity(stem)?;
-    Some(ed2k::transfer::ExpectedFinishedFile {
-        name,
-        ed2k_hash,
-        size,
-    })
+) -> ed2k::transfer::CopyOwner {
+    if uuid::Uuid::parse_str(stem).is_err() {
+        return ed2k::transfer::CopyOwner::Unknown;
+    }
+    if unfinished.is_none_or(|unfinished| unfinished.contains(stem)) {
+        return ed2k::transfer::CopyOwner::Unfinished;
+    }
+    match db.finished_download_identity(stem) {
+        Some((name, ed2k_hash, size)) => {
+            ed2k::transfer::CopyOwner::Finished(ed2k::transfer::ExpectedFinishedFile {
+                name,
+                ed2k_hash,
+                size,
+            })
+        }
+        None => ed2k::transfer::CopyOwner::Unknown,
+    }
 }
 
 /// This mirrors the rendezvous server's accepted-ticket cap. Keeping the
@@ -1195,20 +1206,44 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     }
     // In the background, one folder each, so an offline one holds up nothing;
     // only copies older than this run are touched, never one a completion
-    // starting meanwhile is writing.
+    // starting meanwhile is writing. An unfinished download's copies are
+    // settled by its resume instead, before it can start.
     {
         let cutoff = std::time::SystemTime::now()
             .checked_sub(std::time::Duration::from_secs(5))
             .unwrap_or(std::time::UNIX_EPOCH);
+        let unfinished = match db.incomplete_downloads_owning_partials() {
+            Ok(unfinished) => Some(Arc::new(unfinished)),
+            Err(e) => {
+                warn!("Leaving completion copies of downloads alone: downloads unreadable ({e})");
+                None
+            }
+        };
         let roots = settings.download_roots();
         for root in roots.clone() {
-            let (roots, db) = (roots.clone(), db.clone());
+            let (roots, db, unfinished) = (roots.clone(), db.clone(), unfinished.clone());
             tokio::task::spawn_blocking(move || {
                 ed2k::transfer::settle_stale_completion_copies(&root, &roots, cutoff, &|stem| {
-                    expected_finished_file(&db, stem)
+                    completion_copy_owner(&db, unfinished.as_deref(), stem)
                 })
             });
         }
+    }
+    // Files a completion or a Cancel could not remove, retried for as long
+    // as the app runs: a scanner lets go, a drive comes back.
+    crate::storage::deferred_removals::install(&db);
+    {
+        let (db, folders) = (db.clone(), state.download_folders.clone());
+        tokio::spawn(async move {
+            loop {
+                let (db, folders) = (db.clone(), folders.read().clone());
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::storage::deferred_removals::retry(&db, &folders)
+                })
+                .await;
+                tokio::time::sleep(crate::storage::deferred_removals::RETRY_INTERVAL).await;
+            }
+        });
     }
 
     // Seed the Ember DHT routing table from the last session's persisted

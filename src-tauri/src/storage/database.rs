@@ -4130,12 +4130,13 @@ impl Database {
         Ok(count.max(0) as usize)
     }
 
-    /// A download's file name, ed2k hash (hex) and size.
-    pub fn download_identity(&self, transfer_id: &str) -> Option<(String, String, u64)> {
+    /// A finished download's file name, ed2k hash (hex) and size.
+    pub fn finished_download_identity(&self, transfer_id: &str) -> Option<(String, String, u64)> {
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT file_name, file_hash, total_size FROM transfers
-              WHERE id = ?1 AND direction = 'download'",
+              WHERE id = ?1 AND direction = 'download'
+                AND status IN ('completed', 'noneneeded')",
             params![transfer_id],
             |row| {
                 Ok((
@@ -4333,8 +4334,14 @@ impl Database {
         speed: u64,
         part_folder: Option<&str>,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        let updated = conn.execute(
+        let mut conn = self.conn.lock();
+        if part_folder.is_some() {
+            Self::ensure_transfer_part_folders_locked(&conn)?;
+        }
+        // One transaction: progress on record without the folder it is in
+        // would let a restart start the download over elsewhere.
+        let tx = conn.transaction()?;
+        let updated = tx.execute(
             "UPDATE transfers
              SET transferred = ?1, progress = ?2, speed = ?3
              WHERE id = ?4 AND status NOT IN ('completed', 'cancelled')",
@@ -4346,29 +4353,109 @@ impl Database {
             ],
         )?;
         if let Some(folder) = part_folder.filter(|_| updated > 0) {
-            Self::ensure_transfer_part_folders_locked(&conn)?;
-            conn.execute(
-                "INSERT INTO transfer_part_folders (transfer_id, folder) VALUES (?1, ?2)
-                 ON CONFLICT(transfer_id) DO UPDATE SET folder = excluded.folder
-                 WHERE folder != excluded.folder",
-                params![transfer_id, folder],
+            Self::upsert_part_folder(&tx, transfer_id, folder)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn upsert_part_folder(
+        conn: &Connection,
+        transfer_id: &str,
+        folder: &str,
+    ) -> anyhow::Result<()> {
+        conn.execute(
+            "INSERT INTO transfer_part_folders (transfer_id, folder) VALUES (?1, ?2)
+             ON CONFLICT(transfer_id) DO UPDATE SET folder = excluded.folder
+             WHERE folder != excluded.folder",
+            params![transfer_id, folder],
+        )?;
+        Ok(())
+    }
+
+    /// Record, in one transaction, the download folder each of these
+    /// unfinished downloads' part files were found in: `(transfer_id, folder)`.
+    pub fn record_part_folders(&self, found: &[(String, String)]) -> anyhow::Result<()> {
+        if found.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        Self::ensure_transfer_part_folders_locked(&conn)?;
+        let tx = conn.transaction()?;
+        for (transfer_id, folder) in found {
+            Self::upsert_part_folder(&tx, transfer_id, folder)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Forget the part folders of downloads that finished or are gone.
+    pub fn forget_finished_part_folders(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_transfer_part_folders_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM transfer_part_folders
+              WHERE transfer_id NOT IN (
+                    SELECT id FROM transfers
+                     WHERE direction = 'download'
+                       AND status NOT IN ('completed', 'noneneeded'))",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Remember files to remove once they can be: `(path, download folder
+    /// the path is in)`.
+    pub fn defer_file_removals(&self, removals: &[(String, String)]) -> anyhow::Result<()> {
+        if removals.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        Self::ensure_deferred_file_removals_locked(&conn)?;
+        let tx = conn.transaction()?;
+        for (path, folder) in removals {
+            tx.execute(
+                "INSERT INTO deferred_file_removals (path, folder) VALUES (?1, ?2)
+                 ON CONFLICT(path) DO UPDATE SET folder = excluded.folder",
+                params![path, folder],
             )?;
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every `(path, folder)` [`Self::defer_file_removals`] recorded.
+    pub fn deferred_file_removals(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        Self::ensure_deferred_file_removals_locked(&conn)?;
+        let mut stmt = conn.prepare("SELECT path, folder FROM deferred_file_removals")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn forget_deferred_file_removals(&self, paths: &[String]) -> anyhow::Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        Self::ensure_deferred_file_removals_locked(&conn)?;
+        let tx = conn.transaction()?;
+        for path in paths {
+            tx.execute(
+                "DELETE FROM deferred_file_removals WHERE path = ?1",
+                params![path],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
     /// The download folder each download's `.part` was last recorded in.
-    /// Also forgets the folders of downloads that are gone.
     pub fn download_part_folders(
         &self,
     ) -> anyhow::Result<std::collections::HashMap<String, String>> {
         let conn = self.conn.lock();
         Self::ensure_transfer_part_folders_locked(&conn)?;
-        conn.execute(
-            "DELETE FROM transfer_part_folders
-              WHERE transfer_id NOT IN (SELECT id FROM transfers WHERE direction = 'download')",
-            [],
-        )?;
         let mut stmt = conn.prepare(
             "SELECT transfer_id, folder FROM transfer_part_folders WHERE folder != ''",
         )?;
@@ -4394,7 +4481,12 @@ impl Database {
         remove_row: bool,
     ) -> anyhow::Result<()> {
         let mut conn = self.conn.lock();
+        Self::ensure_transfer_part_folders_locked(&conn)?;
         let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM transfer_part_folders WHERE transfer_id = ?1",
+            params![transfer_id],
+        )?;
         match final_total {
             Some(total) => {
                 tx.execute(
@@ -8238,6 +8330,18 @@ impl Database {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS transfer_part_folders (
                 transfer_id TEXT PRIMARY KEY,
+                folder TEXT NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Files whose removal failed or had to wait for their folder, created on
+    /// first use for the same reason as [`Self::ensure_transfer_part_folders_locked`].
+    fn ensure_deferred_file_removals_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS deferred_file_removals (
+                path TEXT PRIMARY KEY,
                 folder TEXT NOT NULL
             );",
         )?;
@@ -12625,6 +12729,59 @@ mod tests {
 
         db.remove_transfer("t-active").unwrap();
         assert!(db.download_part_folders().unwrap().is_empty());
+
+        for (id, status) in [("t-paused", "paused"), ("t-finishing", "verifying")] {
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO transfers (
+                        id, file_name, file_hash, peer_id, peer_name, direction, status,
+                        progress, speed, total_size, transferred, started_at, priority,
+                        category, expected_aich, ember_file_hash
+                     ) VALUES (?1, 'file.bin', ?2, '', '', 'download', ?3, 0, 0, 4, 2, 1, 'normal', '', NULL, NULL)",
+                    params![id, "44".repeat(16), status],
+                )
+                .unwrap();
+        }
+        db.record_part_folders(&[
+            ("t-paused".into(), "E:/ember".into()),
+            ("t-finishing".into(), "E:/ember".into()),
+            ("t-gone".into(), "E:/ember".into()),
+        ])
+        .unwrap();
+        assert_eq!(
+            db.incomplete_downloads_with_progress().unwrap().get("t-paused").map(String::as_str),
+            Some("E:/ember"),
+            "a paused download found at startup is recorded without any progress event"
+        );
+        db.complete_transfer("t-finishing", Some(4), None, false).unwrap();
+        db.conn
+            .lock()
+            .execute("UPDATE transfers SET status = 'noneneeded' WHERE id = 't-paused'", [])
+            .unwrap();
+        let left = db.download_part_folders().unwrap();
+        assert!(!left.contains_key("t-finishing"), "completion drops the record");
+        db.forget_finished_part_folders().unwrap();
+        assert!(
+            db.download_part_folders().unwrap().is_empty(),
+            "records of finished or missing downloads are pruned"
+        );
+
+        db.defer_file_removals(&[("E:/ember/Temp/x.part".into(), "E:/ember".into())])
+            .unwrap();
+        assert_eq!(
+            db.deferred_file_removals().unwrap(),
+            vec![("E:/ember/Temp/x.part".to_string(), "E:/ember".to_string())]
+        );
+        db.forget_deferred_file_removals(&["E:/ember/Temp/x.part".into()])
+            .unwrap();
+        assert!(db.deferred_file_removals().unwrap().is_empty());
+        let version: i64 = db
+            .conn
+            .lock()
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 62);
 
         drop(db);
         let _ = std::fs::remove_file(&path);

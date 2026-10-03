@@ -980,9 +980,43 @@ fn open_directory_nofollow(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+/// `path` as the NUL-terminated wide string `CreateFileW` takes. One too long
+/// for `MAX_PATH` gets the extended-length prefix, as `std::fs` gives it, so
+/// deep download folders open like any other.
+#[cfg(windows)]
+fn windows_wide_path(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    // `std::fs` adds the prefix from 248 units: a directory's path is
+    // limited to `MAX_PATH` less room for an 8.3 file name.
+    const LONGEST_UNPREFIXED: usize = 247;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let prefixed = |prefix: &str| prefix.encode_utf16().collect::<Vec<u16>>();
+    let mut long = if wide.len() <= LONGEST_UNPREFIXED
+        || wide.starts_with(&prefixed(r"\\?\"))
+        || wide.starts_with(&prefixed(r"\\.\"))
+    {
+        wide
+    } else {
+        match std::path::absolute(path) {
+            Ok(absolute) => {
+                let absolute: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+                match absolute.strip_prefix(prefixed(r"\\").as_slice()) {
+                    Some(share) => [prefixed(r"\\?\UNC\").as_slice(), share].concat(),
+                    None if absolute.get(1) == Some(&u16::from(b':')) => {
+                        [prefixed(r"\\?\").as_slice(), absolute.as_slice()].concat()
+                    }
+                    None => absolute,
+                }
+            }
+            Err(_) => wide,
+        }
+    };
+    long.push(0);
+    long
+}
+
 #[cfg(windows)]
 fn open_windows_path(path: &Path, desired_access: u32, directory: bool) -> io::Result<File> {
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{FromRawHandle, RawHandle};
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -990,8 +1024,7 @@ fn open_windows_path(path: &Path, desired_access: u32, directory: bool) -> io::R
         FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    wide.push(0);
+    let wide = windows_wide_path(path);
     let mut flags = FILE_FLAG_OPEN_REPARSE_POINT;
     if directory {
         flags |= FILE_FLAG_BACKUP_SEMANTICS;
@@ -1015,7 +1048,6 @@ fn open_windows_path(path: &Path, desired_access: u32, directory: bool) -> io::R
 
 #[cfg(windows)]
 fn create_windows_new_file(path: &Path) -> io::Result<File> {
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{FromRawHandle, RawHandle};
     use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1025,8 +1057,7 @@ fn create_windows_new_file(path: &Path) -> io::Result<File> {
     const DELETE_ACCESS: u32 = 0x0001_0000;
     const WRITE_DAC_ACCESS: u32 = 0x0004_0000;
 
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    wide.push(0);
+    let wide = windows_wide_path(path);
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
@@ -2734,7 +2765,6 @@ pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 pub fn object_identity(path: &Path) -> io::Result<ObjectIdentity> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
@@ -2742,8 +2772,7 @@ pub fn object_identity(path: &Path) -> io::Result<ObjectIdentity> {
         FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    wide.push(0);
+    let wide = windows_wide_path(path);
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
@@ -2792,6 +2821,42 @@ pub fn object_identity(path: &Path) -> io::Result<ObjectIdentity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A completion copy's name in a deep download folder runs past
+    /// `MAX_PATH`; the handles Ember opens itself must still reach it.
+    #[cfg(windows)]
+    #[test]
+    fn files_past_max_path_open_and_identify() {
+        let base = std::env::temp_dir().join(format!(
+            "ember-long-path-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let mut deep = base.clone();
+        while deep.as_os_str().len() < 280 {
+            deep = deep.join("a-rather-long-download-folder-name");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let file =
+            deep.join(".ember-copy-0123456789abcdef.0b2b2352-0daa-4f1e-9d6b-1e3c5d7f9a10.tmp");
+        drop(create_windows_new_file(&file).unwrap());
+        assert!(file.as_os_str().len() > 300);
+        let opened = open_windows_path(&file, windows_sys::Win32::Foundation::GENERIC_READ, false)
+            .unwrap();
+        assert_eq!(
+            object_identity(&file).unwrap(),
+            object_identity_from_file(&opened).unwrap()
+        );
+        drop(opened);
+        let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+        assert_eq!(windows_wide_path(Path::new(r"C:\short")), wide("C:\\short\0"));
+        let share = format!(r"\\nas\media\{}", "d".repeat(260));
+        assert_eq!(
+            windows_wide_path(Path::new(&share)),
+            wide(&format!("\\\\?\\UNC\\nas\\media\\{}\0", "d".repeat(260)))
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     #[test]
     fn approved_rename_publishes_the_pinned_file_and_never_replaces() {

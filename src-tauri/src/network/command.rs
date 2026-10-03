@@ -3422,6 +3422,10 @@ async fn handle_command_inner(
                 // task and this handler holds `&mut`), so the capacity and ban
                 // checks above still hold on the far side.
                 let allowed_roots = vec![download_folder.to_string_lossy().into_owned()];
+                crate::storage::part_folders::note_part_owner(&format!(
+                    "ember-xfer-{}",
+                    hex::encode(xfer_id)
+                ));
                 let part_name = format!("ember-xfer-{}.part", hex::encode(xfer_id));
                 let prepared = tokio::task::spawn_blocking({
                     let root = download_folder.clone();
