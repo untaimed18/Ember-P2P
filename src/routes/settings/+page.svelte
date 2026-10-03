@@ -1234,8 +1234,8 @@
     // can arrive before it does.
     if (s.max_upload_speed === 0) s.uss_enabled = false;
     s.max_download_speed = cn(s.max_download_speed, MAX_CONFIGURED_SPEED_BPS, 0);
-    s.max_concurrent_downloads = ci(s.max_concurrent_downloads, 1, 50, 3);
-    s.max_concurrent_uploads = ci(s.max_concurrent_uploads, 1, 50, 4);
+    s.max_concurrent_downloads = ci(s.max_concurrent_downloads, 1, 50, 5);
+    s.max_concurrent_uploads = ci(s.max_concurrent_uploads, 1, 50, 5);
     s.max_sources_per_file = ci(s.max_sources_per_file, 50, 2000, 400);
     s.max_connections = ci(s.max_connections, 1, 2000, 500);
     // Lower bound 0: that is the documented "no burst gate" value, not an
@@ -2624,6 +2624,7 @@
           <div class="field">
             <label for="nickname">{m.settings_nickname_label()}</label>
             <input id="nickname" bind:value={settings.nickname} maxlength="128" placeholder={m.settings_nickname_placeholder()} />
+            <span class="hint">{m.settings_nickname_hint()}</span>
           </div>
           <div class="divider"></div>
           <div class="field toggle-row">
