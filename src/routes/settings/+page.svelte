@@ -3306,6 +3306,7 @@
             onfocusout={() => (uploadCapEditing = false)}
           >
             <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} />
+            <span class="hint">{m.settings_max_upload_speed_hint()}</span>
           </div>
           <div class="field">
             <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} />
