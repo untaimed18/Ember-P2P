@@ -69,7 +69,9 @@
   --type-image: #129393;
   --type-archive: var(--warning);
   --type-document: var(--accent);
+  --type-program: #3d7a32;
   --type-disc: #5f6e84;
+  --type-collection: #9a5b2f;
   --priority-verylow: #888888;
   --priority-low: #5599bb;
   --priority-auto: #7cb342;
@@ -248,7 +250,9 @@
   --type-image: #4cc4c4;
   --type-archive: var(--warning);
   --type-document: var(--accent);
+  --type-program: #8fbf78;
   --type-disc: #93a1b5;
+  --type-collection: #d4a574;
   --priority-verylow: #9a9fa8;
   --priority-low: #7fb6d9;
   --priority-auto: #9ccc65;

@@ -1424,6 +1424,8 @@
   "library_type_image": "Image",
   "library_type_archive": "Archive",
   "library_type_document": "Document",
+  "library_type_program": "Program",
+  "library_type_collection": "Collection",
   "library_type_cd_dvd": "CD/DVD",
   "library_confirm_discard_comment_title": "Discard unsaved comment?",
   "library_confirm_discard_comment_message": "Your rating or comment for this file hasn't been saved. Discard it?",

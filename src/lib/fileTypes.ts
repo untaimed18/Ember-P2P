@@ -9,7 +9,7 @@ import * as m from '$lib/paraglide/messages';
  * persists the selected value, and a translated key would stop matching as
  * soon as the locale changed. Use {@link fileTypeFilterLabel} for display.
  */
-export const FILE_TYPE_FILTERS = ['All', 'Audio', 'Video', 'Image', 'Archive', 'Document', 'CD/DVD'] as const;
+export const FILE_TYPE_FILTERS = ['All', 'Audio', 'Video', 'Image', 'Archive', 'Document', 'Program', 'CD/DVD', 'Collection'] as const;
 export type FileTypeFilter = (typeof FILE_TYPE_FILTERS)[number];
 export type FileTypeKey = Exclude<FileTypeFilter, 'All'>;
 
@@ -41,10 +41,19 @@ const DOCUMENT_EXTS: ReadonlySet<string> = new Set([
   'html','lit','mobi','azw','nfo','ods','odt','odp','pdf','pps',
   'ppt','pptx','ps','rtf','text','txt','wri','xls','xlsx','xml',
 ]);
+/** Same set as `search::index::infer_file_type`'s Program arm (eMule
+ *  ED2KFT_PROGRAM, plus apk/deb/rpm/scr/app). */
+const PROGRAM_EXTS: ReadonlySet<string> = new Set([
+  'apk','app','bat','cmd','com','deb','exe','hta','js','jse','msc',
+  'rpm','scr','vbe','vbs','wsf','wsh',
+]);
 const CD_DVD_EXTS: ReadonlySet<string> = new Set([
   'bin','bwa','bwi','bws','bwt','ccd','cue','dmg','img','iso',
   'mdf','mds','nrg','sub','toast',
 ]);
+/** Same extension as `search::index::infer_file_type`'s Collection arm. A
+ *  `.txt` link list stays a Document. */
+const COLLECTION_EXTS: ReadonlySet<string> = new Set(['emulecollection']);
 
 /** Extension of the last path segment, without the dot; `''` for none, a
  *  dotfile (`.nfo`) or a trailing dot. Accepts `/` and `\` separators. */
@@ -64,7 +73,9 @@ export function fileTypeKey(ext: string): FileTypeKey | '' {
   if (IMAGE_EXTS.has(lower)) return 'Image';
   if (ARCHIVE_EXTS.has(lower)) return 'Archive';
   if (DOCUMENT_EXTS.has(lower)) return 'Document';
+  if (PROGRAM_EXTS.has(lower)) return 'Program';
   if (CD_DVD_EXTS.has(lower)) return 'CD/DVD';
+  if (COLLECTION_EXTS.has(lower)) return 'Collection';
   return '';
 }
 
@@ -76,6 +87,8 @@ export function fileTypeFilterLabel(filter: FileTypeFilter): string {
     case 'Image': return m.library_type_image();
     case 'Archive': return m.library_type_archive();
     case 'Document': return m.library_type_document();
+    case 'Program': return m.library_type_program();
     case 'CD/DVD': return m.library_type_cd_dvd();
+    case 'Collection': return m.library_type_collection();
   }
 }

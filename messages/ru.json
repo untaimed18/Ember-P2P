@@ -1424,6 +1424,8 @@
   "library_type_image": "Изображение",
   "library_type_archive": "Архив",
   "library_type_document": "Документ",
+  "library_type_program": "Программа",
+  "library_type_collection": "Коллекция",
   "library_type_cd_dvd": "CD/DVD",
   "library_confirm_discard_comment_title": "Отменить несохранённый комментарий?",
   "library_confirm_discard_comment_message": "Оценка или комментарий к этому файлу не сохранены. Отменить их?",

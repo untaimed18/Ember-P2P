@@ -1424,6 +1424,8 @@
   "library_type_image": "图片",
   "library_type_archive": "压缩包",
   "library_type_document": "文档",
+  "library_type_program": "程序",
+  "library_type_collection": "合集",
   "library_type_cd_dvd": "CD/DVD",
   "library_confirm_discard_comment_title": "放弃未保存的评论？",
   "library_confirm_discard_comment_message": "此文件的评分或评论尚未保存。要放弃吗？",

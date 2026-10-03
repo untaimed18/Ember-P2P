@@ -12,6 +12,33 @@
  *  frame or two is already rendered when it lands. */
 export const DEFAULT_ROW_OVERSCAN = 8;
 
+/**
+ * Smallest change in measured row height the spacers will follow.
+ *
+ * Rows in one window differ by fractions of a pixel — a badge on one, a
+ * wrapped origin chip on another. Adopting each of those selects a different
+ * slice, which measures a different height, which selects the first slice
+ * again. A scrollbar drag jumps between the two instead of sliding, and the
+ * exchange never returns; the wheel rarely lands on the other height, which
+ * is why only the thumb froze the page. A whole pixel is the smallest drift
+ * worth correcting for.
+ */
+export const ROW_HEIGHT_SETTLE_PX = 1;
+
+/**
+ * The row height the spacers should use after a measurement.
+ *
+ * Keeps `current` when `measured` is missing or only a fraction of a pixel
+ * off, so a window full of slightly uneven rows cannot walk the height.
+ */
+export function adoptRowHeight(current: number, measured: number): number {
+  const fallback = Number.isFinite(current) && current > 0 ? current : 1;
+  if (!Number.isFinite(measured) || measured <= 0) return fallback;
+  if (!Number.isFinite(current) || current <= 0) return measured;
+  if (Math.abs(measured - current) < ROW_HEIGHT_SETTLE_PX) return current;
+  return measured;
+}
+
 export type RowWindow = {
   /** First row index to render. */
   start: number;

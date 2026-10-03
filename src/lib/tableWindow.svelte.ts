@@ -1,5 +1,5 @@
 import { untrack } from 'svelte';
-import { computeRowWindow } from '$lib/rowWindow';
+import { adoptRowHeight, computeRowWindow } from '$lib/rowWindow';
 
 export type TableWindowOptions = {
   /** Lists this long or shorter render whole, so short lists keep their row
@@ -136,17 +136,16 @@ export class TableWindow {
    * The row height, from the rows rendered now, so font size, locale and zoom
    * cannot put the spacers out of step with them.
    *
-   * Averaged over those rows, and changed only by a pixel or more, because
-   * rows can differ by a fraction of one (a nickname in one, no flag in
-   * another). Taken only when a scroll, a resize or the list moves the window:
-   * remeasuring each window it computes could move it between rows of two
-   * heights forever.
+   * Averaged over those rows. `adoptRowHeight` is what refuses a fraction of
+   * a pixel: rows can differ by that much (a nickname in one, no flag in
+   * another), and remeasuring each window it computes could move it between
+   * rows of two heights forever. Taken only when a scroll, a resize or the
+   * list moves the window, for the same reason.
    */
   #measure(body: HTMLTableSectionElement): void {
     const rows = body.querySelectorAll<HTMLElement>(this.#rowSelector);
     if (rows.length === 0) return;
     const span = rows[rows.length - 1].getBoundingClientRect().bottom - rows[0].getBoundingClientRect().top;
-    const measured = span / rows.length;
-    if (measured > 0 && Math.abs(measured - this.#rowHeight) >= 1) this.#rowHeight = measured;
+    this.#rowHeight = adoptRowHeight(this.#rowHeight, span / rows.length);
   }
 }

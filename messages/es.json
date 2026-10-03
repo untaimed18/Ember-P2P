@@ -1424,6 +1424,8 @@
   "library_type_image": "Imagen",
   "library_type_archive": "Comprimido",
   "library_type_document": "Documento",
+  "library_type_program": "Programa",
+  "library_type_collection": "Colección",
   "library_type_cd_dvd": "CD/DVD",
   "library_confirm_discard_comment_title": "¿Descartar el comentario no guardado?",
   "library_confirm_discard_comment_message": "La valoración o el comentario de este archivo no se han guardado. ¿Descartarlos?",

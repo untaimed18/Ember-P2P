@@ -1424,6 +1424,8 @@
   "library_type_image": "Bild",
   "library_type_archive": "Archiv",
   "library_type_document": "Dokument",
+  "library_type_program": "Programm",
+  "library_type_collection": "Sammlung",
   "library_type_cd_dvd": "CD/DVD",
   "library_confirm_discard_comment_title": "Ungespeicherten Kommentar verwerfen?",
   "library_confirm_discard_comment_message": "Ihre Bewertung oder Ihr Kommentar zu dieser Datei ist nicht gespeichert. Verwerfen?",

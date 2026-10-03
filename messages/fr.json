@@ -1424,6 +1424,8 @@
   "library_type_image": "Image",
   "library_type_archive": "Archive",
   "library_type_document": "Document",
+  "library_type_program": "Programme",
+  "library_type_collection": "Collection",
   "library_type_cd_dvd": "CD/DVD",
   "library_confirm_discard_comment_title": "Abandonner le commentaire non enregistré ?",
   "library_confirm_discard_comment_message": "La note ou le commentaire de ce fichier n'a pas été enregistré. Les abandonner ?",

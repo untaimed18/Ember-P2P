@@ -174,7 +174,7 @@
    *  where the matches are rather than what the friend shares overall. */
   let typeCounts = $derived.by(() => {
     const counts: Record<FileTypeFilter, number> = {
-      All: textMatchedFiles.length, Audio: 0, Video: 0, Image: 0, Archive: 0, Document: 0, 'CD/DVD': 0,
+      All: textMatchedFiles.length, Audio: 0, Video: 0, Image: 0, Archive: 0, Document: 0, Program: 0, 'CD/DVD': 0, Collection: 0,
     };
     for (const f of textMatchedFiles) {
       const key = typeByHash.get(f.hash);

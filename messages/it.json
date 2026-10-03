@@ -1424,6 +1424,8 @@
   "library_type_image": "Immagine",
   "library_type_archive": "Archivio",
   "library_type_document": "Documento",
+  "library_type_program": "Programma",
+  "library_type_collection": "Raccolta",
   "library_type_cd_dvd": "CD/DVD",
   "library_confirm_discard_comment_title": "Scartare il commento non salvato?",
   "library_confirm_discard_comment_message": "La valutazione o il commento di questo file non sono stati salvati. Scartarli?",
