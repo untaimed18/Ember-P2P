@@ -197,6 +197,38 @@ fn mark_quarantined(path: &Path) {
         .insert(path.to_path_buf());
 }
 
+/// Copy a damaged known.met aside, once per path per process, and say whether
+/// a copy now exists.
+///
+/// Once, because `load` runs at least four times a launch — the AICH
+/// migration, the startup hashing pass, the network task's deferred load, and
+/// the sharing command, which also runs on every folder-add and library reload
+/// — and the catalog is not repaired until the first periodic save up to two
+/// minutes later. Copying on each of them produced a distinct timestamped
+/// backup per call, roughly a gigabyte of them on one launch against a 256 MiB
+/// catalog, with nothing ever deleting any of it.
+fn quarantine_copy(path: &Path) -> bool {
+    if already_quarantined(path) {
+        return true;
+    }
+    let backup = path.with_extension(format!(
+        "met.{}.corrupt",
+        chrono::Utc::now().format("%Y%m%d%H%M%S")
+    ));
+    match std::fs::copy(path, &backup) {
+        Ok(_) => {
+            crate::security::restrict_file_permissions(&backup);
+            mark_quarantined(path);
+            warn!("Damaged known.met preserved as {}", backup.display());
+            true
+        }
+        Err(error) => {
+            warn!("Failed to preserve damaged known.met: {error}");
+            false
+        }
+    }
+}
+
 /// Set one field of a record's media, creating the struct on first sight.
 ///
 /// The fields arrive as separate tags in whatever order they were written, and
@@ -390,6 +422,8 @@ pub struct KnownFileList {
     dirty: bool,
     dirty_generation: u64,
     authoritative: bool,
+    /// See [`Self::lost_records`].
+    lost_records: bool,
     /// Forgets asked of the placeholder before the catalog on disk was
     /// absorbed, replayed over it then: it would otherwise bring every one of
     /// those paths back. Empty once absorbed.
@@ -465,6 +499,7 @@ impl KnownFileList {
             dirty: false,
             dirty_generation: 0,
             authoritative: false,
+            lost_records: false,
             forgets_before_absorb: Vec::new(),
         }
     }
@@ -706,6 +741,11 @@ impl KnownFileList {
         // Absorbing a catalog that was actually read off disk is what makes
         // this list safe to write back.
         self.authoritative |= other.authoritative;
+        // A partly read catalog is repaired by the next save; a clean absorb
+        // with nothing new would otherwise never make one.
+        if other.dirty {
+            self.mark_dirty();
+        }
         if self.authoritative {
             for forget in std::mem::take(&mut self.forgets_before_absorb) {
                 let paths = match forget {
@@ -800,12 +840,14 @@ impl KnownFileList {
     /// before an empty in-memory list is returned.
     pub fn load(path: &Path) -> Self {
         match Self::load_checked(path) {
-            Ok(list) => {
+            Ok(mut list) => {
                 if !path.exists() {
                     if let Err(error) = crate::storage::share_intent::note_catalog_missing() {
                         tracing::debug!("Could not record missing known.met state: {error}");
                         crate::storage::share_intent::force_unshared_all();
                     }
+                } else if !list.authoritative {
+                    list.repair_partial_load(path);
                 }
                 list
             }
@@ -814,37 +856,8 @@ impl KnownFileList {
                 // back: `save` refuses to overwrite a catalog it never read,
                 // and after a failed quarantine the damaged file on disk is
                 // the only copy of those hashes left.
-                let mut quarantined = false;
-                if path.exists() {
-                    let backup = path.with_extension(format!(
-                        "met.{}.corrupt",
-                        chrono::Utc::now().format("%Y%m%d%H%M%S")
-                    ));
-                    // Once per path per process. `load` runs at least four
-                    // times a launch — the AICH migration, the startup hashing
-                    // pass, the network task's deferred load, and the sharing
-                    // command, which also runs on every folder-add and library
-                    // reload — and the catalog is not repaired until the first
-                    // periodic save up to two minutes later. Copying on each of
-                    // them produced a distinct timestamped backup per call,
-                    // roughly a gigabyte of them on one launch against a
-                    // 256 MiB catalog, with nothing ever deleting any of it.
-                    if already_quarantined(path) {
-                        quarantined = true;
-                    } else if let Err(backup_error) = std::fs::copy(path, &backup) {
-                        warn!("Failed to preserve corrupt known.met: {backup_error}");
-                    } else {
-                        crate::security::restrict_file_permissions(&backup);
-                        mark_quarantined(path);
-                        quarantined = true;
-                    }
-                    warn!(
-                        "Failed to load known.met: {e}; fail-closed share intent enabled (backup: {})",
-                        backup.display()
-                    );
-                } else {
-                    warn!("Failed to load known.met: {e}; fail-closed share intent enabled");
-                }
+                let quarantined = path.exists() && quarantine_copy(path);
+                warn!("Failed to load known.met: {e}; fail-closed share intent enabled");
                 if let Err(intent_error) = crate::storage::share_intent::enter_fail_closed() {
                     warn!("Failed to persist fail-closed share intent: {intent_error}");
                     crate::storage::share_intent::force_unshared_all();
@@ -875,6 +888,43 @@ impl KnownFileList {
                 list
             }
         }
+    }
+
+    /// Make a catalog that parsed only in part safe to write back, so the file
+    /// is repaired instead of being left damaged, and never rewritten, for
+    /// every session after.
+    ///
+    /// The damaged file is copied aside first; without that copy the bytes
+    /// past the readable part would be lost by the rewrite, so the list stays
+    /// unwritable. A tail lost mid-record took any friends-only flags it held
+    /// with it, so sharing then fails closed, as for a catalog that could not
+    /// be read at all. Stray bytes after complete records lost nothing.
+    fn repair_partial_load(&mut self, path: &Path) {
+        if !quarantine_copy(path) {
+            warn!("known.met read only in part and could not be copied aside; leaving it as it is");
+            return;
+        }
+        if self.lost_records {
+            warn!(
+                "known.met read only in part: keeping its {} readable records, rewriting it, and \
+                 failing closed for the files whose records were lost",
+                self.files.len()
+            );
+            if let Err(error) = crate::storage::share_intent::enter_fail_closed() {
+                warn!("Failed to persist fail-closed share intent: {error}");
+                crate::storage::share_intent::force_unshared_all();
+            }
+        } else {
+            warn!("known.met had stray bytes after its records; rewriting it without them");
+        }
+        self.authoritative = true;
+        self.mark_dirty();
+    }
+
+    /// Whether a parse stopped partway through a record, losing every record
+    /// after it.
+    pub fn lost_records(&self) -> bool {
+        self.lost_records
     }
 
     /// `own_catalog` is true for Ember's own known.met, whose older records
@@ -928,6 +978,7 @@ impl KnownFileList {
                         self.files.len()
                     );
                     self.authoritative = false;
+                    self.lost_records = true;
                     return Ok(());
                 }
             };
@@ -2934,6 +2985,79 @@ mod tests {
         trailing.find_by_hash_mut(&[0x42; 16]).unwrap().friends_only = true;
         assert!(!trailing.save_reporting(&path).unwrap(), "unreadable past its records");
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A catalog read only in part used to stay unwritable for every session
+    /// after, holding back every new file from hashing until the user repaired
+    /// it by hand. Copied aside, it is now rewritten from what could be read.
+    #[test]
+    fn a_catalog_with_stray_bytes_is_copied_aside_and_rewritten() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-repair-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        let mut on_disk = KnownFileList::new();
+        on_disk.mark_authoritative_for_tests();
+        on_disk.add_or_update(sample_record());
+        assert!(on_disk.save_reporting(&path).unwrap());
+        let clean = std::fs::read(&path).unwrap();
+        let mut damaged = clean.clone();
+        damaged.push(0);
+        std::fs::write(&path, &damaged).unwrap();
+
+        let mut repaired = KnownFileList::load(&path);
+        assert!(repaired.is_authoritative(), "safe to write back once copied aside");
+        assert!(!repaired.lost_records(), "every declared record read cleanly");
+        assert!(repaired.is_dirty(), "the next save repairs the file");
+        assert!(repaired.find_by_hash(&[0x42; 16]).is_some());
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".corrupt"))
+            .collect();
+        assert_eq!(backups.len(), 1, "the damaged file is preserved");
+        assert_eq!(std::fs::read(backups[0].path()).unwrap(), damaged);
+
+        assert!(repaired.save_reporting(&path).unwrap());
+        assert!(KnownFileList::load_checked(&path).unwrap().is_authoritative());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What decides whether a partly read catalog also fails closed: only a
+    /// parse that stopped inside a record lost anything.
+    #[test]
+    fn only_a_record_cut_short_counts_as_lost_records() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-lost-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        let mut on_disk = KnownFileList::new();
+        on_disk.mark_authoritative_for_tests();
+        on_disk.add_or_update(sample_record());
+        let mut second = sample_record();
+        second.file_hash = [0x43; 16];
+        on_disk.add_or_update(second);
+        assert!(on_disk.save_reporting(&path).unwrap());
+        let clean = std::fs::read(&path).unwrap();
+
+        std::fs::write(&path, &clean[..clean.len() - 3]).unwrap();
+        let cut = KnownFileList::load_checked(&path).unwrap();
+        assert!(!cut.is_authoritative());
+        assert!(cut.lost_records());
+
+        let mut trailing = clean.clone();
+        trailing.push(0);
+        std::fs::write(&path, &trailing).unwrap();
+        let stray = KnownFileList::load_checked(&path).unwrap();
+        assert!(!stray.is_authoritative());
+        assert!(!stray.lost_records());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

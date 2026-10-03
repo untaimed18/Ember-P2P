@@ -431,6 +431,12 @@ fn absorb_known_catalog(data_dir: &Path, state: &mut PersistedShareIntent) {
                 state.explicit_allow.remove(&key);
                 state.denied.insert(key);
             }
+            // The unshares and restrictions past the readable part are gone
+            // with it, as for a catalog that could not be read at all.
+            if known.lost_records() {
+                tracing::error!("known.met read only in part; enabling fail-closed sharing");
+                note_fail_closed_entered(state);
+            }
         }
         Ok(_) => {
             if state.catalog_seen {
