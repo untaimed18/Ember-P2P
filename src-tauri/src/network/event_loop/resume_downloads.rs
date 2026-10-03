@@ -514,10 +514,16 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                     mgr.register_control(&tid, control);
                 }
                 let handle_id = tid.clone();
+                // The event is sent from the blocking task itself. Pause, Stop
+                // and Cancel abort the async task but cannot stop the check,
+                // which may still publish the file and remove its `.part`:
+                // were the event sent from the task, the row would be left
+                // unfinished beside a finished file, and the check's entry
+                // would misroute the download's next failure.
                 let handle = tokio::spawn(async move {
-                    let part_owner = tid.clone();
-                    let recovered = tokio::task::spawn_blocking(move || {
-                        let published = recover_restored_copies(
+                    let (panic_tx, panic_tid) = (tx.clone(), tid.clone());
+                    let checked = tokio::task::spawn_blocking(move || {
+                        let recovered = recover_restored_copies(
                             &copies,
                             &download_root,
                             &file_name,
@@ -525,34 +531,45 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                             &expected,
                             expected_aich.as_deref(),
                             expected_ember.as_deref(),
-                        )?;
-                        if let Some(folder) = part_files_in {
-                            remove_recovered_part_files(&folder, &part_owner);
-                        }
-                        Ok::<_, String>(published)
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(format!("Restored final file could not be read: {e}")));
-                    let event = match recovered {
-                        Ok(final_path) => {
-                            take_copy_check(&tid);
-                            DownloadEvent::Completed {
-                                transfer_id: tid,
-                                final_path: Some(final_path.to_string_lossy().into_owned()),
-                                part_hashes: Vec::new(),
-                                ember_verified: ember_pinned,
+                        );
+                        if recovered.is_ok() {
+                            if let Some(folder) = part_files_in {
+                                remove_recovered_part_files(&folder, &tid);
                             }
                         }
-                        Err(error) => {
-                            let failure_kind = ed2k::transfer::classify_error(&error);
-                            DownloadEvent::Failed {
-                                transfer_id: tid,
+                        let event = match recovered {
+                            Ok(final_path) => {
+                                take_copy_check(&tid);
+                                DownloadEvent::Completed {
+                                    transfer_id: tid,
+                                    final_path: Some(final_path.to_string_lossy().into_owned()),
+                                    part_hashes: Vec::new(),
+                                    ember_verified: ember_pinned,
+                                }
+                            }
+                            Err(error) => {
+                                let failure_kind = ed2k::transfer::classify_error(&error);
+                                DownloadEvent::Failed {
+                                    transfer_id: tid,
+                                    error,
+                                    failure_kind,
+                                }
+                            }
+                        };
+                        let _ = tx.blocking_send(event);
+                    })
+                    .await;
+                    if let Err(e) = checked {
+                        let error = format!("Restored final file could not be read: {e}");
+                        let failure_kind = ed2k::transfer::classify_error(&error);
+                        let _ = panic_tx
+                            .send(DownloadEvent::Failed {
+                                transfer_id: panic_tid,
                                 error,
                                 failure_kind,
-                            }
-                        }
-                    };
-                    let _ = tx.send(event).await;
+                            })
+                            .await;
+                    }
                 });
                 state.download_handles.insert(handle_id, handle);
                 continue;
