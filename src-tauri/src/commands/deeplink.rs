@@ -282,6 +282,11 @@ fn is_network_path(path: &str) -> bool {
     let Some(rest) = normalized.strip_prefix(r"\\") else {
         return false;
     };
+    // Windows collapses `..` in a `\\.\` path before resolving it, so
+    // `\\.\C:\..\UNC\server\share` climbs off the drive onto a share.
+    if rest.split('\\').any(|component| component.trim() == "..") {
+        return true;
+    }
     let names_local_drive = |device: &str| {
         let bytes = device.as_bytes();
         bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
@@ -345,26 +350,35 @@ pub fn extract_deep_link_payloads(args: &[String]) -> Vec<String> {
 /// next `ed2k:` link. Other platforms deliver argv whole, where no link is
 /// unfinished and nothing changes.
 ///
-/// Inside a link only another `ed2k:` link may split off: the pieces are the
-/// link's own fields, which whoever wrote the link controls, so a field that
-/// reads as a collection path or an invite must not become a payload of its own.
+/// After an `ed2k:` link only another `ed2k:` link may split off: the pieces
+/// may be the link's own fields, which whoever wrote the link controls, so a
+/// field that reads as a collection path or an invite must not become a
+/// payload of its own. That holds after a link that already looks finished
+/// too — a browser-encoded `ed2k://%7Cfile%7C…%7C/` can be followed by raw
+/// `|` pieces of the same URL. A launch the OS makes for a clicked link or a
+/// double-clicked collection carries one payload, so nothing real follows one.
 pub fn rejoin_forwarded_args(args: Vec<String>) -> Vec<String> {
+    use crate::network::ed2k::hash::looks_like_ed2k_uri;
     let mut rejoined: Vec<String> = Vec::with_capacity(args.len());
     let mut open_link = false;
+    let mut after_link = false;
     for (index, piece) in args.into_iter().enumerate() {
         let is_payload = index > 0
-            && if open_link {
-                crate::network::ed2k::hash::looks_like_ed2k_uri(&piece)
+            && if after_link {
+                looks_like_ed2k_uri(&piece)
             } else {
                 is_deep_link_payload(&piece)
             };
-        if open_link && !is_payload {
-            if let Some(link) = rejoined.last_mut() {
-                link.push('|');
-                link.push_str(&piece);
+        if after_link && !is_payload {
+            if open_link {
+                if let Some(link) = rejoined.last_mut() {
+                    link.push('|');
+                    link.push_str(&piece);
+                }
             }
             continue;
         }
+        after_link = after_link || (is_payload && looks_like_ed2k_uri(&piece));
         open_link = is_payload && ed2k_link_unfinished(&piece);
         rejoined.push(piece);
     }
@@ -794,6 +808,9 @@ mod tests {
             format!("ed2k://|file|ember-channel:abc|1|{hash}|/"),
             format!("ed2k://|file|ember3:abc|1|{hash}|/"),
             format!("ed2k://|file|x.iso|1|{hash}|/|{local}"),
+            format!("ed2k://%7Cfile%7Cx.iso%7C1%7C{hash}%7C/|ember-channel:abc"),
+            format!("ed2k://%7Cfile%7Cx.iso%7C1%7C{hash}%7C/|ember3:abc"),
+            format!("ed2k://%7Cfile%7Cx.iso%7C1%7C{hash}%7C/|{local}"),
         ];
         for link in &links {
             let payloads =
@@ -811,6 +828,8 @@ mod tests {
             r"\\?\UNC\attacker.example\s\list.emulecollection",
             r"\\.\UNC\attacker.example\s\list.emulecollection",
             r"\\?\GLOBALROOT\Device\Mup\attacker.example\s\list.emulecollection",
+            r"\\.\C:\..\UNC\attacker.example\s\list.emulecollection",
+            r"\\.\C:\Users\..\..\UNC\attacker.example\s\list.emulecollection",
         ];
         for path in remote {
             assert!(is_network_path(path), "{path}");

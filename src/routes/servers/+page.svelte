@@ -908,9 +908,10 @@
 
   function handleTableWrapKeydown(e: KeyboardEvent) {
     if (e.target !== e.currentTarget || !parkedKey) return;
-    const index = serverIndexByKey.get(parkedKey);
-    const target = index === undefined ? null : rowNavTarget(index, e.key);
-    if (target === null) return;
+    // A parked server that a filter or refresh has since removed has no index;
+    // walk from just above the list rather than leave the keys dead.
+    const target = rowNavTarget(serverIndexByKey.get(parkedKey) ?? -1, e.key);
+    if (target === null || target < 0) return;
     e.preventDefault();
     void focusServerRow(target);
   }
