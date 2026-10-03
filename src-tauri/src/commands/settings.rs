@@ -1735,7 +1735,7 @@ pub async fn update_settings(
         .network_tx
         .send_timeout(
             NetworkCommand::UpdateSettings {
-                settings: settings.clone(),
+                settings: Box::new(settings.clone()),
             },
             std::time::Duration::from_secs(5),
         )
@@ -2248,6 +2248,43 @@ pub fn take_pending_restore_failed_notice(
     Ok(state
         .pending_restore_failed_notice
         .swap(false, std::sync::atomic::Ordering::AcqRel))
+}
+
+const KNOWN_MET_NOTICE_NONE: u8 = 0;
+const KNOWN_MET_NOTICE_UNREADABLE: u8 = 1;
+const KNOWN_MET_NOTICE_RESET: u8 = 2;
+static PENDING_KNOWN_MET_NOTICE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(KNOWN_MET_NOTICE_NONE);
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct KnownMetNotice {
+    /// The catalog was lost and sharing reset to fail-closed, rather than
+    /// unreadable this session.
+    pub reset: bool,
+}
+
+/// Latch the "known.met could not be read" notice for the frontend to take.
+pub(crate) fn raise_known_met_notice(reset: bool) {
+    let notice = if reset {
+        KNOWN_MET_NOTICE_RESET
+    } else {
+        KNOWN_MET_NOTICE_UNREADABLE
+    };
+    PENDING_KNOWN_MET_NOTICE.store(notice, std::sync::atomic::Ordering::Release);
+}
+
+/// Consume the known.met notice, if the deferred catalog load raised one.
+/// Its event is emitted once, seconds into the session, and a webview still
+/// starting or reloading then would leave sharing failing closed unexplained.
+#[tauri::command]
+pub fn take_pending_known_met_notice() -> Result<Option<KnownMetNotice>, String> {
+    let notice =
+        PENDING_KNOWN_MET_NOTICE.swap(KNOWN_MET_NOTICE_NONE, std::sync::atomic::Ordering::AcqRel);
+    Ok(match notice {
+        KNOWN_MET_NOTICE_UNREADABLE => Some(KnownMetNotice { reset: false }),
+        KNOWN_MET_NOTICE_RESET => Some(KnownMetNotice { reset: true }),
+        _ => None,
+    })
 }
 
 #[tauri::command]
@@ -2920,6 +2957,22 @@ pub async fn open_ember_share(target: String, text: String) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_met_notice_waits_for_the_frontend_and_is_taken_once() {
+        raise_known_met_notice(false);
+        assert_eq!(
+            take_pending_known_met_notice().unwrap(),
+            Some(KnownMetNotice { reset: false })
+        );
+        assert_eq!(take_pending_known_met_notice().unwrap(), None);
+        raise_known_met_notice(true);
+        assert_eq!(
+            take_pending_known_met_notice().unwrap(),
+            Some(KnownMetNotice { reset: true })
+        );
+        assert_eq!(take_pending_known_met_notice().unwrap(), None);
+    }
 
     /// Removing one root must not prune state that belongs to a whole-drive
     /// share still in the list, and removing the drive share prunes its own.

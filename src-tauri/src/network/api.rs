@@ -358,7 +358,7 @@ pub enum NetworkCommand {
     /// library to scan), so last session's upload waiters can rejoin the queue.
     StartupLibraryIndexed,
     UpdateSettings {
-        settings: AppSettings,
+        settings: Box<AppSettings>,
     },
     SetFileComment {
         file_hash: String,
@@ -640,7 +640,7 @@ pub enum NetworkCommand {
     },
     /// Publish an already-signed Ember DHT record (channel index/presence/moderation).
     PublishEmberRecord {
-        record: crate::network::ember::dht::publish::SignedRecord,
+        record: Box<crate::network::ember::dht::publish::SignedRecord>,
         tx: oneshot::Sender<Result<EmberPublishPending, String>>,
     },
     /// Iterative FIND_VALUE for raw 16-byte DHT keys (channel Gather).

@@ -3034,7 +3034,7 @@ async fn handle_command_inner(
             let key_hex = hex::encode(record.keyword_hash);
             let publish_id = match state
                 .ember_publish
-                .start_publish(record, state.ember_dht.routing())
+                .start_publish(*record, state.ember_dht.routing())
             {
                 Some(id) => id,
                 None => {

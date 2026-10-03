@@ -98,6 +98,29 @@ export class TableWindow {
     return list.slice(this.start, this.end);
   }
 
+  /**
+   * Scroll row `index` into the viewport, below a sticky header
+   * `headerHeight` tall, and render it now rather than on the next frame, so
+   * keyboard navigation can focus a row the window had not mounted. A list
+   * too short to window has every row mounted already; focusing it scrolls.
+   */
+  reveal(index: number, headerHeight = 0): void {
+    const scroller = this.scroller;
+    const body = this.body;
+    if (!this.active || !scroller || !body || index < 0 || index >= this.#total()) return;
+    const bodyTop = body.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+    const rowTop = bodyTop + index * this.#rowHeight;
+    const rowBottom = rowTop + this.#rowHeight;
+    if (rowTop < headerHeight) {
+      scroller.scrollTop += rowTop - headerHeight;
+    } else if (rowBottom > scroller.clientHeight) {
+      scroller.scrollTop += rowBottom - scroller.clientHeight;
+    } else {
+      return;
+    }
+    this.#update();
+  }
+
   /** Recompute on the next frame; several calls in one frame measure once. */
   schedule(): void {
     if (this.#raf !== null) return;

@@ -33,6 +33,7 @@
     takePendingCloseRequest,
     takePendingEmberDefaultOnNotice,
     takePendingRestoreFailedNotice,
+    takePendingKnownMetNotice,
   } from '$lib/api/settings';
   import {
     applyBackgroundCheckResult,
@@ -370,11 +371,22 @@
 
     // known.met could not be read: nothing is published and only friends are
     // uploaded to this session, which used to show nowhere but the log.
-    listen<{ reset?: boolean } | null>('known-met-unreadable', (event) => {
-      toastWarning(event.payload?.reset ? m.layout_known_met_reset() : m.layout_known_met_unreadable());
-    })
+    // Pulled from a backend latch, with the event only a wake-up: it is emitted
+    // once, and a webview still starting or reloading then would miss it.
+    const showKnownMetNotice = () => {
+      if (!mounted) return;
+      takePendingKnownMetNotice()
+        .then((notice) => {
+          if (mounted && notice) {
+            toastWarning(notice.reset ? m.layout_known_met_reset() : m.layout_known_met_unreadable());
+          }
+        })
+        .catch((e) => console.error('Failed to consume the known-met latch:', e));
+    };
+    listen('known-met-unreadable', showKnownMetNotice)
       .then((fn) => { if (mounted) unlistenKnownMet = fn; else fn(); })
-      .catch((e) => console.error('Failed to register known-met listener:', e));
+      .catch((e) => console.error('Failed to register known-met listener:', e))
+      .finally(showKnownMetNotice);
 
     // An eMule import staged before this launch was applied during startup.
     // Marked seen as it is read, so the notice shows once; the full report

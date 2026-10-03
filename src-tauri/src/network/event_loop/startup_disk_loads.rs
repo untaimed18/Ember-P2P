@@ -9,13 +9,14 @@ use super::*;
 /// Until it is, Ember publishes nothing to KAD, eD2K servers or the Ember DHT
 /// and uploads only to friends, so that a friends-only file cannot be offered
 /// as public. That held every session until the file was repaired by hand,
-/// with a log line as the only sign. Delayed like the config and database
-/// notices, so the window has its listeners by then.
+/// with a log line as the only sign. Latched for the frontend to take, and the
+/// event delayed like the config and database notices.
 fn notify_catalog_unreadable(app_handle: &tauri::AppHandle) {
+    crate::commands::settings::raise_known_met_notice(false);
     let app_handle = app_handle.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let _ = app_handle.emit("known-met-unreadable", serde_json::json!({ "reset": false }));
+        let _ = app_handle.emit("known-met-unreadable", ());
     });
 }
 
@@ -29,7 +30,8 @@ fn notify_catalog_reset_if_lost(app_handle: &tauri::AppHandle) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         if crate::storage::share_intent::fail_closed_this_session() {
-            let _ = app_handle.emit("known-met-unreadable", serde_json::json!({ "reset": true }));
+            crate::commands::settings::raise_known_met_notice(true);
+            let _ = app_handle.emit("known-met-unreadable", ());
         }
     });
 }

@@ -160,6 +160,12 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
         });
     }
     if !lower.starts_with("ed2k://") && lower.ends_with(".emulecollection") {
+        if is_network_path(&payload) {
+            return Err(coded(
+                "deeplink_terminal_invalid",
+                "Collections on a network share cannot be opened from a link",
+            ));
+        }
         let name = std::path::Path::new(&payload)
             .file_name()
             .map(|name| crate::security::sanitize_remote_text(&name.to_string_lossy(), 1024))
@@ -265,9 +271,33 @@ pub fn load_pending_queue(app: &AppHandle) -> Vec<PendingDeepLink> {
         })
 }
 
+/// True for a UNC share (`\\server\share`, `//server/share`, `\\?\UNC\…`) or
+/// any other `\\` namespace path that does not name a local drive letter.
+///
+/// Merely resolving such a path makes Windows connect to the server over SMB
+/// and offer the user's NTLM credentials, so a link must never get Ember to
+/// touch one.
+fn is_network_path(path: &str) -> bool {
+    let normalized = path.trim().replace('/', "\\");
+    let Some(rest) = normalized.strip_prefix(r"\\") else {
+        return false;
+    };
+    let names_local_drive = |device: &str| {
+        let bytes = device.as_bytes();
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    };
+    match rest
+        .strip_prefix(r"?\")
+        .or_else(|| rest.strip_prefix(r".\"))
+    {
+        Some(device) => !names_local_drive(device),
+        None => true,
+    }
+}
+
 /// True if `arg` looks like a deep link we should act on: an `ed2k:` URI
-/// (including browser-encoded `ed2k://%7Cfile%7C…` forms), an absolute path
-/// ending in `.emulecollection`, or an in-app Ember invite / friend code.
+/// (including browser-encoded `ed2k://%7Cfile%7C…` forms), an absolute local
+/// path ending in `.emulecollection`, or an in-app Ember invite / friend code.
 ///
 /// A relative path is not one the OS hands over for a double-clicked file. It
 /// would be opened against the running Ember's working directory, not the
@@ -277,7 +307,9 @@ pub fn is_deep_link_payload(arg: &str) -> bool {
     let trimmed = arg.trim();
     let lower = trimmed.to_ascii_lowercase();
     crate::network::ed2k::hash::looks_like_ed2k_uri(trimmed)
-        || (lower.ends_with(".emulecollection") && Path::new(trimmed).is_absolute())
+        || (lower.ends_with(".emulecollection")
+            && Path::new(trimmed).is_absolute()
+            && !is_network_path(trimmed))
         || lower.starts_with("ember3:")
         || lower.starts_with("ember2:")
         || lower.starts_with("ember-channel:")
@@ -309,14 +341,23 @@ pub fn extract_deep_link_payloads(args: &[String]) -> Vec<String> {
 /// A second launch's argv as that launch had it, from what the Windows
 /// single-instance plugin delivers: it joins the arguments with `|` and splits
 /// them on `|` again, so a raw `ed2k://|file|…|/` arrives as `ed2k://`,
-/// `file`, …. A link left unfinished takes back the pieces after it, up to one
-/// that is a deep link of its own. Other platforms deliver argv whole, where
-/// no link is unfinished and nothing changes.
+/// `file`, …. A link left unfinished takes back the pieces after it, up to the
+/// next `ed2k:` link. Other platforms deliver argv whole, where no link is
+/// unfinished and nothing changes.
+///
+/// Inside a link only another `ed2k:` link may split off: the pieces are the
+/// link's own fields, which whoever wrote the link controls, so a field that
+/// reads as a collection path or an invite must not become a payload of its own.
 pub fn rejoin_forwarded_args(args: Vec<String>) -> Vec<String> {
     let mut rejoined: Vec<String> = Vec::with_capacity(args.len());
     let mut open_link = false;
     for (index, piece) in args.into_iter().enumerate() {
-        let is_payload = index > 0 && is_deep_link_payload(&piece);
+        let is_payload = index > 0
+            && if open_link {
+                crate::network::ed2k::hash::looks_like_ed2k_uri(&piece)
+            } else {
+                is_deep_link_payload(&piece)
+            };
         if open_link && !is_payload {
             if let Some(link) = rejoined.last_mut() {
                 link.push('|');
@@ -721,15 +762,10 @@ mod tests {
         let with_sources = "ed2k://|file|c.iso|2048|FEDCBA9876543210FEDCBA9876543210|/|sources,198.51.100.7:4662|/";
         let encoded = "ed2k://%7Cfile%7Cd.iso%7C4096%7C00112233445566778899AABBCCDDEEFF%7C/";
         let mixed = "ed2k://%7Cfile%7Ce#1.iso|8192|00112233445566778899AABBCCDDEEFF|/";
-        let collection = std::env::temp_dir()
-            .join("set.emulecollection")
-            .to_string_lossy()
-            .into_owned();
-        let cases: [&[&str]; 6] = [
+        let cases: [&[&str]; 5] = [
             &["ember.exe", raw],
             &["ember.exe", with_sources],
             &["ember.exe", raw, with_sources],
-            &["ember.exe", raw, &collection],
             &["ember.exe", encoded],
             &["ember.exe", mixed],
         ];
@@ -743,6 +779,60 @@ mod tests {
         }
         let plain = vec!["ember.exe".to_string()];
         assert_eq!(rejoin_forwarded_args(plain.clone()), plain);
+    }
+
+    #[test]
+    fn a_field_inside_a_forwarded_link_never_becomes_its_own_payload() {
+        let local = std::env::temp_dir()
+            .join("set.emulecollection")
+            .to_string_lossy()
+            .into_owned();
+        let hash = "0123456789ABCDEF0123456789ABCDEF";
+        let links = [
+            format!(r"ed2k://|file|\\attacker.example\s\list.emulecollection|1|{hash}|/"),
+            format!("ed2k://|file|{local}|1|{hash}|/"),
+            format!("ed2k://|file|ember-channel:abc|1|{hash}|/"),
+            format!("ed2k://|file|ember3:abc|1|{hash}|/"),
+            format!("ed2k://|file|x.iso|1|{hash}|/|{local}"),
+        ];
+        for link in &links {
+            let payloads =
+                extract_deep_link_payloads(&rejoin_forwarded_args(forwarded(&["ember.exe", link])));
+            assert_eq!(payloads.len(), 1, "{link}");
+            assert!(payloads[0].starts_with("ed2k://|file|"), "{link}");
+        }
+    }
+
+    #[test]
+    fn collections_on_a_network_share_are_refused() {
+        let remote = [
+            r"\\attacker.example\s\list.emulecollection",
+            "//attacker.example/s/list.emulecollection",
+            r"\\?\UNC\attacker.example\s\list.emulecollection",
+            r"\\.\UNC\attacker.example\s\list.emulecollection",
+            r"\\?\GLOBALROOT\Device\Mup\attacker.example\s\list.emulecollection",
+        ];
+        for path in remote {
+            assert!(is_network_path(path), "{path}");
+            assert!(!is_deep_link_payload(path), "{path}");
+            assert!(preview_deep_link_payload(path).is_err(), "{path}");
+            let pending = vec![PendingDeepLink {
+                id: "remote".to_string(),
+                payload: path.to_string(),
+            }];
+            assert!(
+                collection_path_from_pending(&pending, "remote").is_err(),
+                "{path}"
+            );
+        }
+        for local in [
+            r"C:\Users\Ember\set.emulecollection",
+            r"\\?\C:\Users\Ember\set.emulecollection",
+            "/home/ember/set.emulecollection",
+        ] {
+            assert!(!is_network_path(local), "{local}");
+            assert_eq!(preview_deep_link_payload(local).unwrap().kind, "collection");
+        }
     }
 
     #[test]

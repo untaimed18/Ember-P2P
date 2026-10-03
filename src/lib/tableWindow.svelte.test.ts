@@ -134,6 +134,35 @@ describe('TableWindow', () => {
     expect(win.end).toBeGreaterThan(4200 / 21);
   });
 
+  it('scrolls a row outside the window into view and renders it at once', () => {
+    const win = mount(() => 1000);
+    const table = fakeTable(20, 200);
+    let scrollTop = 0;
+    Object.defineProperty(table.scroller, 'scrollTop', {
+      get: () => scrollTop,
+      set: (top: number) => {
+        scrollTop = top;
+        table.scrollTo(top);
+      },
+    });
+    win.scroller = table.scroller;
+    win.body = table.body;
+    flushSync();
+
+    win.reveal(500, 30);
+    expect(scrollTop).toBe(501 * 20 - 200);
+    expect(win.start).toBeLessThanOrEqual(500);
+    expect(win.end).toBeGreaterThan(500);
+
+    win.reveal(400, 30);
+    expect(scrollTop).toBe(400 * 20 - 30);
+    expect(win.start).toBeLessThanOrEqual(400);
+    expect(win.end).toBeGreaterThan(400);
+
+    win.reveal(401, 30);
+    expect(scrollTop).toBe(400 * 20 - 30);
+  });
+
   it('stops listening once its owner is gone', () => {
     const win = mount(() => 1000);
     const table = fakeTable(20, 200);

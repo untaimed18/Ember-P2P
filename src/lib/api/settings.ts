@@ -128,6 +128,14 @@ export async function takePendingRestoreFailedNotice(): Promise<boolean> {
   return invoke('take_pending_restore_failed_notice');
 }
 
+/**
+ * Consume the notice that known.met could not be read this session (`reset`:
+ * the catalog was lost and sharing reset to fail-closed), or null.
+ */
+export async function takePendingKnownMetNotice(): Promise<{ reset: boolean } | null> {
+  return invoke('take_pending_known_met_notice');
+}
+
 /** Open the official Ember website in the default browser. */
 export async function openEmberWebsite(): Promise<void> {
   return invoke('open_ember_website');

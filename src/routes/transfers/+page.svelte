@@ -7165,10 +7165,15 @@
   .toolbar-more-menu button.menu-danger:hover {
     background: color-mix(in srgb, var(--danger) 14%, transparent);
   }
+  /* Both panes window their tables behind spacer rows. Scroll anchoring would
+     answer each spacer resize by nudging scrollTop, which moves the window
+     again; a scrollbar drag turns that into a loop (see `.results-scroll` on
+     the search page). */
   .pane-content {
     flex: 1;
     overflow: auto;
     min-height: 0;
+    overflow-anchor: none;
   }
 
   /* --- Bottom pane tabs --- */

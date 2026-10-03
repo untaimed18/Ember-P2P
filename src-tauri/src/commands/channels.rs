@@ -519,7 +519,7 @@ async fn persist_channel_username(state: &AppState, username: &str) -> Result<()
     let _ = state
         .network_tx
         .try_send(NetworkCommand::UpdateSettings {
-            settings: new_settings,
+            settings: Box::new(new_settings),
         });
     apply_channel_username_locally(state, username);
     Ok(())
@@ -5256,7 +5256,10 @@ async fn queue_signed_record(state: &AppState, record: SignedRecord) -> Result<(
     let (tx, _rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
-        .try_send(NetworkCommand::PublishEmberRecord { record, tx })
+        .try_send(NetworkCommand::PublishEmberRecord {
+            record: Box::new(record),
+            tx,
+        })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     Ok(())
 }
@@ -5268,7 +5271,10 @@ async fn start_signed_record(
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
-        .try_send(NetworkCommand::PublishEmberRecord { record, tx })
+        .try_send(NetworkCommand::PublishEmberRecord {
+            record: Box::new(record),
+            tx,
+        })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     await_reply(rx, "channels_publish_failed", "No response from network").await?
 }
