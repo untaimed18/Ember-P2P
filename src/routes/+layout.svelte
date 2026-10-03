@@ -33,6 +33,7 @@
     takePendingCloseRequest,
     takePendingEmberDefaultOnNotice,
     takePendingRestoreFailedNotice,
+    takePendingRestoreExpiredNotice,
     takePendingKnownMetNotice,
   } from '$lib/api/settings';
   import {
@@ -419,6 +420,14 @@
         if (mounted && pending) addToast('warning', m.layout_restore_failed(), 0);
       })
       .catch((e) => console.error('Failed to consume the restore-failed latch:', e));
+
+    // Sticky: the user restarted expecting a restore, and the staging it lived
+    // in is already gone, so this is the only place they learn it did not land.
+    takePendingRestoreExpiredNotice()
+      .then((expired) => {
+        if (mounted && expired) addToast('warning', m.layout_restore_expired(), 0);
+      })
+      .catch((e) => console.error('Failed to consume the restore-expired latch:', e));
 
     listen<{ loaded: boolean; resetRequired: boolean; reason?: string }>(
       'security-policy-reset-required',

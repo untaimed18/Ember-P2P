@@ -688,25 +688,28 @@ pub fn run() {
             // are latched for a blocking UI notice — logging alone left users
             // running on mixed or pre-restore files with no explanation.
             let mut restore_failed_notice = false;
+            let mut restore_expired_notice = false;
             let mut restore_applied = false;
             match storage::paths::ensure_data_dir_with_app(&app_handle) {
                 Ok(dir) => {
+                    use commands::backup::StartupRestore;
                     match commands::backup::apply_pending_restore(&dir) {
                         Err(e) => {
                             tracing::error!("Failed to apply the staged restore: {e}");
                             restore_failed_notice = true;
                         }
-                        // `Ok(Some(_))` applied. A leftover marker is a failed
+                        // A leftover marker after `Applied` is a failed
                         // staging-dir cleanup, not a failed restore — the
                         // toast would wrongly say we are on previous files.
-                        // `Ok(None)` with a marker still on disk is schema-
+                        // `NotApplied` with a marker still on disk is schema-
                         // too-new or a mid-apply abort left for retry.
-                        Ok(None) => {
+                        Ok(StartupRestore::NotApplied) => {
                             if commands::backup::pending_restore_still_staged(&dir) {
                                 restore_failed_notice = true;
                             }
                         }
-                        Ok(Some(_)) => restore_applied = true,
+                        Ok(StartupRestore::Applied) => restore_applied = true,
+                        Ok(StartupRestore::Expired) => restore_expired_notice = true,
                     }
                 }
                 Err(e) => tracing::error!("Failed to prepare the data dir: {e}"),
@@ -1029,6 +1032,9 @@ pub fn run() {
                 )),
                 pending_restore_failed_notice: Arc::new(std::sync::atomic::AtomicBool::new(
                     restore_failed_notice,
+                )),
+                pending_restore_expired_notice: Arc::new(std::sync::atomic::AtomicBool::new(
+                    restore_expired_notice,
                 )),
                 close_behavior: Arc::new(parking_lot::RwLock::new(
                     settings.close_to_tray_behavior.clone(),
@@ -2172,6 +2178,7 @@ pub fn run() {
             commands::backup::import_backup,
             commands::backup::pending_restore_status,
             commands::backup::discard_pending_restore,
+            commands::backup::take_pending_restored_prefs,
             commands::search::search_files,
             commands::search::plan_related_search,
             commands::search::related_search_supported,
@@ -2388,6 +2395,7 @@ pub fn run() {
             commands::settings::take_pending_close_request,
             commands::settings::take_pending_ember_default_on_notice,
             commands::settings::take_pending_restore_failed_notice,
+            commands::settings::take_pending_restore_expired_notice,
             commands::settings::take_pending_known_met_notice,
             commands::settings::open_ember_website,
             commands::settings::get_ember_website_url,

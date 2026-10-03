@@ -62,6 +62,7 @@
     type PendingRestoreStatus,
     type RestoreSummary,
   } from '$lib/api/backup';
+  import { collectBackupPrefs } from '$lib/backupPrefs';
   import {
     clampInputUtf8Bytes,
     formatDateTime,
@@ -417,7 +418,12 @@
     backupBusy = true;
     showBackupMsg(m.settings_backup_exporting(), 'progress');
     try {
-      const summary = await exportBackup(backupPassphrase);
+      const summary = await exportBackup(
+        backupPassphrase,
+        collectBackupPrefs(typeof localStorage === 'undefined' ? null : localStorage, {
+          searchHistory: $appSettings?.save_search_history ?? true,
+        }),
+      );
       if (!summary) {
         backupMessage = null;
         return;
@@ -4155,6 +4161,13 @@
                   when: formatDateTime(pendingRestore.staged_at),
                 })}
               </span>
+              {#if pendingRestore.expires_at > 0}
+                <span class="hint">
+                  {m.settings_backup_pending_expires({
+                    when: formatDateTime(pendingRestore.expires_at),
+                  })}
+                </span>
+              {/if}
               <div class="action-row">
                 <button class="action-btn" onclick={performRestart} disabled={backupBusy}>
                   {m.settings_restart_now()}

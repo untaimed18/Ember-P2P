@@ -2250,6 +2250,17 @@ pub fn take_pending_restore_failed_notice(
         .swap(false, std::sync::atomic::Ordering::AcqRel))
 }
 
+/// Consume the "a staged restore was too old and was discarded" notice, if
+/// startup raised one. One-shot for the same reason as the latch above.
+#[tauri::command]
+pub fn take_pending_restore_expired_notice(
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    Ok(state
+        .pending_restore_expired_notice
+        .swap(false, std::sync::atomic::Ordering::AcqRel))
+}
+
 const KNOWN_MET_NOTICE_NONE: u8 = 0;
 const KNOWN_MET_NOTICE_UNREADABLE: u8 = 1;
 const KNOWN_MET_NOTICE_RESET: u8 = 2;

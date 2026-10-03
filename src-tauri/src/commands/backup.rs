@@ -205,6 +205,89 @@ const BACKUP_FILES: &[BackupFile] = &[
 /// roots on *this* machine.
 const LEGACY_IGNORED_FILES: &[&str] = &["approved_roots.json"];
 
+/// Zip entry holding the preferences the app window keeps in its own storage
+/// rather than in the data directory: language, theme, room lists and the like.
+/// The frontend hands them over when a backup is made and takes them back with
+/// [`take_pending_restored_prefs`] after the restore is applied.
+///
+/// Described by [`Manifest::webview_prefs`], never listed in `files`. Readers
+/// that predate it refuse an archive whose `files` names anything unknown, but
+/// ignore an unknown manifest field and a zip entry nothing asks for, so they
+/// restore such a backup minus these preferences instead of rejecting it.
+const WEBVIEW_PREFS_NAME: &str = "webview-prefs.json";
+/// Where an applied restore leaves the preferences for the frontend to take.
+const RESTORED_PREFS_FILE: &str = "restored-webview-prefs.json";
+/// Serialized size ceiling, on export and on every read back.
+const MAX_WEBVIEW_PREFS_BYTES: usize = 1024 * 1024;
+
+/// The app-window storage keys a backup carries. A restore writes only these,
+/// so a crafted archive cannot plant arbitrary keys in the window's storage.
+/// Keep in step with `BACKED_UP_STORAGE_KEYS` in `src/lib/backupPrefs.ts`.
+const WEBVIEW_PREF_KEYS: &[&str] = &[
+    "PARAGLIDE_LOCALE",
+    "ember-theme",
+    "ember.channels.notify.v1",
+    "ember.channels.favourites.v1",
+    "ember.channels.hidden.v1",
+    "ember.channels.ignored.v1",
+    "search-recent-queries-v1",
+    "search-prefs-v1",
+    "transfers-advanced-cols",
+    "transfers-column-hidden-DownloadListCtrl",
+    "transfers-column-hidden-UploadListCtrlV3",
+    "transfers-column-hidden-QueueListCtrlV2",
+    "transfers-column-hidden-KnownClientsCtrlV2",
+    "transfers-column-hidden-DownloadClientsCtrl",
+    "transfers-column-order-DownloadListCtrl",
+    "transfers-column-order-UploadListCtrl",
+    "transfers-column-order-QueueListCtrlV3",
+    "transfers-column-order-KnownClientsCtrlV2",
+    "transfers-column-order-DownloadClientsCtrl",
+    "library-col-hidden",
+    "library-col-order",
+    "kad-search-col-hidden",
+];
+
+type WebviewPrefs = std::collections::BTreeMap<String, String>;
+
+fn is_webview_pref_key(key: &str) -> bool {
+    WEBVIEW_PREF_KEYS.contains(&key)
+}
+
+/// Check a snapshot the frontend handed over for a new backup.
+fn validate_webview_prefs(prefs: &WebviewPrefs) -> Result<(), String> {
+    if let Some(key) = prefs.keys().find(|key| !is_webview_pref_key(key)) {
+        return Err(coded_ctx(
+            "backup_export_failed",
+            "Unexpected app preference for the backup",
+            key,
+        ));
+    }
+    let size = serde_json::to_vec(prefs)
+        .map_err(|e| coded_ctx("backup_export_failed", "Failed to write the preferences", e))?
+        .len();
+    if size > MAX_WEBVIEW_PREFS_BYTES {
+        return Err(coded_ctx(
+            "backup_export_failed",
+            "The app preferences are too large to back up",
+            format!("{size} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+/// Parse a stored snapshot, or `None` if it is oversized or not an object of
+/// strings. Keys this build does not restore are dropped rather than refused,
+/// so a backup from a later version that carries more still restores the rest.
+fn parse_webview_prefs(raw: &[u8]) -> Option<WebviewPrefs> {
+    if raw.len() > MAX_WEBVIEW_PREFS_BYTES {
+        return None;
+    }
+    let mut prefs: WebviewPrefs = serde_json::from_slice(raw).ok()?;
+    prefs.retain(|key, _| is_webview_pref_key(key));
+    Some(prefs)
+}
+
 fn backup_file(name: &str) -> Option<&'static BackupFile> {
     BACKUP_FILES.iter().find(|f| f.name == name)
 }
@@ -238,6 +321,10 @@ struct Manifest {
     /// refuse one written by a newer Ember instead of corrupting itself.
     schema_version: i64,
     files: Vec<ManifestEntry>,
+    /// The app window's preferences, when the backup carries them; see
+    /// [`WEBVIEW_PREFS_NAME`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    webview_prefs: Option<ManifestEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -261,6 +348,9 @@ struct PendingRestore {
     #[serde(default)]
     schema_version: i64,
     files: Vec<String>,
+    /// Staging also holds [`WEBVIEW_PREFS_NAME`].
+    #[serde(default)]
+    webview_prefs: bool,
 }
 
 #[derive(Serialize)]
@@ -666,12 +756,14 @@ fn temp_dir_in(data_dir: &Path, tag: &str) -> Result<PathBuf, String> {
     ))
 }
 
-/// Build the plaintext zip: `manifest.json` plus one entry per present file.
+/// Build the plaintext zip: `manifest.json` plus one entry per present file,
+/// and the app window's preferences when there are any.
 fn build_archive(
     data_dir: &Path,
     scratch: &Path,
     db: &crate::storage::database::Database,
     app_version: &str,
+    webview_prefs: Option<&WebviewPrefs>,
 ) -> Result<(PathBuf, Manifest), String> {
     let zip_path = scratch.join("payload.zip");
     let file = std::fs::File::create(&zip_path)
@@ -738,12 +830,35 @@ fn build_archive(
         });
     }
 
+    let webview_prefs = match webview_prefs {
+        Some(prefs) => {
+            validate_webview_prefs(prefs)?;
+            let bytes = serde_json::to_vec(prefs).map_err(|e| {
+                coded_ctx("backup_export_failed", "Failed to write the preferences", e)
+            })?;
+            zip.start_file(WEBVIEW_PREFS_NAME, options).map_err(|e| {
+                coded_ctx("backup_export_failed", "Failed to write the preferences", e)
+            })?;
+            zip.write_all(&bytes).map_err(|e| {
+                coded_ctx("backup_export_failed", "Failed to write the preferences", e)
+            })?;
+            Some(ManifestEntry {
+                name: WEBVIEW_PREFS_NAME.to_string(),
+                size: bytes.len() as u64,
+                blake3: blake3::hash(&bytes).to_hex().to_string(),
+                rewrap: false,
+            })
+        }
+        None => None,
+    };
+
     let manifest = Manifest {
         version: FORMAT_VERSION,
         app_version: app_version.to_string(),
         created_at: chrono::Utc::now().timestamp(),
         schema_version: db.schema_version(),
         files: entries,
+        webview_prefs,
     };
     let manifest_json = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| coded_ctx("backup_export_failed", "Failed to write the manifest", e))?;
@@ -931,13 +1046,19 @@ pub async fn export_backup(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     passphrase: String,
+    webview_prefs: Option<WebviewPrefs>,
 ) -> Result<Option<BackupSummary>, String> {
     validate_passphrase(&passphrase)?;
+    if let Some(prefs) = &webview_prefs {
+        validate_webview_prefs(prefs)?;
+    }
     let Some(picked) = pick_backup_save_path(&app).await? else {
         return Ok(None);
     };
     let dest = validate_destination(&ensure_backup_extension(picked))?;
-    Ok(Some(write_backup(&app, &state, dest, passphrase).await?))
+    Ok(Some(
+        write_backup(&app, &state, dest, passphrase, webview_prefs).await?,
+    ))
 }
 
 async fn write_backup(
@@ -945,6 +1066,7 @@ async fn write_backup(
     state: &AppState,
     dest: PathBuf,
     passphrase: String,
+    webview_prefs: Option<WebviewPrefs>,
 ) -> Result<BackupSummary, String> {
     let db = state.db.clone();
     let app_version = app.package_info().version.to_string();
@@ -955,7 +1077,13 @@ async fn write_backup(
         let scratch = temp_dir_in(&data_dir, "backup-tmp")?;
         let partial = partial_export_path(&dest);
         let result = (|| {
-            let (zip_path, manifest) = build_archive(&data_dir, &scratch, &db, &app_version)?;
+            let (zip_path, manifest) = build_archive(
+                &data_dir,
+                &scratch,
+                &db,
+                &app_version,
+                webview_prefs.as_ref(),
+            )?;
             let mut zip_file = std::fs::File::open(&zip_path)
                 .map_err(|e| coded_ctx("backup_export_failed", "Failed to read the archive", e))?;
             let bytes = encrypt_stream(&mut zip_file, &partial, &passphrase)?;
@@ -1151,6 +1279,67 @@ fn read_archive(zip_path: &Path) -> Result<(Manifest, Vec<(ManifestEntry, Vec<u8
     Ok((manifest, out))
 }
 
+/// Read and verify the app-window preferences a decrypted archive carries, if
+/// any. Held to the same standard as the files: a backup whose manifest
+/// promises preferences it cannot deliver intact is damaged, not merely
+/// lacking them.
+fn read_webview_prefs(
+    zip_path: &Path,
+    manifest: &Manifest,
+) -> Result<Option<WebviewPrefs>, String> {
+    let Some(entry) = &manifest.webview_prefs else {
+        return Ok(None);
+    };
+    if entry.name != WEBVIEW_PREFS_NAME {
+        return Err(coded_ctx(
+            "backup_corrupt_archive",
+            "The backup contains an unexpected file",
+            &entry.name,
+        ));
+    }
+    if entry.size > MAX_WEBVIEW_PREFS_BYTES as u64 {
+        return Err(coded_ctx(
+            "backup_corrupt_archive",
+            "The backup contains a file that is too large",
+            &entry.name,
+        ));
+    }
+    let mut archive = open_archive(zip_path)?;
+    let mut zipped = archive.by_name(WEBVIEW_PREFS_NAME).map_err(|e| {
+        coded_ctx(
+            "backup_corrupt_archive",
+            format!("The backup is missing {WEBVIEW_PREFS_NAME}"),
+            e,
+        )
+    })?;
+    let mut bytes = Vec::new();
+    (&mut zipped)
+        .take(MAX_WEBVIEW_PREFS_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| {
+            coded_ctx(
+                "backup_corrupt_archive",
+                format!("Failed to read {WEBVIEW_PREFS_NAME}"),
+                e,
+            )
+        })?;
+    if bytes.len() as u64 != entry.size || blake3::hash(&bytes).to_hex().to_string() != entry.blake3
+    {
+        return Err(coded_ctx(
+            "backup_corrupt_archive",
+            "A file in the backup does not match its checksum",
+            WEBVIEW_PREFS_NAME,
+        ));
+    }
+    parse_webview_prefs(&bytes).map(Some).ok_or_else(|| {
+        coded_ctx(
+            "backup_corrupt_archive",
+            "The backup's app preferences are not readable",
+            WEBVIEW_PREFS_NAME,
+        )
+    })
+}
+
 fn staging_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(STAGING_DIR)
 }
@@ -1182,8 +1371,20 @@ fn read_pending_marker(staging: &Path) -> Option<PendingRestore> {
 pub struct PendingRestoreStatus {
     pub pending: bool,
     pub staged_at: i64,
+    /// When a launch stops applying it and discards it instead; 0 when that
+    /// does not apply (nothing staged, or a marker without a timestamp).
+    pub expires_at: i64,
     pub app_version: String,
     pub files: usize,
+}
+
+/// The [`PendingRestoreStatus::expires_at`] for a restore staged at `staged_at`.
+fn staged_restore_expires_at(staged_at: i64) -> i64 {
+    if staged_at > 0 {
+        staged_at.saturating_add(STAGED_RESTORE_MAX_AGE_SECS)
+    } else {
+        0
+    }
 }
 
 #[tauri::command]
@@ -1194,12 +1395,14 @@ pub async fn pending_restore_status(app: tauri::AppHandle) -> Result<PendingRest
         Some(p) => PendingRestoreStatus {
             pending: true,
             staged_at: p.staged_at,
+            expires_at: staged_restore_expires_at(p.staged_at),
             app_version: p.source_app_version,
             files: p.files.len(),
         },
         None => PendingRestoreStatus {
             pending: false,
             staged_at: 0,
+            expires_at: 0,
             app_version: String::new(),
             files: 0,
         },
@@ -1344,7 +1547,8 @@ pub async fn import_backup(
                     ),
                 ));
             }
-            stage_restore(&staging, &manifest, entries)
+            let webview_prefs = read_webview_prefs(&zip_path, &manifest)?;
+            stage_restore(&staging, &manifest, entries, webview_prefs.as_ref())
         })();
         let _ = std::fs::remove_dir_all(&scratch);
         if result.is_err() {
@@ -1365,6 +1569,7 @@ fn stage_restore(
     staging: &Path,
     manifest: &Manifest,
     entries: Vec<(ManifestEntry, Vec<u8>)>,
+    webview_prefs: Option<&WebviewPrefs>,
 ) -> Result<RestoreSummary, String> {
     std::fs::create_dir_all(staging)
         .map_err(|e| coded_ctx("backup_restore_failed", "Failed to stage the restore", e))?;
@@ -1398,12 +1603,27 @@ fn stage_restore(
         staged.push(entry.name.clone());
     }
 
+    if let Some(prefs) = webview_prefs {
+        let bytes = serde_json::to_vec(prefs)
+            .map_err(|e| coded_ctx("backup_restore_failed", "Failed to stage the restore", e))?;
+        crate::security::atomic_write(&staging.join(WEBVIEW_PREFS_NAME), &bytes, true).map_err(
+            |e| {
+                coded_ctx(
+                    "backup_restore_failed",
+                    format!("Failed to stage {WEBVIEW_PREFS_NAME}"),
+                    e,
+                )
+            },
+        )?;
+    }
+
     let pending = PendingRestore {
         version: FORMAT_VERSION,
         staged_at: chrono::Utc::now().timestamp(),
         source_app_version: manifest.app_version.clone(),
         schema_version: manifest.schema_version,
         files: staged.clone(),
+        webview_prefs: webview_prefs.is_some(),
     };
     let marker = serde_json::to_vec_pretty(&pending)
         .map_err(|e| coded_ctx("backup_restore_failed", "Failed to stage the restore", e))?;
@@ -1448,6 +1668,19 @@ fn copy_into_place(staged: &Path, live: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// What [`apply_pending_restore`] did with the staging directory.
+#[derive(Debug)]
+pub enum StartupRestore {
+    /// Nothing was applied: none was staged, staging was unusable debris, or
+    /// the restore was refused and left staged for a later launch.
+    NotApplied,
+    /// Applied, with the displaced originals kept in `pre-restore-*`.
+    Applied,
+    /// Staged longer than [`STAGED_RESTORE_MAX_AGE_SECS`] ago, and discarded
+    /// without being applied.
+    Expired,
+}
+
 /// Swap a staged restore into place. Called during startup before the
 /// database, config or identity are opened, because every one of those files
 /// is held open (or cached in memory) once the app is running.
@@ -1455,7 +1688,7 @@ fn copy_into_place(staged: &Path, live: &Path) -> std::io::Result<()> {
 /// Displaced originals are moved to `pre-restore-<timestamp>/` rather than
 /// deleted: a restore from the wrong backup is otherwise unrecoverable. Only
 /// files the backup actually carried are touched.
-pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>> {
+pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<StartupRestore> {
     let staging = staging_dir(data_dir);
     let marker = staging.join(STAGING_MARKER);
     if staging.join(APPLIED_SENTINEL).exists() {
@@ -1469,7 +1702,7 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
                 staging.display()
             );
         }
-        return Ok(None);
+        return Ok(StartupRestore::NotApplied);
     }
     if !marker.is_file() {
         // No marker means either no restore or an interrupted staging run;
@@ -1481,14 +1714,14 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
             );
             let _ = std::fs::remove_dir_all(&staging);
         }
-        return Ok(None);
+        return Ok(StartupRestore::NotApplied);
     }
     let pending: PendingRestore = match read_pending_marker(&staging) {
         Some(p) => p,
         None => {
             tracing::warn!("Staged restore marker is unreadable; discarding the staged files");
             let _ = std::fs::remove_dir_all(&staging);
-            return Ok(None);
+            return Ok(StartupRestore::NotApplied);
         }
     };
 
@@ -1508,17 +1741,17 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
             age_secs / 86_400
         );
         let _ = std::fs::remove_dir_all(&staging);
-        return Ok(None);
+        return Ok(StartupRestore::Expired);
     }
 
     // Every refusal from here on leaves the restore staged for a later launch.
     // One that interrupts an apply already under way must roll it back first,
     // or the app starts on a mix of restored and original files.
-    let refuse = || -> std::io::Result<Option<PathBuf>> {
+    let refuse = || -> std::io::Result<StartupRestore> {
         if resuming {
             abandon_interrupted_apply(data_dir, &staging);
         }
-        Ok(None)
+        Ok(StartupRestore::NotApplied)
     };
 
     // The build that staged this restore accepted its schema; the build now
@@ -1608,7 +1841,7 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
                  staged copy is kept for the next launch and the previous files remain in {}",
                 backup_dir.display()
             );
-            return Ok(None);
+            return Ok(StartupRestore::NotApplied);
         }
     };
 
@@ -1617,6 +1850,7 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
     if pending.files.iter().any(|name| name == "config.json") {
         sanitize_restored_config(data_dir);
     }
+    hand_over_webview_prefs(data_dir, &staging, pending.webview_prefs);
     retire_applied_staging(&staging);
     tracing::warn!(
         "Applied a staged restore of {applied} file(s) from a backup made by Ember {}; the \
@@ -1624,7 +1858,81 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<Option<PathBuf>
         pending.source_app_version,
         backup_dir.display()
     );
-    Ok(Some(backup_dir))
+    Ok(StartupRestore::Applied)
+}
+
+/// Leave an applied restore's app-window preferences where
+/// [`take_pending_restored_prefs`] finds them, replacing any an earlier
+/// restore left untaken: those belong to the profile just replaced. Best
+/// effort, because failing here must not undo a restore that has landed.
+fn hand_over_webview_prefs(data_dir: &Path, staging: &Path, staged: bool) {
+    let target = data_dir.join(RESTORED_PREFS_FILE);
+    match std::fs::remove_file(&target) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::error!(
+                "Could not remove the untaken preferences of an earlier restore ({e}); not \
+                 handing over this restore's"
+            );
+            return;
+        }
+    }
+    if !staged {
+        return;
+    }
+    let Some(prefs) = std::fs::read(staging.join(WEBVIEW_PREFS_NAME))
+        .ok()
+        .and_then(|raw| parse_webview_prefs(&raw))
+    else {
+        tracing::warn!("The restored app preferences are missing or unreadable; skipping them");
+        return;
+    };
+    let written = serde_json::to_vec(&prefs)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| crate::security::atomic_write(&target, &bytes, true));
+    if let Err(e) = written {
+        tracing::warn!("Could not hand the restored app preferences to the window: {e}");
+    }
+}
+
+/// Consume the preferences [`hand_over_webview_prefs`] left. Removed before
+/// they are returned, and withheld if removal fails: the window reloads after
+/// applying them, so a file that survived would reapply them on every start.
+fn take_restored_prefs(data_dir: &Path) -> Option<WebviewPrefs> {
+    let path = data_dir.join(RESTORED_PREFS_FILE);
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!("Could not read the restored app preferences: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = std::fs::remove_file(&path) {
+        tracing::error!(
+            "Could not remove {} ({e}); not applying the restored app preferences",
+            path.display()
+        );
+        return None;
+    }
+    let prefs = parse_webview_prefs(&raw);
+    if prefs.is_none() {
+        tracing::warn!("The restored app preferences are unreadable; skipping them");
+    }
+    prefs
+}
+
+/// The app-window preferences a restore applied at this launch brought back,
+/// once; `None` on every later call and when there were none.
+#[tauri::command]
+pub async fn take_pending_restored_prefs(
+    app: tauri::AppHandle,
+) -> Result<Option<WebviewPrefs>, String> {
+    let data_dir = paths::resolve_data_dir_with_app(&app);
+    tokio::task::spawn_blocking(move || take_restored_prefs(&data_dir))
+        .await
+        .map_err(|e| coded_ctx("backup_task_failed", "Restore task failed", e))
 }
 
 /// A live file the apply loop has touched, and what it takes to undo that.
@@ -2384,6 +2692,22 @@ fn sanitize_restored_config(data_dir: &Path) {
 mod tests {
     use super::*;
 
+    impl StartupRestore {
+        fn applied(&self) -> bool {
+            matches!(self, StartupRestore::Applied)
+        }
+    }
+
+    /// Apply as startup does, insist that it applied, and return the
+    /// pre-restore directory holding the displaced originals.
+    fn apply_expecting_success(dir: &Path) -> PathBuf {
+        let outcome = apply_pending_restore(dir).unwrap();
+        assert!(outcome.applied(), "{outcome:?}");
+        let mut backup_dirs = pre_restore_dirs(dir);
+        assert_eq!(backup_dirs.len(), 1, "{backup_dirs:?}");
+        backup_dirs.pop().unwrap()
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "ember-backup-test-{tag}-{}-{}",
@@ -2527,7 +2851,7 @@ mod tests {
         // No RESTORE.json: staging was interrupted.
         std::fs::write(staging.join("config.json"), b"{}").unwrap();
         std::fs::write(dir.join("config.json"), b"live").unwrap();
-        assert!(apply_pending_restore(&dir).unwrap().is_none());
+        assert!(!apply_pending_restore(&dir).unwrap().applied());
         assert!(!staging.exists());
         assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), b"live");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2546,6 +2870,7 @@ mod tests {
             source_app_version: "1.3.3".to_string(),
             schema_version: 1,
             files: vec!["config.json".to_string()],
+            webview_prefs: false,
         };
         std::fs::write(
             staging.join(STAGING_MARKER),
@@ -2553,7 +2878,7 @@ mod tests {
         )
         .unwrap();
 
-        let preserved = apply_pending_restore(&dir).unwrap().unwrap();
+        let preserved = apply_expecting_success(&dir);
         assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), b"restored");
         assert_eq!(
             std::fs::read(preserved.join("config.json")).unwrap(),
@@ -2589,6 +2914,7 @@ mod tests {
             source_app_version: "1.3.3".to_string(),
             schema_version: 1,
             files: vec!["config.json".to_string(), "identity.json".to_string()],
+            webview_prefs: false,
         };
         std::fs::write(
             staging.join(STAGING_MARKER),
@@ -2596,7 +2922,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(apply_pending_restore(&dir).unwrap().is_none());
+        assert!(!apply_pending_restore(&dir).unwrap().applied());
         // Nothing swapped: both live files are still the machine's own.
         assert_eq!(
             std::fs::read(dir.join("identity.json")).unwrap(),
@@ -2630,6 +2956,7 @@ mod tests {
             source_app_version: "1.3.3".to_string(),
             schema_version: 1,
             files: vec!["config.json".to_string(), "identity.json".to_string()],
+            webview_prefs: false,
         };
         std::fs::write(
             staging.join(STAGING_MARKER),
@@ -2637,7 +2964,7 @@ mod tests {
         )
         .unwrap();
 
-        let preserved = apply_pending_restore(&dir).unwrap().unwrap();
+        let preserved = apply_expecting_success(&dir);
         assert_eq!(
             std::fs::read(dir.join("config.json")).unwrap(),
             b"restored-config"
@@ -2973,6 +3300,7 @@ mod tests {
             source_app_version: "1.3.3".to_string(),
             schema_version: 1,
             files: files.iter().map(|f| (*f).to_string()).collect(),
+            webview_prefs: false,
         };
         std::fs::write(
             staging.join(STAGING_MARKER),
@@ -3006,7 +3334,7 @@ mod tests {
         std::fs::write(staging.join(APPLIED_SENTINEL), b"applied\n").unwrap();
         std::fs::write(dir.join("config.json"), b"changed since").unwrap();
 
-        assert!(apply_pending_restore(&dir).unwrap().is_none());
+        assert!(!apply_pending_restore(&dir).unwrap().applied());
         assert_eq!(
             std::fs::read(dir.join("config.json")).unwrap(),
             b"changed since"
@@ -3028,14 +3356,14 @@ mod tests {
         let (staging, _) = stage(&dir, &[("config.json", &config)]);
         write_marker(&staging, &["config.json"]);
 
-        let backup_dir = apply_pending_restore(&dir).unwrap().unwrap();
+        let backup_dir = apply_expecting_success(&dir);
         let repaired: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
         assert_eq!(repaired["preview_player"].as_str().unwrap(), "");
         assert_eq!(repaired["nickname"].as_str().unwrap(), "kept");
         assert!(!staging.exists());
         assert!(backup_dir.is_dir());
-        assert!(apply_pending_restore(&dir).unwrap().is_none());
+        assert!(!apply_pending_restore(&dir).unwrap().applied());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3069,7 +3397,7 @@ mod tests {
         write_marker(&staging, &["identity.json", "ember.db", "config.json"]);
         crash(&dir, &staging, &names, "ember.db");
 
-        let backup_dir = apply_pending_restore(&dir).unwrap().unwrap();
+        let backup_dir = apply_expecting_success(&dir);
         assert_contents(&dir, STAGED_PROFILE);
         assert_contents(&backup_dir, LIVE_PROFILE);
         assert!(!staging.exists());
@@ -3087,7 +3415,7 @@ mod tests {
         crash(&dir, &staging, &names, "ember.db");
         std::fs::remove_file(staging.join("config.json")).unwrap();
 
-        assert!(apply_pending_restore(&dir).unwrap().is_none());
+        assert!(!apply_pending_restore(&dir).unwrap().applied());
         assert_contents(&dir, LIVE_PROFILE);
         assert!(pending_restore_still_staged(&dir));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3233,7 +3561,7 @@ mod tests {
         std::fs::create_dir_all(staging.join(STAGING_MARKER).join("held")).unwrap();
         std::fs::write(staging.join(APPLIED_SENTINEL), b"applied\n").unwrap();
 
-        assert!(apply_pending_restore(&dir).unwrap().is_none());
+        assert!(!apply_pending_restore(&dir).unwrap().applied());
         assert!(staging.join(APPLIED_SENTINEL).is_file());
         assert!(!pending_restore_still_staged(&dir));
         assert!(read_pending_marker(&staging).is_none());
@@ -3279,6 +3607,7 @@ mod tests {
             source_app_version: "1.3.3".to_string(),
             schema_version: 1,
             files: vec!["config.json".to_string()],
+            webview_prefs: false,
         };
         std::fs::write(
             staging.join(STAGING_MARKER),
@@ -3286,7 +3615,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(apply_pending_restore(&dir).unwrap().is_none());
+        assert!(matches!(
+            apply_pending_restore(&dir).unwrap(),
+            StartupRestore::Expired
+        ));
         // The profile in use wins, and the staged copies do not linger.
         assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), b"live");
         assert!(!staging.exists());
@@ -3306,6 +3638,7 @@ mod tests {
             source_app_version: "9.9.9".to_string(),
             schema_version: crate::storage::database::MAX_SUPPORTED_SCHEMA_VERSION + 1,
             files: vec!["config.json".to_string()],
+            webview_prefs: false,
         };
         std::fs::write(
             staging.join(STAGING_MARKER),
@@ -3313,7 +3646,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(apply_pending_restore(&dir).unwrap().is_none());
+        assert!(!apply_pending_restore(&dir).unwrap().applied());
         // Left intact for a build that can actually open it, and still
         // discardable from the Backup screen.
         assert!(staging.join(STAGING_MARKER).is_file());
@@ -3349,6 +3682,7 @@ mod tests {
             source_app_version: "1.3.3".to_string(),
             schema_version: 1,
             files: vec!["evil.exe".to_string()],
+            webview_prefs: false,
         };
         std::fs::write(
             staging.join(STAGING_MARKER),
@@ -3463,6 +3797,7 @@ mod tests {
                     rewrap: false,
                 })
                 .collect(),
+            webview_prefs: None,
         }
     }
 
@@ -3618,7 +3953,7 @@ mod tests {
         // Export.
         let scratch_dir = temp_dir_in(&source_dir, "backup-tmp").expect("scratch");
         let (zip_path, manifest) =
-            build_archive(&source_dir, &scratch_dir, &db, "1.3.3").expect("build archive");
+            build_archive(&source_dir, &scratch_dir, &db, "1.3.3", None).expect("build archive");
         assert!(
             manifest.files.iter().any(|f| f.name == "ember.db"),
             "the database snapshot must be in the archive"
@@ -3654,16 +3989,22 @@ mod tests {
         let (read_manifest, entries) = read_archive(&decrypted).expect("verify archive");
         assert_eq!(read_manifest.app_version, "1.3.3");
         let staging = staging_dir(&restore_dir);
-        let summary = stage_restore(&staging, &read_manifest, entries).expect("stage");
+        assert!(read_webview_prefs(&decrypted, &read_manifest)
+            .expect("no preferences is not an error")
+            .is_none());
+        let summary = stage_restore(&staging, &read_manifest, entries, None).expect("stage");
         assert!(summary.staged.iter().any(|n| n == "ember.db"));
         let _ = std::fs::remove_dir_all(&restore_scratch);
 
         // Nothing is in place until the swap runs, which is what startup does.
         assert!(!restore_dir.join("ember.db").exists());
-        let preserved = apply_pending_restore(&restore_dir)
-            .expect("apply")
-            .expect("a restore was applied");
+        let preserved = apply_expecting_success(&restore_dir);
         assert!(!staging.exists(), "the staging directory is consumed");
+        assert_eq!(
+            take_restored_prefs(&restore_dir),
+            None,
+            "a backup without app preferences hands none to the window"
+        );
 
         // Plain files come back byte-for-byte.
         assert_eq!(
@@ -3701,5 +4042,279 @@ mod tests {
         // A first restore into an empty directory displaces nothing.
         assert!(preserved.is_dir());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn sample_prefs() -> WebviewPrefs {
+        [
+            ("PARAGLIDE_LOCALE", "de"),
+            ("ember-theme", "dark"),
+            (
+                "ember.channels.hidden.v1",
+                r#"["0123456789abcdef0123456789abcdef"]"#,
+            ),
+            ("search-recent-queries-v1", r#"["ubuntu iso"]"#),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    /// The preferences travel the whole runtime path: into the encrypted
+    /// archive, back out, through staging and the startup apply, and to the
+    /// window exactly once.
+    #[test]
+    fn app_preferences_round_trip_through_a_backup_and_are_handed_over_once() {
+        let root = scratch("prefs-e2e");
+        let source_dir = root.join("source");
+        let restore_dir = root.join("restore");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&restore_dir).unwrap();
+        let db = crate::storage::database::Database::open_at(&source_dir.join("ember.db"))
+            .expect("open source database");
+        std::fs::write(source_dir.join("config.json"), br#"{"nickname":"tester"}"#).unwrap();
+        let prefs = sample_prefs();
+
+        let scratch_dir = temp_dir_in(&source_dir, "backup-tmp").expect("scratch");
+        let (zip_path, manifest) =
+            build_archive(&source_dir, &scratch_dir, &db, "1.7.1", Some(&prefs))
+                .expect("build archive");
+        assert!(manifest.webview_prefs.is_some());
+        assert!(
+            manifest.files.iter().all(|f| f.name != WEBVIEW_PREFS_NAME),
+            "listing the preferences in `files` would make older readers refuse the backup"
+        );
+        let archive = root.join("profile.emberbackup");
+        let mut zip_file = std::fs::File::open(&zip_path).unwrap();
+        encrypt_stream(&mut zip_file, &archive, "correct horse battery").expect("encrypt");
+        drop(zip_file);
+        let _ = std::fs::remove_dir_all(&scratch_dir);
+        drop(db);
+        let raw = std::fs::read(&archive).unwrap();
+        assert!(
+            !raw.windows(b"ubuntu iso".len()).any(|w| w == b"ubuntu iso"),
+            "the preferences must only exist inside the encrypted payload"
+        );
+
+        let restore_scratch = temp_dir_in(&restore_dir, "restore-tmp").expect("scratch");
+        let decrypted = restore_scratch.join("payload.zip");
+        decrypt_stream(&archive, &decrypted, "correct horse battery").expect("decrypt");
+        let (read_manifest, entries) = read_archive(&decrypted).expect("verify archive");
+        let read_prefs = read_webview_prefs(&decrypted, &read_manifest).expect("read prefs");
+        assert_eq!(read_prefs.as_ref(), Some(&prefs));
+        let staging = staging_dir(&restore_dir);
+        stage_restore(&staging, &read_manifest, entries, read_prefs.as_ref()).expect("stage");
+        let _ = std::fs::remove_dir_all(&restore_scratch);
+        assert_eq!(
+            take_restored_prefs(&restore_dir),
+            None,
+            "nothing reaches the window before the restore is applied"
+        );
+
+        apply_expecting_success(&restore_dir);
+        assert!(!staging.exists());
+        assert_eq!(take_restored_prefs(&restore_dir), Some(prefs));
+        assert_eq!(
+            take_restored_prefs(&restore_dir),
+            None,
+            "the window reloads after applying them, so a second take must find nothing"
+        );
+        assert!(!restore_dir.join(RESTORED_PREFS_FILE).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A previous Ember's reader: the manifest exactly as it was before the
+    /// preferences existed, and an allow-list check over `files` alone.
+    #[derive(Deserialize)]
+    struct PreviousManifest {
+        version: u32,
+        files: Vec<ManifestEntry>,
+    }
+
+    #[test]
+    fn a_backup_with_app_preferences_still_reads_in_the_previous_format() {
+        let dir = scratch("prefs-compat");
+        let prefs_bytes = serde_json::to_vec(&sample_prefs()).unwrap();
+        let files: &[(&str, &[u8])] = &[("config.json", b"{}")];
+        let mut manifest = manifest_for(files);
+        manifest.webview_prefs = Some(ManifestEntry {
+            name: WEBVIEW_PREFS_NAME.to_string(),
+            size: prefs_bytes.len() as u64,
+            blake3: blake3::hash(&prefs_bytes).to_hex().to_string(),
+            rewrap: false,
+        });
+        let in_zip: &[(&str, &[u8])] = &[
+            ("config.json", b"{}"),
+            (WEBVIEW_PREFS_NAME, prefs_bytes.as_slice()),
+        ];
+        let zip_path = write_archive(&dir, in_zip, &manifest);
+
+        let mut archive = open_archive(&zip_path).unwrap();
+        let mut raw = Vec::new();
+        archive
+            .by_name(MANIFEST_NAME)
+            .unwrap()
+            .read_to_end(&mut raw)
+            .unwrap();
+        let previous: PreviousManifest =
+            serde_json::from_slice(&raw).expect("the previous manifest shape still parses");
+        assert_eq!(
+            previous.version, 1,
+            "a format bump would make older Ember refuse it"
+        );
+        assert!(previous
+            .files
+            .iter()
+            .all(|f| backup_file(&f.name).is_some() || is_legacy_ignored(&f.name)));
+
+        let (_, entries) = read_archive(&zip_path).unwrap();
+        assert_eq!(entries.len(), 1, "the preferences are not a profile file");
+        assert_eq!(
+            read_webview_prefs(&zip_path, &manifest).unwrap(),
+            Some(sample_prefs())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preferences_that_do_not_match_the_manifest_fail_the_restore() {
+        let dir = scratch("prefs-tamper");
+        let prefs_bytes = serde_json::to_vec(&sample_prefs()).unwrap();
+        let entry = |name: &str, bytes: &[u8]| ManifestEntry {
+            name: name.to_string(),
+            size: bytes.len() as u64,
+            blake3: blake3::hash(bytes).to_hex().to_string(),
+            rewrap: false,
+        };
+        let mut manifest = manifest_for(&[]);
+        manifest.webview_prefs = Some(entry(WEBVIEW_PREFS_NAME, b"{}"));
+        let zip_path = write_archive(
+            &dir,
+            &[(WEBVIEW_PREFS_NAME, prefs_bytes.as_slice())],
+            &manifest,
+        );
+        let err = read_webview_prefs(&zip_path, &manifest).unwrap_err();
+        assert!(err.contains("checksum"), "{err}");
+
+        manifest.webview_prefs = Some(entry("../../evil.json", &prefs_bytes));
+        let err = read_webview_prefs(&zip_path, &manifest).unwrap_err();
+        assert!(err.contains("unexpected file"), "{err}");
+
+        let not_strings = br#"{"ember-theme":1}"#;
+        manifest.webview_prefs = Some(entry(WEBVIEW_PREFS_NAME, not_strings));
+        let zip_path = write_archive(&dir, &[(WEBVIEW_PREFS_NAME, &not_strings[..])], &manifest);
+        let err = read_webview_prefs(&zip_path, &manifest).unwrap_err();
+        assert!(err.contains("not readable"), "{err}");
+
+        let mut oversized = entry(WEBVIEW_PREFS_NAME, &prefs_bytes);
+        oversized.size = MAX_WEBVIEW_PREFS_BYTES as u64 + 1;
+        manifest.webview_prefs = Some(oversized);
+        let err = read_webview_prefs(&zip_path, &manifest).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_backup_refuses_preferences_outside_the_allow_list_or_too_large() {
+        assert!(validate_webview_prefs(&sample_prefs()).is_ok());
+        assert!(validate_webview_prefs(&WebviewPrefs::new()).is_ok());
+
+        let mut unknown = sample_prefs();
+        unknown.insert(
+            "ember.updater.dismissedUpdate".to_string(),
+            "1.8.0".to_string(),
+        );
+        let err = validate_webview_prefs(&unknown).unwrap_err();
+        assert!(err.contains("ember.updater.dismissedUpdate"), "{err}");
+
+        let mut huge = WebviewPrefs::new();
+        huge.insert(
+            "search-recent-queries-v1".to_string(),
+            "x".repeat(MAX_WEBVIEW_PREFS_BYTES),
+        );
+        let err = validate_webview_prefs(&huge).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn restored_preferences_keep_only_the_allow_listed_string_values() {
+        let parsed = parse_webview_prefs(
+            br#"{"ember-theme":"dark","__proto__":"x","ember.chatTabs.v1":"[]"}"#,
+        )
+        .expect("an object of strings parses");
+        assert_eq!(
+            parsed.into_iter().collect::<Vec<_>>(),
+            vec![("ember-theme".to_string(), "dark".to_string())]
+        );
+        assert!(parse_webview_prefs(br#"{"ember-theme":true}"#).is_none());
+        assert!(parse_webview_prefs(br#"["ember-theme","dark"]"#).is_none());
+        assert!(parse_webview_prefs(b"not json").is_none());
+        let mut oversized = br#"{"ember-theme":""#.to_vec();
+        oversized.extend(vec![b'x'; MAX_WEBVIEW_PREFS_BYTES]);
+        oversized.extend_from_slice(br#""}"#);
+        assert!(parse_webview_prefs(&oversized).is_none());
+    }
+
+    #[test]
+    fn a_hand_placed_handover_file_cannot_plant_unknown_keys() {
+        let dir = scratch("prefs-take");
+        std::fs::write(
+            dir.join(RESTORED_PREFS_FILE),
+            br#"{"PARAGLIDE_LOCALE":"fr","evil-key":"payload"}"#,
+        )
+        .unwrap();
+        let taken = take_restored_prefs(&dir).expect("readable");
+        assert_eq!(
+            taken.get("PARAGLIDE_LOCALE").map(String::as_str),
+            Some("fr")
+        );
+        assert!(!taken.contains_key("evil-key"));
+        assert!(!dir.join(RESTORED_PREFS_FILE).exists());
+
+        std::fs::write(dir.join(RESTORED_PREFS_FILE), b"garbage").unwrap();
+        assert_eq!(take_restored_prefs(&dir), None);
+        assert!(
+            !dir.join(RESTORED_PREFS_FILE).exists(),
+            "an unreadable handover is consumed, not retried forever"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Preferences an earlier restore left untaken belong to the profile the
+    /// next restore replaces; applying them afterwards would undo part of it.
+    #[test]
+    fn a_restore_without_preferences_drops_an_earlier_untaken_handover() {
+        let dir = scratch("prefs-stale-handover");
+        std::fs::write(dir.join(RESTORED_PREFS_FILE), br#"{"ember-theme":"dark"}"#).unwrap();
+        let (staging, names) = stage(&dir, &[("config.json", b"restored")]);
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        write_marker(&staging, &names);
+
+        apply_expecting_success(&dir);
+        assert_eq!(take_restored_prefs(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_preference_keys_are_unique_and_never_collide_with_profile_files() {
+        let mut seen = std::collections::HashSet::new();
+        for key in WEBVIEW_PREF_KEYS {
+            assert!(seen.insert(*key), "{key} listed twice");
+        }
+        assert!(backup_file(WEBVIEW_PREFS_NAME).is_none());
+        assert!(backup_file(RESTORED_PREFS_FILE).is_none());
+        assert!(!is_legacy_ignored(WEBVIEW_PREFS_NAME));
+    }
+
+    #[test]
+    fn a_staged_restore_reports_when_it_expires() {
+        assert_eq!(
+            staged_restore_expires_at(0),
+            0,
+            "an undated marker never expires"
+        );
+        assert_eq!(
+            staged_restore_expires_at(1_700_000_000),
+            1_700_000_000 + STAGED_RESTORE_MAX_AGE_SECS
+        );
     }
 }
