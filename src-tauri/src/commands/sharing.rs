@@ -1705,13 +1705,22 @@ async fn load_known_files_for_scan() -> (KnownFileList, bool) {
     }
 }
 
-/// Whether a scan whose known.met read failed has to hold back the files it
-/// cannot place ([`hold_back_unrecorded_files`]). Not while sharing fails
-/// closed, which offers no new content anyway; that is also where a catalog
-/// that cannot be read for the whole session leaves it.
-fn unread_catalog_holds_back(catalog_read: bool) -> bool {
-    !catalog_read
-        && !crate::storage::share_intent::global().map_or(true, |store| store.is_fail_closed())
+/// Whether a scan has to hold back the files it cannot place
+/// ([`hold_back_unrecorded_files`]): its known.met read failed, or read only
+/// in part (up to a damaged record, or with bytes past its records), so the
+/// record at a file's path may be among what was not read. Not while sharing
+/// fails closed, which offers no new content anyway; that is also where a
+/// catalog that cannot be read for the whole session leaves it.
+fn unread_catalog_holds_back(catalog_read: bool, known: &KnownFileList) -> bool {
+    catalog_holds_back(
+        catalog_read,
+        known,
+        crate::storage::share_intent::global().map_or(true, |store| store.is_fail_closed()),
+    )
+}
+
+fn catalog_holds_back(catalog_read: bool, known: &KnownFileList, fail_closed: bool) -> bool {
+    (!catalog_read || !known.is_authoritative()) && !fail_closed
 }
 
 /// For a scan whose known.met read failed: take out of `discovered` and
@@ -4106,13 +4115,13 @@ pub(crate) async fn add_shared_folder_approved(
             needs_hashing: mut files_to_hash,
             needs_top_up,
         } = resolve_from_known_or_live(&mut discovered, &known_list, &local_index).await;
-        if unread_catalog_holds_back(catalog_read) {
+        if unread_catalog_holds_back(catalog_read, &known_list) {
             let held = {
                 let index = local_index.read().await;
                 hold_back_unrecorded_files(&mut discovered, &mut files_to_hash, &index)
             };
             if held > 0 {
-                warn!("known.met could not be read; {held} new or changed file(s) in {path} wait for a later scan");
+                warn!("known.met could not be read in full; {held} new or changed file(s) in {path} wait for a later scan");
                 let _ = app.emit(
                     "shared-folder-scan-failed",
                     serde_json::json!({ "folder": path }),
@@ -4819,21 +4828,18 @@ pub async fn share_dropped_paths(app: tauri::AppHandle, paths: Vec<std::path::Pa
 }
 
 /// What handing over an already-shared folder again means, as in the folder
-/// picker: the whole folder. One shared in part loses its allowlist and has
-/// every file under it offered; one shared whole is left as it is.
+/// picker: the whole folder. One shared in part, or with a subfolder
+/// unshared, loses those allowlists and has every file under it offered; one
+/// shared whole is left as it is.
 async fn share_partial_folder_whole(
     app: &tauri::AppHandle,
     state: &AppState,
     folder: &str,
 ) -> Result<(), String> {
-    let partial = state
-        .config
-        .read()
-        .await
-        .settings
-        .pending_folder_allowlists
-        .keys()
-        .any(|key| paths_equal_ignore_case(key, folder));
+    let partial = limited_at_or_under(
+        &state.config.read().await.settings.pending_folder_allowlists,
+        folder,
+    );
     if !partial {
         return Ok(());
     }
@@ -7102,13 +7108,13 @@ async fn reload_shared_files_page(
         // and are held back from hashing just below.
         discovered.extend(early_settling.iter().cloned());
         files_to_hash.extend(early_settling);
-        if unread_catalog_holds_back(catalog_read) {
+        if unread_catalog_holds_back(catalog_read, &known_list) {
             let held = {
                 let index = local_index.read().await;
                 hold_back_unrecorded_files(&mut discovered, &mut files_to_hash, &index)
             };
             if held > 0 {
-                warn!("known.met could not be read; {held} new or changed file(s) wait for a later scan");
+                warn!("known.met could not be read in full; {held} new or changed file(s) wait for a later scan");
                 let _ = app.emit(
                     "shared-folder-scan-failed",
                     serde_json::json!({ "folder": null }),
@@ -7881,18 +7887,31 @@ fn readmit_keys(lists: &mut std::collections::HashMap<String, Vec<String>>, keys
 /// Used when the whole folder stops being offered, so nothing is left to
 /// re-share its files the next time they are scanned.
 async fn clear_allowlists_under(state: &AppState, folder: &str) -> Result<(), String> {
-    edit_folder_allowlists(state, |lists| {
-        let before = lists.len();
-        lists.retain(|listed, _| !crate::security::path_within_dir(listed, folder));
-        let mut changed = lists.len() != before;
-        for entries in lists.values_mut() {
-            let before = entries.len();
-            entries.retain(|entry| !crate::security::path_within_dir(entry, folder));
-            changed |= entries.len() != before;
-        }
-        changed
-    })
-    .await
+    edit_folder_allowlists(state, |lists| clear_under(lists, folder)).await
+}
+
+fn clear_under(lists: &mut std::collections::HashMap<String, Vec<String>>, folder: &str) -> bool {
+    let before = lists.len();
+    lists.retain(|listed, _| !crate::security::path_within_dir(listed, folder));
+    let mut changed = lists.len() != before;
+    for entries in lists.values_mut() {
+        let before = entries.len();
+        entries.retain(|entry| !crate::security::path_within_dir(entry, folder));
+        changed |= entries.len() != before;
+    }
+    changed
+}
+
+/// Whether `folder`, or a folder under it, has an allowlist of its own: it is
+/// shared in part, or a subfolder was unshared while the rest stayed shared.
+/// Sharing it whole lifts those lists.
+pub(crate) fn limited_at_or_under(
+    allowlists: &std::collections::HashMap<String, Vec<String>>,
+    folder: &str,
+) -> bool {
+    allowlists
+        .keys()
+        .any(|listed| crate::security::path_within_dir(listed, folder))
 }
 
 /// Stop the allowlists offering anything under `folder`, for a folder being
@@ -9017,6 +9036,52 @@ mod tests {
         assert_eq!(paths(&discovered), vec!["C:/L/changed.bin".to_string(), "C:/L/known.bin".to_string()]);
     }
 
+    /// A known.met that loads only in part, cut off inside a record or with
+    /// bytes past its records, may have lost the friends-only record at a new
+    /// file's path just as an unread one has: the scan holds the file back.
+    #[test]
+    fn a_partly_read_catalog_holds_back_like_an_unread_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-scan-partial-known-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        let mut catalog = KnownFileList::new();
+        catalog.mark_authoritative_for_tests();
+        catalog.add_or_update(known_record("C:/L/kept.bin", [0x11; 16], ""));
+        let mut restricted = known_record("C:/L/friends.bin", [0x22; 16], "");
+        restricted.friends_only = true;
+        catalog.add_or_update(restricted);
+        catalog.save(&path).unwrap();
+        let whole = std::fs::read(&path).unwrap();
+
+        let read = KnownFileList::load_checked(&path).unwrap();
+        assert!(!catalog_holds_back(true, &read, false), "a catalog read in full");
+        assert!(catalog_holds_back(false, &KnownFileList::new(), false), "an unread one");
+        assert!(!catalog_holds_back(false, &KnownFileList::new(), true), "not while failing closed");
+
+        let cut = &whole[..whole.len() - 3];
+        let mut trailing = whole.clone();
+        trailing.push(0);
+        for damaged in [cut, trailing.as_slice()] {
+            std::fs::write(&path, damaged).unwrap();
+            let read = KnownFileList::load_checked(&path).unwrap();
+            assert!(catalog_holds_back(true, &read, false));
+
+            let new = indexed_file("C:/L/friends-copy.bin", "");
+            let mut discovered = vec![new.clone()];
+            let mut files_to_hash = vec![new];
+            assert_eq!(
+                hold_back_unrecorded_files(&mut discovered, &mut files_to_hash, &LocalIndex::new()),
+                1
+            );
+            assert!(discovered.is_empty() && files_to_hash.is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn sharing_a_file_again_puts_it_back_on_its_folders_allowlist() {
         let sep = std::path::MAIN_SEPARATOR;
@@ -9137,6 +9202,46 @@ mod tests {
         let offers = crate::sharing::indexer::AllowlistOffers::new(&lists);
         assert!(!offers.offers(&format!("{deep}{sep}track.mp3")));
         assert!(offers.offers(&later_in_sub));
+    }
+
+    /// Sharing a folder whole again undoes an unshared subfolder: the empty
+    /// list the unshare left it goes, and its files, indexed or added later,
+    /// are offered with the rest. Another share's list is not touched.
+    #[test]
+    fn sharing_a_folder_whole_again_lifts_an_unshared_subfolder() {
+        let key = crate::search::index::normalize_path_key;
+        let folder = key("C:/music");
+        let sub = key("C:/music/live");
+        let in_sub = "C:/music/live/c.mp3";
+        let later_in_sub = key("C:/music/live/new.mp3");
+        let other = key("D:/films");
+        let film = key("D:/films/d.mkv");
+        let mut lists = std::collections::HashMap::from([(other.clone(), vec![film.clone()])]);
+        let mut withheld = std::collections::HashMap::new();
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            indexed_file("C:/music/a.mp3", &"aa".repeat(16)),
+            indexed_file(in_sub, &"bb".repeat(16)),
+        ]);
+
+        assert!(withhold_under(&mut lists, &mut withheld, &sub, &HashSet::from([key(in_sub)])));
+        index.set_shared_by_path_prefix(&sub, false);
+        assert!(!index.get_by_path(in_sub).unwrap().shared);
+        assert!(limited_at_or_under(&lists, &folder), "the share is no longer offered whole");
+        assert!(!limited_at_or_under(&lists, &key("C:/music/other")));
+
+        assert!(clear_under(&mut lists, &folder));
+        tidy_withheld(&lists, &mut withheld);
+        assert!(withheld.is_empty());
+        assert_eq!(lists, std::collections::HashMap::from([(other.clone(), vec![film.clone()])]));
+        let offers = crate::sharing::indexer::AllowlistOffers::new(&lists);
+        let mut mutation = index.set_shared_by_path_prefix(&folder, true);
+        keep_unlisted_copies_unshared(&mut index, &mut mutation, &offers, None);
+        assert!(index.get_by_path(in_sub).unwrap().shared);
+        assert_eq!(mutation.changed_paths, 1);
+        assert!(offers.offers(&later_in_sub));
+        assert!(crate::sharing::indexer::DiscoveryScope::for_root(&folder, &lists).is_none());
+        assert!(!offers.offers(&key("D:/films/other.mkv")));
     }
 
     #[test]

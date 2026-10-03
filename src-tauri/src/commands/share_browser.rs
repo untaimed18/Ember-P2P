@@ -32,8 +32,9 @@ use serde::Serialize;
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
 use crate::commands::sharing::{
-    add_shared_folder_approved, admit_known_files, batch_share, finish_pick, offer_all_in_folder,
-    path_key_covers, persist_folder_allowlists, share_all_in_folder, FolderAddOutcome,
+    add_shared_folder_approved, admit_known_files, batch_share, finish_pick, limited_at_or_under,
+    offer_all_in_folder, path_key_covers, persist_folder_allowlists, share_all_in_folder,
+    FolderAddOutcome,
     FolderListsBefore, ShareApproval, SharedFolderPick,
 };
 use crate::commands::settings::{elide_for_dialog, shared_paths_overlap};
@@ -383,14 +384,15 @@ fn share_status_for(
     let display = display_fs_path(path);
     for existing in shared {
         if same_folder(&display, &display_fs_path(existing)) {
-            // Partly shared either because an allowlist limits what the next
-            // scan offers, or because files under it were taken off the
-            // network one at a time. Both are fixed by sharing the folder.
+            // Partly shared either because an allowlist (its own, or an
+            // unshared subfolder's) limits what the next scan offers, or
+            // because files under it were taken off the network one at a
+            // time. Both are fixed by sharing the folder.
             let key = normalize_path_key(&display);
             let held_back = offers
                 .get(&key)
                 .is_some_and(|offer| offer.offered < offer.indexed);
-            return if allowlists.contains_key(&key) || held_back {
+            return if limited_at_or_under(allowlists, &display) || held_back {
                 ShareBrowserStatus::Partial
             } else {
                 ShareBrowserStatus::Already
@@ -402,9 +404,12 @@ fn share_status_for(
                 return ShareBrowserStatus::ContainsShared;
             }
             return match allowlist_contains(allowlists, existing, path) {
+                Some(false) => ShareBrowserStatus::Overlap,
+                // Offered through its share, but unsharing it, or a folder
+                // under it, left it a list of its own.
+                _ if limited_at_or_under(allowlists, &display) => ShareBrowserStatus::Partial,
                 // A folder offered whole through its share's allowlist.
                 Some(true) => ShareBrowserStatus::Already,
-                Some(false) => ShareBrowserStatus::Overlap,
                 None => ShareBrowserStatus::Inherited,
             };
         }
@@ -422,9 +427,18 @@ fn containing_share<'a>(file: &Path, shared: &'a [PathBuf]) -> Option<&'a Path> 
         .map(PathBuf::as_path)
 }
 
+/// Whether the innermost allowlist above `file` in the share `folder` offers
+/// it: the share's own, or one a subfolder was left with when it was
+/// unshared. `None` when no list holds it.
 fn allowlist_contains(allowlists: &HashMap<String, Vec<String>>, folder: &Path, file: &Path) -> Option<bool> {
-    let list = allowlists.get(&normalize_path_key(&display_fs_path(folder)))?;
+    let share = display_fs_path(folder);
     let file_key = normalize_path_key(&display_fs_path(file));
+    let (_, list) = allowlists
+        .iter()
+        .filter(|(listed, _)| {
+            !same_folder(listed, &file_key) && path_within(&file_key, listed) && path_within(listed, &share)
+        })
+        .max_by_key(|(listed, _)| listed.len())?;
     Some(list.iter().any(|item| path_key_covers(item, &file_key)))
 }
 
@@ -1391,12 +1405,19 @@ fn new_share_roots(
     let mut roots = Vec::new();
     for folder in folders {
         let scope = if is_share(folder) {
-            if allowlist_for(folder, allowlists).is_none() {
+            if !limited_at_or_under(allowlists, folder) {
                 continue;
             }
             ShareScope::Widened
         } else if overlaps_share(folder, shared) {
-            continue;
+            // A subfolder of a share is only picked to lift the lists an
+            // unshare left on it.
+            if containing_share(Path::new(folder), shared).is_none()
+                || !limited_at_or_under(allowlists, folder)
+            {
+                continue;
+            }
+            ShareScope::Widened
         } else {
             ShareScope::Whole
         };
@@ -1669,17 +1690,24 @@ pub async fn share_browser_selection(
         .iter()
         .filter(|item| !item.is_file && item.was_partial)
         .filter(|item| {
-            allowlist_for(&item.path, &allowlists).is_none()
+            !limited_at_or_under(&allowlists, &item.path)
                 || approved.iter().any(|root| same_folder(root, &item.path))
         })
         .map(|item| item.path.clone())
         .collect();
     // Only ones the dialog above named as widened (or new) may lose their
-    // allowlist; lifting it is what puts the rest of the folder on the network.
+    // allowlists; lifting them is what puts the rest of the folder on the
+    // network. The lists of folders under one go too: an unshared subfolder
+    // keeps one, and it would hold back the whole share being asked for.
     let cleared: Vec<String> = folders
         .iter()
         .filter(|folder| approved.iter().any(|root| same_folder(root, folder)))
-        .filter_map(|folder| allowlists.keys().find(|key| same_folder(key, folder)).cloned())
+        .flat_map(|folder| {
+            allowlists
+                .keys()
+                .filter(|key| path_within(key, folder))
+                .cloned()
+        })
         .collect();
     if !cleared.is_empty() {
         persist_folder_allowlists(&state, &[], &cleared).await?;
@@ -1757,28 +1785,42 @@ pub async fn share_browser_selection(
 
     for path in folders {
         let promoting = promoted.iter().any(|folder| same_folder(folder, &path));
-        match add_shared_folder_approved(app.clone(), state.clone(), path.clone(), None, approval)
-            .await
-        {
-            Ok(add) if add.outcome == FolderAddOutcome::Added => result.added.push(path),
-            Ok(add) if promoting => {
-                let offered = if cleared.iter().any(|folder| same_folder(folder, &add.folder)) {
-                    offer_all_in_folder(app.clone(), state.inner(), &add.folder).await
-                } else {
-                    share_all_in_folder(app.clone(), state.inner(), &add.folder, &lists_before).await
-                };
-                match offered {
-                    Ok(paths) if paths.is_empty() => result.files_shared.push(add.folder.clone()),
-                    Ok(paths) => result.files_shared.extend(paths),
-                    Err(error) => {
-                        tracing::warn!("Could not offer the rest of {path}: {error}");
-                        result.failed.push(error);
-                    }
+        let in_share = containing_share(Path::new(&path), &shared_folders)
+            .is_some_and(|share| !same_folder(&display_fs_path(share), &path));
+        // A subfolder of a share is not added: it is offered through the share
+        // once the lists lifted above stop holding it back.
+        let folder = if promoting && in_share {
+            path.clone()
+        } else {
+            match add_shared_folder_approved(app.clone(), state.clone(), path.clone(), None, approval)
+                .await
+            {
+                Ok(add) if add.outcome == FolderAddOutcome::Added => {
+                    result.added.push(path);
+                    continue;
+                }
+                Ok(add) if promoting => add.folder,
+                Ok(_) => {
+                    remember_once(&mut result.already_shared, path);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!("Selected folder {path} was not shared: {error}");
+                    result.failed.push(error);
+                    continue;
                 }
             }
-            Ok(_) => remember_once(&mut result.already_shared, path),
+        };
+        let offered = if cleared.iter().any(|key| path_within(key, &folder)) {
+            offer_all_in_folder(app.clone(), state.inner(), &folder).await
+        } else {
+            share_all_in_folder(app.clone(), state.inner(), &folder, &lists_before).await
+        };
+        match offered {
+            Ok(paths) if paths.is_empty() => result.files_shared.push(folder),
+            Ok(paths) => result.files_shared.extend(paths),
             Err(error) => {
-                tracing::warn!("Selected folder {path} was not shared: {error}");
+                tracing::warn!("Could not offer the rest of {path}: {error}");
                 result.failed.push(error);
             }
         }
@@ -2236,6 +2278,48 @@ mod tests {
         assert_eq!(status(share), ShareBrowserStatus::Already);
         assert_eq!(status(sub), ShareBrowserStatus::Inherited);
         assert_eq!(status(parent), ShareBrowserStatus::ContainsShared);
+    }
+
+    /// Unsharing a subfolder of a whole share leaves it an empty list. Both
+    /// it and the share are then only partly shared, and picking either one
+    /// is a widening the user confirms, which lifts that list.
+    #[test]
+    fn an_unshared_subfolder_of_a_whole_share_can_be_shared_again() {
+        let (share, sub, deep, other, data) = if cfg!(windows) {
+            (
+                r"C:\Music",
+                r"C:\Music\Live",
+                r"C:\Music\Live\Disc1",
+                r"C:\Music\Other",
+                r"D:\Ember",
+            )
+        } else {
+            ("/music", "/music/live", "/music/live/disc1", "/music/other", "/ember")
+        };
+        let shared = [PathBuf::from(share)];
+        let allowlists = HashMap::from([(normalize_path_key(sub), Vec::new())]);
+        let status = |path: &str| {
+            share_status_for(
+                Path::new(path),
+                ShareBrowserKind::Folder,
+                &shared,
+                Path::new(data),
+                &allowlists,
+                &HashMap::new(),
+            )
+        };
+        assert_eq!(status(share), ShareBrowserStatus::Partial);
+        assert_eq!(status(sub), ShareBrowserStatus::Partial);
+        assert_eq!(status(deep), ShareBrowserStatus::Overlap, "held back by the subfolder's list");
+        assert_eq!(status(other), ShareBrowserStatus::Inherited);
+
+        for picked in [share, sub] {
+            assert_eq!(
+                new_share_roots(&[picked.to_string()], &[], &shared, &allowlists),
+                vec![NewShareRoot::new(picked, ShareScope::Widened)],
+            );
+        }
+        assert!(new_share_roots(&[other.to_string()], &[], &shared, &allowlists).is_empty());
     }
 
     #[test]

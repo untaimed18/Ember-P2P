@@ -1739,38 +1739,63 @@ impl KnownFileList {
     /// ceiling, and outlives any ordinary reorganisation of a library.
     const MAX_UNREFERENCED_RECORDS: usize = 50_000;
 
+    /// [`Self::MAX_UNREFERENCED_RECORDS`] for friends-only records, counted
+    /// apart so cached hashes never push one out.
+    const MAX_UNREFERENCED_FRIENDS_ONLY_RECORDS: usize = 50_000;
+
     /// Drop the oldest records whose content is no longer at any indexed path,
-    /// down to [`Self::MAX_UNREFERENCED_RECORDS`].
+    /// down to [`Self::MAX_UNREFERENCED_RECORDS`], and the oldest friends-only
+    /// ones down to [`Self::MAX_UNREFERENCED_FRIENDS_ONLY_RECORDS`].
     ///
     /// Records with a live path are never touched, so this can only discard
     /// cached hashes for files the library no longer contains — at worst a
     /// re-hash if one reappears, against an index that otherwise grows until it
-    /// can no longer be read. Nor are friends-only ones: the restriction is
-    /// kept nowhere else, and the file coming back would be public.
+    /// can no longer be read. Friends-only ones have a ceiling of their own:
+    /// the restriction is kept nowhere else, and the file coming back would be
+    /// public, but without one they would only ever accumulate.
     fn prune_unreferenced(&mut self, known_met: &Path) {
-        let mut pathless: Vec<([u8; 16], i64)> = self
-            .files
-            .iter()
-            .filter(|(hash, record)| !record.friends_only && !self.path_refs.contains_key(*hash))
-            .map(|(hash, record)| (*hash, record.modified_at))
-            .collect();
-        if prune_hold_active(known_met, pathless.len(), Self::MAX_UNREFERENCED_RECORDS) {
+        let mut plain: Vec<([u8; 16], i64)> = Vec::new();
+        let mut restricted: Vec<([u8; 16], i64)> = Vec::new();
+        for (hash, record) in self.files.iter().filter(|(hash, _)| !self.path_refs.contains_key(*hash)) {
+            let entry = (*hash, record.modified_at);
+            if record.friends_only {
+                restricted.push(entry);
+            } else {
+                plain.push(entry);
+            }
+        }
+        if prune_hold_active(known_met, plain.len(), Self::MAX_UNREFERENCED_RECORDS) {
             return;
         }
-        if pathless.len() <= Self::MAX_UNREFERENCED_RECORDS {
-            return;
+        let excess = self.remove_oldest(plain, Self::MAX_UNREFERENCED_RECORDS);
+        if excess > 0 {
+            warn!(
+                "Pruned {excess} known.met record(s) whose files are no longer in the library, \
+                 keeping the {} most recent",
+                Self::MAX_UNREFERENCED_RECORDS
+            );
         }
-        // Oldest first, so the most recently touched cached hashes survive.
-        pathless.sort_unstable_by_key(|(_, modified_at)| *modified_at);
-        let excess = pathless.len() - Self::MAX_UNREFERENCED_RECORDS;
-        for (hash, _) in pathless.into_iter().take(excess) {
+        let excess = self.remove_oldest(restricted, Self::MAX_UNREFERENCED_FRIENDS_ONLY_RECORDS);
+        if excess > 0 {
+            warn!(
+                "Pruned {excess} friends-only known.met record(s) whose files are no longer in the \
+                 library, keeping the {} most recent",
+                Self::MAX_UNREFERENCED_FRIENDS_ONLY_RECORDS
+            );
+        }
+    }
+
+    /// Remove the oldest of `records` beyond `keep`; returns how many went.
+    fn remove_oldest(&mut self, mut records: Vec<([u8; 16], i64)>, keep: usize) -> usize {
+        if records.len() <= keep {
+            return 0;
+        }
+        records.sort_unstable_by_key(|(_, modified_at)| *modified_at);
+        let excess = records.len() - keep;
+        for (hash, _) in records.into_iter().take(excess) {
             self.files.remove(&hash);
         }
-        warn!(
-            "Pruned {excess} known.met record(s) whose files are no longer in the library, \
-             keeping the {} most recent",
-            Self::MAX_UNREFERENCED_RECORDS
-        );
+        excess
     }
 
     pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
@@ -1781,6 +1806,12 @@ impl KnownFileList {
     /// a save it declined, after which disk still holds the old catalog. A
     /// caller that reports a change as durable must check it.
     pub fn save_reporting(&mut self, path: &Path) -> anyhow::Result<bool> {
+        self.save_within(path, MAX_KNOWN_MET_BYTES)
+    }
+
+    /// [`Self::save_reporting`] for a catalog that has to stay within
+    /// `max_bytes` to be read back.
+    fn save_within(&mut self, path: &Path, max_bytes: u64) -> anyhow::Result<bool> {
         // The share-intent migration reads known.met off-thread at startup. A
         // replace-fallback save leaves no known.met for a moment, and a probe
         // landing then records a previously seen catalog as lost, persisting
@@ -1864,6 +1895,7 @@ impl KnownFileList {
         // Encoded size of each record no library path refers to, the ones
         // that can go if the catalog outgrows what `load_checked` reads back.
         let mut pathless_sizes: Vec<([u8; 16], i64, u64)> = Vec::new();
+        let mut restricted_sizes: Vec<([u8; 16], i64, u64)> = Vec::new();
         for record in encodable {
             let record_start = buf.len();
             buf.write_u32::<LittleEndian>(
@@ -1996,25 +2028,33 @@ impl KnownFileList {
 
             buf.write_u32::<LittleEndian>(tag_count)?;
             buf.write_all(&tags)?;
-            if !record.friends_only && !self.path_refs.contains_key(&record.file_hash) {
-                pathless_sizes.push((
+            if !self.path_refs.contains_key(&record.file_hash) {
+                let entry = (
                     record.file_hash,
                     record.modified_at,
                     (buf.len() - record_start) as u64,
-                ));
+                );
+                if record.friends_only {
+                    restricted_sizes.push(entry);
+                } else {
+                    pathless_sizes.push(entry);
+                }
             }
         }
 
         // A catalog over the read ceiling would load as "cannot read" at the
         // next launch, which turns sharing off. That is how a prune hold after
         // a large import would end, so the ceiling wins over the hold: the
-        // oldest pathless records go until it fits, and if records with live
+        // oldest pathless records go until it fits, friends-only ones only
+        // once every other pathless record has, and if records with live
         // paths alone are too many, the readable catalog on disk is kept.
-        if buf.len() as u64 > MAX_KNOWN_MET_BYTES {
-            let mut excess = buf.len() as u64 - MAX_KNOWN_MET_BYTES;
+        if buf.len() as u64 > max_bytes {
+            let mut excess = buf.len() as u64 - max_bytes;
             pathless_sizes.sort_unstable_by_key(|(_, modified_at, _)| *modified_at);
+            restricted_sizes.sort_unstable_by_key(|(_, modified_at, _)| *modified_at);
+            let plain = pathless_sizes.len();
             let mut shed = Vec::new();
-            for (hash, _, size) in pathless_sizes {
+            for (hash, _, size) in pathless_sizes.into_iter().chain(restricted_sizes) {
                 if excess == 0 {
                     break;
                 }
@@ -2023,8 +2063,8 @@ impl KnownFileList {
             }
             if excess > 0 {
                 anyhow::bail!(
-                    "known.met would be {} bytes, over the {MAX_KNOWN_MET_BYTES} it can be read back \
-                     at; keeping the catalog already on disk",
+                    "known.met would be {} bytes, over the {max_bytes} it can be read back at; \
+                     keeping the catalog already on disk",
                     buf.len()
                 );
             }
@@ -2032,11 +2072,12 @@ impl KnownFileList {
                 self.files.remove(hash);
             }
             warn!(
-                "Dropped the {} oldest known.met record(s) whose files are not in the library, \
-                 to keep the catalog readable",
-                shed.len()
+                "Dropped the {} oldest known.met record(s) whose files are not in the library \
+                 ({} of them friends-only), to keep the catalog readable",
+                shed.len(),
+                shed.len().saturating_sub(plain)
             );
-            return self.save_reporting(path);
+            return self.save_within(path, max_bytes);
         }
 
         crate::security::atomic_write(path, &buf, true)?;
@@ -2920,6 +2961,84 @@ mod tests {
         assert!(kf.find_by_hash(&[0xFF; 16]).is_some_and(|record| record.friends_only));
         assert_eq!(kf.file_count(), KnownFileList::MAX_UNREFERENCED_RECORDS + 1);
         assert!(kf.find_by_hash(&pathless(0, 0).file_hash).is_none(), "the oldest plain one went");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pathless friends-only records are kept apart from the cached hashes,
+    /// but not without bound: past their own ceiling the oldest go.
+    #[test]
+    fn pathless_friends_only_records_have_a_ceiling_of_their_own() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-prune-fo-cap-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut kf = KnownFileList::new();
+        kf.files.insert([0xEE; 16], pathless(0xEE, 1));
+        for n in 0..=KnownFileList::MAX_UNREFERENCED_FRIENDS_ONLY_RECORDS as u32 {
+            let mut record = pathless(0, 1_000 + i64::from(n));
+            record.file_hash[..4].copy_from_slice(&n.to_le_bytes());
+            record.friends_only = true;
+            kf.files.insert(record.file_hash, record);
+        }
+        kf.prune_unreferenced(&dir.join("known.met"));
+        assert_eq!(kf.file_count(), KnownFileList::MAX_UNREFERENCED_FRIENDS_ONLY_RECORDS + 1);
+        assert!(kf.find_by_hash(&pathless(0, 0).file_hash).is_none(), "the oldest friends-only one went");
+        assert!(kf.find_by_hash(&[0xEE; 16]).is_some(), "a cached hash under its own ceiling stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A catalog over the read ceiling sheds every other pathless record
+    /// first, then the oldest friends-only ones, rather than refusing every
+    /// later save. Only records with live paths are never shed.
+    #[test]
+    fn the_size_shed_reaches_friends_only_records_before_giving_up() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-shed-fo-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let restricted = |hash: u8, modified_at: i64| {
+            let mut record = pathless(hash, modified_at);
+            record.friends_only = true;
+            record
+        };
+        let catalog = |pathless_records: Vec<KnownFileRecord>| {
+            let mut kf = KnownFileList::new();
+            kf.mark_authoritative_for_tests();
+            kf.add_or_update(sample_record());
+            for record in pathless_records {
+                kf.files.insert(record.file_hash, record);
+            }
+            kf
+        };
+        let saved_len = |mut kf: KnownFileList, name: &str| {
+            let path = dir.join(name);
+            assert!(kf.save_reporting(&path).unwrap());
+            std::fs::metadata(&path).unwrap().len()
+        };
+        let live_only = saved_len(catalog(Vec::new()), "live.met");
+        let one_restricted = saved_len(catalog(vec![restricted(1, 1)]), "one.met") - live_only;
+
+        let path = dir.join("known.met");
+        let mut kf = catalog(vec![
+            pathless(0xEE, 50),
+            restricted(1, 1),
+            restricted(2, 2),
+            restricted(3, 3),
+        ]);
+        assert!(kf.save_within(&path, live_only + one_restricted).unwrap());
+        let read = KnownFileList::load_checked(&path).unwrap();
+        assert_eq!(read.file_count(), 2);
+        assert!(read.find_by_hash(&[0x42; 16]).is_some(), "a record with a live path stays");
+        assert!(read.find_by_hash(&[3; 16]).is_some_and(|record| record.friends_only));
+
+        let before = std::fs::read(&path).unwrap();
+        let mut too_big = catalog(vec![restricted(4, 4)]);
+        assert!(too_big.save_within(&path, live_only - 1).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before, "live paths alone too many");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
