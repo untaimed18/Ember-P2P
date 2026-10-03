@@ -701,20 +701,23 @@ fn spawn_deferred_partial_cleanup(
 
 /// Relocate a failed download's `.part` into `Downloads/` so "Remove from List"
 /// keeps the bytes instead of deleting Temp/{uuid}.part. Named `*.part` so it
-/// is not mistaken for a completed file. `Ok` once the bytes are safe to
-/// delete from `Temp`: they were relocated, or there are none in any folder
-/// that can be looked at. `Err`, the coded error to show, leaves everything
-/// as it was, with the download listed: the move failed, or the folder its
-/// part files were last in — the current one when there is none — cannot be
-/// reached.
+/// is not mistaken for a completed file. `Ok` once the row may go: the bytes
+/// were relocated, there are none in any folder that can be looked at, or
+/// the folder its part files were last in — the current one when there is
+/// none — cannot be reached. That last is `Ok(true)`: the part files are to
+/// be left as they are, never deleted, since nothing can be moved off a drive
+/// that is not there. Refusing then left a failed row on a drive that is gone
+/// for good impossible to remove, since a failed row offers nothing else.
+/// `Err`, the coded error to show, leaves everything as it was, with the
+/// download listed: the move failed.
 async fn preserve_failed_partial(
     folders: &crate::storage::part_folders::DownloadFolders,
     transfer_id: &str,
     file_name: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     use crate::storage::part_folders::PartLocation;
     if uuid::Uuid::parse_str(transfer_id).is_err() {
-        return Ok(());
+        return Ok(false);
     }
     let not_moved = || {
         coded(
@@ -729,17 +732,14 @@ async fn preserve_failed_partial(
     };
     let part_root = match located {
         Ok(PartLocation::Found(root)) => root,
-        Ok(PartLocation::Absent { unreachable }) if unreachable.is_empty() => return Ok(()),
+        Ok(PartLocation::Absent { unreachable }) if unreachable.is_empty() => return Ok(false),
         Ok(PartLocation::Absent { unreachable }) => {
             tracing::warn!(
-                "Keeping failed download {transfer_id} listed: {} holds its bytes and cannot \
-                 be reached",
+                "Removing failed download {transfer_id} from the list; its bytes stay in {}, \
+                 which cannot be reached",
                 unreachable[0].display()
             );
-            return Err(coded(
-                "transfers_part_folder_unreachable",
-                "The drive with this download's progress is not connected",
-            ));
+            return Ok(true);
         }
         Err(error) => {
             tracing::warn!("preserve_failed_partial: folder lookup failed: {error}");
@@ -756,7 +756,7 @@ async fn preserve_failed_partial(
         }
     };
     let Some((verified, identity)) = pinned else {
-        return Ok(());
+        return Ok(false);
     };
     let safe = crate::security::sanitize_filename(file_name);
     let dest_name = if safe
@@ -782,7 +782,7 @@ async fn preserve_failed_partial(
     {
         Ok(Ok(path)) => {
             tracing::info!("Preserved failed download partial as {}", path.display());
-            Ok(())
+            Ok(false)
         }
         Ok(Err(error)) => {
             tracing::warn!("Failed to preserve partial for {transfer_id}, keeping it: {error}");
@@ -1403,7 +1403,24 @@ pub async fn pause_transfers_batch(
 /// the user lets go of progress on a drive that is not coming back.
 async fn start_held_over(state: &AppState, ids: &[String]) -> Vec<String> {
     let current = state.config.read().await.settings.download_folder.clone();
-    let restarted: Vec<String> = ids
+    // Only a row still waiting for its drive is let go of. One paused or
+    // stopped since it was held is being resumed, not abandoned: Pause All
+    // then Resume All must not throw away progress on a drive that is only
+    // unplugged, so it goes back to waiting and is held again if need be.
+    let waiting: Vec<String> = {
+        let manager = state.transfer_manager.read().await;
+        ids.iter()
+            .filter(|id| {
+                !manager.queue.iter().any(|t| {
+                    &t.id == *id && matches!(t.status, TransferStatus::Stopped | TransferStatus::Paused)
+                }) && !manager.active.get(id.as_str()).is_some_and(|t| {
+                    matches!(t.status, TransferStatus::Paused | TransferStatus::Stopped)
+                })
+            })
+            .cloned()
+            .collect()
+    };
+    let restarted: Vec<String> = waiting
         .iter()
         .filter(|id| {
             crate::storage::part_folders::start_over_if_held(id, Path::new(&current))
@@ -1415,6 +1432,15 @@ async fn start_held_over(state: &AppState, ids: &[String]) -> Vec<String> {
             "Starting {} held download(s) over in the current download folder",
             restarted.len()
         );
+        {
+            // Otherwise the row keeps saying the drive is not connected, and
+            // keeps offering a Resume that no longer does anything, until a
+            // source connects.
+            let mut manager = state.transfer_manager.write().await;
+            for id in &restarted {
+                manager.set_failure_context(id, None, None, None);
+            }
+        }
         let records: Vec<(String, String)> =
             restarted.iter().map(|id| (id.clone(), current.clone())).collect();
         let db = state.db.clone();
@@ -2058,20 +2084,52 @@ pub async fn remove_transfer(
     // anything else, since the cancel below deletes its `.part.met`. Until
     // they are safe the row, the `.part` and the `.part.met` stay as they
     // are, and the user is told why.
+    let mut leave_files = false;
     if let Some(failed) = snapshot.filter(|t| {
         t.status == TransferStatus::Failed && t.direction == TransferDirection::Download
     }) {
-        preserve_failed_partial(&dl_folders, &transfer_id, &failed.file_name).await?;
+        leave_files = preserve_failed_partial(&dl_folders, &transfer_id, &failed.file_name).await?;
     }
     let promoted = {
         let mut manager = state.transfer_manager.write().await;
         if let Some(control) = manager.get_control(&transfer_id) {
             // Remove-from-List deletes the Temp `.part`/`.part.met` too (a
-            // failed download's bytes were relocated above).
-            control.discard();
+            // failed download's bytes were relocated above), unless they are
+            // on a drive that is not there and are to be left alone.
+            if leave_files {
+                control.cancel();
+            } else {
+                control.discard();
+            }
         }
         manager.remove(&transfer_id)
     };
+
+    if leave_files {
+        // The non-deleting teardown, as Stop sends: nothing on that drive is
+        // removed or queued for removal when it comes back.
+        if let Err(e) = bounded_send(
+            &state.network_tx,
+            NetworkCommand::CancelDownload {
+                transfer_id: transfer_id.clone(),
+                cleanup_ack: None,
+            },
+        )
+        .await
+        {
+            tracing::warn!("remove_transfer: network task unavailable for {transfer_id}: {e}");
+        }
+        let db = state.db.clone();
+        let tid = transfer_id.clone();
+        db_blocking(move || {
+            if let Err(e) = db.remove_transfer(&tid) {
+                tracing::warn!("Failed to remove transfer {tid} from database: {e}");
+            }
+        })
+        .await;
+        start_promoted_downloads(&state, &promoted).await;
+        return Ok(());
+    }
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let send_result = bounded_send(
@@ -3070,13 +3128,14 @@ mod ipc_lifecycle_tests {
             super::preserve_failed_partial(&with_offline, &unrelated, "movie.mkv").await;
         crate::storage::part_folders::simulate_unplugged(&volume, false);
         assert_eq!(
-            error_code(&preserved.unwrap_err()),
-            "transfers_part_folder_unreachable",
-            "its bytes are on the drive that is not there"
+            preserved,
+            Ok(true),
+            "its bytes are on a drive that is not there: the row may go, the files stay untouched"
         );
-        assert!(
-            not_there.is_ok(),
-            "a drive this download was never on is no reason to keep it listed"
+        assert_eq!(
+            not_there,
+            Ok(false),
+            "a drive this download was never on leaves nothing to keep"
         );
         let _ = std::fs::remove_dir_all(base);
     }
@@ -3111,7 +3170,7 @@ mod ipc_lifecycle_tests {
         crate::storage::part_folders::simulate_unplugged(&root, true);
         let unreachable = super::preserve_failed_partial(&folders, &unplugged, "song.mp3").await;
         crate::storage::part_folders::simulate_unplugged(&root, false);
-        assert_eq!(error_code(&unreachable.unwrap_err()), "transfers_part_folder_unreachable");
+        assert_eq!(unreachable, Ok(true), "an unplugged download folder no longer blocks removal");
         let _ = std::fs::remove_dir_all(base);
     }
 

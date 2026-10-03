@@ -3169,7 +3169,6 @@
   "error_transfers_open_task_failed": "Öffnungsaufgabe fehlgeschlagen: {detail}",
   "error_transfers_part_file_not_found": "Part-Datei nicht gefunden — Download wurde möglicherweise nicht gestartet",
   "error_transfers_part_tracker_task_failed": "Downloadfortschritt konnte nicht gelesen werden: {detail}",
-  "error_transfers_part_folder_unreachable": "Das Laufwerk mit dem Fortschritt dieses Downloads ist nicht verbunden, daher bleibt er in der Liste. Schließen Sie das Laufwerk an und versuchen Sie es erneut.",
   "error_transfers_preserve_partial_failed": "Der Fortschritt dieses Downloads konnte nicht in den Ordner „Downloads“ verschoben werden, daher bleibt er in der Liste. Prüfen Sie den Ordner und versuchen Sie es erneut.",
   "error_transfers_path_escapes_dir": "Dateipfad zeigt aus dem Downloadordner heraus",
   "error_transfers_path_non_utf8": "Pfad enthält Nicht-UTF-8-Zeichen",

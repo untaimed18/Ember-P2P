@@ -3166,7 +3166,6 @@
   "error_transfers_open_task_failed": "Задача открытия не удалась: {detail}",
   "error_transfers_part_file_not_found": "Файл части не найден — загрузка, возможно, не началась",
   "error_transfers_part_tracker_task_failed": "Не удалось прочитать ход загрузки: {detail}",
-  "error_transfers_part_folder_unreachable": "Диск с прогрессом этой загрузки не подключён, поэтому она остаётся в списке. Подключите диск и попробуйте снова.",
   "error_transfers_preserve_partial_failed": "Не удалось переместить прогресс этой загрузки в папку Downloads, поэтому она остаётся в списке. Проверьте папку и попробуйте снова.",
   "error_transfers_path_escapes_dir": "Путь к файлу указывает за пределы папки загрузок",
   "error_transfers_path_non_utf8": "Путь содержит символы не в UTF-8",

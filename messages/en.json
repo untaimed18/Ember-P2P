@@ -3169,7 +3169,6 @@
   "error_transfers_open_task_failed": "Open task failed: {detail}",
   "error_transfers_part_file_not_found": "Part file not found — download may not have started",
   "error_transfers_part_tracker_task_failed": "Could not read download progress: {detail}",
-  "error_transfers_part_folder_unreachable": "The drive with this download's progress isn't connected, so it stays in the list. Connect the drive, then try again.",
   "error_transfers_preserve_partial_failed": "This download's progress couldn't be moved into the Downloads folder, so it stays in the list. Check the folder, then try again.",
   "error_transfers_path_escapes_dir": "File path points outside the download folder",
   "error_transfers_path_non_utf8": "Path contains non-UTF8 characters",

@@ -3166,7 +3166,6 @@
   "error_transfers_open_task_failed": "打开任务失败：{detail}",
   "error_transfers_part_file_not_found": "未找到分块文件 — 下载可能尚未开始",
   "error_transfers_part_tracker_task_failed": "无法读取下载进度：{detail}",
-  "error_transfers_part_folder_unreachable": "保存此下载进度的驱动器未连接，因此它仍保留在列表中。请连接该驱动器，然后重试。",
   "error_transfers_preserve_partial_failed": "无法将此下载的进度移入 Downloads 文件夹，因此它仍保留在列表中。请检查该文件夹，然后重试。",
   "error_transfers_path_escapes_dir": "文件路径指向下载文件夹之外",
   "error_transfers_path_non_utf8": "路径包含非 UTF8 字符",

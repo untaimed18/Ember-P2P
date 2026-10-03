@@ -3166,7 +3166,6 @@
   "error_transfers_open_task_failed": "Falló la tarea de apertura: {detail}",
   "error_transfers_part_file_not_found": "Archivo de parte no encontrado — puede que la descarga no haya comenzado",
   "error_transfers_part_tracker_task_failed": "No se pudo leer el progreso de la descarga: {detail}",
-  "error_transfers_part_folder_unreachable": "La unidad con el progreso de esta descarga no está conectada, así que sigue en la lista. Conecta la unidad y vuelve a intentarlo.",
   "error_transfers_preserve_partial_failed": "No se pudo mover el progreso de esta descarga a la carpeta Downloads, así que sigue en la lista. Revisa la carpeta y vuelve a intentarlo.",
   "error_transfers_path_escapes_dir": "La ruta del archivo apunta fuera de la carpeta de descargas",
   "error_transfers_path_non_utf8": "La ruta contiene caracteres no UTF8",

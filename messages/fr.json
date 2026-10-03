@@ -3166,7 +3166,6 @@
   "error_transfers_open_task_failed": "Échec de la tâche d'ouverture : {detail}",
   "error_transfers_part_file_not_found": "Fichier de partie introuvable — le téléchargement n'a peut-être pas démarré",
   "error_transfers_part_tracker_task_failed": "Impossible de lire la progression du téléchargement : {detail}",
-  "error_transfers_part_folder_unreachable": "Le lecteur qui contient la progression de ce téléchargement n'est pas connecté : il reste donc dans la liste. Connectez le lecteur, puis réessayez.",
   "error_transfers_preserve_partial_failed": "La progression de ce téléchargement n'a pas pu être déplacée dans le dossier Downloads : il reste donc dans la liste. Vérifiez le dossier, puis réessayez.",
   "error_transfers_path_escapes_dir": "Le chemin du fichier pointe hors du dossier de téléchargement",
   "error_transfers_path_non_utf8": "Le chemin contient des caractères non UTF8",
