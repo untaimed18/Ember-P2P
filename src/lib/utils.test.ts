@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { getLocale } from '$lib/i18n';
 import {
+  clampInputUtf8Bytes,
   clampUtf8Bytes,
   confusableSkeleton,
   disambiguatedMemberName,
@@ -46,6 +47,98 @@ describe('clampUtf8Bytes', () => {
     expect(clamped).toBe('a' + '🔥'.repeat(31));
     expect(bytes(clamped)).toBeLessThanOrEqual(128);
     expect(clamped).not.toMatch(/[\uD800-\uDBFF]$/);
+  });
+
+  it('keeps an emoji ZWJ sequence or an accented letter whole', () => {
+    const family = '👨‍👩‍👧';
+    expect(bytes(family)).toBe(18);
+    expect(clampUtf8Bytes('a'.repeat(110) + family, 127)).toBe('a'.repeat(110));
+    expect(clampUtf8Bytes('a'.repeat(110) + family, 128)).toBe('a'.repeat(110) + family);
+    const accented = 'e\u0301';
+    expect(clampUtf8Bytes('a'.repeat(126) + accented, 128)).toBe('a'.repeat(126));
+  });
+
+  it('falls back to whole code points without Intl.Segmenter', () => {
+    const segmenter = Intl.Segmenter;
+    Reflect.deleteProperty(Intl, 'Segmenter');
+    try {
+      expect(clampUtf8Bytes('a' + '🔥'.repeat(40), 128)).toBe('a' + '🔥'.repeat(31));
+      expect(clampUtf8Bytes('a'.repeat(126) + 'e\u0301', 128)).toBe('a'.repeat(126) + 'e');
+    } finally {
+      Object.assign(Intl, { Segmenter: segmenter });
+    }
+  });
+});
+
+describe('clampInputUtf8Bytes', () => {
+  /** An `<input>` after the browser applied an edit, caret at `caret`. */
+  function edited(value: string, caret = value.length, isComposing = false) {
+    const input = {
+      value,
+      selectionStart: caret as number | null,
+      selectionEnd: caret as number | null,
+      setSelectionRange(start: number, end: number) {
+        input.selectionStart = start;
+        input.selectionEnd = end;
+      },
+    };
+    return { input, event: { currentTarget: input, isComposing } as unknown as Event };
+  }
+
+  it('passes an edit within the cap through untouched', () => {
+    const { input, event } = edited('Ember user');
+    expect(clampInputUtf8Bytes(event, 16, 'Ember use')).toBe('Ember user');
+    expect(input.value).toBe('Ember user');
+  });
+
+  it('drops a letter typed in the middle at the cap, not the last one, and keeps the caret', () => {
+    const previous = 'abcdefgh';
+    const { input, event } = edited('abcXdefgh', 4);
+    expect(clampInputUtf8Bytes(event, 8, previous)).toBe(previous);
+    expect(input.value).toBe(previous);
+    expect(input.selectionStart).toBe(3);
+  });
+
+  it('keeps what fits of a paste in the middle and puts the caret after it', () => {
+    const { input, event } = edited('ab12345cd', 7);
+    expect(clampInputUtf8Bytes(event, 6, 'abcd')).toBe('ab12cd');
+    expect(input.selectionStart).toBe(4);
+    expect(input.selectionEnd).toBe(4);
+  });
+
+  it('places a repeated letter where the caret says it was typed', () => {
+    const { input, event } = edited('aaab', 2);
+    expect(clampInputUtf8Bytes(event, 3, 'aab')).toBe('aab');
+    expect(input.selectionStart).toBe(1);
+  });
+
+  it('cuts a pasted emoji sequence whole', () => {
+    const family = '👨‍👩‍👧';
+    const { input, event } = edited(`ab${family}🔥cd`, 2 + family.length + 2);
+    expect(clampInputUtf8Bytes(event, 4 + 18, 'abcd')).toBe(`ab${family}cd`);
+    expect(input.selectionStart).toBe(2 + family.length);
+  });
+
+  it('cuts at the end only when the value was over the cap before the edit', () => {
+    const { input, event } = edited('abcdefX', 7);
+    expect(clampInputUtf8Bytes(event, 4, 'abcdef')).toBe('abcd');
+    expect(input.selectionStart).toBe(4);
+  });
+
+  it('waits out IME composition, then trims what it inserted', () => {
+    const previous = '火'.repeat(41);
+    const composing = `火deng${'火'.repeat(40)}`;
+    const { input, event } = edited(composing, 5, true);
+    expect(clampInputUtf8Bytes(event, 128, previous)).toBe(composing);
+    expect(input.value).toBe(composing);
+
+    input.value = `火灯灯${'火'.repeat(40)}`;
+    input.setSelectionRange(3, 3);
+    const compositionEnd = { currentTarget: input } as unknown as Event;
+    // The store already holds the composing text; the edit is measured from
+    // the value before composition began.
+    expect(clampInputUtf8Bytes(compositionEnd, 128, composing)).toBe(`火灯${'火'.repeat(40)}`);
+    expect(input.selectionStart).toBe(2);
   });
 });
 

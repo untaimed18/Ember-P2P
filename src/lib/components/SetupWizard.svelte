@@ -572,10 +572,10 @@
             <input
               id="nickname"
               type="text"
-              bind:value={nickname}
+              value={nickname}
               maxlength="128"
-              oninput={(e) => (nickname = clampInputUtf8Bytes(e, NICKNAME_MAX_BYTES))}
-              oncompositionend={(e) => (nickname = clampInputUtf8Bytes(e, NICKNAME_MAX_BYTES))}
+              oninput={(e) => (nickname = clampInputUtf8Bytes(e, NICKNAME_MAX_BYTES, nickname))}
+              oncompositionend={(e) => (nickname = clampInputUtf8Bytes(e, NICKNAME_MAX_BYTES, nickname))}
               class="text-input"
               placeholder={m.wizard_nickname_placeholder()}
             />

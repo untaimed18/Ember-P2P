@@ -149,13 +149,13 @@ pub mod logging {
         static PEER_TEXT: OnceLock<Regex> = OnceLock::new();
 
         let had_newline = input.ends_with('\n');
-        let mut value = input
-            .trim_end_matches(['\r', '\n'])
-            .replace(['\r', '\n'], "\\n");
+        // Newlines stay real until the end so a path stops at one, and are
+        // escaped last so nothing a peer sent can start a record of its own.
+        let mut value = input.trim_end_matches(['\r', '\n']).to_owned();
         value = PEER_TEXT
             .get_or_init(|| {
                 Regex::new(
-                    r#"(?i)(?:\b(?:nick(?:name)?|query|search(?:_term)?)\s*=\s*|\b(?:search|query)[^'"\r\n]{0,48})['"][^'"\r\n]*['"]"#,
+                    r#"(?i)(?:\b(?:nick(?:name)?|query|search(?:_term)?)\s*=\s*|\b(?:search|query)[^'"]{0,48})['"][^'"]*['"]"#,
                 )
                 .expect("static peer-text regex")
             })
@@ -163,21 +163,43 @@ pub mod logging {
                 format!("<text:{}>", pseudonym(&caps[0]))
             })
             .into_owned();
-        value = replace_regex(
-            value,
-            &WINDOWS_PATH,
-            r#"(?i)\b[A-Z]:[\\/][^\r\n\t,;)"']+"#,
-            "path",
-        );
-        // The leading `/` must follow a delimiter, never a word char, `:` or
-        // another `/`, so URLs, ed2k:// links and ratios like 3/4 survive.
-        value = UNIX_PATH
+        // A path is directory components, which may hold spaces, then a last
+        // component that only takes another space-separated word when it has
+        // an extension, so the words after a path are left readable. A
+        // component may hold a `(...)` group (`Program Files (x86)`), while a
+        // lone `)` closes the bracket the path sits in. A literal `\n`, `\r`
+        // or `\t` is a line break escaped by a `Debug` format, not part of
+        // the path.
+        value = WINDOWS_PATH
             .get_or_init(|| {
-                Regex::new(r#"(^|[\s=(\[{<"'`,])(/[^\s/,;)"'][^\r\n\t,;)"']*)"#)
-                    .expect("static Unix path regex")
+                let part = r#"(?:[^\s\\/,;()"']|\([^\s\\/,;()"']*\))"#;
+                Regex::new(&format!(
+                    r"(?i)(^|\\[nrt]|\W)([A-Z]:[\\/]+(?:{part}+(?:\x20+{part}+)*[\\/]+)*(?:{part}+(?:\x20+{part}+\.{part}+)*)?)"
+                ))
+                .expect("static Windows path regex")
             })
             .replace_all(&value, |caps: &Captures<'_>| {
                 format!("{}<path:{}>", &caps[1], pseudonym(&caps[2]))
+            })
+            .into_owned();
+        // The leading `/` must follow a delimiter, never a word char or
+        // another `/`, so URLs, ed2k:// links and ratios like 3/4 survive.
+        // `file://` keeps its scheme, and an HTTP request line keeps its
+        // target.
+        value = UNIX_PATH
+            .get_or_init(|| {
+                let part = r#"(?:[^\s\\/,;()"']|\([^\s\\/,;()"']*\))"#;
+                let last = format!(r"{part}+(?:\x20+{part}+\.{part}+)*");
+                Regex::new(&format!(
+                    r#"(\b(?:GET|HEAD|POST|PUT|DELETE|PATCH|OPTIONS)\x20+/\S*)|(^|[\s=(\[{{<"'`,:]|\\[nrt]|(?i:file://))(/(?:(?:{part}+(?:\x20+{part}+)*/+)+(?:{last})?|{last}))"#
+                ))
+                .expect("static Unix path regex")
+            })
+            .replace_all(&value, |caps: &Captures<'_>| {
+                if caps.get(1).is_some() {
+                    return caps[0].to_owned();
+                }
+                format!("{}<path:{}>", &caps[2], pseudonym(&caps[3]))
             })
             .into_owned();
         value = replace_regex(value, &HEX_ID, r"(?i)\b[0-9a-f]{32,128}\b", "id");
@@ -205,6 +227,7 @@ pub mod logging {
                 }
             })
             .into_owned();
+        let mut value = value.replace(['\r', '\n'], "\\n");
         if had_newline {
             value.push('\n');
         }
@@ -272,8 +295,74 @@ pub mod logging {
                 "ratio 3/4 reached",
                 "rate 12 KB/s, peers 3 / 5",
                 "tcp/udp relay and/or direct",
+                "GET /api/v1/status 200",
+                "POST /announce?info=1 took 3 ms",
+                "request HEAD /index.html, then DELETE /api/item/7",
+                "see https://example.com/a: ok",
             ] {
                 assert_eq!(redact_normal_log(line), line);
+            }
+        }
+
+        #[test]
+        fn paths_after_a_line_break_are_redacted() {
+            for (line, path) in [
+                (r"read failed:\n/home/canary/secret.bin", "/home/canary/secret.bin"),
+                (r"error=\r/home/canary/secret.bin", "/home/canary/secret.bin"),
+                (r"tab\t/home/canary/secret.bin", "/home/canary/secret.bin"),
+                ("read failed:\n/home/canary/secret.bin", "/home/canary/secret.bin"),
+                (r"read failed:\nC:\Users\canary\secret.bin", r"C:\Users\canary\secret.bin"),
+                ("read failed:\nC:\\Users\\canary\\secret.bin", r"C:\Users\canary\secret.bin"),
+                (r#"path="C:\\Users\\canary\\secret.bin""#, r"Users\\canary"),
+            ] {
+                let redacted = redact_normal_log(line);
+                assert!(!redacted.contains(path), "{line} -> {redacted}");
+                assert!(!redacted.contains("canary"), "{line} -> {redacted}");
+                assert!(redacted.contains("<path:"), "{line} -> {redacted}");
+                assert!(!redacted.contains('\n'), "{line} -> {redacted}");
+            }
+            assert!(redact_normal_log("failed:\n/home/canary/x")
+                .starts_with(r"failed:\n<path:"));
+        }
+
+        #[test]
+        fn file_urls_and_colon_prefixed_paths_are_redacted() {
+            let redacted = redact_normal_log("opening file:///home/canary/secret.bin now");
+            assert!(redacted.starts_with("opening file://<path:"), "{redacted}");
+            assert!(redacted.ends_with("> now"), "{redacted}");
+            assert!(!redacted.contains("canary"), "{redacted}");
+
+            let redacted = redact_normal_log("file:///C:/Users/canary/secret.bin");
+            assert!(!redacted.contains("canary"), "{redacted}");
+
+            for line in ["path:/home/canary/share", "missing:/home/canary/share"] {
+                let redacted = redact_normal_log(line);
+                assert!(!redacted.contains("canary"), "{line} -> {redacted}");
+                assert!(redacted.contains(":<path:"), "{line} -> {redacted}");
+            }
+        }
+
+        #[test]
+        fn the_words_after_a_path_stay_readable() {
+            for (line, tail) in [
+                ("opening /home/canary/secret.bin for upload", " for upload"),
+                (r"opening C:\Users\canary\secret.bin for upload", " for upload"),
+                ("moved /home/canary/a.bin and retried", " and retried"),
+                ("scan /Users/canary/Library/Application Support/Ember done", " done"),
+            ] {
+                let redacted = redact_normal_log(line);
+                assert!(!redacted.contains("canary"), "{line} -> {redacted}");
+                assert!(redacted.ends_with(&format!(">{tail}")), "{line} -> {redacted}");
+            }
+            for line in [
+                "opening /home/canary/My Secret.bin",
+                r"opening C:\Users\canary\My Secret.bin",
+                r"installed to C:\Program Files (x86)\canary\Ember",
+            ] {
+                let redacted = redact_normal_log(line);
+                assert!(!redacted.contains("canary"), "{line} -> {redacted}");
+                assert!(!redacted.contains("Secret"), "{line} -> {redacted}");
+                assert!(!redacted.contains("x86"), "{line} -> {redacted}");
             }
         }
 

@@ -44,8 +44,9 @@ export const SEARCH_HISTORY_STORAGE_KEY = 'search-recent-queries-v1';
 type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
 
 /**
- * The backed-up keys that are set, for a new backup. Search history stays out
- * when the user has turned off saving it.
+ * The backed-up keys that are set, for a new backup. Search history goes in
+ * only when saving it is known to be on: `undefined` (settings not loaded yet)
+ * leaves it out, as turning saving off is a privacy choice.
  *
  * Null without storage rather than an empty snapshot: a restore reads a key
  * missing from the snapshot as unset and clears it, so an empty one would wipe
@@ -53,12 +54,12 @@ type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
  */
 export function collectBackupPrefs(
   storage: StorageLike | null,
-  options: { searchHistory: boolean },
+  options: { searchHistory: boolean | undefined },
 ): Record<string, string> | null {
   if (!storage) return null;
   const prefs: Record<string, string> = {};
   for (const key of BACKED_UP_STORAGE_KEYS) {
-    if (key === SEARCH_HISTORY_STORAGE_KEY && !options.searchHistory) continue;
+    if (key === SEARCH_HISTORY_STORAGE_KEY && options.searchHistory !== true) continue;
     try {
       const value = storage.getItem(key);
       if (value !== null) prefs[key] = value;

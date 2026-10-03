@@ -89,6 +89,16 @@ describe('collectBackupPrefs', () => {
     expect(collectBackupPrefs(storage, { searchHistory: false })).toEqual({});
   });
 
+  it('leaves search history out while the setting is not known', () => {
+    const storage = memoryStorage({
+      [SEARCH_HISTORY_STORAGE_KEY]: '["linux"]',
+      'ember-theme': 'dark',
+    });
+    expect(collectBackupPrefs(storage, { searchHistory: undefined })).toEqual({
+      'ember-theme': 'dark',
+    });
+  });
+
   it('survives storage that throws or is missing', () => {
     const broken = {
       getItem: () => {

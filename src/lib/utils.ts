@@ -314,14 +314,27 @@ const utf8 = new TextEncoder();
 /** The backend's nickname cap (`commands/settings.rs`), in UTF-8 bytes. */
 export const NICKNAME_MAX_BYTES = 128;
 
+let graphemeSegmenter: Intl.Segmenter | undefined;
+/** An input's value when its IME composition began. */
+const beforeComposition = new WeakMap<EventTarget, string>();
+
+/** What a user sees as single characters: an emoji ZWJ sequence or a letter
+ *  with its combining accents is one. Whole code points where the webview has
+ *  no `Intl.Segmenter`. */
+function graphemes(text: string): Iterable<string> {
+  if (typeof Intl === 'undefined' || typeof Intl.Segmenter !== 'function') return text;
+  graphemeSegmenter ??= new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  return Array.from(graphemeSegmenter.segment(text), (s) => s.segment);
+}
+
 /** Cut `text` to at most `maxBytes` UTF-8 bytes, for fields the backend caps in
- *  bytes where `maxlength` counts UTF-16 units. Iterating a string yields whole
- *  code points, so the cut never leaves half a surrogate pair. */
+ *  bytes where `maxlength` counts UTF-16 units. Cuts between characters as
+ *  {@link graphemes} sees them. */
 export function clampUtf8Bytes(text: string, maxBytes: number): string {
   if (utf8.encode(text).length <= maxBytes) return text;
   let bytes = 0;
   let out = '';
-  for (const ch of text) {
+  for (const ch of graphemes(text)) {
     bytes += utf8.encode(ch).length;
     if (bytes > maxBytes) break;
     out += ch;
@@ -329,15 +342,64 @@ export function clampUtf8Bytes(text: string, maxBytes: number): string {
   return out;
 }
 
-/** `oninput`/`oncompositionend` handler that applies `clampUtf8Bytes` to an
- *  input as the user types. Waits out IME composition, as `maxlength` does, so
- *  a half-composed CJK character is not cut. Returns the value to store. */
-export function clampInputUtf8Bytes(event: Event, maxBytes: number): string {
+const isHighSurrogate = (unit: number) => unit >= 0xd800 && unit <= 0xdbff;
+const isLowSurrogate = (unit: number) => unit >= 0xdc00 && unit <= 0xdfff;
+
+/** Where `next` differs from `previous`, as `[start, end)` in `next`, with the
+ *  caret (when known) marking the end of what was typed so a repeated letter
+ *  is placed where the user put it. Never splits a surrogate pair. */
+function editedRange(previous: string, next: string, caret: number | null): [number, number] {
+  let end = next.length;
+  let previousEnd = previous.length;
+  const floor = caret === null ? 0 : Math.min(caret, next.length);
+  while (end > floor && previousEnd > 0 && next[end - 1] === previous[previousEnd - 1]) {
+    end--;
+    previousEnd--;
+  }
+  let start = 0;
+  while (start < end && start < previousEnd && next[start] === previous[start]) start++;
+  if (start > 0 && isHighSurrogate(next.charCodeAt(start - 1))) start--;
+  if (end < next.length && isLowSurrogate(next.charCodeAt(end))) end++;
+  return [start, end];
+}
+
+/** `oninput`/`oncompositionend` handler that keeps an input within `maxBytes`
+ *  UTF-8 bytes as the user types. `previous` is the value before this edit.
+ *  What does not fit is cut from the text just typed or pasted, not from the
+ *  end of the value, and the caret stays after what was kept. Waits out IME
+ *  composition, as `maxlength` does, so a half-composed CJK character is not
+ *  cut. Returns the value to store. */
+export function clampInputUtf8Bytes(event: Event, maxBytes: number, previous: string): string {
   const input = event.currentTarget as HTMLInputElement;
-  if ((event as InputEvent).isComposing) return input.value;
-  const clamped = clampUtf8Bytes(input.value, maxBytes);
-  if (clamped !== input.value) input.value = clamped;
-  return clamped;
+  if ((event as InputEvent).isComposing) {
+    if (!beforeComposition.has(input)) beforeComposition.set(input, previous);
+    return input.value;
+  }
+  const before = beforeComposition.get(input) ?? previous;
+  beforeComposition.delete(input);
+  const next = input.value;
+  if (utf8.encode(next).length <= maxBytes) return next;
+
+  const caret = input.selectionStart === input.selectionEnd ? input.selectionStart : null;
+  const [start, end] = editedRange(before, next, caret);
+  const head = next.slice(0, start);
+  const tail = next.slice(end);
+  const room = maxBytes - utf8.encode(head + tail).length;
+  let value: string;
+  let caretAt: number;
+  if (room < 0) {
+    // Over the cap before this edit too, e.g. a prefill: only a cut at the end
+    // can bring it back.
+    value = clampUtf8Bytes(head + tail, maxBytes);
+    caretAt = Math.min(head.length, value.length);
+  } else {
+    const kept = clampUtf8Bytes(next.slice(start, end), room);
+    value = head + kept + tail;
+    caretAt = head.length + kept.length;
+  }
+  input.value = value;
+  input.setSelectionRange?.(caretAt, caretAt);
+  return value;
 }
 
 // Lives in its own module so `$lib/i18n` can recognise `TimeoutError` without

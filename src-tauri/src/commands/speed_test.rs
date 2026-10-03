@@ -42,6 +42,12 @@ const WARM_UP_FRACTION: f64 = 0.25;
 const MAX_WARM_UP_SECS: f64 = 2.0;
 const RATE_PERCENTILE: usize = 90;
 const RECOMMENDED_PERCENT: u64 = 80;
+/// The most of Ember's own traffic added back, as a percent of what the test
+/// measured on its own. The limiter counts every metered byte, LAN peers that
+/// never touch the internet link included, so the add-back is only an upper
+/// bound on what shared the link. At this cap the recommendation is at most
+/// the rate the test itself measured.
+const MAX_ADD_BACK_PERCENT: u64 = 100 * 100 / RECOMMENDED_PERCENT - 100;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SpeedTestResult {
@@ -93,15 +99,9 @@ impl Leg {
 struct Sample {
     at: f64,
     test_bytes: u64,
-    /// Ember's own transfers in the same direction since the window opened.
-    /// They share the link with the test, so the link carried both.
+    /// Ember's own transfers in the same direction since the window opened,
+    /// LAN ones included.
     own_bytes: u64,
-}
-
-impl Sample {
-    fn total(&self) -> u64 {
-        self.test_bytes.saturating_add(self.own_bytes)
-    }
 }
 
 #[tauri::command]
@@ -312,17 +312,25 @@ async fn upload_once(
 }
 
 /// The rate the link sustains once the streams are up to speed: the
-/// [`RATE_PERCENTILE`]th percentile of the rates over sliding
+/// [`RATE_PERCENTILE`]th percentile of the test's rates over sliding
 /// [`RATE_WINDOW_SECS`] windows, ignoring windows that open during the
 /// warm-up (TCP slow start, the send buffer filling). A leg that ended early
 /// on its byte cap may have no full window, and then the rate over everything
-/// after the warm-up stands in. `samples` must be in time order.
+/// after the warm-up stands in. Ember's own transfers after the warm-up are
+/// added back at their average rate, up to [`MAX_ADD_BACK_PERCENT`] of that.
+/// `samples` must be in time order.
 fn steady_state_rate(samples: &[Sample]) -> Option<u64> {
     let last = samples.last()?;
     if last.at <= 0.0 {
         return None;
     }
     let warm_up = (last.at * WARM_UP_FRACTION).min(MAX_WARM_UP_SECS);
+    let settled = samples
+        .iter()
+        .rev()
+        .find(|s| s.at <= warm_up)
+        .unwrap_or(&samples[0]);
+    let test_bytes = |s: &Sample| s.test_bytes;
     let mut rates: Vec<u64> = samples
         .iter()
         .enumerate()
@@ -331,26 +339,25 @@ fn steady_state_rate(samples: &[Sample]) -> Option<u64> {
             samples[i + 1..]
                 .iter()
                 .find(|to| to.at - from.at >= RATE_WINDOW_SECS)
-                .and_then(|to| rate_between(from, to))
+                .and_then(|to| rate_between(from, to, test_bytes))
         })
         .collect();
-    if rates.is_empty() {
-        let from = samples
-            .iter()
-            .rev()
-            .find(|s| s.at <= warm_up)
-            .unwrap_or(&samples[0]);
-        return rate_between(from, last);
-    }
-    Some(percentile(&mut rates, RATE_PERCENTILE))
+    let measured = if rates.is_empty() {
+        rate_between(settled, last, test_bytes)?
+    } else {
+        percentile(&mut rates, RATE_PERCENTILE)
+    };
+    let own = rate_between(settled, last, |s| s.own_bytes).unwrap_or(0);
+    let add_back = own.min(measured.saturating_mul(MAX_ADD_BACK_PERCENT) / 100);
+    Some(measured.saturating_add(add_back))
 }
 
-fn rate_between(from: &Sample, to: &Sample) -> Option<u64> {
+fn rate_between(from: &Sample, to: &Sample, bytes: impl Fn(&Sample) -> u64) -> Option<u64> {
     let secs = to.at - from.at;
     if secs <= 0.0 {
         return None;
     }
-    Some((to.total().saturating_sub(from.total()) as f64 / secs) as u64)
+    Some((bytes(to).saturating_sub(bytes(from)) as f64 / secs) as u64)
 }
 
 /// Nearest-rank percentile. `values` must not be empty.
@@ -432,11 +439,38 @@ mod tests {
 
     #[test]
     fn ember_transfers_during_the_test_are_added_back() {
-        let mut samples = series(8.0, |t| (t * 600_000.0) as u64);
+        let mut samples = series(8.0, |t| (t * 900_000.0) as u64);
         for s in &mut samples {
-            s.own_bytes = (s.at * 400_000.0) as u64;
+            s.own_bytes = (s.at * 100_000.0) as u64;
         }
         assert_eq!(steady_state_rate(&samples), Some(1_000_000));
+    }
+
+    /// The limiter counts LAN peers too, and they never touch the link the
+    /// test measures. However much of that there is, the recommendation must
+    /// not go above what the test moved over the internet.
+    #[test]
+    fn lan_traffic_cannot_lift_the_recommendation_above_the_measured_link() {
+        let mut samples = series(8.0, |t| (t * 1_000_000.0) as u64);
+        for s in &mut samples {
+            s.own_bytes = (s.at * 100_000_000.0) as u64;
+        }
+        let rate = steady_state_rate(&samples).unwrap();
+        assert_eq!(rate, 1_250_000, "the add-back is capped at a quarter of the test's rate");
+        assert!(recommended_limit(rate) <= 1_000_000);
+    }
+
+    /// The percentile picks the test's best windows; Ember's own traffic is
+    /// added at its average, so a burst of it lands in no window's favour.
+    #[test]
+    fn a_burst_of_ember_traffic_is_averaged_not_picked_by_the_percentile() {
+        let mut samples = series(8.0, |t| (t * 1_000_000.0) as u64);
+        for s in &mut samples {
+            s.own_bytes = if s.at < 6.0 { 0 } else { 120_000 };
+        }
+        // 120 kB after the 2 s warm-up is 20 kB/s on average; the 2 s windows
+        // across the burst would have read it as 60 kB/s.
+        assert_eq!(steady_state_rate(&samples), Some(1_020_000));
     }
 
     /// A fast link hits the byte cap before any full window after the warm-up.

@@ -421,7 +421,7 @@
       const summary = await exportBackup(
         backupPassphrase,
         collectBackupPrefs(typeof localStorage === 'undefined' ? null : localStorage, {
-          searchHistory: $appSettings?.save_search_history ?? true,
+          searchHistory: $appSettings?.save_search_history,
         }),
       );
       if (!summary) {
@@ -1152,7 +1152,7 @@
   }
 
   function clampNicknameInput(event: Event) {
-    if (settings) settings.nickname = clampInputUtf8Bytes(event, NICKNAME_MAX_BYTES);
+    if (settings) settings.nickname = clampInputUtf8Bytes(event, NICKNAME_MAX_BYTES, settings.nickname);
   }
 
   /** Validate and clamp numeric fields to the ranges documented in AppSettings.
@@ -2634,7 +2634,7 @@
             <label for="nickname">{m.settings_nickname_label()}</label>
             <input
               id="nickname"
-              bind:value={settings.nickname}
+              value={settings.nickname}
               maxlength="128"
               oninput={clampNicknameInput}
               oncompositionend={clampNicknameInput}
