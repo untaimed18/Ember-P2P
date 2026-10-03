@@ -193,7 +193,7 @@ pub(super) fn priority_str_to_u32(s: &str) -> u32 {
     }
 }
 
-pub(super) const DISK_SPACE_BUFFER: u64 = 50 * 1024 * 1024; // 50 MB safety margin
+pub(crate) const DISK_SPACE_BUFFER: u64 = 50 * 1024 * 1024; // 50 MB safety margin
 
 /// Bytes still needed on disk for a download (full size minus already written).
 pub(super) fn remaining_download_bytes(file_size: u64, completed: u64) -> u64 {

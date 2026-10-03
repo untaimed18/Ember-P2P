@@ -19,14 +19,21 @@ pub(in crate::network) struct RestoredPart {
 pub(in crate::network) type RestoredParts = HashMap<String, RestoredPart>;
 
 /// Read each restored download's `.part` from whichever download folder holds
-/// it. Blocking.
+/// it. One found nowhere is taken to be in the folder `recorded` last saw it
+/// in, so a worker waits for that folder if it is offline. Blocking.
 fn read_restored_parts(
     folders: &crate::storage::part_folders::DownloadFolders,
     jobs: Vec<(String, u64, String)>,
+    recorded: &HashMap<String, String>,
 ) -> RestoredParts {
     let mut map = HashMap::new();
     for (id, total, name) in jobs {
         let folder = folders.part_folder_for(&id);
+        if crate::storage::part_folders::located_folder(&id).is_none() {
+            if let Some(recorded) = recorded.get(&id) {
+                crate::storage::part_folders::note_located(&id, Path::new(recorded));
+            }
+        }
         let part_path = folder.join("Temp").join(format!("{id}.part"));
         if part_path.exists() && total > 0 {
             let tracker = crate::network::ed2k::part_tracker::PartTracker::new(total, &part_path);
@@ -69,8 +76,13 @@ pub(in crate::network) async fn resume_incomplete_downloads(
             .iter()
             .map(|t| (t.id.clone(), t.total_size, t.file_name.clone()))
             .collect();
+        let db = db.clone();
         *part_progress_task = Some(tokio::task::spawn_blocking(move || {
-            read_restored_parts(&folders, jobs)
+            let recorded = db.download_part_folders().unwrap_or_else(|e| {
+                warn!("Could not read where restored downloads were: {e}");
+                HashMap::new()
+            });
+            read_restored_parts(&folders, jobs, &recorded)
         }));
     }
     if let Some(handle) = part_progress_task.as_mut() {
@@ -110,13 +122,6 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                     mgr.completed.drain(..keep_from);
                 }
                 continue;
-            }
-
-            // From the database, before the `.part` reading below replaces
-            // it: a download whose `.part` is on a drive that is not
-            // connected must not be started over from zero.
-            if transfer.completed_size > 0 {
-                crate::storage::part_folders::note_restored_with_progress(&transfer.id);
             }
 
             let control = TransferControl::new();
@@ -501,10 +506,27 @@ mod tests {
             &[old.to_string_lossy().into_owned()],
         );
         let job = |id: &str| (id.to_string(), 100, format!("{id}.bin"));
+        let (gone, moved) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        std::fs::write(new.join("Temp").join(format!("{moved}.part")), vec![0u8; 100]).unwrap();
+        let offline = base.join("unplugged").to_string_lossy().into_owned();
+        let recorded = HashMap::from([
+            (gone.clone(), offline.clone()),
+            (moved.clone(), offline.clone()),
+        ]);
 
         let restored = read_restored_parts(
             &folders,
-            vec![job("before-change"), job("after-change"), job("never-started")],
+            vec![
+                job("before-change"),
+                job("after-change"),
+                job("never-started"),
+                job(&gone),
+                job(&moved),
+            ],
+            &recorded,
         );
 
         assert_eq!(restored["before-change"].folder, old);
@@ -512,6 +534,16 @@ mod tests {
         assert!(
             !restored.contains_key("never-started"),
             "no `.part` anywhere: nothing to restore"
+        );
+        assert_eq!(
+            crate::storage::part_folders::located_folder(&gone),
+            Some(PathBuf::from(&offline)),
+            "found nowhere, it is where the database last saw it"
+        );
+        assert_eq!(
+            crate::storage::part_folders::located_folder(&moved),
+            Some(new.clone()),
+            "a `.part` found on disk wins over the record"
         );
         let _ = std::fs::remove_dir_all(base);
     }

@@ -2147,6 +2147,7 @@
   "transfers_failure_reason_aich_pin_corrupt": "La marca AICH guardada estaba dañada. Cancela esta descarga y vuelve a añadir el enlace AICH.",
   "transfers_failure_reason_final_verify_inconclusive": "No se pudo leer el archivo terminado para verificarlo",
   "transfers_failure_reason_local_read_failed": "No se puede leer el archivo terminado desde la unidad. Revisa la unidad y vuelve a intentar la descarga.",
+  "transfers_failure_reason_completion_move_failed": "No se pudo mover el archivo terminado a la carpeta de descargas. El progreso se conserva; revisa la carpeta y reanuda la descarga.",
   "transfers_failure_stage_tcp_connect": "Conectando",
   "transfers_failure_stage_hello_wait": "Saludo con el par",
   "transfers_failure_stage_emule_info_wait": "Intercambio de datos del cliente",

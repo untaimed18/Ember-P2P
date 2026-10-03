@@ -2147,6 +2147,7 @@
   "transfers_failure_reason_aich_pin_corrupt": "A marca AICH salva estava corrompida. Cancele este download e adicione o link AICH novamente.",
   "transfers_failure_reason_final_verify_inconclusive": "Não foi possível ler o arquivo concluído para verificá-lo",
   "transfers_failure_reason_local_read_failed": "O arquivo concluído não pode ser lido da unidade. Verifique a unidade e tente o download novamente.",
+  "transfers_failure_reason_completion_move_failed": "Não foi possível mover o arquivo concluído para a pasta de downloads. O progresso foi mantido; verifique a pasta e retome o download.",
   "transfers_failure_stage_tcp_connect": "Conectando",
   "transfers_failure_stage_hello_wait": "Handshake com o par",
   "transfers_failure_stage_emule_info_wait": "Troca de informações do cliente",

@@ -180,6 +180,21 @@ fn relay_ticket_next_round_delay(
         .saturating_duration_since(completed_at)
 }
 
+/// What the download whose `.part` stem a completion copy carries finished
+/// as. Chat and room transfers have no hash on record to check a copy by.
+fn expected_finished_file(
+    db: &Database,
+    stem: &str,
+) -> Option<ed2k::transfer::ExpectedFinishedFile> {
+    uuid::Uuid::parse_str(stem).ok()?;
+    let (name, ed2k_hash, size) = db.download_identity(stem)?;
+    Some(ed2k::transfer::ExpectedFinishedFile {
+        name,
+        ed2k_hash,
+        size,
+    })
+}
+
 /// This mirrors the rendezvous server's accepted-ticket cap. Keeping the
 /// responder's active join/session work bounded prevents a hostile or slow
 /// relay endpoint from accumulating background tasks across poll cycles.
@@ -1178,14 +1193,22 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let folders = settings.download_roots();
         let _ = tokio::task::spawn_blocking(move || chat_attach::sweep_interrupted(&db, &folders)).await;
     }
-    // Before any download can complete: a completion copy being written now
-    // would otherwise look like one a crash left behind.
+    // In the background, one folder each, so an offline one holds up nothing;
+    // only copies older than this run are touched, never one a completion
+    // starting meanwhile is writing.
     {
-        let folders = settings.download_roots();
-        let _ = tokio::task::spawn_blocking(move || {
-            ed2k::transfer::remove_stale_completion_copies(&folders)
-        })
-        .await;
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(5))
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let roots = settings.download_roots();
+        for root in roots.clone() {
+            let (roots, db) = (roots.clone(), db.clone());
+            tokio::task::spawn_blocking(move || {
+                ed2k::transfer::settle_stale_completion_copies(&root, &roots, cutoff, &|stem| {
+                    expected_finished_file(&db, stem)
+                })
+            });
+        }
     }
 
     // Seed the Ember DHT routing table from the last session's persisted
@@ -2532,12 +2555,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         .chain(state.xfer_finishing.keys())
                         .map(|id| format!("ember-xfer-{}", hex::encode(id))),
                 );
-                crate::commands::transfers::sweep_orphan_part_files(
-                    &settings.download_roots(),
-                    &known_ids,
-                    &db,
-                )
-                .await;
+                // A coarse filesystem clock can date a file written just
+                // after the snapshot a little before it.
+                let cutoff = std::time::SystemTime::now()
+                    .checked_sub(std::time::Duration::from_secs(5))
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                let (roots, db) = (settings.download_roots(), db.clone());
+                tokio::spawn(async move {
+                    crate::commands::transfers::sweep_orphan_part_files(
+                        &roots, &known_ids, &db, cutoff,
+                    )
+                    .await;
+                });
             }
 
             #[cfg(target_os = "windows")]

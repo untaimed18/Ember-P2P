@@ -27,7 +27,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 62;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 63;
 
 /// Longest room name kept from a moderation snapshot. Keep in step with
 /// `MAX_CHANNEL_NAME_CHARS` in `commands/channels.rs`, the cap an owner names
@@ -3013,6 +3013,22 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 63 {
+            // The download folder a download's `.part` is in, written with its
+            // progress, so a restored download waits for a drive that is not
+            // connected only when that drive is the one holding its progress.
+            // Empty for rows from before, which wait for none.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(
+                &tx,
+                "transfers",
+                "part_folder",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            set_version(&tx, 63)?;
+            tx.commit()?;
+        }
+
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -4130,6 +4146,25 @@ impl Database {
         Ok(count.max(0) as usize)
     }
 
+    /// A download's file name, ed2k hash (hex) and size.
+    pub fn download_identity(&self, transfer_id: &str) -> Option<(String, String, u64)> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT file_name, file_hash, total_size FROM transfers
+              WHERE id = ?1 AND direction = 'download'",
+            params![transfer_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .ok()
+        .and_then(|(name, hash, size)| Some((name, hash, u64::try_from(size).ok()?)))
+    }
+
     pub fn transfer_exists(&self, transfer_id: &str) -> bool {
         let conn = self.conn.lock();
         conn.query_row(
@@ -4162,18 +4197,21 @@ impl Database {
     }
 
     /// The [`Self::incomplete_downloads_owning_partials`] with bytes on disk,
-    /// which `transferred` records.
+    /// which `transferred` records, each with the download folder its
+    /// `.part` was last recorded in (empty when none was).
     pub fn incomplete_downloads_with_progress(
         &self,
-    ) -> anyhow::Result<std::collections::HashSet<String>> {
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id FROM transfers
+            "SELECT id, part_folder FROM transfers
               WHERE direction = 'download'
                 AND status NOT IN ('completed', 'noneneeded')
                 AND transferred > 0",
         )?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
         Ok(rows.filter_map(Result::ok).collect())
     }
 
@@ -4291,26 +4329,46 @@ impl Database {
     /// show — and the `.part.met` is gone by then, so nothing can repair it.
     /// Terminal states are only left via a deliberate re-queue, which writes
     /// its own progress.
+    /// `part_folder`, when known, is the download folder holding the
+    /// `.part` the progress is in; `None` keeps the one on record.
     pub fn update_transfer_progress_if_active(
         &self,
         transfer_id: &str,
         transferred: u64,
         progress: f64,
         speed: u64,
+        part_folder: Option<&str>,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE transfers
-             SET transferred = ?1, progress = ?2, speed = ?3
+             SET transferred = ?1, progress = ?2, speed = ?3,
+                 part_folder = COALESCE(?5, part_folder)
              WHERE id = ?4 AND status NOT IN ('completed', 'cancelled')",
             params![
                 i64::try_from(transferred).unwrap_or(i64::MAX),
                 progress,
                 i64::try_from(speed).unwrap_or(i64::MAX),
-                transfer_id
+                transfer_id,
+                part_folder
             ],
         )?;
         Ok(())
+    }
+
+    /// The download folder each download's `.part` was last recorded in.
+    pub fn download_part_folders(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, part_folder FROM transfers
+              WHERE direction = 'download' AND part_folder != ''",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
     }
 
     /// Commit a finished download's terminal state in one transaction.

@@ -2147,6 +2147,7 @@
   "transfers_failure_reason_aich_pin_corrupt": "保存的 AICH 校验值已损坏。请取消此下载并重新添加 AICH 链接。",
   "transfers_failure_reason_final_verify_inconclusive": "无法读取已完成的文件以进行校验",
   "transfers_failure_reason_local_read_failed": "无法从磁盘读取已完成的文件。请检查磁盘，然后重试下载。",
+  "transfers_failure_reason_completion_move_failed": "无法将已完成的文件移入下载文件夹。进度已保留；请检查该文件夹，然后继续下载。",
   "transfers_failure_stage_tcp_connect": "正在连接",
   "transfers_failure_stage_hello_wait": "与对方握手",
   "transfers_failure_stage_emule_info_wait": "交换客户端信息",

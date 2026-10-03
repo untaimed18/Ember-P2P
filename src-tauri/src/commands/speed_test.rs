@@ -192,7 +192,8 @@ async fn measure(leg: Leg, limiter: &BandwidthLimiter) -> Result<u64, String> {
         return Err(leg.failed("no data was transferred"));
     }
     let rate = steady_state_rate(&samples)
-        .ok_or_else(|| leg.failed("not enough data to measure"))?;
+        .ok_or_else(|| leg.failed("not enough data to measure"))
+        .and_then(|rate| measurable(rate).ok_or_else(|| leg.failed("the transfer stalled")))?;
     info!(
         "Speed test: {:?} moved {} bytes in {:.2}s alongside {} bytes of Ember transfers = {}/s",
         leg,
@@ -352,6 +353,15 @@ fn steady_state_rate(samples: &[Sample]) -> Option<u64> {
     Some(measured.saturating_add(add_back))
 }
 
+/// The slowest rate a leg can report. Below it the transfer stalled after
+/// the warm-up, and "Apply recommended" would set a limit of a few bytes a
+/// second.
+const MIN_MEASURED_RATE: u64 = 1_000;
+
+fn measurable(rate: u64) -> Option<u64> {
+    (rate >= MIN_MEASURED_RATE).then_some(rate)
+}
+
 fn rate_between(from: &Sample, to: &Sample, bytes: impl Fn(&Sample) -> u64) -> Option<u64> {
     let secs = to.at - from.at;
     if secs <= 0.0 {
@@ -488,6 +498,17 @@ mod tests {
             (99_000_000..=100_000_000).contains(&rate),
             "the dead first quarter must not count: {rate}"
         );
+    }
+
+    /// Data during the warm-up, then nothing: the windows after it all read
+    /// 0, which used to recommend a limit of 1 B/s.
+    #[test]
+    fn a_leg_that_stalls_after_the_warm_up_has_no_rate_to_recommend() {
+        let samples = series(8.0, |t| (t.min(1.5) * 1_000_000.0) as u64);
+        assert_eq!(steady_state_rate(&samples), Some(0));
+        assert_eq!(measurable(0), None);
+        assert_eq!(measurable(MIN_MEASURED_RATE - 1), None);
+        assert_eq!(measurable(MIN_MEASURED_RATE), Some(MIN_MEASURED_RATE));
     }
 
     #[test]

@@ -2147,6 +2147,7 @@
   "transfers_failure_reason_aich_pin_corrupt": "The saved AICH pin was corrupt. Cancel this download and re-add the AICH link.",
   "transfers_failure_reason_final_verify_inconclusive": "Couldn't read the finished file to verify it",
   "transfers_failure_reason_local_read_failed": "The finished file can't be read from the drive. Check the drive, then retry the download.",
+  "transfers_failure_reason_completion_move_failed": "The finished file couldn't be moved into the download folder. Its progress is kept; check the folder, then resume the download.",
   "transfers_failure_stage_tcp_connect": "Connecting",
   "transfers_failure_stage_hello_wait": "Peer handshake",
   "transfers_failure_stage_emule_info_wait": "Client info exchange",

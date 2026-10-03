@@ -596,7 +596,13 @@ async fn cleanup_one_partial(
     delay_ms: u64,
 ) {
     for attempt in 0..max_attempts {
-        match pin_cleanup_target(path, allowed_roots) {
+        let pinned = tokio::task::spawn_blocking({
+            let (path, allowed_roots) = (path.to_path_buf(), allowed_roots.to_vec());
+            move || pin_cleanup_target(&path, &allowed_roots)
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+        match pinned {
             Ok(None) => return,
             Ok(Some((pinned, identity))) => {
                 delete_with_retry(&pinned, allowed_roots, &identity, max_attempts, delay_ms).await;
@@ -623,25 +629,40 @@ async fn cleanup_one_partial(
     }
 }
 
+/// How long Cancel and Remove wait on one download folder. A download held
+/// for a drive that is not connected must still be cancellable, and an
+/// offline share can hold every call into it for tens of seconds.
+const PARTIAL_CLEANUP_FOLDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Delete a download's `.part` and `.part.met` from whichever download folder
 /// holds them; `download_roots` is every one that may (see
-/// `AppSettings::download_roots`).
+/// `AppSettings::download_roots`). The folders are cleaned in parallel, each
+/// for at most [`PARTIAL_CLEANUP_FOLDER_BUDGET`].
 async fn cleanup_partial_files(download_roots: &[String], transfer_id: &str) {
     if uuid::Uuid::parse_str(transfer_id).is_err() {
         tracing::warn!("cleanup_partial_files: invalid transfer_id, skipping");
         return;
     }
-    for root in download_roots {
+    futures::future::join_all(download_roots.iter().map(|root| async move {
         let temp_dir = std::path::PathBuf::from(root).join("Temp");
         let part_path = temp_dir.join(format!("{transfer_id}.part"));
         let met_path = temp_dir.join(format!("{transfer_id}.part.met"));
         crate::network::ed2k::part_tracker::suppress_met_saves(&met_path);
         let allowed = vec![root.clone()];
-        tokio::join!(
-            cleanup_one_partial(&part_path, &allowed, 6, 500),
-            cleanup_one_partial(&met_path, &allowed, 6, 500),
-        );
-    }
+        let cleanup = async {
+            tokio::join!(
+                cleanup_one_partial(&part_path, &allowed, 6, 500),
+                cleanup_one_partial(&met_path, &allowed, 6, 500),
+            )
+        };
+        if tokio::time::timeout(PARTIAL_CLEANUP_FOLDER_BUDGET, cleanup)
+            .await
+            .is_err()
+        {
+            tracing::warn!("Gave up removing {transfer_id}'s part files from {root}");
+        }
+    }))
+    .await;
 }
 
 fn spawn_deferred_partial_cleanup(download_roots: Vec<String>, transfer_id: String) {
@@ -734,23 +755,24 @@ async fn preserve_failed_partial(
 /// created part files use UUID basenames, so user-managed files in the
 /// same folder are never touched.
 ///
-/// Must stay on the caller's task rather than being spawned off it, even
-/// though it walks a directory and deletes files. `known_ids` is a snapshot
-/// taken just before the call, and it is the only thing standing between this
-/// sweep and a live download's `.part`. Detached, the sweep would still be
-/// walking Temp while the loop accepted a download whose id postdates that
-/// snapshot — and it would delete that file out from under the worker writing
-/// it. The startup gate this runs behind exists to keep the two ordered.
+/// Runs in the background, so a slow or offline download folder holds up
+/// nothing. `known_ids` is a snapshot taken at `cutoff`, and a download the
+/// loop accepts afterwards is not in it: a file modified at or after `cutoff`
+/// is therefore never removed, which keeps the sweep off every `.part` a
+/// worker creates or writes from then on. Whatever that leaves, the next
+/// startup sweeps.
 ///
 /// `download_roots` is every download folder a `.part` may be in
 /// (`AppSettings::download_roots`). An earlier one is forgotten at startup
 /// only once it holds none of these orphans, so sweeping it here is what
 /// lets it go — and what stops a finished file's `.part` whose removal failed
-/// after a copy from staying behind in it for good.
+/// after a copy from staying behind in it for good. The folders are swept in
+/// parallel, each for at most [`ORPHAN_SWEEP_FOLDER_BUDGET`].
 pub async fn sweep_orphan_part_files(
     download_roots: &[String],
     known_ids: &std::collections::HashSet<String>,
     db: &Database,
+    cutoff: std::time::SystemTime,
 ) {
     // Read once, up front, instead of querying per file. This runs inline on
     // the network task's startup gate, so a Temp directory full of stale
@@ -767,22 +789,24 @@ pub async fn sweep_orphan_part_files(
             std::collections::HashSet::new()
         }
     };
-    for download_folder in download_roots {
-        let sweep = sweep_orphan_part_files_in(download_folder, known_ids, &owns_partial);
+    let owns_partial = &owns_partial;
+    futures::future::join_all(download_roots.iter().map(|download_folder| async move {
+        let sweep = sweep_orphan_part_files_in(download_folder, known_ids, owns_partial, cutoff);
         if tokio::time::timeout(ORPHAN_SWEEP_FOLDER_BUDGET, sweep).await.is_err() {
             tracing::warn!("Orphan sweep: gave up on {download_folder}, which is not answering");
         }
-    }
+    }))
+    .await;
 }
 
-/// An offline network share can hold every call into it for tens of seconds,
-/// and the network loop waits for this sweep before it starts.
+/// An offline network share can hold every call into it for tens of seconds.
 const ORPHAN_SWEEP_FOLDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
 
 async fn sweep_orphan_part_files_in(
     download_folder: &str,
     known_ids: &std::collections::HashSet<String>,
     owns_partial: &std::collections::HashSet<String>,
+    cutoff: std::time::SystemTime,
 ) {
     let temp_dir = std::path::PathBuf::from(download_folder).join("Temp");
     if !tokio::fs::metadata(&temp_dir).await.is_ok_and(|m| m.is_dir()) {
@@ -832,6 +856,15 @@ async fn sweep_orphan_part_files_in(
                 skipped_known += 1;
                 continue;
             }
+        }
+        let older = entry
+            .metadata()
+            .await
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified < cutoff);
+        if !older {
+            skipped_known += 1;
+            continue;
         }
         let allowed = vec![download_folder.to_string()];
         let deletion = tokio::task::spawn_blocking({
@@ -2846,8 +2879,18 @@ mod ipc_lifecycle_tests {
         std::fs::write(&owned, b"unfinished").unwrap();
         let known: std::collections::HashSet<String> = [live.to_string()].into();
 
-        super::sweep_orphan_part_files(&folders.roots(), &known, &db).await;
+        super::sweep_orphan_part_files(&folders.roots(), &known, &db, std::time::UNIX_EPOCH)
+            .await;
+        for file in &orphans {
+            assert!(
+                file.exists(),
+                "written since the snapshot, so possibly a download accepted after it: {}",
+                file.display()
+            );
+        }
 
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        super::sweep_orphan_part_files(&folders.roots(), &known, &db, later).await;
         for file in &orphans {
             assert!(!file.exists(), "{}", file.display());
         }

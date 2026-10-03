@@ -329,6 +329,7 @@ const TRANSFER_FAILURE_CODES = new Map<string, () => string>([
   ['aich_pin_corrupt', m.transfers_failure_reason_aich_pin_corrupt],
   ['final_verify_inconclusive', m.transfers_failure_reason_final_verify_inconclusive],
   ['local_read_failed', m.transfers_failure_reason_local_read_failed],
+  ['completion_move_failed', m.transfers_failure_reason_completion_move_failed],
 ]);
 
 /**

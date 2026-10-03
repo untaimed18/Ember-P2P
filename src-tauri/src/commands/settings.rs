@@ -931,7 +931,7 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
-    changed |= repair_previous_download_folders(settings, &data_canon);
+    changed |= repair_previous_download_folders(settings);
 
     changed
 }
@@ -943,68 +943,56 @@ fn is_filesystem_root(path: &std::path::Path) -> bool {
             .any(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
-/// What `folder` resolves to, compared to tell two entries naming one folder
-/// apart, or `None` when it could not be the download folder: relative, `..`,
-/// too long, a filesystem root, a system directory, or Ember's data directory
-/// or one above it. Blocking: canonicalizes.
-fn previous_download_folder_key(folder: &str, data_canon: &std::path::Path) -> Option<Vec<String>> {
-    let path = std::path::Path::new(folder);
-    if folder.is_empty()
-        || folder.len() > MAX_PATH_LEN
-        || !path.is_absolute()
-        || path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return None;
-    }
-    let canonical = path.canonicalize().ok();
-    let refused = std::iter::once(path)
-        .chain(canonical.as_deref())
-        .any(|candidate| {
-            is_filesystem_root(candidate)
-                || crate::sharing::path_has_sensitive_component(candidate)
-                || candidate == data_canon
-                || data_canon.starts_with(candidate)
-        });
-    if refused {
-        return None;
-    }
-    Some(normalized_path_components(canonical.as_deref().unwrap_or(path)))
+/// What the download folder may neither be nor resolve to: a filesystem root
+/// or a system directory. The earlier download folders get the same check,
+/// at startup, on what they resolve to.
+pub(crate) fn resolved_download_folder_refused(path: &std::path::Path) -> bool {
+    is_filesystem_root(path) || crate::sharing::path_has_sensitive_component(path)
 }
 
-/// Drop the earlier download folders that fail the download folder's own
-/// checks, and keep the rest once each by what they resolve to, newest first
-/// and at most [`MAX_PREVIOUS_DOWNLOAD_FOLDERS`]. Each one is an approved
-/// root, and startup approves all of them after a restore, so a crafted
-/// backup must not be able to list a drive root or a system folder here.
-/// Dropped rather than refused: one bad entry is not worth resetting every
-/// other setting. Kept as written: the approved-root registry knows a root by
-/// that string, and a resolved spelling would read as a different root.
+/// The download folder's checks that need only its text: set, within the
+/// length limit, no `..`, and not refused as written.
+fn download_folder_text_acceptable(folder: &str) -> bool {
+    let path = std::path::Path::new(folder);
+    !folder.is_empty()
+        && folder.len() <= MAX_PATH_LEN
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        && !resolved_download_folder_refused(path)
+}
+
+/// Drop the earlier download folders whose text fails the download folder's
+/// own checks, and keep the rest once each, newest first and at most
+/// [`MAX_PREVIOUS_DOWNLOAD_FOLDERS`]. Each one is an approved root, and
+/// startup approves all of them after a restore, so a crafted backup must not
+/// be able to list a drive root or a system folder here. Dropped rather than
+/// refused: one bad entry is not worth resetting every other setting. Kept as
+/// written: the approved-root registry knows a root by that string, and a
+/// resolved spelling would read as a different root. Touches no disk, as a
+/// config load must not wait on an offline share: what each one resolves to
+/// is checked at startup, within a time limit
+/// (`storage::part_folders::forget_finished_previous_folders`).
 ///
 /// [`MAX_PREVIOUS_DOWNLOAD_FOLDERS`]: crate::storage::part_folders::MAX_PREVIOUS_DOWNLOAD_FOLDERS
-fn repair_previous_download_folders(
-    settings: &mut AppSettings,
-    data_canon: &std::path::Path,
-) -> bool {
+fn repair_previous_download_folders(settings: &mut AppSettings) -> bool {
     if settings.previous_download_folders.is_empty() {
         return false;
     }
-    let current = std::path::Path::new(&settings.download_folder);
-    let mut taken = vec![normalized_path_components(current)];
-    if let Ok(canonical) = current.canonicalize() {
-        taken.push(normalized_path_components(&canonical));
-    }
+    let mut taken = vec![normalized_path_components(std::path::Path::new(
+        &settings.download_folder,
+    ))];
     let mut kept: Vec<String> = Vec::new();
     for folder in &settings.previous_download_folders {
         if kept.len() == crate::storage::part_folders::MAX_PREVIOUS_DOWNLOAD_FOLDERS {
             tracing::warn!("Too many earlier download folders in config; keeping the newest");
             break;
         }
-        let Some(key) = previous_download_folder_key(folder, data_canon) else {
+        if !download_folder_text_acceptable(folder) {
             tracing::warn!("Removing earlier download folder that cannot be a download folder on load: {folder}");
             continue;
-        };
+        }
+        let key = normalized_path_components(std::path::Path::new(folder));
         if taken.contains(&key) {
             continue;
         }
@@ -3321,21 +3309,21 @@ mod tests {
         } else {
             ("/srv/ember-now", "/srv/ember-old/one", "/srv/ember-old/two", "/", "/etc/ember")
         };
-        let data_dir = crate::storage::paths::resolve_data_dir()
-            .to_string_lossy()
-            .into_owned();
         let escaping = format!("{kept_a}{}..", std::path::MAIN_SEPARATOR);
+        let respelled = if cfg!(windows) {
+            r"q:\ember old\one\".to_string()
+        } else {
+            format!("{kept_a}/")
+        };
         let mut settings = AppSettings {
             download_folder: current.into(),
             previous_download_folders: vec![
                 kept_a.into(),
                 root.into(),
                 system.into(),
-                "relative/old".into(),
                 escaping,
                 "x".repeat(MAX_PATH_LEN + 1),
-                data_dir,
-                kept_a.into(),
+                respelled,
                 current.into(),
                 String::new(),
                 kept_b.into(),
@@ -3350,6 +3338,58 @@ mod tests {
             !soft_repair_settings(&mut settings),
             "a clean list is left alone"
         );
+    }
+
+    /// An earlier download folder is held to exactly the download folder's
+    /// rules, no stricter: one that was a valid download folder — the home
+    /// folder, holding Ember's data directory, included — stays valid once
+    /// the user picks another.
+    #[test]
+    fn an_earlier_download_folder_is_valid_exactly_when_it_could_be_the_download_folder() {
+        let home = directories::UserDirs::new()
+            .map(|dirs| dirs.home_dir().to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let candidates = if cfg!(windows) {
+            vec![
+                r"Q:\Ember Old".to_string(),
+                r"Q:\".to_string(),
+                r"Q:\Windows\Ember".to_string(),
+                r"Q:\Ember Old\..\x".to_string(),
+                "relative\\old".to_string(),
+                "x".repeat(MAX_PATH_LEN + 1),
+                String::new(),
+                home,
+            ]
+        } else {
+            vec![
+                "/srv/ember-old".to_string(),
+                "/".to_string(),
+                "/etc/ember".to_string(),
+                "/srv/ember-old/../x".to_string(),
+                "relative/old".to_string(),
+                "x".repeat(MAX_PATH_LEN + 1),
+                String::new(),
+                home,
+            ]
+        };
+        let current = if cfg!(windows) { r"Q:\Ember Now" } else { "/srv/ember-now" };
+        for candidate in candidates {
+            let as_download_folder = AppSettings {
+                download_folder: candidate.clone(),
+                ..AppSettings::default()
+            };
+            let mut as_previous = AppSettings {
+                download_folder: current.into(),
+                previous_download_folders: vec![candidate.clone()],
+                ..AppSettings::default()
+            };
+            soft_repair_settings(&mut as_previous);
+            assert_eq!(
+                validate_settings(&as_download_folder).is_ok(),
+                as_previous.previous_download_folders == [candidate.clone()],
+                "{candidate:?}"
+            );
+        }
     }
 
     #[test]

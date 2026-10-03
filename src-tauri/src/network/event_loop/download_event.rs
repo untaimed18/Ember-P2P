@@ -81,6 +81,31 @@ fn forget_requeue_history(transfer_id: &str) {
     }
 }
 
+/// Failed moves of a verified download into `Downloads` before it is left
+/// Failed instead of re-queued.
+const COMPLETION_MOVE_ATTEMPTS: u32 = 2;
+
+fn completion_move_failures() -> &'static std::sync::Mutex<HashMap<String, u32>> {
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u32>>> =
+        std::sync::OnceLock::new();
+    FAILURES.get_or_init(Default::default)
+}
+
+fn note_completion_move_failure(transfer_id: &str) -> u32 {
+    let Ok(mut failures) = completion_move_failures().lock() else {
+        return COMPLETION_MOVE_ATTEMPTS;
+    };
+    let count = failures.entry(transfer_id.to_string()).or_insert(0);
+    *count = count.saturating_add(1);
+    *count
+}
+
+fn forget_completion_move_failures(transfer_id: &str) {
+    if let Ok(mut failures) = completion_move_failures().lock() {
+        failures.remove(transfer_id);
+    }
+}
+
 /// Scope of a finished download's known.met record. An existing record is the
 /// user's own decision about this content and wins either way: re-downloading
 /// something they restricted must not republish it, and a friend's restriction
@@ -202,6 +227,7 @@ pub(in crate::network) async fn on_download_event(
         state.per_file_sources.remove(transfer_id);
         state.download_handles.remove(transfer_id);
         forget_requeue_history(transfer_id);
+        forget_completion_move_failures(transfer_id);
         {
             let mgr_snap = transfer_manager.read().await;
             if let Some(t) = mgr_snap.get_transfer(transfer_id) {
@@ -752,12 +778,14 @@ pub(in crate::network) async fn on_download_event(
         if failure_code == ed2k::transfer::TransferFailureCode::DownloadFolderUnavailable {
             emit_download_folder_unavailable(app_handle);
         }
-        // The finished `.part` could not be read back. Also local: no source
-        // is blamed, the same as a folder error.
+        // The finished `.part` could not be read back, or moved once
+        // verified. Also local: no source is blamed, the same as a folder
+        // error.
         let is_local_read_error = matches!(
             failure_code,
             ed2k::transfer::TransferFailureCode::FinalVerifyInconclusive
                 | ed2k::transfer::TransferFailureCode::LocalReadFailed
+                | ed2k::transfer::TransferFailureCode::CompletionMoveFailed
         );
         let blames_source = !is_folder_error && !is_local_read_error;
 
@@ -911,6 +939,19 @@ pub(in crate::network) async fn on_download_event(
             state.pending_downloads.remove(transfer_id);
             forget_requeue_history(transfer_id);
             warn!("Download {transfer_id} cannot be read back from disk — not re-queuing");
+        } else if failure_code == ed2k::transfer::TransferFailureCode::CompletionMoveFailed
+            && !is_user_cancel
+            && note_completion_move_failure(transfer_id) >= COMPLETION_MOVE_ATTEMPTS
+        {
+            // Each attempt re-reads the whole file to verify it first, and the
+            // same move failed again. Falls through to Failed with the `.part`
+            // kept, like the read failure above.
+            state.pending_downloads.remove(transfer_id);
+            forget_requeue_history(transfer_id);
+            forget_completion_move_failures(transfer_id);
+            warn!(
+                "Download {transfer_id} could not be moved into Downloads again — not re-queuing"
+            );
         } else if is_disk_full && !is_user_cancel {
             let file_name = {
                 let mgr = transfer_manager.read().await;
@@ -1839,5 +1880,28 @@ mod requeue_tests {
         forget_requeue_history(id);
         assert_eq!(note_requeue(id, None, 10), 1);
         forget_requeue_history(id);
+    }
+
+    /// A move into `Downloads` that fails again after a full re-verification
+    /// will keep failing; the second one leaves the download Failed.
+    #[test]
+    fn a_repeated_completion_move_failure_stops_the_retries() {
+        let id = "requeue-tests-completion-move";
+        forget_completion_move_failures(id);
+        assert!(note_completion_move_failure(id) < COMPLETION_MOVE_ATTEMPTS);
+        assert!(note_completion_move_failure(id) >= COMPLETION_MOVE_ATTEMPTS);
+        forget_completion_move_failures(id);
+        assert!(
+            note_completion_move_failure(id) < COMPLETION_MOVE_ATTEMPTS,
+            "a resume after the download was left Failed starts afresh"
+        );
+        forget_completion_move_failures(id);
+        assert_eq!(
+            ed2k::transfer::classify_failure(
+                "stage:completion_move: Access is denied. (os error 5)",
+                &ed2k::transfer::SourceFailureKind::Permanent,
+            ),
+            ed2k::transfer::TransferFailureCode::CompletionMoveFailed
+        );
     }
 }

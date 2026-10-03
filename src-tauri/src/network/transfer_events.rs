@@ -178,6 +178,8 @@ pub(super) async fn handle_download_event(
             if should_persist_db {
                 let db_for_progress = db.clone();
                 let transfer_id_for_progress = transfer_id.clone();
+                let part_folder = crate::storage::part_folders::located_folder(&transfer_id)
+                    .map(|folder| folder.to_string_lossy().into_owned());
                 tokio::task::spawn_blocking(move || {
                     // Guarded: this write is unsequenced and can be executed
                     // after the completion write it was queued before, which
@@ -188,6 +190,7 @@ pub(super) async fn handle_download_event(
                         capped_downloaded,
                         progress,
                         speed,
+                        part_folder.as_deref(),
                     ) {
                         warn!(
                             "DB update_transfer_progress failed for {transfer_id_for_progress}: {e}"

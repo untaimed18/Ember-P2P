@@ -184,14 +184,15 @@ pub mod logging {
             .into_owned();
         // The leading `/` must follow a delimiter, never a word char or
         // another `/`, so URLs, ed2k:// links and ratios like 3/4 survive.
-        // `file://` keeps its scheme, and an HTTP request line keeps its
-        // target.
+        // A colon counts only when it does not follow another, so IPv6
+        // prefixes like `::/0` survive too. `file://` keeps its scheme, and
+        // an HTTP request line (`GET /x HTTP/1.1`) keeps its target.
         value = UNIX_PATH
             .get_or_init(|| {
                 let part = r#"(?:[^\s\\/,;()"']|\([^\s\\/,;()"']*\))"#;
                 let last = format!(r"{part}+(?:\x20+{part}+\.{part}+)*");
                 Regex::new(&format!(
-                    r#"(\b(?:GET|HEAD|POST|PUT|DELETE|PATCH|OPTIONS)\x20+/\S*)|(^|[\s=(\[{{<"'`,:]|\\[nrt]|(?i:file://))(/(?:(?:{part}+(?:\x20+{part}+)*/+)+(?:{last})?|{last}))"#
+                    r#"(\b(?:GET|HEAD|POST|PUT|DELETE|PATCH|OPTIONS)\x20+/\S*\x20+HTTP/)|(^:?|[\s=(\[{{<"'`,]|[^:]:|\\[nrt]|(?i:file://))(/(?:(?:{part}+(?:\x20+{part}+)*/+)+(?:{last})?|{last}))"#
                 ))
                 .expect("static Unix path regex")
             })
@@ -295,13 +296,41 @@ pub mod logging {
                 "ratio 3/4 reached",
                 "rate 12 KB/s, peers 3 / 5",
                 "tcp/udp relay and/or direct",
-                "GET /api/v1/status 200",
-                "POST /announce?info=1 took 3 ms",
-                "request HEAD /index.html, then DELETE /api/item/7",
+                "GET /api/v1/status HTTP/1.1",
+                "\"POST /announce?info=1 HTTP/1.0\" took 3 ms",
                 "see https://example.com/a: ok",
             ] {
                 assert_eq!(redact_normal_log(line), line);
             }
+        }
+
+        /// Only a real HTTP request line keeps its target; a path after an
+        /// uppercase verb anywhere else is a path.
+        #[test]
+        fn a_path_after_an_http_verb_is_redacted_outside_a_request_line() {
+            for line in [
+                "DELETE /home/canary/secret.bin failed",
+                "GET /home/canary/secret.bin 200",
+                "PUT /Users/canary/Library/x.db, retrying",
+                "request HEAD /home/canary/a.bin, then DELETE /home/canary/b.bin",
+            ] {
+                let redacted = redact_normal_log(line);
+                assert!(!redacted.contains("canary"), "{line} -> {redacted}");
+                assert!(redacted.contains("<path:"), "{line} -> {redacted}");
+            }
+        }
+
+        #[test]
+        fn ipv6_prefixes_are_not_paths() {
+            for line in [
+                "route ::/0 via gateway",
+                "allowed 2001:db8::/32 and fe80::/10",
+                "prefix=::/0",
+            ] {
+                let redacted = redact_normal_log(line);
+                assert!(!redacted.contains("<path:"), "{line} -> {redacted}");
+            }
+            assert!(redact_normal_log("missing:/home/canary/share").contains(":<path:"));
         }
 
         #[test]

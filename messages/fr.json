@@ -2147,6 +2147,7 @@
   "transfers_failure_reason_aich_pin_corrupt": "L'empreinte AICH enregistrée était corrompue. Annulez ce téléchargement et rajoutez le lien AICH.",
   "transfers_failure_reason_final_verify_inconclusive": "Impossible de lire le fichier terminé pour le vérifier",
   "transfers_failure_reason_local_read_failed": "Le fichier terminé ne peut pas être lu depuis le disque. Vérifiez le disque, puis relancez le téléchargement.",
+  "transfers_failure_reason_completion_move_failed": "Le fichier terminé n'a pas pu être déplacé dans le dossier de téléchargement. La progression est conservée ; vérifiez le dossier, puis reprenez le téléchargement.",
   "transfers_failure_stage_tcp_connect": "Connexion",
   "transfers_failure_stage_hello_wait": "Poignée de main avec le pair",
   "transfers_failure_stage_emule_info_wait": "Échange des informations client",
