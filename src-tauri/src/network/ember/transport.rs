@@ -755,6 +755,12 @@ struct DialLogInner {
     /// refreshing an existing dial updates the map in place — so the queue
     /// holds each resident address at most once and cannot outgrow it.
     order: VecDeque<IpAddr>,
+    /// Until when every address counts as dialled, because the cap pushed out
+    /// an entry still inside [`DIAL_MEMORY`]. The QUIC half also logs replies
+    /// to unvalidated sources, so spoofed Initials can fill the log; forgetting
+    /// a real dial would let that peer's ping pass as unsolicited, and the
+    /// safe answer for an address we can no longer vouch for is "dialled".
+    saturated_until: Option<Instant>,
 }
 
 impl DialLog {
@@ -777,7 +783,15 @@ impl DialLog {
             let Some(oldest) = inner.order.pop_front() else {
                 break;
             };
-            if inner.at.remove(&oldest).is_some() {
+            if let Some(evicted_at) = inner.at.remove(&oldest) {
+                let forgotten_until = evicted_at + DIAL_MEMORY;
+                if forgotten_until > now {
+                    inner.saturated_until = Some(
+                        inner
+                            .saturated_until
+                            .map_or(forgotten_until, |until| until.max(forgotten_until)),
+                    );
+                }
                 break;
             }
         }
@@ -789,17 +803,20 @@ impl DialLog {
     /// v4 entry it belongs to, rather than silently missing.
     pub fn recent(&self, ip: IpAddr) -> bool {
         let ip = ip.to_canonical();
-        self.0
-            .lock()
-            .at
-            .get(&ip)
-            .is_some_and(|at| at.elapsed() < DIAL_MEMORY)
+        let inner = self.0.lock();
+        inner
+            .saturated_until
+            .is_some_and(|until| Instant::now() < until)
+            || inner.at.get(&ip).is_some_and(|at| at.elapsed() < DIAL_MEMORY)
     }
 
     fn prune(&self, now: Instant) {
         let mut inner = self.0.lock();
         inner.at.retain(|_, at| now.duration_since(*at) < DIAL_MEMORY);
-        let DialLogInner { at, order } = &mut *inner;
+        if inner.saturated_until.is_some_and(|until| now >= until) {
+            inner.saturated_until = None;
+        }
+        let DialLogInner { at, order, .. } = &mut *inner;
         order.retain(|ip| at.contains_key(ip));
     }
 }
@@ -3289,6 +3306,30 @@ mod tests {
     const TEST_NOISE_PUB: [u8; 32] = [0xAB; 32];
 
     use super::*;
+
+    /// The QUIC half logs replies to sources nobody validated, so a flood of
+    /// spoofed Initials can push real dials out of the log. A real dial it can
+    /// no longer vouch for must not turn into an unsolicited witness.
+    #[test]
+    fn a_dial_log_that_had_to_forget_a_live_dial_treats_everyone_as_dialled() {
+        let log = DialLog::default();
+        let real: IpAddr = "203.0.113.7".parse().unwrap();
+        let stranger: IpAddr = "198.51.100.9".parse().unwrap();
+        log.note(real);
+        assert!(!log.recent(stranger));
+
+        for n in 0..MAX_DIALLED_ADDRS as u32 {
+            log.note(IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000 + n)));
+        }
+        assert!(!log.0.lock().at.contains_key(&real), "the cap pushed the real dial out");
+        assert!(log.recent(real), "a forgotten live dial still counts as dialled");
+        assert!(log.recent(stranger), "and so does every other address until it would have lapsed");
+
+        log.0.lock().saturated_until = Some(Instant::now() - Duration::from_secs(1));
+        log.prune(Instant::now());
+        assert!(log.0.lock().saturated_until.is_none());
+        assert!(!log.recent(stranger));
+    }
 
     fn make_keypair() -> ([u8; 32], [u8; 32]) {
         let params: snow::params::NoiseParams = NOISE_PATTERN_XX.parse().unwrap();

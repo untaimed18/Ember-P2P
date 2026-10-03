@@ -1167,6 +1167,21 @@ fn flush_sealed_offer_readers(writes: &SealedOfferReaderWrites, db: &Database) {
             ember::xfer::SEALED_OFFER_READERS_MAX,
         ) {
             warn!("Ember Transfer: could not remember {} member(s) that read sealed offers: {e}", members.len());
+            // Back in the queue for the next flush, which the next proof starts:
+            // the cache already counts these as written and will not queue them
+            // again for a day. Retrying here would spin on a database that is
+            // refusing writes.
+            {
+                let mut pending = writes.proofs.lock();
+                for (member, at) in proofs {
+                    if pending.len() >= ember::xfer::SEALED_OFFER_READERS_MAX {
+                        break;
+                    }
+                    pending.entry(member).or_insert(at);
+                }
+            }
+            writes.flushing.store(false, Ordering::Release);
+            return;
         }
     }
 }

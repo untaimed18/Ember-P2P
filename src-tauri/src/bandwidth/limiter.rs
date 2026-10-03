@@ -126,12 +126,14 @@ impl BandwidthLimiter {
         PriorityUpload { limiter: self }
     }
 
-    /// Spends the reserve, and from the shared bucket only what sits above a
-    /// quarter of the cap. The shared bucket is the slots' share, and racing
-    /// them for it whenever the reserve runs dry leaves them next to nothing;
-    /// but slots that are parked on it drain every refill, so a balance above
-    /// that floor is one they are leaving unspent, and without it a chat file
-    /// with the slots idle could never use more than the reserve's share.
+    /// Spends the reserve, and from the shared bucket only what sits above half
+    /// the cap. The shared bucket is the slots' share, and racing them for it
+    /// whenever the reserve runs dry leaves them next to nothing; but slots
+    /// that are parked on it drain every refill, so a balance above that floor
+    /// is one they are leaving unspent, and without it a chat file with the
+    /// slots idle could never use more than the reserve's share. Half, not the
+    /// quarter [`Self::yield_then_take_upload`] keeps: the band between is
+    /// relay bridges', which would otherwise lose every refill to this.
     async fn acquire_priority_upload(&self, bytes: u64) -> bool {
         let start = std::time::Instant::now();
         let mut warned_slow = false;
@@ -143,7 +145,7 @@ impl BandwidthLimiter {
             }
             let mut took = take_tokens(&self.priority_tokens, remaining);
             if took < remaining {
-                took += take_tokens_above(&self.upload_tokens, remaining - took, (max / 4).max(1));
+                took += take_tokens_above(&self.upload_tokens, remaining - took, (max / 2).max(1));
             }
             remaining -= took;
             if took == 0 {
@@ -1013,13 +1015,13 @@ mod tests {
         let priority = bw.priority_upload();
         assert_eq!(bw.available_upload_tokens(), 10_000);
 
-        tokio::time::timeout(Duration::from_millis(100), priority.acquire(7_500))
+        tokio::time::timeout(Duration::from_millis(100), priority.acquire(5_000))
             .await
             .expect("the unspent shared balance above the floor covers the request");
         assert_eq!(
             bw.available_upload_tokens(),
-            2_500,
-            "a quarter of the cap is left for slots that start asking"
+            5_000,
+            "half the cap is left for slots and relay bridges that start asking"
         );
         let starved =
             tokio::time::timeout(Duration::from_millis(100), priority.acquire(1)).await;
