@@ -3575,12 +3575,10 @@
           <div class="divider"></div>
 
           <!--
-            KAD bootstraps on startup and there is no switch for it, so this
-            row states the behavior rather than pretending to offer a choice —
-            same shape as the Ember row above. Sitting out KAD for a session is
-            a runtime action and still lives on the KAD Network page; what it
-            is not is a preference that survives a restart, because a client
-            that cannot find peers is a client that looks broken.
+            KAD bootstraps on startup and there is no switch for it, nor a
+            Disconnect on the KAD Network page: Ember depends on it staying
+            connected. So this row states the behavior rather than pretending
+            to offer a choice — same shape as the Ember row above.
           -->
           <div class="field toggle-row">
             <div class="toggle-info">
