@@ -1241,7 +1241,7 @@
     // Lower bound 0: that is the documented "no burst gate" value, not an
     // empty box — `numericFields` above already rejects those.
     s.max_connections_per_five_secs = ci(s.max_connections_per_five_secs, 0, 500, 20);
-    s.download_queue_wait_secs = ci(s.download_queue_wait_secs, 60, 14400, 600);
+    s.download_queue_wait_secs = ci(s.download_queue_wait_secs, 60, 14400, 1800);
     s.multisource_retry_rounds = ci(s.multisource_retry_rounds, 1, 20, 3);
     s.download_part_retry_rounds = ci(s.download_part_retry_rounds, 1, 20, 3);
     s.max_download_file_size_gib = ci(s.max_download_file_size_gib, 1, 593, 593);
@@ -3614,11 +3614,13 @@
           </div>
 
           <!--
-            eD2K server-list discovery. These mirror the three eMule
-            options under Options -> Servers. New-server admission from
-            server/client lists is read live after Save; purging already-
-            listed servers when "filter servers by IP" turns on also runs
-            on Save (and at startup / IP-filter reload).
+            eD2K server-list discovery, after eMule's Options -> Servers.
+            New-server admission from server lists is read live after Save;
+            purging already-listed servers when "filter servers by IP" turns
+            on also runs on Save (and at startup / IP-filter reload). eMule's
+            third option, servers learned from clients, has no switch here:
+            nothing in the backend adds servers from clients, so a toggle for
+            it would only claim to do something.
           -->
           <div class="field toggle-row">
             <div class="toggle-info">
@@ -3626,14 +3628,6 @@
               <span class="hint">{m.settings_update_servers_hint()}</span>
             </div>
             <ToggleSwitch bind:checked={settings.add_servers_from_server} ariaLabel={m.settings_update_servers_aria()} />
-          </div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_update_servers_clients_label()}</span>
-              <span class="hint">{m.settings_update_servers_clients_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.add_servers_from_clients} ariaLabel={m.settings_update_servers_clients_label()} />
           </div>
 
           <div class="field toggle-row">
