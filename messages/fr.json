@@ -994,7 +994,6 @@
   "security_page_subtitle": "Le filtre IP empêche Ember de se connecter aux pairs des plages d’adresses listées ici, comme les réseaux connus pour le spam ou les faux fichiers.",
   "stats_page_subtitle": "Ce qu’Ember a téléchargé et envoyé, pendant cette session et au total, votre ratio d’envoi et le trafic réseau que cela a demandé.",
   "kad_no_source_network": "KAD est déconnecté et aucun serveur eD2K n'est connecté : les recherches et les nouveaux téléchargements ne peuvent trouver aucune source. Reconnectez KAD ci-dessus ou connectez-vous à un serveur.",
-  "kad_disconnecting": "Déconnexion…",
   "kad_firewall_recheck_failed": "Échec de la revérification du pare-feu",
   "kad_bootstrap_host_required": "L'hôte ou l'IP est obligatoire",
   "kad_bootstrap_port_range": "Le port doit être compris entre 1 et 65535",

@@ -994,7 +994,6 @@
   "security_page_subtitle": "Der IP-Filter verhindert, dass Ember sich mit Peers aus den hier aufgeführten Adressbereichen verbindet, etwa aus Netzen, die für Spam oder gefälschte Dateien bekannt sind.",
   "stats_page_subtitle": "Was Ember heruntergeladen und hochgeladen hat, in dieser Sitzung und insgesamt, Ihr Upload-Verhältnis und der Netzwerkverkehr, der dafür nötig war.",
   "kad_no_source_network": "KAD ist getrennt und es ist kein eD2K-Server verbunden. Für Suchen und neue Downloads können daher keine Quellen gefunden werden. Verbinden Sie KAD oben erneut oder verbinden Sie sich mit einem Server.",
-  "kad_disconnecting": "Trennen…",
   "kad_firewall_recheck_failed": "Erneute Firewall-Prüfung fehlgeschlagen",
   "kad_bootstrap_host_required": "Host oder IP ist erforderlich",
   "kad_bootstrap_port_range": "Der Port muss zwischen 1 und 65535 liegen",

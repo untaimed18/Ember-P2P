@@ -27,10 +27,6 @@ export async function kadConnect(): Promise<void> {
   return withTimeout(invoke('kad_connect'), 'KAD connect');
 }
 
-export async function kadDisconnect(): Promise<void> {
-  return withTimeout(invoke('kad_disconnect'), 'KAD disconnect');
-}
-
 /** Resolves once the bootstrap packet actually went out, or throws with a
  *  concrete failure reason. The resolved string is backend English. */
 export async function kadBootstrapIp(ip: string, port: number): Promise<string> {

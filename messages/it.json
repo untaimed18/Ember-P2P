@@ -994,7 +994,6 @@
   "security_page_subtitle": "Il filtro IP impedisce a Ember di connettersi ai peer degli intervalli di indirizzi elencati qui, come le reti note per spam o file falsi.",
   "stats_page_subtitle": "Quanto Ember ha scaricato e caricato, in questa sessione e in totale, il tuo rapporto di upload e il traffico di rete che è servito.",
   "kad_no_source_network": "KAD è disconnesso e non è connesso alcun server eD2K, quindi le ricerche e i nuovi download non possono trovare fonti. Riconnetti KAD qui sopra oppure connettiti a un server.",
-  "kad_disconnecting": "Disconnessione…",
   "kad_firewall_recheck_failed": "Riverifica del firewall non riuscita",
   "kad_bootstrap_host_required": "Host o IP obbligatorio",
   "kad_bootstrap_port_range": "La porta deve essere compresa tra 1 e 65535",

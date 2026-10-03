@@ -994,7 +994,6 @@
   "security_page_subtitle": "IP 过滤器会阻止 Ember 连接这里列出的地址段中的节点，例如以垃圾信息或虚假文件闻名的网络。",
   "stats_page_subtitle": "Ember 在本次会话和累计下载、上传了多少，你的上传比率，以及为此花费的网络流量。",
   "kad_no_source_network": "KAD 已断开连接，且未连接任何 eD2K 服务器，因此搜索和新下载无法查找来源。请在上方重新连接 KAD，或连接到一台服务器。",
-  "kad_disconnecting": "正在断开…",
   "kad_firewall_recheck_failed": "防火墙重新检测失败",
   "kad_bootstrap_host_required": "必须填写主机或 IP",
   "kad_bootstrap_port_range": "端口须为 1 至 65535",
