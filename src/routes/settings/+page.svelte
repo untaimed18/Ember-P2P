@@ -1246,7 +1246,7 @@
     s.download_part_retry_rounds = ci(s.download_part_retry_rounds, 1, 20, 3);
     s.max_download_file_size_gib = ci(s.max_download_file_size_gib, 1, 593, 593);
     s.search_timeout_secs = ci(s.search_timeout_secs, 30, 600, 120);
-    s.max_friends = ci(s.max_friends, 1, 500, 100);
+    s.max_friends = ci(s.max_friends, 1, 500, 200);
     // 0 is "always ask", not an empty box; the ceiling is the attachment cap.
     s.chat_attachment_auto_accept_mb = cn(s.chat_attachment_auto_accept_mb, 2048, 25);
     return { error: null, adjusted };
