@@ -299,7 +299,6 @@ impl ShareIntentStore {
         self.enter_fail_closed()
     }
 
-    #[cfg(test)]
     pub fn is_fail_closed(&self) -> bool {
         self.state.read().fail_closed
     }

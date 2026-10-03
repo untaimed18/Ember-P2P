@@ -1745,12 +1745,13 @@ impl KnownFileList {
     /// Records with a live path are never touched, so this can only discard
     /// cached hashes for files the library no longer contains — at worst a
     /// re-hash if one reappears, against an index that otherwise grows until it
-    /// can no longer be read.
+    /// can no longer be read. Nor are friends-only ones: the restriction is
+    /// kept nowhere else, and the file coming back would be public.
     fn prune_unreferenced(&mut self, known_met: &Path) {
         let mut pathless: Vec<([u8; 16], i64)> = self
             .files
             .iter()
-            .filter(|(hash, _)| !self.path_refs.contains_key(*hash))
+            .filter(|(hash, record)| !record.friends_only && !self.path_refs.contains_key(*hash))
             .map(|(hash, record)| (*hash, record.modified_at))
             .collect();
         if prune_hold_active(known_met, pathless.len(), Self::MAX_UNREFERENCED_RECORDS) {
@@ -1773,6 +1774,13 @@ impl KnownFileList {
     }
 
     pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
+        self.save_reporting(path).map(drop)
+    }
+
+    /// [`Self::save`], answering whether known.met was written: `Ok(false)` is
+    /// a save it declined, after which disk still holds the old catalog. A
+    /// caller that reports a change as durable must check it.
+    pub fn save_reporting(&mut self, path: &Path) -> anyhow::Result<bool> {
         // The share-intent migration reads known.met off-thread at startup. A
         // replace-fallback save leaves no known.met for a moment, and a probe
         // landing then records a previously seen catalog as lost, persisting
@@ -1796,7 +1804,7 @@ impl KnownFileList {
                  record(s) now would discard it",
                 self.files.len()
             );
-            return Ok(());
+            return Ok(false);
         }
         // Nothing in this type removes every record — pathless ones are kept
         // for exactly the re-hash they save — so an empty list here is a
@@ -1807,7 +1815,7 @@ impl KnownFileList {
             && std::fs::metadata(path).is_ok_and(|meta| meta.len() > KNOWN_MET_HEADER_LEN)
         {
             warn!("Skipping known.met save: refusing to replace a populated catalog with an empty one");
-            return Ok(());
+            return Ok(false);
         }
         // Bounded here rather than on every mutation: this is the one place the
         // whole catalog is already being walked, and the only place its size
@@ -1988,7 +1996,7 @@ impl KnownFileList {
 
             buf.write_u32::<LittleEndian>(tag_count)?;
             buf.write_all(&tags)?;
-            if !self.path_refs.contains_key(&record.file_hash) {
+            if !record.friends_only && !self.path_refs.contains_key(&record.file_hash) {
                 pathless_sizes.push((
                     record.file_hash,
                     record.modified_at,
@@ -2028,7 +2036,7 @@ impl KnownFileList {
                  to keep the catalog readable",
                 shed.len()
             );
-            return self.save(path);
+            return self.save_reporting(path);
         }
 
         crate::security::atomic_write(path, &buf, true)?;
@@ -2064,7 +2072,7 @@ impl KnownFileList {
             }
         }
         info!("Saved {} known files to known.met", self.files.len());
-        Ok(())
+        Ok(true)
     }
 
     pub fn file_count(&self) -> usize {
@@ -2853,6 +2861,65 @@ mod tests {
         empty.mark_authoritative_for_tests();
         empty.save(&path).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A caller that reports a change as saved has to be able to tell a
+    /// declined save from a written one: both used to return `Ok(())`.
+    #[test]
+    fn a_declined_save_says_it_did_not_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-declined-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        let mut on_disk = KnownFileList::new();
+        on_disk.mark_authoritative_for_tests();
+        on_disk.add_or_update(sample_record());
+        assert!(on_disk.save_reporting(&path).unwrap());
+
+        let mut placeholder = KnownFileList::new();
+        let mut restricted = sample_record();
+        restricted.friends_only = true;
+        placeholder.add_or_update(restricted);
+        assert!(!placeholder.save_reporting(&path).unwrap(), "not loaded yet");
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0);
+        std::fs::write(&path, &bytes).unwrap();
+        let mut trailing = KnownFileList::load_checked(&path).unwrap();
+        trailing.find_by_hash_mut(&[0x42; 16]).unwrap().friends_only = true;
+        assert!(!trailing.save_reporting(&path).unwrap(), "unreadable past its records");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The restriction is kept nowhere but known.met, so a pathless
+    /// friends-only record, as removing a large folder leaves, is not pruned.
+    #[test]
+    fn pruning_keeps_pathless_friends_only_records() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-prune-fo-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut kf = KnownFileList::new();
+        let mut oldest = pathless(0, 1);
+        oldest.file_hash = [0xFF; 16];
+        oldest.friends_only = true;
+        kf.files.insert(oldest.file_hash, oldest);
+        for n in 0..=KnownFileList::MAX_UNREFERENCED_RECORDS as u32 {
+            let mut record = pathless(0, 1_000 + i64::from(n));
+            record.file_hash[..4].copy_from_slice(&n.to_le_bytes());
+            kf.files.insert(record.file_hash, record);
+        }
+        kf.prune_unreferenced(&dir.join("known.met"));
+        assert!(kf.find_by_hash(&[0xFF; 16]).is_some_and(|record| record.friends_only));
+        assert_eq!(kf.file_count(), KnownFileList::MAX_UNREFERENCED_RECORDS + 1);
+        assert!(kf.find_by_hash(&pathless(0, 0).file_hash).is_none(), "the oldest plain one went");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

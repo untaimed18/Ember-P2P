@@ -376,7 +376,8 @@ pub enum NetworkCommand {
     /// Persist the friends-only scope for a batch of content hashes.
     SetFilesFriendsOnly {
         updates: Vec<(String, bool)>,
-        /// The hashes known.met had no record for, which this did not save.
+        /// The hashes this did not save: known.met had no record for them, or
+        /// declined the write.
         tx: oneshot::Sender<Result<Vec<String>, String>>,
     },
     /// Files confirmed gone from these paths (deleted, or found missing from

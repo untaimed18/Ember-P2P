@@ -5715,15 +5715,24 @@ async fn handle_command_inner(
                 let mut snapshot = known_files.clone();
                 let save_result = tokio::task::spawn_blocking(move || {
                     let _ownership = ownership;
-                    snapshot.save(&known_path)
+                    snapshot.save_reporting(&known_path)
                 })
                 .await
                 .map_err(|e| format!("known.met share-scope save task failed: {e}"))
                 .and_then(|result| result.map_err(|e| e.to_string()));
-                if let Err(e) = save_result {
-                    *known_files = before;
-                    let _ = tx.send(Err(format!("Failed to persist file share scope: {e}")));
-                    return;
+                match save_result {
+                    Err(e) => {
+                        *known_files = before;
+                        let _ = tx.send(Err(format!("Failed to persist file share scope: {e}")));
+                        return;
+                    }
+                    // Declined (known.met not loaded yet, or unreadable past a
+                    // prefix): the change holds in memory, and the caller's
+                    // pending intents are all that carry it to the next start.
+                    Ok(false) => {
+                        unrecorded = parsed.iter().map(|(hash, _)| hex::encode(hash)).collect();
+                    }
+                    Ok(true) => {}
                 }
             }
             let restricted: HashSet<[u8; 16]> = parsed
@@ -5809,6 +5818,8 @@ async fn handle_command_inner(
                     // rationale — short version, this breaks the "permanent
                     // rehash loop" that surfaces whenever an external process
                     // touches a shared file's metadata.
+                    // A row restricted by a pending intent alone (a save
+                    // known.met declined) is written through the same way.
                     if known_files.record_needs_refresh(
                         &fh,
                         &f.path,
@@ -5817,7 +5828,9 @@ async fn handle_command_inner(
                         &f.name,
                         &f.aich_hash,
                         &f.ember_file_hash,
-                    ) {
+                    ) || (f.friends_only
+                        && known_files.find_by_hash(&fh).is_some_and(|r| !r.friends_only))
+                    {
                         drifted.push((fh, f.clone()));
                     }
                 }
