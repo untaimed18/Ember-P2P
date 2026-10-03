@@ -425,8 +425,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let quic_cid_key = settings
         .quic_shares_udp_port
         .then(ember::udp_mux::CidKey::random);
+    let ember_dial_log = ember::transport::DialLog::default();
     let (mut udp_rx, quic_shared_socket) =
-        ember::udp_mux::start(udp_socket.clone(), quic_cid_key.clone());
+        ember::udp_mux::start(udp_socket.clone(), quic_cid_key.clone(), ember_dial_log.clone());
 
     // With QUIC on its own socket it binds the configured `tcp_port`, so
     // `tcp_port == udp_port` means it loses that port to the Kad UDP socket
@@ -1040,9 +1041,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         friend_relay_offer_sent: HashMap::new(),
         friend_relay_offer_seen: HashMap::new(),
         friend_file_offer_seen: HashMap::new(),
-        ember_transport: ember::transport::EmberTransport::new(
+        ember_transport: ember::transport::EmberTransport::with_dial_log(
             identity.noise_private_key,
             identity.noise_public_key,
+            ember_dial_log,
         ),
         ember_pending_pings: HashMap::new(),
         ember_dht,
@@ -1127,7 +1129,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_handoff_fetch_at: HashMap::new(),
         local_ed25519_seed: ed25519_secret_key,
         xfer_send: HashMap::new(),
-        sealed_offer_readers: HashMap::new(),
+        sealed_offer_readers: Default::default(),
         xfer_recv: HashMap::new(),
         xfer_finish_tx,
         xfer_finish_in_flight: 0,

@@ -197,13 +197,14 @@ impl RelaySession {
     /// session's clock lost its bytes and freed its slot while it still ran.
     /// [`RELAY_ACTIVE_BACKSTOP`] only catches a bridge task that ended without
     /// removing it.
-    pub fn is_expired(&self) -> bool {
+    fn is_expired_at(&self, now: Instant) -> bool {
+        let age = now.saturating_duration_since(self.created);
         match self.state {
             RelaySessionState::WaitingForTarget => {
-                self.created.elapsed() > RELAY_MAX_DURATION
-                    || self.last_activity.elapsed() > RELAY_IDLE_TIMEOUT
+                age > RELAY_MAX_DURATION
+                    || now.saturating_duration_since(self.last_activity) > RELAY_IDLE_TIMEOUT
             }
-            RelaySessionState::Active => self.created.elapsed() > RELAY_ACTIVE_BACKSTOP,
+            RelaySessionState::Active => age > RELAY_ACTIVE_BACKSTOP,
         }
     }
 
@@ -442,10 +443,14 @@ impl RelayManager {
 
     /// Clean up expired sessions.
     pub fn cleanup(&mut self) -> Vec<u32> {
+        self.cleanup_at(Instant::now())
+    }
+
+    fn cleanup_at(&mut self, now: Instant) -> Vec<u32> {
         let expired: Vec<u32> = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.is_expired())
+            .filter(|(_, s)| s.is_expired_at(now))
             .map(|(id, _)| *id)
             .collect();
 
@@ -3679,13 +3684,13 @@ mod tests {
             4663,
             [1u8; 16],
         );
-        session.last_activity = Instant::now() - RELAY_IDLE_TIMEOUT - Duration::from_secs(1);
-        assert!(session.is_expired());
+        let idle = session.last_activity + RELAY_IDLE_TIMEOUT + Duration::from_secs(1);
+        assert!(session.is_expired_at(idle));
 
         session.mark_active();
-        session.last_activity = Instant::now() - RELAY_IDLE_TIMEOUT - Duration::from_secs(1);
+        let idle = session.last_activity + RELAY_IDLE_TIMEOUT + Duration::from_secs(1);
         assert!(
-            !session.is_expired(),
+            !session.is_expired_at(idle),
             "active bridges remain tracked until the hard duration cap"
         );
     }
@@ -4001,13 +4006,10 @@ mod tests {
     /// bridge to credit and remove, and reaps only one whose task is gone.
     #[test]
     fn cleanup_leaves_an_active_bridge_to_credit_its_own_bytes() {
-        // A machine up for less time than this cannot date an Instant so far back.
-        let (Some(past_max), Some(past_backstop)) = (
-            Instant::now().checked_sub(RELAY_MAX_DURATION + Duration::from_secs(25)),
-            Instant::now().checked_sub(RELAY_ACTIVE_BACKSTOP + Duration::from_secs(1)),
-        ) else {
-            return;
-        };
+        // Judged from ahead rather than with sessions dated back, which a
+        // machine up for less than two hours cannot do.
+        let past_max = |created: Instant| created + RELAY_MAX_DURATION + Duration::from_secs(25);
+        let past_backstop = |created: Instant| created + RELAY_ACTIVE_BACKSTOP + Duration::from_secs(1);
         let mut mgr = RelayManager::new();
         let open = |mgr: &mut RelayManager, requester: u8| {
             mgr.create_session(
@@ -4024,8 +4026,8 @@ mod tests {
         let bridging = open(&mut mgr, 1);
         let session = mgr.get_session_mut(bridging).unwrap();
         session.mark_active();
-        session.created = past_max;
-        assert!(mgr.cleanup().is_empty(), "the bridge still owns this session");
+        let at = past_max(session.created);
+        assert!(mgr.cleanup_at(at).is_empty(), "the bridge still owns this session");
         mgr.get_session_mut(bridging).unwrap().add_relayed_bytes(1234);
         mgr.remove_session(bridging);
         assert_eq!(mgr.total_bytes_relayed(), 1234);
@@ -4033,12 +4035,14 @@ mod tests {
         let orphaned = open(&mut mgr, 2);
         let session = mgr.get_session_mut(orphaned).unwrap();
         session.mark_active();
-        session.created = past_backstop;
-        assert_eq!(mgr.cleanup(), vec![orphaned], "a session no bridge removed is reaped");
+        let at = past_backstop(session.created);
+        assert_eq!(mgr.cleanup_at(at), vec![orphaned], "a session no bridge removed is reaped");
 
         let waiting = open(&mut mgr, 3);
-        mgr.get_session_mut(waiting).unwrap().created = past_max;
-        assert_eq!(mgr.cleanup(), vec![waiting], "a session never bridged keeps the old limit");
+        let session = mgr.get_session_mut(waiting).unwrap();
+        let at = past_max(session.created);
+        session.last_activity = at;
+        assert_eq!(mgr.cleanup_at(at), vec![waiting], "a session never bridged keeps the old limit");
     }
 
     struct LoopbackPeer {

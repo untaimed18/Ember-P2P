@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -42,9 +42,10 @@ const RELAY_REFUSAL_BACKOFF: Duration = Duration::from_secs(3600);
 /// its sessions end and free slots; without it a busy friend relay stays the
 /// first pick and every further source spends an attempt on the same refusal.
 const RELAY_BUSY_BACKOFF: Duration = Duration::from_secs(60);
-/// Attempts one relay is asked to carry at once: the sessions it holds for one
-/// requester. A burst past that found its handshake and session limits, which
-/// cost each source an attempt and could evict the relay as unreachable.
+/// Attempts one relay is asked to carry at once, counting the bridges it is
+/// still carrying for us: the sessions it holds for one requester. A burst past
+/// that found its handshake and session limits, which cost each source an
+/// attempt and could evict the relay as unreachable.
 const MAX_ATTEMPTS_PER_RELAY: usize = super::relay::MAX_RELAY_SESSIONS_PER_REQUESTER;
 /// Prefer fresh candidates when picking a relay; older-but-still-retained
 /// entries remain until `RELAY_CANDIDATE_PRUNE_MAX_AGE`.
@@ -124,6 +125,9 @@ struct ConnectionAttempt {
     /// The attestation hash the request to that relay presented. A refusal
     /// answers this attestation, which may no longer be the candidate's.
     relay_attestation_hash: Option<[u8; 32]>,
+    /// Held by the relayed stream once there is one; see
+    /// [`ConnectionBroker::bridge_token`].
+    bridge: Option<Weak<()>>,
 }
 
 impl ConnectionAttempt {
@@ -319,6 +323,33 @@ pub struct ConnectionBroker {
     friend_hashes: Option<crate::app_state::SharedFriendHashes>,
     /// The friend set as of the last pick; see [`Self::pick_relay_candidate`].
     friends: std::collections::HashSet<[u8; 16]>,
+    /// Relayed streams handed to a download, by relay address, live while the
+    /// stream is held. The relay counts each one against our per-requester cap
+    /// until its bridge ends, which can be hours after the attempt succeeded.
+    live_bridges: Vec<((Ipv4Addr, u16), Weak<()>)>,
+}
+
+/// A relayed stream's read half, holding its bridge's
+/// [`ConnectionBroker::bridge_token`] for as long as the download keeps it.
+pub struct BridgedReader {
+    inner: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    _bridge: Arc<()>,
+}
+
+impl BridgedReader {
+    pub fn new(inner: Box<dyn tokio::io::AsyncRead + Unpin + Send>, bridge: Arc<()>) -> Self {
+        Self { inner, _bridge: bridge }
+    }
+}
+
+impl tokio::io::AsyncRead for BridgedReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
 }
 
 /// Events emitted by the broker for the main network loop to act on.
@@ -407,6 +438,7 @@ impl ConnectionBroker {
             stats: BrokerStats::default(),
             friend_hashes: None,
             friends: std::collections::HashSet::new(),
+            live_bridges: Vec::new(),
         }
     }
 
@@ -518,6 +550,7 @@ impl ConnectionBroker {
             phase_started: now,
             relay,
             relay_attestation_hash,
+            bridge: None,
         };
 
         info!(
@@ -621,6 +654,9 @@ impl ConnectionBroker {
             return false;
         };
         {
+            if let (Some((ip, port, _)), Some(bridge)) = (attempt.relay, attempt.bridge) {
+                self.live_bridges.push(((ip, port), bridge));
+            }
             if let Some((ip, port, pubkey)) = attempt.relay {
                 // Clears the count rather than decrementing it: a relay that
                 // just carried a connection has proved itself, and occasional
@@ -823,7 +859,7 @@ impl ConnectionBroker {
     }
 
     /// Pick the best available relay candidate that is not already carrying
-    /// [`MAX_ATTEMPTS_PER_RELAY`] of our attempts.
+    /// [`MAX_ATTEMPTS_PER_RELAY`] of our attempts and live bridges together.
     ///
     /// A friend's relay first, because a relay carries only its friends'
     /// traffic, then fewest failures, then a relay that has carried a session
@@ -856,6 +892,11 @@ impl ConnectionBroker {
                         .values()
                         .filter(|a| a.relay.is_some_and(|(ip, port, _)| (ip, port) == (c.ip, c.port)))
                         .count()
+                        + self
+                            .live_bridges
+                            .iter()
+                            .filter(|(relay, bridge)| *relay == (c.ip, c.port) && bridge.strong_count() > 0)
+                            .count()
                         < MAX_ATTEMPTS_PER_RELAY
             })
             // Failures rank ahead of everything but friendship. A candidate that
@@ -908,6 +949,7 @@ impl ConnectionBroker {
         // Prune old cooldowns
         self.cooldowns
             .retain(|_, (ts, _)| ts.elapsed() < ATTEMPT_RESET);
+        self.live_bridges.retain(|(_, bridge)| bridge.strong_count() > 0);
     }
 
     pub fn active_attempts(&self) -> usize {
@@ -948,6 +990,18 @@ impl ConnectionBroker {
     /// The relay delivered a stream; the source's Hello is next.
     pub fn set_greeting_phase(&mut self, attempt_key: &str) {
         self.set_phase(attempt_key, AttemptPhase::Greeting);
+    }
+
+    /// A token for the stream the relay delivered to this attempt, to be held
+    /// (see [`BridgedReader`]) for as long as the stream is. Once the attempt
+    /// succeeds, the relay is treated as carrying one of our sessions until
+    /// the token is dropped.
+    pub fn bridge_token(&mut self, attempt_key: &str) -> Arc<()> {
+        let token = Arc::new(());
+        if let Some(attempt) = self.attempts.get_mut(attempt_key) {
+            attempt.bridge = Some(Arc::downgrade(&token));
+        }
+        token
     }
 
     fn set_phase(&mut self, attempt_key: &str, phase: AttemptPhase) {
@@ -1816,6 +1870,33 @@ mod tests {
         let after = spill + 1;
         assert!(start(&mut broker, after).await);
         assert_eq!(relay_of(&broker, after), Some(friend_relay), "an ended attempt frees its slot");
+    }
+
+    /// The relay counts a session against our cap until its bridge ends, not
+    /// until the attempt that opened it succeeds, so a relay carrying two
+    /// downloads for us is not asked for a third only to answer that it is full.
+    #[tokio::test]
+    async fn a_live_bridge_holds_its_relay_slot_until_the_stream_is_dropped() {
+        let (tx, _rx) = mpsc::channel(64);
+        let mut broker = broker_with_relay(tx);
+        let mut bridges = Vec::new();
+        for n in 1..=MAX_ATTEMPTS_PER_RELAY as u8 {
+            let source = Ipv4Addr::new(10, 0, 0, n);
+            assert!(broker.attempt_low_to_low(&format!("t{n}"), [n; 16], source, 4662, RelayTarget::default(), NatType::Symmetric, None).await);
+            let key = format!("t{n}:{source}:4662");
+            broker.set_relay_phase(&key);
+            broker.set_greeting_phase(&key);
+            bridges.push(broker.bridge_token(&key));
+            assert!(broker.mark_succeeded(&key, ConnectionMethod::PeerRelay));
+        }
+        assert_eq!(broker.active_attempts(), 0);
+        assert!(broker.pick_relay_candidate().is_none(), "both sessions it holds for us are still bridging");
+        assert!(!broker.attempt_low_to_low("t9", [9; 16], Ipv4Addr::new(10, 0, 0, 9), 4662, RelayTarget::default(), NatType::Symmetric, None).await);
+
+        bridges.pop();
+        assert!(broker.pick_relay_candidate().is_some(), "an ended bridge frees its slot");
+        broker.tick().await;
+        assert_eq!(broker.live_bridges.len(), MAX_ATTEMPTS_PER_RELAY - 1, "and is forgotten");
     }
 
     /// Copies of a relay's attestation signed before its latest keep arriving

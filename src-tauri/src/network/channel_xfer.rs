@@ -1080,6 +1080,97 @@ const SEALED_OFFER_READER_REWRITE_SECS: i64 = 24 * 3600;
 /// database still answers for anyone it drops.
 const SEALED_OFFER_READER_CACHE_CAP: usize = 4096;
 
+/// Members proven to read sealed offers, with when that was last written to
+/// the database (or queued to be). Spares a write for every frame that proves
+/// it again.
+#[derive(Default)]
+pub(super) struct SealedOfferReaders {
+    written: HashMap<[u8; 32], i64>,
+    /// Insertion order of `written`, so the cap drops the member proven
+    /// longest ago rather than everyone. A renewed member is pushed again and
+    /// its older row skipped at pop time.
+    order: std::collections::VecDeque<([u8; 32], i64)>,
+    writes: Arc<SealedOfferReaderWrites>,
+}
+
+/// Proofs waiting for the database, written off the network loop in one
+/// transaction per batch by whichever blocking task holds `flushing`.
+#[derive(Default)]
+struct SealedOfferReaderWrites {
+    proofs: parking_lot::Mutex<HashMap<[u8; 32], i64>>,
+    flushing: std::sync::atomic::AtomicBool,
+}
+
+impl SealedOfferReaders {
+    fn get(&self, member: &[u8; 32]) -> Option<i64> {
+        self.written.get(member).copied().or_else(|| self.writes.proofs.lock().get(member).copied())
+    }
+
+    fn insert(&mut self, member: [u8; 32], at: i64) {
+        if self.written.insert(member, at).is_none() {
+            while self.written.len() > SEALED_OFFER_READER_CACHE_CAP {
+                let Some((oldest, oldest_at)) = self.order.pop_front() else {
+                    break;
+                };
+                if self.written.get(&oldest) == Some(&oldest_at) {
+                    self.written.remove(&oldest);
+                }
+            }
+        }
+        self.order.push_back((member, at));
+        if self.order.len() > 2 * SEALED_OFFER_READER_CACHE_CAP {
+            let written = &self.written;
+            self.order.retain(|(m, at)| written.get(m) == Some(at));
+        }
+    }
+
+    /// Queue `member`'s proof for the database. Past
+    /// [`ember::xfer::SEALED_OFFER_READERS_MAX`] waiting, a proof is held only
+    /// in memory: the table keeps no more than that many anyway.
+    fn queue_write(&self, db: &Arc<Database>, member: [u8; 32], at: i64) {
+        {
+            let mut proofs = self.writes.proofs.lock();
+            if proofs.len() >= ember::xfer::SEALED_OFFER_READERS_MAX && !proofs.contains_key(&member) {
+                return;
+            }
+            proofs.insert(member, at);
+        }
+        if self.writes.flushing.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let writes = self.writes.clone();
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || flush_sealed_offer_readers(&writes, &db));
+    }
+}
+
+fn flush_sealed_offer_readers(writes: &SealedOfferReaderWrites, db: &Database) {
+    use std::sync::atomic::Ordering;
+    loop {
+        let proofs: Vec<([u8; 32], i64)> = writes.proofs.lock().drain().collect();
+        if proofs.is_empty() {
+            writes.flushing.store(false, Ordering::Release);
+            // A proof queued between the drain and the store above saw the
+            // flag still set and left it to this task.
+            if writes.proofs.lock().is_empty() || writes.flushing.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            continue;
+        }
+        let members: Vec<(String, i64)> = proofs.iter().map(|(m, at)| (hex::encode(m), *at)).collect();
+        let members: Vec<(&str, i64)> = members.iter().map(|(m, at)| (m.as_str(), *at)).collect();
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = db.note_sealed_offer_readers(
+            &members,
+            now,
+            now.saturating_sub(ember::xfer::SEALED_OFFER_READER_KEEP_SECS),
+            ember::xfer::SEALED_OFFER_READERS_MAX,
+        ) {
+            warn!("Ember Transfer: could not remember {} member(s) that read sealed offers: {e}", members.len());
+        }
+    }
+}
+
 /// Remember that `member` reads sealed offers, and take down any question
 /// about sending them a plain offer.
 ///
@@ -1090,7 +1181,7 @@ const SEALED_OFFER_READER_CACHE_CAP: usize = 4096;
 /// table also keeps only the newest [`ember::xfer::SEALED_OFFER_READERS_MAX`].
 pub(super) fn note_sealed_offer_reader(
     state: &mut NetworkState,
-    db: &Database,
+    db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
     channel_id: [u8; 16],
     member: &[u8; 32],
@@ -1107,24 +1198,12 @@ pub(super) fn note_sealed_offer_reader(
     }
     let now = chrono::Utc::now().timestamp();
     if state.sealed_offer_readers.get(member).is_some_and(|at| {
-        ember::xfer::sealed_offer_reader_current(Some(*at), now)
-            && now.saturating_sub(*at) < SEALED_OFFER_READER_REWRITE_SECS
+        ember::xfer::sealed_offer_reader_current(Some(at), now)
+            && now.saturating_sub(at) < SEALED_OFFER_READER_REWRITE_SECS
     }) {
         return;
     }
-    let forget_before = now.saturating_sub(ember::xfer::SEALED_OFFER_READER_KEEP_SECS);
-    if let Err(e) = db.note_sealed_offer_reader(
-        &hex::encode(member),
-        now,
-        forget_before,
-        ember::xfer::SEALED_OFFER_READERS_MAX,
-    ) {
-        warn!("Ember Transfer: could not remember a member that reads sealed offers: {e}");
-        return;
-    }
-    if state.sealed_offer_readers.len() >= SEALED_OFFER_READER_CACHE_CAP {
-        state.sealed_offer_readers.clear();
-    }
+    state.sealed_offer_readers.queue_write(db, *member, now);
     state.sealed_offer_readers.insert(*member, now);
 }
 
@@ -1135,7 +1214,7 @@ pub(super) fn member_reads_sealed_offers(
     db: &Database,
     member: &[u8; 32],
 ) -> bool {
-    let last_seen = state.sealed_offer_readers.get(member).copied().or_else(|| {
+    let last_seen = state.sealed_offer_readers.get(member).or_else(|| {
         db.sealed_offer_reader_seen_at(&hex::encode(member))
             .ok()
             .flatten()
@@ -2448,6 +2527,73 @@ mod xfer_offer_gate_tests {
             let (_, asked) = gate(true, banned, on_roster, true);
             assert!(!asked.contains(&"rate"), "{asked:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod sealed_offer_reader_tests {
+    use super::{SealedOfferReaders, SEALED_OFFER_READER_CACHE_CAP};
+    use crate::storage::database::Database;
+    use std::sync::Arc;
+
+    fn member(i: usize) -> [u8; 32] {
+        let mut m = [0u8; 32];
+        m[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        m
+    }
+
+    /// At the cap the member proven longest ago makes way, rather than the
+    /// whole cache emptying and every member costing a write again.
+    #[test]
+    fn a_full_cache_drops_its_oldest_member_only() {
+        let mut readers = SealedOfferReaders::default();
+        for i in 0..SEALED_OFFER_READER_CACHE_CAP {
+            readers.insert(member(i), i as i64);
+        }
+        readers.insert(member(0), 10_000);
+        readers.insert(member(SEALED_OFFER_READER_CACHE_CAP), 10_001);
+        assert_eq!(readers.written.len(), SEALED_OFFER_READER_CACHE_CAP);
+        assert_eq!(readers.get(&member(0)), Some(10_000), "renewed, so kept");
+        assert_eq!(readers.get(&member(1)), None, "the oldest made way");
+        assert_eq!(readers.get(&member(2)), Some(2));
+        assert_eq!(readers.get(&member(SEALED_OFFER_READER_CACHE_CAP)), Some(10_001));
+        assert!(readers.order.len() <= 2 * SEALED_OFFER_READER_CACHE_CAP);
+    }
+
+    /// Proofs reach the database from a blocking task, not the caller.
+    #[tokio::test]
+    async fn queued_proofs_reach_the_database() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-sealed-readers-flush-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Arc::new(Database::open_at(&path).expect("open db"));
+        let readers = SealedOfferReaders::default();
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..3 {
+            readers.queue_write(&db, member(i), now - i as i64);
+        }
+        for _ in 0..200 {
+            if !readers.writes.flushing.load(std::sync::atomic::Ordering::Acquire)
+                && readers.writes.proofs.lock().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        for i in 0..3 {
+            assert_eq!(
+                db.sealed_offer_reader_seen_at(&hex::encode(member(i))).unwrap(),
+                Some(now - i as i64)
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 }
 

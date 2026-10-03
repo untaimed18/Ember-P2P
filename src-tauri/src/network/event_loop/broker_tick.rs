@@ -195,6 +195,7 @@ pub(in crate::network) async fn on_broker_tick(
                     broker.set_greeting_phase(&key);
                     let greet_time_left = broker.attempt_time_left(&key).unwrap_or_default();
                     let greet_broker_tx = broker.event_sender();
+                    let bridge = broker.bridge_token(&key);
 
                     // The broker stream is freshly established and
                     // NOT yet greeted: WE initiated it (QUIC
@@ -242,7 +243,8 @@ pub(in crate::network) async fn on_broker_tick(
                     let greet_peer_port = conn.source_port;
                     let greet_file_hash = conn.file_hash;
                     let greet_attempt_key = key.clone();
-                    let mut greet_reader = conn.reader;
+                    let mut greet_reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
+                        Box::new(ember::broker::BridgedReader::new(conn.reader, bridge));
                     let mut greet_writer = conn.writer;
                     tokio::spawn(async move {
                         let greeted = ember::broker::greet_within_attempt(

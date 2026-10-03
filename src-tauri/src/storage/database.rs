@@ -8167,9 +8167,22 @@ impl Database {
     /// member last proven before `forget_before` or too far after `now` (a
     /// proof written while our clock was wrong), and all but the
     /// `keep_at_most` most recently proven.
+    #[cfg(test)]
     pub fn note_sealed_offer_reader(
         &self,
         member_pubkey: &str,
+        now: i64,
+        forget_before: i64,
+        keep_at_most: usize,
+    ) -> anyhow::Result<()> {
+        self.note_sealed_offer_readers(&[(member_pubkey, now)], now, forget_before, keep_at_most)
+    }
+
+    /// [`Self::note_sealed_offer_reader`] for several members in one
+    /// transaction, each proven at its own time; `now` bounds them all.
+    pub fn note_sealed_offer_readers(
+        &self,
+        proofs: &[(&str, i64)],
         now: i64,
         forget_before: i64,
         keep_at_most: usize,
@@ -8180,13 +8193,17 @@ impl Database {
         let conn = self.conn.lock();
         Self::ensure_sealed_offer_readers_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO sealed_offer_readers (member_pubkey, last_seen) VALUES (?1, ?2)
-             ON CONFLICT(member_pubkey) DO UPDATE SET last_seen =
-                CASE WHEN last_seen > ?3 THEN excluded.last_seen
-                     ELSE MAX(last_seen, excluded.last_seen) END",
-            params![member_pubkey.to_ascii_lowercase(), now, future_after],
-        )?;
+        {
+            let mut upsert = tx.prepare(
+                "INSERT INTO sealed_offer_readers (member_pubkey, last_seen) VALUES (?1, ?2)
+                 ON CONFLICT(member_pubkey) DO UPDATE SET last_seen =
+                    CASE WHEN last_seen > ?3 THEN excluded.last_seen
+                         ELSE MAX(last_seen, excluded.last_seen) END",
+            )?;
+            for (member_pubkey, seen_at) in proofs {
+                upsert.execute(params![member_pubkey.to_ascii_lowercase(), seen_at, future_after])?;
+            }
+        }
         tx.execute(
             "DELETE FROM sealed_offer_readers WHERE last_seen < ?1 OR last_seen > ?2",
             params![forget_before, future_after],
@@ -14716,6 +14733,26 @@ mod tests {
         db.note_sealed_offer_reader(&member(9), 2_001, 0, 4).unwrap();
         assert_eq!(db.sealed_offer_reader_seen_at(&member(2)).unwrap(), Some(2_000), "renewed, so kept");
         assert_eq!(db.sealed_offer_reader_seen_at(&member(3)).unwrap(), None);
+        drop(db);
+        remove_temp_db(&path);
+    }
+
+    /// A batch keeps each member's own proof time and is capped and aged as a
+    /// whole, the same as writing its members one at a time.
+    #[test]
+    fn a_batch_of_sealed_offer_readers_is_written_as_one() {
+        let path = temp_db_path("sealed-readers-batch");
+        let db = Database::open_at(&path).expect("open db");
+        let member = |i: u8| format!("{i:02x}").repeat(32);
+        db.note_sealed_offer_reader(&member(0), 500, 0, 4).unwrap();
+        let proofs: Vec<(String, i64)> = (1..6u8).map(|i| (member(i), 1_000 + i as i64)).collect();
+        let proofs: Vec<(&str, i64)> = proofs.iter().map(|(m, at)| (m.as_str(), *at)).collect();
+        db.note_sealed_offer_readers(&proofs, 1_010, 600, 4).unwrap();
+        assert_eq!(db.sealed_offer_reader_seen_at(&member(0)).unwrap(), None, "aged out");
+        assert_eq!(db.sealed_offer_reader_seen_at(&member(1)).unwrap(), None, "the oldest made way");
+        for i in 2..6u8 {
+            assert_eq!(db.sealed_offer_reader_seen_at(&member(i)).unwrap(), Some(1_000 + i as i64));
+        }
         drop(db);
         remove_temp_db(&path);
     }

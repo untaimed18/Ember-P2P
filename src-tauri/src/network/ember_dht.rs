@@ -2291,7 +2291,9 @@ pub(super) async fn handle_ember_dht_message(
     // path from exactly the peers who need it.
     //
     // Two sources answer it, and neither is complete on its own. The transport
-    // records every address Ember dialled, which covers searches and both bridges.
+    // records every address Ember dialled, which covers searches and both bridges,
+    // and every address QUIC sent to while it shares this socket (relays, sources,
+    // friend punches, attachments, room streams).
     // But Ember rides the KAD socket, so a KAD query to the same host opens the very
     // mapping in question — `has_recent_ip` is KAD's own record of that, written
     // only for outbound requests.

@@ -734,6 +734,76 @@ fn slots_at(
     map.range((addr, [0u8; 32])..=(addr, [0xFFu8; 32]))
 }
 
+/// Addresses we have sent to from the KAD/Ember socket, and when: how the caller
+/// tells a peer that reached us unsolicited from one answering through a NAT
+/// mapping we opened ourselves. Keyed on address only: a peer's source port
+/// rotates, and the mapping question is about the host.
+///
+/// Shared, because the transport is not the only thing sending from that socket:
+/// QUIC rides it too when it shares the port, and every QUIC dial opens the same
+/// mapping a Noise packet would. The QUIC half writes from quinn's driver tasks
+/// once per datagram, so the lock is held only for a map update.
+#[derive(Clone, Default)]
+pub struct DialLog(std::sync::Arc<parking_lot::Mutex<DialLogInner>>);
+
+#[derive(Default)]
+struct DialLogInner {
+    at: HashMap<IpAddr, Instant>,
+    /// Insertion order for `at`, for the same reason as
+    /// `EmberTransport::recent_handshake_order`: capped eviction without an
+    /// O(n) scan of the map. Pushed only when an address is newly inserted —
+    /// refreshing an existing dial updates the map in place — so the queue
+    /// holds each resident address at most once and cannot outgrow it.
+    order: VecDeque<IpAddr>,
+}
+
+impl DialLog {
+    pub fn note(&self, ip: IpAddr) {
+        // Canonicalised on the way in as well as the way out. The socket is IPv4
+        // today so the two forms cannot both occur, but storing `::ffff:a.b.c.d`
+        // under one key and querying `a.b.c.d` under another would silently never
+        // match, and nothing about that failure would be visible.
+        let ip = ip.to_canonical();
+        let now = Instant::now();
+        let mut inner = self.0.lock();
+        if let Some(at) = inner.at.get_mut(&ip) {
+            // Already resident: refresh in place and leave its position in the
+            // order queue alone, so re-dialling a known address neither grows
+            // the queue nor costs an eviction.
+            *at = now;
+            return;
+        }
+        while inner.at.len() >= MAX_DIALLED_ADDRS {
+            let Some(oldest) = inner.order.pop_front() else {
+                break;
+            };
+            if inner.at.remove(&oldest).is_some() {
+                break;
+            }
+        }
+        inner.at.insert(ip, now);
+        inner.order.push_back(ip);
+    }
+
+    /// Compared on the canonical address so an IPv4-mapped IPv6 source matches the
+    /// v4 entry it belongs to, rather than silently missing.
+    pub fn recent(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        self.0
+            .lock()
+            .at
+            .get(&ip)
+            .is_some_and(|at| at.elapsed() < DIAL_MEMORY)
+    }
+
+    fn prune(&self, now: Instant) {
+        let mut inner = self.0.lock();
+        inner.at.retain(|_, at| now.duration_since(*at) < DIAL_MEMORY);
+        let DialLogInner { at, order } = &mut *inner;
+        order.retain(|ip| at.contains_key(ip));
+    }
+}
+
 pub struct EmberTransport {
     local_noise_key: [u8; 32],
     local_noise_pub: [u8; 32],
@@ -778,17 +848,9 @@ pub struct EmberTransport {
     /// cannot be aimed by an attacker choosing its source addresses.
     trim_salt: [u8; 32],
     /// Addresses we have sent to, and when. Written by [`Self::note_dialled`] and
-    /// read by [`Self::recently_dialled`], which is how the caller tells a peer
-    /// that reached us unsolicited from one answering through a NAT mapping we
-    /// opened ourselves. Keyed on address only: a peer's source port rotates, and
-    /// the mapping question is about the host.
-    dialled: HashMap<IpAddr, Instant>,
-    /// Insertion order for `dialled`, for the same reason as
-    /// `recent_handshake_order`: capped eviction without an O(n) scan of the
-    /// map. Pushed only when an address is newly inserted — refreshing an
-    /// existing dial updates the map in place — so the queue holds each
-    /// resident address at most once and cannot outgrow it.
-    dialled_order: VecDeque<IpAddr>,
+    /// by the QUIC half of the shared socket, and read by
+    /// [`Self::recently_dialled`]. See [`DialLog`].
+    dialled: DialLog,
     /// Secret keying the XX retry cookie, and the one it replaced. Two, not
     /// one, so a cookie minted a moment before a rotation is still honoured
     /// a moment after it. This is the *only* state an unvalidated XX msg1
@@ -878,7 +940,14 @@ impl Drop for EmberTransport {
 }
 
 impl EmberTransport {
+    #[cfg(test)]
     pub fn new(local_noise_key: [u8; 32], local_noise_pub: [u8; 32]) -> Self {
+        Self::with_dial_log(local_noise_key, local_noise_pub, DialLog::default())
+    }
+
+    /// A transport whose dial record is shared with `dialled`'s other writers,
+    /// so [`Self::recently_dialled`] answers for their sends too.
+    pub fn with_dial_log(local_noise_key: [u8; 32], local_noise_pub: [u8; 32], dialled: DialLog) -> Self {
         Self {
             local_noise_key,
             local_noise_pub,
@@ -889,8 +958,7 @@ impl EmberTransport {
             recent_handshake_order: VecDeque::new(),
             deferred_ik: HashMap::new(),
             trim_salt: fresh_cookie_secret(),
-            dialled: HashMap::new(),
-            dialled_order: VecDeque::new(),
+            dialled,
             cookie_secret: fresh_cookie_secret(),
             prev_cookie_secret: fresh_cookie_secret(),
             cookie_rotated_at: Instant::now(),
@@ -1160,41 +1228,13 @@ impl EmberTransport {
     /// including gossip contacts the routing table refused, and so is the *common*
     /// way to open a mapping to a peer we have no contact for.
     fn note_dialled(&mut self, ip: IpAddr) {
-        // Canonicalised on the way in as well as the way out. The socket is IPv4
-        // today so the two forms cannot both occur, but storing `::ffff:a.b.c.d`
-        // under one key and querying `a.b.c.d` under another would silently never
-        // match, and nothing about that failure would be visible.
-        let ip = ip.to_canonical();
-        let now = Instant::now();
-        if let Some(at) = self.dialled.get_mut(&ip) {
-            // Already resident: refresh in place and leave its position in the
-            // order queue alone, so re-dialling a known address neither grows
-            // the queue nor costs an eviction.
-            *at = now;
-            return;
-        }
-        while self.dialled.len() >= MAX_DIALLED_ADDRS {
-            let Some(oldest) = self.dialled_order.pop_front() else {
-                break;
-            };
-            if self.dialled.remove(&oldest).is_some() {
-                break;
-            }
-        }
-        self.dialled.insert(ip, now);
-        self.dialled_order.push_back(ip);
+        self.dialled.note(ip);
     }
 
     /// Whether we have sent anything to this address recently enough that a NAT
     /// mapping we opened could still be carrying its reply.
-    ///
-    /// Compared on the canonical address so an IPv4-mapped IPv6 source matches the
-    /// v4 entry it belongs to, rather than silently missing.
     pub fn recently_dialled(&self, ip: IpAddr) -> bool {
-        let ip = ip.to_canonical();
-        self.dialled
-            .get(&ip)
-            .is_some_and(|at| at.elapsed() < DIAL_MEMORY)
+        self.dialled.recent(ip)
     }
 
     /// Check if we have an established session with a peer.
@@ -1619,17 +1659,14 @@ impl EmberTransport {
             .retain(|_, e| now.duration_since(e.seen_at) < HANDSHAKE_REPLAY_TTL);
         self.deferred_ik
             .retain(|_, d| now.duration_since(d.stored) < DEFERRED_IK_PAYLOAD_TTL);
-        self.dialled
-            .retain(|_, at| now.duration_since(*at) < DIAL_MEMORY);
-        // Both order queues are swept alongside the maps they index. Stale rows
-        // are harmless at pop time but would otherwise accumulate for the life
-        // of the process, since eviction is the only other thing that drains
-        // them and it only runs at the cap.
+        self.dialled.prune(now);
+        // Swept alongside the map it indexes. Stale rows are harmless at pop
+        // time but would otherwise accumulate for the life of the process, since
+        // eviction is the only other thing that drains them and it only runs at
+        // the cap.
         let live_handshakes = &self.recent_handshakes;
         self.recent_handshake_order
             .retain(|(k, at)| live_handshakes.get(k).is_some_and(|e| e.seen_at == *at));
-        let live_dialled = &self.dialled;
-        self.dialled_order.retain(|ip| live_dialled.contains_key(ip));
     }
 
     /// Drop the session, staged re-handshake and deferred payload held for one

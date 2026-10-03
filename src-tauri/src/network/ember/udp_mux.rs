@@ -40,6 +40,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
+use super::transport::DialLog;
+
 /// Length of the connection ids our endpoint issues.
 pub const CID_LEN: usize = 16;
 const CID_NONCE_LEN: usize = 8;
@@ -201,10 +203,13 @@ pub fn is_quic(data: &[u8], key: &CidKey) -> bool {
 /// socket quinn can drive — `None` when `cid_key` is, which is the fallback to
 /// a separate QUIC socket: then everything goes to the loop, as before.
 ///
+/// The QUIC half records every destination it sends to in `dial_log`.
+///
 /// The reader stops once the loop drops its receiver.
 pub fn start(
     socket: Arc<UdpSocket>,
     cid_key: Option<CidKey>,
+    dial_log: DialLog,
 ) -> (mpsc::Receiver<Datagram>, Option<SharedQuicSocket>) {
     let (other_tx, other_rx) = mpsc::channel(OTHER_QUEUE);
     let (quic_route, quic) = match &cid_key {
@@ -216,6 +221,7 @@ pub fn start(
                 rx: parking_lot::Mutex::new(rx),
                 claimed: claimed.clone(),
                 last_send_error_log: parking_lot::Mutex::new(None),
+                dial_log,
             };
             (Some(QuicRoute { tx, claimed }), Some(shared))
         }
@@ -344,6 +350,10 @@ pub struct SharedQuicSocket {
     /// See [`QuicRoute::claimed`].
     claimed: Arc<AtomicBool>,
     last_send_error_log: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Shared with the Ember transport. A QUIC send opens the same NAT mapping
+    /// a Noise packet would, and the unsolicited-reachability rule must not take
+    /// a peer answering through it for a stranger.
+    dial_log: DialLog,
 }
 
 impl SharedQuicSocket {
@@ -378,6 +388,7 @@ impl AsyncUdpSocket for SharedQuicSocket {
         debug_assert!(transmit
             .segment_size
             .is_none_or(|size| size >= transmit.contents.len()));
+        self.dial_log.note(transmit.destination.ip());
         match self.socket.try_send_to(transmit.contents, transmit.destination) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
@@ -593,7 +604,7 @@ mod tests {
     async fn quic_is_dropped_until_the_endpoint_polls() {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let addr = socket.local_addr().unwrap();
-        let (mut other, quic_half) = start(socket.clone(), Some(CidKey::random()));
+        let (mut other, quic_half) = start(socket.clone(), Some(CidKey::random()), DialLog::default());
         let quic_half = quic_half.unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let initial = long_header(QUIC_VERSION_1, 0xC3);
@@ -675,12 +686,18 @@ mod tests {
     }
 
     async fn shared_endpoint() -> (quinn::Endpoint, Arc<UdpSocket>, mpsc::Receiver<Datagram>) {
+        let (endpoint, socket, other, _) = shared_endpoint_logging().await;
+        (endpoint, socket, other)
+    }
+
+    async fn shared_endpoint_logging() -> (quinn::Endpoint, Arc<UdpSocket>, mpsc::Receiver<Datagram>, DialLog) {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let key = CidKey::random();
-        let (other, quic_half) = start(socket.clone(), Some(key.clone()));
+        let dial_log = DialLog::default();
+        let (other, quic_half) = start(socket.clone(), Some(key.clone()), dial_log.clone());
         let (cert, pkey) = endpoint_identity();
         let endpoint = quic::build_shared_endpoint(&cert, &pkey, quic_half.unwrap(), &key).unwrap();
-        (endpoint, socket, other)
+        (endpoint, socket, other, dial_log)
     }
 
     /// Echo every stream on `endpoint` back to its sender.
@@ -756,6 +773,25 @@ mod tests {
         echo.abort();
     }
 
+    /// A QUIC dial from the shared socket opens the same NAT mapping an Ember
+    /// packet would, so it lands in the transport's dial record, and the
+    /// unsolicited-reachability rule cannot read the peer's later ping as a
+    /// stranger's.
+    #[tokio::test]
+    async fn a_quic_dial_counts_as_dialled_for_the_transport() {
+        let (client, _client_socket, _client_other, dial_log) = shared_endpoint_logging().await;
+        let (server, server_socket, _server_other) = shared_endpoint().await;
+        let server_addr = server_socket.local_addr().unwrap();
+        let transport = crate::network::ember::transport::EmberTransport::with_dial_log([1; 32], [2; 32], dial_log);
+        assert!(!transport.recently_dialled(server_addr.ip()), "nothing sent yet");
+
+        let echo = serve_echo(server);
+        round_trip(&client, server_addr, 1024).await;
+        assert!(transport.recently_dialled(server_addr.ip()));
+        assert!(!transport.recently_dialled("127.0.0.2".parse().unwrap()), "only the host it sent to");
+        echo.abort();
+    }
+
     /// A 1.7.x peer runs QUIC on a socket of its own with quinn's defaults. It
     /// reaches a shared endpoint, and a shared endpoint reaches it.
     #[tokio::test]
@@ -800,7 +836,7 @@ mod tests {
     #[tokio::test]
     async fn the_reader_releases_the_socket_with_the_loop() {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let (other, quic_half) = start(socket.clone(), None);
+        let (other, quic_half) = start(socket.clone(), None, DialLog::default());
         assert!(quic_half.is_none(), "no QUIC half with sharing off");
         drop(other);
         for _ in 0..50 {

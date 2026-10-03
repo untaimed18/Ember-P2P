@@ -2170,7 +2170,7 @@ pub(super) enum ChannelUnicast {
 /// could serve, and a signal is only true for the few seconds after it left.
 pub(super) fn apply_channel_typing(
     state: &mut NetworkState,
-    db: &Database,
+    db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
     channel_id: [u8; 16],
     timestamp: i64,

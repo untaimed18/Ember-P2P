@@ -292,10 +292,9 @@ pub struct DhtInbound {
     /// separately from a malformed payload.
     pub version_mismatch: Option<u8>,
     /// A STORE record repeated a publisher signature we accepted inside the
-    /// replay window (slice 14), and we still hold that record or its
-    /// publisher's newer copy. Not a refusal: it is acknowledged like a fresh
-    /// store, because it is already placed; this marks only that no new work
-    /// was done.
+    /// replay window (slice 14), and we still hold that record. Not a refusal:
+    /// it is acknowledged like a fresh store, because it is already placed;
+    /// this marks only that no new work was done.
     pub store_replay_rejected: bool,
     /// A verified `PROXY_STORE` the caller should fan out via the normal
     /// publish driver (buddy-assisted firewalled source publish).
@@ -1305,7 +1304,9 @@ impl EmberDht {
         // superseding it with a republish. That is not an eviction to make
         // good: `DhtStore::store` finds the newer copy and keeps it, so a
         // replay of the retired copy must not be treated as a fresh store,
-        // re-arm this cache entry, or pay a second Ed25519 verification.
+        // re-arm this cache entry, or pay a second Ed25519 verification. Nor
+        // is it ACKed, any more than `DhtStore::store` ACKs it once the cache
+        // entry has lapsed: the key does not hold that copy.
         //
         // Only past the verification, because what decides it — file hash and
         // creation date — is read from the body, and those are the fields a
@@ -1317,7 +1318,7 @@ impl EmberDht {
                     && h.created_at > parsed.timestamp
             })
         {
-            return StoreOutcome::Replay;
+            return StoreOutcome::Rejected;
         }
 
         // A firewalled source's declared address is exempt from the bind
@@ -5786,7 +5787,8 @@ mod tests {
     /// still holds the entry but the store no longer holds the record, so the
     /// replay reached `store`, hit the newer-copy guard, and was reported as a
     /// fresh store — an ACK for a record we did not take, a re-armed cache
-    /// entry, and two Ed25519 verifications, on demand.
+    /// entry, and two Ed25519 verifications, on demand. It is refused exactly
+    /// as `store` refuses it once the cache entry has lapsed.
     #[test]
     fn a_replay_of_a_record_its_publisher_superseded_is_not_a_fresh_store() {
         let mut a = dht(20);
@@ -5800,7 +5802,7 @@ mod tests {
         let (old_data, old_sig) = redated(&sk, &base, base.timestamp - 300);
         let (new_data, new_sig) = redated(&sk, &base, base.timestamp);
 
-        let (_rid, old_frame) = a.build_store(key, old_data, old_sig);
+        let (_rid, old_frame) = a.build_store(key, old_data.clone(), old_sig);
         assert!(
             b.handle_message(&old_frame, a_addr, a_noise, 1000)
                 .stored_record
@@ -5818,15 +5820,27 @@ mod tests {
             "a superseded copy must not be reported as stored"
         );
         assert!(
-            replay.store_replay_rejected,
-            "a signature we have already seen whose record is gone for good is a replay"
+            !replay.store_replay_rejected,
+            "a copy we no longer hold is not a replay of one we do"
         );
-        assert_eq!(
-            replay.responses.len(),
-            1,
-            "the sender still needs its STORE_ACK"
-        );
+        assert!(replay.responses.is_empty(), "and is not ACKed: the key does not hold it");
         assert_eq!(b.store_stats(), (1, 1), "and the live store is untouched");
+
+        let entry = messages::BatchedRecord {
+            key,
+            record: old_data,
+            record_signature: old_sig,
+        };
+        let (_rid, batch, _taken) = a.build_store_batch(&[entry]).expect("a batch");
+        let on_b = b.handle_message(&batch, a_addr, a_noise, 1003);
+        assert!(!on_b.store_replay_rejected);
+        let on_a = a.handle_message(&on_b.responses[0], addr(21, 4672), b.local_noise_pub, 1004);
+        assert_eq!(
+            on_a.store_batch_ack.map(|(_, accepted)| accepted),
+            Some(0),
+            "nor does it set its accepted bit in a batch"
+        );
+        assert_eq!(b.store_stats(), (1, 1));
     }
 
     /// At capacity the cache used to choose its victim with a `min_by_key` over
