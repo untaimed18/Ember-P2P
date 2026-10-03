@@ -367,7 +367,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let _ = app_handle.emit(
                     "network-error",
                     serde_json::json!({
-                        "message": format!("Failed to create UDP socket: {e}"),
+                        "message": crate::commands::errors::coded_ctx(
+                            "network_udp_socket_failed",
+                            format!("Failed to create UDP socket: {e}"),
+                            &e,
+                        ),
                     }),
                 );
                 anyhow::bail!("Failed to create UDP socket: {e}");
@@ -402,7 +406,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 udp_port.saturating_add(4),
             );
             error!("{msg}");
-            let _ = app_handle.emit("network-error", serde_json::json!({ "message": msg }));
+            let _ = app_handle.emit(
+                "network-error",
+                serde_json::json!({
+                    "message": crate::commands::errors::coded_ctx("network_udp_bind_failed", msg.clone(), udp_port),
+                }),
+            );
             anyhow::bail!("{msg}");
         }
     };

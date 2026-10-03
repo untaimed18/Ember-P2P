@@ -2828,6 +2828,8 @@
   "error_network_busy": "Netzwerk ausgelastet: {detail}",
   "error_network_task_panicked": "Der Netzwerkdienst wurde unerwartet beendet. Starten Sie Ember neu, um die Verbindung wiederherzustellen; Details finden Sie im Protokoll.",
   "error_network_tcp_port_in_use": "TCP-Port {detail} wird bereits verwendet. Uploads funktionieren nicht. Ändern Sie den Port in den Einstellungen oder schließen Sie das andere Programm.",
+  "error_network_udp_bind_failed": "Ember konnte weder den UDP-Port {detail} noch die vier folgenden oder einen freien Port öffnen. KAD, eD2K-Server und das Ember-Netzwerk funktionieren nicht. Ändern Sie den UDP-Port in den Einstellungen oder schließen Sie das andere Programm.",
+  "error_network_udp_socket_failed": "Ember konnte seinen UDP-Socket nicht erstellen ({detail}). KAD, eD2K-Server und das Ember-Netzwerk funktionieren erst, wenn das gelingt.",
   "error_bandwidth_refill_panicked": "Die Bandbreitenbegrenzung wurde unerwartet beendet. Starten Sie Ember neu, um begrenzte Übertragungen fortzusetzen; Details siehe Protokoll.",
   "error_network_timeout": "Das Netzwerk antwortet nicht",
   "error_peers_bootstrap_worker_dropped": "Die Bootstrap-Anfrage wurde unterbrochen. Versuchen Sie es erneut.",

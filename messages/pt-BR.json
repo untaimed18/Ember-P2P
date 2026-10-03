@@ -2825,6 +2825,8 @@
   "error_network_busy": "Rede ocupada: {detail}",
   "error_network_task_panicked": "O serviço de rede parou inesperadamente. Reinicie o Ember para reconectar; consulte os logs para mais detalhes.",
   "error_network_tcp_port_in_use": "A porta TCP {detail} já está em uso. Os envios não vão funcionar. Altere a porta nas Configurações ou feche o outro aplicativo.",
+  "error_network_udp_bind_failed": "O Ember não conseguiu abrir a porta UDP {detail}, as quatro seguintes nem qualquer porta livre. O KAD, os servidores eD2K e a Rede Ember não vão funcionar. Altere a porta UDP nas Configurações ou feche o outro aplicativo.",
+  "error_network_udp_socket_failed": "O Ember não conseguiu criar seu socket UDP ({detail}). O KAD, os servidores eD2K e a Rede Ember não vão funcionar até que consiga.",
   "error_bandwidth_refill_panicked": "A limitação de banda parou inesperadamente. Reinicie o Ember para retomar as transferências limitadas; veja os logs para mais detalhes.",
   "error_network_timeout": "A rede não está respondendo",
   "error_peers_bootstrap_worker_dropped": "A solicitação de bootstrap foi interrompida. Tente novamente.",
