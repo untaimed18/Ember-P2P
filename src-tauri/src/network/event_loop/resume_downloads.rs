@@ -65,20 +65,29 @@ struct RootListing {
 static LISTED_ROOTS: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
 
 impl RootListing {
-    fn read(root: &Path) -> Self {
+    /// `copies` says whether to list `Downloads` for completion copies. Only a
+    /// completion across volumes makes one, or any completion on macOS, which
+    /// copies even on one volume: with a single download folder elsewhere
+    /// nothing can have, and listing what may be a huge `Downloads` on a
+    /// share held up every restore for nothing.
+    fn read(root: &Path, copies: bool) -> Self {
         #[cfg(test)]
         LISTED_ROOTS.lock().push(root.to_path_buf());
         Self {
             parts: crate::storage::part_folders::part_names(root),
-            copies: ed2k::transfer::earlier_completion_copies(&root.join("Downloads")),
+            copies: if copies {
+                ed2k::transfer::earlier_completion_copies(&root.join("Downloads"))
+            } else {
+                Vec::new()
+            },
         }
     }
 
     /// [`Self::read`] for the current folder, whose part files are never
     /// unknown: when its `Temp` cannot be listed, each download's are looked
     /// up by name, as they were before there were earlier folders.
-    fn read_current(root: &Path, jobs: &[RestoreJob]) -> Self {
-        let mut listing = Self::read(root);
+    fn read_current(root: &Path, jobs: &[RestoreJob], copies: bool) -> Self {
+        let mut listing = Self::read(root, copies);
         if listing.parts.is_none() {
             let temp = root.join("Temp");
             listing.parts = Some(
@@ -113,13 +122,16 @@ fn read_restored_parts(
     let Some((current, earlier)) = paths.split_first() else {
         return restore_from_listings(&roots, &[], jobs, recorded);
     };
+    let copies = !earlier.is_empty() || cfg!(target_os = "macos");
     let listings: Vec<Option<RootListing>> = std::thread::scope(|scope| {
         let listing_earlier = (!earlier.is_empty()).then(|| {
             scope.spawn(|| {
-                crate::storage::part_folders::probe_within(earlier, budget, RootListing::read)
+                crate::storage::part_folders::probe_within(earlier, budget, |root| {
+                    RootListing::read(root, true)
+                })
             })
         });
-        let current = RootListing::read_current(current, &jobs);
+        let current = RootListing::read_current(current, &jobs, copies);
         let earlier_listings = match listing_earlier {
             Some(listing) => listing
                 .join()
@@ -981,7 +993,7 @@ mod tests {
         let id = uuid();
         restore_from_listings(
             &folders.roots(),
-            &[Some(RootListing::read(&current)), None],
+            &[Some(RootListing::read(&current, true)), None],
             vec![job(&id)],
             &HashMap::from([(id.clone(), slow.to_string_lossy().into_owned())]),
         );
@@ -1070,6 +1082,27 @@ mod tests {
         path
     }
 
+    /// With a single download folder, restoring lists its `Temp` and nothing
+    /// else, as before there were earlier folders: no completion can have
+    /// left a copy there except on macOS.
+    #[test]
+    fn a_single_download_folder_restores_without_listing_its_downloads() {
+        let scratch = Scratch::new("single-no-copies");
+        let current = scratch.folder("current");
+        let folders = scratch.folders(&current, &[]);
+        let id = uuid();
+        std::fs::write(current.join("Temp").join(format!("{id}.part")), b"x").unwrap();
+        let copy = copy_in(&current, &id, b"whole file");
+        let restored = read_restored_parts(&folders, vec![job(&id)], &HashMap::new(), BUDGET);
+        assert!(restored.parts.contains_key(&id));
+        if cfg!(target_os = "macos") {
+            assert_eq!(restored.copies[&id].len(), 1);
+        } else {
+            assert!(restored.copies.is_empty(), "Downloads was not looked at");
+            assert!(copy.exists());
+        }
+    }
+
     /// The copy is settled before the download can resume, so a `.part`
     /// started over can never cost the only complete copy.
     #[test]
@@ -1078,7 +1111,10 @@ mod tests {
         let scratch = Scratch::new("copies");
         let (current, data) = (scratch.folder("current"), scratch.0.join("data"));
         std::fs::create_dir_all(&data).unwrap();
-        let folders = scratch.folders(&current, &[]);
+        // Copies come from completing across volumes, so from a download
+        // folder changed since; with one folder only macOS makes them.
+        let earlier = scratch.folder("earlier");
+        let folders = scratch.folders(&current, &[&earlier]);
         crate::security::filesystem::initialize_approved_roots(&data, &folders.roots()).unwrap();
         let finished = vec![7u8; 100];
         let hashed = scratch.0.join("finished");
