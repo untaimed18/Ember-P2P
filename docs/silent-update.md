@@ -176,7 +176,11 @@ shown meanwhile, so the user can still install it. If a newer release appears
 while one is staged, the scheduler prepares the newer one and discards the old.
 A newer release starts afresh: it is downloaded at once, whatever became of the
 one it replaces, so a hotfix for a release that would not download is not held
-back an hour. Switching silent updates (or update checks) off stops a
+back an hour, and a background download of the release it replaces is stopped
+rather than left holding the staging folder. A copy being downloaded again,
+for a re-published artifact of the same version, waits a full quiet period
+once it is ready, and the week-long-wait stamp is kept in memory when the state
+file cannot take it. Switching silent updates (or update checks) off stops a
 background download that is running. If the security floor rises past the staged version,
 the staged update is dropped, exactly as the manual path does today
 (`updater_pending_below_floor`).
@@ -289,7 +293,10 @@ until it can.
 that, stamped before the clock stepped back (or written by hand), still holds,
 but is rewritten to end 24 hours after the driver notices it, so a clock that
 moved neither loses the user's answer nor holds updates off for longer than one
-postpone. **Skip this version** stops
+postpone. The dialog closes on an answer, so **Not now**, **Skip this version**
+and **Resume** also hold in memory for the rest of the session, over whatever
+the state file says: a write an antivirus or indexer blocked is logged, and
+the countdown does not run out and install anyway. **Skip this version** stops
 silent installs of that version; the normal "update available" notice still
 shows it, and the next newer release is handled normally. While silent updates
 are going to install an update, the corner "update available" notice stays
@@ -516,14 +523,22 @@ The worst outcome for an unattended update is that Ember closes and nothing
 starts again. It could then sit closed for days, sharing nothing, before the user
 notices. Each path is covered as follows.
 
-**Install fails before anything is stopped.** The staged copy vanished or no
-longer verifies (antivirus, most likely, which will do it again), so the
-install never begins and Ember keeps running. A toast says the version could
-not be installed automatically, and it is never tried silently again
-(`failed_version`). Any other failure at that point, such as a security-floor
-file that cannot be read right now or the update having been superseded, says
-nothing about the release, so it holds the version only until the next launch.
+**Install fails before anything is stopped.** The staged copy no longer
+verifies (antivirus, most likely, which will do it again), so the install never
+begins and Ember keeps running. A toast says the version could not be installed
+automatically, and it is never tried silently again (`failed_version`). A
+staged copy that is gone says nothing about the release, so it is downloaded
+again and waits for a fresh quiet period, once a session; gone a second time,
+the version is held until the next launch. Any other failure at that point,
+such as a security-floor file that cannot be read right now or the update
+having been superseded, likewise holds the version only until the next launch.
 No watchdog is involved, since nothing was handed over.
+
+The staging folder's housekeeping (the hand-off status query's sweep, and
+clearing a hand-off) never deletes the copy the pending update has staged or
+would reuse, and judges a staged file of the highest signed release observed
+by that release's own epoch, so an emergency release that authorizes a version
+no higher than the running one is not swept as stale.
 
 **Install call returns an error** (the AppImage rewrite failed, or on Windows the
 plugin could not write the installer out of the bundle). The graceful shutdown
@@ -724,10 +739,10 @@ with a test key.**
   - block it with Defender;
   - kill the installer halfway.
 
-  In each case Ember reports the failure and does not retry. Deleting the staged
-  copy stops the install before Ember closes, so it simply keeps running; in the
-  other two Ember is running again within 5 minutes on the old version, in the
-  same state.
+  Deleting the staged copy stops the install before Ember closes, so it simply
+  keeps running and downloads the update again, once. In the other two Ember
+  reports the failure, does not retry, and is running again within 5 minutes
+  on the old version, in the same state.
 - AppImage update and relaunch. Confirm the relaunch runs the new AppImage, not
   the old mount.
 - `.deb` build shows the switch disabled with its reason.

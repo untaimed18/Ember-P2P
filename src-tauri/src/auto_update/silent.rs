@@ -155,6 +155,32 @@ static LAST_STATUS: parking_lot::Mutex<Option<SilentUpdateStatus>> = parking_lot
 /// The countdown's tray entry while it is shown. Only touched on the main
 /// thread.
 static TRAY_CANCEL: parking_lot::Mutex<Option<MenuItem<Wry>>> = parking_lot::Mutex::new(None);
+static ANSWERS: parking_lot::Mutex<Answers> = parking_lot::Mutex::new(Answers {
+    postponed_until: None,
+    skipped_version: None,
+});
+
+/// What the user answered this session, laid over every record the driver
+/// reads. The dialog closes on an answer whether or not the record took it, so
+/// a write an antivirus or indexer blocked must not leave the countdown to run
+/// out and install anyway.
+struct Answers {
+    /// `Some(None)` is a "Not now" lifted again, which outranks one still on
+    /// disk because that write failed.
+    postponed_until: Option<Option<i64>>,
+    skipped_version: Option<String>,
+}
+
+impl Answers {
+    fn apply(&self, record: &mut UpdateRecord) {
+        if let Some(until) = self.postponed_until {
+            record.postponed_until = until;
+        }
+        if let Some(version) = &self.skipped_version {
+            record.skipped_version = Some(version.clone());
+        }
+    }
+}
 
 /// Keyboard or mouse input in an Ember window, or one of them gaining focus.
 pub fn note_user_activity_now() {
@@ -261,6 +287,47 @@ fn staged_copy_failed(pending: Option<Option<(String, bool)>>, version: &str) ->
     })
 }
 
+/// What an install that failed before anything was stopped means for the
+/// version it was installing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EarlyFailure {
+    /// The staged copy changed under it: never tried silently again.
+    Release,
+    /// The staged copy is gone, which says nothing about the release: it is
+    /// downloaded again, once a session so an antivirus that keeps removing it
+    /// does not cost a download and a countdown every quiet spell.
+    Restage,
+    /// Held until the next launch.
+    Session,
+}
+
+/// `copy_present` is whether the pending update's staged file is on disk, when
+/// that could be told; `restaged` whether this version was already downloaded
+/// again this session after its copy went missing.
+fn early_failure(
+    pending: Option<Option<(String, bool)>>,
+    version: &str,
+    copy_present: Option<bool>,
+    restaged: bool,
+) -> EarlyFailure {
+    if !staged_copy_failed(pending, version) {
+        return EarlyFailure::Session;
+    }
+    match copy_present {
+        Some(false) if restaged => EarlyFailure::Session,
+        Some(false) => EarlyFailure::Restage,
+        _ => EarlyFailure::Release,
+    }
+}
+
+/// When `version` became ready: the stamp this session already made for it,
+/// which outlives a record that could not take it, else now.
+fn ready_since_for(remembered: Option<ReadySince>, version: &str, now_unix: i64) -> ReadySince {
+    remembered
+        .filter(|ready| ready.version == version)
+        .unwrap_or_else(|| ReadySince { version: version.to_string(), at: now_unix })
+}
+
 /// Whether the user has been away from every Ember window long enough.
 fn user_away(last_input_unix: i64, now_unix: i64) -> bool {
     now_unix.saturating_sub(last_input_unix) >= USER_AWAY_SECS
@@ -293,6 +360,10 @@ struct Driver {
     /// Not installed silently again this session: its install failed for a
     /// reason that says nothing about the release, or could not be recorded.
     held_for_session: Option<String>,
+    /// Downloaded again this session after its staged copy went missing.
+    restaged: Option<String>,
+    /// When the pending version became ready, in case the record cannot keep it.
+    ready_since: Option<ReadySince>,
     clock: TickClock,
     prepare_failed: bool,
     /// The countdown ran out or "Update now" was pressed, and the install is
@@ -434,6 +505,9 @@ impl Driver {
         if !prepared {
             self.leave_countdown(app);
             self.phase = Phase::Preparing;
+            // Activity is not sampled while downloading, so a re-published
+            // copy of this version waits a whole quiet period once it is ready.
+            self.quiet_since = None;
             if self.prepare_task.is_none() && self.next_prepare_at.is_none_or(|at| now >= at) {
                 let task_app = app.clone();
                 self.prepare_task = Some(tauri::async_runtime::spawn(async move {
@@ -446,9 +520,10 @@ impl Driver {
         }
 
         if self.record.ready_since.as_ref().is_none_or(|ready| ready.version != version) {
-            let since = ReadySince { version: version.clone(), at: now_unix };
+            let since = ready_since_for(self.ready_since.take(), &version, now_unix);
             let _ = record::update_stored(|record| record.ready_since = Some(since.clone()));
-            self.record.ready_since = Some(since);
+            self.record.ready_since = Some(since.clone());
+            self.ready_since = Some(since);
         }
 
         let in_countdown = self.countdown_ends.is_some();
@@ -515,6 +590,7 @@ impl Driver {
             Ok(record) => self.record = record,
             Err(error) => tracing::debug!("Silent update: keeping the last record read: {error}"),
         }
+        ANSWERS.lock().apply(&mut self.record);
         if let Some(until) = rebased_postpone(&self.record, now_unix) {
             let stamped = self.record.postponed_until;
             let _ = record::update_stored(|record| {
@@ -522,6 +598,10 @@ impl Driver {
                     record.postponed_until = Some(until);
                 }
             });
+            let mut answers = ANSWERS.lock();
+            if answers.postponed_until.is_some() {
+                answers.postponed_until = Some(Some(until));
+            }
             self.record.postponed_until = Some(until);
         }
     }
@@ -537,6 +617,12 @@ impl Driver {
     /// A different release is pending: nothing learned about the last one
     /// applies to it, including a download of it that failed.
     fn start_version(&mut self, version: String) {
+        // The superseded download would hold the staging folder for up to half
+        // an hour before finding out, and this one could not start until then.
+        if let Some(task) = self.prepare_task.take() {
+            tracing::info!("Silent update: {version} supersedes the update being downloaded; stopping that download");
+            task.abort();
+        }
         self.quiet_since = None;
         self.next_prepare_at = None;
         self.prepare_failed = false;
@@ -702,7 +788,10 @@ impl Driver {
         // start an install: a "Not now", a skip or a transfer that arrived
         // since this tick began must win over the clock.
         let fresh = match record::read_stored() {
-            Ok(fresh) => fresh,
+            Ok(mut fresh) => {
+                ANSWERS.lock().apply(&mut fresh);
+                fresh
+            }
             Err(error) => {
                 tracing::warn!("Silent update of {version} waits: its record cannot be read ({error})");
                 return false;
@@ -762,20 +851,34 @@ impl Driver {
             }
             Err(error) => {
                 // Failed before anything was stopped, so nothing restarts. Only
-                // a staged copy that failed marks the version for good; a floor
-                // file that could not be read, or the update superseded, holds
-                // it for this session. Either way it is not tried again now, or
-                // every quiet spell would count down anew.
+                // a staged copy that changed marks the version for good; one
+                // that is gone is downloaded again, and a floor file that could
+                // not be read, or the update superseded, holds it for this
+                // session. It is not tried again as it stands, or every quiet
+                // spell would count down anew.
                 tracing::warn!("Silent update of {version} did not start: {error}");
-                let lasting = staged_copy_failed(updater::try_pending_update_state(&service), version);
+                let failure = early_failure(
+                    updater::try_pending_update_state(&service),
+                    version,
+                    updater::try_staged_copy_present(app, &service),
+                    self.restaged.as_deref() == Some(version),
+                );
                 let failed = version.to_string();
                 let _ = record::update_stored(|record| {
                     record.attempting = None;
-                    if lasting {
+                    if failure == EarlyFailure::Release {
                         record.failed_version = Some(failed);
                     }
                 });
-                self.hold_after_failure(app, version, enabled, support, now_unix);
+                if failure == EarlyFailure::Restage {
+                    tracing::info!("Silent update: the staged copy of {version} is gone; downloading it again");
+                    self.restaged = Some(version.to_string());
+                    self.phase = Phase::Preparing;
+                    self.quiet_since = None;
+                    self.publish(app, enabled, support, now_unix);
+                } else {
+                    self.hold_after_failure(app, version, enabled, support, now_unix);
+                }
             }
         }
         true
@@ -1031,7 +1134,10 @@ pub fn silent_update_postpone() {
 /// The tray's cancel entry does the same as "Not now".
 pub fn postpone() {
     let until = chrono::Utc::now().timestamp() + POSTPONE_SECS;
-    let _ = record::update_stored(|record| record.postponed_until = Some(until));
+    ANSWERS.lock().postponed_until = Some(Some(until));
+    if let Err(error) = record::update_stored(|record| record.postponed_until = Some(until)) {
+        tracing::warn!("Silent update postponed for this session only: it could not be recorded ({error})");
+    }
     INSTALL_NOW.store(false, Ordering::Release);
     RECORD_DIRTY.store(true, Ordering::Release);
 }
@@ -1041,7 +1147,10 @@ pub fn postpone() {
 #[tauri::command]
 pub fn silent_update_skip(version: String) {
     let version: String = version.chars().take(64).collect();
-    let _ = record::update_stored(|record| record.skipped_version = Some(version));
+    ANSWERS.lock().skipped_version = Some(version.clone());
+    if let Err(error) = record::update_stored(|record| record.skipped_version = Some(version)) {
+        tracing::warn!("Silent update skipped for this session only: it could not be recorded ({error})");
+    }
     INSTALL_NOW.store(false, Ordering::Release);
     RECORD_DIRTY.store(true, Ordering::Release);
 }
@@ -1049,7 +1158,10 @@ pub fn silent_update_skip(version: String) {
 /// Lift a "Not now" early, from Settings → About.
 #[tauri::command]
 pub fn silent_update_resume() {
-    let _ = record::update_stored(|record| record.postponed_until = None);
+    ANSWERS.lock().postponed_until = Some(None);
+    if let Err(error) = record::update_stored(|record| record.postponed_until = None) {
+        tracing::warn!("Silent update resumed for this session only: it could not be recorded ({error})");
+    }
     RECORD_DIRTY.store(true, Ordering::Release);
 }
 
@@ -1161,6 +1273,87 @@ mod tests {
         assert!(!staged_copy_failed(Some(None), "1.8.0"), "superseded and dropped");
         assert!(!staged_copy_failed(None, "1.8.0"), "the updater was busy");
         assert!(!staged_copy_failed(Some(Some(("1.8.1".to_string(), false))), "1.8.0"));
+    }
+
+    #[test]
+    fn only_a_missing_copy_is_downloaded_again_and_only_once() {
+        let dropped = Some(Some(("1.8.0".to_string(), false)));
+        assert_eq!(early_failure(dropped.clone(), "1.8.0", Some(false), false), EarlyFailure::Restage);
+        assert_eq!(
+            early_failure(dropped.clone(), "1.8.0", Some(false), true),
+            EarlyFailure::Session,
+            "gone again after downloading it again"
+        );
+        assert_eq!(early_failure(dropped.clone(), "1.8.0", Some(true), false), EarlyFailure::Release, "altered");
+        assert_eq!(early_failure(dropped, "1.8.0", None, false), EarlyFailure::Release, "could not tell");
+        assert_eq!(
+            early_failure(Some(Some(("1.8.0".to_string(), true))), "1.8.0", Some(false), false),
+            EarlyFailure::Session,
+            "the copy was not what failed"
+        );
+        assert_eq!(early_failure(None, "1.8.0", Some(false), false), EarlyFailure::Session);
+    }
+
+    /// The countdown dialog closes on an answer, so the answer has to hold even
+    /// when the record could not take it.
+    #[test]
+    fn an_answer_holds_for_the_session_whatever_the_record_says() {
+        let unwritten = UpdateRecord::default();
+        let postponed = Answers { postponed_until: Some(Some(NOW + POSTPONE_SECS)), skipped_version: None };
+        let mut record = unwritten.clone();
+        postponed.apply(&mut record);
+        assert_eq!(held_by_record(&record, "1.8.0", NOW), Some(Phase::Postponed));
+
+        let skipped = Answers { postponed_until: None, skipped_version: Some("1.8.0".to_string()) };
+        let mut record = unwritten.clone();
+        skipped.apply(&mut record);
+        assert_eq!(held_by_record(&record, "1.8.0", NOW), Some(Phase::Held));
+        assert_eq!(held_by_record(&record, "1.8.1", NOW), None);
+
+        let resumed = Answers { postponed_until: Some(None), skipped_version: None };
+        let mut record = UpdateRecord { postponed_until: Some(NOW + 60), ..Default::default() };
+        resumed.apply(&mut record);
+        assert_eq!(held_by_record(&record, "1.8.0", NOW), None, "a resume the record missed still lifts it");
+
+        let none = Answers { postponed_until: None, skipped_version: None };
+        let mut record = UpdateRecord { postponed_until: Some(NOW + 60), ..Default::default() };
+        none.apply(&mut record);
+        assert_eq!(record.postponed_until, Some(NOW + 60), "no answer leaves the record as it is");
+    }
+
+    #[test]
+    fn ready_since_outlives_a_record_that_could_not_keep_it() {
+        let first = ready_since_for(None, "1.8.0", NOW);
+        assert_eq!(first, ReadySince { version: "1.8.0".to_string(), at: NOW });
+        assert_eq!(ready_since_for(Some(first.clone()), "1.8.0", NOW + 3600), first);
+        assert_eq!(ready_since_for(Some(first), "1.8.1", NOW + 3600).at, NOW + 3600, "a new release starts over");
+    }
+
+    #[test]
+    fn a_new_release_stops_the_download_of_the_one_it_replaces() {
+        struct Dropped(std::sync::Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let guard = Dropped(dropped.clone());
+        let mut driver = Driver {
+            version: Some("1.8.0".to_string()),
+            prepare_task: Some(tauri::async_runtime::spawn(async move {
+                let _guard = guard;
+                std::future::pending::<Result<Option<String>, String>>().await
+            })),
+            ..Default::default()
+        };
+        driver.start_version("1.8.1".to_string());
+        assert!(driver.prepare_task.is_none(), "the new release is downloaded at once");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dropped.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(dropped.load(Ordering::SeqCst), "the superseded download is stopped");
     }
 
     #[test]

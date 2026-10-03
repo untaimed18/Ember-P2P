@@ -1000,6 +1000,40 @@ fn discard_staged(app: &AppHandle) {
     }
 }
 
+/// What housekeeping in the staging folder must not delete, beyond what the
+/// file names say.
+#[derive(Default)]
+struct StagedKeep {
+    /// The pending update's staged file, or the one it would reuse.
+    pending: Option<String>,
+    /// The highest signed release observed. A file of its version is judged
+    /// by its epoch, which may authorize a version no higher than the running
+    /// one.
+    floor: Option<RollbackState>,
+}
+
+impl StagedKeep {
+    fn epoch_of(&self, staged: &Version) -> u64 {
+        self.floor
+            .as_ref()
+            .filter(|floor| Version::parse(&floor.highest_version).is_ok_and(|floor| floor == *staged))
+            .map_or(CURRENT_SECURITY_EPOCH, |floor| floor.security_epoch)
+    }
+
+    fn is_pending(&self, name: &str) -> bool {
+        self.pending.as_deref() == Some(name)
+    }
+}
+
+/// What the staging folder must keep, given the name the pending update is
+/// staged under.
+fn staged_keep(app: &AppHandle, pending: Option<String>) -> StagedKeep {
+    let floor = state_path(app)
+        .ok()
+        .and_then(|path| load_rollback_state(&path).ok().flatten());
+    StagedKeep { pending, floor }
+}
+
 /// Remove artifacts a preparation staged and never installed, once they are no
 /// longer newer than the running build.
 ///
@@ -1007,29 +1041,27 @@ fn discard_staged(app: &AppHandle) {
 /// comes from the file name, which is untrusted, but it is only ever used to
 /// decide what to delete: the worst a rewritten name can do is cost a
 /// re-download or keep one stale file. Call with the staging lock held.
-fn sweep_stale_staged(app: &AppHandle) {
+fn sweep_stale_staged(app: &AppHandle, keep: &StagedKeep) {
     if let Ok(dir) = pending_dir(app) {
-        sweep_stale_staged_in(&dir, &app.package_info().version.to_string());
+        sweep_stale_staged_in(&dir, &app.package_info().version.to_string(), keep);
     }
 }
 
-fn sweep_stale_staged_in(dir: &Path, running: &str) {
+fn sweep_stale_staged_in(dir: &Path, running: &str, keep: &StagedKeep) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
         // `atomic_write` writes through a dot-named temporary beside the file.
-        if name.to_string_lossy().starts_with('.') {
+        if name.to_string_lossy().starts_with('.') || name.to_str().is_some_and(|name| keep.is_pending(name)) {
             continue;
         }
         let newer = name
             .to_str()
             .and_then(staged_version_from_name)
             .and_then(|version| Version::parse(version).ok())
-            .is_some_and(|staged| {
-                staged_claim_is_an_upgrade(CURRENT_SECURITY_EPOCH, &staged, running)
-            });
+            .is_some_and(|staged| staged_claim_is_an_upgrade(keep.epoch_of(&staged), &staged, running));
         if !newer {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -1039,23 +1071,25 @@ fn sweep_stale_staged_in(dir: &Path, running: &str) {
 /// Forget a hand-off and delete the installer it refers to, which is `claim`'s
 /// when the marker could be verified. One that could not names nothing we can
 /// trust, so only what is no longer an upgrade goes. Anything else in the
-/// staging folder, such as a newer release prepared since, stays. Call with
-/// the staging lock held.
-fn clear_handoff(app: &AppHandle, claim: Option<&HandoffClaim>) {
+/// staging folder, such as a newer release prepared since, stays, and so does
+/// the pending update's own copy whatever the hand-off says. Call with the
+/// staging lock held.
+fn clear_handoff(app: &AppHandle, claim: Option<&HandoffClaim>, keep: &StagedKeep) {
     let (Ok(marker), Ok(dir)) = (handoff_path(app), pending_dir(app)) else {
         return;
     };
     let own = claim.map(|claim| installer_name(&claim.version.to_string(), claim.kind));
-    clear_handoff_in(&marker, &dir, own.as_deref(), &app.package_info().version.to_string());
+    clear_handoff_in(&marker, &dir, own.as_deref(), &app.package_info().version.to_string(), keep);
 }
 
-fn clear_handoff_in(marker: &Path, dir: &Path, own: Option<&str>, running: &str) {
+fn clear_handoff_in(marker: &Path, dir: &Path, own: Option<&str>, running: &str, keep: &StagedKeep) {
     let _ = std::fs::remove_file(marker);
     match own {
+        Some(name) if keep.is_pending(name) => {}
         Some(name) => {
             let _ = std::fs::remove_file(dir.join(name));
         }
-        None => sweep_stale_staged_in(dir, running),
+        None => sweep_stale_staged_in(dir, running, keep),
     }
 }
 
@@ -1609,6 +1643,11 @@ struct PrepareTarget {
     path: PathBuf,
 }
 
+/// The name the pending update is staged under in [`PENDING_DIR`].
+fn staged_name(update: &PendingUpdate) -> String {
+    installer_name(&update.info.version, staged_kind(&update.platform.url))
+}
+
 /// What the updater holds, at a glance.
 enum PendingLook {
     Nothing,
@@ -1632,10 +1671,7 @@ async fn look_at_pending(app: &AppHandle, service: &UpdaterService) -> Result<Pe
             version: update.info.version.clone(),
         });
     }
-    let path = pending_dir(app)?.join(installer_name(
-        &update.info.version,
-        staged_kind(&update.platform.url),
-    ));
+    let path = pending_dir(app)?.join(staged_name(update));
     Ok(PendingLook::Unprepared(PrepareTarget {
         platform: update.platform.clone(),
         version: update.info.version.clone(),
@@ -2113,6 +2149,16 @@ pub(crate) fn try_pending_update_state(service: &UpdaterService) -> Option<Optio
     )
 }
 
+/// Whether the pending update's staged copy is on disk, to tell a copy that is
+/// gone from one that changed. `None` when nothing is pending, the updater is
+/// busy, or the folder cannot be looked at.
+pub(crate) fn try_staged_copy_present(app: &AppHandle, service: &UpdaterService) -> Option<bool> {
+    let pending = service.pending.try_lock().ok()?;
+    let name = staged_name(pending.as_ref()?);
+    drop(pending);
+    pending_dir(app).ok()?.join(name).try_exists().ok()
+}
+
 /// Download, verify and stage the pending update in the background, with no
 /// progress UI. `Ok(None)` when nothing is pending, it has fallen below the
 /// signed floor since it was checked, or a check replaced it while it
@@ -2229,11 +2275,16 @@ pub async fn secure_updater_handoff_status(
     // Never waits for the staging lock: a background download holds it for up
     // to half an hour, and the frontend holds every update check back until
     // this answers, which every page load asks. Only the cleanup needs it, and
-    // is left for a later load while a download runs.
+    // is left for a later load while a download runs, or while an install
+    // holds the pending update whose copy the cleanup must spare.
     let staging = service.staging.try_lock().ok();
+    let keep = staging
+        .as_ref()
+        .and_then(|_| service.pending.try_lock().ok().map(|pending| pending.as_ref().map(staged_name)))
+        .map(|pending| staged_keep(&app, pending));
     let clear = |claim: Option<&HandoffClaim>| {
-        if staging.is_some() {
-            clear_handoff(&app, claim);
+        if let Some(keep) = &keep {
+            clear_handoff(&app, claim, keep);
         }
     };
     let path =
@@ -2244,8 +2295,8 @@ pub async fn secure_updater_handoff_status(
             // Nothing was handed over. Whatever is staged was prepared and never
             // installed; keep it only while it is still an upgrade, so the next
             // preparation can reuse it instead of downloading again.
-            if staging.is_some() {
-                sweep_stale_staged(&app);
+            if let Some(keep) = &keep {
+                sweep_stale_staged(&app, keep);
             }
             return Ok(None);
         }
@@ -2366,6 +2417,7 @@ pub async fn secure_updater_run_saved_installer(
     // Ember down and start an installer.
     let _operation = service.operation.lock().await;
     let _staging = service.staging.lock().await;
+    let keep = staged_keep(&app, service.pending.lock().await.as_ref().map(staged_name));
     let path = handoff_path(&app)
         .map_err(|error| public_failure(UpdaterOperation::InstallerLaunch, error))?;
     let Some(record) = read_handoff(&path)
@@ -2380,7 +2432,7 @@ pub async fn secure_updater_run_saved_installer(
     // record's own fields are not evidence — see `verified_handoff_claim`.
     let claim = verified_handoff_claim(&record).map_err(|error| {
         tracing::warn!("Refusing to run the staged installer: {error:#}");
-        clear_handoff(&app, None);
+        clear_handoff(&app, None, &keep);
         coded(
             "updater_staged_unverified",
             "The staged installer could not be verified against its signed manifest. Check for updates again.",
@@ -2390,7 +2442,7 @@ pub async fn secure_updater_run_saved_installer(
     // not the same question as a permitted version, and a permitted version is
     // not the same question as a newer one.
     if !handoff_is_an_upgrade(&app, &claim) {
-        clear_handoff(&app, Some(&claim));
+        clear_handoff(&app, Some(&claim), &keep);
         return Err(coded(
             "updater_staged_not_newer",
             "The staged update is not newer than the version already installed.",
@@ -2401,7 +2453,7 @@ pub async fn secure_updater_run_saved_installer(
     {
         Some(true) => {}
         Some(false) => {
-            clear_handoff(&app, Some(&claim));
+            clear_handoff(&app, Some(&claim), &keep);
             return Err(coded(
                 "updater_staged_below_floor",
                 "The staged update is older than the signed security floor. Check for updates again.",
@@ -2661,12 +2713,36 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
             std::fs::write(path, b"x").unwrap();
         }
 
-        sweep_stale_staged_in(&dir, "1.7.1");
+        sweep_stale_staged_in(&dir, "1.7.1", &StagedKeep::default());
         assert!(newer.exists());
         assert!(!same.exists());
         assert!(!older.exists());
         assert!(!foreign.exists());
         assert!(writing.exists(), "a staging write in progress is left alone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An emergency release bumps the epoch to authorize a version no higher
+    /// than the running one. Swept as stale, the prepared copy would be gone
+    /// at install time and the release barred from installing silently.
+    #[test]
+    fn the_sweep_keeps_the_pending_copy_and_an_epoch_upgrade() {
+        let dir = scratch_dir("sweep-epoch");
+        let pending = dir.join(installer_name("1.7.0", "exe"));
+        let emergency = dir.join(installer_name("1.6.9", "exe"));
+        let stale = dir.join(installer_name("1.6.0", "exe"));
+        for path in [&pending, &emergency, &stale] {
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        let keep = StagedKeep {
+            pending: Some(installer_name("1.7.0", "exe")),
+            floor: Some(observed_rollback_state(CURRENT_SECURITY_EPOCH + 1, &Version::parse("1.6.9").unwrap())),
+        };
+        sweep_stale_staged_in(&dir, "1.7.1", &keep);
+        assert!(pending.exists(), "the pending update's own copy");
+        assert!(emergency.exists(), "the floor's release, judged by the floor's epoch");
+        assert!(!stale.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2682,7 +2758,8 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
             std::fs::write(path, b"x").unwrap();
         }
 
-        clear_handoff_in(&marker, &staging, Some(&installer_name("1.8.0", "exe")), "1.8.0");
+        let nothing = StagedKeep::default();
+        clear_handoff_in(&marker, &staging, Some(&installer_name("1.8.0", "exe")), "1.8.0", &nothing);
         assert!(!marker.exists());
         assert!(!handed_off.exists());
         assert!(newer.exists(), "a newer release prepared since is not the hand-off's");
@@ -2691,10 +2768,18 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         // what is no longer an upgrade goes.
         std::fs::write(&marker, b"x").unwrap();
         std::fs::write(&handed_off, b"x").unwrap();
-        clear_handoff_in(&marker, &staging, None, "1.8.0");
+        clear_handoff_in(&marker, &staging, None, "1.8.0", &nothing);
         assert!(!marker.exists());
         assert!(!handed_off.exists());
         assert!(newer.exists());
+
+        // A hand-off long forgotten whose version is staged again for the
+        // pending update.
+        std::fs::write(&marker, b"x").unwrap();
+        let keep = StagedKeep { pending: Some(installer_name("1.8.1", "exe")), floor: None };
+        clear_handoff_in(&marker, &staging, Some(&installer_name("1.8.1", "exe")), "1.7.1", &keep);
+        assert!(!marker.exists());
+        assert!(newer.exists(), "the pending update's copy is not the hand-off's to delete");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2771,10 +2856,12 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         );
     }
 
-    /// The silent path must never sit in "Installing" behind a check, with the
-    /// countdown and its tray entry gone.
+    /// `Driver::install` takes the operation lock only through this, and hands
+    /// the tick back while a check holds it rather than sitting in "Installing"
+    /// with the countdown and its tray entry gone. The driver itself needs a
+    /// running app, so only the lock's side is checked here.
     #[tokio::test]
-    async fn a_silent_install_does_not_wait_behind_a_check() {
+    async fn the_operation_lock_is_taken_without_waiting_behind_a_check() {
         let service = UpdaterService::default();
         let check = service.operation.lock().await;
         assert!(try_lock_operation(&service).is_none());
