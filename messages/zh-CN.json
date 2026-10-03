@@ -2627,7 +2627,7 @@
   "settings_speed_test_label": "测速",
   "settings_speed_testing": "测速中…",
   "settings_run_speed_test": "运行测速",
-  "settings_speed_test_hint": "使用 Cloudflare 测速服务测量你的连接，并建议将上限设为实测速度的 80%，为浏览网页和通话留出余量。有传输进行时结果会偏低。在你应用建议并保存之前，不会更改任何设置。",
+  "settings_speed_test_hint": "使用 Cloudflare 测速服务测量你的连接（先测下载、再测上传，约 20 秒），并建议将上限设为实测速度的 80%，为浏览网页和通话留出余量。测速期间 Ember 自身的传输会计入结果，但有传输进行时结果不够精确。在非常快的连接上，测速最多消耗约 350 MB 流量。在你应用建议并保存之前，不会更改任何设置。",
   "settings_speed_download": "下载：",
   "settings_speed_upload": "上传：",
   "settings_speed_recommended_upload": "推荐上传限制：",

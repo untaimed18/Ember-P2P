@@ -2627,7 +2627,7 @@
   "settings_speed_test_label": "Test de débit",
   "settings_speed_testing": "Test en cours…",
   "settings_run_speed_test": "Lancer le test de débit",
-  "settings_speed_test_hint": "Mesure votre connexion avec le test de vitesse de Cloudflare et propose des limites à 80 % des vitesses mesurées, pour garder de la marge pour la navigation et les appels. Les résultats sont plus bas pendant les transferts. Rien ne change tant que vous n'appliquez pas la recommandation et n'enregistrez pas.",
+  "settings_speed_test_hint": "Mesure votre connexion avec le test de vitesse de Cloudflare, d'abord le téléchargement puis l'envoi, en une vingtaine de secondes, et propose des limites à 80 % des vitesses mesurées, pour garder de la marge pour la navigation et les appels. Les transferts d'Ember pendant le test sont pris en compte, mais le résultat est moins précis tant qu'ils sont en cours. Sur une connexion très rapide, le test consomme jusqu'à environ 350 Mo de données. Rien ne change tant que vous n'appliquez pas la recommandation et n'enregistrez pas.",
   "settings_speed_download": "Téléchargement :",
   "settings_speed_upload": "Envoi :",
   "settings_speed_recommended_upload": "Limite d'envoi recommandée :",

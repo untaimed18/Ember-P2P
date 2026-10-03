@@ -2630,7 +2630,7 @@
   "settings_speed_test_label": "Speed test",
   "settings_speed_testing": "Testing…",
   "settings_run_speed_test": "Run speed test",
-  "settings_speed_test_hint": "Measures your connection with Cloudflare's speed test and suggests limits of 80% of the measured speeds, leaving headroom for browsing and calls. Results are lower while transfers are running. Nothing changes until you apply the suggestion and save.",
+  "settings_speed_test_hint": "Measures your connection with Cloudflare's speed test, download first and then upload, in about 20 seconds, and suggests limits of 80% of the measured speeds, leaving headroom for browsing and calls. Ember's own transfers during the test are counted in, but the result is less precise while they run. On very fast connections the test uses up to about 350 MB of data. Nothing changes until you apply the suggestion and save.",
   "settings_speed_download": "Download:",
   "settings_speed_upload": "Upload:",
   "settings_speed_recommended_upload": "Recommended upload limit:",

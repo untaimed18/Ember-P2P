@@ -2627,7 +2627,7 @@
   "settings_speed_test_label": "Prueba de velocidad",
   "settings_speed_testing": "Probando…",
   "settings_run_speed_test": "Ejecutar prueba de velocidad",
-  "settings_speed_test_hint": "Mide tu conexión con la prueba de velocidad de Cloudflare y sugiere límites del 80 % de las velocidades medidas, dejando margen para navegar y hacer llamadas. Los resultados son menores si hay transferencias en curso. No cambia nada hasta que apliques la sugerencia y guardes.",
+  "settings_speed_test_hint": "Mide tu conexión con la prueba de velocidad de Cloudflare, primero la descarga y luego la subida, en unos 20 segundos, y sugiere límites del 80 % de las velocidades medidas, dejando margen para navegar y hacer llamadas. Las transferencias de Ember durante la prueba se tienen en cuenta, pero el resultado es menos preciso mientras están en curso. En conexiones muy rápidas la prueba usa hasta unos 350 MB de datos. No cambia nada hasta que apliques la sugerencia y guardes.",
   "settings_speed_download": "Bajada:",
   "settings_speed_upload": "Subida:",
   "settings_speed_recommended_upload": "Límite de subida recomendado:",
