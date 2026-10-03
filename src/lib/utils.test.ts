@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { getLocale } from '$lib/i18n';
 import {
+  clampUtf8Bytes,
   confusableSkeleton,
   disambiguatedMemberName,
   formatBytes,
@@ -24,6 +25,29 @@ function plain(segments: MessageSegment[]): string {
 function links(segments: MessageSegment[]): string[] {
   return segments.filter((s) => s.href).map((s) => s.href!);
 }
+
+describe('clampUtf8Bytes', () => {
+  const bytes = (s: string) => new TextEncoder().encode(s).length;
+
+  it('leaves text within the cap untouched', () => {
+    expect(clampUtf8Bytes('Ember user', 128)).toBe('Ember user');
+    expect(clampUtf8Bytes('a'.repeat(128), 128)).toBe('a'.repeat(128));
+  });
+
+  it('cuts CJK text that fits maxlength to the byte cap on a character boundary', () => {
+    const nick = '火'.repeat(50);
+    const clamped = clampUtf8Bytes(nick, 128);
+    expect(clamped).toBe('火'.repeat(42));
+    expect(bytes(clamped)).toBe(126);
+  });
+
+  it('never splits a surrogate pair', () => {
+    const clamped = clampUtf8Bytes('a' + '🔥'.repeat(40), 128);
+    expect(clamped).toBe('a' + '🔥'.repeat(31));
+    expect(bytes(clamped)).toBeLessThanOrEqual(128);
+    expect(clamped).not.toMatch(/[\uD800-\uDBFF]$/);
+  });
+});
 
 describe('linkifyMessage', () => {
   it('leaves a message with no link as a single run', () => {

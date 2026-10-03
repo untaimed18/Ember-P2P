@@ -953,8 +953,6 @@ export interface AppSettings {
   readonly default_shared_folder_seeded: boolean;
   /** Monotonic optimistic-concurrency token for settings saves. */
   settings_revision: number;
-  /** Retained for config.json; unsolicited requests always queue, reciprocal accepts auto-confirm. */
-  friend_require_approval: boolean;
   /** Disable incoming chat messages from friends */
   friend_chat_disabled: boolean;
   /** Send and display friend-chat read receipts. Off both ways. */

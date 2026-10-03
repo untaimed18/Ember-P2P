@@ -309,6 +309,37 @@ export function truncateHash(hash: string, len = 16): string {
   return `${hash.slice(0, len)}\u2026`;
 }
 
+const utf8 = new TextEncoder();
+
+/** The backend's nickname cap (`commands/settings.rs`), in UTF-8 bytes. */
+export const NICKNAME_MAX_BYTES = 128;
+
+/** Cut `text` to at most `maxBytes` UTF-8 bytes, for fields the backend caps in
+ *  bytes where `maxlength` counts UTF-16 units. Iterating a string yields whole
+ *  code points, so the cut never leaves half a surrogate pair. */
+export function clampUtf8Bytes(text: string, maxBytes: number): string {
+  if (utf8.encode(text).length <= maxBytes) return text;
+  let bytes = 0;
+  let out = '';
+  for (const ch of text) {
+    bytes += utf8.encode(ch).length;
+    if (bytes > maxBytes) break;
+    out += ch;
+  }
+  return out;
+}
+
+/** `oninput`/`oncompositionend` handler that applies `clampUtf8Bytes` to an
+ *  input as the user types. Waits out IME composition, as `maxlength` does, so
+ *  a half-composed CJK character is not cut. Returns the value to store. */
+export function clampInputUtf8Bytes(event: Event, maxBytes: number): string {
+  const input = event.currentTarget as HTMLInputElement;
+  if ((event as InputEvent).isComposing) return input.value;
+  const clamped = clampUtf8Bytes(input.value, maxBytes);
+  if (clamped !== input.value) input.value = clamped;
+  return clamped;
+}
+
 // Lives in its own module so `$lib/i18n` can recognise `TimeoutError` without
 // importing this file, which imports `$lib/i18n` itself.
 export { TimeoutError, withTimeout } from './timeout';

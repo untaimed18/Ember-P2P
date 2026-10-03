@@ -142,6 +142,7 @@ pub mod logging {
 
     pub fn redact_normal_log(input: &str) -> String {
         static WINDOWS_PATH: OnceLock<Regex> = OnceLock::new();
+        static UNIX_PATH: OnceLock<Regex> = OnceLock::new();
         static HEX_ID: OnceLock<Regex> = OnceLock::new();
         static IPV4: OnceLock<Regex> = OnceLock::new();
         static IPV6: OnceLock<Regex> = OnceLock::new();
@@ -165,9 +166,20 @@ pub mod logging {
         value = replace_regex(
             value,
             &WINDOWS_PATH,
-            r#"(?i)\b[A-Z]:\\[^\r\n\t,;)"']+"#,
+            r#"(?i)\b[A-Z]:[\\/][^\r\n\t,;)"']+"#,
             "path",
         );
+        // The leading `/` must follow a delimiter, never a word char, `:` or
+        // another `/`, so URLs, ed2k:// links and ratios like 3/4 survive.
+        value = UNIX_PATH
+            .get_or_init(|| {
+                Regex::new(r#"(^|[\s=(\[{<"'`,])(/[^\s/,;)"'][^\r\n\t,;)"']*)"#)
+                    .expect("static Unix path regex")
+            })
+            .replace_all(&value, |caps: &Captures<'_>| {
+                format!("{}<path:{}>", &caps[1], pseudonym(&caps[2]))
+            })
+            .into_owned();
         value = replace_regex(value, &HEX_ID, r"(?i)\b[0-9a-f]{32,128}\b", "id");
         value = IPV6
             .get_or_init(|| {
@@ -220,6 +232,49 @@ pub mod logging {
             assert!(redacted.contains("<ip:"));
             assert!(redacted.contains("<id:"));
             assert!(redacted.contains("<path:"));
+        }
+
+        #[test]
+        fn unix_paths_are_redacted() {
+            for path in [
+                "/home/canary/Downloads/secret-file.bin",
+                "/Users/canary/Library/Application Support/Ember",
+                "/media/canary/USB/file.iso",
+                "/mnt/data/share",
+                "/tmp/.mount_EmberAbC123/usr/bin/ember",
+                "/tmp",
+            ] {
+                for line in [
+                    format!("path={path}"),
+                    format!("opening {path}"),
+                    format!("failed to open \"{path}\": denied"),
+                    format!("dir ({path}) missing"),
+                    format!("{path}, retrying"),
+                ] {
+                    let redacted = redact_normal_log(&line);
+                    assert!(!redacted.contains(path), "{line} -> {redacted}");
+                    assert!(redacted.contains("<path:"), "{line} -> {redacted}");
+                }
+            }
+            assert_eq!(
+                redact_normal_log("C:/Users/canary/file.bin").matches("<path:").count(),
+                1
+            );
+        }
+
+        #[test]
+        fn non_paths_with_slashes_are_left_alone() {
+            for line in [
+                "GET https://example.com/api/v1/nodes.dat failed",
+                "url=http://host/path?q=1",
+                "link ed2k://|file|name.bin|1024|0123|/ queued",
+                "link ed2k://|server|example.org|4661|/",
+                "ratio 3/4 reached",
+                "rate 12 KB/s, peers 3 / 5",
+                "tcp/udp relay and/or direct",
+            ] {
+                assert_eq!(redact_normal_log(line), line);
+            }
         }
 
         #[test]

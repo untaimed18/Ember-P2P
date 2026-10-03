@@ -418,9 +418,16 @@ export async function initNetworkStore() {
     // changes are user-visible (forwarding rules, advertised port) so
     // popping a toast lets users correct their router / settings
     // instead of wondering why peer reachability is lower than expected.
-    registered.push(await listen<{ message: string }>('network-warning', (event) => {
-      const msg = event.payload?.message;
-      if (msg) {
+    registered.push(await listen<{
+      message: string;
+      code?: string;
+      configured?: number;
+      bound?: number;
+    }>('network-warning', (event) => {
+      const { message: msg, code, configured, bound } = event.payload ?? {};
+      if (code === 'udp_port_fallback' && typeof configured === 'number' && typeof bound === 'number') {
+        toastWarning(m.network_warning_udp_port_fallback({ configured, bound }));
+      } else if (msg) {
         toastWarning(translateError(msg, msg));
       }
     }));

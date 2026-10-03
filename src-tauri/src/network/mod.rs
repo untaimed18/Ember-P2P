@@ -414,6 +414,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             settings.udp_port, udp_port
         );
         let _ = app_handle.emit("network-warning", serde_json::json!({
+            "code": "udp_port_fallback",
+            "configured": settings.udp_port,
+            "bound": udp_port,
             "message": format!("UDP port {} was in use. Using port {} instead.", settings.udp_port, udp_port),
         }));
     }
@@ -1809,7 +1812,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             {
                 error!("Upload listener error: {e}");
                 let _ = ul_app.emit("network-error", serde_json::json!({
-                    "message": format!("TCP port {tcp_port} is already in use. Uploads will not work. Change the port in Settings or close the other application."),
+                    "message": crate::commands::errors::coded_ctx(
+                        "network_tcp_port_in_use",
+                        format!("TCP port {tcp_port} is already in use. Uploads will not work. Change the port in Settings or close the other application."),
+                        tcp_port,
+                    ),
                 }));
             }
         });

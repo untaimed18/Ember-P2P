@@ -62,7 +62,14 @@
     type PendingRestoreStatus,
     type RestoreSummary,
   } from '$lib/api/backup';
-  import { formatDateTime, formatSize, formatSpeed, shortPubkey } from '$lib/utils';
+  import {
+    clampInputUtf8Bytes,
+    formatDateTime,
+    formatSize,
+    formatSpeed,
+    NICKNAME_MAX_BYTES,
+    shortPubkey,
+  } from '$lib/utils';
   import { getRuntimeStatus } from '$lib/api/system';
   import {
     MAX_RULE_LABEL_CHARS,
@@ -1138,6 +1145,10 @@
     return Math.min(max, Math.max(0, Math.trunc(n)));
   }
 
+  function clampNicknameInput(event: Event) {
+    if (settings) settings.nickname = clampInputUtf8Bytes(event, NICKNAME_MAX_BYTES);
+  }
+
   /** Validate and clamp numeric fields to the ranges documented in AppSettings.
    *  Returns an error message on hard failure (mutates nothing in that case).
    *  Otherwise mutates `s` in place and reports whether any numeric field was
@@ -1148,11 +1159,9 @@
     if (!s.nickname.trim()) {
       return { error: m.settings_validation_nickname_empty(), adjusted: false };
     }
-    // Mirror the backend's 128-byte cap (commands/settings.rs) so an oversized
-    // nickname is rejected here with a clear message instead of only failing on
-    // save. `maxlength` on the input is a coarse char guard; this is the
-    // authoritative byte check (multi-byte UTF-8 can exceed it).
-    if (new TextEncoder().encode(s.nickname).length > 128) {
+    // Mirror the backend's 128-byte cap (commands/settings.rs). The input
+    // already stops at it; this catches a value that arrived another way.
+    if (new TextEncoder().encode(s.nickname).length > NICKNAME_MAX_BYTES) {
       return { error: m.error_settings_nickname_too_long(), adjusted: false };
     }
     if (s.channel_username.trim() && !isValidChannelUsername(s.channel_username)) {
@@ -1317,7 +1326,6 @@
     if (cached) {
       setAppSettings({
         ...cached,
-        friend_require_approval: settings.friend_require_approval,
         friend_chat_disabled: settings.friend_chat_disabled,
         friend_chat_read_receipts: settings.friend_chat_read_receipts,
         friend_browse_disabled: settings.friend_browse_disabled,
@@ -1339,7 +1347,6 @@
           const latest = await getSettings();
           const candidate = {
             ...latest,
-            friend_require_approval: settings.friend_require_approval,
             friend_chat_disabled: settings.friend_chat_disabled,
             friend_chat_read_receipts: settings.friend_chat_read_receipts,
             friend_browse_disabled: settings.friend_browse_disabled,
@@ -1352,7 +1359,6 @@
             settings.settings_revision = result.settings.settings_revision;
             if (originalSettings) {
               const baseline = JSON.parse(originalSettings) as AppSettings;
-              baseline.friend_require_approval = result.settings.friend_require_approval;
               baseline.friend_chat_disabled = result.settings.friend_chat_disabled;
               baseline.friend_chat_read_receipts = result.settings.friend_chat_read_receipts;
               baseline.friend_browse_disabled = result.settings.friend_browse_disabled;
@@ -1382,7 +1388,6 @@
       if (persisted) {
         setAppSettings(persisted);
         if (settings) {
-          settings.friend_require_approval = persisted.friend_require_approval;
           settings.friend_chat_disabled = persisted.friend_chat_disabled;
           settings.friend_chat_read_receipts = persisted.friend_chat_read_receipts;
           settings.friend_browse_disabled = persisted.friend_browse_disabled;
@@ -1395,7 +1400,6 @@
         // Save with nothing edited and popping the leave guard on every exit.
         if (originalSettings) {
           const baseline = JSON.parse(originalSettings) as AppSettings;
-          baseline.friend_require_approval = persisted.friend_require_approval;
           baseline.friend_chat_disabled = persisted.friend_chat_disabled;
           baseline.friend_chat_read_receipts = persisted.friend_chat_read_receipts;
           baseline.friend_browse_disabled = persisted.friend_browse_disabled;
@@ -1828,8 +1832,8 @@
     const trimmedName = name.trim();
     const trimmedUrl = url.trim();
     if (!trimmedName || !looksLikeWebServiceUrl(trimmedUrl)) return 'invalid';
-    if (current.web_services.length >= MAX_WEB_SERVICES) return 'full';
     if (current.web_services.some((s) => s.url === trimmedUrl)) return 'duplicate';
+    if (current.web_services.length >= MAX_WEB_SERVICES) return 'full';
     current.web_services = [...current.web_services, { name: trimmedName, url: trimmedUrl }];
     return 'added';
   }
@@ -1881,23 +1885,22 @@
       // Null is a dismissed picker, which is not a failure and not worth a
       // message.
       if (imported === null) return;
-      let added = 0;
-      for (const service of imported) {
-        if (addWebServiceEntry(service.name, service.url) === 'added') added += 1;
-      }
+      const outcomes = imported.map((service) => addWebServiceEntry(service.name, service.url));
+      const added = outcomes.filter((o) => o === 'added').length;
+      const full = outcomes.includes('full') ? m.webservices_full({ max: MAX_WEB_SERVICES }) : null;
       if (added === 0) {
         webServiceMessage = {
           kind: 'err',
-          text: imported.length === 0 ? m.webservices_import_none() : m.webservices_import_duplicate(),
+          text:
+            full ??
+            (outcomes.includes('duplicate') ? m.webservices_import_duplicate() : m.webservices_import_none()),
         };
       } else {
-        webServiceMessage = {
-          kind: 'ok',
-          text: plural(added, {
-            one: m.webservices_imported_one,
-            other: () => m.webservices_imported_other({ count: added }),
-          }),
-        };
+        const addedText = plural(added, {
+          one: m.webservices_imported_one,
+          other: () => m.webservices_imported_other({ count: added }),
+        });
+        webServiceMessage = { kind: 'ok', text: full ? `${addedText} ${full}` : addedText };
       }
     } catch (e: unknown) {
       webServiceMessage = { kind: 'err', text: translateError(e) };
@@ -2623,7 +2626,14 @@
           <div class="divider"></div>
           <div class="field">
             <label for="nickname">{m.settings_nickname_label()}</label>
-            <input id="nickname" bind:value={settings.nickname} maxlength="128" placeholder={m.settings_nickname_placeholder()} />
+            <input
+              id="nickname"
+              bind:value={settings.nickname}
+              maxlength="128"
+              oninput={clampNicknameInput}
+              oncompositionend={clampNicknameInput}
+              placeholder={m.settings_nickname_placeholder()}
+            />
             <span class="hint">{m.settings_nickname_hint()}</span>
           </div>
           <div class="divider"></div>
@@ -3921,10 +3931,6 @@
           </div>
         </div>
         <div class="card-body">
-          {#if $appSettings?.ember_native_enabled === false}
-            <p class="channels-notice" role="status">{m.settings_channels_ember_off()}</p>
-          {/if}
-
           <div class="field">
             <label for="channel_username">{m.settings_channel_username_label()}</label>
             <input
@@ -5241,17 +5247,6 @@
     margin: 0 0 12px;
     font-size: var(--font-size-sm);
     color: var(--text-muted);
-  }
-
-  .channels-notice {
-    margin: 0 0 4px;
-    padding: 9px 12px;
-    border: 1px solid color-mix(in srgb, var(--warning) 30%, var(--border));
-    border-radius: var(--radius-md);
-    background: color-mix(in srgb, var(--warning) 9%, transparent);
-    color: var(--text-secondary);
-    font-size: var(--font-size-sm);
-    line-height: 1.45;
   }
 
   .channels-pref-action {
