@@ -86,7 +86,8 @@ fn remember_reask_parts(transfer_id: &str, total_size: u64, epoch: u64, parts: O
 
 /// Rebuild one entry from disk on the blocking pool; at most one rebuild per
 /// transfer is in flight, however many reasks arrive for it.
-fn spawn_reask_parts_refresh(transfer_id: String, total_size: u64, part_path: PathBuf) {
+/// `part_paths` lists where the `.part` may be, one per download folder.
+fn spawn_reask_parts_refresh(transfer_id: String, total_size: u64, part_paths: Vec<PathBuf>) {
     if !reask_parts_cache()
         .lock()
         .refreshing
@@ -103,8 +104,8 @@ fn spawn_reask_parts_refresh(transfer_id: String, total_size: u64, part_path: Pa
     tokio::task::spawn_blocking(move || {
         let _done = RefreshDone(transfer_id.clone());
         let epoch = ed2k::part_tracker::verification_epoch();
-        let parts = part_path.exists().then(|| {
-            ed2k::part_tracker::PartTracker::new(total_size, &part_path).serveable_parts()
+        let parts = part_paths.iter().find(|path| path.exists()).map(|part_path| {
+            ed2k::part_tracker::PartTracker::new(total_size, part_path).serveable_parts()
         });
         remember_reask_parts(&transfer_id, total_size, epoch, parts.as_deref());
     });
@@ -594,9 +595,7 @@ pub(super) async fn handle_udp_packet_inner(
                                 spawn_reask_parts_refresh(
                                     transfer_id.clone(),
                                     total_size,
-                                    PathBuf::from(&settings.download_folder)
-                                        .join("Temp")
-                                        .join(format!("{transfer_id}.part")),
+                                    settings.download_folders().part_paths(&transfer_id),
                                 );
                             }
                             match lookup {
@@ -3445,9 +3444,9 @@ mod udp_reask_cache_tests {
     async fn udp_reask_refresh_runs_off_the_caller_and_records_a_missing_part() {
         let id = unique_id("missing");
         let part_path = std::env::temp_dir().join(format!("{id}.part"));
-        spawn_reask_parts_refresh(id.clone(), 100, part_path.clone());
+        spawn_reask_parts_refresh(id.clone(), 100, vec![part_path.clone()]);
         // A second request while one is in flight must not queue another read.
-        spawn_reask_parts_refresh(id.clone(), 100, part_path);
+        spawn_reask_parts_refresh(id.clone(), 100, vec![part_path]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             match cached_reask_parts(&id, 100) {
@@ -3459,7 +3458,7 @@ mod udp_reask_cache_tests {
                     spawn_reask_parts_refresh(
                         id.clone(),
                         100,
-                        std::env::temp_dir().join(format!("{id}.part")),
+                        vec![std::env::temp_dir().join(format!("{id}.part"))],
                     );
                 }
                 _ => panic!("a download with no .part must cache as absent"),

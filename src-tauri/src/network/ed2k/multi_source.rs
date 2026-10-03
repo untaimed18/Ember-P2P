@@ -1819,7 +1819,7 @@ pub struct MultiSourceDownload {
     pub file_name: String,
     pub file_size: u64,
     pub sources: Vec<DownloadSource>,
-    pub download_dir: PathBuf,
+    pub download_folders: crate::storage::part_folders::SharedDownloadFolders,
     pub user_hash: [u8; 16],
     pub nickname: String,
     pub tcp_port: u16,
@@ -2222,11 +2222,12 @@ impl MultiSourceDownload {
                 .control
                 .seal_pending_rename()
                 .unwrap_or_else(|| self.file_name.clone());
+            let download_dir = self.download_folders.read().current.clone();
             let zero_final = super::transfer::finalize_zero_ed2k_file(
                 &self.transfer_id,
                 &zero_name,
                 self.file_hash,
-                &self.download_dir,
+                &download_dir,
             )
             .await?;
             let _ = event_tx
@@ -2266,9 +2267,9 @@ impl MultiSourceDownload {
             self.sources.len()
         );
 
-        let allowed_roots = vec![self.download_dir.to_string_lossy().into_owned()];
-        let (temp_dir, _completed_dir) =
-            super::transfer::prepare_download_dirs(&self.download_dir).await?;
+        let (part_root, temp_dir) =
+            super::transfer::prepare_part_dir(&self.download_folders, &self.transfer_id).await?;
+        let allowed_roots = vec![part_root.to_string_lossy().into_owned()];
 
         let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
         let file_size = self.file_size;
@@ -2351,7 +2352,7 @@ impl MultiSourceDownload {
             .await
             .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))?
             .map_err(|e| {
-                super::transfer::download_folder_error("creating the part file", &self.download_dir, e)
+                super::transfer::download_folder_error("creating the part file", &part_root, e)
             })?;
         }
 
@@ -2795,7 +2796,7 @@ impl MultiSourceDownload {
         )
         .await
         .map_err(|e| {
-            super::transfer::download_folder_error("opening the part file", &self.download_dir, e)
+            super::transfer::download_folder_error("opening the part file", &part_root, e)
         })?;
 
         // Spawn per-source download tasks
@@ -4833,7 +4834,7 @@ impl MultiSourceDownload {
             // the bytes currently on disk diverged from the verified state.
             let expected = hex::encode(self.file_hash);
             let verify_path = part_path.clone();
-            let verify_root = self.download_dir.clone();
+            let verify_root = part_root.clone();
             let expected_aich = self.expected_aich_master;
             let ember_expected = self.ember_file_hash;
             let mut ember_pin_failed = false;
@@ -4992,11 +4993,10 @@ impl MultiSourceDownload {
                     }
                     anyhow::bail!("cancelled by user");
                 }
-                let final_path = self.download_dir.join("Downloads").join(&safe_name);
                 let pp = part_path.clone();
-                let fp = final_path.clone();
-                let root = self.download_dir.clone();
-                let met_roots = vec![self.download_dir.to_string_lossy().into_owned()];
+                let pp_root = part_root.clone();
+                let download_root = self.download_folders.read().current.clone();
+                let met_roots = allowed_roots.clone();
                 let finish_tracker = tracker.clone();
                 let finish_part_hashes = part_hashes.clone();
                 let finish_tx = event_tx.clone();
@@ -5008,10 +5008,11 @@ impl MultiSourceDownload {
                 // `.part` gone, and Resume downloaded the whole file again.
                 let finish = tokio::spawn(async move {
                     let actual_final = tokio::task::spawn_blocking(move || {
-                        super::transfer::move_part_to_final_approved(
+                        super::transfer::move_part_to_downloads(
                             &pp,
-                            &fp,
-                            &root,
+                            &pp_root,
+                            &download_root,
+                            &safe_name,
                             &verified_identity,
                         )
                     })

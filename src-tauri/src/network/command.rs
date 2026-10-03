@@ -840,10 +840,11 @@ async fn handle_command_inner(
             // Cancel (delete) clears known sources; Stop preserves them for resume.
             if deleting {
                 state.per_file_sources.remove(&transfer_id);
-                let met_path = PathBuf::from(&settings.download_folder)
-                    .join("Temp")
-                    .join(format!("{transfer_id}.part.met"));
-                ed2k::part_tracker::mark_met_saves_suppressed(&met_path);
+                for part_path in settings.download_folders().part_paths(&transfer_id) {
+                    ed2k::part_tracker::mark_met_saves_suppressed(
+                        &part_path.with_extension("part.met"),
+                    );
+                }
             }
             let cancel_tracker = if deleting {
                 state.tracker_registry.lock().remove(&transfer_id)
@@ -1576,7 +1577,7 @@ async fn handle_command_inner(
                         file_name,
                         file_size,
                         sources: download_sources,
-                        download_dir: PathBuf::from(&settings.download_folder),
+                        download_folders: state.download_folders.clone(),
                         user_hash: state.user_hash,
                         nickname: settings.nickname.clone(),
                         tcp_port: advertised_tcp_port(state),
@@ -6066,8 +6067,8 @@ async fn handle_command_inner(
                 // Re-add active partial downloads to KAD publish, and collect
                 // the partial OP_OFFERFILES candidates in the same pass.
                 let mut partial_count = 0u32;
-                let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
-                let mut partial_offers: Vec<(String, PathBuf, ed2k::server::OfferFile)> =
+                let download_folders = settings.download_folders();
+                let mut partial_offers: Vec<(String, Vec<PathBuf>, ed2k::server::OfferFile)> =
                     Vec::new();
                 {
                     let mgr = transfer_manager.read().await;
@@ -6114,7 +6115,7 @@ async fn handle_command_inner(
                         if collect_offers && seen_offer_hashes.insert(transfer.file_hash.clone()) {
                             partial_offers.push((
                                 transfer.id.clone(),
-                                temp_dir.join(format!("{}.part", transfer.id)),
+                                download_folders.part_paths(&transfer.id),
                                 ed2k::server::OfferFile {
                                     hash: raw,
                                     name: transfer.file_name.clone(),
@@ -6153,7 +6154,9 @@ async fn handle_command_inner(
                 if collect_offers {
                     let probe: Vec<(String, PathBuf)> = partial_offers
                         .iter()
-                        .map(|(id, path, _)| (id.clone(), path.clone()))
+                        .flat_map(|(id, paths, _)| {
+                            paths.iter().map(move |path| (id.clone(), path.clone()))
+                        })
                         .collect();
                     {
                         let presence = part_presence().lock();
@@ -6291,7 +6294,7 @@ async fn handle_command_inner(
             tx,
             single_flight,
         } => {
-            let download_folder = settings.download_folder.clone();
+            let download_folders = settings.download_folders();
             let preview_player = settings.preview_player.clone();
             let tm = transfer_manager.clone();
             tokio::spawn(async move {
@@ -6310,8 +6313,7 @@ async fn handle_command_inner(
                     let tid = transfer.id.clone();
                     drop(mgr_guard);
 
-                    let temp_dir = PathBuf::from(&download_folder).join("Temp");
-                    let part_path = temp_dir.join(format!("{tid}.part"));
+                    let part_path = download_folders.part_path_for(&tid);
 
                     if !part_path.exists() {
                         return Err(
@@ -6321,7 +6323,7 @@ async fn handle_command_inner(
 
                     let part_path = crate::security::filesystem::verify_existing_path(
                         &part_path,
-                        std::slice::from_ref(&download_folder),
+                        &download_folders.roots(),
                     )
                     .map_err(|e| format!("Invalid or changed part-file path: {e}"))?;
                     let file_name_for_preview = file_name.clone();

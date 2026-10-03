@@ -99,6 +99,7 @@ pub(crate) fn persist_with_root_transaction(
 /// always restores these values from the authoritative in-memory config.
 const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     "shared_folders",
+    "previous_download_folders",
     "default_shared_folder_seeded",
     "folder_priorities",
     "pending_share_states",
@@ -517,7 +518,7 @@ pub async fn pick_preview_player(
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
-fn normalized_path_components(path: &std::path::Path) -> Vec<String> {
+pub(crate) fn normalized_path_components(path: &std::path::Path) -> Vec<String> {
     path.components()
         .map(|component| {
             let value = component.as_os_str().to_string_lossy().into_owned();
@@ -1547,6 +1548,25 @@ pub async fn update_settings(
     // removes the existing mapping, because shutdown tears down on the value it
     // started with.
     let upnp_changed = settings.upnp_enabled != old_settings.upnp_enabled;
+    let download_folder_changed = !settings.download_folder.is_empty()
+        && normalized_path_components(std::path::Path::new(&settings.download_folder))
+            != normalized_path_components(std::path::Path::new(&old_settings.download_folder));
+    if download_folder_changed {
+        // Unfinished downloads stay where they are, so the folder they are in
+        // has to stay listed, and approved, until they are done.
+        let old_current = old_settings.download_folder.clone();
+        let old_previous = old_settings.previous_download_folders.clone();
+        let new_current = settings.download_folder.clone();
+        settings.previous_download_folders = tokio::task::spawn_blocking(move || {
+            crate::storage::part_folders::previous_after_change(
+                &old_current,
+                &old_previous,
+                &new_current,
+            )
+        })
+        .await
+        .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?;
+    }
 
     let save_data = {
         let config = state.config.read().await;
@@ -1559,15 +1579,9 @@ pub async fn update_settings(
         })?
     };
     {
-        let mut roots = settings.shared_folders.clone();
-        if !settings.download_folder.is_empty() {
-            roots.push(settings.download_folder.clone());
-        }
+        let roots = settings.configured_roots();
         let mut explicit_additions = added_shared_folders.clone();
-        if !settings.download_folder.is_empty()
-            && normalized_path_components(std::path::Path::new(&settings.download_folder))
-                != normalized_path_components(std::path::Path::new(&old_settings.download_folder))
-        {
+        if download_folder_changed {
             // Moving the download folder approves a new sandbox root and
             // redirects every future download, so the path must have come from
             // `pick_download_folder`, not from whatever the renderer submitted.
@@ -1728,9 +1742,10 @@ pub async fn update_settings(
     //
     // Waits briefly for room rather than giving up at once. By now the
     // approved-root set already names the new download folder and no longer
-    // names the old one, so a dropped update left the loop starting every
-    // download in a folder it could no longer write to until a restart. A full
-    // queue is a busy loop, not a dead one, and a few seconds is normally enough.
+    // names the old one unless downloads are left in it, so a dropped update
+    // left the loop starting every download in a folder it could no longer
+    // write to until a restart. A full queue is a busy loop, not a dead one,
+    // and a few seconds is normally enough.
     let runtime_update_deferred = match state
         .network_tx
         .send_timeout(
@@ -3552,6 +3567,7 @@ mod tests {
         let mut authoritative = AppSettings {
             shared_folders: vec!["/trusted/share".into()],
             default_shared_folder_seeded: true,
+            previous_download_folders: vec!["/trusted/old-downloads".into()],
             ..AppSettings::default()
         };
         authoritative
@@ -3602,8 +3618,16 @@ mod tests {
             "shared_folder_scan_cursors".into(),
             serde_json::json!({"/renderer/injected": "stolen"}),
         );
+        object.insert(
+            "previous_download_folders".into(),
+            serde_json::json!(["/renderer/injected"]),
+        );
 
         let merged = merge_renderer_settings(renderer, &authoritative).unwrap();
+        assert_eq!(
+            merged.previous_download_folders,
+            authoritative.previous_download_folders
+        );
         assert_eq!(merged.nickname, "Allowed change");
         assert_eq!(merged.shared_folders, authoritative.shared_folders);
         assert_eq!(

@@ -1032,6 +1032,24 @@ mod friend_restricted_download_tests {
 }
 
 #[cfg(test)]
+mod skip_video_compression_tests {
+    use super::*;
+
+    #[test]
+    fn a_video_still_downloading_is_recognised_by_its_name_not_its_part_file() {
+        let part_file = format!("{}.part", uuid::Uuid::new_v4());
+        assert!(
+            !is_video_file_name(&part_file),
+            "what is read from disk says nothing about what the file is"
+        );
+        assert!(is_video_file_name("Holiday 2026.MKV"));
+        assert!(is_video_file_name("clip.webm"));
+        assert!(!is_video_file_name("album.flac"));
+        assert!(!is_video_file_name("no-extension"));
+    }
+}
+
+#[cfg(test)]
 mod upload_cancel_tests {
     use super::*;
 
@@ -2197,8 +2215,28 @@ fn queue_entry_from_hello(
     }
 }
 
+/// Whether "skip compression for video" applies to a file of this name
+/// (eMule's `dontcompressavi`).
+///
+/// Judged from the name the file is shared under, never from the path being
+/// read: a download still in progress is served from `Temp/<id>.part`.
+fn is_video_file_name(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "avi" | "mp4" | "mkv" | "wmv" | "mpg" | "mpeg" | "mov" | "flv" | "webm" | "m4v"
+                    | "divx" | "ts" | "vob"
+            )
+        })
+}
+
 #[derive(Debug)]
 struct ResolvedUploadFile {
+    /// The name the file is shared under: the download's target name for a
+    /// partial, whose `path` is its `.part`.
     name: String,
     path: PathBuf,
     opened: std::fs::File,
@@ -2686,7 +2724,7 @@ struct UploadHandler {
     transfer_manager: Arc<RwLock<TransferManager>>,
     bandwidth_limiter: Arc<BandwidthLimiter>,
     shared_folders: Arc<RwLock<Vec<String>>>,
-    download_folder: PathBuf,
+    download_folders: crate::storage::part_folders::SharedDownloadFolders,
     user_hash: [u8; 16],
     /// Live nickname — Settings can change it without restarting the
     /// upload listener. Read on every Hello / EmuleInfo build.
@@ -4189,7 +4227,7 @@ pub async fn start_upload_server(
     udp_port: u16,
     advertise_udp_port: Arc<std::sync::atomic::AtomicU16>,
     shared_folders: Arc<RwLock<Vec<String>>>,
-    download_folder: PathBuf,
+    download_folders: crate::storage::part_folders::SharedDownloadFolders,
     local_index: Arc<RwLock<LocalIndex>>,
     transfer_manager: Arc<RwLock<TransferManager>>,
     bandwidth_limiter: Arc<BandwidthLimiter>,
@@ -4301,7 +4339,7 @@ pub async fn start_upload_server(
         transfer_manager,
         bandwidth_limiter,
         shared_folders,
-        download_folder,
+        download_folders,
         user_hash,
         nickname,
         obfuscation_enabled,
@@ -5198,13 +5236,9 @@ impl UploadHandler {
                 let allowed: Vec<String> = {
                     let folders = self.shared_folders.read().await;
                     let mut allowed: Vec<String> = folders.clone();
-                    allowed.push(self.download_folder.to_string_lossy().to_string());
-                    allowed.push(
-                        self.download_folder
-                            .join("Downloads")
-                            .to_string_lossy()
-                            .to_string(),
-                    );
+                    let download_folder = self.download_folders.read().current.clone();
+                    allowed.push(download_folder.to_string_lossy().to_string());
+                    allowed.push(download_folder.join("Downloads").to_string_lossy().to_string());
                     allowed
                 };
                 // `canonicalize` is a blocking filesystem syscall; run it (and the
@@ -5276,25 +5310,23 @@ impl UploadHandler {
                 })
         }?;
 
-        let part_path = self
-            .download_folder
-            .join("Temp")
-            .join(format!("{}.part", transfer.id));
-        if !part_path.exists() {
-            return None;
-        }
-        let allowed = vec![self.download_folder.to_string_lossy().into_owned()];
-        let allowed_for_open = allowed.clone();
-        let (verified_part, opened) = tokio::task::spawn_blocking(move || {
-            crate::security::filesystem::open_existing_approved(
-                &part_path,
-                &allowed_for_open,
-                false,
-            )
+        let folders = self.download_folders.read().clone();
+        let transfer_id = transfer.id.clone();
+        let (allowed, verified_part, opened) = tokio::task::spawn_blocking(move || {
+            let part_folder = folders.part_folder_for(&transfer_id);
+            let part_path = part_folder.join("Temp").join(format!("{transfer_id}.part"));
+            if !part_path.exists() {
+                return None;
+            }
+            let allowed = vec![part_folder.to_string_lossy().into_owned()];
+            let (verified, opened) =
+                crate::security::filesystem::open_existing_approved(&part_path, &allowed, false)
+                    .ok()?;
+            Some((allowed, verified, opened))
         })
         .await
         .ok()
-        .and_then(Result::ok)?;
+        .flatten()?;
 
         Some(ResolvedUploadFile {
             name: transfer.file_name,
@@ -10714,15 +10746,8 @@ impl UploadHandler {
                     // it's a property of the file, not the block, and
                     // `to_lowercase()` allocates a fresh String per call.
                     if cached_is_video_ext.as_ref().map(|(p, _)| p != &file_path).unwrap_or(true) {
-                        let is_video = file_path.extension()
-                            .and_then(|e| e.to_str())
-                            .map(|e| {
-                                let e = e.to_lowercase();
-                                matches!(e.as_str(), "avi" | "mp4" | "mkv" | "wmv" | "mpg" |
-                                    "mpeg" | "mov" | "flv" | "webm" | "m4v" | "divx" | "ts" | "vob")
-                            })
-                            .unwrap_or(false);
-                        cached_is_video_ext = Some((file_path.clone(), is_video));
+                        cached_is_video_ext =
+                            Some((file_path.clone(), is_video_file_name(&resolved.name)));
                     }
                     let is_video_ext = cached_is_video_ext.as_ref().map(|(_, v)| *v).unwrap_or(false);
 

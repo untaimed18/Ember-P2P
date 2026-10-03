@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -717,7 +716,7 @@ pub struct Ed2kDownload {
     pub file_name: String,
     pub file_size: u64,
     pub source_addr: SocketAddr,
-    pub download_dir: PathBuf,
+    pub download_folders: crate::storage::part_folders::SharedDownloadFolders,
     pub tcp_port: u16,
     pub udp_port: u16,
     pub bandwidth_limiter: Arc<BandwidthLimiter>,
@@ -1116,6 +1115,44 @@ pub(crate) async fn prepare_download_dirs(
     .await
     .map_err(|e| anyhow::anyhow!("download folder task failed: {e}"))?
     .map_err(|e| download_folder_error("preparing Temp and Downloads", download_dir, e))
+}
+
+/// The download folder holding this download's `.part` — the one it started
+/// in — and that folder's `Temp`, prepared.
+pub(crate) async fn prepare_part_dir(
+    folders: &crate::storage::part_folders::SharedDownloadFolders,
+    transfer_id: &str,
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let folders = folders.read().clone();
+    let id = transfer_id.to_string();
+    let root = tokio::task::spawn_blocking(move || folders.part_folder_for(&id))
+        .await
+        .map_err(|e| anyhow::anyhow!("download folder task failed: {e}"))?;
+    let (temp, _) = prepare_download_dirs(&root).await?;
+    Ok((root, temp))
+}
+
+/// Move a verified `.part` into `<download_root>/Downloads/<file_name>`.
+/// `download_root` is the download folder current at completion, which need
+/// not be the one holding the `.part`. Blocking.
+pub(crate) fn move_part_to_downloads(
+    part_path: &std::path::Path,
+    part_root: &std::path::Path,
+    download_root: &std::path::Path,
+    file_name: &str,
+    expected_source_identity: &crate::security::filesystem::ObjectIdentity,
+) -> anyhow::Result<std::path::PathBuf> {
+    let allowed = vec![download_root.to_string_lossy().into_owned()];
+    let completed_dir =
+        crate::security::filesystem::prepare_approved_subdir(download_root, "Downloads", &allowed)
+            .map_err(|e| download_folder_error("preparing Downloads", download_root, e))?;
+    move_part_between_roots_approved(
+        part_path,
+        part_root,
+        &completed_dir.join(file_name),
+        download_root,
+        expected_source_identity,
+    )
 }
 
 pub(crate) fn failure_kind_name(kind: &SourceFailureKind) -> String {
@@ -2075,6 +2112,58 @@ mod tests {
     }
 
     #[test]
+    fn a_part_left_in_an_earlier_download_folder_completes_into_the_current_one() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-completion-across-folders-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let old = base.join("old");
+        let new = base.join("new");
+        let data = base.join("data");
+        for dir in [old.join("Temp"), new.clone(), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let part = old.join("Temp").join("started-before.part");
+        std::fs::write(&part, b"verified bytes").unwrap();
+        let old_string = old.to_string_lossy().into_owned();
+        let roots = [old_string.clone(), new.to_string_lossy().into_owned()];
+        crate::security::filesystem::initialize_approved_roots(&data, &roots).unwrap();
+        let (_, opened) = crate::security::filesystem::open_existing_approved(
+            &part,
+            std::slice::from_ref(&old_string),
+            false,
+        )
+        .unwrap();
+        let identity = crate::security::filesystem::opened_file_identity(&opened).unwrap();
+        drop(opened);
+
+        let final_path =
+            move_part_to_downloads(&part, &old, &new, "finished.bin", &identity).unwrap();
+        assert_eq!(
+            final_path,
+            new.canonicalize().unwrap().join("Downloads").join("finished.bin")
+        );
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"verified bytes");
+        assert!(!part.exists());
+
+        let stray = old.join("Temp").join("stray.part");
+        std::fs::write(&stray, b"x").unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(
+            move_part_to_downloads(&stray, &new, &new, "x.bin", &identity).is_err(),
+            "the part must be inside the root it is said to be in"
+        );
+        assert!(
+            move_part_to_downloads(&stray, &old, &outside, "x.bin", &identity).is_err(),
+            "and the target inside an approved one"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn approved_completion_copy_fallback_preserves_identity_checks() {
         let _registry_guard = crate::security::filesystem::test_registry_lock();
         let base = std::env::temp_dir().join(format!(
@@ -2189,11 +2278,12 @@ impl Ed2kDownload {
             .control
             .seal_pending_rename()
             .unwrap_or_else(|| self.file_name.clone());
+        let download_dir = self.download_folders.read().current.clone();
         let final_path = finalize_zero_ed2k_file(
             &self.transfer_id,
             &zero_name,
             self.file_hash,
-            &self.download_dir,
+            &download_dir,
         )
         .await?;
         self.emit_source_detail(event_tx, "completed", None, 0, 0, "", "")
@@ -4618,11 +4708,11 @@ impl Ed2kDownload {
             );
         }
 
-        // Ensure download directories exist:
-        //   <download_dir>/Temp/     -- .part files during download
-        //   <download_dir>/Downloads/ -- completed files
-        let allowed_roots = vec![self.download_dir.to_string_lossy().into_owned()];
-        let (temp_dir, completed_dir) = prepare_download_dirs(&self.download_dir).await?;
+        // `.part` files live in `<part_root>/Temp`, completed files go to the
+        // `Downloads` of whichever download folder is current at completion.
+        let (part_root, temp_dir) =
+            prepare_part_dir(&self.download_folders, &self.transfer_id).await?;
+        let allowed_roots = vec![part_root.to_string_lossy().into_owned()];
 
         let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
 
@@ -4747,7 +4837,7 @@ impl Ed2kDownload {
                 Some(self.control.discarding_flag()),
             )
             .await
-            .map_err(|e| download_folder_error("opening the part file", &self.download_dir, e))?
+            .map_err(|e| download_folder_error("opening the part file", &part_root, e))?
         };
 
         let mut downloaded: u64 = tracker.completed_bytes();
@@ -6287,7 +6377,7 @@ impl Ed2kDownload {
         // Temp-file write.
         let expected_hash = hex::encode(self.file_hash);
         let verify_path = part_path.clone();
-        let verify_root = self.download_dir.clone();
+        let verify_root = part_root.clone();
         let expected_aich = self.expected_aich_master;
         let ember_expected = self.ember_file_hash;
         let mut ember_pin_failed = false;
@@ -6491,13 +6581,11 @@ impl Ed2kDownload {
         if self.control.is_cancelled() {
             anyhow::bail!("cancelled by user");
         }
-        let final_path = completed_dir.join(completed_download_name(
-            tracker.file_name(),
-            &self.file_name,
-        ));
+        let final_name = completed_download_name(tracker.file_name(), &self.file_name);
         let pp = part_path.clone();
-        let root = self.download_dir.clone();
-        let met_roots = vec![self.download_dir.to_string_lossy().into_owned()];
+        let pp_root = part_root.clone();
+        let download_root = self.download_folders.read().current.clone();
+        let met_roots = allowed_roots.clone();
         let finish_tx = event_tx.clone();
         let finish_id = self.transfer_id.clone();
         // `download_from_streams` only gets here after its Ember BLAKE3 check
@@ -6508,7 +6596,13 @@ impl Ed2kDownload {
         // after it. See the multi-source worker.
         let finish = tokio::spawn(async move {
             let actual_final = tokio::task::spawn_blocking(move || {
-                move_part_to_final_approved(&pp, &final_path, &root, &verified_identity)
+                move_part_to_downloads(
+                    &pp,
+                    &pp_root,
+                    &download_root,
+                    &final_name,
+                    &verified_identity,
+                )
             })
             .await
             .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
@@ -6804,9 +6898,35 @@ pub(crate) fn move_part_to_final_approved(
     download_root: &std::path::Path,
     expected_source_identity: &crate::security::filesystem::ObjectIdentity,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let allowed = vec![download_root.to_string_lossy().into_owned()];
-    let verified_part = crate::security::filesystem::verify_existing_path(part_path, &allowed)?;
-    let verified_target = crate::security::filesystem::verify_output_path(target, &allowed)?;
+    move_part_between_roots_approved(
+        part_path,
+        download_root,
+        target,
+        download_root,
+        expected_source_identity,
+    )
+}
+
+/// [`move_part_to_final_approved`] for a `.part` left in an earlier download
+/// folder: each end is pinned to its own root, and the move is a copy when
+/// the two are on different volumes.
+pub(crate) fn move_part_between_roots_approved(
+    part_path: &std::path::Path,
+    part_root: &std::path::Path,
+    target: &std::path::Path,
+    target_root: &std::path::Path,
+    expected_source_identity: &crate::security::filesystem::ObjectIdentity,
+) -> anyhow::Result<std::path::PathBuf> {
+    let part_allowed = vec![part_root.to_string_lossy().into_owned()];
+    let target_allowed = vec![target_root.to_string_lossy().into_owned()];
+    let verified_part =
+        crate::security::filesystem::verify_existing_path(part_path, &part_allowed)?;
+    let verified_target =
+        crate::security::filesystem::verify_output_path(target, &target_allowed)?;
+    let mut allowed = part_allowed;
+    if target_allowed != allowed {
+        allowed.extend(target_allowed);
+    }
     move_part_to_final_with_roots(
         &verified_part,
         &verified_target,

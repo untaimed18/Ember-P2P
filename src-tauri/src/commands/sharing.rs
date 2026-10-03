@@ -3899,14 +3899,7 @@ pub(crate) async fn add_shared_folder_approved(
         }
     };
     let limited = limit.is_some();
-    let mut roots = {
-        let config = state.config.read().await;
-        let mut roots = config.settings.shared_folders.clone();
-        if !config.settings.download_folder.is_empty() {
-            roots.push(config.settings.download_folder.clone());
-        }
-        roots
-    };
+    let mut roots = state.config.read().await.settings.configured_roots();
     roots.push(canonical_str.clone());
     let registry = state.approved_roots.clone();
     let approved = canonical_str.clone();
@@ -5310,9 +5303,7 @@ pub async fn remove_shared_folder(
             .filter(|root| !paths_equal_ignore_case(root, &canonical_path))
             .cloned()
             .collect();
-        if !config.settings.download_folder.is_empty() {
-            roots.push(config.settings.download_folder.clone());
-        }
+        roots.extend(config.settings.download_roots());
         roots
     };
     let registry = state.approved_roots.clone();
@@ -5631,10 +5622,7 @@ pub async fn reapprove_shared_folder(
     if !is_shared(&settings) {
         return Err(coded("sharing_folder_not_shared", "Folder is not a shared folder"));
     }
-    let mut roots = settings.shared_folders.clone();
-    if !settings.download_folder.is_empty() {
-        roots.push(settings.download_folder.clone());
-    }
+    let roots = settings.configured_roots();
     let folder = path.clone();
     tokio::task::spawn_blocking(move || registry.reapprove_roots(&roots, std::slice::from_ref(&folder)))
         .await

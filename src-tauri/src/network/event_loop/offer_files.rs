@@ -28,8 +28,8 @@ pub(in crate::network) async fn partial_download_offers(
     restricted: &HashSet<String>,
     seen_offer_hashes: &mut HashSet<String>,
 ) -> Vec<ed2k::server::OfferFile> {
-    let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
-    let candidates: Vec<(String, PathBuf, ed2k::server::OfferFile)> = {
+    let download_folders = settings.download_folders();
+    let candidates: Vec<(String, Vec<PathBuf>, ed2k::server::OfferFile)> = {
         let mgr = transfer_manager.read().await;
         let mut candidates = Vec::new();
         for transfer in mgr.active.values().chain(mgr.queue.iter()) {
@@ -58,7 +58,7 @@ pub(in crate::network) async fn partial_download_offers(
             h.copy_from_slice(&hash_bytes[..16]);
             candidates.push((
                 transfer.id.clone(),
-                temp_dir.join(format!("{}.part", transfer.id)),
+                download_folders.part_paths(&transfer.id),
                 ed2k::server::OfferFile {
                     hash: h,
                     name: transfer.file_name.clone(),
@@ -79,18 +79,19 @@ pub(in crate::network) async fn partial_download_offers(
 }
 
 /// Split partial-offer candidates into the probe to run next and the offers
-/// whose `.part` the last probe found.
+/// whose `.part` the last probe found. A candidate lists where its `.part`
+/// may be in every download folder; finding it in any one is enough.
 fn with_known_parts(
-    candidates: Vec<(String, PathBuf, ed2k::server::OfferFile)>,
+    candidates: Vec<(String, Vec<PathBuf>, ed2k::server::OfferFile)>,
     present: &HashSet<String>,
 ) -> (Vec<(String, PathBuf)>, Vec<ed2k::server::OfferFile>) {
     let mut probe = Vec::with_capacity(candidates.len());
     let mut offers = Vec::new();
-    for (id, path, offer) in candidates {
+    for (id, paths, offer) in candidates {
         if present.contains(&id) {
             offers.push(offer);
         }
-        probe.push((id, path));
+        probe.extend(paths.into_iter().map(|path| (id.clone(), path)));
     }
     (probe, offers)
 }
@@ -298,11 +299,11 @@ async fn still_offerable(
 mod tests {
     use super::*;
 
-    fn candidate(id: &str, hash: u8) -> (String, PathBuf, ed2k::server::OfferFile) {
+    fn candidate(id: &str, hash: u8) -> (String, Vec<PathBuf>, ed2k::server::OfferFile) {
         let name = format!("{id}.bin");
         (
             id.to_string(),
-            PathBuf::from(format!("{id}.part")),
+            vec![PathBuf::from(format!("{id}.part"))],
             ed2k::server::OfferFile {
                 hash: [hash; 16],
                 file_type: ed2k::server::offer_file_type(&name),
@@ -322,5 +323,19 @@ mod tests {
         assert_eq!(offers[0].hash, [1; 16]);
         let probed: Vec<&str> = probe.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(probed, ["found", "not-yet"]);
+    }
+
+    #[test]
+    fn a_part_left_in_an_earlier_download_folder_is_probed_there_too() {
+        let folders = crate::storage::part_folders::DownloadFolders::new(
+            "/downloads/new",
+            &["/downloads/old".to_string()],
+        );
+        let (id, _, offer) = candidate("moved", 3);
+        let paths = folders.part_paths(&id);
+        let (probe, _) = with_known_parts(vec![(id, paths.clone(), offer)], &HashSet::new());
+        let probed: Vec<&PathBuf> = probe.iter().map(|(_, path)| path).collect();
+        assert_eq!(probed, paths.iter().collect::<Vec<_>>());
+        assert!(probed[1].starts_with("/downloads/old"));
     }
 }

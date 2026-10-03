@@ -933,6 +933,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         skip_compress_video_shared: Arc::new(std::sync::atomic::AtomicBool::new(
             settings.skip_compress_video,
         )),
+        download_folders: settings.download_folders().shared(),
         filter_incoming_shared: Arc::new(std::sync::atomic::AtomicBool::new(
             settings.filter_incoming_connections,
         )),
@@ -1174,8 +1175,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // so the transcript never shows a transfer that will not move again.
     {
         let db = db.clone();
-        let folder = settings.download_folder.clone();
-        let _ = tokio::task::spawn_blocking(move || chat_attach::sweep_interrupted(&db, &folder)).await;
+        let folders = settings.download_roots();
+        let _ = tokio::task::spawn_blocking(move || chat_attach::sweep_interrupted(&db, &folders)).await;
     }
 
     // Seed the Ember DHT routing table from the last session's persisted
@@ -1727,7 +1728,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let ul_filter_incoming = state.filter_incoming_shared.clone();
         let ul_share_browsing = state.share_browsing_shared.clone();
         let ul_obfuscation = state.obfuscation_enabled_shared.clone();
-        let ul_download_folder = settings.download_folder.clone();
+        let ul_download_folders = state.download_folders.clone();
         let ul_fw_probes = firewall_probe_ips.clone();
         let ul_fw_shared = state.firewalled_shared.clone();
         let ul_tcp_connect_back = state.tcp_connect_back_shared.clone();
@@ -1768,7 +1769,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 udp_port,
                 ul_adv_udp,
                 ul_folders,
-                PathBuf::from(&ul_download_folder),
+                ul_download_folders,
                 ul_index,
                 ul_transfers,
                 ul_bw,
@@ -2219,10 +2220,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         startup_download_admission.take();
         transfer_manager.write().await.restored = true;
     }
-    let mut part_progress_task: Option<
-        tokio::task::JoinHandle<std::collections::HashMap<String, (u64, bool, bool)>>,
-    > = None;
-    let mut part_progress_map: Option<std::collections::HashMap<String, (u64, bool, bool)>> = None;
+    let mut part_progress_task: Option<tokio::task::JoinHandle<event_loop::RestoredParts>> = None;
+    let mut part_progress_map: Option<event_loop::RestoredParts> = None;
     let mut pending_startup_cleanup = true;
     let mut known_met_ready = false;
     let mut pending_upnp_setup = upnp_enabled;

@@ -69,7 +69,7 @@ pub(in crate::network) async fn on_kad_callback_conn(
                     file_name: pd.file_name,
                     file_size: pd.file_size,
                     source_addr,
-                    download_dir: PathBuf::from(&settings.download_folder),
+                    download_folders: state.download_folders.clone(),
                     tcp_port: advertised_tcp_port(state),
                     udp_port: advertised_udp_port(state),
                     bandwidth_limiter: bandwidth_limiter.clone(),

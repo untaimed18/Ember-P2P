@@ -745,6 +745,9 @@ pub(super) struct NetworkState {
     pub(super) obfuscation_enabled_shared: Arc<std::sync::atomic::AtomicBool>,
     /// Shared "skip video compression" flag for the upload sender loop.
     pub(super) skip_compress_video_shared: Arc<std::sync::atomic::AtomicBool>,
+    /// The download folders, live: download workers and the upload listener
+    /// hold this rather than the folder they were started with.
+    pub(super) download_folders: crate::storage::part_folders::SharedDownloadFolders,
     /// Shared "filter incoming connections via IP filter" flag for the
     /// TCP accept loop.
     pub(super) filter_incoming_shared: Arc<std::sync::atomic::AtomicBool>,

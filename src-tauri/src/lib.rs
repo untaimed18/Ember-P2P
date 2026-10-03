@@ -738,6 +738,7 @@ pub fn run() {
             // network all read below, and none of them can take a change once
             // they have.
             let emule_import = emule_import::apply::apply_pending(&data_dir, &db, &mut config);
+            storage::part_folders::forget_finished_previous_folders(&db, &mut config);
             let settings = config.settings.clone();
             // Best-effort, never fatal. A download folder on an unplugged USB
             // drive, an offline NAS or an unmapped share makes these fail, and
@@ -760,10 +761,7 @@ pub fn run() {
                     }
                 }
             }
-            let mut configured_roots = settings.shared_folders.clone();
-            if !settings.download_folder.is_empty() {
-                configured_roots.push(settings.download_folder.clone());
-            }
+            let configured_roots = settings.configured_roots();
             let mut import_roots =
                 emule_import::apply::pending_root_additions(&data_dir, emule_import.as_ref());
             // The backup deliberately leaves out `approved_roots.json`, whose

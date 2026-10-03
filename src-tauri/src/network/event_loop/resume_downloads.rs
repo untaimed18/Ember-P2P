@@ -5,6 +5,45 @@
 
 use super::*;
 
+/// What the blocking pool read from a restored download's `.part`.
+pub(in crate::network) struct RestoredPart {
+    /// The download folder whose `Temp` holds it, which is not the current
+    /// one for a download started before the download folder changed.
+    folder: PathBuf,
+    completed_bytes: u64,
+    preview_ready: bool,
+    all_complete: bool,
+}
+
+/// Keyed by transfer id, with an entry exactly when the `.part` existed.
+pub(in crate::network) type RestoredParts = HashMap<String, RestoredPart>;
+
+/// Read each restored download's `.part` from whichever download folder holds
+/// it. Blocking.
+fn read_restored_parts(
+    folders: &crate::storage::part_folders::DownloadFolders,
+    jobs: Vec<(String, u64, String)>,
+) -> RestoredParts {
+    let mut map = HashMap::new();
+    for (id, total, name) in jobs {
+        let folder = folders.part_folder_for(&id);
+        let part_path = folder.join("Temp").join(format!("{id}.part"));
+        if part_path.exists() && total > 0 {
+            let tracker = crate::network::ed2k::part_tracker::PartTracker::new(total, &part_path);
+            map.insert(
+                id,
+                RestoredPart {
+                    folder,
+                    completed_bytes: tracker.completed_bytes(),
+                    preview_ready: tracker.is_preview_ready(&name, total),
+                    all_complete: tracker.all_complete(),
+                },
+            );
+        }
+    }
+    map
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn resume_incomplete_downloads(
     state: &mut NetworkState,
@@ -15,8 +54,8 @@ pub(in crate::network) async fn resume_incomplete_downloads(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     known_files: &KnownFileList,
     known_met_ready: bool,
-    part_progress_map: &mut Option<HashMap<String, (u64, bool, bool)>>,
-    part_progress_task: &mut Option<tokio::task::JoinHandle<HashMap<String, (u64, bool, bool)>>>,
+    part_progress_map: &mut Option<RestoredParts>,
+    part_progress_task: &mut Option<tokio::task::JoinHandle<RestoredParts>>,
     pending_incomplete_downloads: &mut Option<Vec<Transfer>>,
     startup_download_admission: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
     upload_queue: &ed2k::upload::UploadQueueRef,
@@ -25,31 +64,13 @@ pub(in crate::network) async fn resume_incomplete_downloads(
         .as_ref()
         .filter(|_| part_progress_task.is_none() && part_progress_map.is_none())
     {
-        let dl_folder = settings.download_folder.clone();
+        let folders = settings.download_folders();
         let jobs: Vec<(String, u64, String)> = pending
             .iter()
             .map(|t| (t.id.clone(), t.total_size, t.file_name.clone()))
             .collect();
         *part_progress_task = Some(tokio::task::spawn_blocking(move || {
-            let mut map = std::collections::HashMap::new();
-            for (id, total, name) in jobs {
-                let part_path = PathBuf::from(&dl_folder)
-                    .join("Temp")
-                    .join(format!("{id}.part"));
-                if part_path.exists() && total > 0 {
-                    let tracker =
-                        crate::network::ed2k::part_tracker::PartTracker::new(total, &part_path);
-                    map.insert(
-                        id,
-                        (
-                            tracker.completed_bytes(),
-                            tracker.is_preview_ready(&name, total),
-                            tracker.all_complete(),
-                        ),
-                    );
-                }
-            }
-            map
+            read_restored_parts(&folders, jobs)
         }));
     }
     if let Some(handle) = part_progress_task.as_mut() {
@@ -99,14 +120,21 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 control.pause();
             }
 
-            let part_path = PathBuf::from(&dl_folder)
-                .join("Temp")
-                .join(format!("{}.part", transfer.id));
             // The map has an entry exactly when the `.part` existed and the
             // size was known as the blocking pool read it. Asking the disk
             // again here would cost a stat per download on the network loop.
-            if let Some((completed_bytes, preview_ready, _)) =
-                progress_map.get(&transfer.id).copied()
+            let restored = progress_map.get(&transfer.id);
+            let part_folder = restored
+                .map(|part| part.folder.clone())
+                .unwrap_or_else(|| PathBuf::from(&dl_folder));
+            let part_path = part_folder
+                .join("Temp")
+                .join(format!("{}.part", transfer.id));
+            if let Some(&RestoredPart {
+                completed_bytes,
+                preview_ready,
+                ..
+            }) = restored
             {
                 // `completed_bytes` is the on-disk figure, so it restores
                 // Completed and drives progress. Transferred takes it as a
@@ -259,10 +287,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
 
 
                 if part_path.exists() && transfer.total_size > 0 {
-                    let all_complete = progress_map
-                        .get(&transfer.id)
-                        .map(|(_, _, ac)| *ac)
-                        .unwrap_or(false);
+                    let all_complete = restored.is_some_and(|part| part.all_complete);
                     if all_complete {
                         info!(
                             "Restored download {} was Verifying with complete .part — re-verifying locally",
@@ -276,6 +301,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                         let expected_ember = transfer.ember_file_hash.clone();
                         let ember_pinned = expected_ember.is_some();
                         let dl_dir = PathBuf::from(&dl_folder);
+                        let part_dir = part_folder.clone();
                         let tx = dl_event_tx.clone();
                         let dl_tid = tid.clone();
                         let dl_tid2 = tid.clone();
@@ -300,6 +326,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                                 file_size,
                                 expected_aich.as_deref(),
                                 expected_ember.as_deref(),
+                                &part_dir,
                                 &dl_dir,
                             )
                             .await;
@@ -441,5 +468,44 @@ pub(in crate::network) async fn resume_incomplete_downloads(
             transfer_manager,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_restored_download_resumes_from_the_folder_it_started_in() {
+        let base = std::env::temp_dir().join(format!(
+            "ember-restore-parts-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let old = base.join("old");
+        let new = base.join("new");
+        for dir in [old.join("Temp"), new.join("Temp")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(old.join("Temp").join("before-change.part"), vec![0u8; 100]).unwrap();
+        std::fs::write(new.join("Temp").join("after-change.part"), vec![0u8; 100]).unwrap();
+        let folders = crate::storage::part_folders::DownloadFolders::new(
+            &new.to_string_lossy(),
+            &[old.to_string_lossy().into_owned()],
+        );
+        let job = |id: &str| (id.to_string(), 100, format!("{id}.bin"));
+
+        let restored = read_restored_parts(
+            &folders,
+            vec![job("before-change"), job("after-change"), job("never-started")],
+        );
+
+        assert_eq!(restored["before-change"].folder, old);
+        assert_eq!(restored["after-change"].folder, new);
+        assert!(
+            !restored.contains_key("never-started"),
+            "no `.part` anywhere: nothing to restore"
+        );
+        let _ = std::fs::remove_dir_all(base);
     }
 }

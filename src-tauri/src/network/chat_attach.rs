@@ -1430,14 +1430,21 @@ async fn receive_over_tcp(
 // --- Either side ---------------------------------------------------------------
 
 /// Stop whatever this node is doing for `xfer_id` and clear its part file.
-fn stop_local(state: &mut NetworkState, download_folder: &str, xfer_id: &[u8; 16]) {
+fn stop_local(state: &mut NetworkState, settings: &AppSettings, xfer_id: &[u8; 16]) {
     state.attach_inbound.remove(xfer_id);
     if let Some(handle) = state.attach_fetches.remove(xfer_id) {
         handle.abort();
         // The aborted task never reaches its own cleanup. Removing a link by
         // name removes the link, not what it points at, so a planted symlink
-        // here cannot turn this into a delete elsewhere.
-        let part = PathBuf::from(download_folder)
+        // here cannot turn this into a delete elsewhere. Every download
+        // folder, because the receive may have started before the last change.
+        remove_part_files(&settings.download_roots(), xfer_id);
+    }
+}
+
+fn remove_part_files(download_folders: &[String], xfer_id: &[u8; 16]) {
+    for folder in download_folders {
+        let part = PathBuf::from(folder)
             .join("Temp")
             .join(part_file_name(xfer_id));
         let _ = std::fs::remove_file(part);
@@ -1465,7 +1472,7 @@ pub(super) async fn cancel(
         .unwrap_or(false);
     // Whatever the row says: a receive still running under a row that ended
     // without it has to be stoppable too.
-    stop_local(state, &settings.download_folder, &xfer_id);
+    stop_local(state, settings, &xfer_id);
     let mut friend = [0u8; 16];
     if cancelled && hex::decode_to_slice(&row.friend_hash, &mut friend).is_ok() {
         // Best effort: an offline friend finds out when their side lapses.
@@ -1508,7 +1515,7 @@ pub(super) fn on_cancel(
     let moved = db
         .advance_chat_attachment(&xfer_hex, status, None, None)
         .unwrap_or(false);
-    stop_local(state, &settings.download_folder, &xfer_id);
+    stop_local(state, settings, &xfer_id);
     if moved {
         emit_by_id(app, db, &xfer_hex);
     }
@@ -1524,7 +1531,7 @@ pub(super) fn on_cancel(
 /// friend may still answer after we come back — and a send that was cut off
 /// goes back to `accepted`, since the friend's receive can resume against the
 /// same grant if it dials again.
-pub(super) fn sweep_interrupted(db: &Database, download_folder: &str) {
+pub(super) fn sweep_interrupted(db: &Database, download_folders: &[String]) {
     let now = chrono::Utc::now().timestamp();
     let _ = db.expire_chat_attachments(now);
     let _ = db.requeue_interrupted_outbound_chat_attachments();
@@ -1536,10 +1543,7 @@ pub(super) fn sweep_interrupted(db: &Database, download_folder: &str) {
         let _ = db.set_chat_attachment_status(&xfer_hex, next, None, None);
         let mut id = [0u8; 16];
         if hex::decode_to_slice(&xfer_hex, &mut id).is_ok() {
-            let part = PathBuf::from(download_folder)
-                .join("Temp")
-                .join(part_file_name(&id));
-            let _ = std::fs::remove_file(part);
+            remove_part_files(download_folders, &id);
         }
     }
 }

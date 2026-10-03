@@ -877,6 +877,9 @@ export interface AppSettings {
    *  discarded. Change shared folders through the sharing commands. */
   readonly shared_folders: string[];
   download_folder: string;
+  /** Earlier download folders that still hold unfinished downloads, which
+   *  finish where they started. Backend-owned, like `shared_folders`. */
+  readonly previous_download_folders?: string[];
   max_upload_speed: number;
   max_download_speed: number;
   max_concurrent_downloads: number;

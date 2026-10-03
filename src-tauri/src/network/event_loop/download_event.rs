@@ -1696,7 +1696,7 @@ pub(in crate::network) async fn on_download_event(
     // event can't unwind the whole network loop (→ outer catch →
     // shutdown). Mirrors the handle_command_inner/handle_udp_packet_inner
     // catch_unwind pattern.
-    if let Err(p) = std::panic::AssertUnwindSafe(handle_download_event(event, app_handle, transfer_manager, source_manager, db, &mut promoted, stats_manager, settings.remove_finished_downloads, a4af_shared, &settings.download_folder, db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL, &mut state.callback_row_pending_since, transfer_status_writes)).catch_unwind().await {
+    if let Err(p) = std::panic::AssertUnwindSafe(handle_download_event(event, app_handle, transfer_manager, source_manager, db, &mut promoted, stats_manager, settings.remove_finished_downloads, a4af_shared, &settings.download_roots(), db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL, &mut state.callback_row_pending_since, transfer_status_writes)).catch_unwind().await {
         error!("handle_download_event panicked, dropping event: {}", describe_panic(&*p));
     }
 

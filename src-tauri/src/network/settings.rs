@@ -295,6 +295,7 @@ pub(super) fn apply_network_settings(
         new_settings.skip_compress_video,
         std::sync::atomic::Ordering::Relaxed,
     );
+    *state.download_folders.write() = new_settings.download_folders();
     state.filter_incoming_shared.store(
         new_settings.filter_incoming_connections,
         std::sync::atomic::Ordering::Relaxed,

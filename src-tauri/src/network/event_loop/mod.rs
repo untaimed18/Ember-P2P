@@ -85,7 +85,7 @@ pub(super) use self::offer_files::drain_offer_files;
 pub(super) use self::publish_tick::on_publish_tick;
 pub(super) use self::punch_poll_tick::on_punch_poll_tick;
 pub(super) use self::rendezvous_register_result::on_rendezvous_register_result;
-pub(super) use self::resume_downloads::resume_incomplete_downloads;
+pub(super) use self::resume_downloads::{resume_incomplete_downloads, RestoredParts};
 pub(super) use self::search_poll_tick::on_search_poll_tick;
 pub(super) use self::server_connect_result::on_server_connect_result;
 pub(super) use self::server_tcp_source_tick::on_server_tcp_source_tick;

@@ -1386,6 +1386,13 @@ pub struct AppSettings {
     pub channel_username: String,
     pub shared_folders: Vec<String>,
     pub download_folder: String,
+    /// Earlier download folders whose `Temp` still holds unfinished downloads.
+    /// A download keeps its `.part` in the folder it started in (see
+    /// `storage::part_folders`), so each of these stays an approved root
+    /// until nothing is left in it. Backend-owned (see
+    /// `BACKEND_OWNED_SETTINGS_FIELDS`): an entry here grants file access.
+    #[serde(default)]
+    pub previous_download_folders: Vec<String>,
     pub max_upload_speed: u64,
     pub max_download_speed: u64,
     pub max_concurrent_downloads: u32,
@@ -1871,6 +1878,26 @@ impl AppSettings {
             max_download_bytes,
         }
     }
+
+    pub fn download_folders(&self) -> crate::storage::part_folders::DownloadFolders {
+        crate::storage::part_folders::DownloadFolders::new(
+            &self.download_folder,
+            &self.previous_download_folders,
+        )
+    }
+
+    /// Every download folder a `.part` may be in, current first.
+    pub fn download_roots(&self) -> Vec<String> {
+        self.download_folders().roots()
+    }
+
+    /// The roots the approved-root registry has to keep: the shared folders
+    /// and every download folder that still holds downloads.
+    pub fn configured_roots(&self) -> Vec<String> {
+        let mut roots = self.shared_folders.clone();
+        roots.extend(self.download_roots());
+        roots
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2295,6 +2322,7 @@ impl Default for AppSettings {
             channel_username: String::new(),
             shared_folders: vec![completed_dir],
             download_folder: download_dir,
+            previous_download_folders: Vec::new(),
             max_upload_speed: 0,
             max_download_speed: 0,
             max_concurrent_downloads: 5,

@@ -1862,7 +1862,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             file_name: pending.file_name,
                             file_size: pending.file_size,
                             sources: download_sources,
-                            download_dir: PathBuf::from(&settings.download_folder),
+                            download_folders: state.download_folders.clone(),
                             user_hash: state.user_hash,
                             nickname: settings.nickname.clone(),
                             tcp_port: advertised_tcp_port(state),

@@ -623,40 +623,58 @@ async fn cleanup_one_partial(
     }
 }
 
-async fn cleanup_partial_files(download_folder: &str, transfer_id: &str) {
+/// Delete a download's `.part` and `.part.met` from whichever download folder
+/// holds them; `download_roots` is every one that may (see
+/// `AppSettings::download_roots`).
+async fn cleanup_partial_files(download_roots: &[String], transfer_id: &str) {
     if uuid::Uuid::parse_str(transfer_id).is_err() {
         tracing::warn!("cleanup_partial_files: invalid transfer_id, skipping");
         return;
     }
-    let temp_dir = std::path::PathBuf::from(download_folder).join("Temp");
-    let part_path = temp_dir.join(format!("{transfer_id}.part"));
-    let met_path = temp_dir.join(format!("{transfer_id}.part.met"));
-    crate::network::ed2k::part_tracker::suppress_met_saves(&met_path);
-    let allowed = vec![download_folder.to_string()];
-    tokio::join!(
-        cleanup_one_partial(&part_path, &allowed, 6, 500),
-        cleanup_one_partial(&met_path, &allowed, 6, 500),
-    );
+    for root in download_roots {
+        let temp_dir = std::path::PathBuf::from(root).join("Temp");
+        let part_path = temp_dir.join(format!("{transfer_id}.part"));
+        let met_path = temp_dir.join(format!("{transfer_id}.part.met"));
+        crate::network::ed2k::part_tracker::suppress_met_saves(&met_path);
+        let allowed = vec![root.clone()];
+        tokio::join!(
+            cleanup_one_partial(&part_path, &allowed, 6, 500),
+            cleanup_one_partial(&met_path, &allowed, 6, 500),
+        );
+    }
 }
 
-fn spawn_deferred_partial_cleanup(download_folder: String, transfer_id: String) {
+fn spawn_deferred_partial_cleanup(download_roots: Vec<String>, transfer_id: String) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        cleanup_partial_files(&download_folder, &transfer_id).await;
+        cleanup_partial_files(&download_roots, &transfer_id).await;
     });
 }
 
 /// Relocate a failed download's `.part` into `Downloads/` so "Remove from List"
 /// keeps the bytes instead of deleting Temp/{uuid}.part. Named `*.part` so it
 /// is not mistaken for a completed file. No-op if the partial is already gone.
-async fn preserve_failed_partial(download_folder: &str, transfer_id: &str, file_name: &str) {
+async fn preserve_failed_partial(
+    folders: &crate::storage::part_folders::DownloadFolders,
+    transfer_id: &str,
+    file_name: &str,
+) {
     if uuid::Uuid::parse_str(transfer_id).is_err() {
         return;
     }
-    let part_path = std::path::PathBuf::from(download_folder)
-        .join("Temp")
-        .join(format!("{transfer_id}.part"));
-    let allowed = vec![download_folder.to_string()];
+    let part_root = {
+        let folders = folders.clone();
+        let id = transfer_id.to_string();
+        match tokio::task::spawn_blocking(move || folders.part_folder_for(&id)).await {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::warn!("preserve_failed_partial: folder lookup failed: {error}");
+                return;
+            }
+        }
+    };
+    let part_path = part_root.join("Temp").join(format!("{transfer_id}.part"));
+    let allowed = vec![part_root.to_string_lossy().into_owned()];
     let pinned = match pin_cleanup_target(&part_path, &allowed) {
         Ok(value) => value,
         Err(error) => {
@@ -667,11 +685,6 @@ async fn preserve_failed_partial(download_folder: &str, transfer_id: &str, file_
     let Some((verified, identity)) = pinned else {
         return;
     };
-    let downloads = std::path::PathBuf::from(download_folder).join("Downloads");
-    if let Err(error) = tokio::fs::create_dir_all(&downloads).await {
-        tracing::warn!("preserve_failed_partial: could not create Downloads: {error}");
-        return;
-    }
     let safe = crate::security::sanitize_filename(file_name);
     let dest_name = if safe
         .rsplit('.')
@@ -682,11 +695,14 @@ async fn preserve_failed_partial(download_folder: &str, transfer_id: &str, file_
     } else {
         format!("{safe}.part")
     };
-    let dest = downloads.join(dest_name);
-    let root = std::path::PathBuf::from(download_folder);
+    let download_root = folders.current.clone();
     match tokio::task::spawn_blocking(move || {
-        crate::network::ed2k::transfer::move_part_to_final_approved(
-            &verified, &dest, &root, &identity,
+        crate::network::ed2k::transfer::move_part_to_downloads(
+            &verified,
+            &part_root,
+            &download_root,
+            &dest_name,
+            &identity,
         )
     })
     .await
@@ -932,20 +948,18 @@ pub async fn start_download(
 
     // D16: reject oversized files up front instead of enqueueing them and
     // failing later at network-start with a confusing "exceeds maximum"
-    // error. `max_download_file_size_gib` is user-configurable; a size of
-    // 0 disables the cap.
+    // error. The ceiling is the one the download worker enforces: Max file
+    // size, which settings keep within 1-593 GiB, so there is always a cap.
     {
         let config = state.config.read().await;
-        let cap_gib = config.settings.max_download_file_size_gib;
-        if cap_gib > 0 {
-            let cap_bytes = (cap_gib as u64).saturating_mul(1024 * 1024 * 1024);
-            if file_size > cap_bytes {
-                let gib = (file_size as f64) / (1024.0 * 1024.0 * 1024.0);
-                return Err(coded("transfers_file_size_exceeds_max", format!(
-                    "File size {:.2} GiB exceeds your configured maximum of {} GiB — raise Max Download Size in Settings > Downloads to enqueue this file.",
-                    gib, cap_gib
-                )));
-            }
+        let cap_bytes = config.settings.ed2k_download_limits().max_download_bytes;
+        if file_size > cap_bytes {
+            let gib = |bytes: u64| (bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+            return Err(coded("transfers_file_size_exceeds_max", format!(
+                "File size {:.2} GiB exceeds your maximum of {:.0} GiB — raise Max file size in Settings › Transfers to download this file.",
+                gib(file_size),
+                gib(cap_bytes)
+            )));
         }
     }
 
@@ -1434,10 +1448,7 @@ pub async fn cancel_transfers_batch(
         }
     }
 
-    let dl_folder = {
-        let config = state.config.read().await;
-        config.settings.download_folder.clone()
-    };
+    let dl_roots = state.config.read().await.settings.download_roots();
     // Both writes go out as one transaction each, before the file cleanup: the
     // rows are what stop a cancelled download resurrecting on the next launch,
     // and per-row writes interleaved with per-row disk deletes held the shared
@@ -1457,8 +1468,8 @@ pub async fn cancel_transfers_batch(
         .await;
     }
     for transfer_id in cancelled_ids {
-        cleanup_partial_files(&dl_folder, &transfer_id).await;
-        spawn_deferred_partial_cleanup(dl_folder.clone(), transfer_id.clone());
+        cleanup_partial_files(&dl_roots, &transfer_id).await;
+        spawn_deferred_partial_cleanup(dl_roots.clone(), transfer_id.clone());
     }
     let promoted: Vec<Transfer> = promoted_by_id.into_values().collect();
     start_promoted_downloads(&state, &promoted).await;
@@ -1559,14 +1570,12 @@ pub async fn stop_transfer(
 /// that a stale in-memory status never misdirects the user.
 fn resolve_transfer_reveal_path(
     transfer: &Transfer,
-    download_folder: &str,
+    folders: &crate::storage::part_folders::DownloadFolders,
 ) -> Result<PathBuf, String> {
     if transfer.direction != TransferDirection::Download {
         return Err(coded("transfers_not_a_download", "Not a download"));
     }
-    let root = PathBuf::from(download_folder);
-    let completed_dir = root.join("Downloads");
-    let temp_dir = root.join("Temp");
+    let completed_dir = folders.current.join("Downloads");
     let safe_name = crate::security::sanitize_filename(&transfer.file_name);
     // Prefer the exact destination recorded at completion (handles the
     // dedup-suffix case); otherwise reconstruct from the file name.
@@ -1574,7 +1583,7 @@ fn resolve_transfer_reveal_path(
         Some(p) if !p.is_empty() => PathBuf::from(p),
         _ => completed_dir.join(&safe_name),
     };
-    let part_path = temp_dir.join(format!("{}.part", transfer.id));
+    let part_path = folders.part_path_for(&transfer.id);
 
     let candidate = if final_path.is_file() {
         final_path
@@ -1584,7 +1593,7 @@ fn resolve_transfer_reveal_path(
         return Err(coded("transfers_file_not_found", "File not found on disk"));
     };
 
-    crate::security::filesystem::verify_existing_path(&candidate, &[download_folder.to_string()])
+    crate::security::filesystem::verify_existing_path(&candidate, &folders.roots())
         .map_err(|e| {
             coded_ctx(
                 "transfers_invalid_path",
@@ -1599,11 +1608,11 @@ pub async fn open_transfer_file_location(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
-    let (transfer, dl_folder) = {
+    let (transfer, dl_folders) = {
         let (mgr, cfg) = tokio::join!(state.transfer_manager.read(), state.config.read(),);
         (
             mgr.get_transfer(&transfer_id).cloned(),
-            cfg.settings.download_folder.clone(),
+            cfg.settings.download_folders(),
         )
     };
     let transfer =
@@ -1613,7 +1622,7 @@ pub async fn open_transfer_file_location(
     // so a slow path (network/cloud/AV-locked) can't stall the async runtime and
     // freeze unrelated IPC commands.
     tokio::task::spawn_blocking(move || {
-        let path = resolve_transfer_reveal_path(&transfer, &dl_folder)?;
+        let path = resolve_transfer_reveal_path(&transfer, &dl_folders)?;
         crate::security::filesystem::reveal_in_file_manager(&path)
             .map_err(|e| coded_ctx("transfers_open_explorer_failed", "Failed to reveal file", e))
     })
@@ -1825,7 +1834,7 @@ pub async fn cancel_transfer(
     }
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    let (send_result, dl_folder) = tokio::join!(
+    let (send_result, dl_roots) = tokio::join!(
         bounded_send(
             &state.network_tx,
             NetworkCommand::CancelDownload {
@@ -1833,10 +1842,7 @@ pub async fn cancel_transfer(
                 cleanup_ack: Some(ack_tx),
             },
         ),
-        async {
-            let config = state.config.read().await;
-            config.settings.download_folder.clone()
-        },
+        async { state.config.read().await.settings.download_roots() },
     );
     // Wait for the network task to confirm it released the file before we
     // delete the partials. On timeout / closed channel we still proceed
@@ -1862,8 +1868,8 @@ pub async fn cancel_transfer(
             ),
         }
     }
-    cleanup_partial_files(&dl_folder, &transfer_id).await;
-    spawn_deferred_partial_cleanup(dl_folder, transfer_id.clone());
+    cleanup_partial_files(&dl_roots, &transfer_id).await;
+    spawn_deferred_partial_cleanup(dl_roots, transfer_id.clone());
 
     {
         let db = state.db.clone();
@@ -1902,7 +1908,7 @@ pub async fn remove_transfer(
     };
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    let (send_result, dl_folder) = tokio::join!(
+    let (send_result, dl_folders) = tokio::join!(
         bounded_send(
             &state.network_tx,
             NetworkCommand::CancelDownload {
@@ -1910,10 +1916,7 @@ pub async fn remove_transfer(
                 cleanup_ack: Some(ack_tx),
             },
         ),
-        async {
-            let config = state.config.read().await;
-            config.settings.download_folder.clone()
-        },
+        async { state.config.read().await.settings.download_folders() },
     );
     // Wait for the network task to confirm it released the file before we
     // delete the partials (best-effort on timeout/closed channel, but log the
@@ -1943,10 +1946,11 @@ pub async fn remove_transfer(
     );
     if keep_failed_partial {
         if let Some((_, file_name, _)) = snapshot {
-            preserve_failed_partial(&dl_folder, &transfer_id, &file_name).await;
+            preserve_failed_partial(&dl_folders, &transfer_id, &file_name).await;
         }
     }
-    tokio::join!(cleanup_partial_files(&dl_folder, &transfer_id), async {
+    let dl_roots = dl_folders.roots();
+    tokio::join!(cleanup_partial_files(&dl_roots, &transfer_id), async {
         db_blocking(move || {
             if let Err(e) = db.remove_transfer(&tid) {
                 tracing::warn!("Failed to remove transfer {tid} from database: {e}");
@@ -1954,7 +1958,7 @@ pub async fn remove_transfer(
         })
         .await;
     },);
-    spawn_deferred_partial_cleanup(dl_folder, transfer_id.clone());
+    spawn_deferred_partial_cleanup(dl_roots, transfer_id.clone());
     start_promoted_downloads(&state, &promoted).await;
     Ok(())
 }
@@ -2448,10 +2452,7 @@ pub async fn clear_completed(state: tauri::State<'_, AppState>) -> Result<u32, S
     let count = u32::try_from(ids.len()).unwrap_or(u32::MAX);
     drop(manager);
 
-    let dl_folder = {
-        let config = state.config.read().await;
-        config.settings.download_folder.clone()
-    };
+    let dl_roots = state.config.read().await.settings.download_roots();
 
     // One transaction for every row, then the disk cleanup. The per-row loop
     // this replaces had no batch-size cap of its own, so clearing a long
@@ -2468,7 +2469,7 @@ pub async fn clear_completed(state: tauri::State<'_, AppState>) -> Result<u32, S
         .await;
     }
     for id in &ids {
-        cleanup_partial_files(&dl_folder, id).await;
+        cleanup_partial_files(&dl_roots, id).await;
     }
     Ok(count)
 }
@@ -2492,14 +2493,14 @@ pub async fn recover_archive(
             )
         })?;
 
-    let (transfer_info, dl_folder, control) = {
+    let (transfer_info, dl_folders, control) = {
         let (mgr, cfg) = tokio::join!(state.transfer_manager.read(), state.config.read(),);
         let t = mgr
             .get_transfer(&transfer_id)
             .map(|t| (t.file_name.clone(), t.total_size, t.id.clone()));
         (
             t,
-            cfg.settings.download_folder.clone(),
+            cfg.settings.download_folders(),
             mgr.get_control(&transfer_id),
         )
     };
@@ -2513,6 +2514,14 @@ pub async fn recover_archive(
         ));
     }
 
+    let dl_folder = {
+        let id = transfer_id_clone.clone();
+        tokio::task::spawn_blocking(move || dl_folders.part_folder_for(&id))
+            .await
+            .map_err(|e| coded_ctx("transfers_recovery_unavailable", "Archive recovery unavailable", e))?
+            .to_string_lossy()
+            .into_owned()
+    };
     let part_path = std::path::PathBuf::from(&dl_folder)
         .join("Temp")
         .join(format!("{transfer_id_clone}.part"));
@@ -2741,10 +2750,100 @@ mod ipc_lifecycle_tests {
         std::fs::write(&part, b"partial-bytes").unwrap();
         std::fs::write(&met, b"met").unwrap();
 
-        super::cleanup_partial_files(&root.to_string_lossy(), &transfer_id).await;
+        super::cleanup_partial_files(&[root.to_string_lossy().into_owned()], &transfer_id).await;
 
         assert!(!part.exists(), ".part must be deleted on cancel cleanup");
         assert!(!met.exists(), ".part.met must be deleted on cancel cleanup");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// An earlier download folder still holding a download, and the current
+    /// one, both approved.
+    fn approved_old_and_new_folders(
+        name: &str,
+    ) -> (crate::storage::part_folders::DownloadFolders, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "ember-moved-{}-{}-{name}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let old = base.join("old");
+        let new = base.join("new");
+        let data = base.join("data");
+        for dir in [old.join("Temp"), new.join("Temp"), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let folders = crate::storage::part_folders::DownloadFolders::new(
+            &new.to_string_lossy(),
+            &[old.to_string_lossy().into_owned()],
+        );
+        crate::security::filesystem::initialize_approved_roots(&data, &folders.roots()).unwrap();
+        (folders, base)
+    }
+
+    #[tokio::test]
+    async fn cancel_cleanup_reaches_a_part_left_in_an_earlier_download_folder() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (folders, base) = approved_old_and_new_folders("cancel");
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let part = folders.previous[0]
+            .join("Temp")
+            .join(format!("{transfer_id}.part"));
+        std::fs::write(&part, b"partial-bytes").unwrap();
+        std::fs::write(part.with_extension("part.met"), b"met").unwrap();
+
+        super::cleanup_partial_files(&folders.roots(), &transfer_id).await;
+
+        assert!(!part.exists());
+        assert!(!part.with_extension("part.met").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn a_failed_partial_left_in_an_earlier_folder_is_kept_in_the_current_downloads() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (folders, base) = approved_old_and_new_folders("preserve");
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let part = folders.previous[0]
+            .join("Temp")
+            .join(format!("{transfer_id}.part"));
+        std::fs::write(&part, b"partial-bytes").unwrap();
+
+        super::preserve_failed_partial(&folders, &transfer_id, "movie.mkv").await;
+
+        let kept = folders.current.join("Downloads").join("movie.mkv.part");
+        assert_eq!(std::fs::read(&kept).unwrap(), b"partial-bytes");
+        assert!(!part.exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn reveal_finds_a_download_still_in_an_earlier_folder() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (folders, base) = approved_old_and_new_folders("reveal");
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let part = folders.previous[0]
+            .join("Temp")
+            .join(format!("{transfer_id}.part"));
+        std::fs::write(&part, b"partial-bytes").unwrap();
+        let transfer: Transfer = serde_json::from_value(serde_json::json!({
+            "id": transfer_id,
+            "file_name": "movie.mkv",
+            "file_hash": hex::encode([0x5A; 16]),
+            "peer_id": "",
+            "peer_name": "",
+            "direction": "download",
+            "status": "paused",
+            "progress": 0.0,
+            "speed": 0,
+            "total_size": 13,
+            "transferred": 0,
+            "started_at": 0,
+        }))
+        .unwrap();
+
+        let revealed = super::resolve_transfer_reveal_path(&transfer, &folders).unwrap();
+        assert_eq!(revealed, part.canonicalize().unwrap());
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -2756,7 +2855,7 @@ mod ipc_lifecycle_tests {
         let met = root.join("Temp").join(format!("{transfer_id}.part.met"));
         std::fs::write(&met, b"met").unwrap();
 
-        super::cleanup_partial_files(&root.to_string_lossy(), &transfer_id).await;
+        super::cleanup_partial_files(&[root.to_string_lossy().into_owned()], &transfer_id).await;
 
         assert!(!met.exists(), ".part.met must still be deleted if .part is missing");
         let _ = std::fs::remove_dir_all(base);
