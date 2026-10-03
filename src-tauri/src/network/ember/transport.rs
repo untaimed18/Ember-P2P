@@ -755,11 +755,11 @@ struct DialLogInner {
     /// refreshing an existing dial updates the map in place — so the queue
     /// holds each resident address at most once and cannot outgrow it.
     order: VecDeque<IpAddr>,
-    /// Until when every address counts as dialled, because the cap pushed out
-    /// an entry still inside [`DIAL_MEMORY`]. The QUIC half also logs replies
-    /// to unvalidated sources, so spoofed Initials can fill the log; forgetting
-    /// a real dial would let that peer's ping pass as unsolicited, and the
-    /// safe answer for an address we can no longer vouch for is "dialled".
+    /// Until when a dial the cap pushed out would still have been inside
+    /// [`DIAL_MEMORY`]. The QUIC half also logs replies to unvalidated
+    /// sources, so spoofed Initials can fill the log. Read only by
+    /// [`EmberTransport::may_have_dialled`]: every other caller treats
+    /// "dialled" as permission, which a flood must not be able to grant.
     saturated_until: Option<Instant>,
 }
 
@@ -803,11 +803,20 @@ impl DialLog {
     /// v4 entry it belongs to, rather than silently missing.
     pub fn recent(&self, ip: IpAddr) -> bool {
         let ip = ip.to_canonical();
-        let inner = self.0.lock();
-        inner
+        self.0
+            .lock()
+            .at
+            .get(&ip)
+            .is_some_and(|at| at.elapsed() < DIAL_MEMORY)
+    }
+
+    /// Whether the cap has pushed out a dial still inside [`DIAL_MEMORY`], so
+    /// an address [`Self::recent`] says nothing about may have been dialled.
+    fn forgot_a_live_dial(&self) -> bool {
+        self.0
+            .lock()
             .saturated_until
             .is_some_and(|until| Instant::now() < until)
-            || inner.at.get(&ip).is_some_and(|at| at.elapsed() < DIAL_MEMORY)
     }
 
     fn prune(&self, now: Instant) {
@@ -1252,6 +1261,14 @@ impl EmberTransport {
     /// mapping we opened could still be carrying its reply.
     pub fn recently_dialled(&self, ip: IpAddr) -> bool {
         self.dialled.recent(ip)
+    }
+
+    /// [`Self::recently_dialled`], or unknown because the log had to forget a
+    /// dial that was still live. For the one question where a wrong "no" is
+    /// the dangerous answer: whether a ping could be a reply through our own
+    /// mapping rather than proof our port is open.
+    pub fn may_have_dialled(&self, ip: IpAddr) -> bool {
+        self.dialled.forgot_a_live_dial() || self.dialled.recent(ip)
     }
 
     /// Check if we have an established session with a peer.
@@ -3322,13 +3339,18 @@ mod tests {
             log.note(IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000 + n)));
         }
         assert!(!log.0.lock().at.contains_key(&real), "the cap pushed the real dial out");
-        assert!(log.recent(real), "a forgotten live dial still counts as dialled");
-        assert!(log.recent(stranger), "and so does every other address until it would have lapsed");
+        let transport = EmberTransport::with_dial_log([1; 32], [2; 32], log.clone());
+        assert!(transport.may_have_dialled(real), "a forgotten live dial may still have been one");
+        assert!(transport.may_have_dialled(stranger), "and so may any address until it would have lapsed");
+        assert!(
+            !transport.recently_dialled(stranger),
+            "the filter and rate exemptions keyed on a real dial are not granted by a flood"
+        );
 
         log.0.lock().saturated_until = Some(Instant::now() - Duration::from_secs(1));
         log.prune(Instant::now());
         assert!(log.0.lock().saturated_until.is_none());
-        assert!(!log.recent(stranger));
+        assert!(!transport.may_have_dialled(stranger));
     }
 
     fn make_keypair() -> ([u8; 32], [u8; 32]) {

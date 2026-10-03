@@ -4828,25 +4828,50 @@ pub async fn share_dropped_paths(app: tauri::AppHandle, paths: Vec<std::path::Pa
 }
 
 /// What handing over an already-shared folder again means, as in the folder
-/// picker: the whole folder. One shared in part, or with a subfolder
-/// unshared, loses those allowlists and has every file under it offered; one
-/// shared whole is left as it is.
+/// picker: the whole folder. One shared in part loses its allowlists and has
+/// every file under it offered. One shared whole with a subfolder unshared
+/// gets back only those subfolders: a drop asks nothing, and offering the
+/// whole folder again would also republish files the user unshared one at a
+/// time outside them. One shared whole and nothing more is left as it is.
 async fn share_partial_folder_whole(
     app: &tauri::AppHandle,
     state: &AppState,
     folder: &str,
 ) -> Result<(), String> {
-    let partial = limited_at_or_under(
-        &state.config.read().await.settings.pending_folder_allowlists,
-        folder,
-    );
-    if !partial {
+    let listed: Vec<String> = state
+        .config
+        .read()
+        .await
+        .settings
+        .pending_folder_allowlists
+        .keys()
+        .filter(|listed| crate::security::path_within_dir(listed, folder))
+        .cloned()
+        .collect();
+    if listed.is_empty() {
         return Ok(());
     }
+    let targets = rewhole_targets(folder, listed);
     let before = FolderListsBefore::take(state).await;
     clear_allowlists_under(state, folder).await?;
-    share_all_in_folder(app.clone(), state, folder, &before).await?;
+    for target in &targets {
+        share_all_in_folder(app.clone(), state, target, &before).await?;
+    }
     Ok(())
+}
+
+/// The folders [`share_partial_folder_whole`] offers again, given the listed
+/// folders at or under `folder`.
+fn rewhole_targets(folder: &str, listed: Vec<String>) -> Vec<String> {
+    let folder_key = crate::search::index::normalize_path_key(folder);
+    if listed
+        .iter()
+        .any(|listed| crate::search::index::normalize_path_key(listed) == folder_key)
+    {
+        vec![folder.to_string()]
+    } else {
+        outermost_folders(listed)
+    }
 }
 
 /// Park folders a drop cannot honour outright and ask the user about them.
@@ -9242,6 +9267,25 @@ mod tests {
         assert!(offers.offers(&later_in_sub));
         assert!(crate::sharing::indexer::DiscoveryScope::for_root(&folder, &lists).is_none());
         assert!(!offers.offers(&key("D:/films/other.mkv")));
+    }
+
+    /// Re-dropping a folder shared whole must not offer the whole folder again
+    /// when only a subfolder was unshared: that would republish files the user
+    /// unshared one at a time elsewhere in it, and a drop asks nothing.
+    #[test]
+    fn re_dropping_a_whole_share_offers_back_only_its_unshared_subfolders() {
+        let key = crate::search::index::normalize_path_key;
+        let folder = key("C:/music");
+        let live = key("C:/music/live");
+        let deeper = key("C:/music/live/2019");
+        let demos = key("C:/music/demos");
+
+        let mut targets = rewhole_targets(&folder, vec![live.clone(), deeper, demos.clone()]);
+        targets.sort();
+        assert_eq!(targets, vec![demos, live]);
+
+        let partial = rewhole_targets(&folder, vec![folder.clone(), key("C:/music/live")]);
+        assert_eq!(partial, vec![folder], "a folder shared in part is shared whole");
     }
 
     #[test]

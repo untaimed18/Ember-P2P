@@ -562,6 +562,9 @@ pub fn run() {
             // re-launched the app to bring it to the front). An update's
             // relaunch arrives here when another launch beat it, and the links
             // it carries are the replaced process's.
+            // Only the Windows plugin joins and re-splits argv on `|`; elsewhere
+            // argv arrives whole, and rejoining would drop what follows a link.
+            #[cfg(windows)]
             let args = commands::deeplink::rejoin_forwarded_args(args);
             let payloads = commands::deeplink::extract_deep_link_payloads(&args);
             if payloads.is_empty() {

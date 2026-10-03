@@ -2311,7 +2311,7 @@ pub(super) async fn handle_ember_dht_message(
     // the relay path from exactly the peer that needed it.
     let unsolicited = inbound.ping_received
         && was_stranger
-        && !state.ember_transport.recently_dialled(from.ip())
+        && !state.ember_transport.may_have_dialled(from.ip())
         && !state.flood_protection.has_recent_ip(from.ip())
         && !crate::security::is_private_ip(from.ip());
     if unsolicited {

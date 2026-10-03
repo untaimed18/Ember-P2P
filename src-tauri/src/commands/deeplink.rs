@@ -357,6 +357,7 @@ pub fn extract_deep_link_payloads(args: &[String]) -> Vec<String> {
 /// too — a browser-encoded `ed2k://%7Cfile%7C…%7C/` can be followed by raw
 /// `|` pieces of the same URL. A launch the OS makes for a clicked link or a
 /// double-clicked collection carries one payload, so nothing real follows one.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn rejoin_forwarded_args(args: Vec<String>) -> Vec<String> {
     use crate::network::ed2k::hash::looks_like_ed2k_uri;
     let mut rejoined: Vec<String> = Vec::with_capacity(args.len());
@@ -386,6 +387,7 @@ pub fn rejoin_forwarded_args(args: Vec<String>) -> Vec<String> {
 }
 
 /// Every complete `ed2k:` link ends in `|/`, however its pipes arrived.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn ed2k_link_unfinished(piece: &str) -> bool {
     use crate::network::ed2k::hash::{looks_like_ed2k_uri, normalize_ed2k_uri};
     looks_like_ed2k_uri(piece) && !normalize_ed2k_uri(piece).ends_with("|/")
