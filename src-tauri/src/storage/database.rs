@@ -27,7 +27,7 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// database, or restoring a backup taken from one, would invite subtle
 /// corruption (missing columns, renamed tables, changed semantics), so both
 /// paths refuse instead. Bump this when introducing a new migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 63;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 62;
 
 /// Longest room name kept from a moderation snapshot. Keep in step with
 /// `MAX_CHANNEL_NAME_CHARS` in `commands/channels.rs`, the cap an owner names
@@ -3013,22 +3013,6 @@ impl Database {
             tx.commit()?;
         }
 
-        if version < 63 {
-            // The download folder a download's `.part` is in, written with its
-            // progress, so a restored download waits for a drive that is not
-            // connected only when that drive is the one holding its progress.
-            // Empty for rows from before, which wait for none.
-            let tx = conn.unchecked_transaction()?;
-            Self::add_column_if_missing(
-                &tx,
-                "transfers",
-                "part_folder",
-                "TEXT NOT NULL DEFAULT ''",
-            )?;
-            set_version(&tx, 63)?;
-            tx.commit()?;
-        }
-
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -4203,11 +4187,13 @@ impl Database {
         &self,
     ) -> anyhow::Result<std::collections::HashMap<String, String>> {
         let conn = self.conn.lock();
+        Self::ensure_transfer_part_folders_locked(&conn)?;
         let mut stmt = conn.prepare(
-            "SELECT id, part_folder FROM transfers
-              WHERE direction = 'download'
-                AND status NOT IN ('completed', 'noneneeded')
-                AND transferred > 0",
+            "SELECT t.id, COALESCE(p.folder, '') FROM transfers t
+               LEFT JOIN transfer_part_folders p ON p.transfer_id = t.id
+              WHERE t.direction = 'download'
+                AND t.status NOT IN ('completed', 'noneneeded')
+                AND t.transferred > 0",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -4218,6 +4204,11 @@ impl Database {
     pub fn remove_transfer(&self, transfer_id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM transfers WHERE id = ?1", params![transfer_id])?;
+        Self::ensure_transfer_part_folders_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM transfer_part_folders WHERE transfer_id = ?1",
+            params![transfer_id],
+        )?;
         Ok(())
     }
 
@@ -4234,11 +4225,14 @@ impl Database {
             return Ok(());
         }
         let mut conn = self.conn.lock();
+        Self::ensure_transfer_part_folders_locked(&conn)?;
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare("DELETE FROM transfers WHERE id = ?1")?;
+            let mut folders = tx.prepare("DELETE FROM transfer_part_folders WHERE transfer_id = ?1")?;
             for id in transfer_ids {
                 stmt.execute(params![id])?;
+                folders.execute(params![id])?;
             }
         }
         tx.commit()?;
@@ -4340,30 +4334,43 @@ impl Database {
         part_folder: Option<&str>,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        conn.execute(
+        let updated = conn.execute(
             "UPDATE transfers
-             SET transferred = ?1, progress = ?2, speed = ?3,
-                 part_folder = COALESCE(?5, part_folder)
+             SET transferred = ?1, progress = ?2, speed = ?3
              WHERE id = ?4 AND status NOT IN ('completed', 'cancelled')",
             params![
                 i64::try_from(transferred).unwrap_or(i64::MAX),
                 progress,
                 i64::try_from(speed).unwrap_or(i64::MAX),
-                transfer_id,
-                part_folder
+                transfer_id
             ],
         )?;
+        if let Some(folder) = part_folder.filter(|_| updated > 0) {
+            Self::ensure_transfer_part_folders_locked(&conn)?;
+            conn.execute(
+                "INSERT INTO transfer_part_folders (transfer_id, folder) VALUES (?1, ?2)
+                 ON CONFLICT(transfer_id) DO UPDATE SET folder = excluded.folder
+                 WHERE folder != excluded.folder",
+                params![transfer_id, folder],
+            )?;
+        }
         Ok(())
     }
 
     /// The download folder each download's `.part` was last recorded in.
+    /// Also forgets the folders of downloads that are gone.
     pub fn download_part_folders(
         &self,
     ) -> anyhow::Result<std::collections::HashMap<String, String>> {
         let conn = self.conn.lock();
+        Self::ensure_transfer_part_folders_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM transfer_part_folders
+              WHERE transfer_id NOT IN (SELECT id FROM transfers WHERE direction = 'download')",
+            [],
+        )?;
         let mut stmt = conn.prepare(
-            "SELECT id, part_folder FROM transfers
-              WHERE direction = 'download' AND part_folder != ''",
+            "SELECT transfer_id, folder FROM transfer_part_folders WHERE folder != ''",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -8221,6 +8228,20 @@ impl Database {
     pub fn drop_channel_handoff_commit(&self, channel_id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         Self::delete_channel_handoff_commit_locked(&conn, channel_id)
+    }
+
+    /// The download folder each download's `.part` was last recorded in, kept
+    /// beside `transfers` rather than as a column of it for the same reason as
+    /// [`Self::ensure_sealed_offer_readers_locked`]: a numbered migration would
+    /// stop 1.7.0 from opening the database after a downgrade.
+    fn ensure_transfer_part_folders_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS transfer_part_folders (
+                transfer_id TEXT PRIMARY KEY,
+                folder TEXT NOT NULL
+            );",
+        )?;
+        Ok(())
     }
 
     /// Created on first use rather than by a numbered migration, like
@@ -12556,6 +12577,54 @@ mod tests {
         restricted.friends_only = false;
         db.save_transfer(&restricted).unwrap();
         assert!(db.get_incomplete_downloads().unwrap()[0].friends_only);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A download's part folder lives in a table of its own, not a column of
+    /// `transfers`, so 1.7.1 does not raise the schema version 1.7.0 checks.
+    #[test]
+    fn part_folders_are_recorded_without_a_schema_bump() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-part-folder-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).unwrap();
+        let version: i64 = db
+            .conn
+            .lock()
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 62, "1.7.0 refuses a database newer than 62");
+        for (id, status) in [("t-active", "downloading"), ("t-done", "completed")] {
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO transfers (
+                        id, file_name, file_hash, peer_id, peer_name, direction, status,
+                        progress, speed, total_size, transferred, started_at, priority,
+                        category, expected_aich, ember_file_hash
+                     ) VALUES (?1, 'file.bin', ?2, '', '', 'download', ?3, 0, 0, 4, 0, 1, 'normal', '', NULL, NULL)",
+                    params![id, "33".repeat(16), status],
+                )
+                .unwrap();
+        }
+
+        db.update_transfer_progress_if_active("t-active", 2, 50.0, 0, Some("D:/old")).unwrap();
+        db.update_transfer_progress_if_active("t-done", 2, 50.0, 0, Some("D:/old")).unwrap();
+        db.update_transfer_progress_if_active("t-active", 3, 75.0, 0, None).unwrap();
+        let folders = db.download_part_folders().unwrap();
+        assert_eq!(folders.get("t-active").map(String::as_str), Some("D:/old"));
+        assert!(!folders.contains_key("t-done"), "a finished row records no folder");
+        let progress = db.incomplete_downloads_with_progress().unwrap();
+        assert_eq!(progress.get("t-active").map(String::as_str), Some("D:/old"));
+
+        db.remove_transfer("t-active").unwrap();
+        assert!(db.download_part_folders().unwrap().is_empty());
 
         drop(db);
         let _ = std::fs::remove_file(&path);
