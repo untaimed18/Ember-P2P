@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -15,6 +15,17 @@ use tokio::sync::Notify;
 pub(crate) const SPEED_SMOOTHING_NEW: u64 = 30;
 pub(crate) const SPEED_SMOOTHING_DENOMINATOR: u64 = 100;
 
+/// Percent of each upload refill held for priority uploads while one is
+/// running. Not all of it: the eD2K slots still need enough to keep each peer
+/// inside the delivery deadline it drops a slot over.
+const PRIORITY_UPLOAD_PERCENT: u64 = 80;
+
+/// The most the priority reserve holds, as a fraction of a second of its
+/// share. Past this a refill goes to the shared bucket instead, so a priority
+/// stream held back by something other than the cap — the friend's downlink,
+/// a congested path — leaves the uplink to the slots rather than idle.
+const PRIORITY_RESERVE_DIVISOR: u64 = 4;
+
 /// eMule-style bandwidth limiter with token bucket and partial acquisition.
 ///
 /// Key differences from a naive token bucket:
@@ -28,6 +39,12 @@ pub struct BandwidthLimiter {
     configured_upload_rate: AtomicU64,
     upload_tokens: AtomicU64,
     download_tokens: AtomicU64,
+    /// Upload allowance only a [`PriorityUpload`] may spend. Filled from the
+    /// upload refill while one is registered, and handed back to
+    /// `upload_tokens` on the first refill after the last one ends.
+    priority_tokens: AtomicU64,
+    /// [`PriorityUpload`] handles alive right now.
+    priority_uploads: AtomicUsize,
     /// Sub-token remainders carried between refill ticks so that very low
     /// rates (where `max_rate * fraction < divisor`) are honored exactly
     /// instead of being rounded up to a 1-token-per-tick floor.
@@ -60,6 +77,8 @@ impl BandwidthLimiter {
             configured_upload_rate: AtomicU64::new(max_upload),
             upload_tokens: AtomicU64::new(max_upload),
             download_tokens: AtomicU64::new(max_download),
+            priority_tokens: AtomicU64::new(0),
+            priority_uploads: AtomicUsize::new(0),
             upload_refill_rem: AtomicU64::new(0),
             download_refill_rem: AtomicU64::new(0),
             total_uploaded: AtomicU64::new(0),
@@ -84,7 +103,40 @@ impl BandwidthLimiter {
             return true;
         }
         if !self
-            .drain_tokens(&self.upload_tokens, bytes, &self.max_upload_rate)
+            .drain_tokens(&[&self.upload_tokens], bytes, &self.max_upload_rate)
+            .await
+        {
+            return false;
+        }
+        self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
+        true
+    }
+
+    /// Register an upload that goes ahead of the eD2K slots — a friend reading
+    /// a file we offered them in chat. While the handle lives, most of every
+    /// refill is held for it; see [`PRIORITY_UPLOAD_PERCENT`].
+    ///
+    /// eMule gives a friend the same standing with its friend slot, which the
+    /// throttler feeds before any other. The slots here pace themselves to
+    /// shares that add up to the whole cap, so anything that is not one of them
+    /// only ever got what they left, and a chat file stalled every time the
+    /// eD2K peers asked for their next blocks.
+    pub fn priority_upload(&self) -> PriorityUpload<'_> {
+        self.priority_uploads.fetch_add(1, Ordering::AcqRel);
+        PriorityUpload { limiter: self }
+    }
+
+    async fn acquire_priority_upload(&self, bytes: u64) -> bool {
+        if self.max_upload_rate.load(Ordering::Relaxed) == 0 {
+            self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
+            return true;
+        }
+        if !self
+            .drain_tokens(
+                &[&self.priority_tokens, &self.upload_tokens],
+                bytes,
+                &self.max_upload_rate,
+            )
             .await
         {
             return false;
@@ -143,7 +195,7 @@ impl BandwidthLimiter {
             return true;
         }
         if !self
-            .drain_tokens(&self.download_tokens, bytes, &self.max_download_rate)
+            .drain_tokens(&[&self.download_tokens], bytes, &self.max_download_rate)
             .await
         {
             return false;
@@ -175,7 +227,10 @@ impl BandwidthLimiter {
     ///
     /// Returns `false` if the refill task is gone so the caller can abort
     /// instead of treating the remainder as unlimited.
-    async fn drain_tokens(&self, tokens: &AtomicU64, mut remaining: u64, max_rate: &AtomicU64) -> bool {
+    ///
+    /// `pools` are spent in order: a priority upload empties its reserve
+    /// before it competes for the shared bucket.
+    async fn drain_tokens(&self, pools: &[&AtomicU64], mut remaining: u64, max_rate: &AtomicU64) -> bool {
         let start = std::time::Instant::now();
         let mut warned_slow = false;
         while remaining > 0 {
@@ -184,8 +239,15 @@ impl BandwidthLimiter {
             if max_rate.load(Ordering::Relaxed) == 0 {
                 return true;
             }
-            let current = tokens.load(Ordering::Acquire);
-            if current == 0 {
+            let mut took = 0;
+            for pool in pools {
+                took += take_tokens(pool, remaining - took);
+                if took == remaining {
+                    break;
+                }
+            }
+            remaining -= took;
+            if took == 0 {
                 if !self.refill_alive.load(Ordering::Acquire) {
                     return false;
                 }
@@ -205,21 +267,6 @@ impl BandwidthLimiter {
                     tracing::warn!(
                         "drain_tokens: waited >60s for bandwidth tokens (remaining={remaining}); check rate limit / refill task"
                     );
-                }
-                continue;
-            }
-            let take = remaining.min(current);
-            match tokens.compare_exchange_weak(
-                current,
-                current - take,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    remaining -= take;
-                }
-                Err(_) => {
-                    continue;
                 }
             }
         }
@@ -246,6 +293,15 @@ impl BandwidthLimiter {
             let add = numer / divisor;
             self.upload_refill_rem
                 .store(numer % divisor, Ordering::Relaxed);
+            let add = if self.priority_uploads.load(Ordering::Acquire) > 0 {
+                let held = self.priority_tokens.load(Ordering::Acquire);
+                let room = priority_reserve_cap(max_up).saturating_sub(held);
+                let reserved = (add.saturating_mul(PRIORITY_UPLOAD_PERCENT) / 100).min(room);
+                self.priority_tokens.fetch_add(reserved, Ordering::AcqRel);
+                add - reserved
+            } else {
+                add.saturating_add(self.priority_tokens.swap(0, Ordering::AcqRel))
+            };
             let cap = max_up.saturating_mul(2);
             loop {
                 let current = self.upload_tokens.load(Ordering::Relaxed);
@@ -301,6 +357,8 @@ impl BandwidthLimiter {
     pub fn set_upload_limit(&self, upload: u64) {
         self.max_upload_rate.store(upload, Ordering::Relaxed);
         if upload > 0 {
+            self.priority_tokens
+                .fetch_min(priority_reserve_cap(upload), Ordering::AcqRel);
             let cap = upload.saturating_mul(2);
             loop {
                 let current = self.upload_tokens.load(Ordering::Relaxed);
@@ -360,6 +418,8 @@ impl BandwidthLimiter {
         // saved limit until those tokens drain. `0` means "unlimited" on
         // the rate side; we leave the token pool alone in that case.
         if upload > 0 {
+            self.priority_tokens
+                .fetch_min(priority_reserve_cap(upload), Ordering::AcqRel);
             let cap = upload.saturating_mul(2);
             loop {
                 let current = self.upload_tokens.load(Ordering::Relaxed);
@@ -579,6 +639,46 @@ impl BandwidthLimiter {
     #[cfg(test)]
     pub fn stop_refill_for_test(&self) {
         self.mark_refill_stopped();
+    }
+}
+
+/// Take up to `max` from `pool` without waiting, returning how much was taken.
+fn take_tokens(pool: &AtomicU64, max: u64) -> u64 {
+    loop {
+        let current = pool.load(Ordering::Acquire);
+        let take = max.min(current);
+        if take == 0 {
+            return 0;
+        }
+        if pool
+            .compare_exchange_weak(current, current - take, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return take;
+        }
+    }
+}
+
+fn priority_reserve_cap(max_upload: u64) -> u64 {
+    (max_upload.saturating_mul(PRIORITY_UPLOAD_PERCENT) / 100 / PRIORITY_RESERVE_DIVISOR).max(1)
+}
+
+/// A registered priority upload; see [`BandwidthLimiter::priority_upload`].
+/// The reserve is held for as long as this lives.
+pub struct PriorityUpload<'a> {
+    limiter: &'a BandwidthLimiter,
+}
+
+impl PriorityUpload<'_> {
+    /// [`BandwidthLimiter::acquire_upload`], spending the reserve first.
+    pub async fn acquire(&self, bytes: u64) -> bool {
+        self.limiter.acquire_priority_upload(bytes).await
+    }
+}
+
+impl Drop for PriorityUpload<'_> {
+    fn drop(&mut self) {
+        self.limiter.priority_uploads.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -828,6 +928,71 @@ mod tests {
         )
         .await
         .expect("a dead refill task must not park a paced caller forever");
+    }
+
+    /// The eD2K slots pace to shares that sum to the whole cap, so a friend's
+    /// chat file only ever got what they left and stalled whenever the eD2K
+    /// peers asked for blocks. A refill now holds most of itself for it.
+    #[tokio::test]
+    async fn a_priority_upload_is_refilled_ahead_of_the_shared_bucket() {
+        let bw = BandwidthLimiter::new(10_000, 0);
+        assert_eq!(bw.try_take_upload(10_000), 10_000);
+        let priority = bw.priority_upload();
+
+        bw.refill_tokens_incremental(1, 10);
+        assert_eq!(
+            bw.available_upload_tokens(),
+            200,
+            "the slots keep a fifth of each refill"
+        );
+
+        tokio::time::timeout(Duration::from_millis(300), priority.acquire(1_000))
+            .await
+            .expect("the reserve and the shared remainder cover the request");
+        assert_eq!(bw.available_upload_tokens(), 0);
+        assert_eq!(bw.total_uploaded(), 11_000);
+    }
+
+    /// A priority stream held back by the friend's downlink rather than the
+    /// cap must not idle the uplink the slots could be using.
+    #[tokio::test]
+    async fn an_unspent_reserve_spills_to_the_slots() {
+        let bw = BandwidthLimiter::new(10_000, 0);
+        assert_eq!(bw.try_take_upload(10_000), 10_000);
+        let priority = bw.priority_upload();
+
+        for _ in 0..10 {
+            bw.refill_tokens_incremental(1, 10);
+        }
+        assert_eq!(
+            bw.available_upload_tokens(),
+            8_000,
+            "past the reserve's quarter-second cap a refill goes to the shared bucket"
+        );
+        assert_eq!(bw.try_take_upload(10_000), 8_000);
+        let raided =
+            tokio::time::timeout(Duration::from_millis(100), bw.acquire_upload(1)).await;
+        assert!(raided.is_err(), "an ordinary upload must not spend the reserve");
+
+        drop(priority);
+        bw.refill_tokens_incremental(1, 10);
+        assert_eq!(
+            bw.available_upload_tokens(),
+            3_000,
+            "the reserve is handed back once no priority upload is left"
+        );
+    }
+
+    #[test]
+    fn lowering_the_cap_clamps_the_priority_reserve() {
+        let bw = BandwidthLimiter::new(10_000, 0);
+        assert_eq!(bw.try_take_upload(10_000), 10_000);
+        let _priority = bw.priority_upload();
+        for _ in 0..5 {
+            bw.refill_tokens_incremental(1, 10);
+        }
+        bw.set_upload_limit(1_000);
+        assert_eq!(bw.priority_tokens.load(Ordering::Relaxed), 200);
     }
 
     #[test]

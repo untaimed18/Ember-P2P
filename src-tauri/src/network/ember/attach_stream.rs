@@ -408,7 +408,8 @@ pub struct FetchOutcome {
 ///
 /// `limiter` is the user's upload cap. A chat file is still upload, and a user
 /// who capped theirs to keep the connection usable should not find a friend's
-/// download saturating it; the room transfer honours the same cap.
+/// download saturating it; the room transfer honours the same cap. Within it
+/// the file is a priority upload, ahead of the eD2K slots.
 pub async fn serve_attachment<R, W, F, P>(
     recv: &mut R,
     send: &mut W,
@@ -423,7 +424,7 @@ where
     F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, [u8; 32], [u8; 32])>,
     P: FnMut(&[u8; 16], u64, u64) -> bool,
 {
-    serve_stream(
+    serve_paced(
         super::attach::ATTACH_STREAM_MSG_TYPE,
         recv,
         send,
@@ -431,13 +432,34 @@ where
         capability_for,
         on_progress,
         limiter,
+        true,
     )
     .await
 }
 
 /// [`serve_attachment`] for a request under `stream_type`. A room transfer
-/// serves through this with [`super::attach::ROOM_XFER_STREAM_MSG_TYPE`].
+/// serves through this with [`super::attach::ROOM_XFER_STREAM_MSG_TYPE`], on
+/// equal terms with the eD2K slots.
 pub async fn serve_stream<R, W, F, P>(
+    stream_type: u8,
+    recv: &mut R,
+    send: &mut W,
+    prefix: &[u8; 7],
+    capability_for: F,
+    on_progress: P,
+    limiter: Option<&crate::bandwidth::limiter::BandwidthLimiter>,
+) -> anyhow::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+    F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, [u8; 32], [u8; 32])>,
+    P: FnMut(&[u8; 16], u64, u64) -> bool,
+{
+    serve_paced(stream_type, recv, send, prefix, capability_for, on_progress, limiter, false).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_paced<R, W, F, P>(
     stream_type: u8,
     recv: &mut R,
     send: &mut W,
@@ -445,6 +467,7 @@ pub async fn serve_stream<R, W, F, P>(
     capability_for: F,
     mut on_progress: P,
     limiter: Option<&crate::bandwidth::limiter::BandwidthLimiter>,
+    priority: bool,
 ) -> anyhow::Result<u64>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -568,6 +591,9 @@ where
     if !on_progress(&request.xfer_id, position, size) {
         anyhow::bail!("attachment grant withdrawn before streaming");
     }
+    // Registered only once the bytes start, so the hash wait above holds no
+    // reserve.
+    let priority = limiter.filter(|_| priority).map(|limiter| limiter.priority_upload());
     for index in request.start_chunk as usize..info.chunk_count() {
         let len = info
             .chunk_len(index)
@@ -578,7 +604,11 @@ where
         // per slice so the sender's bar moves at the same pace.
         for slice in buf[..len].chunks(ATTACH_SEND_SLICE) {
             if let Some(limiter) = limiter {
-                if !limiter.acquire_upload(slice.len() as u64).await {
+                let granted = match &priority {
+                    Some(priority) => priority.acquire(slice.len() as u64).await,
+                    None => limiter.acquire_upload(slice.len() as u64).await,
+                };
+                if !granted {
                     // The refill task is gone; sending on regardless would
                     // ignore the cap entirely.
                     anyhow::bail!("upload limiter stopped");
