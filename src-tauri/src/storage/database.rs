@@ -4161,6 +4161,22 @@ impl Database {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    /// The [`Self::incomplete_downloads_owning_partials`] with bytes on disk,
+    /// which `transferred` records.
+    pub fn incomplete_downloads_with_progress(
+        &self,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM transfers
+              WHERE direction = 'download'
+                AND status NOT IN ('completed', 'noneneeded')
+                AND transferred > 0",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     pub fn remove_transfer(&self, transfer_id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM transfers WHERE id = ?1", params![transfer_id])?;

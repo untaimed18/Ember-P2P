@@ -2142,6 +2142,7 @@
   "transfers_failure_reason_transient": "Errore di connessione temporaneo",
   "transfers_failure_reason_no_channel": "Servizio di rete non disponibile",
   "transfers_failure_reason_download_folder": "Impossibile scrivere nella cartella download",
+  "transfers_failure_reason_part_folder_offline": "L'unità con i progressi di questo download non è collegata. Il download riprende quando l'unità torna disponibile.",
   "transfers_failure_reason_ember_pin_corrupt": "Il digest Ember salvato era danneggiato. Annulla questo download e aggiungi di nuovo il link eh=.",
   "transfers_failure_reason_aich_pin_corrupt": "Il riferimento AICH salvato era danneggiato. Annulla questo download e aggiungi di nuovo il link AICH.",
   "transfers_failure_reason_final_verify_inconclusive": "Impossibile leggere il file completato per verificarlo",

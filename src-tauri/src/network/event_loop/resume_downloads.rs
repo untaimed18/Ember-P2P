@@ -112,6 +112,13 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 continue;
             }
 
+            // From the database, before the `.part` reading below replaces
+            // it: a download whose `.part` is on a drive that is not
+            // connected must not be started over from zero.
+            if transfer.completed_size > 0 {
+                crate::storage::part_folders::note_restored_with_progress(&transfer.id);
+            }
+
             let control = TransferControl::new();
             if matches!(
                 transfer.status,

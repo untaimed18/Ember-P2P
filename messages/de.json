@@ -2142,6 +2142,7 @@
   "transfers_failure_reason_transient": "Vorübergehender Verbindungsfehler",
   "transfers_failure_reason_no_channel": "Netzwerkdienst nicht verfügbar",
   "transfers_failure_reason_download_folder": "Downloadordner nicht beschreibbar",
+  "transfers_failure_reason_part_folder_offline": "Das Laufwerk mit dem bisherigen Fortschritt dieses Downloads ist nicht verbunden. Der Download wird fortgesetzt, sobald es wieder da ist.",
   "transfers_failure_reason_ember_pin_corrupt": "Der gespeicherte Ember-Digest war beschädigt. Brechen Sie diesen Download ab und fügen Sie den eh=-Link erneut hinzu.",
   "transfers_failure_reason_aich_pin_corrupt": "Die gespeicherte AICH-Prüfsumme war beschädigt. Brechen Sie diesen Download ab und fügen Sie den AICH-Link erneut hinzu.",
   "transfers_failure_reason_final_verify_inconclusive": "Die fertige Datei konnte zur Prüfung nicht gelesen werden",

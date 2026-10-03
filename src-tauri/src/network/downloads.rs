@@ -249,16 +249,15 @@ fn probe_disk_space(download_dir: &std::path::Path) -> DiskSpaceProbe {
 
 #[derive(Default)]
 struct DiskSpaceCache {
-    last: Option<(std::path::PathBuf, DiskSpaceProbe, std::time::Instant)>,
-    refreshing: bool,
+    readings: HashMap<std::path::PathBuf, (DiskSpaceProbe, std::time::Instant)>,
+    refreshing: HashSet<std::path::PathBuf>,
 }
 
 impl DiskSpaceCache {
     fn reading(&self, download_dir: &std::path::Path, now: std::time::Instant) -> DiskSpaceProbe {
-        match &self.last {
-            Some((dir, probe, at))
-                if dir == download_dir
-                    && now.saturating_duration_since(*at) <= DISK_SPACE_READING_MAX_AGE =>
+        match self.readings.get(download_dir) {
+            Some((probe, at))
+                if now.saturating_duration_since(*at) <= DISK_SPACE_READING_MAX_AGE =>
             {
                 *probe
             }
@@ -267,12 +266,12 @@ impl DiskSpaceCache {
     }
 }
 
-/// Free space of the download folder, queried on the blocking pool and
+/// Free space of each download folder, queried on the blocking pool and
 /// cached, so the event loop never waits on `GetDiskFreeSpaceExW` — which
 /// takes seconds on a slow or dropped SMB share.
 ///
-/// At most one query is outstanding: while one is stuck on a hung volume,
-/// later ticks reuse the cached reading instead of parking another
+/// At most one query per folder is outstanding: while one is stuck on a hung
+/// volume, later ticks reuse the cached reading instead of parking another
 /// blocking-pool thread behind it.
 #[derive(Clone, Default)]
 pub(super) struct DiskSpaceMonitor {
@@ -286,15 +285,14 @@ impl DiskSpaceMonitor {
     }
 
     /// The last reading for `download_dir`, or `Unknown` when there is none
-    /// yet, it is older than [`DISK_SPACE_READING_MAX_AGE`], or it was taken
-    /// for another folder. Starts a background refresh unless one is already
-    /// running, so the answer trails the volume by up to one call. Never
-    /// blocks on the filesystem.
+    /// yet or it is older than [`DISK_SPACE_READING_MAX_AGE`]. Starts a
+    /// background refresh unless one is already running for the folder, so
+    /// the answer trails the volume by up to one call. Never blocks on the
+    /// filesystem.
     pub(super) fn reading_and_refresh(&self, download_dir: &std::path::Path) -> DiskSpaceProbe {
         let mut cache = self.cache.lock();
         let reading = cache.reading(download_dir, std::time::Instant::now());
-        if !cache.refreshing {
-            cache.refreshing = true;
+        if cache.refreshing.insert(download_dir.to_path_buf()) {
             drop(cache);
             self.spawn_refresh(download_dir.to_path_buf());
         }
@@ -304,18 +302,60 @@ impl DiskSpaceMonitor {
     fn spawn_refresh(&self, download_dir: std::path::PathBuf) {
         // Moved into the task so `refreshing` is cleared even if the probe
         // panics or the task is dropped unrun at runtime shutdown.
-        struct RefreshGuard(Arc<parking_lot::Mutex<DiskSpaceCache>>);
+        struct RefreshGuard(Arc<parking_lot::Mutex<DiskSpaceCache>>, std::path::PathBuf);
         impl Drop for RefreshGuard {
             fn drop(&mut self) {
-                self.0.lock().refreshing = false;
+                self.0.lock().refreshing.remove(&self.1);
             }
         }
-        let guard = RefreshGuard(self.cache.clone());
+        let guard = RefreshGuard(self.cache.clone(), download_dir.clone());
         tokio::task::spawn_blocking(move || {
             let probe = probe_disk_space(&download_dir);
-            guard.0.lock().last = Some((download_dir, probe, std::time::Instant::now()));
+            guard
+                .0
+                .lock()
+                .readings
+                .insert(download_dir, (probe, std::time::Instant::now()));
             drop(guard);
         });
+    }
+}
+
+/// The free space a pending download needs, judged on the volume that holds
+/// its `.part`: an unfinished download stays in the download folder it
+/// started in, which need not share a volume with the current one. One
+/// reading per folder serves a whole tick.
+pub(super) struct PartVolumes<'a> {
+    monitor: &'a DiskSpaceMonitor,
+    current: std::path::PathBuf,
+    readings: HashMap<std::path::PathBuf, DiskSpaceProbe>,
+}
+
+impl<'a> PartVolumes<'a> {
+    pub(super) fn new(monitor: &'a DiskSpaceMonitor, current: std::path::PathBuf) -> Self {
+        Self {
+            monitor,
+            current,
+            readings: HashMap::new(),
+        }
+    }
+
+    /// Whether the volume holding `transfer_id`'s `.part` has room for
+    /// `needed_bytes`. An earlier folder that is not there does not count as
+    /// full: the worker holds such a download until its drive is back, which
+    /// marking it Insufficient would turn into a manual resume.
+    pub(super) fn suffices(&mut self, transfer_id: &str, needed_bytes: u64) -> bool {
+        let folder = crate::storage::part_folders::located_folder(transfer_id)
+            .unwrap_or_else(|| self.current.clone());
+        let monitor = self.monitor;
+        let probe = *self
+            .readings
+            .entry(folder.clone())
+            .or_insert_with(|| monitor.reading_and_refresh(&folder));
+        if probe == DiskSpaceProbe::Missing && folder != self.current {
+            return true;
+        }
+        disk_space_suffices(probe, &folder, needed_bytes)
     }
 }
 
@@ -990,7 +1030,9 @@ mod disk_space_probe_tests {
         let mut cache = DiskSpaceCache::default();
         assert_eq!(cache.reading(&dir, taken), DiskSpaceProbe::Unknown);
 
-        cache.last = Some((dir.clone(), DiskSpaceProbe::Available(123), taken));
+        cache
+            .readings
+            .insert(dir.clone(), (DiskSpaceProbe::Available(123), taken));
         assert_eq!(cache.reading(&dir, taken), DiskSpaceProbe::Available(123));
         assert_eq!(
             cache.reading(&dir, taken + DISK_SPACE_READING_MAX_AGE),
@@ -1005,13 +1047,61 @@ mod disk_space_probe_tests {
             DiskSpaceProbe::Unknown
         );
 
-        cache.last = Some((dir.clone(), DiskSpaceProbe::Missing, taken));
+        cache
+            .readings
+            .insert(dir.clone(), (DiskSpaceProbe::Missing, taken));
         assert_eq!(cache.reading(&dir, taken), DiskSpaceProbe::Missing);
+    }
+
+    #[test]
+    fn each_download_is_judged_on_the_volume_holding_its_part() {
+        let current = std::path::PathBuf::from("current-folder");
+        let earlier = std::path::PathBuf::from("earlier-folder");
+        let offline = std::path::PathBuf::from("offline-folder");
+        let now = std::time::Instant::now();
+        let monitor = DiskSpaceMonitor::default();
+        {
+            let mut cache = monitor.cache.lock();
+            cache
+                .readings
+                .insert(current.clone(), (DiskSpaceProbe::Available(u64::MAX / 2), now));
+            cache
+                .readings
+                .insert(earlier.clone(), (DiskSpaceProbe::Available(0), now));
+            cache
+                .readings
+                .insert(offline.clone(), (DiskSpaceProbe::Missing, now));
+            cache.refreshing.extend([current.clone(), earlier.clone(), offline.clone()]);
+        }
+        let in_earlier = uuid::Uuid::new_v4().to_string();
+        crate::storage::part_folders::note_located(&in_earlier, &earlier);
+        let in_offline = uuid::Uuid::new_v4().to_string();
+        crate::storage::part_folders::note_located(&in_offline, &offline);
+        let unplaced = uuid::Uuid::new_v4().to_string();
+
+        let mut volumes = PartVolumes::new(&monitor, current.clone());
+        assert!(volumes.suffices(&unplaced, 1 << 30), "judged on the current folder");
+        assert!(
+            !volumes.suffices(&in_earlier, 1),
+            "the full volume is the earlier folder's, where this `.part` grows"
+        );
+        assert!(
+            volumes.suffices(&in_offline, 1),
+            "an earlier folder that is offline holds the download, it does not fill it"
+        );
+
+        monitor
+            .cache
+            .lock()
+            .readings
+            .insert(current.clone(), (DiskSpaceProbe::Missing, now));
+        let mut volumes = PartVolumes::new(&monitor, current);
+        assert!(!volumes.suffices(&unplaced, 0), "a missing current folder still refuses");
     }
 
     async fn wait_for_refresh(monitor: &DiskSpaceMonitor) {
         for _ in 0..500 {
-            if !monitor.cache.lock().refreshing {
+            if monitor.cache.lock().refreshing.is_empty() {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1025,7 +1115,7 @@ mod disk_space_probe_tests {
         let dir = std::env::temp_dir();
 
         assert_eq!(monitor.reading_and_refresh(&dir), DiskSpaceProbe::Unknown);
-        assert!(monitor.cache.lock().refreshing);
+        assert!(monitor.cache.lock().refreshing.contains(&dir));
         wait_for_refresh(&monitor).await;
 
         assert!(matches!(
@@ -1038,15 +1128,13 @@ mod disk_space_probe_tests {
     #[tokio::test]
     async fn monitor_never_starts_a_second_refresh_while_one_is_running() {
         let monitor = DiskSpaceMonitor::default();
-        monitor.cache.lock().refreshing = true;
+        let dir = std::env::temp_dir();
+        monitor.cache.lock().refreshing.insert(dir.clone());
 
-        assert_eq!(
-            monitor.reading_and_refresh(&std::env::temp_dir()),
-            DiskSpaceProbe::Unknown
-        );
+        assert_eq!(monitor.reading_and_refresh(&dir), DiskSpaceProbe::Unknown);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let cache = monitor.cache.lock();
-        assert!(cache.refreshing);
-        assert!(cache.last.is_none());
+        assert!(cache.refreshing.contains(&dir));
+        assert!(cache.readings.is_empty());
     }
 }

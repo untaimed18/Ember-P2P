@@ -2142,6 +2142,7 @@
   "transfers_failure_reason_transient": "Fallo temporal de conexión",
   "transfers_failure_reason_no_channel": "Servicio de red no disponible",
   "transfers_failure_reason_download_folder": "No se puede escribir en la carpeta de descargas",
+  "transfers_failure_reason_part_folder_offline": "La unidad con el progreso de esta descarga no está conectada. Continuará cuando vuelva a estarlo.",
   "transfers_failure_reason_ember_pin_corrupt": "El resumen Ember guardado estaba dañado. Cancela esta descarga y vuelve a añadir el enlace eh=.",
   "transfers_failure_reason_aich_pin_corrupt": "La marca AICH guardada estaba dañada. Cancela esta descarga y vuelve a añadir el enlace AICH.",
   "transfers_failure_reason_final_verify_inconclusive": "No se pudo leer el archivo terminado para verificarlo",

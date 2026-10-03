@@ -2142,6 +2142,7 @@
   "transfers_failure_reason_transient": "临时性连接失败",
   "transfers_failure_reason_no_channel": "网络服务不可用",
   "transfers_failure_reason_download_folder": "无法写入下载文件夹",
+  "transfers_failure_reason_part_folder_offline": "保存此下载进度的驱动器未连接。驱动器恢复后将继续下载。",
   "transfers_failure_reason_ember_pin_corrupt": "保存的 Ember 摘要已损坏。请取消此下载并重新添加 eh= 链接。",
   "transfers_failure_reason_aich_pin_corrupt": "保存的 AICH 校验值已损坏。请取消此下载并重新添加 AICH 链接。",
   "transfers_failure_reason_final_verify_inconclusive": "无法读取已完成的文件以进行校验",

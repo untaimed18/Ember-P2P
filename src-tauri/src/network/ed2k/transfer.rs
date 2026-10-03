@@ -1117,18 +1117,45 @@ pub(crate) async fn prepare_download_dirs(
     .map_err(|e| download_folder_error("preparing Temp and Downloads", download_dir, e))
 }
 
+/// Also tagged [`DOWNLOAD_FOLDER_STAGE`], so the download is re-queued without
+/// blaming a source, and starts again once the folder is back.
+pub(crate) const PART_FOLDER_OFFLINE_STAGE: &str = "stage:part_folder_offline";
+
+fn part_folder_offline_error(folder: &std::path::Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{DOWNLOAD_FOLDER_STAGE}: {PART_FOLDER_OFFLINE_STAGE}: {} holds this download's progress \
+         and cannot be reached",
+        folder.display()
+    )
+}
+
 /// The download folder holding this download's `.part` — the one it started
-/// in — and that folder's `Temp`, prepared.
+/// in — and that folder's `Temp`, prepared. Only the current folder gets a
+/// `Downloads`: finished files never go to an earlier one.
 pub(crate) async fn prepare_part_dir(
     folders: &crate::storage::part_folders::SharedDownloadFolders,
     transfer_id: &str,
 ) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
     let folders = folders.read().clone();
+    let current = folders.current.clone();
     let id = transfer_id.to_string();
-    let root = tokio::task::spawn_blocking(move || folders.part_folder_for(&id))
+    let root = tokio::task::spawn_blocking(move || folders.folder_to_resume_in(&id))
         .await
-        .map_err(|e| anyhow::anyhow!("download folder task failed: {e}"))?;
-    let (temp, _) = prepare_download_dirs(&root).await?;
+        .map_err(|e| anyhow::anyhow!("download folder task failed: {e}"))?
+        .map_err(|offline| part_folder_offline_error(&offline))?;
+    let temp = if root == current {
+        prepare_download_dirs(&root).await?.0
+    } else {
+        let part_root = root.clone();
+        tokio::task::spawn_blocking(move || {
+            let allowed = vec![part_root.to_string_lossy().into_owned()];
+            crate::security::filesystem::prepare_approved_subdir(&part_root, "Temp", &allowed)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("download folder task failed: {e}"))?
+        .map_err(|e| download_folder_error("preparing Temp", &root, e))?
+    };
+    crate::storage::part_folders::note_located(transfer_id, &root);
     Ok((root, temp))
 }
 
@@ -1225,6 +1252,8 @@ transfer_failure_codes! {
     NetworkChannelUnavailable => "network_channel_unavailable", "Network channel unavailable";
     DownloadFolderUnavailable => "download_folder_unavailable",
         "The download folder cannot be written; check it in Settings";
+    PartFolderOffline => "part_folder_offline",
+        "The drive holding this download's progress is not connected";
     EmberPinCorrupt => "ember_pin_corrupt",
         "Persisted Ember digest was corrupt; cancel and re-add the eh= link";
     AichPinCorrupt => "aich_pin_corrupt",
@@ -1245,6 +1274,9 @@ pub(crate) fn classify_failure(error: &str, kind: &SourceFailureKind) -> Transfe
     let lower = error.to_lowercase();
     if lower.contains("cancelled") {
         return TransferFailureCode::Cancelled;
+    }
+    if error.contains(PART_FOLDER_OFFLINE_STAGE) {
+        return TransferFailureCode::PartFolderOffline;
     }
     if is_download_folder_error(error) {
         return TransferFailureCode::DownloadFolderUnavailable;
@@ -1520,6 +1552,11 @@ mod tests {
                 "stage:download_folder: opening the part file in /x: Permission denied",
                 Transient,
                 C::DownloadFolderUnavailable,
+            ),
+            (
+                "stage:download_folder: stage:part_folder_offline: /x cannot be reached",
+                Transient,
+                C::PartFolderOffline,
             ),
             (FINAL_VERIFY_INCONCLUSIVE_MSG, Transient, C::FinalVerifyInconclusive),
             (LOCAL_READ_FAILED_MSG, Transient, C::LocalReadFailed),
@@ -2209,6 +2246,176 @@ mod tests {
         );
         assert!(!part.exists());
         assert_eq!(std::fs::read(&final_path).unwrap(), b"fallback bytes");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn completion_copies_in(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with(COMPLETION_COPY_PREFIX))
+            .collect()
+    }
+
+    /// The cross-volume path: copied under a name the library skips, then
+    /// renamed. A kill mid-copy leaves that name, never a truncated file
+    /// under the real one, which the watcher would index and the retried
+    /// completion would step around as "name (1)".
+    #[test]
+    fn a_copied_completion_is_published_by_renaming_a_finished_temporary_copy() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-completion-copy-rename-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        let downloads = root.join("Downloads");
+        for dir in [root.join("Temp"), downloads.clone(), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let root_string = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(
+            &data,
+            std::slice::from_ref(&root_string),
+        )
+        .unwrap();
+        let allowed = [root_string];
+        let target = downloads.join("finished.bin");
+        std::fs::write(&target, b"someone else's").unwrap();
+        let part = root.join("Temp").join("source.part");
+        std::fs::write(&part, b"copied bytes").unwrap();
+        let (_, opened) =
+            crate::security::filesystem::open_existing_approved(&part, &allowed, false).unwrap();
+        let identity = crate::security::filesystem::opened_file_identity(&opened).unwrap();
+        drop(opened);
+
+        let final_path =
+            move_part_to_final_with_roots(&part, &target, &allowed, Some(&identity), false)
+                .unwrap();
+        assert_eq!(final_path.file_name().unwrap(), "finished (1).bin");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"copied bytes");
+        assert_eq!(std::fs::read(&target).unwrap(), b"someone else's", "never replaced");
+        assert!(!part.exists());
+        assert!(completion_copies_in(&downloads).is_empty(), "the copy was renamed, not left");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_completion_copy_is_named_so_the_library_never_shares_it() {
+        let name = format!("{COMPLETION_COPY_PREFIX}{:016x}{COMPLETION_COPY_SUFFIX}", 0xabcu64);
+        assert!(is_completion_copy_name(&name));
+        assert!(crate::sharing::indexer::is_excluded_share_file_name(
+            std::path::Path::new(&name)
+        ));
+        for other in [".ember-copy-.tmp", ".ember-copy-0123456789abcdeg.tmp", "movie.tmp"] {
+            assert!(!is_completion_copy_name(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn interrupted_completion_copies_are_removed_at_startup_and_nothing_else() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-stale-completion-copies-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let (old, new, data) = (base.join("old"), base.join("new"), base.join("data"));
+        for dir in [old.join("Downloads"), new.join("Downloads"), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let roots = [
+            new.to_string_lossy().into_owned(),
+            old.to_string_lossy().into_owned(),
+        ];
+        crate::security::filesystem::initialize_approved_roots(&data, &roots).unwrap();
+        let stale = |root: &std::path::Path| {
+            root.join("Downloads")
+                .join(format!("{COMPLETION_COPY_PREFIX}{:016x}{COMPLETION_COPY_SUFFIX}", 7u64))
+        };
+        std::fs::write(stale(&new), b"half").unwrap();
+        std::fs::write(stale(&old), b"half").unwrap();
+        let kept = [
+            new.join("Downloads").join("movie.mkv"),
+            new.join("Downloads").join(".ember-copy-mine.tmp"),
+        ];
+        for file in &kept {
+            std::fs::write(file, b"keep").unwrap();
+        }
+
+        remove_stale_completion_copies(&roots);
+        assert!(!stale(&new).exists());
+        assert!(!stale(&old).exists(), "every download folder's Downloads is cleaned");
+        for file in &kept {
+            assert!(file.exists(), "{}", file.display());
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_destination_without_room_fails_before_copying_and_keeps_the_part() {
+        let dir = std::path::Path::new("downloads");
+        let error = room_for_completion_copy(100, Some(99), dir).unwrap_err().to_string();
+        assert!(is_disk_full_error(&error), "{error}");
+        assert_eq!(
+            classify_failure(&error, &SourceFailureKind::Transient),
+            TransferFailureCode::InsufficientDisk
+        );
+        assert!(room_for_completion_copy(100, Some(100), dir).is_ok());
+        assert!(
+            room_for_completion_copy(100, None, dir).is_ok(),
+            "a volume that will not say lets the copy try"
+        );
+    }
+
+    // Held across the awaits for the reason given above
+    // `a_download_folder_that_is_not_an_approved_root_is_tagged`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_worker_holds_a_download_whose_progress_is_on_an_offline_folder() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-offline-part-folder-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let (new, data) = (base.join("new"), base.join("data"));
+        let offline = base.join("unplugged").join("old");
+        for dir in [new.clone(), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let folders = crate::storage::part_folders::DownloadFolders::new(
+            &new.to_string_lossy(),
+            &[offline.to_string_lossy().into_owned()],
+        );
+        let roots = folders.roots();
+        let shared = folders.shared();
+        let id = uuid::Uuid::new_v4().to_string();
+        crate::storage::part_folders::note_restored_with_progress(&id);
+
+        let error = prepare_part_dir(&shared, &id).await.unwrap_err().to_string();
+        assert_eq!(
+            classify_failure(&error, &SourceFailureKind::Transient),
+            TransferFailureCode::PartFolderOffline
+        );
+        assert!(
+            !new.join("Temp").join(format!("{id}.part")).exists(),
+            "no second `.part` started from zero"
+        );
+
+        std::fs::create_dir_all(offline.join("Temp")).unwrap();
+        std::fs::write(offline.join("Temp").join(format!("{id}.part")), b"progress").unwrap();
+        crate::security::filesystem::initialize_approved_roots(&data, &roots).unwrap();
+        let (root, temp) = prepare_part_dir(&shared, &id).await.unwrap();
+        assert_eq!(root, offline, "resumed where the progress is once the drive is back");
+        assert_eq!(temp.file_name().unwrap(), "Temp");
+        assert!(
+            !offline.join("Downloads").exists(),
+            "an earlier folder never gets a Downloads"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 }
@@ -6822,11 +7029,13 @@ fn move_part_to_final_with_roots(
     // Windows the loser fails despite having a complete .part; on Unix,
     // rename can replace the winner. Hard-linking claims an absent destination
     // atomically without replacement and remains O(1) on the common same-volume
-    // path. Filesystems without hard-link support fall back to an exclusive
-    // create+copy, which is also collision-safe.
+    // path. Across volumes, or on filesystems without hard links, the file is
+    // copied under a temporary name first and then renamed into a free name
+    // without replacement, which is also collision-safe.
+    let mut staged: Option<CompletionCopy> = None;
     for suffix in 0..=10_000u32 {
         let final_path = dedup_candidate(target, suffix);
-        if allow_hard_link {
+        if allow_hard_link && staged.is_none() {
             let link_result = if allowed_roots.is_empty() {
                 std::fs::hard_link(part_path, &final_path).map(|()| final_path.clone())
             } else if let Some(expected) = expected_source_identity {
@@ -6860,32 +7069,190 @@ fn move_part_to_final_with_roots(
                 Err(e) => return Err(e.into()),
             }
         }
-        match copy_exclusive(
-            part_path,
-            &final_path,
-            allowed_roots,
-            expected_source_identity,
-        ) {
-            Ok(()) => {
+        let copy = match &staged {
+            Some(copy) => copy,
+            None => staged.insert(stage_completion_copy(
+                part_path,
+                target,
+                allowed_roots,
+                expected_source_identity,
+            )?),
+        };
+        match copy.publish(&final_path, allowed_roots) {
+            Ok(published) => {
                 remove_completed_part_best_effort(
                     part_path,
-                    &final_path,
+                    &published,
                     "copied",
                     allowed_roots,
                     expected_source_identity,
                 );
-                return Ok(final_path);
+                return Ok(published);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || final_path.exists() => {
                 continue;
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                copy.discard(allowed_roots);
+                return Err(e.into());
+            }
         }
+    }
+    if let Some(copy) = staged {
+        copy.discard(allowed_roots);
     }
     anyhow::bail!(
         "Could not allocate a unique completed filename for {}",
         target.display()
     )
+}
+
+/// Prefix and suffix of the name a finished file is copied under before it is
+/// published. The `.tmp` keeps the indexer and the folder watcher off it
+/// (`sharing::indexer::is_excluded_share_file_name`), and the startup cleanup
+/// ([`remove_stale_completion_copies`]) only ever removes names of this shape.
+const COMPLETION_COPY_PREFIX: &str = ".ember-copy-";
+const COMPLETION_COPY_SUFFIX: &str = ".tmp";
+
+fn is_completion_copy_name(name: &str) -> bool {
+    name.strip_prefix(COMPLETION_COPY_PREFIX)
+        .and_then(|rest| rest.strip_suffix(COMPLETION_COPY_SUFFIX))
+        .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A finished file copied in full, flushed and synced under a temporary name
+/// next to where it is published.
+struct CompletionCopy {
+    path: std::path::PathBuf,
+    identity: crate::security::filesystem::ObjectIdentity,
+}
+
+impl CompletionCopy {
+    /// Rename the copy to `final_path`, which must not exist yet.
+    fn publish(
+        &self,
+        final_path: &std::path::Path,
+        allowed_roots: &[String],
+    ) -> std::io::Result<std::path::PathBuf> {
+        if allowed_roots.is_empty() {
+            std::fs::hard_link(&self.path, final_path)?;
+            let _ = std::fs::remove_file(&self.path);
+            return Ok(final_path.to_path_buf());
+        }
+        match crate::security::filesystem::rename_approved_no_replace(
+            &self.path,
+            final_path,
+            allowed_roots,
+            &self.identity,
+        ) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists && !final_path.exists() => {
+                // A scanner holding the fresh copy open without delete sharing
+                // blocks a rename on Windows, but not a hard link.
+                let linked = crate::security::filesystem::hard_link_approved(
+                    &self.path,
+                    final_path,
+                    allowed_roots,
+                    &self.identity,
+                )
+                .map_err(|_| e)?;
+                self.discard(allowed_roots);
+                Ok(linked)
+            }
+            published => published,
+        }
+    }
+
+    fn discard(&self, allowed_roots: &[String]) {
+        let removed = if allowed_roots.is_empty() {
+            std::fs::remove_file(&self.path)
+        } else {
+            crate::security::filesystem::remove_approved_file_if_identity(
+                &self.path,
+                allowed_roots,
+                &self.identity,
+            )
+        };
+        if let Err(e) = removed {
+            tracing::warn!(
+                "Could not remove the completion copy {}: {e}. The next startup removes it.",
+                self.path.display()
+            );
+        }
+    }
+}
+
+/// Fail before copying when the volume `target` is on has no room for the
+/// whole file, with the error that marks the download Insufficient and keeps
+/// its `.part`. A failed query lets the copy try: running out of space while
+/// writing fails the same way.
+fn ensure_room_for_completion_copy(
+    part_path: &std::path::Path,
+    target_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let Ok(needed) = std::fs::metadata(part_path).map(|metadata| metadata.len()) else {
+        return Ok(());
+    };
+    room_for_completion_copy(needed, fs2::available_space(target_dir).ok(), target_dir)
+}
+
+fn room_for_completion_copy(
+    needed: u64,
+    available: Option<u64>,
+    target_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    match available {
+        Some(available) if available < needed => anyhow::bail!(
+            "stage:insufficient_disk: the finished file needs {needed} bytes and {} has {available} free",
+            target_dir.display()
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn stage_completion_copy(
+    part_path: &std::path::Path,
+    target: &std::path::Path,
+    allowed_roots: &[String],
+    expected_source_identity: Option<&crate::security::filesystem::ObjectIdentity>,
+) -> anyhow::Result<CompletionCopy> {
+    let target_dir = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("completed file target has no folder"))?;
+    ensure_room_for_completion_copy(part_path, target_dir)?;
+    let path = target_dir.join(format!(
+        "{COMPLETION_COPY_PREFIX}{:016x}{COMPLETION_COPY_SUFFIX}",
+        rand::random::<u64>()
+    ));
+    let identity = copy_exclusive(part_path, &path, allowed_roots, expected_source_identity)?;
+    Ok(CompletionCopy { path, identity })
+}
+
+/// Remove completion copies a crash or a kill left in the `Downloads` of
+/// each download folder. The `.part` they were copied from is still in
+/// place — it is only removed once its copy is published — so the download
+/// completes again from it. Must run before any download can complete.
+/// Blocking.
+pub(crate) fn remove_stale_completion_copies(download_roots: &[String]) {
+    for root in download_roots {
+        let downloads = std::path::Path::new(root).join("Downloads");
+        let Ok(entries) = std::fs::read_dir(&downloads) else {
+            continue;
+        };
+        let allowed = std::slice::from_ref(root);
+        for entry in entries.flatten() {
+            if !entry.file_name().to_str().is_some_and(is_completion_copy_name) {
+                continue;
+            }
+            let path = entry.path();
+            match crate::security::filesystem::remove_approved_file(&path, allowed) {
+                Ok(()) => tracing::info!("Removed interrupted completion copy {}", path.display()),
+                Err(e) => tracing::warn!(
+                    "Could not remove interrupted completion copy {}: {e}",
+                    path.display()
+                ),
+            }
+        }
+    }
 }
 
 /// Approved-root wrapper used by production completion/recovery paths. The
@@ -6996,12 +7363,14 @@ fn dedup_candidate(base: &std::path::Path, suffix: u32) -> std::path::PathBuf {
     parent.join(format!("{stem}{tail}"))
 }
 
+/// Copy `source_path` to the new file `destination_path`, synced and the same
+/// length as the source, returning the copy's identity.
 fn copy_exclusive(
     source_path: &std::path::Path,
     destination_path: &std::path::Path,
     allowed_roots: &[String],
     expected_source_identity: Option<&crate::security::filesystem::ObjectIdentity>,
-) -> std::io::Result<()> {
+) -> std::io::Result<crate::security::filesystem::ObjectIdentity> {
     use std::io::Write;
 
     let mut source = if allowed_roots.is_empty() {
@@ -7027,7 +7396,17 @@ fn copy_exclusive(
         file
     };
     let destination_identity = crate::security::filesystem::opened_file_identity(&destination)?;
+    let source_len = source.metadata()?.len();
     if let Err(e) = std::io::copy(&mut source, &mut destination)
+        .and_then(|copied| {
+            if copied == source_len {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "completion copy wrote {copied} of {source_len} bytes"
+                )))
+            }
+        })
         .and_then(|_| destination.flush())
         .and_then(|_| destination.sync_all())
     {
@@ -7065,7 +7444,7 @@ fn copy_exclusive(
             ));
         }
     }
-    Ok(())
+    Ok(destination_identity)
 }
 
 fn remove_completed_part_best_effort(

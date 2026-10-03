@@ -738,10 +738,18 @@ pub(in crate::network) async fn on_download_event(
         // Our own folder refused the write; no peer was involved, so none is
         // blamed or penalized. The row still re-queues below and recovers by
         // itself once the folder is fixed, which is what eMule does too.
-        let is_folder_error =
-            failure_code == ed2k::transfer::TransferFailureCode::DownloadFolderUnavailable;
+        // An earlier download folder that is offline holds the download back
+        // the same way, until the drive with its progress is connected again;
+        // the row says so, and the download folder itself is fine.
+        let is_folder_error = matches!(
+            failure_code,
+            ed2k::transfer::TransferFailureCode::DownloadFolderUnavailable
+                | ed2k::transfer::TransferFailureCode::PartFolderOffline
+        );
         if is_folder_error {
             warn!("Download {transfer_id} cannot use its download folder: {error}");
+        }
+        if failure_code == ed2k::transfer::TransferFailureCode::DownloadFolderUnavailable {
             emit_download_folder_unavailable(app_handle);
         }
         // The finished `.part` could not be read back. Also local: no source

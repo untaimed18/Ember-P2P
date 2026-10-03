@@ -741,22 +741,17 @@ async fn preserve_failed_partial(
 /// walking Temp while the loop accepted a download whose id postdates that
 /// snapshot — and it would delete that file out from under the worker writing
 /// it. The startup gate this runs behind exists to keep the two ordered.
+///
+/// `download_roots` is every download folder a `.part` may be in
+/// (`AppSettings::download_roots`). An earlier one is forgotten at startup
+/// only once it holds none of these orphans, so sweeping it here is what
+/// lets it go — and what stops a finished file's `.part` whose removal failed
+/// after a copy from staying behind in it for good.
 pub async fn sweep_orphan_part_files(
-    download_folder: &str,
+    download_roots: &[String],
     known_ids: &std::collections::HashSet<String>,
     db: &Database,
 ) {
-    let temp_dir = std::path::PathBuf::from(download_folder).join("Temp");
-    if !temp_dir.is_dir() {
-        return;
-    }
-    let mut entries = match tokio::fs::read_dir(&temp_dir).await {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!("Orphan sweep: failed to read {}: {e}", temp_dir.display());
-            return;
-        }
-    };
     // Read once, up front, instead of querying per file. This runs inline on
     // the network task's startup gate, so a Temp directory full of stale
     // partials used to mean thousands of blocking queries before the loop
@@ -770,6 +765,34 @@ pub async fn sweep_orphan_part_files(
         Err(e) => {
             tracing::warn!("Orphan sweep: could not read owned partials; skipping DB check ({e})");
             std::collections::HashSet::new()
+        }
+    };
+    for download_folder in download_roots {
+        let sweep = sweep_orphan_part_files_in(download_folder, known_ids, &owns_partial);
+        if tokio::time::timeout(ORPHAN_SWEEP_FOLDER_BUDGET, sweep).await.is_err() {
+            tracing::warn!("Orphan sweep: gave up on {download_folder}, which is not answering");
+        }
+    }
+}
+
+/// An offline network share can hold every call into it for tens of seconds,
+/// and the network loop waits for this sweep before it starts.
+const ORPHAN_SWEEP_FOLDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+async fn sweep_orphan_part_files_in(
+    download_folder: &str,
+    known_ids: &std::collections::HashSet<String>,
+    owns_partial: &std::collections::HashSet<String>,
+) {
+    let temp_dir = std::path::PathBuf::from(download_folder).join("Temp");
+    if !tokio::fs::metadata(&temp_dir).await.is_ok_and(|m| m.is_dir()) {
+        return;
+    }
+    let mut entries = match tokio::fs::read_dir(&temp_dir).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("Orphan sweep: failed to read {}: {e}", temp_dir.display());
+            return;
         }
     };
     let mut swept_part: u32 = 0;
@@ -2796,6 +2819,40 @@ mod ipc_lifecycle_tests {
 
         assert!(!part.exists());
         assert!(!part.with_extension("part.met").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A finished download whose `.part` could not be removed after its
+    /// cross-volume copy (an upload held it open) leaves a full-size orphan in
+    /// the earlier folder, which startup only forgets once it holds none.
+    #[tokio::test]
+    async fn the_startup_sweep_removes_orphans_from_earlier_download_folders_too() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (folders, base) = approved_old_and_new_folders("sweep");
+        let db = crate::storage::database::Database::open_at(&base.join("data").join("ember.db"))
+            .unwrap();
+        let old_temp = folders.previous[0].join("Temp");
+        let new_temp = folders.current.join("Temp");
+        let (orphan, live) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let orphans = [
+            old_temp.join(format!("{orphan}.part")),
+            old_temp.join(format!("{orphan}.part.met")),
+            new_temp.join(format!("{orphan}.part")),
+        ];
+        for file in &orphans {
+            std::fs::write(file, b"finished bytes").unwrap();
+        }
+        let owned = old_temp.join(format!("{live}.part"));
+        std::fs::write(&owned, b"unfinished").unwrap();
+        let known: std::collections::HashSet<String> = [live.to_string()].into();
+
+        super::sweep_orphan_part_files(&folders.roots(), &known, &db).await;
+
+        for file in &orphans {
+            assert!(!file.exists(), "{}", file.display());
+        }
+        assert!(owned.exists(), "a download still in the list keeps its part");
+        drop(db);
         let _ = std::fs::remove_dir_all(base);
     }
 

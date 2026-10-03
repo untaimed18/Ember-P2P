@@ -90,6 +90,13 @@ pub(in crate::network) fn take_part_presence_grew() -> bool {
     std::mem::take(&mut part_presence().lock().grew)
 }
 
+/// The roots a cancelled download's tracker may delete its `.part.met` under.
+/// The tracker names the file in the folder its `.part` is in, which is an
+/// earlier download folder for a download started before the folder changed.
+fn met_delete_roots(settings: &AppSettings) -> Vec<String> {
+    settings.download_roots()
+}
+
 pub(in crate::network) fn spawn_part_presence_probe(candidates: Vec<(String, PathBuf)>) {
     static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -878,7 +885,7 @@ async fn handle_command_inner(
                 // in-memory state with no such dependency.
                 let ack = cleanup_ack.take();
                 let tid = transfer_id.clone();
-                let delete_roots = deleting.then(|| vec![settings.download_folder.clone()]);
+                let delete_roots = deleting.then(|| met_delete_roots(settings));
                 tokio::spawn(async move {
                     if let Some(tracker) = stop_tracker {
                         save_part_tracker_snapshot(tracker, &tid, "cancel/stop").await;
@@ -902,7 +909,7 @@ async fn handle_command_inner(
                     }
                 });
             } else if let Some(tracker) = cancel_tracker {
-                let allowed = vec![settings.download_folder.clone()];
+                let allowed = met_delete_roots(settings);
                 tokio::spawn(async move {
                     if let Ok(t) =
                         tokio::time::timeout(std::time::Duration::from_secs(2), tracker.read())
@@ -7584,6 +7591,40 @@ async fn handle_command_inner(
 #[cfg(test)]
 mod reconcile_helper_tests {
     use super::*;
+
+    #[test]
+    fn cancel_deletes_the_part_met_in_the_earlier_folder_its_part_is_in() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-cancel-met-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let (old, new, data) = (base.join("old"), base.join("new"), base.join("data"));
+        for dir in [old.join("Temp"), new.join("Temp"), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let settings = AppSettings {
+            download_folder: new.to_string_lossy().into_owned(),
+            previous_download_folders: vec![old.to_string_lossy().into_owned()],
+            ..AppSettings::default()
+        };
+        crate::security::filesystem::initialize_approved_roots(&data, &settings.download_roots())
+            .unwrap();
+        let part = old
+            .join("Temp")
+            .join(format!("{}.part", uuid::Uuid::new_v4()));
+        std::fs::write(&part, vec![0u8; 16]).unwrap();
+        let met = part.with_extension("part.met");
+        std::fs::write(&met, b"met").unwrap();
+        let tracker = ed2k::part_tracker::PartTracker::new(16, &part);
+
+        tracker.delete_met(std::slice::from_ref(&settings.download_folder));
+        assert!(met.exists(), "the current folder alone does not reach it");
+        tracker.delete_met(&met_delete_roots(&settings));
+        assert!(!met.exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     #[test]
     fn drain_removes_every_indexed_handoff_and_returns_only_wanted() {

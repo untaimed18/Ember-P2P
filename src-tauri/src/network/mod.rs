@@ -1178,6 +1178,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let folders = settings.download_roots();
         let _ = tokio::task::spawn_blocking(move || chat_attach::sweep_interrupted(&db, &folders)).await;
     }
+    // Before any download can complete: a completion copy being written now
+    // would otherwise look like one a crash left behind.
+    {
+        let folders = settings.download_roots();
+        let _ = tokio::task::spawn_blocking(move || {
+            ed2k::transfer::remove_stale_completion_copies(&folders)
+        })
+        .await;
+    }
 
     // Seed the Ember DHT routing table from the last session's persisted
     // contacts (slice 7). This is the native equivalent of KAD's
@@ -2524,7 +2533,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         .map(|id| format!("ember-xfer-{}", hex::encode(id))),
                 );
                 crate::commands::transfers::sweep_orphan_part_files(
-                    &settings.download_folder,
+                    &settings.download_roots(),
                     &known_ids,
                     &db,
                 )

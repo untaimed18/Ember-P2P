@@ -1583,6 +1583,190 @@ pub fn hard_link_approved(
     Ok(destination)
 }
 
+/// Rename `source_path` to `destination_path` in the same approved directory,
+/// failing with `AlreadyExists` instead of replacing whatever is there. The
+/// rename is relative to the verified directory's handle and the source must
+/// still be `expected_source`; on Windows the exact opened object is renamed,
+/// elsewhere a swap of the name is caught afterwards and reported.
+pub fn rename_approved_no_replace(
+    source_path: &Path,
+    destination_path: &Path,
+    allowed_roots: &[String],
+    expected_source: &ObjectIdentity,
+) -> io::Result<PathBuf> {
+    let (parent, parent_handle, parent_identity, source_name) =
+        split_verified_file_parent(source_path, allowed_roots)?;
+    let (_, _, destination_parent_identity, destination_name) =
+        split_verified_file_parent(destination_path, allowed_roots)?;
+    if destination_parent_identity != parent_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "approved rename must stay in one directory",
+        ));
+    }
+    let destination = parent.join(&destination_name);
+
+    #[cfg(unix)]
+    {
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let source = openat_child(&parent_handle, &source_name, flags, 0)?;
+        if &object_identity_from_file(&source)? != expected_source {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "approved rename source changed identity",
+            ));
+        }
+        rename_at_no_replace(&parent_handle, &source_name, &destination_name)?;
+        let renamed = openat_child(&parent_handle, &destination_name, flags, 0)?;
+        if &object_identity_from_file(&renamed)? != expected_source {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "approved rename published a replaced source",
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+        const DELETE_ACCESS: u32 = 0x0001_0000;
+        let source = open_windows_path(
+            &parent.join(&source_name),
+            FILE_READ_ATTRIBUTES | DELETE_ACCESS,
+            false,
+        )?;
+        let source_identity = object_identity_from_file(&source)?;
+        if &source_identity != expected_source
+            || source_identity.reparse_point
+            || !source.metadata()?.is_file()
+            || object_identity(&parent)? != parent_identity
+            || !opened_child_parent_matches(&source, &parent)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "approved rename source changed before handle pinning",
+            ));
+        }
+        rename_opened_file_at(&source, &parent_handle, &destination_name)?;
+        if object_identity(&parent)? != parent_identity
+            || !opened_child_parent_matches(&source, &parent)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "approved rename left its directory",
+            ));
+        }
+    }
+
+    Ok(destination)
+}
+
+#[cfg(target_os = "linux")]
+fn rename_at_no_replace(
+    parent: &File,
+    from: &std::ffi::OsStr,
+    to: &std::ffi::OsStr,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (from, to) = (component_cstring(from)?, component_cstring(to)?);
+    let fd = parent.as_raw_fd();
+    if unsafe { libc::renameat2(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_NOREPLACE) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn rename_at_no_replace(
+    parent: &File,
+    from: &std::ffi::OsStr,
+    to: &std::ffi::OsStr,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (from, to) = (component_cstring(from)?, component_cstring(to)?);
+    let fd = parent.as_raw_fd();
+    if unsafe { libc::renameatx_np(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_EXCL) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn rename_at_no_replace(
+    _parent: &File,
+    _from: &std::ffi::OsStr,
+    _to: &std::ffi::OsStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this platform has no rename that refuses to replace",
+    ))
+}
+
+/// Rename the opened `file` to `parent/<name>`, refusing to replace an
+/// existing `name`.
+#[cfg(windows)]
+fn rename_opened_file_at(file: &File, parent: &File, name: &std::ffi::OsStr) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileRenameInformation, NtSetInformationFile, FILE_RENAME_INFORMATION,
+        FILE_RENAME_INFORMATION_0,
+    };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let wide: Vec<u16> = name.encode_wide().collect();
+    let name_bytes = wide
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename target is too long"))?;
+    let header_len = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+    let total_len = header_len
+        .checked_add(name_bytes as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename target is too long"))?;
+    let word_size = std::mem::size_of::<usize>();
+    let mut storage = vec![0usize; total_len.div_ceil(word_size)];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    unsafe {
+        std::ptr::write(
+            info,
+            FILE_RENAME_INFORMATION {
+                Anonymous: FILE_RENAME_INFORMATION_0 {
+                    ReplaceIfExists: false,
+                },
+                RootDirectory: parent.as_raw_handle().cast(),
+                FileNameLength: name_bytes,
+                FileName: [0],
+            },
+        );
+        std::ptr::copy_nonoverlapping(
+            wide.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            wide.len(),
+        );
+    }
+
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let status = unsafe {
+        NtSetInformationFile(
+            file.as_raw_handle().cast(),
+            &mut status_block,
+            info.cast(),
+            u32::try_from(total_len).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "rename buffer too large")
+            })?,
+            FileRenameInformation,
+        )
+    };
+    if status < 0 {
+        let os_error = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(os_error as i32));
+    }
+    Ok(())
+}
+
 fn remove_approved_file_inner(
     path: &Path,
     allowed_roots: &[String],
@@ -2608,6 +2792,51 @@ pub fn object_identity(path: &Path) -> io::Result<ObjectIdentity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approved_rename_publishes_the_pinned_file_and_never_replaces() {
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-approved-rename-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let (root, data) = (base.join("root"), base.join("data"));
+        let (dir, other_dir) = (root.join("Downloads"), root.join("Elsewhere"));
+        for path in [&dir, &other_dir, &data] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let allowed = [root.to_string_lossy().into_owned()];
+        initialize_approved_roots(&data, &allowed).unwrap();
+        let staged = dir.join(".copy.tmp");
+        std::fs::write(&staged, b"copy").unwrap();
+        let identity = object_identity(&staged).unwrap();
+        let taken = dir.join("taken.bin");
+        std::fs::write(&taken, b"theirs").unwrap();
+
+        let error = rename_approved_no_replace(&staged, &taken, &allowed, &identity).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(std::fs::read(&taken).unwrap(), b"theirs");
+        assert!(
+            rename_approved_no_replace(&staged, &other_dir.join("x.bin"), &allowed, &identity)
+                .is_err(),
+            "stays in one directory"
+        );
+        let other = dir.join("other.tmp");
+        std::fs::write(&other, b"other").unwrap();
+        assert!(
+            rename_approved_no_replace(&other, &dir.join("y.bin"), &allowed, &identity).is_err(),
+            "only the pinned object is renamed"
+        );
+
+        let published =
+            rename_approved_no_replace(&staged, &dir.join("free.bin"), &allowed, &identity)
+                .unwrap();
+        assert_eq!(std::fs::read(&published).unwrap(), b"copy");
+        assert!(!staged.exists());
+        assert_eq!(object_identity(&published).unwrap(), identity);
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     #[test]
     fn passive_policy_normalizes_and_rejects_ads() {

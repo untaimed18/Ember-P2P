@@ -2142,6 +2142,7 @@
   "transfers_failure_reason_transient": "Falha temporária de conexão",
   "transfers_failure_reason_no_channel": "Serviço de rede indisponível",
   "transfers_failure_reason_download_folder": "Não é possível gravar na pasta de downloads",
+  "transfers_failure_reason_part_folder_offline": "A unidade com o progresso deste download não está conectada. Ele continua assim que a unidade voltar.",
   "transfers_failure_reason_ember_pin_corrupt": "O resumo Ember salvo estava corrompido. Cancele este download e adicione o link eh= novamente.",
   "transfers_failure_reason_aich_pin_corrupt": "A marca AICH salva estava corrompida. Cancele este download e adicione o link AICH novamente.",
   "transfers_failure_reason_final_verify_inconclusive": "Não foi possível ler o arquivo concluído para verificá-lo",
