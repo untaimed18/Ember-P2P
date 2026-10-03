@@ -51,10 +51,9 @@ struct Located {
     /// Where each download's part files were last found or opened, this
     /// session or (restored from the database's record) the last.
     folders: HashMap<String, PathBuf>,
-    /// Downloads with progress that startup found in no folder it could look
-    /// at, with no record of one it could: any earlier folder that cannot be
-    /// looked at may hold them.
-    unplaced: HashSet<String>,
+    /// Downloads a worker last found waiting for the folder their part files
+    /// are in ([`DownloadFolders::folder_to_resume_in`]).
+    held: HashSet<String>,
     /// Other part file owners this run created files for.
     owners: HashSet<String>,
 }
@@ -66,20 +65,25 @@ fn located() -> &'static parking_lot::Mutex<Located> {
 
 /// Remember that this download's part files are in `folder`.
 pub fn note_located(transfer_id: &str, folder: &Path) {
-    let mut located = located().lock();
-    located.unplaced.remove(transfer_id);
-    located
+    located()
+        .lock()
         .folders
         .insert(transfer_id.to_string(), folder.to_path_buf());
 }
 
-/// Remember that this download has progress in a folder nothing could name.
-pub fn note_unplaced(transfer_id: &str) {
-    located().lock().unplaced.insert(transfer_id.to_string());
-}
-
-fn is_unplaced(transfer_id: &str) -> bool {
-    located().lock().unplaced.contains(transfer_id)
+/// Let a held download start over in `current`, the way out when the drive
+/// with its progress is gone for good: `true` when it was held, and its
+/// part files are now taken to be in `current`. The user asks for this by
+/// resuming it.
+pub fn start_over_if_held(transfer_id: &str, current: &Path) -> bool {
+    let mut located = located().lock();
+    if !located.held.remove(transfer_id) {
+        return false;
+    }
+    located
+        .folders
+        .insert(transfer_id.to_string(), current.to_path_buf());
+    true
 }
 
 /// Remember that this run creates part files for `owner`, a room transfer's
@@ -92,9 +96,7 @@ pub fn note_part_owner(owner: &str) {
 /// The startup orphan sweep never removes those, whatever their dates say.
 pub fn known_this_run(owner: &str) -> bool {
     let located = located().lock();
-    located.folders.contains_key(owner)
-        || located.unplaced.contains(owner)
-        || located.owners.contains(owner)
+    located.folders.contains_key(owner) || located.owners.contains(owner)
 }
 
 /// The folder this download's part files were last found in. Non-blocking.
@@ -103,14 +105,13 @@ pub fn located_folder(transfer_id: &str) -> Option<PathBuf> {
 }
 
 /// Whether `folder` may hold this download's part files as far as this run
-/// knows: they were last there, or the download is unplaced. Non-blocking.
+/// knows: they were last there. Non-blocking.
 pub fn may_hold_parts(transfer_id: &str, folder: &Path) -> bool {
-    let located = located().lock();
-    located.unplaced.contains(transfer_id)
-        || located
-            .folders
-            .get(transfer_id)
-            .is_some_and(|known| same_path(known, folder))
+    located()
+        .lock()
+        .folders
+        .get(transfer_id)
+        .is_some_and(|known| same_path(known, folder))
 }
 
 /// Whether `folder` can be looked at: it exists, or it is gone from a volume
@@ -259,6 +260,25 @@ impl DownloadFolders {
         PartLocation::Absent { unreachable }
     }
 
+    /// [`Self::locate_part`], where only the folder that can hold this
+    /// download's part files — the one they were last in, or the current one
+    /// for a download with no such folder — counts as unreachable. Another
+    /// folder that cannot be looked at is no evidence either way. Blocking.
+    pub fn locate_own_part(&self, transfer_id: &str) -> PartLocation {
+        let home = located_folder(transfer_id)
+            .filter(|last_seen| self.all().any(|folder| same_path(folder, last_seen)))
+            .unwrap_or_else(|| self.current.clone());
+        match self.locate_part(transfer_id) {
+            PartLocation::Absent { unreachable } => PartLocation::Absent {
+                unreachable: unreachable
+                    .into_iter()
+                    .filter(|folder| same_path(folder, &home))
+                    .collect(),
+            },
+            found => found,
+        }
+    }
+
     /// The folder whose `Temp` holds this download's `.part` or `.part.met`,
     /// or the current one for a download that has neither yet.
     ///
@@ -287,32 +307,36 @@ impl DownloadFolders {
     /// Starting such a download in the current folder would begin a second
     /// `.part` from zero, and once the drive came back the current folder's
     /// copy would win and strand the real progress. A download found nowhere
-    /// waits for the folder it was last in while that one cannot be reached,
-    /// and an unplaced one ([`note_unplaced`]) for any that cannot; it starts
-    /// over in the current folder once its folder answers without its part
-    /// files, or when it never had progress. Blocking.
+    /// waits for the folder it was last in while that one cannot be reached;
+    /// it starts over in the current folder once that folder answers without
+    /// its part files, when it has no such folder, or when the user resumes
+    /// it while it waits ([`start_over_if_held`]). Blocking.
     pub fn folder_to_resume_in(&self, transfer_id: &str) -> Result<PathBuf, PathBuf> {
         if self.previous.is_empty() {
             return Ok(self.current.clone());
         }
+        let resume_in = self.resume_folder(transfer_id);
+        let mut located = located().lock();
+        match &resume_in {
+            Ok(_) => located.held.remove(transfer_id),
+            Err(_) => located.held.insert(transfer_id.to_string()),
+        };
+        resume_in
+    }
+
+    fn resume_folder(&self, transfer_id: &str) -> Result<PathBuf, PathBuf> {
         let unreachable = match self.locate_part(transfer_id) {
             PartLocation::Found(folder) => return Ok(folder),
             PartLocation::Absent { unreachable } => unreachable,
         };
-        let Some(first_unreachable) = unreachable.first() else {
-            return Ok(self.current.clone());
-        };
         let last_seen = located_folder(transfer_id)
             .filter(|last_seen| self.all().any(|folder| same_path(folder, last_seen)));
-        match last_seen {
-            Some(last_seen) => match unreachable
-                .iter()
+        match last_seen.and_then(|last_seen| {
+            unreachable
+                .into_iter()
                 .find(|folder| same_path(folder, &last_seen))
-            {
-                Some(folder) => Err(folder.clone()),
-                None => Ok(self.current.clone()),
-            },
-            None if is_unplaced(transfer_id) => Err(first_unreachable.clone()),
+        }) {
+            Some(folder) => Err(folder),
             None => Ok(self.current.clone()),
         }
     }
@@ -493,10 +517,9 @@ pub struct UnfinishedDownloads {
 /// from it — forgotten first, the folder would lose its approval and the
 /// orphan, which can be a whole file whose removal failed after completion,
 /// would stay behind for good. One whose part files are unknown — it cannot
-/// be reached, or did not answer in time — is kept while an unfinished
-/// download with progress in none of the folders that were listed may be in
-/// it: the one its `.part` was last recorded in, or, when that is not one of
-/// these folders, any of them.
+/// be reached, or did not answer in time — is kept while it is the folder
+/// the `.part` of an unfinished download with progress in none of the
+/// folders that were listed was last recorded in.
 fn retain_needed(
     folders: &[PathBuf],
     listings: &[FolderListing],
@@ -510,19 +533,15 @@ fn retain_needed(
             .any(|names| names_hold(names, id))
     };
     let mut recorded_in = HashSet::new();
-    let mut anywhere = false;
     for (id, recorded) in &unfinished.with_progress {
         if listed(id) {
             continue;
         }
-        match folders
+        if let Some(index) = folders
             .iter()
             .position(|folder| same_folder(&folder.to_string_lossy(), recorded))
         {
-            Some(index) => {
-                recorded_in.insert(index);
-            }
-            None => anywhere = true,
+            recorded_in.insert(index);
         }
     }
     folders
@@ -540,7 +559,7 @@ fn retain_needed(
                         .iter()
                         .filter_map(|name| part_owner(name))
                         .any(|id| unfinished.ids.contains(id) || swept_owner(id)),
-                    None => anywhere || recorded_in.contains(index),
+                    None => recorded_in.contains(index),
                 }
         })
         .map(|(_, (folder, _))| folder.to_string_lossy().into_owned())
@@ -771,21 +790,19 @@ mod tests {
             "with no progress anywhere, nothing is waited for"
         );
 
-        let unplaced = uuid();
-        note_unplaced(&unplaced);
+        let unrecorded = uuid();
         assert_eq!(
-            folders.folder_to_resume_in(&unplaced),
-            Err(PathBuf::from(&offline)),
-            "progress with no record of where it is waits for the drives that are not there"
+            folders.folder_to_resume_in(&unrecorded),
+            Ok(PathBuf::from(&new)),
+            "progress with no record of where it is is not held for an unrelated drive: it \
+             starts over, as a missing `.part` always has"
         );
-        assert!(known_this_run(&unplaced));
 
         let recorded_nowhere_known = uuid();
         note_located(&recorded_nowhere_known, &scratch.0.join("forgotten"));
-        note_unplaced(&recorded_nowhere_known);
         assert_eq!(
             folders.folder_to_resume_in(&recorded_nowhere_known),
-            Err(PathBuf::from(&offline)),
+            Ok(PathBuf::from(&new)),
             "a record of a folder that is no longer a download folder says nothing"
         );
 
@@ -824,6 +841,71 @@ mod tests {
             folders.folder_to_resume_in(&id),
             Ok(PathBuf::from(&offline))
         );
+        assert!(
+            !start_over_if_held(&id, Path::new(&new)),
+            "no longer held: a Resume leaves its progress where it is"
+        );
+        assert_eq!(located_folder(&id), Some(PathBuf::from(&offline)));
+    }
+
+    /// The way out when the drive is gone for good: resuming a held download
+    /// starts it over in the current folder, and it is not held again.
+    #[test]
+    fn resuming_a_held_download_starts_it_over_in_the_current_folder() {
+        let scratch = Scratch::new();
+        let new = scratch.folder("new");
+        let offline = scratch.offline("old");
+        let folders = DownloadFolders::new(&new, std::slice::from_ref(&offline));
+        let (held, paused) = (uuid(), uuid());
+        note_located(&held, Path::new(&offline));
+        note_located(&paused, Path::new(&offline));
+        assert_eq!(folders.folder_to_resume_in(&held), Err(PathBuf::from(&offline)));
+
+        assert!(
+            !start_over_if_held(&paused, Path::new(&new)),
+            "one no worker has found waiting is left alone"
+        );
+        assert_eq!(located_folder(&paused), Some(PathBuf::from(&offline)));
+        assert!(start_over_if_held(&held, Path::new(&new)));
+        assert_eq!(folders.folder_to_resume_in(&held), Ok(PathBuf::from(&new)));
+        assert!(!start_over_if_held(&held, Path::new(&new)), "once");
+    }
+
+    /// For Remove from List, an unrelated folder that is not connected does
+    /// not stop it, and the one that can hold the download's part files does.
+    #[test]
+    fn only_the_folder_that_can_hold_a_download_counts_when_unreachable() {
+        let scratch = Scratch::new();
+        let new = scratch.folder("new");
+        let old = scratch.folder("old");
+        let offline = scratch.offline("older");
+        let folders = DownloadFolders::new(&new, &[old.clone(), offline.clone()]);
+        let absent = |unreachable: &[&str]| PartLocation::Absent {
+            unreachable: unreachable.iter().map(PathBuf::from).collect(),
+        };
+
+        let in_current = uuid();
+        touch(&new, &format!("{in_current}.part"));
+        assert_eq!(folders.locate_own_part(&in_current), PartLocation::Found(PathBuf::from(&new)));
+
+        let unrecorded = uuid();
+        assert_eq!(folders.locate_own_part(&unrecorded), absent(&[]));
+        assert_eq!(folders.locate_part(&unrecorded), absent(&[offline.as_str()]));
+
+        let recorded_offline = uuid();
+        note_located(&recorded_offline, Path::new(&offline));
+        assert_eq!(folders.locate_own_part(&recorded_offline), absent(&[offline.as_str()]));
+
+        let recorded_old = uuid();
+        note_located(&recorded_old, Path::new(&old));
+        touch(&old, &format!("{recorded_old}.part.met"));
+        assert_eq!(
+            folders.locate_own_part(&recorded_old),
+            PartLocation::Found(PathBuf::from(&old))
+        );
+
+        let current_offline = DownloadFolders::new(&offline, &[]);
+        assert_eq!(current_offline.locate_own_part(&unrecorded), absent(&[offline.as_str()]));
     }
 
     /// Deleting `D:\P2P` along with the `D:\P2P\Ember` download folder in it
@@ -1031,14 +1113,14 @@ mod tests {
             vec![path(1)],
             "progress found in no reachable folder is waited for on the folder it was in"
         );
-        assert_eq!(
-            retain(unfinished(&[&unrecorded], &[(&unrecorded, "")])),
-            vec![path(1), path(2)],
-            "progress with no folder on record may be on any folder that did not answer"
+        assert!(
+            retain(unfinished(&[&unrecorded], &[(&unrecorded, "")])).is_empty(),
+            "progress with no folder on record keeps no folder that did not answer: it starts \
+             over rather than waiting for one it may never have been in"
         );
-        assert_eq!(
-            retain(unfinished(&[&unrecorded], &[(&unrecorded, "/no/longer/a/folder")])),
-            vec![path(1), path(2)],
+        assert!(
+            retain(unfinished(&[&unrecorded], &[(&unrecorded, "/no/longer/a/folder")]))
+                .is_empty(),
             "nor with a record of a folder that is not one of them"
         );
         assert!(

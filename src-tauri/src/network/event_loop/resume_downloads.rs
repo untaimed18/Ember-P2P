@@ -33,8 +33,26 @@ struct RestoreJob {
     id: String,
     total_size: u64,
     file_name: String,
-    has_progress: bool,
     failed: bool,
+}
+
+/// Restored downloads whose finished copy is being checked, each with the
+/// status it goes back to when the copy is not its file.
+static COPY_CHECKS: parking_lot::Mutex<Option<HashMap<String, TransferStatus>>> =
+    parking_lot::Mutex::new(None);
+
+fn note_copy_check(transfer_id: &str, status: TransferStatus) {
+    COPY_CHECKS
+        .lock()
+        .get_or_insert_with(HashMap::new)
+        .insert(transfer_id.to_string(), status);
+}
+
+/// The status a restored download had before its finished copy was checked,
+/// when this failure is that check's: the copy is no evidence against any
+/// source, and a download the user had paused or stopped stays so.
+pub(in crate::network) fn take_copy_check(transfer_id: &str) -> Option<TransferStatus> {
+    COPY_CHECKS.lock().as_mut()?.remove(transfer_id)
 }
 
 /// What one listing of a download folder holds for the restore.
@@ -55,13 +73,30 @@ impl RootListing {
             copies: ed2k::transfer::earlier_completion_copies(&root.join("Downloads")),
         }
     }
+
+    /// [`Self::read`] for the current folder, whose part files are never
+    /// unknown: when its `Temp` cannot be listed, each download's are looked
+    /// up by name, as they were before there were earlier folders.
+    fn read_current(root: &Path, jobs: &[RestoreJob]) -> Self {
+        let mut listing = Self::read(root);
+        if listing.parts.is_none() {
+            let temp = root.join("Temp");
+            listing.parts = Some(
+                jobs.iter()
+                    .flat_map(|job| [format!("{}.part", job.id), format!("{}.part.met", job.id)])
+                    .filter(|name| temp.join(name).exists())
+                    .collect(),
+            );
+        }
+        listing
+    }
 }
 
 /// Read each restored download's `.part` from whichever download folder holds
-/// it, listing every folder once, in parallel, for at most `budget`. One
-/// found nowhere is taken to be in the folder `recorded` last saw it in, so
-/// a worker waits for that folder if it is offline; one with progress and no
-/// such record waits for every earlier folder whose listing is unknown.
+/// it, listing every folder once. The current folder is listed for as long
+/// as it takes; the earlier ones in parallel with it, for at most `budget`.
+/// One found nowhere is taken to be in the folder `recorded` last saw it
+/// in, so a worker waits for that folder if it is offline.
 ///
 /// A completion copy shorter than the file, or one of a download that failed
 /// verification, is removed while the `.part` it was made from is there, and
@@ -75,8 +110,24 @@ fn read_restored_parts(
 ) -> RestoredParts {
     let roots = folders.roots();
     let paths: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
-    let listings =
-        crate::storage::part_folders::probe_within(&paths, budget, RootListing::read);
+    let Some((current, earlier)) = paths.split_first() else {
+        return restore_from_listings(&roots, &[], jobs, recorded);
+    };
+    let listings: Vec<Option<RootListing>> = std::thread::scope(|scope| {
+        let listing_earlier = (!earlier.is_empty()).then(|| {
+            scope.spawn(|| {
+                crate::storage::part_folders::probe_within(earlier, budget, RootListing::read)
+            })
+        });
+        let current = RootListing::read_current(current, &jobs);
+        let earlier_listings = match listing_earlier {
+            Some(listing) => listing
+                .join()
+                .unwrap_or_else(|_| earlier.iter().map(|_| None).collect()),
+            None => Vec::new(),
+        };
+        std::iter::once(Some(current)).chain(earlier_listings).collect()
+    });
     restore_from_listings(&roots, &listings, jobs, recorded)
 }
 
@@ -90,10 +141,6 @@ fn restore_from_listings(
 ) -> RestoredParts {
     use crate::storage::part_folders::{names_hold, same_folder};
     let paths: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
-    let earlier_unknown = listings
-        .iter()
-        .skip(1)
-        .any(|listing| listing.as_ref().and_then(|l| l.parts.as_ref()).is_none());
     let mut copies: HashMap<String, Vec<(PathBuf, usize)>> = HashMap::new();
     for (index, listing) in listings.iter().enumerate() {
         for (stem, path) in listing.iter().flat_map(|listing| &listing.copies) {
@@ -133,18 +180,14 @@ fn restore_from_listings(
                     );
                 }
             }
-            None => match recorded
-                .get(&job.id)
-                .filter(|recorded| roots.iter().any(|root| same_folder(root, recorded)))
-            {
-                Some(recorded) => {
+            None => {
+                if let Some(recorded) = recorded
+                    .get(&job.id)
+                    .filter(|recorded| roots.iter().any(|root| same_folder(root, recorded)))
+                {
                     crate::storage::part_folders::note_located(&job.id, Path::new(recorded))
                 }
-                None if job.has_progress && earlier_unknown => {
-                    crate::storage::part_folders::note_unplaced(&job.id)
-                }
-                None => {}
-            },
+            }
         }
         let part_files = found.map(|index| {
             let temp = paths[index].join("Temp");
@@ -223,11 +266,30 @@ fn verify_restored_file(
     Ok(Ok(()))
 }
 
+/// Remove a recovered download's `.part` and `.part.met` from `folder`, or
+/// have them removed once they can be. Blocking.
+fn remove_recovered_part_files(folder: &Path, transfer_id: &str) {
+    let allowed = [folder.to_string_lossy().into_owned()];
+    for name in [format!("{transfer_id}.part"), format!("{transfer_id}.part.met")] {
+        let path = folder.join("Temp").join(name);
+        match crate::security::filesystem::remove_approved_file(&path, &allowed) {
+            Ok(()) => info!("Removed {}, which a recovered finished copy replaces", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!("Could not remove {}: {e}. Removing it later.", path.display());
+                crate::storage::deferred_removals::defer(&path, &allowed);
+            }
+        }
+    }
+}
+
 /// Check a restored download's completion copies, one by one, and publish
-/// the first that is its file; the others are removed or, unreadable, kept.
-/// `Ok` names the published file, and `Err` is why none was. Blocking.
+/// the first that is its file into `download_root`'s `Downloads`; the others
+/// are removed or, unreadable, kept. `Ok` names the published file, and
+/// `Err` is why none was. Blocking.
 fn recover_restored_copies(
     copies: &[(PathBuf, String)],
+    download_root: &str,
     file_name: &str,
     size: u64,
     expected: &str,
@@ -249,8 +311,18 @@ fn recover_restored_copies(
             }
             continue;
         }
-        match ed2k::transfer::recover_completion_copy(copy, root, file_name, size, &is_the_file) {
-            Ok(ed2k::transfer::CopyRecovery::Published(path)) => published = Some(path),
+        match ed2k::transfer::recover_completion_copy(
+            copy,
+            root,
+            download_root,
+            file_name,
+            size,
+            &is_the_file,
+        ) {
+            Ok(
+                ed2k::transfer::CopyRecovery::Published(path)
+                | ed2k::transfer::CopyRecovery::AlreadyPublished(path),
+            ) => published = Some(path),
             Ok(ed2k::transfer::CopyRecovery::NotTheFile) => {
                 info!("Removed completion copy {}, which is not the finished file", copy.display())
             }
@@ -296,7 +368,6 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 id: t.id.clone(),
                 total_size: t.total_size,
                 file_name: t.file_name.clone(),
-                has_progress: t.transferred > 0,
                 failed: t.status == TransferStatus::Failed,
             })
             .collect();
@@ -338,8 +409,9 @@ pub(in crate::network) async fn resume_incomplete_downloads(
         let RestoredParts {
             parts: progress_map,
             copies: mut completion_copies,
-            ..
+            found: found_parts,
         } = part_progress_map.take().unwrap();
+        let found_parts: HashMap<String, String> = found_parts.into_iter().collect();
         let count = incomplete.len();
         info!("Resuming {count} incomplete downloads from previous session");
         let dl_folder = settings.download_folder.clone();
@@ -418,6 +490,9 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 let expected_ember = transfer.ember_file_hash.clone();
                 let ember_pinned = expected_ember.is_some();
                 let tx = dl_event_tx.clone();
+                let download_root = dl_folder.clone();
+                let part_files_in = found_parts.get(&tid).map(PathBuf::from);
+                note_copy_check(&tid, transfer.status.clone());
                 transfer.status = TransferStatus::Verifying;
                 transfer.speed = 0;
                 restore_db_writes.push(transfer.clone());
@@ -428,25 +503,34 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 }
                 let handle_id = tid.clone();
                 let handle = tokio::spawn(async move {
+                    let part_owner = tid.clone();
                     let recovered = tokio::task::spawn_blocking(move || {
-                        recover_restored_copies(
+                        let published = recover_restored_copies(
                             &copies,
+                            &download_root,
                             &file_name,
                             file_size,
                             &expected,
                             expected_aich.as_deref(),
                             expected_ember.as_deref(),
-                        )
+                        )?;
+                        if let Some(folder) = part_files_in {
+                            remove_recovered_part_files(&folder, &part_owner);
+                        }
+                        Ok::<_, String>(published)
                     })
                     .await
                     .unwrap_or_else(|e| Err(format!("Restored final file could not be read: {e}")));
                     let event = match recovered {
-                        Ok(final_path) => DownloadEvent::Completed {
-                            transfer_id: tid,
-                            final_path: Some(final_path.to_string_lossy().into_owned()),
-                            part_hashes: Vec::new(),
-                            ember_verified: ember_pinned,
-                        },
+                        Ok(final_path) => {
+                            take_copy_check(&tid);
+                            DownloadEvent::Completed {
+                                transfer_id: tid,
+                                final_path: Some(final_path.to_string_lossy().into_owned()),
+                                part_hashes: Vec::new(),
+                                ember_verified: ember_pinned,
+                            }
+                        }
                         Err(error) => {
                             let failure_kind = ed2k::transfer::classify_error(&error);
                             DownloadEvent::Failed {
@@ -798,12 +882,11 @@ mod tests {
         }
     }
 
-    fn job(id: &str, has_progress: bool) -> RestoreJob {
+    fn job(id: &str) -> RestoreJob {
         RestoreJob {
             id: id.to_string(),
             total_size: 100,
             file_name: format!("{id}.bin"),
-            has_progress,
             failed: false,
         }
     }
@@ -835,7 +918,7 @@ mod tests {
             &folders,
             [&before, &after, &never, &gone, &moved]
                 .into_iter()
-                .map(|id| job(id, true))
+                .map(|id| job(id))
                 .collect(),
             &recorded,
             BUDGET,
@@ -854,9 +937,10 @@ mod tests {
         assert_eq!(found, HashSet::from([before.as_str(), after.as_str(), moved.as_str()]));
     }
 
-    /// Paused on an external drive that is unplugged at startup, with no
-    /// record of where it was: it waits for the drive instead of starting
-    /// over in the current folder, and resumes from it once it is back.
+    /// Paused on an external drive that is unplugged at startup: with the
+    /// drive on record it waits for it instead of starting over in the
+    /// current folder, and resumes from it once it is back. With no record
+    /// it is not held for a drive it may never have been on.
     #[test]
     fn a_paused_download_on_an_unplugged_drive_is_held_not_restarted() {
         let scratch = Scratch::new("unplugged");
@@ -864,20 +948,20 @@ mod tests {
         let volume = scratch.0.join("unplugged");
         let external = volume.join("ember");
         let folders = scratch.folders(&current, &[&external]);
-        let (paused, fresh) = (uuid(), uuid());
+        let (paused, unrecorded) = (uuid(), uuid());
         simulate_unplugged(&volume, true);
 
         read_restored_parts(
             &folders,
-            vec![job(&paused, true), job(&fresh, false)],
-            &HashMap::new(),
+            vec![job(&paused), job(&unrecorded)],
+            &HashMap::from([(paused.clone(), external.to_string_lossy().into_owned())]),
             BUDGET,
         );
         assert_eq!(folders.folder_to_resume_in(&paused), Err(external.clone()));
         assert_eq!(
-            folders.folder_to_resume_in(&fresh),
+            folders.folder_to_resume_in(&unrecorded),
             Ok(current.clone()),
-            "nothing downloaded yet: nothing to wait for"
+            "no record of the drive: a missing `.part` starts over, as it always has"
         );
         assert!(!current.join("Temp").join(format!("{paused}.part")).exists());
 
@@ -898,8 +982,8 @@ mod tests {
         restore_from_listings(
             &folders.roots(),
             &[Some(RootListing::read(&current)), None],
-            vec![job(&id, true)],
-            &HashMap::new(),
+            vec![job(&id)],
+            &HashMap::from([(id.clone(), slow.to_string_lossy().into_owned())]),
         );
         assert!(crate::storage::part_folders::known_this_run(&id));
         assert!(
@@ -908,12 +992,69 @@ mod tests {
         );
     }
 
+    /// The current folder has no time limit: a slow disk or a huge folder
+    /// still restores every download's progress, and the budget only ever
+    /// cuts off an earlier folder.
+    #[test]
+    fn the_current_folder_is_listed_however_long_it_takes() {
+        let scratch = Scratch::new("slow-current");
+        let current = scratch.folder("current");
+        let (partial, complete) = (uuid(), uuid());
+        let mut half = vec![0u8; 100];
+        half[..10].fill(1);
+        std::fs::write(current.join("Temp").join(format!("{partial}.part")), &half).unwrap();
+        std::fs::write(current.join("Temp").join(format!("{complete}.part")), vec![1u8; 100])
+            .unwrap();
+        let restored = read_restored_parts(
+            &scratch.folders(&current, &[]),
+            vec![job(&partial), job(&complete)],
+            &HashMap::new(),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(restored.parts[&partial].folder, current);
+        assert_eq!(restored.parts[&complete].folder, current);
+
+        let old = scratch.folder("old");
+        let restored = read_restored_parts(
+            &scratch.folders(&current, &[&old]),
+            vec![job(&partial)],
+            &HashMap::new(),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(restored.parts[&partial].folder, current, "still no limit with earlier folders");
+    }
+
+    /// Regression, one download folder: restoring with progress is not held
+    /// and not time-limited, whatever the budget, and the restored progress
+    /// is read from the `.part` as before.
+    #[test]
+    fn a_single_folder_restore_reads_progress_without_a_budget_or_a_hold() {
+        let scratch = Scratch::new("single");
+        let current = scratch.folder("current");
+        let folders = scratch.folders(&current, &[]);
+        let (with_part, without_part) = (uuid(), uuid());
+        std::fs::write(current.join("Temp").join(format!("{with_part}.part")), vec![0u8; 100])
+            .unwrap();
+        let restored = read_restored_parts(
+            &folders,
+            vec![job(&with_part), job(&without_part)],
+            &HashMap::new(),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(restored.parts[&with_part].folder, current);
+        assert!(!restored.parts.contains_key(&without_part));
+        for id in [&with_part, &without_part] {
+            assert_eq!(folders.folder_to_resume_in(id), Ok(current.clone()), "never held");
+            assert!(!crate::storage::part_folders::start_over_if_held(id, &current));
+        }
+    }
+
     #[test]
     fn each_download_folder_is_listed_once_however_many_downloads_there_are() {
         let scratch = Scratch::new("listed");
         let (current, old) = (scratch.folder("current"), scratch.folder("old"));
         let folders = scratch.folders(&current, &[&old]);
-        let jobs: Vec<RestoreJob> = (0..50).map(|_| job(&uuid(), true)).collect();
+        let jobs: Vec<RestoreJob> = (0..50).map(|_| job(&uuid())).collect();
         read_restored_parts(&folders, jobs, &HashMap::new(), BUDGET);
         let listed = LISTED_ROOTS.lock().clone();
         for root in [&current, &old] {
@@ -962,14 +1103,14 @@ mod tests {
         let restored = read_restored_parts(
             &folders,
             vec![
-                job(&only_copy, true),
-                job(&restarted, true),
-                job(&half_done, true),
+                job(&only_copy),
+                job(&restarted),
+                job(&half_done),
                 RestoreJob {
                     failed: true,
-                    ..job(&failed, true)
+                    ..job(&failed)
                 },
-                job(&short_restarted, true),
+                job(&short_restarted),
             ],
             &HashMap::new(),
             BUDGET,
@@ -985,8 +1126,10 @@ mod tests {
             "a `.part` started since the copy never costs the copy"
         );
 
+        let root = current.to_string_lossy().into_owned();
         let published = recover_restored_copies(
             &restored.copies[&restarted],
+            &root,
             "movie.bin",
             100,
             &hash,
@@ -1001,6 +1144,7 @@ mod tests {
         assert_eq!(
             recover_restored_copies(
                 &restored.copies[&only_copy],
+                &root,
                 "movie.bin",
                 100,
                 &"00".repeat(16),
@@ -1011,5 +1155,107 @@ mod tests {
             "not the file: the download resumes as usual"
         );
         assert!(!whole.exists());
+    }
+
+    /// A failed copy check is told apart from a download's own failures, so
+    /// it blames no source and the status the user left is kept; once only.
+    #[test]
+    fn a_copy_check_is_remembered_until_its_failure_is_handled() {
+        let id = uuid();
+        assert_eq!(take_copy_check(&id), None);
+        note_copy_check(&id, TransferStatus::Paused);
+        assert_eq!(take_copy_check(&id), Some(TransferStatus::Paused));
+        assert_eq!(take_copy_check(&id), None, "a later failure is the download's own");
+    }
+
+    /// A copy left in an earlier folder's Downloads is published into the
+    /// current one, as a completion would publish it, so Open and Reveal find
+    /// it; and the `.part` it replaces goes with it.
+    #[test]
+    fn a_recovered_copy_is_published_into_the_current_downloads() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let scratch = Scratch::new("recovered-elsewhere");
+        let (old, current, data) =
+            (scratch.folder("old"), scratch.folder("current"), scratch.0.join("data"));
+        std::fs::create_dir_all(&data).unwrap();
+        let folders = scratch.folders(&current, &[&old]);
+        crate::security::filesystem::initialize_approved_roots(&data, &folders.roots()).unwrap();
+        let finished = vec![9u8; 100];
+        let hashed = scratch.0.join("finished");
+        std::fs::write(&hashed, &finished).unwrap();
+        let hash = ed2k::hash::ed2k_hash_open_file(&mut std::fs::File::open(&hashed).unwrap())
+            .unwrap();
+        let id = uuid();
+        let copy = copy_in(&old, &id, &finished);
+        let part = old.join("Temp").join(format!("{id}.part"));
+        std::fs::write(&part, b"started over").unwrap();
+        std::fs::write(part.with_extension("part.met"), b"met").unwrap();
+
+        let published = recover_restored_copies(
+            &[(copy.clone(), old.to_string_lossy().into_owned())],
+            &current.to_string_lossy(),
+            "movie.bin",
+            100,
+            &hash,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            published.canonicalize().unwrap(),
+            current.join("Downloads").join("movie.bin").canonicalize().unwrap()
+        );
+        assert_eq!(std::fs::read(&published).unwrap(), finished);
+        assert!(!copy.exists());
+        assert!(!old.join("Downloads").join("movie.bin").exists());
+
+        remove_recovered_part_files(&old, &id);
+        assert!(!part.exists(), "the stale `.part` does not outlive the recovery");
+        assert!(!part.with_extension("part.met").exists());
+    }
+
+    /// A copy whose publication went through before the crash — its file
+    /// already there as `name (1)`, linked or with its hash — is not
+    /// published a second time.
+    #[test]
+    fn a_copy_already_published_under_a_numbered_name_is_not_published_again() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let scratch = Scratch::new("already-published");
+        let (current, data) = (scratch.folder("current"), scratch.0.join("data"));
+        std::fs::create_dir_all(&data).unwrap();
+        let root = current.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(&data, std::slice::from_ref(&root))
+            .unwrap();
+        let finished = vec![5u8; 100];
+        let hashed = scratch.0.join("finished");
+        std::fs::write(&hashed, &finished).unwrap();
+        let hash = ed2k::hash::ed2k_hash_open_file(&mut std::fs::File::open(&hashed).unwrap())
+            .unwrap();
+        let downloads = current.join("Downloads");
+        std::fs::write(downloads.join("movie.bin"), b"someone else's").unwrap();
+        let linked = copy_in(&current, &uuid(), &finished);
+        std::fs::hard_link(&linked, downloads.join("movie (1).bin")).unwrap();
+
+        let recover = |copy: &Path| {
+            recover_restored_copies(
+                &[(copy.to_path_buf(), root.clone())],
+                &root,
+                "movie.bin",
+                100,
+                &hash,
+                None,
+                None,
+            )
+        };
+        let published = recover(&linked).unwrap();
+        assert_eq!(published, downloads.join("movie (1).bin"));
+        assert!(!linked.exists());
+        assert!(!downloads.join("movie (2).bin").exists());
+
+        let same_bytes = copy_in(&current, &uuid(), &finished);
+        let published = recover(&same_bytes).unwrap();
+        assert_eq!(published, downloads.join("movie (1).bin"), "the same file by its hash");
+        assert!(!same_bytes.exists());
+        assert!(!downloads.join("movie (2).bin").exists());
     }
 }

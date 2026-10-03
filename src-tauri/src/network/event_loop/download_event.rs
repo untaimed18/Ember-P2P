@@ -118,6 +118,27 @@ fn completed_download_friends_only(
     existing_record.unwrap_or(from_restricting_friend)
 }
 
+/// Give a restored download whose finished copy was not its file back the
+/// paused or stopped `status` it had, where a normal restore puts such a row,
+/// unless the user changed it while the copy was checked. `true` when it was.
+fn restore_status_after_copy_check(
+    mgr: &mut TransferManager,
+    transfer_id: &str,
+    status: TransferStatus,
+) -> bool {
+    let checking = mgr
+        .active
+        .get(transfer_id)
+        .is_some_and(|row| row.status == TransferStatus::Verifying);
+    let Some(mut row) = checking.then(|| mgr.active.remove(transfer_id)).flatten() else {
+        return false;
+    };
+    row.status = status;
+    row.speed = 0;
+    mgr.enqueue(row);
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_download_event(
     event: DownloadEvent,
@@ -787,7 +808,8 @@ pub(in crate::network) async fn on_download_event(
                 | ed2k::transfer::TransferFailureCode::LocalReadFailed
                 | ed2k::transfer::TransferFailureCode::CompletionMoveFailed
         );
-        let blames_source = !is_folder_error && !is_local_read_error;
+        let copy_check = super::resume_downloads::take_copy_check(transfer_id);
+        let blames_source = !is_folder_error && !is_local_read_error && copy_check.is_none();
 
         // Prefer is_user_cancel_error for source-failure classification;
         // also honour an already-cancelled control (cancel race).
@@ -875,6 +897,28 @@ pub(in crate::network) async fn on_download_event(
             if let Some((fh, ip, port)) = retire {
                 retire_dead_source_from_registry(source_manager, &fh, ip, port).await;
             }
+        }
+
+        // A restored download whose finished copy was not its file resumes
+        // as it was left, and one the user had paused or stopped stays so.
+        if let Some(status @ (TransferStatus::Paused | TransferStatus::Stopped)) = copy_check {
+            let restored = restore_status_after_copy_check(
+                &mut *transfer_manager.write().await,
+                transfer_id,
+                status.clone(),
+            );
+            if restored {
+                let key = if status == TransferStatus::Paused { "paused" } else { "stopped" };
+                spawn_transfer_status_write(
+                    transfer_status_writes,
+                    db.clone(),
+                    transfer_id.clone(),
+                    key,
+                );
+                crate::commands::transfers::emit_transfer_status(app_handle, transfer_id, &status);
+            }
+            info!("Restored download {transfer_id} keeps its {status:?} state: {error}");
+            return;
         }
 
         // eMule-style: downloads never auto-fail. Re-queue for source
@@ -1903,5 +1947,45 @@ mod requeue_tests {
             ),
             ed2k::transfer::TransferFailureCode::CompletionMoveFailed
         );
+    }
+
+    fn checking(id: &str) -> Transfer {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "file_name": "movie.bin",
+            "file_hash": "00".repeat(16),
+            "peer_id": "203.0.113.7:4662",
+            "peer_name": "",
+            "direction": "download",
+            "status": "verifying",
+            "progress": 0.0,
+            "speed": 0,
+            "total_size": 100,
+            "transferred": 0,
+            "started_at": 0,
+        }))
+        .unwrap()
+    }
+
+    /// A paused download whose leftover finished copy fails its check stays
+    /// paused, as a normal restore leaves it, instead of starting to download.
+    #[test]
+    fn a_paused_download_whose_copy_fails_its_check_stays_paused() {
+        let mut mgr = TransferManager::new(3);
+        mgr.active.insert("paused".into(), checking("paused"));
+        assert!(restore_status_after_copy_check(&mut mgr, "paused", TransferStatus::Paused));
+        let row = mgr.get_transfer("paused").unwrap();
+        assert_eq!(row.status, TransferStatus::Paused);
+        assert!(!mgr.active.contains_key("paused"), "queued like any restored paused row");
+
+        let mut resumed = checking("resumed");
+        resumed.status = TransferStatus::Searching;
+        mgr.active.insert("resumed".into(), resumed);
+        assert!(
+            !restore_status_after_copy_check(&mut mgr, "resumed", TransferStatus::Stopped),
+            "a row the user changed while it was checked is left as they set it"
+        );
+        assert_eq!(mgr.get_transfer("resumed").unwrap().status, TransferStatus::Searching);
+        assert!(!restore_status_after_copy_check(&mut mgr, "gone", TransferStatus::Paused));
     }
 }

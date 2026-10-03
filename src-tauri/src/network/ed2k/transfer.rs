@@ -1267,7 +1267,7 @@ transfer_failure_codes! {
     DownloadFolderUnavailable => "download_folder_unavailable",
         "The download folder cannot be written; check it in Settings";
     PartFolderOffline => "part_folder_offline",
-        "The drive holding this download's progress is not connected";
+        "The drive holding this download's progress is not connected; Resume starts it over";
     EmberPinCorrupt => "ember_pin_corrupt",
         "Persisted Ember digest was corrupt; cancel and re-add the eh= link";
     AichPinCorrupt => "aich_pin_corrupt",
@@ -2497,6 +2497,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    /// Regression for volumes without hard links (exFAT, FAT32, some
+    /// shares), where the scanner's hold cannot be got round by a link: a
+    /// short hold is waited out as everywhere, and a long one ends in the
+    /// file copied straight to a free name, as before the temporary copy
+    /// existed, rather than in a failed completion.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_copy_on_a_volume_without_hard_links_still_completes() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-held-no-links-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let (root, data) = (base.join("root"), base.join("data"));
+        let downloads = root.join("Downloads");
+        for dir in [root.join("Temp"), downloads.clone(), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let root_string = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(
+            &data,
+            std::slice::from_ref(&root_string),
+        )
+        .unwrap();
+        let allowed = [root_string];
+        let part = root.join("Temp").join("source.part");
+        let identity = |part: &std::path::Path| {
+            let (_, opened) =
+                crate::security::filesystem::open_existing_approved(part, &allowed, false)
+                    .unwrap();
+            crate::security::filesystem::opened_file_identity(&opened).unwrap()
+        };
+        let complete = |held: u32, name: &str| {
+            HARD_LINKS_UNSUPPORTED.with(|unsupported| unsupported.set(true));
+            COMPLETION_COPY_HELD.with(|copy_held| copy_held.set(held));
+            let moved = move_part_to_final_with_roots(
+                &part,
+                &downloads.join(name),
+                &allowed,
+                Some(&identity(&part)),
+                false,
+            );
+            COMPLETION_COPY_HELD.with(|copy_held| copy_held.set(0));
+            HARD_LINKS_UNSUPPORTED.with(|unsupported| unsupported.set(false));
+            moved
+        };
+
+        std::fs::write(&part, b"held a moment").unwrap();
+        let moved = complete(2, "moment.bin").unwrap();
+        assert_eq!(moved.file_name().unwrap(), "moment.bin");
+        assert_eq!(std::fs::read(&moved).unwrap(), b"held a moment");
+        assert!(!part.exists());
+
+        std::fs::write(&part, b"held for good").unwrap();
+        std::fs::write(downloads.join("held.bin"), b"someone else's").unwrap();
+        let moved = complete(u32::MAX, "held.bin").unwrap();
+        assert_eq!(moved.file_name().unwrap(), "held (1).bin", "a free name, never a replace");
+        assert_eq!(std::fs::read(&moved).unwrap(), b"held for good");
+        assert_eq!(std::fs::read(downloads.join("held.bin")).unwrap(), b"someone else's");
+        assert!(!part.exists());
+        assert!(completion_copies_in(&downloads).is_empty(), "the held copy is removed");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn a_completion_copy_is_named_so_the_library_never_shares_it() {
         let id = uuid::Uuid::new_v4().to_string();
@@ -2505,6 +2570,12 @@ mod tests {
             let part = std::path::Path::new("Temp").join(format!("{stem}.part"));
             let name = completion_copy_name(&part);
             assert_eq!(parse_completion_copy_name(&name), Some(stem));
+            let copy_of_copy = completion_copy_name(std::path::Path::new(&name));
+            assert_eq!(
+                parse_completion_copy_name(&copy_of_copy),
+                Some(stem),
+                "a recovered copy published across volumes keeps naming its download"
+            );
             assert!(crate::sharing::indexer::is_excluded_share_file_name(
                 std::path::Path::new(&name)
             ));
@@ -2564,7 +2635,8 @@ mod tests {
         let leftover = copy_of(&new, "Downloads", &duplicate, b"song bytes");
         std::fs::write(downloads.join("song.bin"), b"song bytes").unwrap();
         let linked_copy = copy_of(&new, "Downloads", &linked, b"clip bytes");
-        std::fs::hard_link(&linked_copy, downloads.join("clip (2).bin")).unwrap();
+        std::fs::write(downloads.join("clip.bin"), b"another clip").unwrap();
+        std::fs::hard_link(&linked_copy, downloads.join("clip (1).bin")).unwrap();
         let restarted = copy_of(&new, "Downloads", &newer, b"finished bytes");
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(new.join("Temp").join(format!("{newer}.part")), b"x").unwrap();
@@ -2593,7 +2665,7 @@ mod tests {
             } else if stem == duplicate {
                 CopyOwner::Finished(finished_file("song.bin", b"song bytes"))
             } else if stem == linked {
-                CopyOwner::Finished(finished_file("clip (2).bin", b"clip bytes"))
+                CopyOwner::Finished(finished_file("clip.bin", b"clip bytes"))
             } else {
                 CopyOwner::Unknown
             }
@@ -2624,7 +2696,12 @@ mod tests {
         assert!(!leftover.exists(), "the finished file is there: its copy goes");
         assert!(!downloads.join("song (1).bin").exists(), "and is not published again");
         assert!(!linked_copy.exists(), "a copy linked as the finished file goes");
-        assert_eq!(std::fs::read(downloads.join("clip (2).bin")).unwrap(), b"clip bytes");
+        assert_eq!(
+            std::fs::read(downloads.join("clip (1).bin")).unwrap(),
+            b"clip bytes",
+            "the name it was published as, the plain one being taken"
+        );
+        assert!(!downloads.join("clip (2).bin").exists(), "and it is not published again");
         assert!(restarted.exists(), "a .part newer than the copy never costs the copy");
         assert!(unknown.exists(), "a copy nothing can check is kept");
         assert!(unrelated.exists());
@@ -7452,7 +7529,7 @@ fn completion_copy_name(part_path: &std::path::Path) -> String {
     let stem = part_path
         .file_name()
         .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_suffix(".part"))
+        .and_then(|name| name.strip_suffix(".part").or_else(|| parse_completion_copy_name(name)))
         .filter(|stem| is_copy_name_stem(stem))
         .unwrap_or("unknown");
     format!(
@@ -7573,6 +7650,9 @@ thread_local! {
     /// scanner holding the copy would; `u32::MAX` holds it for good, against
     /// the hard link too.
     static COMPLETION_COPY_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Makes [`CompletionCopy::publish`]'s hard link fail as on a volume
+    /// without hard links.
+    static HARD_LINKS_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A finished file copied in full, flushed and synced under a temporary name
@@ -7628,21 +7708,48 @@ impl CompletionCopy {
         if final_path.exists() {
             return Err(error);
         }
+        // A scanner holding the fresh copy open without delete sharing
+        // blocks a rename on Windows, but not a hard link. A volume without
+        // hard links (exFAT, FAT32, some shares) is answered like one without
+        // a no-replace rename: the caller copies the file straight to a free
+        // name, as before the temporary copy existed.
+        match self.hard_link_to(final_path, allowed_roots) {
+            Ok(linked) => {
+                self.discard(allowed_roots);
+                Ok(linked)
+            }
+            Err(link_error)
+                if hard_link_fallback_allowed(&link_error)
+                    && !held_by_another_process(&link_error) =>
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!("{error}; no hard links here either ({link_error})"),
+                ))
+            }
+            Err(_) => Err(error),
+        }
+    }
+
+    fn hard_link_to(
+        &self,
+        final_path: &std::path::Path,
+        allowed_roots: &[String],
+    ) -> std::io::Result<std::path::PathBuf> {
+        #[cfg(test)]
+        if HARD_LINKS_UNSUPPORTED.with(std::cell::Cell::get) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        }
         #[cfg(test)]
         if COMPLETION_COPY_HELD.with(std::cell::Cell::get) == u32::MAX {
-            return Err(error);
+            return Err(std::io::Error::from_raw_os_error(32));
         }
-        // A scanner holding the fresh copy open without delete sharing
-        // blocks a rename on Windows, but not a hard link.
-        let linked = crate::security::filesystem::hard_link_approved(
+        crate::security::filesystem::hard_link_approved(
             &self.path,
             final_path,
             allowed_roots,
             &self.identity,
         )
-        .map_err(|_| error)?;
-        self.discard(allowed_roots);
-        Ok(linked)
     }
 
     fn rename_no_replace(
@@ -7890,9 +7997,12 @@ pub(crate) fn settle_stale_completion_copies(
             let path = entry.path();
             match owner(stem) {
                 CopyOwner::Unfinished => {}
-                CopyOwner::Finished(expected) => {
-                    settle_finished_copy(&path, &dir, root, &expected)
-                }
+                CopyOwner::Finished(expected) => settle_finished_copy(
+                    &path,
+                    root,
+                    download_roots.first().map_or(root, String::as_str),
+                    &expected,
+                ),
                 CopyOwner::Unknown => match completion_source(download_roots, stem) {
                     Ok(Some(part)) if made_before(&part, &copy) => {
                         remove_interrupted_copy(&path, &allowed)
@@ -7925,23 +8035,28 @@ fn remove_interrupted_copy(path: &std::path::Path, allowed: &[String]) {
 
 fn settle_finished_copy(
     path: &std::path::Path,
-    dir: &std::path::Path,
     root: &str,
+    download_root: &str,
     expected: &ExpectedFinishedFile,
 ) {
-    let allowed = [root.to_string()];
-    let published = dir.join(crate::security::sanitize_filename(&expected.name));
-    if is_published_as(path, &published, &allowed, expected) {
-        remove_interrupted_copy(path, &allowed);
-        return;
-    }
     let is_the_file = |file: &mut std::fs::File| -> anyhow::Result<bool> {
         Ok(super::hash::ed2k_hash_open_file(file)?.eq_ignore_ascii_case(&expected.ed2k_hash))
     };
-    match recover_completion_copy(path, root, &expected.name, expected.size, &is_the_file) {
+    match recover_completion_copy(
+        path,
+        root,
+        download_root,
+        &expected.name,
+        expected.size,
+        &is_the_file,
+    ) {
         Ok(CopyRecovery::Published(published)) => tracing::warn!(
             "Recovered a finished file whose publication was interrupted as {}",
             published.display()
+        ),
+        Ok(CopyRecovery::AlreadyPublished(_)) => tracing::info!(
+            "Removed interrupted completion copy {}: the finished file is there",
+            path.display()
         ),
         Ok(CopyRecovery::NotTheFile) => tracing::info!(
             "Removed completion copy {}, which is not the finished file",
@@ -7951,33 +8066,60 @@ fn settle_finished_copy(
     }
 }
 
-/// Whether `published` is the finished file the copy at `path` was published
-/// as: the same file, or `expected` in full. Blocking.
-fn is_published_as(
-    path: &std::path::Path,
-    published: &std::path::Path,
-    allowed: &[String],
-    expected: &ExpectedFinishedFile,
-) -> bool {
-    let Ok((_, mut file)) =
-        crate::security::filesystem::open_existing_approved(published, allowed, false)
-    else {
-        return false;
-    };
-    let same_file = crate::security::filesystem::opened_file_identity(&file).is_ok_and(|id| {
-        crate::security::filesystem::object_identity(path).is_ok_and(|copy| copy == id)
-    });
-    same_file
-        || (file.metadata().is_ok_and(|metadata| metadata.len() == expected.size)
-            && super::hash::ed2k_hash_open_file(&mut file)
-                .is_ok_and(|hash| hash.eq_ignore_ascii_case(&expected.ed2k_hash)))
-}
-
 /// What [`recover_completion_copy`] did with a copy.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CopyRecovery {
     Published(std::path::PathBuf),
+    /// The file was published before, as this name: the copy is removed.
+    AlreadyPublished(std::path::PathBuf),
     NotTheFile,
+}
+
+/// `name` in `dir` and every name completion gives it there when that one
+/// is taken (`name (1)`, `name (2)`, …), lowest first. Blocking.
+fn published_names(dir: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
+    let base = dir.join(name);
+    let mut variants: Vec<(u32, std::path::PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let text = file_name.to_str()?;
+            let open = text.rfind(" (")?;
+            let rest = &text[open + 2..];
+            let suffix: u32 = rest[..rest.find(')')?].parse().ok()?;
+            (suffix > 0
+                && dedup_candidate(&base, suffix).file_name() == Some(file_name.as_os_str()))
+            .then(|| (suffix, entry.path()))
+        })
+        .collect();
+    variants.sort();
+    std::iter::once(base)
+        .chain(variants.into_iter().map(|(_, path)| path))
+        .collect()
+}
+
+/// Whether `published`, in the download folder `root`, is the finished file:
+/// the copy itself (`identity`), or `size` bytes `is_the_file` accepts.
+/// Blocking.
+fn is_published_copy(
+    published: &std::path::Path,
+    root: &str,
+    identity: &crate::security::filesystem::ObjectIdentity,
+    size: u64,
+    is_the_file: &dyn Fn(&mut std::fs::File) -> anyhow::Result<bool>,
+) -> bool {
+    let Ok((_, mut file)) = crate::security::filesystem::open_existing_approved(
+        published,
+        &[root.to_string()],
+        false,
+    ) else {
+        return false;
+    };
+    crate::security::filesystem::opened_file_identity(&file).is_ok_and(|id| id == *identity)
+        || (file.metadata().is_ok_and(|metadata| metadata.len() == size)
+            && is_the_file(&mut file).unwrap_or(false))
 }
 
 /// The completion copies an earlier run left in `dir`, each with the
@@ -8000,12 +8142,17 @@ pub(crate) fn earlier_completion_copies(
 }
 
 /// Publish the completion copy at `path`, in the download folder `root`,
-/// under the first free name from `file_name` beside it when it is `size`
-/// bytes that `is_the_file` accepts, and remove it when it is not. An error
-/// keeps it. Blocking.
+/// when it is `size` bytes that `is_the_file` accepts, and remove it when it
+/// is not. It is published in `download_root`, the current download folder,
+/// under the first free name from `file_name` in its `Downloads`, the way a
+/// completion publishes; but when the file was published already — the copy
+/// is linked as, or `is_the_file` accepts, `file_name` or a `name (N)` of
+/// it beside the copy or there — the copy is only removed. An error keeps
+/// it. Blocking.
 pub(crate) fn recover_completion_copy(
     path: &std::path::Path,
     root: &str,
+    download_root: &str,
     file_name: &str,
     size: u64,
     is_the_file: &dyn Fn(&mut std::fs::File) -> anyhow::Result<bool>,
@@ -8026,14 +8173,40 @@ pub(crate) fn recover_completion_copy(
         copy.discard(&allowed);
         return Ok(CopyRecovery::NotTheFile);
     }
-    let target = path
+    let name = crate::security::sanitize_filename(file_name);
+    let dir = path
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("completion copy has no folder"))?
-        .join(crate::security::sanitize_filename(file_name));
+        .ok_or_else(|| anyhow::anyhow!("completion copy has no folder"))?;
+    let elsewhere = !crate::storage::part_folders::same_folder(root, download_root);
+    let places = std::iter::once((dir.to_path_buf(), root)).chain(
+        elsewhere.then(|| (std::path::Path::new(download_root).join("Downloads"), download_root)),
+    );
+    for (dir, dir_root) in places {
+        for published in published_names(&dir, &name) {
+            if is_published_copy(&published, dir_root, &copy.identity, size, is_the_file) {
+                copy.discard(&allowed);
+                return Ok(CopyRecovery::AlreadyPublished(published));
+            }
+        }
+    }
+    if elsewhere {
+        let published = move_part_to_downloads(
+            path,
+            std::path::Path::new(root),
+            std::path::Path::new(download_root),
+            &name,
+            &copy.identity,
+        )?;
+        return Ok(CopyRecovery::Published(published));
+    }
+    let target = dir.join(&name);
     for suffix in 0..=10_000u32 {
         let final_path = dedup_candidate(&target, suffix);
         match copy.publish(&final_path, &allowed) {
-            Ok(published) => return Ok(CopyRecovery::Published(published)),
+            Ok(published) => {
+                sync_published(&published, &allowed);
+                return Ok(CopyRecovery::Published(published));
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || final_path.exists() => {}
             Err(e) => return Err(e.into()),
         }

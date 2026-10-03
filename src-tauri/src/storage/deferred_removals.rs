@@ -57,11 +57,24 @@ fn containing_root(path: &Path, roots: &[String]) -> Option<String> {
         .cloned()
 }
 
+/// How long a removal waits for a folder that cannot be reached before it is
+/// given up, and stops keeping the folder a download folder: a drive gone
+/// that long is not coming back with these files on it.
+pub const UNREACHABLE_GIVE_UP: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 /// Remove what [`defer`] and [`record`] left, each from its folder while
 /// that is still one of `folders` and can be reached. One whose folder is
 /// no longer a download folder can no longer be removed safely and is
-/// forgotten. Blocking.
+/// forgotten, and so is one whose folder has not been reachable for
+/// [`UNREACHABLE_GIVE_UP`]. Blocking.
 pub fn retry(db: &Database, folders: &DownloadFolders) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64);
+    retry_at(db, folders, now);
+}
+
+fn retry_at(db: &Database, folders: &DownloadFolders, now: i64) {
     let pending = match db.deferred_file_removals() {
         Ok(pending) => pending,
         Err(e) => {
@@ -73,6 +86,18 @@ pub fn retry(db: &Database, folders: &DownloadFolders) {
         return;
     }
     let roots = folders.roots();
+    let unreachable: Vec<String> = roots
+        .iter()
+        .filter(|root| pending.iter().any(|(_, folder)| same_folder(root, folder)))
+        .filter(|root| !folder_reachable(Path::new(root)))
+        .cloned()
+        .collect();
+    let unreachable_since = db
+        .deferred_folders_unreachable_since(&unreachable, now)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Could not track the folders removals wait for: {e}");
+            Default::default()
+        });
     let mut done = Vec::new();
     for (path, folder) in pending {
         let Some(root) = roots.iter().find(|root| same_folder(root, &folder)) else {
@@ -80,7 +105,17 @@ pub fn retry(db: &Database, folders: &DownloadFolders) {
             done.push(path);
             continue;
         };
-        if !folder_reachable(Path::new(root)) {
+        if unreachable.contains(root) {
+            let waited = unreachable_since
+                .get(root)
+                .map_or(0, |since| now.saturating_sub(*since));
+            if waited >= UNREACHABLE_GIVE_UP.as_secs() as i64 {
+                tracing::warn!(
+                    "Leaving {path}: {root} has not been reachable for {} days",
+                    waited / (24 * 60 * 60)
+                );
+                done.push(path);
+            }
             continue;
         }
         match crate::security::filesystem::remove_approved_file(
@@ -152,6 +187,64 @@ mod tests {
         assert!(
             db.deferred_file_removals().unwrap().is_empty(),
             "one in a folder that is no longer a download folder is let go"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A drive gone for good does not keep its removals, or its folder, for
+    /// ever; one that came back in between starts the wait over.
+    #[test]
+    fn a_removal_is_given_up_once_its_folder_has_been_unreachable_for_long() {
+        let base = std::env::temp_dir().join(format!(
+            "ember-deferred-give-up-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let volume = base.join("drive");
+        let (current, gone) = (base.join("current"), volume.join("ember"));
+        for dir in [current.join("Temp"), gone.join("Temp"), base.join("data")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let folders = DownloadFolders::new(
+            &current.to_string_lossy(),
+            &[gone.to_string_lossy().into_owned()],
+        );
+        let db = Database::open_at(&base.join("data").join("ember.db")).unwrap();
+        // A folder where the file should be: removing it fails whenever the
+        // drive is there, so only giving up can let the removal go.
+        let part = gone.join("Temp").join("cancelled.part");
+        record(
+            &db,
+            &[(
+                part.to_string_lossy().into_owned(),
+                gone.to_string_lossy().into_owned(),
+            )],
+        );
+        let day = 24 * 60 * 60;
+        let give_up = UNREACHABLE_GIVE_UP.as_secs() as i64;
+
+        crate::storage::part_folders::simulate_unplugged(&volume, true);
+        retry_at(&db, &folders, 1_000);
+        retry_at(&db, &folders, 1_000 + give_up - day);
+        assert_eq!(db.deferred_file_removals().unwrap().len(), 1, "still waited for");
+
+        crate::storage::part_folders::simulate_unplugged(&volume, false);
+        std::fs::create_dir_all(&part).unwrap();
+        retry_at(&db, &folders, 1_000 + give_up);
+        crate::storage::part_folders::simulate_unplugged(&volume, true);
+        retry_at(&db, &folders, 1_000 + give_up + day);
+        assert_eq!(
+            db.deferred_file_removals().unwrap().len(),
+            1,
+            "the folder answered in between, so the wait starts over"
+        );
+
+        retry_at(&db, &folders, 1_000 + 2 * give_up + day);
+        crate::storage::part_folders::simulate_unplugged(&volume, false);
+        assert!(
+            db.deferred_file_removals().unwrap().is_empty(),
+            "given up after the folder was unreachable for the whole wait"
         );
         drop(db);
         let _ = std::fs::remove_dir_all(base);

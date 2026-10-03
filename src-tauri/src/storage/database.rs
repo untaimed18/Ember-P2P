@@ -4450,6 +4450,48 @@ impl Database {
         Ok(())
     }
 
+    /// When each of `unreachable`, folders with removals waiting for them,
+    /// was first found unreachable, as unix seconds: `now` for one that was
+    /// not before. Every other folder is forgotten, so the time starts over
+    /// once a folder answers again.
+    pub fn deferred_folders_unreachable_since(
+        &self,
+        unreachable: &[String],
+        now: i64,
+    ) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+        let mut conn = self.conn.lock();
+        Self::ensure_unreachable_download_folders_locked(&conn)?;
+        let tx = conn.transaction()?;
+        let mut since = std::collections::HashMap::new();
+        {
+            let mut known = tx.prepare("SELECT folder, since FROM unreachable_download_folders")?;
+            let rows = known.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            let known: Vec<(String, i64)> = rows.filter_map(Result::ok).collect();
+            let mut forget =
+                tx.prepare("DELETE FROM unreachable_download_folders WHERE folder = ?1")?;
+            for (folder, first) in known {
+                if unreachable.contains(&folder) {
+                    since.insert(folder, first);
+                } else {
+                    forget.execute(params![folder])?;
+                }
+            }
+            let mut note = tx.prepare(
+                "INSERT INTO unreachable_download_folders (folder, since) VALUES (?1, ?2)",
+            )?;
+            for folder in unreachable {
+                if !since.contains_key(folder) {
+                    note.execute(params![folder, now])?;
+                    since.insert(folder.clone(), now);
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(since)
+    }
+
     /// The download folder each download's `.part` was last recorded in.
     pub fn download_part_folders(
         &self,
@@ -8343,6 +8385,19 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS deferred_file_removals (
                 path TEXT PRIMARY KEY,
                 folder TEXT NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Since when the folders deferred removals wait for have been
+    /// unreachable, created on first use for the same reason as
+    /// [`Self::ensure_transfer_part_folders_locked`].
+    fn ensure_unreachable_download_folders_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS unreachable_download_folders (
+                folder TEXT PRIMARY KEY,
+                since INTEGER NOT NULL
             );",
         )?;
         Ok(())

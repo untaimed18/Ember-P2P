@@ -2695,8 +2695,22 @@
     return t.status !== 'completed' && t.status !== 'failed' && t.status !== 'stopped';
   }
 
-  function canResume(t: Transfer): boolean {
+  function isPausedState(t: Transfer): boolean {
     return t.status === 'paused' || t.status === 'stopped' || t.status === 'insufficient';
+  }
+
+  /** Waiting for the drive with its progress. Resume starts it over in the
+   *  current download folder, as its status text says. */
+  function isHeldForDrive(t: Transfer): boolean {
+    return (
+      t.direction === 'download'
+      && t.failure_code === 'part_folder_offline'
+      && (t.status === 'searching' || t.status === 'queued')
+    );
+  }
+
+  function canResume(t: Transfer): boolean {
+    return isPausedState(t) || isHeldForDrive(t);
   }
 
   // Not while the file is being hashed or moved: completion has already read
@@ -3299,7 +3313,7 @@
     }
   }
   async function handleResumeAll() {
-    const ids = globalDownloadTargets().filter((t) => canResume(t)).map((t) => t.id);
+    const ids = globalDownloadTargets().filter((t) => isPausedState(t)).map((t) => t.id);
     if (!ids.length) { showInfo(m.transfers_nothing_to_resume()); return; }
     const ok = await runBatchCommand(ids, resumeTransfersBatch, m.transfers_batch_label_resumed());
     const filter = narrowLabel;
