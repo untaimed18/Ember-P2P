@@ -22,8 +22,9 @@
 //! a push-grant dialled in that window would offer a file we cannot yet find.
 //! They wait in [`PendingRestore`] until the startup scan says the library is
 //! in the index (`NetworkCommand::StartupLibraryIndexed`, sent at once for a
-//! node with no shared folders), and then only the rows for files we serve are
-//! merged. A long fallback deadline covers a scan that fails without saying so.
+//! node with no shared folders) and the last session's downloads are back in
+//! the transfer manager, and then only the rows for files we serve are merged.
+//! A long fallback deadline covers a scan that fails without saying so.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -275,8 +276,8 @@ impl PendingRestore {
         Instant::now() >= self.deadline
     }
 
-    /// The startup signal came before the loop could act on it, so merge at
-    /// the next check instead of waiting for the fallback.
+    /// The startup signal came, so merge at the next check instead of waiting
+    /// for the fallback.
     pub(crate) fn make_due(&mut self) {
         self.deadline = Instant::now();
     }
@@ -348,11 +349,34 @@ pub(crate) fn fold_for_save(queue: &mut Vec<QueueEntry>, pending: PendingRestore
     merge_into(queue, pending.entries, &asked, |_| true);
 }
 
+/// Merge `held` into the live queue once it is due — the library is indexed or
+/// the fallback has passed — and the last session's downloads have been
+/// restored. Until then a file we are still downloading is not in the
+/// transfer manager yet, and everyone queued for it would be dropped as
+/// waiting for a file we do not serve. Call from each side that can complete
+/// last; the merge runs once, whichever it is.
+pub(crate) async fn merge_when_ready(
+    held: &mut Option<PendingRestore>,
+    queue: &UploadQueueRef,
+    local_index: &RwLock<LocalIndex>,
+    transfer_manager: &RwLock<TransferManager>,
+) {
+    if !held.as_ref().is_some_and(PendingRestore::overdue) {
+        return;
+    }
+    if !transfer_manager.read().await.restored {
+        return;
+    }
+    if let Some(pending) = held.take() {
+        merge_pending(pending, queue, local_index, transfer_manager).await;
+    }
+}
+
 /// Merge a pending restore into the live queue now.
 ///
 /// Takes the index, the transfer manager and the queue one at a time, never
 /// nested, for the lock discipline `purge_unshared_queue_entries` keeps.
-pub(crate) async fn merge_pending(
+async fn merge_pending(
     pending: PendingRestore,
     queue: &UploadQueueRef,
     local_index: &RwLock<LocalIndex>,
@@ -421,7 +445,9 @@ fn asked_while_held() -> &'static parking_lot::Mutex<Option<HashSet<QueueIdentit
     ASKED.get_or_init(Default::default)
 }
 
-/// Note a peer asking for an upload, for a restore still held.
+/// Note a peer whose ask got it a live row, a slot or a ban, for a restore
+/// still held. Not one refused a row (queue full, per-IP cap): the restored
+/// row is the place it still has.
 pub(crate) fn note_asked(identity: &QueueIdentity) {
     if let Some(asked) = asked_while_held().lock().as_mut() {
         if asked.len() < MAX_UPLOAD_QUEUE_SIZE * 10 {
@@ -732,6 +758,72 @@ mod tests {
         let rows = decode(&bytes, now, NOW_UNIX);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_hash, [0xAB; 16]);
+    }
+
+    fn download_of(file_hash: [u8; 16]) -> crate::types::Transfer {
+        serde_json::from_value(serde_json::json!({
+            "id": "restored",
+            "file_name": "restored.bin",
+            "file_hash": hex::encode(file_hash),
+            "peer_id": "",
+            "peer_name": "",
+            "direction": "download",
+            "status": "searching",
+            "progress": 0.0,
+            "speed": 0,
+            "total_size": 4096,
+            "transferred": 0,
+            "started_at": 0,
+        }))
+        .unwrap()
+    }
+
+    /// The library can be indexed long before last session's downloads are
+    /// back in the transfer manager, and a merge in between dropped everyone
+    /// queued for a file we were still downloading.
+    #[tokio::test]
+    async fn the_merge_waits_for_the_downloads_to_be_restored() {
+        let file_hash = [0x5A; 16];
+        let mut row = restored([0x5A; 16], [8, 8, 8, 8], 3000);
+        row.file_hash = file_hash;
+        let mut held = Some(PendingRestore {
+            entries: vec![row],
+            deadline: Instant::now() + MERGE_FALLBACK,
+        });
+        let queue: UploadQueueRef = Default::default();
+        let index = RwLock::new(LocalIndex::new());
+        let manager = RwLock::new(TransferManager::new(1));
+
+        held.as_mut().unwrap().make_due();
+        merge_when_ready(&mut held, &queue, &index, &manager).await;
+        assert!(held.is_some(), "downloads not restored yet: the rows stay held");
+        assert!(queue.lock().await.is_empty());
+
+        {
+            let mut mgr = manager.write().await;
+            mgr.enqueue(download_of(file_hash));
+            mgr.restored = true;
+        }
+        merge_when_ready(&mut held, &queue, &index, &manager).await;
+        assert!(held.is_none(), "merged once both sides are ready");
+        let live = queue.lock().await;
+        assert_eq!(live.len(), 1, "a waiter for a file still downloading rejoins");
+        assert_eq!(live[0].identity, QueueIdentity::UserHash([0x5A; 16]));
+    }
+
+    #[tokio::test]
+    async fn restored_downloads_alone_do_not_merge_before_the_library_is_indexed() {
+        let mut held = Some(PendingRestore {
+            entries: vec![restored([0x5B; 16], [8, 8, 8, 8], 3000)],
+            deadline: Instant::now() + MERGE_FALLBACK,
+        });
+        let queue: UploadQueueRef = Default::default();
+        let index = RwLock::new(LocalIndex::new());
+        let manager = RwLock::new(TransferManager::new(1));
+        manager.write().await.restored = true;
+
+        merge_when_ready(&mut held, &queue, &index, &manager).await;
+        assert!(held.is_some());
     }
 
     #[test]

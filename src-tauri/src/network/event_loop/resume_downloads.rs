@@ -19,6 +19,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
     part_progress_task: &mut Option<tokio::task::JoinHandle<HashMap<String, (u64, bool, bool)>>>,
     pending_incomplete_downloads: &mut Option<Vec<Transfer>>,
     startup_download_admission: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
+    upload_queue: &ed2k::upload::UploadQueueRef,
 ) {
     if let Some(pending) = pending_incomplete_downloads
         .as_ref()
@@ -433,5 +434,12 @@ pub(in crate::network) async fn resume_incomplete_downloads(
         // renderer admissions may safely continue against the same totals.
         startup_download_admission.take();
         transfer_manager.write().await.restored = true;
+        ed2k::upload_queue_store::merge_when_ready(
+            &mut state.restored_upload_queue,
+            upload_queue,
+            local_index,
+            transfer_manager,
+        )
+        .await;
     }
 }

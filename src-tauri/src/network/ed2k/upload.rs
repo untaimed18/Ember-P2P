@@ -21,7 +21,7 @@ use crate::network::ed2k::credits::CreditManager;
 use crate::network::ed2k::sources::SourceManager;
 use crate::network::ed2k::tcp_obfuscation::{self, NegotiationResult, Rc4Reader, Rc4Writer};
 use crate::search::index::LocalIndex;
-use crate::sharing::manager::TransferManager;
+use crate::sharing::manager::{TransferControl, TransferManager};
 use crate::types::{TransferDirection, TransferStatus};
 
 /// A live friend session's outbound packet sender, plus a liveness
@@ -1028,6 +1028,42 @@ mod friend_restricted_download_tests {
         assert!(download_restricted_by_friend(&mgr, &restricted.to_ascii_uppercase()));
         assert!(!download_restricted_by_friend(&mgr, &public));
         assert!(!download_restricted_by_friend(&mgr, &hex::encode([0x5C; 16])));
+    }
+}
+
+#[cfg(test)]
+mod upload_cancel_tests {
+    use super::*;
+
+    /// The row can be added and cancelled between two of the session's checks,
+    /// leaving nothing in the manager to say it was ever there. The control
+    /// registered ahead of it is what still says so.
+    #[test]
+    fn a_cancel_reaches_a_control_registered_before_the_row() {
+        let mut mgr = TransferManager::new(4);
+        let control = TransferControl::new();
+        mgr.register_control("up", control.clone());
+
+        let row: crate::types::Transfer = serde_json::from_value(serde_json::json!({
+            "id": "up",
+            "file_name": "f.bin",
+            "file_hash": hex::encode([0x5A; 16]),
+            "peer_id": "8.8.8.8:4662",
+            "peer_name": "",
+            "direction": "upload",
+            "status": "active",
+            "progress": 0.0,
+            "speed": 0,
+            "total_size": 10,
+            "transferred": 0,
+            "started_at": 0,
+        }))
+        .unwrap();
+        mgr.enqueue(row);
+        mgr.cancel("up");
+
+        assert!(!mgr.active.contains_key("up"));
+        assert!(control.is_cancelled());
     }
 }
 
@@ -5634,6 +5670,20 @@ impl UploadHandler {
             .await;
     }
 
+    /// A fresh upload row id, with the control Cancel reaches the session
+    /// through. Registered before `Started` is sent: the row itself appears
+    /// and disappears between the session's checks, so its absence cannot
+    /// tell a cancel from a row the network loop has not added yet.
+    async fn new_upload_row(&self) -> (String, Arc<TransferControl>) {
+        let tid = uuid::Uuid::new_v4().to_string();
+        let control = TransferControl::new();
+        self.transfer_manager
+            .write()
+            .await
+            .register_control(&tid, control.clone());
+        (tid, control)
+    }
+
     /// eMule ForceNewClient/AcceptNewClient dynamic slot computation.
     /// Uses observed (smoothed) upload bandwidth to decide how many concurrent
     /// upload slots the server should maintain, scaling per-slot target rate
@@ -8161,6 +8211,8 @@ impl UploadHandler {
         // reaches the manager through the network loop, so a row missing
         // before it was ever seen is not registered yet, not cancelled.
         let mut registered_transfer_id: Option<String> = None;
+        // The control registered with `transfer_id`; see `new_upload_row`.
+        let mut upload_control: Option<Arc<TransferControl>> = None;
         // Wire bytes of the current OP_REQUESTPARTS batch not yet credited to
         // the peer. A `?` mid-batch skips the batch's flush, so the teardown
         // credits what is left here.
@@ -8269,8 +8321,9 @@ impl UploadHandler {
             queue_wait_at_grant = granted_join_time.map_or(0, |t| t.elapsed().as_secs());
             session_start = Some(std::time::Instant::now());
             last_part_request = std::time::Instant::now();
-            let tid = uuid::Uuid::new_v4().to_string();
+            let (tid, control) = self.new_upload_row().await;
             transfer_id = Some(tid.clone());
+            upload_control = Some(control);
             total_size = resolved.size;
             let _ = self
                 .upload_event_tx
@@ -8902,8 +8955,9 @@ impl UploadHandler {
                                         last_part_request = std::time::Instant::now();
 
                                         if let Some(hash) = current_file_hash {
-                                            let tid = uuid::Uuid::new_v4().to_string();
+                                            let (tid, control) = self.new_upload_row().await;
                                             transfer_id = Some(tid.clone());
+                                            upload_control = Some(control);
                                             // Reset the Progress throttle for this new
                                             // session so the first chunk we send always
                                             // produces an immediate UI update instead
@@ -9564,7 +9618,6 @@ impl UploadHandler {
                         }
                         continue;
                     }
-                    super::upload_queue_store::note_asked(&queue_identity);
 
                     // Duplicate OP_STARTUPLOADREQ on an already-granted session.
                     // eMule/Ember peers occasionally re-send STARTUPLOADREQ after
@@ -9585,6 +9638,7 @@ impl UploadHandler {
                     // scoring a slot holder could queue it while it keeps the
                     // slot, and the next OP_REQUESTPARTS mints the new row.
                     if slot_guard.is_active() {
+                        super::upload_queue_store::note_asked(&queue_identity);
                         write_packet_async(
                             &mut writer,
                             OP_EDONKEYHEADER,
@@ -9632,6 +9686,7 @@ impl UploadHandler {
                                 )
                             };
                             if should_ban {
+                                super::upload_queue_store::note_asked(&queue_identity);
                                 warn!("Banning {} for excessive file request frequency (AddRequestCount)", peer_addr);
                                 // Immediate local effect for the shared upload set so
                                 // any in-flight connection from this IP is rejected
@@ -10155,6 +10210,7 @@ impl UploadHandler {
                         drop(queue);
                         drop(idx_snap);
                         drop(cm);
+                        super::upload_queue_store::note_asked(&queue_identity);
                         // eMule OP_QUEUERANKING (UploadClient.cpp:633): 12 bytes = rank(u16) + 10 zeros
                         //
                         // Only the packet is gated: the peer is on our queue
@@ -10180,6 +10236,7 @@ impl UploadHandler {
                     }
 
                     // Accept the upload (guard against duplicate OP_STARTUPLOADREQ)
+                    super::upload_queue_store::note_asked(&queue_identity);
                     write_packet_async(
                         &mut writer,
                         OP_EDONKEYHEADER,
@@ -10206,8 +10263,9 @@ impl UploadHandler {
                     last_part_request = std::time::Instant::now();
 
                     if let Some(hash) = current_file_hash {
-                        let tid = uuid::Uuid::new_v4().to_string();
+                        let (tid, control) = self.new_upload_row().await;
                         transfer_id = Some(tid.clone());
+                        upload_control = Some(control);
                         // Reset the Progress throttle for this new session
                         // so the first chunk's Progress event is emitted
                         // immediately rather than coalesced.
@@ -10354,8 +10412,9 @@ impl UploadHandler {
                                 total_size = file.size;
                             }
                             if transfer_id.is_none() {
-                                let tid = uuid::Uuid::new_v4().to_string();
+                                let (tid, control) = self.new_upload_row().await;
                                 transfer_id = Some(tid.clone());
+                                upload_control = Some(control);
                                 // Fresh row: emit the first Progress immediately
                                 // rather than coalescing against the prior file's.
                                 last_progress_emit = None;
@@ -10770,7 +10829,9 @@ impl UploadHandler {
                             if present && !seen {
                                 registered_transfer_id = Some(tid.clone());
                             }
-                            if !present && seen {
+                            let cancelled =
+                                upload_control.as_ref().is_some_and(|c| c.is_cancelled());
+                            if cancelled || (!present && seen) {
                                 info!("Upload {tid} cancelled by user, ending session");
                                 user_cancelled = true;
                                 break;

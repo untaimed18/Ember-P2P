@@ -103,7 +103,7 @@ impl BandwidthLimiter {
             return true;
         }
         if !self
-            .drain_tokens(&[&self.upload_tokens], bytes, &self.max_upload_rate)
+            .drain_tokens(&self.upload_tokens, bytes, &self.max_upload_rate)
             .await
         {
             return false;
@@ -126,17 +126,16 @@ impl BandwidthLimiter {
         PriorityUpload { limiter: self }
     }
 
+    /// Spends the reserve only: the shared bucket is the slots' share, and
+    /// racing them for it whenever the reserve runs dry leaves them next to
+    /// nothing.
     async fn acquire_priority_upload(&self, bytes: u64) -> bool {
         if self.max_upload_rate.load(Ordering::Relaxed) == 0 {
             self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
             return true;
         }
         if !self
-            .drain_tokens(
-                &[&self.priority_tokens, &self.upload_tokens],
-                bytes,
-                &self.max_upload_rate,
-            )
+            .drain_tokens(&self.priority_tokens, bytes, &self.max_upload_rate)
             .await
         {
             return false;
@@ -195,7 +194,7 @@ impl BandwidthLimiter {
             return true;
         }
         if !self
-            .drain_tokens(&[&self.download_tokens], bytes, &self.max_download_rate)
+            .drain_tokens(&self.download_tokens, bytes, &self.max_download_rate)
             .await
         {
             return false;
@@ -227,10 +226,7 @@ impl BandwidthLimiter {
     ///
     /// Returns `false` if the refill task is gone so the caller can abort
     /// instead of treating the remainder as unlimited.
-    ///
-    /// `pools` are spent in order: a priority upload empties its reserve
-    /// before it competes for the shared bucket.
-    async fn drain_tokens(&self, pools: &[&AtomicU64], mut remaining: u64, max_rate: &AtomicU64) -> bool {
+    async fn drain_tokens(&self, pool: &AtomicU64, mut remaining: u64, max_rate: &AtomicU64) -> bool {
         let start = std::time::Instant::now();
         let mut warned_slow = false;
         while remaining > 0 {
@@ -239,13 +235,7 @@ impl BandwidthLimiter {
             if max_rate.load(Ordering::Relaxed) == 0 {
                 return true;
             }
-            let mut took = 0;
-            for pool in pools {
-                took += take_tokens(pool, remaining - took);
-                if took == remaining {
-                    break;
-                }
-            }
+            let took = take_tokens(pool, remaining);
             remaining -= took;
             if took == 0 {
                 if !self.refill_alive.load(Ordering::Acquire) {
@@ -670,7 +660,7 @@ pub struct PriorityUpload<'a> {
 }
 
 impl PriorityUpload<'_> {
-    /// [`BandwidthLimiter::acquire_upload`], spending the reserve first.
+    /// [`BandwidthLimiter::acquire_upload`], spending only the reserve.
     pub async fn acquire(&self, bytes: u64) -> bool {
         self.limiter.acquire_priority_upload(bytes).await
     }
@@ -946,11 +936,73 @@ mod tests {
             "the slots keep a fifth of each refill"
         );
 
-        tokio::time::timeout(Duration::from_millis(300), priority.acquire(1_000))
+        tokio::time::timeout(Duration::from_millis(300), priority.acquire(800))
             .await
-            .expect("the reserve and the shared remainder cover the request");
-        assert_eq!(bw.available_upload_tokens(), 0);
-        assert_eq!(bw.total_uploaded(), 11_000);
+            .expect("the reserve covers its own share");
+        assert_eq!(bw.priority_tokens.load(Ordering::Relaxed), 0);
+        assert_eq!(bw.available_upload_tokens(), 200);
+        assert_eq!(bw.total_uploaded(), 10_800);
+    }
+
+    /// Once the reserve is spent, a priority upload waits for the next refill
+    /// rather than taking the share the eD2K slots were left with.
+    #[tokio::test]
+    async fn a_starved_priority_upload_leaves_the_slots_their_share() {
+        let bw = BandwidthLimiter::new(10_000, 0);
+        assert_eq!(bw.try_take_upload(10_000), 10_000);
+        let priority = bw.priority_upload();
+        bw.refill_tokens_incremental(1, 10);
+
+        let starved =
+            tokio::time::timeout(Duration::from_millis(100), priority.acquire(1_000)).await;
+        assert!(starved.is_err(), "the reserve alone cannot cover the request");
+        assert_eq!(
+            bw.available_upload_tokens(),
+            200,
+            "the shared bucket is the slots', not the priority stream's"
+        );
+        tokio::time::timeout(Duration::from_millis(100), bw.acquire_upload(200))
+            .await
+            .expect("the slots spend their share while the priority stream is starved");
+    }
+
+    /// A request bigger than the reserve can ever hold completes by draining
+    /// it across refills.
+    #[tokio::test]
+    async fn a_priority_upload_larger_than_the_reserve_completes_across_refills() {
+        let bw = Arc::new(BandwidthLimiter::new(10_000, 0));
+        assert_eq!(bw.try_take_upload(10_000), 10_000);
+        let refills = {
+            let bw = bw.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    bw.refill_tokens_incremental(1, 10);
+                }
+            })
+        };
+
+        let priority = bw.priority_upload();
+        let request = super::priority_reserve_cap(10_000) * 3;
+        tokio::time::timeout(Duration::from_secs(5), priority.acquire(request))
+            .await
+            .expect("a large priority request drains across refills");
+        refills.abort();
+    }
+
+    #[tokio::test]
+    async fn a_priority_upload_still_ends_on_unlimited_and_on_a_dead_refill() {
+        let unlimited = BandwidthLimiter::new(0, 0);
+        assert!(unlimited.priority_upload().acquire(1_000_000).await);
+        assert_eq!(unlimited.total_uploaded(), 1_000_000);
+
+        let bw = BandwidthLimiter::new(10_000, 0);
+        let priority = bw.priority_upload();
+        bw.stop_refill_for_test();
+        let ok = tokio::time::timeout(Duration::from_secs(2), priority.acquire(1_000))
+            .await
+            .expect("must not hang after refill death");
+        assert!(!ok, "a dead refill must not bypass the cap for a priority upload either");
     }
 
     /// A priority stream held back by the friend's downlink rather than the

@@ -2483,6 +2483,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             &mut part_progress_task,
             &mut pending_incomplete_downloads,
             &mut startup_download_admission,
+            &upload_queue_handle,
         )
         .await;
 
@@ -3392,21 +3393,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 }
                 // A node with no shared folders never runs the startup
                 // reconcile that merges last session's upload waiters.
-                if state
-                    .restored_upload_queue
-                    .as_ref()
-                    .is_some_and(|pending| pending.overdue())
-                {
-                    if let Some(pending) = state.restored_upload_queue.take() {
-                        ed2k::upload_queue_store::merge_pending(
-                            pending,
-                            &upload_queue_handle,
-                            &local_index,
-                            &transfer_manager,
-                        )
-                        .await;
-                    }
-                }
+                ed2k::upload_queue_store::merge_when_ready(
+                    &mut state.restored_upload_queue,
+                    &upload_queue_handle,
+                    &local_index,
+                    &transfer_manager,
+                )
+                .await;
             }
 
             // Broker tick + event drain. Used to live inside the

@@ -5767,15 +5767,16 @@ async fn handle_command_inner(
             // The first moment the index says which files we serve, so when last
             // session's waiters can rejoin the upload queue. Not any reconcile:
             // a settings save can send one while discovery is still running.
-            if let Some(pending) = state.restored_upload_queue.take() {
-                ed2k::upload_queue_store::merge_pending(
-                    pending,
-                    upload_queue,
-                    local_index,
-                    transfer_manager,
-                )
-                .await;
+            if let Some(pending) = state.restored_upload_queue.as_mut() {
+                pending.make_due();
             }
+            ed2k::upload_queue_store::merge_when_ready(
+                &mut state.restored_upload_queue,
+                upload_queue,
+                local_index,
+                transfer_manager,
+            )
+            .await;
         }
 
         NetworkCommand::SharedFilesChangedAck { tx: reconcile_ack } => {
