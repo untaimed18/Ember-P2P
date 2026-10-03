@@ -2711,7 +2711,7 @@
   "settings_max_friends_hint": "好友列表最多可有多少人。更改后请保存设置。添加时若达到上限，请调高此值。调低不会移除已在列表中的好友。",
   "settings_chat_attach_auto_label": "自动下载好友发送的文件，大小上限为",
   "settings_chat_attach_auto_unit": "MB",
-  "settings_chat_attach_auto_hint": "更大的文件需要你确认接受。设为 0 表示每次都询问。收到的文件保存在下载文件夹中的 Chat Files 文件夹里。Chat Files 文件夹不会共享。",
+  "settings_chat_attach_auto_hint": "更大的文件需要你确认接受，程序和脚本无论大小也都需要。设为 0 表示每次都询问。收到的文件保存在下载文件夹中的 Chat Files 文件夹里。Chat Files 文件夹不会共享。",
   "settings_chat_attach_open_folder": "打开 Chat Files",
   "settings_channel_files_open_folder": "打开 Channel Files",
   "settings_channel_file_offers": "谁可以在房间中给你发文件",

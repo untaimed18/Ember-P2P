@@ -2711,7 +2711,7 @@
   "settings_max_friends_hint": "Combien de personnes peuvent figurer sur votre liste d’amis. Enregistrez les réglages après modification. Augmentez-le si vous atteignez la limite en ajoutant quelqu’un. Le baisser ne retire personne de la liste.",
   "settings_chat_attach_auto_label": "Télécharger automatiquement les fichiers de mes amis jusqu'à",
   "settings_chat_attach_auto_unit": "Mo",
-  "settings_chat_attach_auto_hint": "Les fichiers plus volumineux attendent votre accord. Indiquez 0 pour toujours demander. Les fichiers reçus sont enregistrés dans le dossier Chat Files de votre dossier de téléchargement. Chat Files n’est pas partagé.",
+  "settings_chat_attach_auto_hint": "Les fichiers plus volumineux attendent votre accord, tout comme les programmes et scripts, quelle que soit leur taille. Indiquez 0 pour toujours demander. Les fichiers reçus sont enregistrés dans le dossier Chat Files de votre dossier de téléchargement. Chat Files n’est pas partagé.",
   "settings_chat_attach_open_folder": "Ouvrir Chat Files",
   "settings_channel_files_open_folder": "Ouvrir Channel Files",
   "settings_channel_file_offers": "Qui peut vous envoyer des fichiers dans les salons",

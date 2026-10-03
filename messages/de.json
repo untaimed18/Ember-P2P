@@ -2714,7 +2714,7 @@
   "settings_max_friends_hint": "Wie viele Personen auf Ihrer Freundesliste stehen dürfen. Nach der Änderung speichern. Erhöhen Sie den Wert, wenn Sie beim Hinzufügen an die Grenze stoßen. Ein niedrigerer Wert entfernt niemanden, der bereits auf der Liste steht.",
   "settings_chat_attach_auto_label": "Dateien von Freunden automatisch herunterladen bis",
   "settings_chat_attach_auto_unit": "MB",
-  "settings_chat_attach_auto_hint": "Größere Dateien warten auf Ihre Zustimmung. Bei 0 wird jedes Mal gefragt. Empfangene Dateien werden im Ordner „Chat Files“ in Ihrem Download-Ordner gespeichert. „Chat Files“ wird nicht freigegeben.",
+  "settings_chat_attach_auto_hint": "Größere Dateien warten auf Ihre Zustimmung, ebenso Programme und Skripte jeder Größe. Bei 0 wird jedes Mal gefragt. Empfangene Dateien werden im Ordner „Chat Files“ in Ihrem Download-Ordner gespeichert. „Chat Files“ wird nicht freigegeben.",
   "settings_chat_attach_open_folder": "„Chat Files“ öffnen",
   "settings_channel_files_open_folder": "„Channel Files“ öffnen",
   "settings_channel_file_offers": "Wer Ihnen in Räumen Dateien senden darf",

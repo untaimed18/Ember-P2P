@@ -780,6 +780,10 @@ pub(super) async fn on_offer(
         return;
     }
     let size = offer.size;
+    // A program, script or shortcut, or one named to pass for a document, is
+    // never fetched unasked whatever its size: the bubble's warning is only
+    // worth anything if the user sees it before the file is on disk.
+    let risky = crate::security::is_dangerous_extension(&name);
     state.attach_inbound.insert(
         xfer_id,
         InboundAttach {
@@ -795,7 +799,7 @@ pub(super) async fn on_offer(
     // Announced only once it is known to be waiting on the user: the UI treats
     // `awaiting` as "offered you a file", which is wrong for one fetched
     // without asking.
-    if !try_auto_accept(state, db, app, settings, friend, xfer_id, size, now).await {
+    if risky || !try_auto_accept(state, db, app, settings, friend, xfer_id, size, now).await {
         emit_by_id(app, db, &xfer_hex);
     }
 }
