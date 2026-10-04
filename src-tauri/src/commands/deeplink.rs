@@ -271,34 +271,7 @@ pub fn load_pending_queue(app: &AppHandle) -> Vec<PendingDeepLink> {
         })
 }
 
-/// True for a UNC share (`\\server\share`, `//server/share`, `\\?\UNC\…`) or
-/// any other `\\` namespace path that does not name a local drive letter.
-///
-/// Merely resolving such a path makes Windows connect to the server over SMB
-/// and offer the user's NTLM credentials, so a link must never get Ember to
-/// touch one.
-fn is_network_path(path: &str) -> bool {
-    let normalized = path.trim().replace('/', "\\");
-    let Some(rest) = normalized.strip_prefix(r"\\") else {
-        return false;
-    };
-    // Windows collapses `..` in a `\\.\` path before resolving it, so
-    // `\\.\C:\..\UNC\server\share` climbs off the drive onto a share.
-    if rest.split('\\').any(|component| component.trim() == "..") {
-        return true;
-    }
-    let names_local_drive = |device: &str| {
-        let bytes = device.as_bytes();
-        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
-    };
-    match rest
-        .strip_prefix(r"?\")
-        .or_else(|| rest.strip_prefix(r".\"))
-    {
-        Some(device) => !names_local_drive(device),
-        None => true,
-    }
-}
+use crate::security::is_network_path;
 
 /// True if `arg` looks like a deep link we should act on: an `ed2k:` URI
 /// (including browser-encoded `ed2k://%7Cfile%7C…` forms), an absolute local

@@ -506,6 +506,15 @@ impl ApprovedRootRegistry {
         Ok(())
     }
 
+    /// The canonical target recorded when `configured` was approved, from
+    /// memory: no disk access.
+    fn recorded_canonical(&self, configured: &str) -> Option<String> {
+        self.roots
+            .read()
+            .get(&path_key(Path::new(configured)))
+            .map(|record| record.canonical.clone())
+    }
+
     pub fn verify_root(&self, configured: &Path) -> io::Result<PathBuf> {
         let key = path_key(configured);
         let record = self.roots.read().get(&key).cloned().ok_or_else(|| {
@@ -536,6 +545,7 @@ impl ApprovedRootRegistry {
         candidate: &Path,
         allowed_roots: &[String],
     ) -> io::Result<PathBuf> {
+        refuse_network_path_outside(candidate, allowed_roots)?;
         let canonical = candidate.canonicalize()?;
         if !canonical.is_file() && !canonical.is_dir() {
             return Err(io::Error::new(
@@ -574,6 +584,7 @@ impl ApprovedRootRegistry {
         candidate: &Path,
         allowed_roots: &[String],
     ) -> io::Result<PathBuf> {
+        refuse_network_path_outside(candidate, allowed_roots)?;
         match object_identity(candidate) {
             Ok(identity) if identity.reparse_point => {
                 return Err(io::Error::new(
@@ -1130,7 +1141,46 @@ fn verified_parent_handle(
     parent: &Path,
     allowed_roots: &[String],
 ) -> io::Result<(PathBuf, File, ObjectIdentity)> {
+    refuse_network_path_outside(parent, allowed_roots)?;
     open_verified_directory(parent, allowed_roots)
+}
+
+/// Refuse, before anything resolves it, a network path that is not inside an
+/// approved root by its text alone. Resolving `\\host\share\x` opens an SMB
+/// session that offers the user's NTLM credentials to that host, so the
+/// containment checks that canonicalize first had already leaked them by the
+/// time they said no. A share the user approved as a root still passes, and so
+/// does a path under a root's recorded canonical form: a mapped drive `Z:\x`
+/// canonicalizes to `\\?\UNC\server\share\x`, and the move into Downloads and
+/// the Library's delete work on canonical paths. A local path is checked
+/// exactly as before. Windows only: elsewhere `//x` is an ordinary path.
+fn refuse_network_path_outside(candidate: &Path, allowed_roots: &[String]) -> io::Result<()> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let text = candidate.to_string_lossy();
+    if !crate::security::is_network_path(&text) {
+        return Ok(());
+    }
+    let registry = global_slot().read().clone();
+    let inside = allowed_roots
+        .iter()
+        .filter(|root| !root.is_empty())
+        .any(|root| {
+            crate::security::path_within_dir(&text, root)
+                || registry
+                    .as_ref()
+                    .and_then(|registry| registry.recorded_canonical(root))
+                    .is_some_and(|canonical| crate::security::path_within_dir(&text, &canonical))
+        });
+    if inside {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "network path is outside the approved roots",
+        ))
+    }
 }
 
 #[cfg(unix)]
@@ -2821,6 +2871,71 @@ pub fn object_identity(path: &Path) -> io::Result<ObjectIdentity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A network path outside every approved root is refused before anything
+    /// resolves it; one under an approved share, and any local path, go on to
+    /// the ordinary checks.
+    #[cfg(windows)]
+    #[test]
+    fn network_paths_outside_the_roots_are_refused_unresolved() {
+        let roots = vec![r"C:\Share".to_string(), r"\\nas\media".to_string()];
+        for refused in [
+            r"\\attacker\share\x.mkv",
+            r"//attacker/share/x.mkv",
+            r"\\?\UNC\attacker\share\x.mkv",
+            r"\\.\C:\..\UNC\attacker\share",
+            r"\\nas\other\x.mkv",
+        ] {
+            assert!(
+                refuse_network_path_outside(Path::new(refused), &roots).is_err(),
+                "{refused}"
+            );
+        }
+        // A UNC path's root is `\\server\share`, which `..` cannot climb above.
+        for passed in [
+            r"\\nas\media\film.mkv",
+            r"\\nas\media\..\film.mkv",
+            r"C:\Share\x.mkv",
+            r"D:\elsewhere\x.mkv",
+        ] {
+            assert!(refuse_network_path_outside(Path::new(passed), &roots).is_ok(), "{passed}");
+        }
+    }
+
+    /// A mapped drive canonicalizes to `\\?\UNC\…`: paths under an approved
+    /// root's recorded canonical form must pass, or nothing could complete
+    /// into, or be deleted from, a download folder on a mapped drive.
+    #[cfg(windows)]
+    #[test]
+    fn a_mapped_drive_roots_canonical_unc_paths_pass() {
+        let _guard = test_registry_lock();
+        let previous = global_slot().read().clone();
+        let identity: ObjectIdentity = serde_json::from_str("{}").unwrap();
+        let configured = r"Z:\Ember".to_string();
+        let mut roots = HashMap::new();
+        roots.insert(
+            path_key(Path::new(&configured)),
+            ApprovedRoot {
+                configured: configured.clone(),
+                canonical: r"\\?\UNC\nas\share\Ember".to_string(),
+                configured_identity: identity.clone(),
+                target_identity: identity,
+                volume: None,
+            },
+        );
+        *global_slot().write() = Some(Arc::new(ApprovedRootRegistry {
+            state_path: std::env::temp_dir().join("ember-unused-roots.json"),
+            roots: parking_lot::RwLock::new(roots),
+        }));
+        let allowed = [configured];
+        let canonical_part = Path::new(r"\\?\UNC\nas\share\Ember\Temp\x.part");
+        let other_share = Path::new(r"\\?\UNC\nas\other\x.part");
+        let accepted = refuse_network_path_outside(canonical_part, &allowed).is_ok();
+        let refused = refuse_network_path_outside(other_share, &allowed).is_err();
+        *global_slot().write() = previous;
+        assert!(accepted, "under the root's canonical form");
+        assert!(refused, "another share stays refused");
+    }
 
     /// A completion copy's name in a deep download folder runs past
     /// `MAX_PATH`; the handles Ember opens itself must still reach it.

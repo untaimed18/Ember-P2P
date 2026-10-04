@@ -1092,6 +1092,16 @@ pub async fn navigate_share_browser(
         .await;
     }
 
+    if cfg!(windows) && crate::security::is_network_path(trimmed) {
+        let shared_folders = current_shared_folders(&state).await;
+        let app = tauri::Manager::app_handle(&window).clone();
+        if !network_location_allowed(&app, trimmed, &shared_folders).await {
+            return Err(coded(
+                "sharing_browser_blocked",
+                "Cannot share this location",
+            ));
+        }
+    }
     let requested = PathBuf::from(trimmed);
     let resolved = tokio::task::spawn_blocking(move || existing_dir(&requested))
         .await
@@ -1511,6 +1521,87 @@ pub(crate) fn share_confirmation_text(
         }
     });
     (title, body)
+}
+
+/// `\\SERVER\SHARE` for a UNC path (plain or `\\?\UNC\`), the unit a browse
+/// approval covers. `None` for any other network form (`\\.\`, a climb with
+/// `..`), which is never browsed.
+fn unc_share_key(path: &str) -> Option<String> {
+    use std::path::{Component, Prefix};
+    if path.split(['\\', '/']).any(|part| part.trim() == "..") {
+        return None;
+    }
+    let normalized = path.trim().replace('/', "\\");
+    match Path::new(&normalized).components().next()? {
+        Component::Prefix(prefix) => match prefix.kind() {
+            Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => Some(format!(
+                r"\\{}\{}",
+                server.to_string_lossy().to_uppercase(),
+                share.to_string_lossy().to_uppercase()
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Shares the user agreed to browse this session.
+static BROWSE_APPROVED_SHARES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether a typed network location may be opened. Listing `\\host\share`
+/// connects to that host and offers it the user's Windows sign-in (NTLM), so
+/// a path the renderer typed is never opened on its own say: a share already
+/// shared, or one the user confirms here once per session, is.
+async fn network_location_allowed(
+    app: &tauri::AppHandle,
+    path: &str,
+    shared_folders: &[PathBuf],
+) -> bool {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    if shared_folders
+        .iter()
+        .any(|folder| crate::security::path_within_dir(path, &folder.to_string_lossy()))
+    {
+        return true;
+    }
+    let Some(share) = unc_share_key(path) else {
+        return false;
+    };
+    let approved = || {
+        BROWSE_APPROVED_SHARES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&share)
+    };
+    if approved() {
+        return true;
+    }
+    let prompt = format!(
+        "Open the network location {share}?\n\nOpening it connects to that computer, which can receive your Windows sign-in details. Continue only if you typed this location yourself and trust that computer."
+    );
+    let dialog_app = app.clone();
+    let confirmed = tokio::task::spawn_blocking(move || {
+        dialog_app
+            .dialog()
+            .message(prompt)
+            .title("Open network location?")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "Open".to_string(),
+                "Cancel".to_string(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .unwrap_or(false);
+    if confirmed && !approved() {
+        let mut list = BROWSE_APPROVED_SHARES.lock().unwrap_or_else(|e| e.into_inner());
+        if list.len() >= 32 {
+            list.remove(0);
+        }
+        list.push(share);
+    }
+    confirmed
 }
 
 /// Ask, in a dialog the renderer can neither draw nor dismiss, whether to share

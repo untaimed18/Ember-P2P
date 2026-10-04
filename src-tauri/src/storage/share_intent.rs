@@ -27,6 +27,13 @@ struct PersistedShareIntent {
     denied: HashSet<String>,
     #[serde(default)]
     explicit_allow: HashSet<String>,
+    /// Hashes the user restricted to friends. known.met keeps the same flag,
+    /// but alone it was the only copy: a lost or partly read catalog lifted
+    /// every restriction, and fail-closed mode still offered a hash in
+    /// `explicit_allow` publicly. Absent in files written before 1.7.2, so
+    /// the first load after an upgrade seeds it from known.met.
+    #[serde(default)]
+    friends_only: HashSet<String>,
 }
 
 impl Default for PersistedShareIntent {
@@ -37,6 +44,7 @@ impl Default for PersistedShareIntent {
             fail_closed: false,
             denied: HashSet::new(),
             explicit_allow: HashSet::new(),
+            friends_only: HashSet::new(),
         }
     }
 }
@@ -302,6 +310,42 @@ impl ShareIntentStore {
     pub fn is_fail_closed(&self) -> bool {
         self.state.read().fail_closed
     }
+
+    pub fn is_friends_only(&self, hash: &[u8; 16]) -> bool {
+        self.state.read().friends_only.contains(&normalize_hash(hash))
+    }
+
+    /// Record friends-only choices. Returns whether anything changed (and was
+    /// persisted); a batch already in effect is not rewritten.
+    pub fn set_friends_only_batch(&self, updates: &[([u8; 16], bool)]) -> io::Result<bool> {
+        let in_effect = {
+            let state = self.state.read();
+            updates
+                .iter()
+                .all(|(hash, on)| state.friends_only.contains(&normalize_hash(hash)) == *on)
+        };
+        if in_effect {
+            return Ok(false);
+        }
+        self.mutate(|state| {
+            for (hash, on) in updates {
+                let key = normalize_hash(hash);
+                if *on {
+                    state.friends_only.insert(key);
+                } else {
+                    state.friends_only.remove(&key);
+                }
+            }
+            if state.friends_only.len() > MAX_INTENTS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "share-intent store exceeds its safety limit",
+                ));
+            }
+            Ok(())
+        })?;
+        Ok(true)
+    }
 }
 
 /// Synchronous form of [`initialize_in_background`].
@@ -403,6 +447,7 @@ fn read_persisted(path: &Path) -> io::Result<PersistedShareIntent> {
             .len()
             .saturating_add(parsed.explicit_allow.len())
             > MAX_INTENTS
+            || parsed.friends_only.len() > MAX_INTENTS
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -430,6 +475,14 @@ fn absorb_known_catalog(data_dir: &Path, state: &mut PersistedShareIntent) {
                 let key = normalize_hash(&record.file_hash);
                 state.explicit_allow.remove(&key);
                 state.denied.insert(key);
+            }
+            // Added, never removed here: lifting a restriction goes through
+            // `set_friends_only_batch` together with the known.met record.
+            for record in known.all_records().filter(|record| record.friends_only) {
+                if state.friends_only.len() >= MAX_INTENTS {
+                    break;
+                }
+                state.friends_only.insert(normalize_hash(&record.file_hash));
             }
             // The unshares and restrictions past the readable part are gone
             // with it, as for a catalog that could not be read at all.
@@ -538,6 +591,39 @@ pub fn effective_shared(hash: &[u8; 16], catalog_value: bool) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the user restricted this content to friends. A store that failed to
+/// initialize answers false here, but shares nothing at all then
+/// ([`effective_shared`] is false for every hash).
+pub fn is_friends_only(hash: &[u8; 16]) -> bool {
+    global()
+        .map(|store| store.is_friends_only(hash))
+        .unwrap_or(false)
+}
+
+/// Every friends-only hash, for the backstops that otherwise read only
+/// known.met. Never waits: before the store has settled this is empty, and
+/// known.met's own records still apply.
+pub fn friends_only_hashes_if_ready() -> HashSet<[u8; 16]> {
+    let Some(Ok(store)) = global_slot().resolved() else {
+        return HashSet::new();
+    };
+    let state = store.state.read();
+    state
+        .friends_only
+        .iter()
+        .filter_map(|key| {
+            let mut hash = [0u8; 16];
+            hex::decode_to_slice(key, &mut hash).ok()?;
+            Some(hash)
+        })
+        .collect()
+}
+
+/// See [`ShareIntentStore::set_friends_only_batch`].
+pub fn set_friends_only_batch(updates: &[([u8; 16], bool)]) -> io::Result<bool> {
+    global()?.set_friends_only_batch(updates)
+}
+
 /// Returns whether the store changed (and was persisted).
 pub fn set_explicit_batch(updates: &[([u8; 16], bool)]) -> io::Result<bool> {
     global()?.set_explicit_batch(updates)
@@ -599,6 +685,31 @@ mod tests {
             }),
             write_seq: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    #[test]
+    fn friends_only_choices_are_kept_and_lifted() {
+        let store = test_store(false);
+        let (a, b) = ([0x61; 16], [0x62; 16]);
+        assert!(store.set_friends_only_batch(&[(a, true), (b, true)]).unwrap());
+        assert!(store.is_friends_only(&a) && store.is_friends_only(&b));
+        assert!(!store.set_friends_only_batch(&[(a, true)]).unwrap(), "already in effect");
+
+        assert!(store.set_friends_only_batch(&[(b, false)]).unwrap());
+        assert!(store.is_friends_only(&a) && !store.is_friends_only(&b));
+
+        let written: PersistedShareIntent =
+            serde_json::from_slice(&std::fs::read(&store.path).unwrap()).unwrap();
+        assert!(written.friends_only.contains(&hex::encode(a)), "persisted");
+        assert!(!written.friends_only.contains(&hex::encode(b)));
+        let _ = std::fs::remove_file(&store.path);
+    }
+
+    #[test]
+    fn a_store_written_before_friends_only_was_kept_still_loads() {
+        let old = br#"{"version":1,"catalog_seen":true,"fail_closed":false,"denied":[],"explicit_allow":[]}"#;
+        let parsed: PersistedShareIntent = serde_json::from_slice(old).unwrap();
+        assert!(parsed.friends_only.is_empty());
     }
 
     #[test]

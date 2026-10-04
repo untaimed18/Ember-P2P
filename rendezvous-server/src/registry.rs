@@ -241,6 +241,15 @@ struct RankedDirectory {
     entries: Vec<(DirectoryCursor, DirectoryListing)>,
 }
 
+/// The sorted tombstone list `/v4/channels/deleted` pages through, kept like
+/// [`RankedDirectory`].
+#[derive(Debug)]
+struct DeletedIds {
+    generation: u64,
+    built_at: i64,
+    ids: Arc<Vec<String>>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct RegistryFile {
     #[serde(default)]
@@ -297,6 +306,7 @@ pub struct ChannelRegistry {
     /// acknowledged (see [`Self::touch_durable`]).
     durable_generation: u64,
     directory_cache: Mutex<Option<Arc<RankedDirectory>>>,
+    deleted_cache: Mutex<Option<DeletedIds>>,
     /// Ticket dispenser and completion gate for [`PersistJob::write`]. See
     /// [`PersistGate`].
     persist_gate: Arc<PersistGate>,
@@ -396,6 +406,7 @@ impl ChannelRegistry {
             generation: 0,
             durable_generation: 0,
             directory_cache: Mutex::new(None),
+            deleted_cache: Mutex::new(None),
             persist_gate: Arc::new(PersistGate::new()),
             read_only,
             closed: false,
@@ -1368,18 +1379,51 @@ impl ChannelRegistry {
 
     /// One page of [`Self::deleted_ids`], starting after `after`.
     ///
-    /// `deleted_ids` clones, sorts and dedups the entire tombstone set on every
-    /// call, and `/v4/channels/deleted` is unauthenticated and polled by every
-    /// client — so a ~200-byte request bought an unbounded response plus
-    /// O(n log n) work. The list is sorted, so a plain "greater than the last
-    /// id you saw" cursor pages it without holding any server-side state.
+    /// `/v4/channels/deleted` is unauthenticated and polled by every client.
+    /// The list is sorted, so a plain "greater than the last id you saw"
+    /// cursor pages it without server-side state, and it is cached like the
+    /// directory ranking: rebuilt only after a write, and then at most once
+    /// per [`DIRECTORY_REBUILD_MIN_SECS`]. Built per request, every page
+    /// cloned and sorted the whole tombstone set under the registry lock.
     pub fn deleted_ids_page(&self, after: Option<&str>, limit: usize) -> Vec<String> {
-        let all = self.deleted_ids();
+        self.deleted_ids_page_at(after, limit, unix_now(), DIRECTORY_REBUILD_MIN_SECS)
+    }
+
+    fn deleted_ids_page_at(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+        now: i64,
+        rebuild_min_secs: i64,
+    ) -> Vec<String> {
+        let all = self.cached_deleted_ids(now, rebuild_min_secs);
         let start = match after {
             Some(cursor) => all.partition_point(|id| id.as_str() <= cursor),
             None => 0,
         };
-        all.into_iter().skip(start).take(limit).collect()
+        all.iter().skip(start).take(limit).cloned().collect()
+    }
+
+    fn cached_deleted_ids(&self, now: i64, rebuild_min_secs: i64) -> Arc<Vec<String>> {
+        let mut cache = self
+            .deleted_cache
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(cached) = cache.as_ref() {
+            let age = now.saturating_sub(cached.built_at);
+            let usable = (0..DIRECTORY_CACHE_MAX_AGE_SECS).contains(&age)
+                && (cached.generation == self.generation || age < rebuild_min_secs);
+            if usable {
+                return cached.ids.clone();
+            }
+        }
+        let ids = Arc::new(self.deleted_ids());
+        *cache = Some(DeletedIds {
+            generation: self.generation,
+            built_at: now,
+            ids: ids.clone(),
+        });
+        ids
     }
 }
 
@@ -1803,6 +1847,27 @@ mod tests {
 
         // A cursor past the end yields nothing rather than wrapping.
         assert!(reg.deleted_ids_page(Some(&"f".repeat(32)), 10).is_empty());
+    }
+
+    /// The cached list is served until a write, then rebuilt once the minimum
+    /// interval has passed, so a deletion shows up without a sort per request.
+    #[test]
+    fn the_deleted_list_is_cached_until_a_write() {
+        let mut reg = ChannelRegistry::in_memory();
+        let now = 1_000_000;
+        assert!(reg.deleted_ids_page_at(None, 10, now, 2).is_empty());
+
+        let id = "ab".repeat(16);
+        reg.delete_channel(&id, &"cd".repeat(32)).expect("tombstoned");
+        assert!(
+            reg.deleted_ids_page_at(None, 10, now + 1, 2).is_empty(),
+            "within the rebuild interval the cached list stands"
+        );
+        assert_eq!(reg.deleted_ids_page_at(None, 10, now + 2, 2), vec![id.clone()]);
+
+        // No write since: still served from the cache, not rebuilt.
+        reg.deleted.insert("ff".repeat(16));
+        assert_eq!(reg.deleted_ids_page_at(None, 10, now + 10, 2), vec![id]);
     }
 
     fn ed25519_test_pubkey() -> String {

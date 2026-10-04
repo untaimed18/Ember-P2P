@@ -1520,6 +1520,21 @@ pub async fn update_settings(
         tokio::task::spawn_blocking(move || normalize_shared_folders(shared_folders))
             .await
             .map_err(|e| coded_ctx("settings_validation_task_failed", "Validation failed", e))??;
+    // Provenance before validation. `validate_settings` resolves the folder on
+    // disk, and resolving `\\host\share` opens an SMB session that hands the
+    // user's NTLM credentials to that host — so a changed folder the picker
+    // did not produce is refused before anything touches it. The full check,
+    // with the writability probe, still runs below.
+    if !settings.download_folder.is_empty()
+        && normalized_path_components(std::path::Path::new(&settings.download_folder))
+            != normalized_path_components(std::path::Path::new(&old_settings.download_folder))
+        && !download_root_was_picked(std::path::Path::new(&settings.download_folder))
+    {
+        return Err(coded(
+            "settings_download_folder_not_picked",
+            "Choose the download folder with Browse before saving",
+        ));
+    }
     {
         let settings_for_validation = settings.clone();
         tokio::task::spawn_blocking(move || validate_settings(&settings_for_validation))

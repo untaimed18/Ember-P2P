@@ -158,6 +158,9 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 # pull in a second, incompatible hashing stack.
 hkdf = "0.12"
 argon2 = "0.5"
+# Library deletes go to the Recycle Bin / Trash, so a delete is recoverable and
+# a compromised webview cannot wipe shared folders for good.
+trash = "5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

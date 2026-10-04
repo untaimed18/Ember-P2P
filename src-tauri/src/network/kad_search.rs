@@ -1304,6 +1304,15 @@ pub(super) fn matches_search_expr_impl(
             let value = kad::publish::kad_keyword_lowercase(value);
             if tag_matches_filename(tag) {
                 lower_name.contains(&value)
+            } else if tag_matches_fileformat(tag) {
+                // Nobody publishes the extension as a tag: it is part of the
+                // name, and eMule matches it there (`Entry.cpp`, "special
+                // handling for TAG_FILEFORMAT"). Looked up as a stored tag, an
+                // extension filter matched nothing on an Ember storage node.
+                let wanted = value.trim_start_matches('.');
+                lower_name
+                    .rsplit_once('.')
+                    .is_some_and(|(_, ext)| !wanted.is_empty() && ext == wanted)
             } else if let Some(tags) = tags {
                 tags.iter()
                     .find(|entry_tag| tag_name_matches(tag, &entry_tag.name))
@@ -1362,6 +1371,16 @@ pub(super) fn tag_matches_filename(tag: &SearchTagRef) -> bool {
     }
 }
 
+/// eMule `TAG_FILEFORMAT` (`FT_FILEFORMAT`): the file extension, no dot.
+const TAG_FILEFORMAT: u8 = 0x04;
+
+pub(super) fn tag_matches_fileformat(tag: &SearchTagRef) -> bool {
+    match tag {
+        SearchTagRef::Id(id) => *id == TAG_FILEFORMAT,
+        SearchTagRef::Str(_) => false,
+    }
+}
+
 pub(super) fn tag_matches_filesize(tag: &SearchTagRef) -> bool {
     match tag {
         SearchTagRef::Id(id) => *id == TAG_FILESIZE,
@@ -1382,4 +1401,34 @@ pub(super) fn matches_requested_file_size_tags(tags: &[KadTag], requested_size: 
         .find_map(search_entry_tag_u64)
         .map(|size| size == requested_size)
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod fileformat_tests {
+    use super::*;
+
+    fn named(name: &str) -> Vec<KadTag> {
+        vec![KadTag {
+            name: TagName::Id(TAG_FILENAME),
+            value: TagValue::String(name.to_string()),
+        }]
+    }
+
+    fn ext(value: &str) -> KadSearchExpr {
+        KadSearchExpr::MetaString {
+            tag: SearchTagRef::Id(TAG_FILEFORMAT),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_extension_term_matches_the_file_name_like_emule() {
+        let tags = named("Some.Movie.2024.MKV");
+        assert!(matches_search_expr_for_tags(&ext("mkv"), &tags));
+        assert!(matches_search_expr_for_tags(&ext(".mkv"), &tags));
+        assert!(!matches_search_expr_for_tags(&ext("mk"), &tags), "equality, not a substring");
+        assert!(!matches_search_expr_for_tags(&ext("avi"), &tags));
+        assert!(!matches_search_expr_for_tags(&ext("mkv"), &named("no_extension")));
+        assert!(!matches_search_expr_for_tags(&ext(""), &tags));
+    }
 }

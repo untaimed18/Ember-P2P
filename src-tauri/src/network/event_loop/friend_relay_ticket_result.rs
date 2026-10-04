@@ -149,6 +149,14 @@ pub(in crate::network) async fn on_friend_relay_ticket_poll_result(
                 .await
                 {
                     Ok(ws) => {
+                        // The ticket is spent once joined, and the session's
+                        // own lifetime is bounded by `channel_relay_pending` /
+                        // `channel_relay_outboxes` against
+                        // `MAX_CHANNEL_RELAY_SESSIONS`. Held until the session
+                        // ended (up to the server's 30-minute cap), room
+                        // sessions filled the slots friend tickets count
+                        // against, and two friends behind NAT could not meet.
+                        let _ = done_tx.send(ticket_id);
                         run_channel_relay_session(
                             ws, peer_pubkey, session_id, event_tx,
                         )
@@ -156,9 +164,9 @@ pub(in crate::network) async fn on_friend_relay_ticket_poll_result(
                     }
                     Err(e) => {
                         tracing::debug!("Channel relay ticket join failed: {e}");
+                        let _ = done_tx.send(ticket_id);
                     }
                 }
-                let _ = done_tx.send(ticket_id);
             });
             continue;
         }

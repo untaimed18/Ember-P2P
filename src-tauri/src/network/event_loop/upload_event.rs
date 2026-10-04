@@ -1559,11 +1559,24 @@ pub(in crate::network) async fn on_upload_event(
             transfer_manager,
             pending_kad_callbacks,
             app_handle,
+            ul_event_tx,
             settings,
             ed25519_secret_key,
             ember_hash,
             ack_eh,
             status,
+            nonce,
+        )
+        .await;
+    }
+
+    if let UploadEventKind::FriendTransferPunchFailed { friend, nonce } = event.kind {
+        abandon_friend_transfer_attempt(
+            state,
+            transfer_manager,
+            pending_kad_callbacks,
+            app_handle,
+            friend,
             nonce,
         )
         .await;

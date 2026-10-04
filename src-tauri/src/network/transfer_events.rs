@@ -15,7 +15,13 @@ pub(super) async fn take_fresh_part_hashes(
 
 /// Re-verify a .part file that was fully downloaded but the app crashed before
 /// completion.  On success, moves the file to `Downloads/` and cleans up.
-pub(super) async fn reverify_complete_part_file(
+///
+/// Blocking, start to finish, for the caller to run on one blocking task and
+/// report from it: Pause, Stop and Cancel abort the async task that awaits
+/// it, which cannot stop a move already under way, and a Completed event sent
+/// from that task would be lost while the `.part` was gone.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reverify_complete_part_file(
     transfer_id: &str,
     file_hash: &str,
     file_name: &str,
@@ -24,40 +30,32 @@ pub(super) async fn reverify_complete_part_file(
     expected_ember: Option<&str>,
     part_dir: &std::path::Path,
     download_dir: &std::path::Path,
+    control: &TransferControl,
 ) -> anyhow::Result<std::path::PathBuf> {
     let part_path = part_dir.join("Temp").join(format!("{transfer_id}.part"));
-    let expected = file_hash.to_string();
-    let verify_path = part_path.clone();
-    let verify_root = part_dir.to_path_buf();
-    let expected_aich_owned = expected_aich.map(str::to_string);
-    let ember_wanted = expected_ember.is_some();
-    let (computed_hash, verified_identity, computed_aich, computed_ember) =
-        tokio::task::spawn_blocking(move || {
-            let allowed = vec![verify_root.to_string_lossy().into_owned()];
-            let (_, mut file) =
-                crate::security::filesystem::open_existing_approved(&verify_path, &allowed, false)?;
-            let identity = crate::security::filesystem::opened_file_identity(&file)?;
-            let hash = ed2k::hash::ed2k_hash_open_file(&mut file)?;
-            let aich = if expected_aich_owned.is_some() {
-                Some(hex::encode(
-                    ed2k::aich::AICHRecoveryHashSet::build_from_open_file(&mut file)?.root_hash,
-                ))
-            } else {
-                None
-            };
-            // Hashed off the same handle the identity check covers, like the
-            // other two, so all three describe the file that is about to move.
-            let ember = if ember_wanted {
-                Some(hex::encode(ember::crypto::blake3_hash_open_file(
-                    &mut file,
-                )?))
-            } else {
-                None
-            };
-            Ok::<_, anyhow::Error>((hash, identity, aich, ember))
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+    let (computed_hash, verified_identity, computed_aich, computed_ember) = {
+        let allowed = vec![part_dir.to_string_lossy().into_owned()];
+        let (_, mut file) =
+            crate::security::filesystem::open_existing_approved(&part_path, &allowed, false)?;
+        let identity = crate::security::filesystem::opened_file_identity(&file)?;
+        let hash = ed2k::hash::ed2k_hash_open_file(&mut file)?;
+        let aich = if expected_aich.is_some() {
+            Some(hex::encode(
+                ed2k::aich::AICHRecoveryHashSet::build_from_open_file(&mut file)?.root_hash,
+            ))
+        } else {
+            None
+        };
+        // Hashed off the same handle the identity check covers, like the
+        // other two, so all three describe the file that is about to move.
+        let ember = if expected_ember.is_some() {
+            Some(hex::encode(ember::crypto::blake3_hash_open_file(&mut file)?))
+        } else {
+            None
+        };
+        (hash, identity, aich, ember)
+    };
+    let expected = file_hash;
 
     if computed_hash != expected {
         anyhow::bail!("Re-verification hash mismatch — .part preserved for retry");
@@ -83,23 +81,25 @@ pub(super) async fn reverify_complete_part_file(
         }
     }
 
+    // A Pause, Stop or Cancel that arrived during the verify: the verified
+    // `.part` stays where it is, as on the live path, rather than moving a
+    // file the user has just stopped. The Failed handler ignores this error.
+    if control.is_cancelled() {
+        anyhow::bail!("cancelled by user");
+    }
     let safe_name = crate::security::sanitize_filename(file_name);
-    let pp = part_path.clone();
-    let pp_root = part_dir.to_path_buf();
-    let root = download_dir.to_path_buf();
-    let actual_final = tokio::task::spawn_blocking(move || {
-        ed2k::transfer::move_part_to_downloads(&pp, &pp_root, &root, &safe_name, &verified_identity)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+    let actual_final = ed2k::transfer::move_part_to_downloads(
+        &part_path,
+        part_dir,
+        download_dir,
+        &safe_name,
+        &verified_identity,
+    )?;
 
     // Clean up .part.met
     let met_path = part_path.with_extension("part.met");
     let cleanup_root = part_dir.to_string_lossy().into_owned();
-    let _ = tokio::task::spawn_blocking(move || {
-        crate::security::filesystem::remove_approved_file(&met_path, &[cleanup_root])
-    })
-    .await;
+    let _ = crate::security::filesystem::remove_approved_file(&met_path, &[cleanup_root]);
 
     info!(
         "Re-verified and completed restored download {transfer_id} ({file_name}, {file_size} bytes)"
@@ -1103,6 +1103,7 @@ pub(super) async fn handle_upload_event(
         | UploadEventKind::EmberFriendConnected { .. }
         | UploadEventKind::FriendEndpointDiscovered { .. }
         | UploadEventKind::EmberFriendSearchFailed { .. }
+        | UploadEventKind::FriendTransferPunchFailed { .. }
         | UploadEventKind::PeerAutoBanned { .. }
         | UploadEventKind::EmberTransferRequest { .. }
         | UploadEventKind::EmberTransferAck { .. }

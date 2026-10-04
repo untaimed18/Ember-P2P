@@ -707,6 +707,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                         transfer.status = TransferStatus::Verifying;
                         transfer.speed = 0;
                         restore_db_writes.push(transfer.clone());
+                        let verify_control = control.clone();
                         {
                             let mut mgr = transfer_manager.write().await;
                             mgr.active.insert(tid.clone(), transfer);
@@ -716,45 +717,62 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                         if let Some(old_handle) = state.download_handles.remove(&dl_tid2) {
                             old_handle.abort();
                         }
+                        // Verify, move and report on one blocking task, as the
+                        // copy check above does: Pause, Stop and Cancel abort
+                        // the async task but cannot stop a move under way, and
+                        // were the event sent from the task, the row would be
+                        // left unfinished with its `.part` gone, so Resume
+                        // would download it all again as "name (1)".
                         let handle = tokio::spawn(async move {
-                            let result = reverify_complete_part_file(
-                                &dl_tid,
-                                &file_hash,
-                                &file_name,
-                                file_size,
-                                expected_aich.as_deref(),
-                                expected_ember.as_deref(),
-                                &part_dir,
-                                &dl_dir,
-                            )
+                            let (panic_tx, panic_tid) = (tx.clone(), dl_tid.clone());
+                            let checked = tokio::task::spawn_blocking(move || {
+                                let result = reverify_complete_part_file(
+                                    &dl_tid,
+                                    &file_hash,
+                                    &file_name,
+                                    file_size,
+                                    expected_aich.as_deref(),
+                                    expected_ember.as_deref(),
+                                    &part_dir,
+                                    &dl_dir,
+                                    &verify_control,
+                                );
+                                let event = match result {
+                                    Ok(final_path) => DownloadEvent::Completed {
+                                        transfer_id: dl_tid,
+                                        final_path: Some(
+                                            final_path.to_string_lossy().into_owned(),
+                                        ),
+                                        // `reverify_complete_part_file` only
+                                        // re-checks the whole-file ed2k hash,
+                                        // not a per-part hashset.
+                                        part_hashes: Vec::new(),
+                                        ember_verified: ember_pinned,
+                                    },
+                                    Err(e) => {
+                                        warn!("Re-verification of restored download failed: {e}");
+                                        let error = e.to_string();
+                                        let failure_kind = ed2k::transfer::classify_error(&error);
+                                        DownloadEvent::Failed {
+                                            transfer_id: dl_tid,
+                                            error,
+                                            failure_kind,
+                                        }
+                                    }
+                                };
+                                let _ = tx.blocking_send(event);
+                            })
                             .await;
-                            match result {
-                                Ok(final_path) => {
-                                    let _ = tx
-                                        .send(DownloadEvent::Completed {
-                                            transfer_id: dl_tid,
-                                            final_path: Some(
-                                                final_path.to_string_lossy().into_owned(),
-                                            ),
-                                            // `reverify_complete_part_file` only
-                                            // re-checks the whole-file ed2k hash,
-                                            // not a per-part hashset.
-                                            part_hashes: Vec::new(),
-                                            ember_verified: ember_pinned,
-                                        })
-                                        .await;
-                                }
-                                Err(e) => {
-                                    warn!("Re-verification of restored download failed: {e}");
-                                    let kind = ed2k::transfer::classify_error(&e.to_string());
-                                    let _ = tx
-                                        .send(DownloadEvent::Failed {
-                                            transfer_id: dl_tid,
-                                            error: e.to_string(),
-                                            failure_kind: kind,
-                                        })
-                                        .await;
-                                }
+                            if let Err(e) = checked {
+                                let error = format!("Re-verification of restored download failed: {e}");
+                                let failure_kind = ed2k::transfer::classify_error(&error);
+                                let _ = panic_tx
+                                    .send(DownloadEvent::Failed {
+                                        transfer_id: panic_tid,
+                                        error,
+                                        failure_kind,
+                                    })
+                                    .await;
                             }
                         });
                         state.download_handles.insert(dl_tid2, handle);

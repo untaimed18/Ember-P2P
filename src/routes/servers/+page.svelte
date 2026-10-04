@@ -975,15 +975,19 @@
 
   $effect(() => {
     const validKeys = new Set(servers.map(serverKey));
+    // The multi-selection is trimmed to the rows on screen, as on the Search
+    // page: bulk actions and Remove act on the selection, and one that kept
+    // rows the filter hid changed servers the user could no longer see.
+    const visibleKeys = new Set(filteredServers.map(serverKey));
     untrack(() => {
-      const next = new Set([...selectedServers].filter((key) => validKeys.has(key)));
+      const next = new Set([...selectedServers].filter((key) => visibleKeys.has(key)));
       if (next.size !== selectedServers.size) {
         selectedServers = next;
       }
       if (selectedServer && !validKeys.has(serverKey(selectedServer))) {
         selectedServer = null;
       }
-      if (lastClickedKey && !validKeys.has(lastClickedKey)) {
+      if (lastClickedKey && !visibleKeys.has(lastClickedKey)) {
         lastClickedKey = null;
       }
     });

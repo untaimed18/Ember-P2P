@@ -1194,10 +1194,14 @@ pub(super) async fn handle_udp_packet_inner(
         }
     }
 
-    // eMule SetAlive: refresh the sender in the routing table on every valid message
-    if let std::net::IpAddr::V4(ipv4) = from.ip() {
-        state.routing_table.touch_contact_by_addr(ipv4, from.port());
-    }
+    // No refresh here by source address. eMule's SetAlive runs only on
+    // `CRoutingZone::Add`'s update path, keyed by the sender's KadID and
+    // behind the UDP-key check, which the Hello and BootstrapRes handlers
+    // below reach through `insert`. Refreshing whatever contact sat at this
+    // IP:port let spoofed packets revive dead contacts, and kept a departed
+    // node alive for ever once a different node took its address: the
+    // newcomer's own HelloRes refreshed the old entry, and the per-IP limit
+    // then kept the newcomer out.
 
     match msg {
         KadMessage::BootstrapReq => {
@@ -1273,7 +1277,7 @@ pub(super) async fn handle_udp_packet_inner(
                 if i < 8 {
                     hello_addrs.push((addr, id, ver));
                 }
-                state.routing_table.insert(c);
+                state.routing_table.insert_if_new(c);
             }
 
             // Hello the bootstrap node itself, then the first returned contacts.
@@ -2013,7 +2017,7 @@ pub(super) async fn handle_udp_packet_inner(
                         }
                     } else {
                         for c in &safe_contacts {
-                            state.routing_table.insert(c.clone());
+                            state.routing_table.insert_if_new(c.clone());
                         }
                     }
                 }

@@ -1422,6 +1422,25 @@ impl LocalIndex {
 }
 
 fn preserve_runtime_state(existing: &FileInfo, file: &mut FileInfo) {
+    // Other content now sits at this path (a file copied or moved over
+    // another, keeping its mtime, matched to its own known.met record). Its
+    // row already says what its hash's share intent and known.met allow, so
+    // the stricter of the two wins, as in `finalize_pending_hash`. Copying the
+    // old row's `shared` over it republished content the user had unshared,
+    // until the next cold start. The old content's counters and publish state
+    // are not this file's either.
+    let content_changed = !file.hash.is_empty() && !existing.hash.eq_ignore_ascii_case(&file.hash);
+    if content_changed {
+        file.shared = existing.shared && file.shared;
+        file.friends_only = existing.friends_only || file.friends_only;
+        // A still-hashing placeholder is this same file, not other content:
+        // a priority set on it (or its folder's default) is the user's, as
+        // `finalize_pending_hash` keeps it.
+        if existing.hash.is_empty() {
+            file.priority = existing.priority.clone();
+        }
+        return;
+    }
     file.priority = existing.priority.clone();
     file.requests = existing.requests;
     file.accepted = existing.accepted;
@@ -1610,6 +1629,39 @@ mod local_index_tests {
         assert_eq!(row.alltime_requests, 7);
         assert_eq!(row.alltime_accepted, 3);
         assert_eq!(row.alltime_transferred, 4096);
+    }
+
+    /// Unshared content copied over a shared file of the same name (Explorer
+    /// keeps the mtime) must stay unshared: the path's old row is not a reason
+    /// to publish what the new content's own intent withholds.
+    #[test]
+    fn other_content_at_a_path_keeps_its_own_restrictions() {
+        let shared_hash = "11".repeat(16);
+        let withheld_hash = "22".repeat(16);
+        let mut index = LocalIndex::new();
+        let mut old = file("B/song.mp3", &shared_hash, true, "high");
+        old.alltime_requests = 9;
+        index.add_files(vec![old]);
+
+        let mut replaced = file("B/song.mp3", &withheld_hash, false, "normal");
+        replaced.friends_only = false;
+        index.add_file(replaced);
+        let row = index.get_by_hash(&withheld_hash).expect("the new content is indexed");
+        assert!(!row.shared, "unshared content stays unshared");
+        assert_eq!(row.alltime_requests, 0, "the old content's counters are not its own");
+
+        // The same content again keeps the row's runtime state, as before.
+        let mut again = file("B/song.mp3", &withheld_hash, true, "normal");
+        again.alltime_requests = 0;
+        index.add_file(again);
+        assert!(!index.get_by_hash(&withheld_hash).unwrap().shared);
+
+        // And a path restricted to friends keeps that for new content too.
+        let mut friends = file("C/a.bin", &"33".repeat(16), true, "normal");
+        friends.friends_only = true;
+        index.add_files(vec![friends]);
+        index.add_file(file("C/a.bin", &"44".repeat(16), true, "normal"));
+        assert!(index.get_by_hash(&"44".repeat(16)).unwrap().friends_only);
     }
 
     /// The key buffer is reused across rows, so a short-lived bug in the

@@ -119,8 +119,33 @@ pub fn ensure_data_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Written beside the data once the legacy folder has been migrated.
+const LEGACY_MIGRATION_MARKER: &str = ".legacy-data-migrated";
+/// Written before the copy starts and removed once it has finished.
+const LEGACY_MIGRATION_STARTED: &str = ".legacy-data-migrating";
+
 fn migrate_legacy_app_data(legacy: &Path, canonical: &Path) -> std::io::Result<()> {
     if paths_equivalent(legacy, canonical) || !legacy.exists() {
+        return Ok(());
+    }
+    // Once. Re-run on every launch, the copy brought back whatever the user
+    // or Ember had since deleted here: a plaintext `identity.json` the reset
+    // instructions say to remove, a rolled-back `cryptkey.dat`, a retired
+    // `aich_cache.dat`. A data folder that already holds a database or a
+    // config migrated on an earlier launch (the copy used to run each time),
+    // so it is marked done without copying again.
+    let marker = canonical.join(LEGACY_MIGRATION_MARKER);
+    if marker.exists() {
+        return Ok(());
+    }
+    // A copy cut short (a locked file, say) leaves the started marker behind,
+    // so the data that copy did land is not mistaken for an earlier finished
+    // migration: the next call copies the rest.
+    let started = canonical.join(LEGACY_MIGRATION_STARTED);
+    if !started.exists()
+        && (canonical.join(DATABASE_FILE_NAME).exists() || canonical.join("config.json").exists())
+    {
+        write_legacy_migration_marker(&marker);
         return Ok(());
     }
     let legacy_meta = std::fs::symlink_metadata(legacy)?;
@@ -131,8 +156,20 @@ fn migrate_legacy_app_data(legacy: &Path, canonical: &Path) -> std::io::Result<(
         );
         return Ok(());
     }
+    write_legacy_migration_marker(&started);
     park_orphaned_sqlite_sidecars(legacy, canonical)?;
-    copy_missing_entries(legacy, canonical)
+    copy_missing_entries(legacy, canonical)?;
+    write_legacy_migration_marker(&marker);
+    let _ = std::fs::remove_file(&started);
+    Ok(())
+}
+
+/// Best-effort: without it the next launch only repeats a copy of what is
+/// still missing, as every launch used to.
+fn write_legacy_migration_marker(marker: &Path) {
+    if let Err(error) = std::fs::write(marker, b"1") {
+        tracing::warn!("Could not record the legacy data migration as done: {error}");
+    }
 }
 
 /// Move aside WAL/SHM sidecars left behind by a database that is no longer
@@ -529,6 +566,51 @@ mod tests {
             .filter(|name| name.ends_with(".pre-migration.bak"))
             .collect();
         assert_eq!(parked.len(), 1, "the WAL must be preserved, not deleted");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The legacy folder is migrated once: a file deleted from the data folder
+    /// afterwards (an identity reset, a rolled-back key) must stay deleted.
+    #[test]
+    fn the_legacy_folder_is_migrated_once() {
+        let root = std::env::temp_dir().join(format!(
+            "ember-paths-once-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let legacy = root.join("legacy");
+        let canonical = root.join("canonical");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::write(legacy.join("identity.json"), b"old").unwrap();
+
+        migrate_legacy_app_data(&legacy, &canonical).unwrap();
+        assert!(canonical.join("identity.json").exists(), "first launch migrates");
+        assert!(!canonical.join(LEGACY_MIGRATION_STARTED).exists());
+        std::fs::remove_file(canonical.join("identity.json")).unwrap();
+        migrate_legacy_app_data(&legacy, &canonical).unwrap();
+        assert!(!canonical.join("identity.json").exists(), "not brought back");
+
+        // An install that migrated before the marker existed is marked done
+        // without another copy.
+        let upgraded = root.join("upgraded");
+        std::fs::create_dir_all(&upgraded).unwrap();
+        std::fs::write(upgraded.join("config.json"), b"{}").unwrap();
+        migrate_legacy_app_data(&legacy, &upgraded).unwrap();
+        assert!(!upgraded.join("identity.json").exists());
+        assert!(upgraded.join(LEGACY_MIGRATION_MARKER).exists());
+
+        // A copy cut short after the database landed finishes next time
+        // rather than being taken for a migration done long ago.
+        let interrupted = root.join("interrupted");
+        std::fs::create_dir_all(&interrupted).unwrap();
+        std::fs::write(interrupted.join(DATABASE_FILE_NAME), b"db").unwrap();
+        std::fs::write(interrupted.join(LEGACY_MIGRATION_STARTED), b"1").unwrap();
+        migrate_legacy_app_data(&legacy, &interrupted).unwrap();
+        assert!(interrupted.join("identity.json").exists(), "the rest is copied");
         let _ = std::fs::remove_dir_all(root);
     }
 

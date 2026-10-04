@@ -1975,6 +1975,114 @@ pub(crate) fn file_in_shared_folders(file_path: &str, shared_folders: &[String])
         .any(|folder| crate::security::path_within_dir(file_path, folder))
 }
 
+/// The Library's Delete: to the Recycle Bin / Trash, so it can be undone and a
+/// compromised webview cannot wipe shared folders for good with a loop of
+/// calls. Only where the bin will not take the file (some network shares) is
+/// it deleted outright, and then only after a native confirmation the
+/// renderer can neither draw nor answer.
+async fn recycle_library_file(
+    app: &tauri::AppHandle,
+    path: &std::path::Path,
+    allowed_roots: &[String],
+    expected: &crate::security::filesystem::ObjectIdentity,
+) -> Result<(), String> {
+    // A network share has no Recycle Bin, and the shell then deletes for good
+    // without a word, so such a file goes straight to the question below. A
+    // mapped drive counts: the path here is canonical, `\\?\UNC\…`.
+    let on_network = cfg!(windows) && crate::security::is_network_path(&path.to_string_lossy());
+    // Retried like the outright delete: a file being uploaded is briefly
+    // locked, and that is no reason to offer deleting it for good.
+    const ATTEMPTS: u32 = 6;
+    let mut recycle_error = None;
+    for attempt in (1..=ATTEMPTS).filter(|_| !on_network) {
+        let recycle_path = path.to_path_buf();
+        let allowed = allowed_roots.to_vec();
+        let identity = expected.clone();
+        let recycled = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            // Re-checked at the last moment, as the outright delete does
+            // through its handle: the object here must still be the one
+            // verified.
+            let verified =
+                crate::security::filesystem::verify_existing_path(&recycle_path, &allowed)?;
+            if crate::security::filesystem::object_identity(&verified)? != identity {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "the file changed before it could be moved to the Recycle Bin",
+                ));
+            }
+            move_to_trash(&verified).map_err(std::io::Error::other)
+        })
+        .await
+        .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?;
+        match recycled {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(coded_ctx("sharing_invalid_path", "Invalid or changed path", e));
+            }
+            // Windows' own "too big for the Recycle Bin, delete permanently?"
+            // answered no. Asking it again five times is not a retry.
+            Err(e) if e.to_string().contains("aborted") => {
+                recycle_error = Some(e);
+                break;
+            }
+            Err(e) => recycle_error = Some(e),
+        }
+        if attempt < ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+    let recycle_error = recycle_error
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "it is on a network location".to_string());
+    tracing::warn!("Could not move {} to the Recycle Bin: {recycle_error}", path.display());
+
+    let confirm_app = app.clone();
+    let prompt = format!(
+        "This file cannot be moved to the Recycle Bin{}:\n\n{}\n\nDelete it permanently? This cannot be undone.",
+        if on_network { " (it is on a network location)" } else { "" },
+        crate::commands::settings::elide_for_dialog(&path.to_string_lossy())
+    );
+    let confirmed = tokio::task::spawn_blocking(move || {
+        confirm_app
+            .dialog()
+            .message(prompt)
+            .title("Delete permanently?")
+            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                "Delete permanently".to_string(),
+                "Keep file".to_string(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .unwrap_or(false);
+    if !confirmed {
+        return Err(coded(
+            "sharing_delete_declined",
+            "The file was kept: it could not go to the Recycle Bin",
+        ));
+    }
+    delete_file_with_retry(path, allowed_roots, expected, 6, 250).await
+}
+
+/// Into the Recycle Bin / Trash. On macOS through `NSFileManager`, not the
+/// crate's default of scripting the Finder, which needs an Apple Events
+/// permission Ember does not hold, so every delete would have fallen through
+/// to the delete-permanently question.
+fn move_to_trash(path: &std::path::Path) -> Result<(), trash::Error> {
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut context = trash::TrashContext::default();
+        context.set_delete_method(DeleteMethod::NsFileManager);
+        context.delete(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        trash::delete(path)
+    }
+}
+
 async fn delete_file_with_retry(
     path: &std::path::Path,
     allowed_roots: &[String],
@@ -2129,7 +2237,8 @@ fn resolve_from_known(files: &mut [FileInfo], known: &KnownFileList) -> Resolved
             // live row already exists; a cold rediscovery has nothing to carry
             // from, and leaving this false would publish a restricted file to
             // the open network until the next restart put the flag back.
-            file.friends_only = record.friends_only;
+            file.friends_only = record.friends_only
+                || crate::storage::share_intent::is_friends_only(&record.file_hash);
             // The Library's Top Uploads panel and all-time activity columns
             // are populated from these persisted known.met counters. Restore
             // them with the hash instead of showing an empty Library until the
@@ -2651,7 +2760,8 @@ pub(crate) fn restore_known_hash_flags(file: &mut FileInfo, known: &KnownFileLis
     let mut hash = [0u8; 16];
     hash.copy_from_slice(&bytes);
     file.shared = crate::storage::share_intent::effective_shared(&hash, true);
-    file.friends_only = known.find_by_hash(&hash).is_some_and(|record| record.friends_only);
+    file.friends_only = known.find_by_hash(&hash).is_some_and(|record| record.friends_only)
+        || crate::storage::share_intent::is_friends_only(&hash);
 }
 
 /// Apply a folder's configured default priority only to paths that need a new
@@ -5184,6 +5294,17 @@ pub async fn remove_shared_folder(
             MAX_PATH_LEN,
         ));
     }
+    // A network path that names no shared folder is not resolved at all:
+    // canonicalizing `\\host\share` connects to that host and offers it the
+    // user's NTLM credentials. It can only fail the stored-folder match below.
+    let unlisted_network_path = cfg!(windows) && crate::security::is_network_path(&path) && {
+        let config = state.config.read().await;
+        !config
+            .settings
+            .shared_folders
+            .iter()
+            .any(|folder| crate::security::path_within_dir(&path, folder))
+    };
     // Canonicalize off the async runtime (blocking I/O on slow/network paths).
     // An unavailable USB/network root cannot canonicalize, but it still must
     // be removable. In that case only accept an exact normalized entry already
@@ -5191,6 +5312,12 @@ pub async fn remove_shared_folder(
     let resolved_path = tokio::task::spawn_blocking({
         let path = path.clone();
         move || -> Result<String, String> {
+            if unlisted_network_path {
+                return Err(coded(
+                    "sharing_invalid_folder_path",
+                    "Invalid folder path",
+                ));
+            }
             std::path::Path::new(&path)
                 .canonicalize()
                 .map(|p| p.to_string_lossy().to_string())
@@ -8213,7 +8340,7 @@ pub async fn delete_shared_file(
     .await
     .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))??;
 
-    delete_file_with_retry(&canonical, &allowed_dirs, &expected_identity, 6, 250).await?;
+    recycle_library_file(&app, &canonical, &allowed_dirs, &expected_identity).await?;
 
     let canonical_str = canonical.to_string_lossy().to_string();
     let (removed, removed_hashes, unpublish) = {
@@ -8339,6 +8466,15 @@ impl MissingCheck {
     /// nearest folder above the file that is there must also hold something.
     /// A folder the user emptied themselves is left to the next rescan.
     fn is_definitely_missing(&mut self, path: &str) -> bool {
+        // Not even probed: asking whether `\\host\share\x` exists connects to
+        // that host and offers it the user's NTLM credentials. A share the
+        // user approved as a root is still checked.
+        if cfg!(windows)
+            && crate::security::is_network_path(path)
+            && !self.roots.iter().any(|root| crate::security::path_within_dir(path, root))
+        {
+            return false;
+        }
         let file = std::path::Path::new(path);
         if !matches!(file.try_exists(), Ok(false)) {
             return false;

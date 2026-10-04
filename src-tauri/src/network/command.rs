@@ -4023,8 +4023,10 @@ async fn handle_command_inner(
                 .into_iter()
                 .take(applied_bootstrap_contact_count(declared_count))
                 .collect();
+            // Insert-only: a supplied list is hearsay about contacts we may
+            // already know better (`RoutingTable::insert_if_new`).
             let count = count_accepted_bootstrap_contacts(contacts.iter().cloned(), |contact| {
-                state.routing_table.insert(contact)
+                state.routing_table.insert_if_new(contact)
             });
             let table_size = state.routing_table.len();
             info!(
@@ -4782,6 +4784,12 @@ async fn handle_command_inner(
                 }
             }
 
+            // Every download that had a worker, before the drain forgets them:
+            // a row only turns Active once a source sends bytes, so one still
+            // Queued or Searching on remote queues had a worker too and needs
+            // re-queueing as much as an Active one.
+            let had_worker: std::collections::HashSet<String> =
+                state.download_handles.keys().cloned().collect();
             for (tid, handle) in state.download_handles.drain() {
                 handle.abort();
                 tokio::spawn(async move {
@@ -4809,9 +4817,14 @@ async fn handle_command_inner(
                 let active_tids: Vec<String> = mgr
                     .get_all()
                     .iter()
+                    .filter(|t| t.direction == TransferDirection::Download)
                     .filter(|t| {
                         t.status == TransferStatus::Active
-                            && t.direction == TransferDirection::Download
+                            || (had_worker.contains(&t.id)
+                                && matches!(
+                                    t.status,
+                                    TransferStatus::Searching | TransferStatus::Queued
+                                ))
                     })
                     .map(|t| t.id.clone())
                     .collect();
@@ -5004,7 +5017,7 @@ async fn handle_command_inner(
             let count = contacts.len();
             info!("KAD bootstrap from {count} downloaded contact(s)");
             for c in &contacts {
-                state.routing_table.insert(c.clone());
+                state.routing_table.insert_if_new(c.clone());
             }
             for contact in contacts.iter().take(20) {
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
@@ -5706,6 +5719,35 @@ async fn handle_command_inner(
                 let _ = tx.send(Err(error));
                 return;
             }
+            // The share intent's copy first, so a restriction outlives a lost
+            // or partly read known.met. Off the loop: it is an fsync'd write.
+            // A restriction it cannot record still stands on known.met (or the
+            // caller's pending intents). A lift it cannot record fails here,
+            // before known.met changes: left behind, the intent's entry would
+            // put the restriction straight back at the next reconcile.
+            let intent_updates = parsed.clone();
+            let intent_result = tokio::task::spawn_blocking(move || {
+                let previous: Vec<([u8; 16], bool)> = intent_updates
+                    .iter()
+                    .map(|(hash, _)| (*hash, crate::storage::share_intent::is_friends_only(hash)))
+                    .collect();
+                crate::storage::share_intent::set_friends_only_batch(&intent_updates)
+                    .map(|_| previous)
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|result| result.map_err(|e| e.to_string()));
+            let intent_previous = match intent_result {
+                Ok(previous) => Some(previous),
+                Err(e) if parsed.iter().any(|(_, friends_only)| !friends_only) => {
+                    let _ = tx.send(Err(format!("Failed to persist file share scope: {e}")));
+                    return;
+                }
+                Err(e) => {
+                    warn!("Could not record friends-only choices in the share intent: {e}");
+                    None
+                }
+            };
             let before = known_files.clone();
             let mut unrecorded = Vec::new();
             for (hash, friends_only) in &parsed {
@@ -5735,6 +5777,18 @@ async fn handle_command_inner(
                 match save_result {
                     Err(e) => {
                         *known_files = before;
+                        // The caller rolls its rows back on this error, so the
+                        // intent goes back too, or it would bring the change
+                        // the user was told failed back at the next reconcile.
+                        if let Some(previous) = intent_previous {
+                            let restored = tokio::task::spawn_blocking(move || {
+                                crate::storage::share_intent::set_friends_only_batch(&previous)
+                            })
+                            .await;
+                            if !matches!(restored, Ok(Ok(_))) {
+                                warn!("Could not roll back friends-only choices in the share intent");
+                            }
+                        }
                         let _ = tx.send(Err(format!("Failed to persist file share scope: {e}")));
                         return;
                     }

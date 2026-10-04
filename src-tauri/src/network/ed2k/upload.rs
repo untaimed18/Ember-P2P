@@ -2696,6 +2696,14 @@ pub enum UploadEventKind {
     EmberFriendSearchFailed {
         ember_hash: [u8; 16],
     },
+    /// The punch registration for a friend transfer they accepted could not
+    /// be published, so the punch can never happen. Sent from the spawned
+    /// registration back into the network task, which releases the source as
+    /// a decline does. State-mutation only; never reaches the UI.
+    FriendTransferPunchFailed {
+        friend: [u8; 16],
+        nonce: [u8; 16],
+    },
     /// The upload listener auto-banned an IP (eMule-style
     /// AddRequestCount: a peer re-requesting the same file far too
     /// frequently). Routed back to the network task so the ban lands in

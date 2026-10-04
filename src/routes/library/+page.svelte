@@ -74,7 +74,7 @@
     flattenLibraryFolderTree,
   } from '$lib/libraryFolderTree';
   import * as m from '$lib/paraglide/messages';
-  import { translateError } from '$lib/i18n';
+  import { codedErrorOf, translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
   import { openChatFilesFolder } from '$lib/api/friends';
   import { openChannelFilesFolder } from '$lib/api/channels';
@@ -1683,6 +1683,10 @@
           deleted++;
         } catch (e: unknown) {
           failures.push(`${f.name}: ${toErr(e)}`);
+          // "Keep file" in the backend's delete-permanently question (a file
+          // the Recycle Bin will not take): the rest are very likely in the
+          // same place, so stop rather than ask again for every one of them.
+          if (codedErrorOf(e)?.code === 'sharing_delete_declined') break;
         }
         bulkProgress = { done: index + 1, total: targets.length };
       }

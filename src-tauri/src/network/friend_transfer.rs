@@ -575,6 +575,36 @@ pub(super) async fn friend_transfer_request_status(
     status
 }
 
+/// Give up an accepted transfer whose punch cannot happen: release the source
+/// for ordinary retry, as a decline does. A no-op once the attempt is gone (it
+/// timed out, or the friend's dial already arrived and took it).
+pub(super) async fn abandon_friend_transfer_attempt(
+    state: &mut NetworkState,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    pending: &upload_server::PendingKadCallbacks,
+    app_handle: &tauri::AppHandle,
+    friend: [u8; 16],
+    nonce: [u8; 16],
+) {
+    let Some(key) = find_friend_xfer_attempt(&state.friend_xfer_attempts, friend, nonce) else {
+        return;
+    };
+    // A registration that failed only after the attempt timed out finds the
+    // record the timeout sweep deliberately kept: it carries the retry count
+    // and cooldown, and the sweep has already released the sources. Removing
+    // it would reset both, and a second release could free a source parked
+    // since for another friend.
+    if state.friend_xfer_attempts[&key].sent_at.elapsed().as_secs()
+        >= FRIEND_XFER_ATTEMPT_TIMEOUT_SECS
+    {
+        return;
+    }
+    let transfer_id = state.friend_xfer_attempts[&key].transfer_id.clone();
+    state.friend_xfer_attempts.remove(&key);
+    drop_pending_friend_callback(pending, friend, key.1).await;
+    release_friend_connect_sources(state, transfer_manager, app_handle, &transfer_id).await;
+}
+
 /// Apply a friend's answer to our own `OP_EMBER_XFER_REQ`.
 ///
 /// An accept is informational: the inbound expectation was registered when the
@@ -587,6 +617,7 @@ pub(super) async fn handle_friend_transfer_ack(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     pending: &upload_server::PendingKadCallbacks,
     app_handle: &tauri::AppHandle,
+    ul_event_tx: &mpsc::Sender<upload_server::UploadEvent>,
     settings: &AppSettings,
     ed25519_secret_key: [u8; 32],
     ember_hash: [u8; 16],
@@ -626,39 +657,52 @@ pub(super) async fn handle_friend_transfer_ack(
             // happen, even though the friend has already armed its serve role.
             // Release the source now rather than letting it idle out the full
             // attempt timeout — exactly what a decline does.
-            let registered = match state.nat_info.external_addr {
-                Some(external_addr) => ember::relay::register_punch_with_ip(
-                    &settings.rendezvous_url,
+            let Some(external_addr) = state.nat_info.external_addr else {
+                debug!(
+                    "Punch accepted by {} but our external address is unknown",
+                    hex::encode(friend)
+                );
+                abandon_friend_transfer_attempt(
+                    state, transfer_manager, pending, app_handle, friend, nonce,
+                )
+                .await;
+                return;
+            };
+            // Off the loop, like every other rendezvous call: a protocol
+            // probe, an identity lookup and the register POST can take a
+            // minute against a slow server, and awaited here they stalled
+            // UDP, IPC and every timer for all of it.
+            let rendezvous_url = settings.rendezvous_url.clone();
+            let nat_type = state.nat_info.nat_type.as_u8();
+            let failed_tx = ul_event_tx.clone();
+            tokio::spawn(async move {
+                let result = ember::relay::register_punch_with_ip(
+                    &rendezvous_url,
                     &ember_hash,
                     &friend,
                     quic_port,
-                    state.nat_info.nat_type.as_u8(),
+                    nat_type,
                     external_addr.ip(),
                     &ed25519_secret_key,
                     &ember_hash,
                 )
-                .await
-                .map_err(|e| {
+                .await;
+                if let Err(e) = result {
                     debug!(
                         "Could not register a transfer punch for friend {}: {e}",
                         hex::encode(friend)
                     );
-                })
-                .is_ok(),
-                None => {
-                    debug!(
-                        "Punch accepted by {} but our external address is unknown",
-                        hex::encode(friend)
-                    );
-                    false
+                    let _ = failed_tx
+                        .send(upload_server::UploadEvent {
+                            transfer_id: String::new(),
+                            kind: upload_server::UploadEventKind::FriendTransferPunchFailed {
+                                friend,
+                                nonce,
+                            },
+                        })
+                        .await;
                 }
-            };
-            if !registered {
-                state.friend_xfer_attempts.remove(&key);
-                drop_pending_friend_callback(pending, friend, key.1).await;
-                release_friend_connect_sources(state, transfer_manager, app_handle, &transfer_id)
-                    .await;
-            }
+            });
         }
         return;
     }

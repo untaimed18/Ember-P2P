@@ -858,28 +858,6 @@ impl RoutingZone {
         }
     }
 
-    /// Find contact by IP+port across all bins. Returns mutable ref for SetAlive.
-    fn touch_contact_by_addr(&mut self, ip: Ipv4Addr, udp_port: u16) -> bool {
-        if let Some(bin) = &mut self.bin {
-            if let Some(pos) = bin
-                .contacts
-                .iter()
-                .position(|c| c.ip == ip && c.udp_port == udp_port)
-            {
-                let contact = &mut bin.contacts[pos];
-                contact.update_type();
-                let id = contact.id;
-                bin.push_to_bottom(&id);
-                return true;
-            }
-            false
-        } else if let Some(children) = &mut self.children {
-            children.0.touch_contact_by_addr(ip, udp_port)
-                || children.1.touch_contact_by_addr(ip, udp_port)
-        } else {
-            false
-        }
-    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -1474,8 +1452,16 @@ impl RoutingTable {
         }
     }
 
-    pub fn touch_contact_by_addr(&mut self, ip: Ipv4Addr, udp_port: u16) -> bool {
-        self.root.touch_contact_by_addr(ip, udp_port)
+    /// Add a contact another node told us about (a KadRes or BootstrapRes
+    /// list), leaving one we already have untouched, as eMule does with
+    /// `bUpdate = false`. A list is hearsay: letting it update an existing
+    /// entry let any node revive dead contacts, clear their options, or move
+    /// them to a port of its choosing.
+    pub fn insert_if_new(&mut self, contact: KadContact) -> bool {
+        if self.get_contact(&contact.id).is_some() {
+            return false;
+        }
+        self.insert(contact)
     }
 
     pub fn all_contacts(&self) -> impl Iterator<Item = &KadContact> {
@@ -1889,6 +1875,26 @@ mod find_closest_tests {
             last_type_set: 0,
             received_hello: false,
         }
+    }
+
+    #[test]
+    fn a_contact_list_from_another_node_never_rewrites_a_known_contact() {
+        let mut rt = RoutingTable::new(KadId([0xFF; 16]), false);
+        let mut known = contact(0x01, 1);
+        known.kad_options = 0x02;
+        known.contact_type = CONTACT_TYPE_DEAD;
+        assert!(rt.insert(known.clone()));
+
+        let mut hearsay = contact(0x01, 1);
+        hearsay.udp_port = 9999;
+        hearsay.kad_options = 0;
+        assert!(!rt.insert_if_new(hearsay), "already known: left alone");
+        let kept = rt.get_contact(&known.id).expect("still there");
+        assert_eq!(kept.udp_port, 4672, "not moved to the port the list named");
+        assert_eq!(kept.kad_options, 0x02, "options not cleared");
+        assert_eq!(kept.contact_type, CONTACT_TYPE_DEAD, "not revived");
+
+        assert!(rt.insert_if_new(contact(0x02, 2)), "a new one is still added");
     }
 
     /// Regression guard: `find_closest` seeds fresh FindNode/self-lookup
