@@ -2,6 +2,7 @@
   import * as m from '$lib/paraglide/messages';
   import { openEmberWebsite } from '$lib/api/settings';
   import { translateError } from '$lib/i18n';
+  import BuyCoffeeButton from './BuyCoffeeButton.svelte';
   const appVersion = import.meta.env.VITE_APP_VERSION;
   const license = import.meta.env.VITE_APP_LICENSE;
   // Description used to come from the package.json `description`
@@ -115,6 +116,11 @@
         <p class="about-website-error" role="alert">{websiteError}</p>
       {/if}
 
+      <div class="about-support">
+        <p class="about-support-text">{m.support_body()}</p>
+        <BuyCoffeeButton size="sm" />
+      </div>
+
       <div class="about-actions">
         <button type="button" class="about-website" onclick={() => void openWebsite()}>
           {m.about_dialog_website()}
@@ -211,6 +217,29 @@
     color: var(--danger);
     font-size: var(--font-size-sm);
     margin: -10px 0 14px;
+  }
+
+  .about-support {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px 14px;
+    margin: 0 0 18px;
+    border: 1px solid color-mix(in srgb, #ffdd00 35%, var(--border));
+    border-radius: var(--radius-md);
+    background: linear-gradient(
+      120deg,
+      color-mix(in srgb, #ffdd00 14%, transparent) 0%,
+      color-mix(in srgb, #ffdd00 3%, transparent) 75%
+    );
+  }
+
+  .about-support-text {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
   }
 
   .about-actions {

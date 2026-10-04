@@ -52,6 +52,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { relaunch } from '@tauri-apps/plugin-process';
   import { flushToastActionsBeforeExit } from '$lib/stores/toast';
+  import BuyCoffeeButton from '$lib/components/BuyCoffeeButton.svelte';
   import {
     discardPendingRestore,
     exportBackup,
@@ -4540,6 +4541,22 @@
             </div>
           </div>
 
+          <div class="about-support">
+            <span class="about-support-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M8.5 2.8c-.9 1-.9 2.2 0 3.2M12 2.8c-.9 1-.9 2.2 0 3.2" />
+                <path d="M4 9.5h12v4.25A5.25 5.25 0 0 1 10.75 19h-1.5A5.25 5.25 0 0 1 4 13.75z" fill="currentColor" fill-opacity="0.18" />
+                <path d="M16 11h1.25a2.75 2.75 0 0 1 0 5.5H15.4" />
+                <path d="M3 21.5h14" />
+              </svg>
+            </span>
+            <div class="about-support-copy">
+              <p class="about-support-title">{m.support_title()}</p>
+              <p class="about-support-text">{m.support_body()}</p>
+            </div>
+            <BuyCoffeeButton />
+          </div>
+
           <div class="divider"></div>
 
           <div class="field toggle-row">
@@ -5555,6 +5572,62 @@
   .about-action-go svg { width: 14px; height: 14px; }
 
   .about-action:hover .about-action-go { color: var(--accent); }
+
+  /* Warm, in Buy Me a Coffee's yellow, but a panel rather than a banner: it
+     sits beside the rest of the card and does not shout over it. */
+  .about-support {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-top: 10px;
+    padding: 14px 16px;
+    border: 1px solid color-mix(in srgb, #ffdd00 35%, var(--border));
+    border-radius: var(--radius-md);
+    background: linear-gradient(
+      120deg,
+      color-mix(in srgb, #ffdd00 14%, transparent) 0%,
+      color-mix(in srgb, #ffdd00 3%, transparent) 75%
+    );
+  }
+
+  .about-support-mark {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 40px;
+    height: 40px;
+    border-radius: var(--radius-md);
+    background: #ffdd00;
+    color: #0d0c22;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), 0 1px 3px rgba(0, 0, 0, 0.12);
+  }
+
+  .about-support-mark svg { width: 24px; height: 24px; }
+
+  .about-support-copy {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .about-support-title {
+    margin: 0 0 2px;
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .about-support-text {
+    margin: 0;
+    font-size: var(--font-size-sm);
+    line-height: 1.45;
+    color: var(--text-secondary);
+  }
+
+  /* Narrow window: the button drops under the text rather than squeezing it. */
+  @media (max-width: 720px) {
+    .about-support { flex-wrap: wrap; }
+  }
 
 
   .about-frequency-disabled {

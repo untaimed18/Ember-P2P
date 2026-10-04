@@ -2657,6 +2657,22 @@ pub async fn open_ember_website() -> Result<(), String> {
     })
 }
 
+/// The project's Buy Me a Coffee page.
+const EMBER_SUPPORT_URL: &str = "https://buymeacoffee.com/emberp2p";
+
+/// Open the support page in the user's default browser. Hardcoded for the
+/// same reason as [`open_ember_website`].
+#[tauri::command]
+pub async fn open_support_page() -> Result<(), String> {
+    crate::security::filesystem::open_url_with_default_app(EMBER_SUPPORT_URL).map_err(|e| {
+        coded_ctx(
+            "settings_open_support_failed",
+            "Failed to open the support page",
+            e,
+        )
+    })
+}
+
 /// The official site, for copying. Same constant [`open_ember_website`] opens
 /// so the clipboard and the browser cannot drift.
 #[tauri::command]

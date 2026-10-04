@@ -181,6 +181,11 @@ export async function openEmberWebsite(): Promise<void> {
   return invoke('open_ember_website');
 }
 
+/** Open the project's Buy Me a Coffee page. The address is fixed in the backend. */
+export async function openSupportPage(): Promise<void> {
+  return invoke('open_support_page');
+}
+
 export async function getEmberWebsiteUrl(): Promise<string> {
   return invoke('get_ember_website_url');
 }
