@@ -34,6 +34,8 @@ const BUDDY_PING_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// cadence, and Ember up to 1.7.1 drops a served client after 180 s
 /// without a packet.
 const BUDDY_ANSWERED_PING_INTERVAL: Duration = Duration::from_secs(50);
+/// eMule never pongs twice within this (`AllowIncomingBuddyPingPong`).
+const EMULE_BUDDY_PONG_GAP: Duration = Duration::from_secs(13 * 60);
 /// Max time to wait for the *next* packet from the client we serve before
 /// treating the connection as dead. eMule clients ping every 10 minutes, so
 /// this outlasts one lost ping.
@@ -185,6 +187,8 @@ pub struct BuddyManager {
     buddy_reader_handle: Option<tokio::task::JoinHandle<()>>,
     last_buddy_ping: Option<Instant>,
     buddy_ponged_since_ping: bool,
+    last_buddy_pong: Option<Instant>,
+    buddy_pongs_promptly: bool,
 
     serving_buddy_for: Option<KadId>,
     serving_callback_check: Option<KadId>,
@@ -220,6 +224,8 @@ impl BuddyManager {
             buddy_reader_handle: None,
             last_buddy_ping: None,
             buddy_ponged_since_ping: false,
+            last_buddy_pong: None,
+            buddy_pongs_promptly: false,
             serving_buddy_for: None,
             serving_callback_check: None,
             serving_callback_budget: 0,
@@ -244,6 +250,8 @@ impl BuddyManager {
         }
         self.last_buddy_ping = None;
         self.buddy_ponged_since_ping = false;
+        self.last_buddy_pong = None;
+        self.buddy_pongs_promptly = false;
         if let Some(h) = self.serving_reader_handle.take() {
             h.abort();
         }
@@ -558,6 +566,8 @@ impl BuddyManager {
         self.buddy_reader_handle = Some(conn.reader_handle);
         self.last_buddy_ping = None;
         self.buddy_ponged_since_ping = false;
+        self.last_buddy_pong = None;
+        self.buddy_pongs_promptly = false;
         self.state = BuddyState::Connected;
         self.find_attempt_count = 0;
         conn.events
@@ -624,7 +634,7 @@ impl BuddyManager {
         let Some(sent) = self.last_buddy_ping else {
             return true;
         };
-        let interval = if self.buddy_ponged_since_ping {
+        let interval = if self.buddy_ponged_since_ping || self.buddy_pongs_promptly {
             BUDDY_ANSWERED_PING_INTERVAL
         } else {
             BUDDY_PING_INTERVAL
@@ -638,15 +648,34 @@ impl BuddyManager {
     }
 
     pub fn note_buddy_pong(&mut self) {
+        self.note_buddy_pong_at(Instant::now());
+    }
+
+    /// Two pongs closer together than eMule ever answers mark an Ember buddy
+    /// for the rest of the link, so one lost pong does not drop it to the
+    /// 10-minute cadence its 180 s timeout cannot outlast.
+    fn note_buddy_pong_at(&mut self, now: Instant) {
+        if self
+            .last_buddy_pong
+            .is_some_and(|previous| now.saturating_duration_since(previous) < EMULE_BUDDY_PONG_GAP)
+        {
+            self.buddy_pongs_promptly = true;
+        }
+        self.last_buddy_pong = Some(now);
         self.buddy_ponged_since_ping = true;
     }
 
     /// Send OP_BUDDYPING to our buddy (we are firewalled).
     pub async fn send_buddy_ping(&mut self) -> bool {
-        self.record_buddy_ping(Instant::now());
         let pkt = build_emule_packet(OP_BUDDYPING, &[]);
         match self.enqueue_buddy(pkt) {
-            Enqueue::Queued | Enqueue::Busy => true,
+            Enqueue::Queued => {
+                self.record_buddy_ping(Instant::now());
+                true
+            }
+            // Not sent: the next tick tries again rather than waiting out a
+            // whole interval for a ping that never left.
+            Enqueue::Busy => true,
             Enqueue::Dead => {
                 debug!("Buddy ping failed, connection lost");
                 self.disconnect_buddy().await;
@@ -794,6 +823,8 @@ impl BuddyManager {
         }
         self.last_buddy_ping = None;
         self.buddy_ponged_since_ping = false;
+        self.last_buddy_pong = None;
+        self.buddy_pongs_promptly = false;
         self.buddy_id = None;
         self.buddy_addr = None;
         self.buddy_udp_port = None;
@@ -1286,7 +1317,7 @@ mod tests {
                 longest_out = longest_out.max(at - last_out);
                 last_out = at;
                 if answers(at) {
-                    mgr.note_buddy_pong();
+                    mgr.note_buddy_pong_at(start + at);
                     longest_in = longest_in.max(at - last_in);
                     last_in = at;
                 }
@@ -1326,6 +1357,22 @@ mod tests {
         let (longest_in, longest_out) = simulate_buddy_link(|_| true);
         assert!(longest_out < Duration::from_secs(180), "pinged {longest_out:?} apart");
         assert!(longest_in < Duration::from_secs(180));
+    }
+
+    /// One pong lost on its way (a full writer queue on either side) must not
+    /// drop a released Ember buddy to the 10-minute cadence: it would cut the
+    /// link at 180 s.
+    #[test]
+    fn a_released_ember_buddy_survives_one_lost_pong() {
+        let mut lost = false;
+        let (_, longest_out) = simulate_buddy_link(|at| {
+            if !lost && at >= Duration::from_secs(10 * 60) {
+                lost = true;
+                return false;
+            }
+            true
+        });
+        assert!(longest_out < Duration::from_secs(180), "pinged {longest_out:?} apart");
     }
 
     #[test]

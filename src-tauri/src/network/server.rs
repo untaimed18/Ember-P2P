@@ -482,7 +482,9 @@ pub(super) fn record_server_connect_failure(
     error: &str,
 ) -> bool {
     let network_down = server_connect_error_is_network_down(error);
-    let attempt = if network_down {
+    // Uncounted only while auto-connect is on: otherwise nothing would ever
+    // end the 30 s retries of a connection the user made by hand.
+    let attempt = if network_down && settings.auto_connect_server {
         state.server_reconnect_failures
     } else {
         state.server_reconnect_failures.saturating_add(1)

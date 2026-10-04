@@ -986,22 +986,39 @@ pub fn publish_known_records(
 /// record is used only when its size matches and its hashes recombine to
 /// `file_hash`: the record is keyed by hash alone, and a hashset that does not
 /// describe exactly that content would fail every part the downloader checks.
+///
+/// And only while the file still has the time it was hashed at: one edited in
+/// place since then, before a rescan, keeps its size, and its old hashset would
+/// pass the downloader's check and then fail every part it fetched.
 fn stored_md4_hashset(
     records: &SharedKnownRecords,
     file_hash: &[u8; 16],
     file_size: u64,
+    on_disk_mtime: Option<i64>,
 ) -> Option<Vec<[u8; 16]>> {
     if file_size > 0 && file_size < PARTSIZE {
         return Some(vec![*file_hash]);
     }
+    let on_disk_mtime = on_disk_mtime?;
     let part_hashes = {
         let records = records.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let record = records
-            .find_by_hash(file_hash)
-            .filter(|record| record.file_size == file_size)?;
+        let record = records.find_by_hash(file_hash).filter(|record| {
+            record.file_size == file_size
+                && crate::storage::known_files::recorded_mtime_matches(
+                    record.modified_at,
+                    on_disk_mtime,
+                )
+        })?;
         record.part_hashes.clone()
     };
     super::transfer::verify_hashset(file_hash, &part_hashes, file_size).then_some(part_hashes)
+}
+
+/// The file's modification time in whole seconds, as known.met records it.
+async fn file_mtime_secs(path: &std::path::Path) -> Option<i64> {
+    let modified = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
+    let secs = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    i64::try_from(secs).ok()
 }
 
 /// Snapshot hit is always restricted. Until known.met has been absorbed,
@@ -3126,10 +3143,11 @@ const UNCACHED_HASH_WINDOW_SECS: u64 = 300;
 /// Uncached whole-file hash computations running at once across every peer.
 ///
 /// The per-address budget does not bound a request flood spread over many
-/// addresses; this does, at the disk. A request that finds every job busy goes
-/// unanswered without spending its address's budget, as a refusal the peer did
-/// nothing to earn.
+/// addresses; this does, at the disk. A request that finds every job busy for
+/// [`UNCACHED_HASH_JOB_WAIT`] goes unanswered without spending its address's
+/// budget, as a refusal the peer did nothing to earn.
 const MAX_CONCURRENT_UNCACHED_HASH_JOBS: usize = 2;
+const UNCACHED_HASH_JOB_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// MD4 part hashes for complete shared files, keyed by ed2k hash hex.
 ///
@@ -6014,8 +6032,16 @@ impl UploadHandler {
         peer_addr: SocketAddr,
         opcode: &str,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let Ok(permit) = self.uncached_hash_jobs.clone().try_acquire_owned() else {
-            debug!("Every uncached hash job is busy; not answering {opcode} from {peer_addr}");
+        // Waited for rather than refused outright: eMule asks for a slot only
+        // once the hashset has arrived, so a dropped answer costs that peer
+        // its place until its next reask. Only this session waits.
+        let Ok(Ok(permit)) = tokio::time::timeout(
+            UNCACHED_HASH_JOB_WAIT,
+            self.uncached_hash_jobs.clone().acquire_owned(),
+        )
+        .await
+        else {
+            debug!("Every uncached hash job stayed busy; not answering {opcode} from {peer_addr}");
             return None;
         };
         let within_budget = self
@@ -6158,12 +6184,12 @@ impl UploadHandler {
         }
 
         let candidate = {
-            let slot_holders = self.slot_holder_snapshot();
             let cm = self.credit_manager.read().await;
             let idx = self.local_index.read().await;
             let in_flight = self.push_grant_in_flight.lock().await;
             let backoff = self.push_grant_backoff.lock().await;
             let queue = self.upload_queue.lock().await;
+            let slot_holders = self.slot_holder_snapshot();
 
             let queued = QueuedPerFile::new(&queue);
             let fresh =
@@ -8979,10 +9005,10 @@ impl UploadHandler {
                                 // STARTUPLOADREQ; otherwise a peer that only holds the TCP
                                 // session open can live in the queue past the 1-hour cap.
                                 let best_identity = {
-                                    let slot_holders = self.slot_holder_snapshot();
                                     let cm = self.credit_manager.read().await;
                                     let idx_snap = self.local_index.read().await;
                                     let mut queue = self.upload_queue.lock().await;
+                                    let slot_holders = self.slot_holder_snapshot();
                                     queue.retain(|e| {
                                         e.last_request.elapsed().as_secs() < MAX_PURGEQUEUETIME_SECS
                                     });
@@ -9835,12 +9861,12 @@ impl UploadHandler {
                     let should_accept = if current_active >= dynamic_slots {
                         false
                     } else {
-                        let slot_holders = self.slot_holder_snapshot();
                         // Global scoring lock order: credit manager → local index
                         // → upload queue.
                         let cm = self.credit_manager.read().await;
                         let idx_snap = self.local_index.read().await;
                         let mut queue = self.upload_queue.lock().await;
+                        let slot_holders = self.slot_holder_snapshot();
                         queue.retain(|e| e.last_request.elapsed().as_secs() < MAX_PURGEQUEUETIME_SECS);
                         let own_row = queue.iter().position(|e| e.identity == queue_identity);
                         // A live waiter bound to a different socket still owns the
@@ -11446,8 +11472,8 @@ impl UploadHandler {
                     // exists because these self-inflicted rotations were
                     // tripping our own leecher detector.
                     let queue_has_waiters = {
-                        let slot_holders = self.slot_holder_snapshot();
                         let q = self.upload_queue.lock().await;
+                        let slot_holders = self.slot_holder_snapshot();
                         q.iter().any(|e| !slot_holders.contains(&e.identity))
                     };
                     let can_open_another_slot = self
@@ -11512,10 +11538,10 @@ impl UploadHandler {
                         && last_preempt_check.elapsed().as_secs() >= 10
                     {
                         last_preempt_check = std::time::Instant::now();
-                        let slot_holders = self.slot_holder_snapshot();
                         let cm = self.credit_manager.read().await;
                         let idx_snap = self.local_index.read().await;
                         let queue = self.upload_queue.lock().await;
+                        let slot_holders = self.slot_holder_snapshot();
                         if queue.is_empty() {
                             false
                         } else {
@@ -12135,9 +12161,12 @@ impl UploadHandler {
                         let cache_key = hex::encode(req_hash);
                         let memoized = if is_partial {
                             None
-                        } else if let Some(hashes) =
-                            stored_md4_hashset(&self.known_records, &req_hash, file_size)
-                        {
+                        } else if let Some(hashes) = stored_md4_hashset(
+                            &self.known_records,
+                            &req_hash,
+                            file_size,
+                            file_mtime_secs(&path).await,
+                        ) {
                             Some(hashes)
                         } else {
                             self.part_hash_cache.lock().await.get(&cache_key)
@@ -12272,6 +12301,7 @@ impl UploadHandler {
                                     &self.known_records,
                                     &file_ident.md4_hash,
                                     file_size,
+                                    file_mtime_secs(&path).await,
                                 ) {
                                     Some(hashes)
                                 } else {
@@ -17176,25 +17206,38 @@ mod abuse_and_seniority_tests {
         known.add_or_update(known_record(other_hash, file_size, parts.clone()));
         let records: SharedKnownRecords = Default::default();
         assert_eq!(
-            stored_md4_hashset(&records, &file_hash, file_size),
+            stored_md4_hashset(&records, &file_hash, file_size, Some(0)),
             None,
             "nothing published yet"
         );
 
         publish_known_records(&records, &known);
-        assert_eq!(stored_md4_hashset(&records, &file_hash, file_size), Some(parts));
         assert_eq!(
-            stored_md4_hashset(&records, &file_hash, file_size + 1),
+            stored_md4_hashset(&records, &file_hash, file_size, Some(0)),
+            Some(parts.clone())
+        );
+        assert_eq!(
+            stored_md4_hashset(&records, &file_hash, file_size, Some(60)),
+            None,
+            "edited in place since it was hashed: same size, other bytes"
+        );
+        assert_eq!(
+            stored_md4_hashset(&records, &file_hash, file_size, None),
+            None,
+            "a file whose time cannot be read is not vouched for"
+        );
+        assert_eq!(
+            stored_md4_hashset(&records, &file_hash, file_size + 1, Some(0)),
             None,
             "a record of another size is other content"
         );
         assert_eq!(
-            stored_md4_hashset(&records, &other_hash, file_size),
+            stored_md4_hashset(&records, &other_hash, file_size, Some(0)),
             None,
             "hashes that do not recombine to the file hash are not its hashset"
         );
         assert_eq!(
-            stored_md4_hashset(&records, &[0x55; 16], 4096),
+            stored_md4_hashset(&records, &[0x55; 16], 4096, Some(0)),
             Some(vec![[0x55; 16]]),
             "a file under one part is its own part hash"
         );

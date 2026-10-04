@@ -476,6 +476,15 @@ pub struct NameSizeLookup<'a> {
     by_name_size: HashMap<(&'a str, u64), Vec<&'a KnownFileRecord>>,
 }
 
+/// Whether a file's time on disk is still the one its record was hashed at,
+/// by the rules of [`pick_by_mtime`].
+pub fn recorded_mtime_matches(recorded: i64, on_disk: i64) -> bool {
+    const FAT_SLACK_SECS: i64 = 2;
+    const DST_SHIFT_SECS: i64 = 3600;
+    let delta = (recorded - on_disk).abs();
+    delta <= FAT_SLACK_SECS || delta == DST_SHIFT_SECS
+}
+
 /// Of `candidates`, all named `name` with `size` bytes, the one record that
 /// is the file modified at `mtime`, or `None` when none or several are.
 ///
@@ -497,16 +506,13 @@ fn pick_by_mtime<'a>(
     size: u64,
     mtime: i64,
 ) -> Option<&'a KnownFileRecord> {
-    const FAT_SLACK_SECS: i64 = 2;
-    const DST_SHIFT_SECS: i64 = 3600;
     let (mut exact, mut exact_count) = (None, 0usize);
     let (mut near, mut near_count) = (None, 0usize);
     for record in candidates {
-        let delta = (record.modified_at - mtime).abs();
-        if delta == 0 {
+        if record.modified_at == mtime {
             exact = Some(record);
             exact_count += 1;
-        } else if delta <= FAT_SLACK_SECS || delta == DST_SHIFT_SECS {
+        } else if recorded_mtime_matches(record.modified_at, mtime) {
             near = Some(record);
             near_count += 1;
         }
