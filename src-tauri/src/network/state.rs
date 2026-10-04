@@ -751,6 +751,9 @@ pub(super) struct NetworkState {
     /// The download folders, live: download workers and the upload listener
     /// hold this rather than the folder they were started with.
     pub(super) download_folders: crate::storage::part_folders::SharedDownloadFolders,
+    /// known.met's records for the upload listener's hashset answers.
+    /// Published when the catalog is absorbed and on every save of it.
+    pub(super) known_records_shared: ed2k::upload::SharedKnownRecords,
     /// Shared "filter incoming connections via IP filter" flag for the
     /// TCP accept loop.
     pub(super) filter_incoming_shared: Arc<std::sync::atomic::AtomicBool>,

@@ -46,6 +46,7 @@ pub(in crate::network) fn start_known_met_save(
     let known_path = state.data_dir.join("known.met");
     let generation = known_files.dirty_generation();
     let mut snapshot = known_files.snapshot();
+    ed2k::upload::publish_known_records(&state.known_records_shared, known_files);
     let tx = known_met_save_result_tx.clone();
     *known_met_save_in_flight = true;
     *known_met_save_started_at = Some(tokio::time::Instant::now());

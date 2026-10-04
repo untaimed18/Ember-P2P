@@ -420,6 +420,24 @@ impl<K: Eq + Hash + Clone, V: Clone> CowMap<K, V> {
     }
 }
 
+/// The records of a [`KnownFileList`] without its path tables, for a reader on
+/// another task. Taken in O(1) like [`KnownFileList::snapshot`], and likewise a
+/// later edit of the list copies what it touches instead of writing through.
+#[derive(Clone)]
+pub struct KnownRecords(CowMap<[u8; 16], KnownFileRecord>);
+
+impl Default for KnownRecords {
+    fn default() -> Self {
+        Self(CowMap::new())
+    }
+}
+
+impl KnownRecords {
+    pub fn find_by_hash(&self, hash: &[u8; 16]) -> Option<&KnownFileRecord> {
+        self.0.get(hash)
+    }
+}
+
 #[derive(Clone)]
 pub struct KnownFileList {
     files: CowMap<[u8; 16], KnownFileRecord>,
@@ -656,6 +674,11 @@ impl KnownFileList {
     /// copies what it touches instead of writing through to the snapshot.
     pub fn snapshot(&self) -> Self {
         self.clone()
+    }
+
+    /// See [`KnownRecords`].
+    pub fn records(&self) -> KnownRecords {
+        KnownRecords(self.files.clone())
     }
 
     /// Merge records from a freshly loaded catalog.
@@ -3323,6 +3346,32 @@ mod tests {
         assert_eq!(kf.path_refs.get(&[0x42; 16]).copied(), None);
         assert!(!kf.files.contains_key(&[0x42; 16]));
         agrees(&kf);
+    }
+
+    /// The upload listener holds the records between publishes, so taking them
+    /// must be O(1) and the live list's later edits must not reach them.
+    #[test]
+    fn published_records_share_the_table_and_ignore_later_edits() {
+        let mut kf = KnownFileList::new();
+        let mut record = sample_record();
+        record.part_hashes = vec![[0x01; 16], [0x02; 16]];
+        let hash = record.file_hash;
+        kf.add_or_update(record);
+        let records = kf.records();
+        assert!(records.0.shares_table_with(&kf.files));
+
+        kf.find_by_hash_mut(&hash).unwrap().part_hashes.clear();
+        let mut added = sample_record();
+        added.file_hash = [0x99; 16];
+        added.file_path = "C:/Library/added.bin".to_string();
+        kf.add_or_update(added);
+
+        assert_eq!(
+            records.find_by_hash(&hash).unwrap().part_hashes,
+            vec![[0x01; 16], [0x02; 16]]
+        );
+        assert!(records.find_by_hash(&[0x99; 16]).is_none());
+        assert!(kf.records().find_by_hash(&[0x99; 16]).is_some());
     }
 
     /// The periodic known.met save snapshots the catalogue on the network

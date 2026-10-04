@@ -964,6 +964,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             settings.skip_compress_video,
         )),
         download_folders: settings.download_folders().shared(),
+        known_records_shared: Default::default(),
         filter_incoming_shared: Arc::new(std::sync::atomic::AtomicBool::new(
             settings.filter_incoming_connections,
         )),
@@ -1794,6 +1795,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let ul_banned = shared_banned_ips.clone();
         let ul_banned_hashes = shared_banned_hashes.clone();
         let ul_friends_only = shared_friends_only_hashes.clone();
+        let ul_known_records = state.known_records_shared.clone();
         let ul_antileech = shared_antileech.clone();
         let ul_skip_compress = state.skip_compress_video_shared.clone();
         let ul_filter_incoming = state.filter_incoming_shared.clone();
@@ -1859,6 +1861,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 ul_banned,
                 ul_banned_hashes,
                 ul_friends_only,
+                ul_known_records,
                 ul_antileech,
                 ul_skip_compress,
                 ul_filter_incoming,
