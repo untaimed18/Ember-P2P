@@ -2658,23 +2658,46 @@ fn sanitize_restored_config(data_dir: &Path) {
         .and_then(|v| v.as_str())
         .map(str::to_owned)
     {
-        // Creating anything on a share connects to its server and offers it the
-        // user's credentials, which an archive is not to bring about.
+        // A share is not kept either: startup approves the restored download
+        // folders and opens them, and touching a share connects to its server
+        // and offers it the user's credentials, which an archive is not to
+        // bring about. The user picks it again in Settings if it was theirs.
+        let on_share = crate::security::is_network_path(&folder);
         if !folder.is_empty()
-            && !crate::security::is_network_path(&folder)
-            && std::fs::create_dir_all(Path::new(&folder)).is_err()
+            && (on_share || std::fs::create_dir_all(Path::new(&folder)).is_err())
         {
             let fallback = directories::UserDirs::new()
                 .and_then(|dirs| dirs.download_dir().map(|d| d.join("Ember")))
                 .unwrap_or_else(|| data_dir.join("Downloads"));
             tracing::warn!(
-                "Restored download folder {folder} cannot be created on this machine; using {} instead",
+                "Restored download folder {folder} {} on this machine; using {} instead",
+                if on_share { "is on a network share, which a restore does not open" } else { "cannot be created" },
                 fallback.display()
             );
             let _ = std::fs::create_dir_all(&fallback);
             obj.insert(
                 "download_folder".to_string(),
                 serde_json::Value::String(fallback.to_string_lossy().to_string()),
+            );
+            changed = true;
+        }
+    }
+
+    // The earlier download folders are approved and swept at startup too.
+    if let Some(earlier) = obj
+        .get_mut("previous_download_folders")
+        .and_then(|v| v.as_array_mut())
+    {
+        let before = earlier.len();
+        earlier.retain(|folder| {
+            !folder
+                .as_str()
+                .is_some_and(crate::security::is_network_path)
+        });
+        if earlier.len() != before {
+            tracing::warn!(
+                "Dropped {} earlier download folder(s) on a network share from the restored config",
+                before - earlier.len()
             );
             changed = true;
         }
@@ -3749,12 +3772,17 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_download_folder_on_a_network_share_is_not_created() {
+    fn a_restored_download_folder_on_a_network_share_is_not_kept() {
         let dir = scratch("sanitize-share");
         let share = r"\\192.0.2.1\share\Ember";
+        let local = dir.join("earlier").to_string_lossy().into_owned();
         std::fs::write(
             dir.join("config.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({ "download_folder": share })).unwrap(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "download_folder": share,
+                "previous_download_folders": [r"\\192.0.2.1\old", local],
+            }))
+            .unwrap(),
         )
         .unwrap();
 
@@ -3762,7 +3790,13 @@ mod tests {
 
         let repaired: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
-        assert_eq!(repaired["download_folder"].as_str().unwrap(), share);
+        let folder = repaired["download_folder"].as_str().unwrap();
+        assert!(!crate::security::is_network_path(folder), "{folder}");
+        assert_eq!(
+            repaired["previous_download_folders"],
+            serde_json::json!([local]),
+            "a local earlier folder stays, a share goes"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
