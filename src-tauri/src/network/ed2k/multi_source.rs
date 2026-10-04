@@ -1332,27 +1332,72 @@ fn no_source_can_ever_arrive(
     sources_empty && !has_source_rx && !has_established_rx
 }
 
-/// Smallest OP_SENDINGPART accepted for a range we never asked for (D18). A
-/// peer shipping 1-byte chunks unprompted is broken or abusive (work
-/// amplification against the syscall/allocator path).
-const MIN_UNSOLICITED_BLOCK_BYTES: u64 = 16;
+/// How many of a worker's past request ranges [`RecentRequests`] keeps.
+const MAX_RECENT_REQUESTS: usize = 64;
 
-/// True for an undersized block that neither ends the file nor lies inside a
-/// range we requested. The floor cannot apply to requested ranges: the gap
-/// planner asks for whatever gaps remain, and an interrupted compressed block
-/// can leave a tail of any length, which the uploader answers with an
-/// uncompressed packet of exactly that size.
-fn is_unsolicited_undersized_block(
+/// Every range this worker has asked its peer for, newest last, kept after it
+/// leaves the outstanding set. An uploader serves requests in order and can be
+/// well behind, so an answer to a request that has expired, or that belongs to
+/// a part this worker has since moved past, is still one we asked for.
+#[derive(Default)]
+struct RecentRequests {
+    ranges: std::collections::VecDeque<(u64, u64)>,
+}
+
+impl RecentRequests {
+    fn record(&mut self, batch: &[(u64, u64)]) {
+        for &range in batch {
+            if self.ranges.len() >= MAX_RECENT_REQUESTS {
+                self.ranges.pop_front();
+            }
+            self.ranges.push_back(range);
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.ranges.iter().copied()
+    }
+
+    /// End of the range recorded as starting at `start`, newest first.
+    fn end_for_start(&self, start: u64) -> Option<u64> {
+        self.ranges
+            .iter()
+            .rev()
+            .find_map(|&(s, e)| (s == start).then_some(e))
+    }
+}
+
+/// Where a received block `[start, end)` may be written up to, or `None` when
+/// `start` lies in no range we requested from this peer.
+///
+/// eMule writes a block only inside one of its own pending requests to that
+/// client (`ProcessBlockPacket`, DownloadClient.cpp:1003-1033). Accepting any
+/// block that overlapped a gap let one peer write into ranges other sources
+/// were fetching — the per-part MD4 then failed on the honest sources too —
+/// and fragment the gap list toward `MAX_GAP_ENTRIES`, which every worker then
+/// walked under the tracker lock. Requested ranges that touch are merged, so a
+/// packet spanning two adjacent blocks of one request is still whole.
+fn requested_block_end(
     start: u64,
     end: u64,
-    file_size: u64,
     requested: impl IntoIterator<Item = (u64, u64)>,
-) -> bool {
-    end.saturating_sub(start) < MIN_UNSOLICITED_BLOCK_BYTES
-        && end != file_size
-        && !requested
-            .into_iter()
-            .any(|(req_start, req_end)| start >= req_start && end <= req_end)
+) -> Option<u64> {
+    let mut ranges: Vec<(u64, u64)> = requested.into_iter().filter(|&(s, e)| s < e).collect();
+    ranges.sort_unstable();
+    let mut run: Option<(u64, u64)> = None;
+    for (s, e) in ranges {
+        match run.as_mut() {
+            Some((_, run_end)) if s <= *run_end => *run_end = (*run_end).max(e),
+            _ => {
+                if run.is_some_and(|(run_start, run_end)| run_start <= start && start < run_end) {
+                    break;
+                }
+                run = Some((s, e));
+            }
+        }
+    }
+    run.filter(|&(run_start, run_end)| run_start <= start && start < run_end)
+        .map(|(_, run_end)| end.min(run_end))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1559,6 +1604,16 @@ impl InProgressGuard {
             return;
         }
         self.tracker.write().await.claim_in_progress(part_idx);
+        self.active.push(part_idx);
+    }
+
+    /// [`Self::claim`] while the caller already holds the tracker write guard,
+    /// so choosing an unclaimed part and claiming it cannot be interleaved.
+    fn claim_locked(&mut self, part_idx: usize, tracker: &mut PartTracker) {
+        if self.active.contains(&part_idx) {
+            return;
+        }
+        tracker.claim_in_progress(part_idx);
         self.active.push(part_idx);
     }
 
@@ -1952,10 +2007,12 @@ fn disk_full_error() -> anyhow::Error {
 /// Wait until every source task has returned, or until the file is complete
 /// and settled, in which case the rest are aborted.
 ///
-/// A source waiting in a remote queue holds no part claim and returns only
-/// when its queue wait runs out, up to `queue_wait_secs`. Checked once before
-/// waiting, a file another source finished meanwhile sat unverified at 100%
-/// until then.
+/// A source waiting in a remote queue may not return for up to
+/// `queue_wait_secs`. Checked once before waiting, a file another source
+/// finished meanwhile sat unverified at 100% until then. That only holds
+/// while a queued source holds no part claim: `download_parts_from_source`
+/// claims a part only once the peer has granted a slot, and releases every
+/// queued-ahead claim before an in-session re-queue wait.
 async fn wait_for_sources_unless_settled<T>(
     tracker: &Arc<RwLock<PartTracker>>,
     handles: &[tokio::task::JoinHandle<T>],
@@ -2011,6 +2068,8 @@ enum InSessionRequeueResult {
     Timeout(String),
     /// TCP read failed mid-wait — connection is gone.
     Disconnected(String),
+    /// Other sources finished the file while we waited.
+    FileComplete,
 }
 
 /// Wait on the SAME TCP connection that just signalled `OP_OUTOFPARTREQS`
@@ -2036,6 +2095,7 @@ async fn try_in_session_requeue<R>(
     reader: &mut R,
     timeout_secs: u64,
     control: &TransferControl,
+    tracker: &Arc<RwLock<PartTracker>>,
 ) -> InSessionRequeueResult
 where
     R: AsyncReadExt + Unpin + ?Sized,
@@ -2047,27 +2107,29 @@ where
         if let Err(e) = check_control(control).await {
             return InSessionRequeueResult::Disconnected(format!("cancelled: {e:#}"));
         }
+        if tracker.read().await.all_complete() {
+            return InSessionRequeueResult::FileComplete;
+        }
         let elapsed = queue_start.elapsed().as_secs();
         if elapsed >= timeout_secs {
             return InSessionRequeueResult::Timeout(format!(
                 "no OP_ACCEPTUPLOADREQ within {timeout_secs}s"
             ));
         }
-        let remaining = timeout_secs.saturating_sub(elapsed).max(5);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(remaining),
-            read_packet_async_ms(reader),
+        let poll_secs = timeout_secs.saturating_sub(elapsed).clamp(1, 5);
+        let result = read_packet_within_ms(
+            reader,
+            std::time::Duration::from_secs(poll_secs),
+            std::time::Duration::from_secs(HANDSHAKE_READ_TIMEOUT_SECS),
         )
         .await;
         let (proto, opcode, _payload) = match result {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => {
+            Ok(Some(p)) => p,
+            Ok(None) => continue,
+            Err(e) => {
                 return InSessionRequeueResult::Disconnected(format!(
                     "read failed during re-queue: {e:#}"
                 ));
-            }
-            Err(_) => {
-                return InSessionRequeueResult::Timeout("read timeout during re-queue".to_string());
             }
         };
         if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
@@ -2798,6 +2860,35 @@ impl MultiSourceDownload {
         .map_err(|e| {
             super::transfer::download_folder_error("opening the part file", &part_root, e)
         })?;
+
+        // Stopped before the final verification, which it must not race.
+        let rehash_sweep = {
+            let tracker = tracker.clone();
+            let part_hashes = part_hashes.clone();
+            let output = shared_part_file.clone();
+            let mut guard =
+                InProgressGuard::with_release_tx(tracker.clone(), usize::MAX, drop_tx.clone());
+            let file_hash = self.file_hash;
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let mut skip = HashSet::new();
+                let mut tick = tokio::time::interval(UNVERIFIED_PART_SWEEP_INTERVAL);
+                loop {
+                    tick.tick().await;
+                    rehash_unverified_parts(
+                        &tracker,
+                        &part_hashes,
+                        &output,
+                        &mut guard,
+                        &mut skip,
+                        &file_hash,
+                        &event_tx,
+                    )
+                    .await;
+                }
+            })
+        };
+        source_aborts.track(&rehash_sweep);
 
         // Spawn per-source download tasks
         let mut handles = Vec::new();
@@ -3884,6 +3975,216 @@ impl MultiSourceDownload {
             })
         };
 
+        // Adopts every stream in `pending_established`: at the top of each retry
+        // round, and as soon as one arrives while a round's sources run.
+        macro_rules! adopt_pending_callbacks {
+            ($round:expr) => {
+                for es in std::mem::take(&mut pending_established) {
+                    let source = es.source;
+                    let stream = es.stream;
+
+                    // Assign a part exactly like the active-phase arm: pick the
+                    // best needed part this peer can serve. If none is assignable
+                    // (everything already complete / in-progress in endgame) the
+                    // live stream is dropped — only one task can read a socket.
+                    let parts = {
+                        match select_part_for_new_source(
+                            &chunk_selector,
+                            &tracker,
+                            &source.available_parts,
+                            self.control.is_preview_priority(),
+                        )
+                        .await
+                        {
+                            Some(p) => vec![p],
+                            None => Vec::new(),
+                        }
+                    };
+                    if parts.is_empty() {
+                        debug!(
+                            "Adopted callback {}:{} has no assignable parts; dropping stream",
+                            source.peer_ip, source.peer_port,
+                        );
+                        let _ = event_tx
+                            .send(DownloadEvent::SourceDetail {
+                                transfer_id: self.transfer_id.clone(),
+                                ip: source.peer_ip.clone(),
+                                port: source.peer_port,
+                                status: "parts_busy".to_string(),
+                                queue_rank: None,
+                                speed: 0,
+                                transferred: 0,
+                                client_software: String::new(),
+                                peer_name: String::new(),
+                                failure_kind: None,
+                                available_parts: None,
+                                total_parts: None,
+                                country_code: None,
+                            })
+                            .await;
+                        drop(stream);
+                        continue;
+                    }
+
+                    let src_idx = next_src_idx;
+                    next_src_idx += 1;
+                    let new_total = commit_known_source(
+                        &mut known_sources,
+                        &total_sources,
+                        &source.peer_ip,
+                        source.peer_port,
+                    );
+                    let _ = event_tx
+                        .send(DownloadEvent::SourcesUpdate {
+                            transfer_id: self.transfer_id.clone(),
+                            total: new_total,
+                            active: active_count.load(Ordering::Relaxed),
+                            queued: queued_count.load(Ordering::Relaxed),
+                        })
+                        .await;
+                    // Spelled as `add_source` rather than open-coded, so that
+                    // grepping the add/remove pair finds it. The matching
+                    // `remove_source` is at the bottom of the task spawned below.
+                    chunk_selector
+                        .write()
+                        .await
+                        .add_source(&source.available_parts);
+                    info!(
+                        "Retry round {}: adopting inbound callback stream {}:{} (idx {src_idx})",
+                        $round,
+                        source.peer_ip,
+                        source.peer_port,
+                    );
+
+                    let src = source.clone();
+                    let trk = tracker.clone();
+                    let pp = part_path.clone();
+                    let fh = self.file_hash;
+                    let fs = self.file_size;
+                    let uh = self.user_hash;
+                    let nn = self.nickname.clone();
+                    let tp = self.tcp_port;
+                    let up = self.udp_port;
+                    let bw = self.bandwidth_limiter.clone();
+                    let a_progress_tx = adopt_progress_tx.clone();
+                    let ph = part_hashes.clone();
+                    let aich_m = shared_aich_master.clone();
+                    let sa = active_count.clone();
+                    let sq = queued_count.clone();
+                    let sm = self.source_manager.clone();
+                    let cm = self.credit_manager.clone();
+                    let cmt = self.comment_manager.clone();
+                    let cs = chunk_selector.clone();
+                    let avail = source.available_parts.clone();
+                    let etx = event_tx.clone();
+                    let tid = self.transfer_id.clone();
+                    let bi = self.shared_buddy_info.clone();
+                    let ctrl = self.control.clone();
+                    let sem = conn_semaphore.clone();
+                    let fail_etx = event_tx.clone();
+                    let fail_tid = self.transfer_id.clone();
+                    let fail_ip = source.peer_ip.clone();
+                    let fail_port = source.peer_port;
+                    let obf_enabled = self.obfuscation_enabled;
+                    let hello_server = self.server_addr;
+                    let a_ember_hash = self.ember_hash;
+                    let a_ember_pubkey = self.ed25519_public_key;
+                    let a_ember_secret = self.ed25519_secret_key;
+                    let a_nick = self.nickname.clone();
+                    let a_qw = queue_wait_secs;
+                    let a_shared_out = shared_part_file.clone();
+                    let a_epx = self.ember_payload.clone();
+                    let a_epx_gen = self.ember_payload_generation.clone();
+                    let a_aich_p = self.aich_pending.clone();
+                    let a_ipf = self.ip_filter.clone();
+                    let a_ban = self.banned_ips.clone();
+                    let a_ext = self.external_ip;
+                    let a_geo = self.geoip.clone();
+                    let a_fh = self.friend_hashes.clone();
+                    let a_sx_oh = self.sx_overhead.clone();
+                    let a_epx_oh = self.epx_overhead.clone();
+                    let a_file_req_oh = self.file_req_overhead.clone();
+                    let a_missing_parts = peers_missing_parts.clone();
+                    let a_disk_full = disk_full.clone();
+                    let a_queued = peers_that_queued.clone();
+                    let src_drop_tx = drop_tx.clone();
+                    let handle = tokio::spawn(async move {
+                        let _permit = match acquire_source_permit(&sem, &ctrl).await {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
+                        // Paired with the `add_source` at the adoption site above,
+                        // before this task was spawned.
+                        let freq_avail = avail.clone();
+                        let cancel_ctrl = ctrl.clone();
+                        let result = tokio::select! {
+                            res = download_parts_from_source(
+                                src_idx, &src, &parts, trk, &pp, &fh, fs, &uh, &nn,
+                                tp, up, bw, a_progress_tx, ph, aich_m, sa, sq, sm, cm,
+                                cmt, Some(cs.clone()), avail, Some(etx), tid, bi, ctrl,
+                                obf_enabled, hello_server, a_qw,
+                                Some(a_shared_out), a_epx, a_epx_gen,
+                                a_aich_p,
+                                a_ipf, a_ban, a_ext,
+                                a_geo, a_fh,
+                                a_ember_hash,
+                                a_ember_pubkey,
+                                a_ember_secret,
+                                a_nick,
+                                a_sx_oh,
+                                a_epx_oh,
+                                a_file_req_oh,
+                                Some(stream),
+                                a_missing_parts,
+                                Some(src_drop_tx),
+                            ) => res,
+                            _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
+                        };
+                        if !freq_avail.is_empty() {
+                            let mut csel = cs.write().await;
+                            csel.remove_source(&freq_avail);
+                        }
+                        if let Err(e) = &result {
+                            note_disk_full(&a_disk_full, e);
+                            let err_str = e.to_string();
+                            // See the injected-source closures: an adopted callback peer that
+                            // queued us needs the same FILEREASKTIME promotion.
+                            if super::transfer::is_queue_state_error(&err_str) {
+                                if let Ok(mut q) = a_queued.lock() {
+                                    q.insert((fail_ip.clone(), fail_port));
+                                }
+                            }
+                            if super::transfer::should_emit_source_failed(&err_str) {
+                                warn!(
+                                    "Adopted callback source {} ({}) failed: {e:#}",
+                                    src_idx, fail_ip
+                                );
+                                let _ = fail_etx
+                                    .send(DownloadEvent::SourceDetail {
+                                        transfer_id: fail_tid,
+                                        ip: fail_ip,
+                                        port: fail_port,
+                                        status: "failed".to_string(),
+                                        queue_rank: None,
+                                        speed: 0,
+                                        transferred: 0,
+                                        client_software: String::new(),
+                                        peer_name: String::new(),
+                                        failure_kind: Some(super::transfer::classify_error(&err_str)),
+                                        available_parts: None,
+                                        total_parts: None,
+                                        country_code: None,
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                    source_aborts.track(&handle);
+                    adopted_handles.push(handle);
+                }
+            };
+        }
+
         while retry_round < max_retry_rounds {
             if disk_full_hit(&disk_full) {
                 for handle in adopted_handles.drain(..) {
@@ -3989,209 +4290,7 @@ impl MultiSourceDownload {
                     }
                 }
             }
-            for es in std::mem::take(&mut pending_established) {
-                let source = es.source;
-                let stream = es.stream;
-
-                // Assign a part exactly like the active-phase arm: pick the
-                // best needed part this peer can serve. If none is assignable
-                // (everything already complete / in-progress in endgame) the
-                // live stream is dropped — only one task can read a socket.
-                let parts = {
-                    match select_part_for_new_source(
-                        &chunk_selector,
-                        &tracker,
-                        &source.available_parts,
-                        self.control.is_preview_priority(),
-                    )
-                    .await
-                    {
-                        Some(p) => vec![p],
-                        None => Vec::new(),
-                    }
-                };
-                if parts.is_empty() {
-                    debug!(
-                        "Adopted callback {}:{} has no assignable parts; dropping stream",
-                        source.peer_ip, source.peer_port,
-                    );
-                    let _ = event_tx
-                        .send(DownloadEvent::SourceDetail {
-                            transfer_id: self.transfer_id.clone(),
-                            ip: source.peer_ip.clone(),
-                            port: source.peer_port,
-                            status: "parts_busy".to_string(),
-                            queue_rank: None,
-                            speed: 0,
-                            transferred: 0,
-                            client_software: String::new(),
-                            peer_name: String::new(),
-                            failure_kind: None,
-                            available_parts: None,
-                            total_parts: None,
-                            country_code: None,
-                        })
-                        .await;
-                    drop(stream);
-                    continue;
-                }
-
-                let src_idx = next_src_idx;
-                next_src_idx += 1;
-                let new_total = commit_known_source(
-                    &mut known_sources,
-                    &total_sources,
-                    &source.peer_ip,
-                    source.peer_port,
-                );
-                let _ = event_tx
-                    .send(DownloadEvent::SourcesUpdate {
-                        transfer_id: self.transfer_id.clone(),
-                        total: new_total,
-                        active: active_count.load(Ordering::Relaxed),
-                        queued: queued_count.load(Ordering::Relaxed),
-                    })
-                    .await;
-                // Spelled as `add_source` rather than open-coded, so that
-                // grepping the add/remove pair finds it. The matching
-                // `remove_source` is at the bottom of the task spawned below.
-                chunk_selector
-                    .write()
-                    .await
-                    .add_source(&source.available_parts);
-                info!(
-                    "Retry round {}: adopting inbound callback stream {}:{} (idx {src_idx})",
-                    retry_round + 1,
-                    source.peer_ip,
-                    source.peer_port,
-                );
-
-                let src = source.clone();
-                let trk = tracker.clone();
-                let pp = part_path.clone();
-                let fh = self.file_hash;
-                let fs = self.file_size;
-                let uh = self.user_hash;
-                let nn = self.nickname.clone();
-                let tp = self.tcp_port;
-                let up = self.udp_port;
-                let bw = self.bandwidth_limiter.clone();
-                let a_progress_tx = adopt_progress_tx.clone();
-                let ph = part_hashes.clone();
-                let aich_m = shared_aich_master.clone();
-                let sa = active_count.clone();
-                let sq = queued_count.clone();
-                let sm = self.source_manager.clone();
-                let cm = self.credit_manager.clone();
-                let cmt = self.comment_manager.clone();
-                let cs = chunk_selector.clone();
-                let avail = source.available_parts.clone();
-                let etx = event_tx.clone();
-                let tid = self.transfer_id.clone();
-                let bi = self.shared_buddy_info.clone();
-                let ctrl = self.control.clone();
-                let sem = conn_semaphore.clone();
-                let fail_etx = event_tx.clone();
-                let fail_tid = self.transfer_id.clone();
-                let fail_ip = source.peer_ip.clone();
-                let fail_port = source.peer_port;
-                let obf_enabled = self.obfuscation_enabled;
-                let hello_server = self.server_addr;
-                let a_ember_hash = self.ember_hash;
-                let a_ember_pubkey = self.ed25519_public_key;
-                let a_ember_secret = self.ed25519_secret_key;
-                let a_nick = self.nickname.clone();
-                let a_qw = queue_wait_secs;
-                let a_shared_out = shared_part_file.clone();
-                let a_epx = self.ember_payload.clone();
-                let a_epx_gen = self.ember_payload_generation.clone();
-                let a_aich_p = self.aich_pending.clone();
-                let a_ipf = self.ip_filter.clone();
-                let a_ban = self.banned_ips.clone();
-                let a_ext = self.external_ip;
-                let a_geo = self.geoip.clone();
-                let a_fh = self.friend_hashes.clone();
-                let a_sx_oh = self.sx_overhead.clone();
-                let a_epx_oh = self.epx_overhead.clone();
-                let a_file_req_oh = self.file_req_overhead.clone();
-                let a_missing_parts = peers_missing_parts.clone();
-                let a_disk_full = disk_full.clone();
-                let a_queued = peers_that_queued.clone();
-                let src_drop_tx = drop_tx.clone();
-                let handle = tokio::spawn(async move {
-                    let _permit = match acquire_source_permit(&sem, &ctrl).await {
-                        Ok(p) => p,
-                        Err(_) => return,
-                    };
-                    // Paired with the `add_source` at the adoption site above,
-                    // before this task was spawned.
-                    let freq_avail = avail.clone();
-                    let cancel_ctrl = ctrl.clone();
-                    let result = tokio::select! {
-                        res = download_parts_from_source(
-                            src_idx, &src, &parts, trk, &pp, &fh, fs, &uh, &nn,
-                            tp, up, bw, a_progress_tx, ph, aich_m, sa, sq, sm, cm,
-                            cmt, Some(cs.clone()), avail, Some(etx), tid, bi, ctrl,
-                            obf_enabled, hello_server, a_qw,
-                            Some(a_shared_out), a_epx, a_epx_gen,
-                            a_aich_p,
-                            a_ipf, a_ban, a_ext,
-                            a_geo, a_fh,
-                            a_ember_hash,
-                            a_ember_pubkey,
-                            a_ember_secret,
-                            a_nick,
-                            a_sx_oh,
-                            a_epx_oh,
-                            a_file_req_oh,
-                            Some(stream),
-                            a_missing_parts,
-                            Some(src_drop_tx),
-                        ) => res,
-                        _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
-                    };
-                    if !freq_avail.is_empty() {
-                        let mut csel = cs.write().await;
-                        csel.remove_source(&freq_avail);
-                    }
-                    if let Err(e) = &result {
-                        note_disk_full(&a_disk_full, e);
-                        let err_str = e.to_string();
-                        // See the injected-source closures: an adopted callback peer that
-                        // queued us needs the same FILEREASKTIME promotion.
-                        if super::transfer::is_queue_state_error(&err_str) {
-                            if let Ok(mut q) = a_queued.lock() {
-                                q.insert((fail_ip.clone(), fail_port));
-                            }
-                        }
-                        if super::transfer::should_emit_source_failed(&err_str) {
-                            warn!(
-                                "Adopted callback source {} ({}) failed: {e:#}",
-                                src_idx, fail_ip
-                            );
-                            let _ = fail_etx
-                                .send(DownloadEvent::SourceDetail {
-                                    transfer_id: fail_tid,
-                                    ip: fail_ip,
-                                    port: fail_port,
-                                    status: "failed".to_string(),
-                                    queue_rank: None,
-                                    speed: 0,
-                                    transferred: 0,
-                                    client_software: String::new(),
-                                    peer_name: String::new(),
-                                    failure_kind: Some(super::transfer::classify_error(&err_str)),
-                                    available_parts: None,
-                                    total_parts: None,
-                                    country_code: None,
-                                })
-                                .await;
-                        }
-                    }
-                });
-                source_aborts.track(&handle);
-                adopted_handles.push(handle);
-            }
+            adopt_pending_callbacks!(retry_round + 1);
 
             // Deduplicate on the dial key. `injected_sources` is appended to
             // on every re-injection with no existing-entry check, so over a
@@ -4738,7 +4837,44 @@ impl MultiSourceDownload {
             drop(retry_tx);
             // See the initial-phase abort above: a part still claimed by a
             // source is one that source may yet repair.
-            wait_for_sources_unless_settled(&tracker, &retry_handles).await;
+            //
+            // Callback streams are adopted as they arrive, not at the next
+            // round boundary. The firewalled peer connects back while this
+            // round's sources are still running, and eMule closes a socket it
+            // hears nothing on after `CONNECTION_TIMEOUT` (40 s); buffered
+            // here, the stream was dead by the time anything read it.
+            loop {
+                tokio::select! {
+                    _ = wait_for_sources_unless_settled(&tracker, &retry_handles) => break,
+                    new_est = async {
+                        match post_phase_new_established_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        match new_est {
+                            Some(es) => {
+                                pending_established.push(es);
+                                adopt_pending_callbacks!(retry_round);
+                            }
+                            None => post_phase_new_established_rx = None,
+                        }
+                    }
+                    new_src = async {
+                        match post_phase_new_source_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        match new_src {
+                            Some(source) => {
+                                remember_injected_source(&mut injected_sources, source);
+                            }
+                            None => post_phase_new_source_rx = None,
+                        }
+                    }
+                }
+            }
             for h in retry_handles {
                 let _ = h.await;
             }
@@ -4778,6 +4914,10 @@ impl MultiSourceDownload {
         // eMule-style: remaining incomplete parts are handled through normal
         // retry rounds above. Endgame: tighter request pipelining and (when ≤3
         // parts remain) chunk selection biases toward higher availability.
+
+        // Awaited so its writer clone is gone before the `.part` is closed.
+        rehash_sweep.abort();
+        let _ = rehash_sweep.await;
 
         // Check if all parts are complete
         let all_done = {
@@ -5204,6 +5344,115 @@ async fn install_verified_part_hashes(
     let mut tracker = tracker.write().await;
     if tracker.part_hashes().is_empty() {
         tracker.set_part_hashes(installed);
+    }
+}
+
+/// How often a transfer runs [`rehash_unverified_parts`].
+const UNVERIFIED_PART_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Parts that hold every byte but no verified bit, whose MD4 is known, and that
+/// no source is working on.
+fn unverified_complete_parts(tracker: &PartTracker, part_hashes: &[[u8; 16]]) -> Vec<usize> {
+    let in_progress = tracker.in_progress_flags();
+    (0..tracker.part_count.min(part_hashes.len()))
+        .filter(|&p| {
+            tracker.is_part_complete(p)
+                && !tracker.is_part_verified(p)
+                && !in_progress.get(p).copied().unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Hash every part [`unverified_complete_parts`] names, one at a time: a match
+/// marks it verified, a mismatch reopens it.
+///
+/// A worker hashes a part once, when its receive loop closes the last gap, and
+/// nothing revisits a part that came out of that unverified — no hashset yet,
+/// a read or fsync error, a connection lost during AICH recovery — or that a
+/// resumed `.part.met` carried no verified bit for. Such a part cannot be
+/// uploaded, and bad bytes in it surfaced only as a failed whole-file
+/// verification and a re-download of every part it could not name.
+///
+/// `skip` collects parts whose read or fsync failed, so a failing disk region
+/// is not re-read on every sweep.
+async fn rehash_unverified_parts(
+    tracker: &Arc<RwLock<PartTracker>>,
+    part_hashes: &Arc<RwLock<Vec<[u8; 16]>>>,
+    output: &super::write_coordinator::PartFileWriter,
+    guard: &mut InProgressGuard,
+    skip: &mut HashSet<usize>,
+    file_hash: &[u8; 16],
+    event_tx: &mpsc::Sender<DownloadEvent>,
+) {
+    let hashes = part_hashes.read().await.clone();
+    loop {
+        let picked = {
+            let mut t = tracker.write().await;
+            let next = unverified_complete_parts(&t, &hashes)
+                .into_iter()
+                .find(|p| !skip.contains(p));
+            next.map(|p| {
+                guard.claim_locked(p, &mut t);
+                (p, t.part_range(p), t.part_content_generation(p))
+            })
+        };
+        let Some((part_idx, (ps, pe), hashed_generation)) = picked else {
+            return;
+        };
+        let checked = match output.hash_part_md4(ps, (pe - ps) as usize).await {
+            Ok((_, actual)) if actual == hashes[part_idx] => {
+                // Durability before persisting the verified bit, as for a
+                // part a worker verifies.
+                output.sync_data().await.map(|()| true)
+            }
+            Ok(_) => Ok(false),
+            Err(e) => Err(e),
+        };
+        let verified = match checked {
+            Ok(verified) => verified,
+            Err(e) => {
+                debug!("Re-hash of unverified part {part_idx} failed: {e}");
+                skip.insert(part_idx);
+                let mut t = tracker.write().await;
+                guard.release_locked(part_idx, &mut t);
+                continue;
+            }
+        };
+        let snap = {
+            let mut t = tracker.write().await;
+            let superseded = t.part_verdict_superseded(part_idx, hashed_generation);
+            if !superseded {
+                if verified {
+                    t.set_part_verified(part_idx);
+                } else {
+                    t.mark_incomplete(part_idx);
+                }
+            }
+            guard.release_locked(part_idx, &mut t);
+            (!superseded).then(|| t.snapshot_for_save())
+        };
+        let Some(snap) = snap else {
+            continue;
+        };
+        save_snapshot_now(snap, "re-hashed part").await;
+        let event = if verified {
+            info!("Re-hashed part {part_idx}: verified");
+            DownloadEvent::PartVerified {
+                file_hash: *file_hash,
+                part_start: ps,
+                part_end: pe,
+                sender_user_hash: None,
+            }
+        } else {
+            warn!("Re-hashed part {part_idx}: MD4 mismatch, reopening it");
+            DownloadEvent::PartCorrupted {
+                file_hash: *file_hash,
+                part_start: ps,
+                part_end: pe,
+                sender_user_hash: None,
+            }
+        };
+        let _ = event_tx.send(event).await;
     }
 }
 
@@ -7746,12 +7995,10 @@ async fn download_parts_from_source(
                 // pre-pipeline path do. Without it this reported
                 // `no_needed_parts` — "peer has no parts we need" — about a peer
                 // that demonstrably holds a part we need, purely because another
-                // source had claimed it. Claims are taken before the queue wait,
-                // so the claim holder may be sitting at a queue rank for hours,
-                // and every other source holding only that part was turned away
-                // with a status saying it was useless. On a file whose peers all
-                // hold the same part that left the download at 0% with a drawer
-                // full of "No needed parts".
+                // source had claimed it, and every other source holding only that
+                // part was turned away with a status saying it was useless. On a
+                // file whose peers all hold the same part that left the download
+                // at 0% with a drawer full of "No needed parts".
                 if chosen.is_none() {
                     let free = vec![false; pc];
                     chosen = cs.select_part(
@@ -7764,13 +8011,16 @@ async fn download_parts_from_source(
                         prefer_higher,
                     );
                 }
+                // Not claimed here: the claim is taken where pre-assigned parts
+                // take theirs, once the peer has granted a slot. Claimed now, it
+                // was held through a queue wait of up to `queue_wait_secs`, and
+                // `all_complete_and_settled()` stayed false that long after the
+                // other sources had finished the file.
                 if let Some(p) = chosen {
                     debug!(
                         "Source {} pre-assigned parts unavailable, dynamically selected part {}",
                         _src_idx, p
                     );
-                    drop(cs);
-                    ip_guard.claim(p).await;
                     filtered_parts.push(p);
                 }
             }
@@ -8129,6 +8379,18 @@ async fn download_parts_from_source(
         let mut last_rank: Option<u32> = None;
         loop {
             check_control(&control).await?;
+            if tracker.read().await.all_complete() {
+                debug!(
+                    "Source {} ({}) leaving the queue at rank {:?}: the file completed while it waited",
+                    _src_idx, addr, last_rank
+                );
+                peer_conn.held.set_awaiting_grant(false);
+                write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_END_OF_DOWNLOAD, file_hash)
+                    .await
+                    .ok();
+                emit_source!("no_needed_parts", None, 0u64);
+                return Ok(());
+            }
             let elapsed = queue_start.elapsed().as_secs();
             if elapsed > queue_wait_secs {
                 // Not a failure. eMule holds a queued source at DS_ONQUEUE
@@ -8351,6 +8613,7 @@ async fn download_parts_from_source(
     }
     let mut pipelined_next: Option<PipelinedNext> = None;
     let mut pending_compressed = CompressedPartAccumulator::default();
+    let mut recent_requests = RecentRequests::default();
     // Taken once, outside the receive loop: the wire-byte counter is incremented
     // on every packet and must not cost a tracker lock each time.
     let wire_bytes_counter = tracker.read().await.transferred_counter();
@@ -8414,6 +8677,13 @@ async fn download_parts_from_source(
                         pipelined_next = None;
                     }
                     drop(t);
+                    // The part may be claimed already — by the pipeline, a
+                    // previous stale-skip extend, or a reopened requeue — and
+                    // nothing further down releases a part this loop skips.
+                    {
+                        let mut t = tracker.write().await;
+                        ip_guard.release_locked(part_idx, &mut t);
+                    }
 
                     // Dynamic-extend attempt. Mirrors the end-of-iteration
                     // block further down, but fires when the current part
@@ -8635,6 +8905,7 @@ async fn download_parts_from_source(
                 }
                 write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await?;
                 push_outstanding_batch(&mut outstanding_ranges, &batch);
+                recent_requests.record(&batch);
                 sent_idx += 1;
             }
             // Republished at each send rather than on every receipt: another
@@ -9011,6 +9282,7 @@ async fn download_parts_from_source(
                                             &mut outstanding_ranges,
                                             &batch,
                                         );
+                                        recent_requests.record(&batch);
                                         sent_any = true;
                                     }
                                     // Keyed on a request actually going out,
@@ -9289,12 +9561,13 @@ async fn download_parts_from_source(
                                             .flatten()
                                             .copied(),
                                     )
-                            }));
-                        if is_unsolicited_undersized_block(start, end, file_size, requested_ranges)
-                        {
+                            }))
+                            .chain(recent_requests.iter());
+                        let accepted_end = requested_block_end(start, end, requested_ranges);
+                        let Some(end) = accepted_end else {
                             consecutive_bad_blocks += 1;
                             tracing::debug!(
-                            "source {_src_idx} sent undersized block ({piece_len} bytes); treating as abusive"
+                            "source {_src_idx} sent a block we never requested: start={start} ({piece_len} bytes, bad streak: {consecutive_bad_blocks})"
                         );
                             if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
                                 if let (Some(etx), std::net::IpAddr::V4(v4)) =
@@ -9310,7 +9583,8 @@ async fn download_parts_from_source(
                                 anyhow::bail!("source {_src_idx} sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
                             }
                             continue;
-                        }
+                        };
+                        let data = &data[..(end - start) as usize];
                         consecutive_bad_blocks = 0;
                         if !bw.acquire_download(piece_len).await {
                             anyhow::bail!("bandwidth limiter stopped");
@@ -9532,20 +9806,42 @@ async fn download_parts_from_source(
                                     )
                                 })
                             });
-                        // No outstanding request for this start is a stale block,
-                        // not misbehaviour: `batches` and the accumulator are both
+                        // A block for an earlier request is stale, not
+                        // misbehaviour: `batches` and the accumulator are both
                         // per-part, so a block we legitimately asked for arrives
-                        // unmatched whenever another source closed the last gap in
-                        // this part first, or the pipelined target completed
+                        // unmatched whenever another source closed the last gap
+                        // in this part first, or the pipelined target completed
                         // elsewhere and we moved on. Treating it as fatal
                         // propagated out of the worker and dropped a healthy peer
-                        // into its reask cooldown for the rest of the session. The
-                        // uncompressed branch already discards such a block as a
-                        // duplicate; do the same and let the gap be re-requested.
-                        let Some(requested_end) = requested_end else {
+                        // into its reask cooldown for the rest of the session.
+                        // Discard it and let the gap be re-requested.
+                        if requested_end.is_none() && recent_requests.end_for_start(start).is_some()
+                        {
                             tracing::debug!(
                                 "Discarding compressed block at {start} from source {_src_idx}: no outstanding request (part advanced)"
                             );
+                            continue;
+                        }
+                        // Held to the same rule as the uncompressed branch: a
+                        // block we never asked this peer for is not written.
+                        let Some(requested_end) = requested_end else {
+                            consecutive_bad_blocks += 1;
+                            tracing::debug!(
+                                "Discarding compressed block at {start} from source {_src_idx}: never requested (bad streak: {consecutive_bad_blocks})"
+                            );
+                            if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                                if let (Some(etx), std::net::IpAddr::V4(v4)) =
+                                    (event_tx.as_ref(), addr.ip())
+                                {
+                                    let _ = etx
+                                        .send(DownloadEvent::ProtocolViolation {
+                                            sender_ip: v4,
+                                            sender_user_hash: Some(peer_user_hash),
+                                        })
+                                        .await;
+                                }
+                                anyhow::bail!("source {_src_idx} sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
+                            }
                             continue;
                         };
                         let fragment = match pending_compressed.append(
@@ -10199,6 +10495,7 @@ async fn download_parts_from_source(
                             write_part_request_batch(&mut *writer, file_hash, &batch, needs_i64)
                                 .await?;
                             push_outstanding_batch(&mut outstanding_ranges, &batch);
+                            recent_requests.record(&batch);
                             ip_guard.publish_in_flight(&outstanding_ranges).await;
                         }
                     } else if sent_idx >= batches.len()
@@ -10372,6 +10669,7 @@ async fn download_parts_from_source(
                                     queue_idx, part_queue.len(),
                                 );
                                     ip_guard.claim(target_part_idx).await;
+                                    recent_requests.record(&first_batch);
                                     // The pipelined state must reflect
                                     // exactly what bytes the peer will
                                     // send us next. We pipelined ONE
@@ -10449,6 +10747,7 @@ async fn download_parts_from_source(
                         write_part_request_batch(&mut *writer, file_hash, &batch, needs_i64)
                             .await?;
                         push_outstanding_batch(&mut outstanding_ranges, &batch);
+                        recent_requests.record(&batch);
                         sent_any = true;
                     }
                     if sent_any {
@@ -10576,6 +10875,7 @@ async fn download_parts_from_source(
 
             // Verify part hash before marking complete
             let mut hashed_generation: u64 = 0;
+            let mut aich_wait_desynced = false;
             let part_hash_outcome = {
                 // Copied out under a short read, so the guard drops here.
                 //
@@ -10685,11 +10985,16 @@ async fn download_parts_from_source(
                                             // next would be payload bytes
                                             // parsed as a header. End the
                                             // source instead of corrupting the
-                                            // rest of the session with it.
+                                            // rest of the session with it —
+                                            // but only after the mismatch
+                                            // below has reopened the part.
+                                            // Bailing here left a part whose
+                                            // MD4 had just failed gapless and
+                                            // unverified, so no source would
+                                            // fetch it again.
                                             AichAnswerOutcome::StreamDesynced => {
-                                                anyhow::bail!(
-                                                    "AICH recovery wait left the stream desynchronized"
-                                                );
+                                                stream_maybe_desynced = true;
+                                                aich_wait_desynced = true;
                                             }
                                         }
                                     }
@@ -11028,6 +11333,9 @@ async fn download_parts_from_source(
                     spawn_save_snapshot(snap).await;
                 }
             }
+            if aich_wait_desynced {
+                anyhow::bail!("AICH recovery wait left the stream desynchronized");
+            }
 
             // Dynamically select the next part if we have a shared chunk selector.
             //
@@ -11259,8 +11567,40 @@ async fn download_parts_from_source(
         emit_source!("queued", None, 0u64);
         peer_conn.held.set_awaiting_grant(true);
 
+        // Release every claim the outgoing queue still holds before waiting in
+        // the peer's queue. Claims are taken for parts pushed onto
+        // `part_queue` ahead of time — the stale-skip extend, the cross-part
+        // pipeline target, the post-verify dynamic extend — but every release
+        // site only ever releases the *current* `part_idx`, so a queued-ahead
+        // claim is released only when the loop reaches that entry. Held
+        // through the wait, they kept `all_complete_and_settled()` false for
+        // up to `requeue_timeout_secs` after other sources finished the file,
+        // and replacing the queue wholesale on promotion meant they stayed in
+        // `ip_guard.active` until the task exited — and eMule's
+        // `SESSIONMAXTRANS` makes this rotation fire about once per part.
+        //
+        // The cost was not just memory: `in_progress_flags()` then reports
+        // parts nobody is pulling, so the strict pass of `select_part` rejects
+        // them and the engine falls through to the relaxed fallback —
+        // defeating the very anti-herding mechanism the claims exist for.
+        //
+        // `queue_idx` is incremented before the `peer_out_of_parts` break, so
+        // the entry that break consumed without processing is at
+        // `queue_idx - 1`. Starting one earlier covers it; on the paths where
+        // that part *was* processed the extra release is a no-op, because
+        // `release_locked` only acts while this guard still holds the claim.
+        {
+            let mut t = tracker.write().await;
+            for &stale in part_queue.iter().skip(queue_idx.saturating_sub(1)) {
+                ip_guard.release_locked(stale, &mut t);
+            }
+            if let Some(pending) = pipelined_next.as_ref() {
+                ip_guard.release_locked(pending.part_idx, &mut t);
+            }
+        }
+
         let requeue_outcome =
-            try_in_session_requeue(&mut *reader, requeue_timeout_secs, &control).await;
+            try_in_session_requeue(&mut *reader, requeue_timeout_secs, &control, &tracker).await;
 
         match requeue_outcome {
             InSessionRequeueResult::Promoted => {
@@ -11282,39 +11622,6 @@ async fn download_parts_from_source(
                 _src_idx, addr,
             );
                 peer_out_of_parts = false;
-                // Release every claim the outgoing queue still holds before it
-                // is thrown away. Claims are taken for parts pushed onto
-                // `part_queue` ahead of time — the stale-skip extend, the
-                // cross-part pipeline target, the post-verify dynamic extend —
-                // but every release site only ever releases the *current*
-                // `part_idx`, so a queued-ahead claim is released only when the
-                // loop reaches that entry. Replacing the queue wholesale here
-                // meant those claims stayed in `ip_guard.active` until the task
-                // exited, and eMule's `SESSIONMAXTRANS` makes this rotation fire
-                // about once per part.
-                //
-                // The cost was not just memory: `in_progress_flags()` then
-                // reports parts nobody is pulling, so the strict pass of
-                // `select_part` rejects them and the engine falls through to the
-                // relaxed fallback — defeating the very anti-herding mechanism
-                // the claims exist for — and `all_complete_and_settled()` stays
-                // false, so the parent's early-completion breaks never fire.
-                //
-                // `queue_idx` is incremented before the `peer_out_of_parts`
-                // break, so the entry that break consumed without processing is
-                // at `queue_idx - 1`. Starting one earlier covers it; on the
-                // paths where that part *was* processed the extra release is a
-                // no-op, because `release_locked` only acts while this guard
-                // still holds the claim.
-                {
-                    let mut t = tracker.write().await;
-                    for &stale in part_queue.iter().skip(queue_idx.saturating_sub(1)) {
-                        ip_guard.release_locked(stale, &mut t);
-                    }
-                    if let Some(pending) = pipelined_next.as_ref() {
-                        ip_guard.release_locked(pending.part_idx, &mut t);
-                    }
-                }
                 queue_idx = 0;
                 pipelined_next = None;
                 // Reset the speed-measurement window so the post-rotation
@@ -11351,6 +11658,13 @@ async fn download_parts_from_source(
                 info!(
                     "DIAG: source {} ({}) in-session re-queue timed out: {} — closing TCP",
                     _src_idx, addr, reason,
+                );
+                break 'session_loop;
+            }
+            InSessionRequeueResult::FileComplete => {
+                info!(
+                    "DIAG: source {} ({}) file completed during in-session re-queue — closing TCP",
+                    _src_idx, addr,
                 );
                 break 'session_loop;
             }
@@ -13274,6 +13588,143 @@ mod new_connection_window_tests {
 }
 
 #[cfg(test)]
+// Held across the writer open for the same reason as in `write_coordinator`'s
+// tests: the approved-root registry is process-wide.
+#[allow(clippy::await_holding_lock)]
+mod unverified_part_sweep_tests {
+    use super::*;
+    use crate::network::ed2k::hash::PARTSIZE;
+    use crate::network::ed2k::write_coordinator::{OpenMode, PartFileWriter};
+
+    fn temp_base(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ember-rehash-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    struct SweepResult {
+        complete: bool,
+        verified: bool,
+        event: Option<DownloadEvent>,
+    }
+
+    /// Runs one sweep over a single-part file holding `data` whose part hash
+    /// is `expected`, with `claimed` simulating a worker still on the part.
+    async fn sweep_once(tag: &str, data: &[u8], expected: [u8; 16], claimed: bool) -> SweepResult {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = temp_base(tag);
+        let root = base.join("root");
+        let data_dir = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let root_s = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(
+            &data_dir,
+            std::slice::from_ref(&root_s),
+        )
+        .unwrap();
+        let path = root.join("file.part");
+        std::fs::write(&path, data).unwrap();
+        let output = PartFileWriter::open(path.clone(), OpenMode::OpenExisting, vec![root_s], None)
+            .await
+            .unwrap();
+
+        let tracker = Arc::new(RwLock::new(PartTracker::new(data.len() as u64, &path)));
+        tracker.write().await.fill_range(0, data.len() as u64);
+        let mut worker = InProgressGuard::new(tracker.clone(), 0);
+        if claimed {
+            worker.claim(0).await;
+        }
+        let hashes = Arc::new(RwLock::new(vec![expected]));
+        let mut guard = InProgressGuard::new(tracker.clone(), usize::MAX);
+        let (tx, mut rx) = mpsc::channel(4);
+        rehash_unverified_parts(
+            &tracker,
+            &hashes,
+            &output,
+            &mut guard,
+            &mut HashSet::new(),
+            &[0x42; 16],
+            &tx,
+        )
+        .await;
+        drop(output);
+        drop(guard);
+        drop(worker);
+
+        let event = rx.try_recv().ok();
+        let live = tracker.read().await;
+        assert_eq!(live.in_progress_part_count(), 0, "the sweep must release its claim");
+        let result = SweepResult {
+            complete: live.is_part_complete(0),
+            verified: live.is_part_verified(0),
+            event,
+        };
+        drop(live);
+        if result.event.is_some() {
+            let saved = PartTracker::new(data.len() as u64, &path);
+            assert_eq!(saved.is_part_complete(0), result.complete, "the verdict must be saved");
+        }
+        let _ = std::fs::remove_dir_all(base);
+        result
+    }
+
+    #[test]
+    fn only_gapless_unverified_unclaimed_parts_with_a_known_hash_are_swept() {
+        let path = temp_base("predicate").with_extension("part");
+        let mut t = PartTracker::new(PARTSIZE * 4, &path);
+        t.fill_range(0, PARTSIZE * 3);
+        t.set_part_verified(0);
+        t.claim_in_progress(1);
+        let hashes = vec![[0u8; 16]; 4];
+        assert_eq!(unverified_complete_parts(&t, &hashes), vec![2]);
+        assert!(
+            unverified_complete_parts(&t, &hashes[..2]).is_empty(),
+            "a part without a known hash cannot be checked"
+        );
+        t.release_in_progress(1);
+        assert_eq!(unverified_complete_parts(&t, &hashes), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn a_gapless_part_whose_hash_matches_is_marked_verified() {
+        let data = vec![0x5Au8; 4096];
+        let expected: [u8; 16] = Md4::digest(&data).into();
+        let swept = sweep_once("match", &data, expected, false).await;
+        assert!(swept.complete && swept.verified);
+        assert!(matches!(
+            swept.event,
+            Some(DownloadEvent::PartVerified { part_start: 0, part_end: 4096, sender_user_hash: None, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_gapless_part_whose_hash_differs_is_reopened() {
+        let data = vec![0x5Au8; 4096];
+        let swept = sweep_once("mismatch", &data, [0x11; 16], false).await;
+        assert!(!swept.complete, "the bad bytes must be fetched again");
+        assert!(!swept.verified);
+        assert!(matches!(
+            swept.event,
+            Some(DownloadEvent::PartCorrupted { part_start: 0, part_end: 4096, sender_user_hash: None, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_part_a_worker_still_claims_is_left_to_that_worker() {
+        let data = vec![0x5Au8; 4096];
+        let swept = sweep_once("claimed", &data, [0x11; 16], true).await;
+        assert!(swept.complete && !swept.verified);
+        assert!(swept.event.is_none());
+    }
+}
+
+#[cfg(test)]
 mod final_verify_recovery_tests {
     use super::*;
     use crate::network::ed2k::hash::{ed2k_hash_bytes, PARTSIZE};
@@ -13509,69 +13960,106 @@ mod final_verify_recovery_tests {
 }
 
 #[cfg(test)]
-mod undersized_block_tests {
+mod requested_block_tests {
     use super::super::hash::PARTSIZE;
     use super::*;
 
-    const FILE_SIZE: u64 = 3 * PARTSIZE;
+    const BLOCK: u64 = 180 * 1024;
 
     #[test]
-    fn a_tiny_block_inside_a_requested_range_is_accepted() {
+    fn a_packet_inside_a_requested_block_is_accepted_whole() {
+        let requested = [(0, BLOCK)];
+        assert_eq!(requested_block_end(10_240, 20_480, requested), Some(20_480));
+    }
+
+    #[test]
+    fn a_tiny_requested_tail_is_accepted() {
         // The gap planner re-requests the 5-byte tail an interrupted packed
         // block left behind; the uploader answers with exactly those bytes.
         let requested = [(1_000, 1_005)];
-        assert!(!is_unsolicited_undersized_block(
-            1_000, 1_005, FILE_SIZE, requested
-        ));
+        assert_eq!(requested_block_end(1_000, 1_005, requested), Some(1_005));
     }
 
     #[test]
-    fn a_tiny_slice_of_a_larger_request_is_accepted() {
-        let requested = [(0, 180 * 1024)];
-        assert!(!is_unsolicited_undersized_block(
-            10_240, 10_241, FILE_SIZE, requested
-        ));
+    fn a_block_nobody_asked_for_is_rejected_whatever_its_size() {
+        let requested = [(0, BLOCK)];
+        assert_eq!(requested_block_end(PARTSIZE, PARTSIZE + BLOCK, requested), None);
+        assert_eq!(requested_block_end(PARTSIZE, PARTSIZE + 1, requested), None);
+        assert_eq!(requested_block_end(500, 10_740, std::iter::empty()), None);
     }
 
     #[test]
-    fn a_tiny_block_nobody_asked_for_is_rejected() {
-        let requested = [(0, 180 * 1024)];
-        assert!(is_unsolicited_undersized_block(
-            PARTSIZE,
-            PARTSIZE + 1,
-            FILE_SIZE,
-            requested
-        ));
-        assert!(is_unsolicited_undersized_block(
-            500,
-            501,
-            FILE_SIZE,
-            std::iter::empty()
-        ));
+    fn a_block_starting_just_before_a_request_is_rejected() {
+        let requested = [(BLOCK, 2 * BLOCK)];
+        assert_eq!(requested_block_end(BLOCK - 1, BLOCK + 10_240, requested), None);
     }
 
     #[test]
-    fn a_tiny_block_straddling_a_request_edge_is_rejected() {
-        let requested = [(1_000, 1_005)];
-        assert!(is_unsolicited_undersized_block(
-            1_003, 1_008, FILE_SIZE, requested
-        ));
+    fn a_block_running_past_its_request_is_clipped_to_it() {
+        let requested = [(0, BLOCK), (3 * BLOCK, 4 * BLOCK)];
+        assert_eq!(requested_block_end(BLOCK - 100, BLOCK + 10_000, requested), Some(BLOCK));
     }
 
     #[test]
-    fn the_file_tail_and_full_size_blocks_are_never_rejected() {
-        assert!(!is_unsolicited_undersized_block(
-            FILE_SIZE - 3,
-            FILE_SIZE,
-            FILE_SIZE,
-            std::iter::empty()
-        ));
-        assert!(!is_unsolicited_undersized_block(
-            0,
-            MIN_UNSOLICITED_BLOCK_BYTES,
-            FILE_SIZE,
-            std::iter::empty()
-        ));
+    fn adjacent_requests_are_one_range() {
+        let requested = [(BLOCK, 2 * BLOCK), (0, BLOCK), (2 * BLOCK, 3 * BLOCK)];
+        assert_eq!(
+            requested_block_end(BLOCK - 100, BLOCK + 100, requested),
+            Some(BLOCK + 100)
+        );
+        assert_eq!(
+            requested_block_end(100, 4 * BLOCK, requested),
+            Some(3 * BLOCK),
+            "clipped at the end of the merged run"
+        );
+    }
+
+    #[test]
+    fn a_later_run_does_not_stand_in_for_the_one_holding_the_start() {
+        let requested = [(0, BLOCK), (5 * BLOCK, 6 * BLOCK)];
+        assert_eq!(requested_block_end(100, 200, requested), Some(200));
+        assert_eq!(requested_block_end(5 * BLOCK, 5 * BLOCK + 10, requested), Some(5 * BLOCK + 10));
+        assert_eq!(requested_block_end(2 * BLOCK, 2 * BLOCK + 10, requested), None);
+    }
+
+    #[test]
+    fn empty_requests_accept_nothing() {
+        assert_eq!(requested_block_end(100, 200, [(100, 100)]), None);
+    }
+
+    #[test]
+    fn recent_requests_keep_only_the_newest_ranges() {
+        let mut recent = RecentRequests::default();
+        let batch: Vec<(u64, u64)> = (0..MAX_RECENT_REQUESTS as u64 + 2)
+            .map(|i| (i * BLOCK, (i + 1) * BLOCK))
+            .collect();
+        recent.record(&batch);
+        assert_eq!(recent.iter().count(), MAX_RECENT_REQUESTS);
+        assert_eq!(recent.end_for_start(0), None, "the oldest range was dropped");
+        assert_eq!(recent.end_for_start(2 * BLOCK), Some(3 * BLOCK));
+    }
+
+    #[test]
+    fn an_answer_to_an_expired_request_is_accepted_from_the_recent_list() {
+        let mut recent = RecentRequests::default();
+        recent.record(&[(PARTSIZE, PARTSIZE + BLOCK)]);
+        let outstanding = [(2 * PARTSIZE, 2 * PARTSIZE + BLOCK)];
+        assert_eq!(
+            requested_block_end(
+                PARTSIZE,
+                PARTSIZE + 10_240,
+                outstanding.into_iter().chain(recent.iter())
+            ),
+            Some(PARTSIZE + 10_240)
+        );
+    }
+
+    #[test]
+    fn the_newest_request_at_a_start_wins() {
+        let mut recent = RecentRequests::default();
+        recent.record(&[(0, BLOCK)]);
+        recent.record(&[(0, 100)]);
+        assert_eq!(recent.end_for_start(0), Some(100));
     }
 }
 
