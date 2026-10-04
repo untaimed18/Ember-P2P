@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -68,7 +68,13 @@ pub fn set_global_preview_priority(enabled: bool) {
     GLOBAL_PREVIEW_PRIORITY.store(enabled, Ordering::Release);
 }
 
+static NEXT_CONTROL_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 pub struct TransferControl {
+    /// Unique per control for the life of the process, never reused. A
+    /// worker's terminal events carry it, so one sent by a worker whose
+    /// control has since been replaced can be told from the current worker's.
+    generation: u64,
     cancelled: AtomicBool,
     /// Set only when this transfer's `.part` is about to be deleted (Cancel /
     /// Remove from List), never on Pause or Stop. Handed to the part-file
@@ -114,6 +120,7 @@ impl std::fmt::Debug for TransferControl {
 impl TransferControl {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
+            generation: NEXT_CONTROL_GENERATION.fetch_add(1, Ordering::Relaxed),
             cancelled: AtomicBool::new(false),
             discarding: Arc::new(AtomicBool::new(false)),
             paused: AtomicBool::new(false),
@@ -124,6 +131,10 @@ impl TransferControl {
             download_priority: AtomicU8::new(2),
             pending_rename: std::sync::Mutex::new(PendingRename::default()),
         })
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn cancel(&self) {
@@ -317,7 +328,8 @@ pub struct TransferManager {
     /// Restored downloads whose re-verification has not reported back yet.
     /// That check runs on the blocking pool, where Pause and Stop cannot stop
     /// it, and its result is sent whatever happened to the row meanwhile.
-    restore_verifications: HashSet<String>,
+    /// Keyed to the generation of the control the check reports under.
+    restore_verifications: HashMap<String, u64>,
     /// Per-transfer source details (eMule-style per-source tracking)
     source_details: HashMap<String, Vec<crate::types::SourceInfo>>,
     /// Bumped by every structural change to `queue` made here. Nothing
@@ -658,7 +670,7 @@ impl TransferManager {
             max_concurrent,
             speed_history: HashMap::new(),
             controls: HashMap::new(),
-            restore_verifications: HashSet::new(),
+            restore_verifications: HashMap::new(),
             source_details: HashMap::new(),
             queue_generation: 0,
             queue_index: std::sync::Mutex::new(QueueIndex::default()),
@@ -722,17 +734,26 @@ impl TransferManager {
     /// [`Self::finish_restore_verification`] sees its result. Resume is refused
     /// meanwhile: a worker started beside the check would be torn down by the
     /// check's own late result.
-    pub fn begin_restore_verification(&mut self, id: &str) {
-        self.restore_verifications.insert(id.to_string());
+    pub fn begin_restore_verification(&mut self, id: &str, control: &TransferControl) {
+        self.restore_verifications
+            .insert(id.to_string(), control.generation());
     }
 
-    /// `true` when one was running: the result being handled is its own.
-    pub fn finish_restore_verification(&mut self, id: &str) -> bool {
-        self.restore_verifications.remove(id)
+    /// `true` when one was running and the result being handled is its own:
+    /// it came from the check's control, or from no worker at all.
+    pub fn finish_restore_verification(&mut self, id: &str, generation: Option<u64>) -> bool {
+        let own = self
+            .restore_verifications
+            .get(id)
+            .is_some_and(|&check| generation.is_none_or(|g| g == check));
+        if own {
+            self.restore_verifications.remove(id);
+        }
+        own
     }
 
     pub fn is_restore_verification_running(&self, id: &str) -> bool {
-        self.restore_verifications.contains(id)
+        self.restore_verifications.contains_key(id)
     }
 
     /// Remove a row's control, cancelling it for a download. A worker still
@@ -3466,8 +3487,9 @@ mod tests {
         let mut manager = TransferManager::new(2);
         for id in ["single", "batched"] {
             manager.enqueue(download(id));
-            manager.register_control(id, TransferControl::new());
-            manager.begin_restore_verification(id);
+            let control = TransferControl::new();
+            manager.begin_restore_verification(id, &control);
+            manager.register_control(id, control);
         }
         manager.pause_many(&owned(&["single", "batched"]));
 
@@ -3482,10 +3504,31 @@ mod tests {
             );
         }
 
-        assert!(manager.finish_restore_verification("single"));
-        assert!(!manager.finish_restore_verification("single"));
+        assert!(manager.finish_restore_verification("single", None));
+        assert!(!manager.finish_restore_verification("single", None));
         manager.resume("single");
         assert_ne!(status_of(&manager, "single"), TransferStatus::Paused);
+    }
+
+    #[test]
+    fn a_restore_verification_ends_only_on_its_own_controls_result() {
+        let mut manager = TransferManager::new(2);
+        manager.enqueue(download("restored"));
+        let check = TransferControl::new();
+        let other = TransferControl::new();
+        manager.begin_restore_verification("restored", &check);
+
+        assert!(!manager.finish_restore_verification("restored", Some(other.generation())));
+        assert!(manager.is_restore_verification_running("restored"));
+        assert!(manager.finish_restore_verification("restored", Some(check.generation())));
+        assert!(!manager.is_restore_verification_running("restored"));
+    }
+
+    #[test]
+    fn every_control_gets_its_own_generation() {
+        let first = TransferControl::new();
+        let second = TransferControl::new();
+        assert_ne!(first.generation(), second.generation());
     }
 
     /// A rate measured over a window that has only just opened used to be

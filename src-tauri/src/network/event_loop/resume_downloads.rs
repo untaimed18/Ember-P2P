@@ -504,6 +504,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 let tx = dl_event_tx.clone();
                 let download_root = dl_folder.clone();
                 let part_files_in = found_parts.get(&tid).map(PathBuf::from);
+                let generation = Some(control.generation());
                 note_copy_check(&tid, transfer.status.clone());
                 transfer.status = TransferStatus::Verifying;
                 transfer.speed = 0;
@@ -511,8 +512,8 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 {
                     let mut mgr = transfer_manager.write().await;
                     mgr.active.insert(tid.clone(), transfer);
+                    mgr.begin_restore_verification(&tid, &control);
                     mgr.register_control(&tid, control);
-                    mgr.begin_restore_verification(&tid);
                 }
                 let handle_id = tid.clone();
                 // The event is sent from the blocking task itself. Pause, Stop
@@ -546,6 +547,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                                     final_path: Some(final_path.to_string_lossy().into_owned()),
                                     part_hashes: Vec::new(),
                                     ember_verified: ember_pinned,
+                                    generation,
                                 }
                             }
                             Err(error) => {
@@ -554,6 +556,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                                     transfer_id: tid,
                                     error,
                                     failure_kind,
+                                    generation,
                                 }
                             }
                         };
@@ -568,6 +571,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                                 transfer_id: panic_tid,
                                 error,
                                 failure_kind,
+                                generation,
                             })
                             .await;
                     }
@@ -612,6 +616,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                     let tid = transfer.id.clone();
                     let tid_handle = tid.clone();
                     let tx = dl_event_tx.clone();
+                    let generation = Some(control.generation());
                     transfer.status = TransferStatus::Verifying;
                     transfer.speed = 0;
                     restore_db_writes.push(transfer.clone());
@@ -662,6 +667,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                                         ),
                                         part_hashes: Vec::new(),
                                         ember_verified: ember_pinned,
+                                        generation,
                                     })
                                     .await;
                             }
@@ -675,6 +681,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                                         transfer_id: tid,
                                         error,
                                         failure_kind,
+                                        generation,
                                     })
                                     .await;
                             }
@@ -709,11 +716,12 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                         transfer.speed = 0;
                         restore_db_writes.push(transfer.clone());
                         let verify_control = control.clone();
+                        let generation = Some(control.generation());
                         {
                             let mut mgr = transfer_manager.write().await;
                             mgr.active.insert(tid.clone(), transfer);
+                            mgr.begin_restore_verification(&tid, &control);
                             mgr.register_control(&tid, control);
-                            mgr.begin_restore_verification(&tid);
                         }
 
                         if let Some(old_handle) = state.download_handles.remove(&dl_tid2) {
@@ -750,6 +758,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                                         // not a per-part hashset.
                                         part_hashes: Vec::new(),
                                         ember_verified: ember_pinned,
+                                        generation,
                                     },
                                     Err(e) => {
                                         warn!("Re-verification of restored download failed: {e}");
@@ -759,6 +768,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                                             transfer_id: dl_tid,
                                             error,
                                             failure_kind,
+                                            generation,
                                         }
                                     }
                                 };
@@ -773,6 +783,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                                         transfer_id: panic_tid,
                                         error,
                                         failure_kind,
+                                        generation,
                                     })
                                     .await;
                             }

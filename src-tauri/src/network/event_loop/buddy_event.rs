@@ -232,11 +232,12 @@ pub(in crate::network) async fn on_buddy_event(
                         old_handle.abort();
                     }
                     let dl_tid2 = dl_tid.clone();
+                    let generation = Some(ms_download.control.generation());
                     let handle = tokio::spawn(async move {
                         if let Err(e) = ms_download.run(tx).await {
                             warn!("Callback download failed: {e}");
                             let kind = classify_error(&e.to_string());
-                            let _ = tx2.send(DownloadEvent::Failed { transfer_id: dl_tid, error: e.to_string(), failure_kind: kind }).await;
+                            let _ = tx2.send(DownloadEvent::Failed { transfer_id: dl_tid, error: e.to_string(), failure_kind: kind, generation }).await;
                         }
                     });
                     state.download_handles.insert(dl_tid2, handle);

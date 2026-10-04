@@ -147,6 +147,27 @@ fn cancel_failure_is_superseded(error: &str, registered: Option<&TransferControl
     ed2k::transfer::is_user_cancel_error(error) && registered.is_some_and(|c| !c.is_cancelled())
 }
 
+/// Whether a `Completed` or `Failed` was sent by a worker whose control has
+/// since been replaced, so the senders, handle and row it would act on are a
+/// newer worker's. Such an event still ends the restore verification it
+/// reports. One sent by no worker, or arriving with no control registered, is
+/// handled as it always was.
+fn drop_superseded_terminal_event(event: &DownloadEvent, mgr: &mut TransferManager) -> bool {
+    let (transfer_id, generation) = match event {
+        DownloadEvent::Completed { transfer_id, generation, .. }
+        | DownloadEvent::Failed { transfer_id, generation, .. } => (transfer_id, *generation),
+        _ => return false,
+    };
+    let superseded = generation
+        .zip(mgr.get_control(transfer_id))
+        .is_some_and(|(sender, registered)| sender != registered.generation());
+    if superseded {
+        mgr.finish_restore_verification(transfer_id, generation);
+        debug!("Ignoring {transfer_id}'s result from a worker that has since been replaced");
+    }
+    superseded
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_download_event(
     event: DownloadEvent,
@@ -230,15 +251,21 @@ pub(in crate::network) async fn on_download_event(
         });
         }
     }
+    if matches!(event, DownloadEvent::Completed { .. } | DownloadEvent::Failed { .. })
+        && drop_superseded_terminal_event(&event, &mut *transfer_manager.write().await)
+    {
+        return;
+    }
     let mut completed_worker = None;
     if let DownloadEvent::Completed {
         ref transfer_id,
         ref final_path,
         part_hashes: ref event_part_hashes,
+        generation,
         ..
     } = event
     {
-        transfer_manager.write().await.finish_restore_verification(transfer_id);
+        transfer_manager.write().await.finish_restore_verification(transfer_id, generation);
         {
             let mgr_snap = transfer_manager.read().await;
             if let Some(t) = mgr_snap.get_transfer(transfer_id) {
@@ -766,10 +793,10 @@ pub(in crate::network) async fn on_download_event(
             }
         }
     }
-    if let DownloadEvent::Failed { ref transfer_id, ref error, ref failure_kind } = event {
+    if let DownloadEvent::Failed { ref transfer_id, ref error, ref failure_kind, generation } = event {
         let superseded = {
             let mut mgr = transfer_manager.write().await;
-            let restore_check = mgr.finish_restore_verification(transfer_id);
+            let restore_check = mgr.finish_restore_verification(transfer_id, generation);
             !restore_check
                 && cancel_failure_is_superseded(error, mgr.get_control(transfer_id).as_deref())
         };
@@ -1886,6 +1913,75 @@ mod superseded_failure_tests {
     fn other_failures_are_never_taken_for_a_replaced_workers() {
         let live = TransferControl::new();
         assert!(!cancel_failure_is_superseded("connection reset by peer", Some(&live)));
+    }
+
+    fn completed(id: &str, generation: Option<u64>) -> DownloadEvent {
+        DownloadEvent::Completed {
+            transfer_id: id.to_string(),
+            final_path: None,
+            part_hashes: Vec::new(),
+            ember_verified: false,
+            generation,
+        }
+    }
+
+    fn failed(id: &str, generation: Option<u64>) -> DownloadEvent {
+        DownloadEvent::Failed {
+            transfer_id: id.to_string(),
+            error: "connection reset by peer".to_string(),
+            failure_kind: ed2k::transfer::SourceFailureKind::Transient,
+            generation,
+        }
+    }
+
+    #[test]
+    fn results_from_a_worker_replaced_by_resume_are_dropped() {
+        let mut mgr = TransferManager::new(2);
+        let paused = TransferControl::new();
+        mgr.register_control("dl", paused.clone());
+        mgr.register_control("dl", TransferControl::new());
+
+        let old = Some(paused.generation());
+        assert!(drop_superseded_terminal_event(&failed("dl", old), &mut mgr));
+        assert!(drop_superseded_terminal_event(&completed("dl", old), &mut mgr));
+    }
+
+    #[test]
+    fn results_from_the_registered_worker_are_handled() {
+        let mut mgr = TransferManager::new(2);
+        let worker = TransferControl::new();
+        mgr.register_control("dl", worker.clone());
+
+        let current = Some(worker.generation());
+        assert!(!drop_superseded_terminal_event(&failed("dl", current), &mut mgr));
+        assert!(!drop_superseded_terminal_event(&completed("dl", current), &mut mgr));
+    }
+
+    #[test]
+    fn results_from_no_worker_or_with_no_control_registered_are_handled() {
+        let mut mgr = TransferManager::new(2);
+        let gone = Some(TransferControl::new().generation());
+        assert!(!drop_superseded_terminal_event(&failed("dl", gone), &mut mgr));
+        assert!(!drop_superseded_terminal_event(&completed("dl", gone), &mut mgr));
+
+        mgr.register_control("dl", TransferControl::new());
+        assert!(!drop_superseded_terminal_event(&failed("dl", None), &mut mgr));
+        assert!(!drop_superseded_terminal_event(&completed("dl", None), &mut mgr));
+    }
+
+    #[test]
+    fn a_dropped_result_ends_only_its_own_restore_verification() {
+        let mut mgr = TransferManager::new(2);
+        let check = TransferControl::new();
+        mgr.begin_restore_verification("dl", &check);
+        mgr.register_control("dl", check.clone());
+        mgr.register_control("dl", TransferControl::new());
+
+        let other = Some(TransferControl::new().generation());
+        assert!(drop_superseded_terminal_event(&failed("dl", other), &mut mgr));
+        assert!(mgr.is_restore_verification_running("dl"));
+        assert!(drop_superseded_terminal_event(&completed("dl", Some(check.generation())), &mut mgr));
+        assert!(!mgr.is_restore_verification_running("dl"));
     }
 }
 

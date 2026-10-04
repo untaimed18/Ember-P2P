@@ -1694,6 +1694,7 @@ async fn handle_command_inner(
                             debug!("Previous download worker for {teardown_tid} finished teardown");
                         });
                     }
+                    let generation = Some(control.generation());
                     let handle = tokio::spawn(async move {
                         if let Err(e) = ms_download.run(tx).await {
                             error!("Multi-source download failed: {e}");
@@ -1703,6 +1704,7 @@ async fn handle_command_inner(
                                     transfer_id: tid,
                                     error: e.to_string(),
                                     failure_kind: kind,
+                                    generation,
                                 })
                                 .await;
                         }

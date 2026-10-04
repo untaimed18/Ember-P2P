@@ -748,6 +748,7 @@ pub(super) async fn handle_download_event(
             transfer_id,
             error,
             failure_kind,
+            ..
         } => {
             let failure_stage = ed2k::transfer::infer_stage_from_error(&error).to_string();
             let failure_kind_name = ed2k::transfer::failure_kind_name(&failure_kind);

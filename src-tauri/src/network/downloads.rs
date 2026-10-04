@@ -818,6 +818,7 @@ async fn start_pending_download_worker(
                 transfer_id: pending.transfer_id,
                 error: "Invalid file hash in pending download".to_string(),
                 failure_kind: SourceFailureKind::Permanent,
+                generation: None,
             };
             if let Err(mpsc::error::TrySendError::Full(failed)) = dl_event_tx.try_send(failed) {
                 let tx = dl_event_tx.clone();
@@ -1093,6 +1094,7 @@ async fn start_pending_download_worker(
             debug!("Previous download worker for {teardown_tid} finished teardown");
         });
     }
+    let generation = Some(ms_download.control.generation());
     let handle = tokio::spawn(async move {
         if let Err(e) = ms_download.run(tx).await {
             error!("Multi-source download failed: {e}");
@@ -1102,6 +1104,7 @@ async fn start_pending_download_worker(
                     transfer_id: dl_tid,
                     error: e.to_string(),
                     failure_kind: kind,
+                    generation,
                 })
                 .await;
         }

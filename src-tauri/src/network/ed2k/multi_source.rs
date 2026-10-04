@@ -2306,6 +2306,7 @@ impl MultiSourceDownload {
                     final_path: Some(zero_final.to_string_lossy().into_owned()),
                     part_hashes: Vec::new(),
                     ember_verified: false,
+                    generation: Some(self.control.generation()),
                 })
                 .await;
             return Ok(());
@@ -5096,6 +5097,7 @@ impl MultiSourceDownload {
                         transfer_id: self.transfer_id.clone(),
                         error: super::transfer::EMBER_BLAKE3_MISMATCH_MSG.to_string(),
                         failure_kind: super::transfer::SourceFailureKind::Permanent,
+                        generation: Some(self.control.generation()),
                     })
                     .await;
             } else if let Some((verified_identity, actual_aich, verified_part_hashes)) =
@@ -5141,6 +5143,7 @@ impl MultiSourceDownload {
                 let finish_part_hashes = part_hashes.clone();
                 let finish_tx = event_tx.clone();
                 let finish_id = self.transfer_id.clone();
+                let finish_generation = Some(self.control.generation());
                 // Spawned, not awaited in place: Pause and Stop abort this
                 // worker, and `abort` cannot stop the blocking move. Dropped at
                 // its await, the move still finished but nothing after it ran:
@@ -5187,6 +5190,7 @@ impl MultiSourceDownload {
                             // `Some`, which only happens after the Ember BLAKE3
                             // check above passed (or there was none to run).
                             ember_verified: ember_expected != [0u8; 32],
+                            generation: finish_generation,
                         })
                         .await;
                     Ok::<(), anyhow::Error>(())
@@ -5264,6 +5268,7 @@ impl MultiSourceDownload {
                                 // the network loop re-queues Searching so recovery
                                 // continues.
                                 failure_kind: super::transfer::SourceFailureKind::Transient,
+                                generation: Some(self.control.generation()),
                             })
                             .await;
                     }
@@ -5278,6 +5283,7 @@ impl MultiSourceDownload {
                                 transfer_id: self.transfer_id.clone(),
                                 error: super::transfer::LOCAL_READ_FAILED_MSG.to_string(),
                                 failure_kind: super::transfer::SourceFailureKind::Transient,
+                                generation: Some(self.control.generation()),
                             })
                             .await;
                     }
@@ -5294,6 +5300,7 @@ impl MultiSourceDownload {
                                 transfer_id: self.transfer_id.clone(),
                                 error: super::transfer::FINAL_VERIFY_INCONCLUSIVE_MSG.to_string(),
                                 failure_kind: super::transfer::SourceFailureKind::Transient,
+                                generation: Some(self.control.generation()),
                             })
                             .await;
                     }
@@ -5314,6 +5321,7 @@ impl MultiSourceDownload {
                     transfer_id: self.transfer_id.clone(),
                     error: format!("{remaining} parts still incomplete after retries"),
                     failure_kind: super::transfer::SourceFailureKind::Transient,
+                    generation: Some(self.control.generation()),
                 })
                 .await;
         }

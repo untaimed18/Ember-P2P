@@ -958,11 +958,16 @@ pub enum DownloadEvent {
         /// paths in `network::mod` that only re-check ed2k/AICH — never
         /// `true` on a path that skipped the check.
         ember_verified: bool,
+        /// [`TransferControl::generation`](crate::sharing::manager::TransferControl::generation)
+        /// of the worker that sent this; `None` from a path that runs no worker.
+        generation: Option<u64>,
     },
     Failed {
         transfer_id: String,
         error: String,
         failure_kind: SourceFailureKind,
+        /// As for `Completed`.
+        generation: Option<u64>,
     },
     /// Sources discovered via source exchange from a connected peer.
     /// The network loop injects these into the active download.
@@ -3102,6 +3107,7 @@ impl Ed2kDownload {
                     final_path: Some(zero_final.to_string_lossy().into_owned()),
                     part_hashes: Vec::new(),
                     ember_verified: false,
+                    generation: Some(self.control.generation()),
                 })
                 .await;
             return Ok(());
@@ -7270,6 +7276,7 @@ impl Ed2kDownload {
         // `download_from_streams` only gets here after its Ember BLAKE3 check
         // passed (or there was none to run).
         let ember_verified = self.ember_file_hash != [0u8; 32];
+        let generation = Some(self.control.generation());
         // Spawned so that an abort (Pause, Stop) landing during the move, which
         // `abort` cannot stop, does not drop the sidecar delete and `Completed`
         // after it. See the multi-source worker.
@@ -7298,6 +7305,7 @@ impl Ed2kDownload {
                     // the whole file again to recompute them.
                     part_hashes: verified_part_hashes,
                     ember_verified,
+                    generation,
                 })
                 .await;
             Ok::<(), anyhow::Error>(())
