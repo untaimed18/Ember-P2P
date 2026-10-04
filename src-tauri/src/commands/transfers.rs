@@ -1791,22 +1791,21 @@ fn resolve_transfer_reveal_path(
     };
     let part_path = folders.part_path_for(&transfer.id);
 
-    let candidate = if final_path.is_file() {
-        final_path
+    let verified = if final_path.is_file() {
+        crate::security::filesystem::verify_recorded_file(&final_path, &folders.roots(), "Downloads")
     } else if part_path.is_file() {
-        part_path
+        crate::security::filesystem::verify_existing_path(&part_path, &folders.roots())
     } else {
         return Err(coded("transfers_file_not_found", "File not found on disk"));
     };
 
-    crate::security::filesystem::verify_existing_path(&candidate, &folders.roots())
-        .map_err(|e| {
-            coded_ctx(
-                "transfers_invalid_path",
-                "Invalid or changed download path",
-                e,
-            )
-        })
+    verified.map_err(|e| {
+        coded_ctx(
+            "transfers_invalid_path",
+            "Invalid or changed download path",
+            e,
+        )
+    })
 }
 
 #[tauri::command]
@@ -1896,21 +1895,21 @@ pub async fn open_file(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
-    let (transfer, dl_folder) = {
+    let (transfer, dl_folders) = {
         let (mgr, cfg) = tokio::join!(state.transfer_manager.read(), state.config.read(),);
         (
             mgr.get_transfer(&transfer_id).cloned(),
-            cfg.settings.download_folder.clone(),
+            cfg.settings.download_folders(),
         )
     };
     let transfer =
         transfer.ok_or_else(|| coded("transfers_transfer_not_found", "Transfer not found"))?;
     let safe_name = crate::security::sanitize_filename(&transfer.file_name);
-    let download_dir = std::path::PathBuf::from(&dl_folder).join("Downloads");
+    let download_dir = dl_folders.current.join("Downloads");
     // Prefer the exact path recorded at completion time. Falling back to
     // `Downloads/<name>` is only correct when no dedup suffix was applied;
     // the canonical-containment check below still confines either choice to
-    // the Downloads directory.
+    // a Downloads directory.
     let file_path = match transfer.completed_path.as_deref() {
         Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
         _ => download_dir.join(&safe_name),
@@ -1922,14 +1921,18 @@ pub async fn open_file(
                 "Download has not finished yet",
             ));
         }
-        let canonical = crate::security::filesystem::verify_existing_path(&file_path, &[dl_folder])
-            .map_err(|e| {
-                coded_ctx(
-                    "transfers_invalid_path",
-                    "Invalid or changed download path",
-                    e,
-                )
-            })?;
+        let canonical = crate::security::filesystem::verify_recorded_file(
+            &file_path,
+            &dl_folders.roots(),
+            "Downloads",
+        )
+        .map_err(|e| {
+            coded_ctx(
+                "transfers_invalid_path",
+                "Invalid or changed download path",
+                e,
+            )
+        })?;
         if crate::security::filesystem::passive_type_agrees(&transfer.file_name, &canonical) {
             crate::security::filesystem::open_with_default_app(&canonical)
                 .map_err(|e| coded_ctx("transfers_open_file_failed", "Failed to open file", e))
@@ -3344,6 +3347,73 @@ mod ipc_lifecycle_tests {
 
         let revealed = super::resolve_transfer_reveal_path(&transfer, &folders).unwrap();
         assert_eq!(revealed, part.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Changing the download folder drops the old one from the approved roots
+    /// once no part file is left in it, but what finished there is still the
+    /// user's download and Open / Show in folder must still reach it.
+    #[test]
+    fn reveal_finds_a_finished_download_in_a_folder_that_is_no_longer_approved() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (root, base) = approved_download_folder("replaced-folder");
+        let finished = base.join("old").join("Downloads").join("movie (1).mkv");
+        std::fs::create_dir_all(finished.parent().unwrap()).unwrap();
+        std::fs::write(&finished, b"finished-bytes").unwrap();
+        let mut transfer: Transfer = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "file_name": "movie.mkv",
+            "file_hash": hex::encode([0x5B; 16]),
+            "peer_id": "",
+            "peer_name": "",
+            "direction": "download",
+            "status": "completed",
+            "progress": 100.0,
+            "speed": 0,
+            "total_size": 14,
+            "transferred": 14,
+            "started_at": 0,
+        }))
+        .unwrap();
+        transfer.completed_path = Some(finished.to_string_lossy().into_owned());
+        let folders =
+            crate::storage::part_folders::DownloadFolders::new(&root.to_string_lossy(), &[]);
+
+        let revealed = super::resolve_transfer_reveal_path(&transfer, &folders).unwrap();
+        assert_eq!(revealed, finished.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Outside the approved roots only the landing folder Ember wrote into
+    /// vouches for a recorded path, so anything not directly inside a folder of
+    /// that name stays refused.
+    #[test]
+    fn a_recorded_file_outside_the_roots_must_sit_directly_in_its_landing_folder() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (root, base) = approved_download_folder("landing");
+        let roots = [root.to_string_lossy().into_owned()];
+        let old = base.join("old");
+        let direct = old.join("Chat Files").join("photo.jpg");
+        let nested = old.join("Chat Files").join("sub").join("photo.jpg");
+        let elsewhere = old.join("Documents").join("photo.jpg");
+        for file in [&direct, &nested, &elsewhere] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, b"jpeg").unwrap();
+        }
+        let verify = |path: &std::path::Path, landing: &str| {
+            crate::security::filesystem::verify_recorded_file(path, &roots, landing)
+        };
+
+        assert_eq!(
+            verify(&direct, "Chat Files").unwrap(),
+            direct.canonicalize().unwrap()
+        );
+        assert!(verify(&direct, "Downloads").is_err());
+        assert!(verify(&nested, "Chat Files").is_err());
+        assert!(verify(&elsewhere, "Chat Files").is_err());
+        let climbed_out = old.join("Chat Files").join("..").join("Documents").join("photo.jpg");
+        assert!(verify(&climbed_out, "Chat Files").is_err());
+        assert!(verify(&old.join("Chat Files").join("missing.jpg"), "Chat Files").is_err());
         let _ = std::fs::remove_dir_all(base);
     }
 

@@ -129,6 +129,90 @@ async fn mark_sealed_intro_unsupported(base_url: &str) {
     }
 }
 
+/// Rendezvous servers that have answered `/v4/protocol` with version 4, kept
+/// in the data folder across runs. Legacy v3 signs addresses without the IP
+/// they were sent from, so a server on this list that later claims to lack v4
+/// is refused rather than downgraded.
+const V4_SERVERS_FILE: &str = "rendezvous-v4-servers.json";
+const V4_SERVERS_MAX: usize = 64;
+const MAX_V4_SERVERS_FILE_BYTES: u64 = 64 * 1024;
+
+type V4Servers = tokio::sync::Mutex<std::collections::BTreeSet<String>>;
+
+fn v4_server_key(base_url: &str) -> String {
+    base_url.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn v4_servers_path() -> std::path::PathBuf {
+    crate::storage::paths::resolve_data_dir().join(V4_SERVERS_FILE)
+}
+
+fn load_v4_servers(path: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let too_large = std::fs::metadata(path).is_ok_and(|meta| meta.len() > MAX_V4_SERVERS_FILE_BYTES);
+    if too_large {
+        warn!("Rendezvous: {} is implausibly large; ignoring it", path.display());
+        return Default::default();
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return Default::default();
+    };
+    match serde_json::from_slice::<Vec<String>>(&bytes) {
+        Ok(urls) => urls
+            .iter()
+            .map(|url| v4_server_key(url))
+            .take(V4_SERVERS_MAX)
+            .collect(),
+        Err(error) => {
+            warn!("Rendezvous: {} is unparseable ({error}); ignoring it", path.display());
+            Default::default()
+        }
+    }
+}
+
+fn save_v4_servers(
+    path: &std::path::Path,
+    servers: &std::collections::BTreeSet<String>,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(servers).map_err(std::io::Error::other)?;
+    crate::security::atomic_write(path, &bytes, true)
+}
+
+fn legacy_fallback_allowed(servers: &std::collections::BTreeSet<String>, base_url: &str) -> bool {
+    !servers.contains(&v4_server_key(base_url))
+}
+
+async fn v4_servers() -> &'static V4Servers {
+    static SERVERS: tokio::sync::OnceCell<V4Servers> = tokio::sync::OnceCell::const_new();
+    SERVERS
+        .get_or_init(|| async {
+            let path = v4_servers_path();
+            let loaded = tokio::task::spawn_blocking(move || load_v4_servers(&path))
+                .await
+                .unwrap_or_default();
+            tokio::sync::Mutex::new(loaded)
+        })
+        .await
+}
+
+/// Held across the write so two first sightings cannot save over each other.
+async fn remember_v4_server(base_url: &str) {
+    let key = v4_server_key(base_url);
+    let mut servers = v4_servers().await.lock().await;
+    if servers.contains(&key) || servers.len() >= V4_SERVERS_MAX {
+        return;
+    }
+    servers.insert(key);
+    let snapshot = servers.clone();
+    let path = v4_servers_path();
+    let saved = tokio::task::spawn_blocking(move || save_v4_servers(&path, &snapshot))
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|result| result);
+    if let Err(error) = saved {
+        warn!("Rendezvous: could not record a v4 server: {error}");
+    }
+}
+
 pub(crate) async fn negotiate_protocol(base_url: &str) -> Result<RendezvousProtocol, String> {
     Ok(negotiate_server_features(base_url).await?.protocol)
 }
@@ -158,6 +242,7 @@ pub(crate) async fn negotiate_server_features(base_url: &str) -> Result<ServerFe
                 protocol: RendezvousProtocol::IpBoundV4,
                 sealed_intro: body["sealed_intro"].as_bool() == Some(true),
             };
+            remember_v4_server(base_url).await;
             remember_protocol(base_url, features).await;
             Ok(features)
         } else {
@@ -165,6 +250,17 @@ pub(crate) async fn negotiate_server_features(base_url: &str) -> Result<ServerFe
         };
     }
     if explicit_version_unsupported(response.status()) {
+        let fallback_allowed = {
+            let servers = v4_servers().await.lock().await;
+            legacy_fallback_allowed(&servers, base_url)
+        };
+        if !fallback_allowed {
+            warn!("Rendezvous: server spoke v4 before and now claims to lack it; refusing legacy v3");
+            return Err(format!(
+                "rendezvous protocol probe returned {} from a server that spoke v4 before",
+                response.status()
+            ));
+        }
         debug!("Rendezvous: server explicitly lacks v4; using bounded legacy v3 compatibility");
         let features = ServerFeatures {
             protocol: RendezvousProtocol::LegacyV3,
@@ -3642,6 +3738,52 @@ mod relay_ticket_tests {
         assert!(!explicit_version_unsupported(
             reqwest::StatusCode::TOO_MANY_REQUESTS
         ));
+    }
+
+    fn v4_servers_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-rdv-v4-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_server_seen_on_v4_survives_a_restart_and_is_never_downgraded() {
+        let dir = v4_servers_test_dir("restart");
+        let path = dir.join(V4_SERVERS_FILE);
+        let mut servers = std::collections::BTreeSet::new();
+        servers.insert(v4_server_key("https://rdv.example.org/"));
+        save_v4_servers(&path, &servers).unwrap();
+
+        let reloaded = load_v4_servers(&path);
+        assert!(!legacy_fallback_allowed(&reloaded, "https://rdv.example.org"));
+        assert!(!legacy_fallback_allowed(&reloaded, " HTTPS://RDV.example.org/ "));
+        assert!(
+            legacy_fallback_allowed(&reloaded, "https://old-rdv.example.org"),
+            "a server never seen on v4 keeps legacy v3"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_missing_or_damaged_v4_server_list_allows_legacy_v3() {
+        let dir = v4_servers_test_dir("damaged");
+        let path = dir.join(V4_SERVERS_FILE);
+        assert!(load_v4_servers(&path).is_empty());
+
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(load_v4_servers(&path).is_empty());
+
+        let oversized = vec![b' '; MAX_V4_SERVERS_FILE_BYTES as usize + 1];
+        std::fs::write(&path, oversized).unwrap();
+        assert!(load_v4_servers(&path).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

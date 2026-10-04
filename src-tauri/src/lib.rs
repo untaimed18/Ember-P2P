@@ -1194,7 +1194,9 @@ pub fn run() {
                             let _ = window.set_focus();
                         }
                     }
-                    auto_update::silent::TRAY_CANCEL_ID => auto_update::silent::postpone(),
+                    auto_update::silent::TRAY_CANCEL_ID => {
+                        tauri::async_runtime::spawn(auto_update::silent::postpone());
+                    }
                     finish_action::TRAY_CANCEL_ID => {
                         finish_action::cancel_finish_action(app.clone());
                     }

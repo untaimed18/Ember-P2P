@@ -874,6 +874,61 @@ pub fn verify_existing_path(candidate: &Path, allowed_roots: &[String]) -> io::R
     approved_roots()?.verify_existing_path(candidate, allowed_roots)
 }
 
+/// A finished file at the path Ember recorded when it wrote it, resolved
+/// within the approved roots when it is still under one, else within the
+/// folder it was written into.
+///
+/// A download folder stops being an approved root once the user moves to
+/// another and no part file is left in it, but what Ember finished there is
+/// still the user's download. `recorded` must come from Ember's own record of
+/// that write, never from the renderer: outside the roots, all that vouches
+/// for it is that it still sits directly in a folder named `landing_dir`
+/// (`Downloads`, `Chat Files`), with neither that folder nor the file a
+/// reparse point, so nothing swapped in since can send the open elsewhere.
+pub fn verify_recorded_file(
+    recorded: &Path,
+    allowed_roots: &[String],
+    landing_dir: &str,
+) -> io::Result<PathBuf> {
+    verify_existing_path(recorded, allowed_roots)
+        .or_else(|error| verify_in_landing_dir(recorded, landing_dir).map_err(|_| error))
+}
+
+fn verify_in_landing_dir(recorded: &Path, landing_dir: &str) -> io::Result<PathBuf> {
+    refuse_network_path_outside(recorded, &[])?;
+    let outside = || {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "target is not where Ember recorded writing it",
+        )
+    };
+    let landing = recorded
+        .parent()
+        .filter(|parent| recorded.is_absolute() && is_landing_dir(parent, landing_dir))
+        .ok_or_else(outside)?;
+    ensure_not_reparse(landing)?;
+    let canonical_landing = landing.canonicalize()?;
+    let canonical = recorded.canonicalize()?;
+    if canonical.parent() != Some(canonical_landing.as_path()) || !canonical.is_file() {
+        return Err(outside());
+    }
+    ensure_not_reparse(&canonical)?;
+    Ok(canonical)
+}
+
+/// `dir` is named `landing_dir`, compared as the platform's file system
+/// compares names: a folder that already existed as `downloads` is reused,
+/// and canonical paths carry its own spelling.
+pub fn is_landing_dir(dir: &Path, landing_dir: &str) -> bool {
+    dir.file_name().is_some_and(|name| {
+        if cfg!(any(windows, target_os = "macos")) {
+            name.to_string_lossy().eq_ignore_ascii_case(landing_dir)
+        } else {
+            name == landing_dir
+        }
+    })
+}
+
 pub fn verify_output_path(candidate: &Path, allowed_roots: &[String]) -> io::Result<PathBuf> {
     approved_roots()?.verify_output_path(candidate, allowed_roots)
 }

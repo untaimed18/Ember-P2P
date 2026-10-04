@@ -1142,17 +1142,27 @@ pub fn silent_update_now() {
     INSTALL_NOW.store(true, Ordering::Release);
 }
 
+/// Write an answer to the record on the blocking pool: synchronous commands
+/// and the tray menu both run on the main thread.
+async fn record_answer(
+    change: impl FnOnce(&mut UpdateRecord) + Send + 'static,
+) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || record::update_stored(change))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 /// "Not now": no silent install for the next 24 hours.
 #[tauri::command]
-pub fn silent_update_postpone() {
-    postpone();
+pub async fn silent_update_postpone() {
+    postpone().await;
 }
 
 /// The tray's cancel entry does the same as "Not now".
-pub fn postpone() {
+pub async fn postpone() {
     let until = chrono::Utc::now().timestamp() + POSTPONE_SECS;
     ANSWERS.lock().postponed_until = Some(Some(until));
-    if let Err(error) = record::update_stored(|record| record.postponed_until = Some(until)) {
+    if let Err(error) = record_answer(move |record| record.postponed_until = Some(until)).await {
         tracing::warn!("Silent update postponed for this session only: it could not be recorded ({error})");
     }
     INSTALL_NOW.store(false, Ordering::Release);
@@ -1162,10 +1172,10 @@ pub fn postpone() {
 /// "Skip this version": never install it silently. The ordinary notice still
 /// offers it, and the next release is handled normally.
 #[tauri::command]
-pub fn silent_update_skip(version: String) {
+pub async fn silent_update_skip(version: String) {
     let version: String = version.chars().take(64).collect();
     ANSWERS.lock().skipped_version = Some(version.clone());
-    if let Err(error) = record::update_stored(|record| record.skipped_version = Some(version)) {
+    if let Err(error) = record_answer(move |record| record.skipped_version = Some(version)).await {
         tracing::warn!("Silent update skipped for this session only: it could not be recorded ({error})");
     }
     INSTALL_NOW.store(false, Ordering::Release);
@@ -1174,9 +1184,9 @@ pub fn silent_update_skip(version: String) {
 
 /// Lift a "Not now" early, from Settings → About.
 #[tauri::command]
-pub fn silent_update_resume() {
+pub async fn silent_update_resume() {
     ANSWERS.lock().postponed_until = Some(None);
-    if let Err(error) = record::update_stored(|record| record.postponed_until = None) {
+    if let Err(error) = record_answer(|record| record.postponed_until = None).await {
         tracing::warn!("Silent update resumed for this session only: it could not be recorded ({error})");
     }
     RECORD_DIRTY.store(true, Ordering::Release);
