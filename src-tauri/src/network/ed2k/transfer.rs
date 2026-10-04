@@ -161,6 +161,11 @@ fn looks_like_zlib(header: &[u8]) -> bool {
 #[derive(Default)]
 pub(super) struct CompressedPartAccumulator {
     pending: HashMap<u64, PendingCompressedBlock>,
+    /// Blocks whose stream would not inflate, by start, as `(declared_total,
+    /// packed_seen)`. eD2K cannot cancel a requested block, so the rest of that
+    /// stream is still coming; it is absorbed here rather than fed to a fresh
+    /// inflater it would only fail again.
+    broken: HashMap<u64, (usize, usize)>,
 }
 
 impl CompressedPartAccumulator {
@@ -182,6 +187,7 @@ impl CompressedPartAccumulator {
     pub(super) fn retain_outstanding(&mut self, retained: impl Fn(u64) -> bool) {
         let before = self.pending.len();
         self.pending.retain(|start, _| retained(*start));
+        self.broken.retain(|start, _| retained(*start));
         if before != self.pending.len() {
             debug!(
                 "Dropped {} abandoned compressed block(s) from reassembly",
@@ -190,7 +196,49 @@ impl CompressedPartAccumulator {
         }
     }
 
+    /// Inflate one packet of the block at `start`.
+    ///
+    /// An error ends that block's stream, never more: the block is dropped, the
+    /// rest of its stream is absorbed, and the shortfall stays a gap to
+    /// re-request. eMule does the same and keeps the client
+    /// (`DownloadClient.cpp:1097`), because a block that was re-requested while
+    /// its first stream was still arriving lands that stream's tail on a fresh
+    /// inflater, which an honest peer causes as easily as a broken one.
     pub(super) fn append(
+        &mut self,
+        start: u64,
+        requested_end: Option<u64>,
+        declared_total: u32,
+        chunk: &[u8],
+    ) -> anyhow::Result<Option<InflatedFragment>> {
+        let declared = declared_total as usize;
+        if let Some((total, seen)) = self.broken.get_mut(&start) {
+            if *total == declared {
+                *seen = seen.saturating_add(chunk.len());
+                if *seen >= *total {
+                    self.broken.remove(&start);
+                }
+                return Ok(None);
+            }
+            self.broken.remove(&start);
+        }
+        let seen_before = self
+            .pending
+            .get(&start)
+            .filter(|block| block.declared_total == declared)
+            .map_or(0, |block| block.packed_seen);
+        let result = self.inflate_packet(start, requested_end, declared_total, chunk);
+        if result.is_err() {
+            self.pending.remove(&start);
+            let seen = seen_before.saturating_add(chunk.len());
+            if seen < declared && self.broken.len() < MAX_PENDING_COMPRESSED_BLOCKS {
+                self.broken.insert(start, (declared, seen));
+            }
+        }
+        result
+    }
+
+    fn inflate_packet(
         &mut self,
         start: u64,
         requested_end: Option<u64>,
@@ -218,24 +266,19 @@ impl CompressedPartAccumulator {
         if chunk.is_empty() {
             anyhow::bail!("compressed part carried an empty fragment");
         }
+        // A block's packets arrive back to back, so another size or range at the
+        // same start is the stream of a fresh request for it, and the old one
+        // is over.
+        if self.pending.get(&start).is_some_and(|entry| {
+            entry.declared_total != declared_total || entry.expected_len != expected_len
+        }) {
+            self.pending.remove(&start);
+        }
         if !self.pending.contains_key(&start) && self.pending.len() >= MAX_PENDING_COMPRESSED_BLOCKS
         {
             anyhow::bail!("too many concurrent compressed parts");
         }
-        let existing = self
-            .pending
-            .get(&start)
-            .map(|entry| {
-                if entry.declared_total != declared_total || entry.expected_len != expected_len {
-                    Err(anyhow::anyhow!(
-                        "compressed part changed declared packed size"
-                    ))
-                } else {
-                    Ok(entry.packed_seen)
-                }
-            })
-            .transpose()?
-            .unwrap_or(0);
+        let existing = self.pending.get(&start).map_or(0, |entry| entry.packed_seen);
         if chunk.len() > declared_total.saturating_sub(existing) {
             self.remove(start);
             anyhow::bail!("compressed part fragments exceed declared packed size");
@@ -707,6 +750,53 @@ mod compressed_part_bounds_tests {
         accumulator.retain_outstanding(|start| start == 0);
         assert_eq!(accumulator.pending.len(), 1);
         assert!(accumulator.pending.contains_key(&0));
+    }
+
+    /// A stream that will not inflate costs its own block. The rest of it is
+    /// absorbed rather than failing packet after packet, and the next stream
+    /// for the same block starts clean.
+    #[test]
+    fn a_stream_that_will_not_inflate_costs_only_its_own_block() {
+        let plain = vec![9u8; 4096];
+        let good = packed(&plain);
+        let mut accumulator = CompressedPartAccumulator::default();
+        // A valid zlib header, then a deflate block of the reserved type 3.
+        let broken_head = [0x78, 0x9c, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert!(accumulator.append(0, Some(4096), 30, &broken_head).is_err());
+        assert!(accumulator.pending.is_empty());
+
+        for _ in 0..2 {
+            assert!(accumulator.append(0, Some(4096), 30, &[0u8; 10]).unwrap().is_none());
+        }
+        assert!(accumulator.broken.is_empty(), "the whole broken stream was absorbed");
+
+        let fragment = accumulator
+            .append(0, Some(4096), good.len() as u32, &good)
+            .unwrap()
+            .expect("a fresh stream for the block inflates");
+        assert_eq!(fragment.data, plain);
+    }
+
+    /// A block requested again with a shorter range gets a stream of its own
+    /// at the same start. That stream replaces the one it cut short instead of
+    /// being refused as a size change.
+    #[test]
+    fn a_fresh_stream_for_a_recut_block_replaces_the_old_one() {
+        let plain: Vec<u8> = (0..8192).map(|i| (i / 97) as u8).collect();
+        let first = packed(&plain);
+        let mut accumulator = CompressedPartAccumulator::default();
+        assert!(accumulator
+            .append(0, Some(8192), first.len() as u32, &first[..1])
+            .unwrap()
+            .is_none());
+
+        let second = packed(&plain[..4096]);
+        let fragment = accumulator
+            .append(0, Some(4096), second.len() as u32, &second)
+            .unwrap()
+            .expect("the re-cut block's stream inflates");
+        assert_eq!(fragment.offset, 0);
+        assert_eq!(fragment.data, plain[..4096]);
     }
 }
 
@@ -5857,16 +5947,20 @@ impl Ed2kDownload {
                                         newly_written.saturating_add(tracker.fill_range(gs, ge));
                                 }
 
+                                // Only the gap sub-ranges are this peer's bytes,
+                                // and the corruption blackbox blames by range.
                                 if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
-                                    let _ = event_tx
-                                        .send(DownloadEvent::DataReceived {
-                                            file_hash: self.file_hash,
-                                            start,
-                                            end,
-                                            sender_ip: v4,
-                                            sender_user_hash: Some(peer_user_hash),
-                                        })
-                                        .await;
+                                    for &(gs, ge) in &fill_subranges {
+                                        let _ = event_tx
+                                            .send(DownloadEvent::DataReceived {
+                                                file_hash: self.file_hash,
+                                                start: gs,
+                                                end: ge,
+                                                sender_ip: v4,
+                                                sender_user_hash: Some(peer_user_hash),
+                                            })
+                                            .await;
+                                    }
                                 }
                             }
 
@@ -5961,15 +6055,27 @@ impl Ed2kDownload {
                                 );
                                 continue;
                             };
-                            let Some(fragment) = pending_compressed.append(
+                            let fragment = match pending_compressed.append(
                                 start,
                                 Some(requested_end),
                                 compressed_total_size,
                                 compressed,
-                            )?
-                            else {
-                                refresh_outstanding_range(&mut outstanding_ranges, start);
-                                continue;
+                            ) {
+                                Ok(Some(fragment)) => fragment,
+                                Ok(None) => {
+                                    refresh_outstanding_range(&mut outstanding_ranges, start);
+                                    continue;
+                                }
+                                // Costs the block, not the source: see
+                                // `CompressedPartAccumulator::append`.
+                                Err(e) => {
+                                    consecutive_bad_blocks += 1;
+                                    debug!("Dropping compressed block at {start}: {e} (bad streak: {consecutive_bad_blocks})");
+                                    if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                                        anyhow::bail!("peer sent {consecutive_bad_blocks} consecutive undecodable compressed blocks, disconnecting");
+                                    }
+                                    continue;
+                                }
                             };
 
                             // This packet's inflated bytes and where they belong —
@@ -6032,15 +6138,17 @@ impl Ed2kDownload {
                                 }
 
                                 if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
-                                    let _ = event_tx
-                                        .send(DownloadEvent::DataReceived {
-                                            file_hash: self.file_hash,
-                                            start,
-                                            end: start + piece_len,
-                                            sender_ip: v4,
-                                            sender_user_hash: Some(peer_user_hash),
-                                        })
-                                        .await;
+                                    for &(gs, ge) in &fill_subranges {
+                                        let _ = event_tx
+                                            .send(DownloadEvent::DataReceived {
+                                                file_hash: self.file_hash,
+                                                start: gs,
+                                                end: ge,
+                                                sender_ip: v4,
+                                                sender_user_hash: Some(peer_user_hash),
+                                            })
+                                            .await;
+                                    }
                                 }
                             }
 

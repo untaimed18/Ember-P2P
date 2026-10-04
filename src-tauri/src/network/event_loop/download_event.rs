@@ -1350,11 +1350,14 @@ pub(in crate::network) async fn on_download_event(
                         rv_url, nat_ctx,
                     ).await {
                         info!("Proactive friend session to {} failed: {e}", hex::encode(friend_eh));
-                        let _ = ultx2.send(upload_server::UploadEvent {
-                            transfer_id: String::new(),
-                            kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
-                        }).await;
                     }
+                    // Always release the outbound-task slot (success or
+                    // failure). On Ok the live session lives in ember_sessions;
+                    // the slot only gated this connect attempt.
+                    let _ = ultx2.send(upload_server::UploadEvent {
+                        transfer_id: String::new(),
+                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                    }).await;
                 });
             }
         }

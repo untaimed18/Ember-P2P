@@ -414,6 +414,7 @@ impl ServerList {
         }
         let mut added = 0;
         let mut filtered = 0;
+        let mut unroutable = 0;
         let mut duplicate = 0;
         let mut at_capacity = 0;
         for _ in 0..count {
@@ -426,7 +427,11 @@ impl ServerList {
                 Err(_) => break,
             };
             let ip = Ipv4Addr::from(ip_raw.to_le_bytes());
-            if ip.is_unspecified() || port == 0 {
+            // Whatever the IP filter says, and before it has loaded: a loopback
+            // or LAN address from a remote server names one of its machines,
+            // never one of ours.
+            if port == 0 || crate::security::is_special_use_v4(ip) {
+                unroutable += 1;
                 continue;
             }
             let mut entry = ServerEntry::new(ip.to_string(), port);
@@ -442,10 +447,11 @@ impl ServerList {
         // Always summarise the push if it carried anything actionable —
         // before, a list of 27 entries that were all IP-filtered would
         // produce 27 INFO lines and no aggregate. Now: one line.
-        if added > 0 || filtered > 0 || at_capacity > 0 {
+        if added > 0 || filtered > 0 || unroutable > 0 || at_capacity > 0 {
             info!(
                 "Server list push: {added} added, {filtered} blocked by IP filter, \
-                 {duplicate} duplicate, {at_capacity} dropped at capacity (out of {count})",
+                 {unroutable} unroutable, {duplicate} duplicate, \
+                 {at_capacity} dropped at capacity (out of {count})",
             );
         }
         added
@@ -1644,5 +1650,48 @@ mod tests {
             "blocked".to_string(),
         );
         assert!(ServerList::is_ip_filtered("8.8.8.8", &mut filter));
+    }
+
+    #[test]
+    fn a_server_list_push_never_adds_special_use_addresses() {
+        let pushed = [
+            ([127, 0, 0, 1], 4661u16),
+            ([192, 168, 1, 10], 4661),
+            ([10, 0, 0, 1], 4661),
+            ([169, 254, 3, 4], 4661),
+            ([224, 0, 0, 1], 4661),
+            ([0, 0, 0, 0], 4661),
+            ([255, 255, 255, 255], 4661),
+            ([8, 8, 8, 8], 0),
+            ([8, 8, 8, 8], 4661),
+        ];
+        let mut payload = vec![pushed.len() as u8];
+        for (octets, port) in pushed {
+            payload.extend_from_slice(&octets);
+            payload.extend_from_slice(&port.to_le_bytes());
+        }
+        // Neither a disabled filter nor one still loading may let them through.
+        for mut filter in [
+            crate::network::kad::ip_filter::IpFilter::new(false, false),
+            crate::network::kad::ip_filter::IpFilter::new(true, false),
+        ] {
+            let mut list = ServerList::new();
+            assert_eq!(list.add_from_server_list_packet(&payload, true, &mut filter), 1);
+            let added: Vec<_> = list
+                .servers()
+                .iter()
+                .map(|s| (s.ip.as_str(), s.port))
+                .collect();
+            assert_eq!(added, vec![("8.8.8.8", 4661)]);
+        }
+    }
+
+    #[test]
+    fn a_server_the_user_adds_by_hand_may_be_on_the_lan() {
+        let mut filter = crate::network::kad::ip_filter::IpFilter::new(false, false);
+        let mut list = ServerList::new();
+        let outcome =
+            list.add_filtered(ServerEntry::new("192.168.1.10".into(), 4661), true, &mut filter);
+        assert!(matches!(outcome, AddServerOutcome::Added));
     }
 }

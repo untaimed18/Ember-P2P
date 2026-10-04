@@ -4775,9 +4775,30 @@ async fn handle_command_inner(
             // drop their sockets. The re-queue below registers fresh controls
             // for the resume-on-reconnect entries, so this only affects the
             // now-dead generation.
+            //
+            // A Verifying row is the exception. Its task is hashing a finished
+            // file on our own disk with its sources already closed, and it ends
+            // in Completed or in a Failed the usual handler re-queues. Aborting
+            // it threw that work away and left the row Verifying with nothing
+            // behind it, since the re-queue below only takes rows that download.
+            let verifying: std::collections::HashSet<String> = {
+                let mgr = transfer_manager.read().await;
+                state
+                    .download_handles
+                    .keys()
+                    .filter(|tid| {
+                        mgr.get_transfer(tid)
+                            .is_some_and(|t| t.status == TransferStatus::Verifying)
+                    })
+                    .cloned()
+                    .collect()
+            };
             {
                 let mgr = transfer_manager.read().await;
                 for tid in state.download_handles.keys() {
+                    if verifying.contains(tid) {
+                        continue;
+                    }
                     if let Some(control) = mgr.get_control(tid) {
                         control.cancel();
                     }
@@ -4790,7 +4811,12 @@ async fn handle_command_inner(
             // re-queueing as much as an Active one.
             let had_worker: std::collections::HashSet<String> =
                 state.download_handles.keys().cloned().collect();
-            for (tid, handle) in state.download_handles.drain() {
+            let (still_verifying, aborted): (HashMap<_, _>, HashMap<_, _>) =
+                std::mem::take(&mut state.download_handles)
+                    .into_iter()
+                    .partition(|(tid, _)| verifying.contains(tid));
+            state.download_handles = still_verifying;
+            for (tid, handle) in aborted {
                 handle.abort();
                 tokio::spawn(async move {
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
@@ -4798,8 +4824,12 @@ async fn handle_command_inner(
                 });
             }
 
-            // Clear the registry — tasks are gone, trackers are saved.
-            state.tracker_registry.lock().clear();
+            // Clear the registry but for the tasks still verifying — the rest
+            // are gone and their trackers saved.
+            state
+                .tracker_registry
+                .lock()
+                .retain(|tid, _| verifying.contains(tid));
             state.active_source_senders.clear();
             // Lockstep cleanup — KAD disconnect tears down all
             // workers, so the established-source channel map must be
@@ -7277,6 +7307,7 @@ async fn handle_command_inner(
             state.friend_reconnect_last.remove(&removed_hash);
             state.recent_ember_chat.remove(&removed_hash);
             super::browse::forget_friend_scope(removed_hash);
+            super::chat_attach::forget_friend(state, settings, &removed_hash);
 
             if let Some(pending) = state.pending_browse_requests.remove(&removed_hash) {
                 for request in pending {

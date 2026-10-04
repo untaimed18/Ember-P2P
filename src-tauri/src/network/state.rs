@@ -1622,8 +1622,9 @@ pub(super) struct NetworkState {
     /// with what accepting one needs. In memory only: see
     /// [`chat_attach::sweep_interrupted`] for what a restart does to them.
     pub(super) attach_inbound: HashMap<[u8; 16], chat_attach::InboundAttach>,
-    /// Receives in flight, so a cancel from either side can stop one.
-    pub(super) attach_fetches: HashMap<[u8; 16], tokio::task::JoinHandle<()>>,
+    /// Receives in flight with the friend each is from, so a cancel from
+    /// either side, or removing the friend, can stop one.
+    pub(super) attach_fetches: HashMap<[u8; 16], ([u8; 16], tokio::task::JoinHandle<()>)>,
     /// Recent auto-accepts per friend, as `(when, bytes)`, for the budget that
     /// stops a friend filling the disk one small file at a time. See
     /// [`chat_attach::auto_accept_allowed`].

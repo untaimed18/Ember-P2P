@@ -711,13 +711,19 @@ pub(super) async fn try_start_pending_download_from_known_sources(
                 "Pending download {transfer_id} has invalid file hash {:?}; failing transfer",
                 pending.file_hash
             );
-            let _ = dl_event_tx
-                .send(DownloadEvent::Failed {
-                    transfer_id: pending.transfer_id,
-                    error: "Invalid file hash in pending download".to_string(),
-                    failure_kind: SourceFailureKind::Permanent,
-                })
-                .await;
+            // The event loop that drains this queue is usually our caller, so an
+            // awaited send on a full queue would never complete.
+            let failed = DownloadEvent::Failed {
+                transfer_id: pending.transfer_id,
+                error: "Invalid file hash in pending download".to_string(),
+                failure_kind: SourceFailureKind::Permanent,
+            };
+            if let Err(mpsc::error::TrySendError::Full(failed)) = dl_event_tx.try_send(failed) {
+                let tx = dl_event_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(failed).await;
+                });
+            }
             return false;
         }
     };

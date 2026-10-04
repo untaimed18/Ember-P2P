@@ -9548,18 +9548,30 @@ async fn download_parts_from_source(
                             );
                             continue;
                         };
-                        let Some(fragment) = pending_compressed.append(
+                        let fragment = match pending_compressed.append(
                             start,
                             Some(requested_end),
                             compressed_total_size,
                             compressed,
-                        )?
-                        else {
-                            refresh_outstanding_range(&mut outstanding_ranges, start);
-                            if let Some(pending) = pipelined_next.as_mut() {
-                                refresh_outstanding_range(&mut pending.outstanding_ranges, start);
+                        ) {
+                            Ok(Some(fragment)) => fragment,
+                            Ok(None) => {
+                                refresh_outstanding_range(&mut outstanding_ranges, start);
+                                if let Some(pending) = pipelined_next.as_mut() {
+                                    refresh_outstanding_range(&mut pending.outstanding_ranges, start);
+                                }
+                                continue;
                             }
-                            continue;
+                            // Costs the block, not the source: see
+                            // `CompressedPartAccumulator::append`.
+                            Err(e) => {
+                                consecutive_bad_blocks += 1;
+                                tracing::debug!("Dropping compressed block at {start} from source {_src_idx}: {e} (bad streak: {consecutive_bad_blocks})");
+                                if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                                    anyhow::bail!("source {_src_idx} sent {consecutive_bad_blocks} consecutive undecodable compressed blocks, disconnecting");
+                                }
+                                continue;
+                            }
                         };
                         refresh_outstanding_range(&mut outstanding_ranges, start);
                         if let Some(pending) = pipelined_next.as_mut() {

@@ -369,23 +369,17 @@ pub(super) fn quic_endpoint(state: &NetworkState) -> Option<Arc<quinn::Endpoint>
 }
 
 pub(super) fn running_fetches(state: &mut NetworkState) -> usize {
-    state.attach_fetches.retain(|_, handle| !handle.is_finished());
+    state.attach_fetches.retain(|_, (_, handle)| !handle.is_finished());
     state.attach_fetches.len()
 }
 
-/// Whether another receive may start from `friend`. The running set is keyed
-/// by transfer, so the friend behind each comes from its row — at most
-/// [`MAX_ACTIVE_FETCHES`] point reads, on an accept.
-fn fetch_slot_free(state: &mut NetworkState, db: &Database, friend: &[u8; 16]) -> bool {
+/// Whether another receive may start from `friend`.
+fn fetch_slot_free(state: &mut NetworkState, friend: &[u8; 16]) -> bool {
     let total = running_fetches(state);
-    let friend_hex = hex::encode(friend);
     let theirs = state
         .attach_fetches
-        .keys()
-        .filter(|id| {
-            db.chat_attachment(&hex::encode(id))
-                .is_some_and(|row| row.friend_hash.eq_ignore_ascii_case(&friend_hex))
-        })
+        .values()
+        .filter(|(from, _)| from == friend)
         .count();
     fetch_slots_allow(total, theirs)
 }
@@ -823,7 +817,7 @@ async fn try_auto_accept(
         .chat_attachment_auto_accept_mb
         .min(crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB)
         .saturating_mul(1024 * 1024);
-    if ceiling == 0 || size > ceiling || !fetch_slot_free(state, db, &friend) {
+    if ceiling == 0 || size > ceiling || !fetch_slot_free(state, &friend) {
         return false;
     }
     // Bound the map itself: an entry per friend who ever auto-sent, dropped
@@ -934,7 +928,7 @@ async fn accept_offer(
     else {
         return Err(not_found());
     };
-    if !fetch_slot_free(state, db, &friend) {
+    if !fetch_slot_free(state, &friend) {
         return Err(coded(
             "peers_attach_busy",
             "Too many files are already downloading. Try again when one finishes.",
@@ -1020,8 +1014,9 @@ async fn accept_offer(
         cancel_tx,
         row,
     };
+    let friend = ctx.friend;
     let handle = tokio::spawn(run_fetch(ctx));
-    state.attach_fetches.insert(xfer_id, handle);
+    state.attach_fetches.insert(xfer_id, (friend, handle));
     Ok(())
 }
 
@@ -1432,7 +1427,7 @@ async fn receive_over_tcp(
 /// Stop whatever this node is doing for `xfer_id` and clear its part file.
 fn stop_local(state: &mut NetworkState, settings: &AppSettings, xfer_id: &[u8; 16]) {
     state.attach_inbound.remove(xfer_id);
-    if let Some(handle) = state.attach_fetches.remove(xfer_id) {
+    if let Some((_, handle)) = state.attach_fetches.remove(xfer_id) {
         handle.abort();
         // The aborted task never reaches its own cleanup. Removing a link by
         // name removes the link, not what it points at, so a planted symlink
@@ -1519,6 +1514,34 @@ pub(super) fn on_cancel(
     if moved {
         emit_by_id(app, db, &xfer_hex);
     }
+}
+
+/// A friend was removed. Their rows went with them, which already stops our
+/// grants resolving; what is left is in memory: offers of theirs waiting to be
+/// accepted and receives still pulling from them.
+pub(super) fn forget_friend(state: &mut NetworkState, settings: &AppSettings, friend: &[u8; 16]) {
+    for xfer_id in transfers_with(&state.attach_inbound, &state.attach_fetches, friend) {
+        stop_local(state, settings, &xfer_id);
+    }
+    state.attach_auto_log.remove(friend);
+}
+
+fn transfers_with(
+    inbound: &std::collections::HashMap<[u8; 16], InboundAttach>,
+    fetches: &std::collections::HashMap<[u8; 16], ([u8; 16], tokio::task::JoinHandle<()>)>,
+    friend: &[u8; 16],
+) -> Vec<[u8; 16]> {
+    inbound
+        .iter()
+        .filter(|(_, offer)| offer.friend == *friend)
+        .map(|(id, _)| *id)
+        .chain(
+            fetches
+                .iter()
+                .filter(|(_, (from, _))| from == friend)
+                .map(|(id, _)| *id),
+        )
+        .collect()
 }
 
 /// Settle what a restart stranded.
@@ -1797,6 +1820,36 @@ mod tests {
         assert!(named("invoice.pdf.LNK"));
         assert!(!named("holiday.jpg"));
         assert!(!named("notes.txt"));
+    }
+
+    #[tokio::test]
+    async fn removing_a_friend_finds_their_waiting_offers_and_running_receives_only() {
+        let (gone, kept) = ([1u8; 16], [2u8; 16]);
+        let offer = |friend, id: u8| InboundAttach {
+            friend,
+            peer_pubkey: [0; 32],
+            peer_addr: None,
+            offer: AttachOffer {
+                xfer_id: [id; 16],
+                size: 1,
+                root: [0; 32],
+                quic_port: 1,
+                name: "f".into(),
+            },
+            name: "f".into(),
+            received_at: 0,
+        };
+        let inbound = std::collections::HashMap::from([
+            ([10u8; 16], offer(gone, 10)),
+            ([11u8; 16], offer(kept, 11)),
+        ]);
+        let fetches = std::collections::HashMap::from([
+            ([20u8; 16], (gone, tokio::spawn(async {}))),
+            ([21u8; 16], (kept, tokio::spawn(async {}))),
+        ]);
+        let mut found = transfers_with(&inbound, &fetches, &gone);
+        found.sort();
+        assert_eq!(found, vec![[10u8; 16], [20u8; 16]]);
     }
 
     #[test]
