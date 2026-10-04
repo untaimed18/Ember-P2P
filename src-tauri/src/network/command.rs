@@ -1694,6 +1694,22 @@ async fn handle_command_inner(
                             debug!("Previous download worker for {teardown_tid} finished teardown");
                         });
                     }
+                    // The worker's own Completed / Failed are honoured only
+                    // while its control is the registered one, and Pause and
+                    // Cancel reach it only through the registry. Not for a
+                    // control already cancelled: a late command from before a
+                    // Pause must not displace the control a later Resume made.
+                    if !control.is_cancelled() {
+                        let mut mgr = transfer_manager.write().await;
+                        if let Some(existing) = mgr.get_control(&tid2) {
+                            if !std::sync::Arc::ptr_eq(&existing, &control) {
+                                existing.cancel();
+                                mgr.register_control(&tid2, control.clone());
+                            }
+                        } else if mgr.get_transfer(&tid2).is_some() {
+                            mgr.register_control(&tid2, control.clone());
+                        }
+                    }
                     let generation = Some(control.generation());
                     let handle = tokio::spawn(async move {
                         if let Err(e) = ms_download.run(tx).await {
