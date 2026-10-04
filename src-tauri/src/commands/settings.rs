@@ -3056,7 +3056,13 @@ pub async fn open_web_service(
             name: file_name.trim(),
             size: file_size,
         },
-    );
+    )
+    .ok_or_else(|| {
+        coded(
+            "settings_open_link_invalid",
+            "That link cannot be opened safely",
+        )
+    })?;
     let safe = validate_external_url(&filled)?;
     reject_non_public_external_host(&safe).await?;
     crate::security::filesystem::open_url_with_default_app(&safe).map_err(|e| {

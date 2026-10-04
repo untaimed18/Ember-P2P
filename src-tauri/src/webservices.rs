@@ -155,7 +155,14 @@ fn strip_extension(name: &str) -> &str {
 /// `#hashid` is upper-cased because eMule's `md4str` produces upper-case hex and
 /// services were built against that; a site matching case-sensitively would
 /// otherwise answer "not found" for every file.
-pub fn substitute_placeholders(template: &str, facts: &FileFacts<'_>) -> String {
+///
+/// `None` when the result no longer names the template's site. Encoding keeps a
+/// value inside its query parameter or path segment, but not inside a host: a
+/// placeholder written straight after one, as in `https://x.test#name`, reads
+/// as a fragment in the template and as more host once filled, and the `.` an
+/// encoded value keeps is all a file called `.evil.example.avi` needs to send
+/// the lookup to `x.test.evil.example` instead of the site the user approved.
+pub fn substitute_placeholders(template: &str, facts: &FileFacts<'_>) -> Option<String> {
     let hash = facts.hash.to_ascii_uppercase();
     let stripped = strip_extension(facts.name);
     let replacements: [(&str, String); 6] = [
@@ -172,7 +179,16 @@ pub fn substitute_placeholders(template: &str, facts: &FileFacts<'_>) -> String 
             out = out.replace(token, &percent_encode_component(&value));
         }
     }
-    out
+    same_site(template, &out).then_some(out)
+}
+
+fn same_site(a: &str, b: &str) -> bool {
+    let (Ok(a), Ok(b)) = (url::Url::parse(a), url::Url::parse(b)) else {
+        return false;
+    };
+    a.scheme() == b.scheme()
+        && a.host() == b.host()
+        && a.port_or_known_default() == b.port_or_known_default()
 }
 
 /// Whether a stored template is worth keeping.
@@ -183,7 +199,8 @@ pub fn substitute_placeholders(template: &str, facts: &FileFacts<'_>) -> String 
 /// and whose fragment is `hashid`. The strict validation therefore cannot run
 /// until the placeholders are gone, which is at open time, on the substituted
 /// result. What is checked here is only what stays true through substitution:
-/// the scheme, the presence of a host, and the absence of credentials.
+/// the scheme, the presence of a host, the absence of credentials, and that no
+/// placeholder sits where filling it would change the host.
 ///
 /// Both checks are real. This one stops a template that could never open from
 /// being stored at all; the one at open time is what actually guards the shell,
@@ -221,6 +238,16 @@ pub fn validate_service_template(name: &str, url: &str) -> Result<WebService, &'
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("A service URL must not contain a username or password");
+    }
+    // Every placeholder fills with at least one character here, so one in the
+    // host changes it whatever file is opened later.
+    let probe = FileFacts {
+        hash: "0123456789abcdef0123456789abcdef",
+        name: "a.b",
+        size: 1,
+    };
+    if substitute_placeholders(url, &probe).is_none() {
+        return Err("A placeholder in a service URL must come after the site's address");
     }
     Ok(WebService {
         name: name.to_string(),
@@ -394,7 +421,8 @@ mod tests {
         let filled = substitute_placeholders(
             &parsed[0].url,
             &facts("ffdd6a41a2b30f27a1c3858a433b9822", "movie.avi", 700),
-        );
+        )
+        .unwrap();
         assert_eq!(
             filled,
             "http://ed2k.shortypower.org/?hash=FFDD6A41A2B30F27A1C3858A433B9822"
@@ -408,7 +436,8 @@ mod tests {
         let filled = substitute_placeholders(
             "https://x.test/?h=#hashid",
             &facts("abcdef01", "f.bin", 1),
-        );
+        )
+        .unwrap();
         assert_eq!(filled, "https://x.test/?h=ABCDEF01");
     }
 
@@ -419,7 +448,8 @@ mod tests {
         let filled = substitute_placeholders(
             "https://x.test/?a=#filename&b=#cleanfilename&c=#name&d=#cleanname&e=#hashid&f=#filesize",
             &facts("aa", "Some.Movie_2009-x264.mkv", 4096),
-        );
+        )
+        .unwrap();
         assert_eq!(
             filled,
             "https://x.test/?a=Some.Movie_2009-x264.mkv\
@@ -439,7 +469,8 @@ mod tests {
         let filled = substitute_placeholders(
             "https://x.test/?q=#filename",
             &facts("aa", "some movie.avi", 1),
-        );
+        )
+        .unwrap();
         assert_eq!(filled, "https://x.test/?q=some%20movie.avi");
         assert!(!filled.contains(' '));
     }
@@ -452,7 +483,8 @@ mod tests {
         let filled = substitute_placeholders(
             "https://x.test/?q=#filename",
             &facts("aa", "a&admin=1#/../b?c=d", 1),
-        );
+        )
+        .unwrap();
         assert_eq!(
             filled,
             "https://x.test/?q=a%26admin%3D1%23%2F..%2Fb%3Fc%3Dd"
@@ -643,7 +675,8 @@ mod tests {
         let filled = substitute_placeholders(
             &service.url,
             &facts("ffdd6a41a2b30f27a1c3858a433b9822", "x.avi", 1),
-        );
+        )
+        .unwrap();
         assert!(filled.ends_with("FFDD6A41A2B30F27A1C3858A433B9822"));
         assert!(!filled.contains('#'), "no placeholder is left behind");
     }
@@ -664,6 +697,46 @@ mod tests {
             "https://www.emule-project.org/faq/",
             &facts("aa", "f.bin", 1),
         );
-        assert_eq!(filled, "https://www.emule-project.org/faq/");
+        assert_eq!(filled.as_deref(), Some("https://www.emule-project.org/faq/"));
+    }
+
+    /// Encoding keeps a value inside a query or a path, but a placeholder
+    /// written straight after the host is filled *into* the host, and a dot
+    /// survives encoding. Whatever the file is called, the site opened has to
+    /// be the one the user approved.
+    #[test]
+    fn a_hostile_file_name_cannot_move_the_lookup_to_another_site() {
+        for template in [
+            "https://x.test#name",
+            "https://x.test#filename",
+            "https://x.test:8443#filesize",
+            "https://x#hashid.test/",
+        ] {
+            for name in [".evil.example.avi", "evil.example", "a.b"] {
+                let filled = substitute_placeholders(template, &facts("aa", name, 1));
+                assert!(
+                    filled.is_none(),
+                    "{template} with {name:?} gave {filled:?}"
+                );
+            }
+            assert!(
+                validate_service_template("Name", template).is_err(),
+                "{template} must not be storable"
+            );
+        }
+
+        // The same file is harmless to a template whose placeholder is in a
+        // place encoding can hold it.
+        for template in [
+            "https://x.test/#name",
+            "https://x.test/?q=#name",
+            "https://x.test/s/#name",
+        ] {
+            assert!(validate_service_template("Name", template).is_ok(), "{template}");
+            let filled = substitute_placeholders(template, &facts("aa", ".evil.example.avi", 1))
+                .expect("still the same site");
+            let parsed = url::Url::parse(&filled).unwrap();
+            assert_eq!(parsed.host_str(), Some("x.test"), "{template}");
+        }
     }
 }

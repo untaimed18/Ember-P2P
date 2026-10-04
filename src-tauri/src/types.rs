@@ -2600,7 +2600,8 @@ mod tests {
                 name: "some movie.avi",
                 size: 700,
             },
-        );
+        )
+        .expect("the shipped default names its own site whatever the file");
         assert!(
             filled.ends_with("FFDD6A41A2B30F27A1C3858A433B9822"),
             "the hash has to reach the URL, upper-cased: {filled}"

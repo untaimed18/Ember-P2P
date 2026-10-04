@@ -146,22 +146,38 @@ const PRUNE_HOLD_SECS: i64 = 14 * 24 * 3600;
 
 /// Start a prune hold for the catalog in `data_dir`. See [`PRUNE_HOLD_FILE`].
 pub fn hold_pruning(data_dir: &Path) -> std::io::Result<()> {
-    std::fs::write(
-        data_dir.join(PRUNE_HOLD_FILE),
-        chrono::Utc::now().timestamp().to_string(),
-    )
+    write_prune_hold(&data_dir.join(PRUNE_HOLD_FILE))
+}
+
+fn write_prune_hold(marker: &Path) -> std::io::Result<()> {
+    crate::security::atomic_write(marker, chrono::Utc::now().timestamp().to_string().as_bytes(), false)
 }
 
 /// Whether a hold still applies, releasing it once pruning would do nothing
 /// anyway (the scan has caught up) or it has run its course.
+///
+/// A marker that is there but cannot be read as a time still holds: pruning
+/// is the step that cannot be undone, and reading damage as "no hold" would
+/// drop the imported records the marker exists to keep. Its clock restarts
+/// instead, so the hold still ends on its own.
 fn prune_hold_active(known_met: &Path, pathless: usize, ceiling: usize) -> bool {
     let marker = known_met.with_file_name(PRUNE_HOLD_FILE);
-    let Ok(text) = std::fs::read_to_string(&marker) else {
-        return false;
+    let since = match std::fs::read_to_string(&marker) {
+        Ok(text) => text.trim().parse::<i64>().ok(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => None,
     };
-    let since = text.trim().parse::<i64>().unwrap_or(0);
-    let expired = chrono::Utc::now().timestamp().saturating_sub(since) > PRUNE_HOLD_SECS;
-    if expired || pathless <= ceiling {
+    if pathless <= ceiling {
+        let _ = std::fs::remove_file(&marker);
+        return false;
+    }
+    let Some(since) = since else {
+        if let Err(e) = write_prune_hold(&marker) {
+            warn!("known.met: could not rewrite a damaged prune hold ({e}); still holding");
+        }
+        return true;
+    };
+    if chrono::Utc::now().timestamp().saturating_sub(since) > PRUNE_HOLD_SECS {
         let _ = std::fs::remove_file(&marker);
         return false;
     }
@@ -452,6 +468,11 @@ pub struct NameSizeLookup<'a> {
 /// `AdjustNTFSDaylightFileTime`). Without it an archive carried over from eMule
 /// on such a drive was re-hashed in full, which on a multi-terabyte library is
 /// days of disk time.
+///
+/// The hour gets no slack of its own. A shift moves a stored time by the whole
+/// hour and nothing else, so a time a few seconds either side of it is a file
+/// rewritten about an hour after it was hashed, and keeping its record would
+/// share the old hashes for new bytes.
 fn pick_by_mtime<'a>(
     candidates: impl Iterator<Item = &'a KnownFileRecord>,
     name: &str,
@@ -467,7 +488,7 @@ fn pick_by_mtime<'a>(
         if delta == 0 {
             exact = Some(record);
             exact_count += 1;
-        } else if delta <= FAT_SLACK_SECS || (delta - DST_SHIFT_SECS).abs() <= FAT_SLACK_SECS {
+        } else if delta <= FAT_SLACK_SECS || delta == DST_SHIFT_SECS {
             near = Some(record);
             near_count += 1;
         }
@@ -2738,10 +2759,10 @@ mod tests {
         }
         let mut kf = KnownFileList::new();
         kf.files.insert([1; 16], pathless(1, 1_700_000_000));
-        for delta in [0, 1, -2, 3600, -3600, 3601] {
+        for delta in [0, 1, -2, 3600, -3600] {
             assert!(find(&kf, 1_700_000_000 + delta).is_some(), "delta {delta}");
         }
-        for delta in [3, 60, 7200] {
+        for delta in [3, 60, 3601, 7200] {
             assert!(find(&kf, 1_700_000_000 + delta).is_none(), "delta {delta}");
         }
 
@@ -2750,6 +2771,27 @@ mod tests {
         assert_eq!(find(&kf, 1_700_000_002), Some([2; 16]));
         // Two near matches and no exact one: ambiguous, so re-hash.
         assert!(find(&kf, 1_700_000_001).is_none());
+    }
+
+    /// Only a whole-hour difference is a daylight-saving shift. A file at the
+    /// same path and size whose time is an hour and a second or two off was
+    /// rewritten after it was hashed, and has to be hashed again.
+    #[test]
+    fn a_file_rewritten_about_an_hour_after_hashing_is_not_matched() {
+        let record = sample_record();
+        let hashed_at = record.modified_at;
+        let mut kf = KnownFileList::new();
+        kf.add_or_update(record);
+        let lookup = kf.name_size_lookup();
+        let find = |mtime| {
+            kf.find_by_path_and_meta_in(&lookup, "C:/Library/movie.mkv", 1024 * 1024, mtime)
+                .is_some()
+        };
+        assert!(find(hashed_at + 3600), "a DST shift is still the same file");
+        assert!(find(hashed_at - 3600), "in either direction");
+        for delta in [3598, 3599, 3601, 3602, -3598, -3599, -3601, -3602] {
+            assert!(!find(hashed_at + delta), "delta {delta} is a rewrite");
+        }
     }
 
     #[test]
@@ -3179,6 +3221,38 @@ mod tests {
         assert!(prune_hold_active(&path, 10, 5), "held while the scan has not caught up");
         assert!(!prune_hold_active(&path, 5, 5), "released once pruning would do nothing");
         assert!(!dir.join(PRUNE_HOLD_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A marker torn by a crash mid-write is empty or garbage. Reading that as
+    /// "no hold" would prune exactly the imported records it was holding.
+    #[test]
+    fn a_damaged_prune_hold_keeps_holding_and_restarts_its_clock() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-known-hold-torn-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known.met");
+        let marker = dir.join(PRUNE_HOLD_FILE);
+        for torn in ["", "17000x", "\0\0\0"] {
+            std::fs::write(&marker, torn).unwrap();
+            assert!(prune_hold_active(&path, 10, 5), "{torn:?} still holds");
+            let since: i64 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+            assert!(
+                chrono::Utc::now().timestamp() - since < 60,
+                "{torn:?} restarts the hold from now"
+            );
+        }
+
+        std::fs::write(&marker, "").unwrap();
+        assert!(!prune_hold_active(&path, 5, 5), "a caught-up scan still releases it");
+        assert!(!marker.exists());
+
+        let expired = chrono::Utc::now().timestamp() - PRUNE_HOLD_SECS - 1;
+        std::fs::write(&marker, expired.to_string()).unwrap();
+        assert!(!prune_hold_active(&path, 10, 5), "a readable expired hold ends");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
