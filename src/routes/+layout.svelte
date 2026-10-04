@@ -41,6 +41,8 @@
     takePendingRestoreExpiredNotice,
     takePendingKnownMetNotice,
     SETTINGS_CHANGED_EVENT,
+    QUIT_REQUESTED_EVENT,
+    setPendingUndo,
   } from '$lib/api/settings';
   import {
     applyBackgroundCheckResult,
@@ -53,7 +55,9 @@
     acknowledgeSecurityPolicyReset,
     getSecurityPolicyState,
   } from '$lib/api/security';
-  import { addToast, clearAllToasts, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
+  import {
+    addToast, clearAllToasts, onPendingUndoChange, toastError, toastSuccess, toastWarning,
+  } from '$lib/stores/toast';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { confirmDroppedFolders, dismissDroppedFolders } from '$lib/api/sharing';
   import { takePendingDownloadOverflowNotice } from '$lib/api/transfers';
@@ -303,6 +307,7 @@
     let unlistenUpdateCheck: UnlistenFn | null = null;
     let unlistenUpdateResume: UnlistenFn | null = null;
     let unlistenSettingsChanged: UnlistenFn | null = null;
+    let unlistenQuitRequested: UnlistenFn | null = null;
     let unlistenSilentUpdate: UnlistenFn | null = null;
     let unlistenFinishAction: UnlistenFn | null = null;
     const stopActivityReporting = startUserActivityReporting();
@@ -531,6 +536,18 @@
       .then((fn) => { if (mounted) unlistenSettingsChanged = fn; else fn(); })
       .catch((e) => console.error('Failed to register settings-changed listener:', e));
 
+    // A cancel or removal behind an Undo toast reaches the backend only when
+    // the toast goes, so an exit started from the tray asks for it first.
+    onPendingUndoChange((pending) => {
+      void setPendingUndo(pending).catch((e) => console.warn('Failed to report pending Undo actions:', e));
+    });
+    listen(QUIT_REQUESTED_EVENT, () => {
+      if (!mounted) return;
+      void quitApp().catch((e) => console.error('Failed to quit Ember:', e));
+    })
+      .then((fn) => { if (mounted) unlistenQuitRequested = fn; else fn(); })
+      .catch((e) => console.error('Failed to register quit-requested listener:', e));
+
     // An update restart asks for the page and search tabs just before it shuts
     // Ember down, so the launch after it can put them back.
     initUpdateResume()
@@ -559,7 +576,7 @@
     listen<{ path?: string; freeBytes?: number }>('disk-space-low', (event) => {
       if (!mounted) return;
       const free = formatBytes(event.payload?.freeBytes ?? 0);
-      const message = m.layout_disk_space_low({ free });
+      const message = m.layout_disk_space_low({ free, path: event.payload?.path ?? '' });
       toastWarning(message);
       void notify('disk_space', m.layout_disk_space_low_title(), message);
     })
@@ -758,6 +775,9 @@
       if (unlistenUpdateCheck) unlistenUpdateCheck();
       if (unlistenUpdateResume) unlistenUpdateResume();
       if (unlistenSettingsChanged) unlistenSettingsChanged();
+      if (unlistenQuitRequested) unlistenQuitRequested();
+      // The pending-Undo listener stays: `clearAllToasts` below starts the
+      // commits it has to report the end of. The next mount replaces it.
       if (unlistenSilentUpdate) unlistenSilentUpdate();
       if (unlistenFinishAction) unlistenFinishAction();
       stopActivityReporting();

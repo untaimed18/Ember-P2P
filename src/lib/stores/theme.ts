@@ -34,9 +34,14 @@ function clearStoredTheme(): void {
   }
 }
 
-function storedThemeIsExplicit(): boolean {
+/** The explicit choice made this session, so it holds even where storage
+ *  refuses to keep it; `undefined` until one is made either way. */
+let sessionChoice: Theme | null | undefined;
+
+function explicitTheme(): Theme | null {
+  if (sessionChoice !== undefined) return sessionChoice;
   const stored = readStoredTheme();
-  return stored === 'light' || stored === 'dark';
+  return stored === 'light' || stored === 'dark' ? stored : null;
 }
 
 function prefersDark(): boolean {
@@ -47,10 +52,16 @@ function prefersDark(): boolean {
   }
 }
 
+function hasTauri(): boolean {
+  // The browser-only Vite preview does not expose Tauri's IPC bridge.
+  // Guard it so theme development outside the desktop shell remains usable.
+  return browser && '__TAURI_INTERNALS__' in window;
+}
+
 export function getInitialTheme(): Theme {
   if (browser) {
-    const stored = readStoredTheme();
-    if (stored === 'light' || stored === 'dark') return stored;
+    const explicit = explicitTheme();
+    if (explicit) return explicit;
     if (prefersDark()) return 'dark';
   }
   return 'light';
@@ -59,73 +70,101 @@ export function getInitialTheme(): Theme {
 export const theme = writable<Theme>(getInitialTheme());
 
 /** True until the user picks Light or Dark; the OS decides meanwhile. */
-export const themeFollowsSystem = writable<boolean>(browser ? !storedThemeIsExplicit() : true);
+export const themeFollowsSystem = writable<boolean>(browser ? explicitTheme() === null : true);
 
 function applyThemeToDOM(t: Theme) {
   if (!browser) return;
   document.documentElement.setAttribute('data-theme', t);
 }
 
-function applyThemeToNativeWindow(t: Theme) {
-  // The browser-only Vite preview does not expose Tauri's IPC bridge.
-  // Guard it so theme development outside the desktop shell remains usable.
-  if (!browser || !('__TAURI_INTERNALS__' in window)) return;
+/**
+ * `null` follows the OS. That has to reach the window, not only the page: on
+ * Windows a window theme is handed on to WebView2 as its color scheme, so a
+ * window pinned to the theme the OS had last would also pin
+ * `prefers-color-scheme`, and the next OS change would never be seen.
+ */
+function applyThemeToNativeWindow(t: Theme | null) {
+  if (!hasTauri()) return;
   void getCurrentWindow().setTheme(t).catch((error) => {
     console.warn('Failed to apply native window theme:', error);
   });
 }
 
-function applyResolvedTheme(t: Theme) {
+function showSystemTheme(t: Theme) {
   applyThemeToDOM(t);
-  applyThemeToNativeWindow(t);
+  theme.set(t);
+}
+
+/** The OS theme as the window reports it, where the media query may lag. */
+async function resolveSystemTheme(): Promise<void> {
+  if (!hasTauri()) return;
+  try {
+    const t = await getCurrentWindow().theme();
+    if (t && explicitTheme() === null) showSystemTheme(t);
+  } catch {
+    // The media query's answer stands.
+  }
 }
 
 export function applyTheme(t: Theme) {
-  applyResolvedTheme(t);
+  sessionChoice = t;
+  applyThemeToDOM(t);
+  applyThemeToNativeWindow(t);
   if (browser) writeStoredTheme(t);
   themeFollowsSystem.set(false);
 }
 
 /** Drop the explicit choice, so the theme tracks the OS again. */
 export function followSystemTheme() {
-  const t: Theme = browser && prefersDark() ? 'dark' : 'light';
+  sessionChoice = null;
   if (browser) clearStoredTheme();
-  applyResolvedTheme(t);
-  theme.set(t);
+  applyThemeToNativeWindow(null);
+  showSystemTheme(browser && prefersDark() ? 'dark' : 'light');
   themeFollowsSystem.set(true);
+  void resolveSystemTheme();
 }
 
 let themeCleanup: (() => void) | null = null;
 
 export function initTheme() {
   const t = getInitialTheme();
-  applyResolvedTheme(t);
+  const following = explicitTheme() === null;
+  applyThemeToDOM(t);
+  applyThemeToNativeWindow(following ? null : t);
   theme.set(t);
-  if (browser) themeFollowsSystem.set(!storedThemeIsExplicit());
-  // Important: do NOT persist `t` here. The OS-tracking branch in the
-  // matchMedia handler below uses "is `STORAGE_KEY` unset?" as the
-  // signal for "user has not made an explicit choice yet" — if we
-  // wrote the resolved theme back to localStorage on every init,
-  // every user would look like they had explicitly chosen the
-  // OS-derived value, and OS dark/light flips after launch would
-  // never propagate. `applyTheme()` (called from settings) is the single
-  // point that records an explicit choice.
-  // `getInitialTheme()` already validates whatever's in storage and
-  // safely falls through to the OS preference if it's garbage, so
-  // there's nothing to "self-heal" by writing it back.
+  if (browser) themeFollowsSystem.set(following);
+  // Important: do NOT persist `t` here. "Is `STORAGE_KEY` unset?" is the
+  // signal for "user has not made an explicit choice yet" — if we wrote the
+  // resolved theme back to localStorage on every init, every user would look
+  // like they had explicitly chosen the OS-derived value, and OS dark/light
+  // flips after launch would never propagate. `applyTheme()` (called from
+  // settings) is the single point that records an explicit choice.
 
   if (browser) {
     if (themeCleanup) themeCleanup();
+    if (following) void resolveSystemTheme();
     const mq = window.matchMedia('(prefers-color-scheme: dark)');
     const handler = (e: MediaQueryListEvent) => {
-      if (!storedThemeIsExplicit()) {
-        const next: Theme = e.matches ? 'dark' : 'light';
-        applyResolvedTheme(next);
-        theme.set(next);
-      }
+      if (explicitTheme() === null) showSystemTheme(e.matches ? 'dark' : 'light');
     };
     mq.addEventListener('change', handler);
-    themeCleanup = () => mq.removeEventListener('change', handler);
+    // The window's own theme event as well: it reports the OS change even
+    // where the webview's media query is slow to.
+    let unlistenNative: (() => void) | null = null;
+    let live = true;
+    if (hasTauri()) {
+      getCurrentWindow()
+        .onThemeChanged(({ payload }) => {
+          if (explicitTheme() === null) showSystemTheme(payload);
+        })
+        .then((fn) => { if (live) unlistenNative = fn; else fn(); })
+        .catch((error) => console.warn('Failed to watch the OS theme:', error));
+    }
+    themeCleanup = () => {
+      live = false;
+      mq.removeEventListener('change', handler);
+      unlistenNative?.();
+    };
   }
 }
 

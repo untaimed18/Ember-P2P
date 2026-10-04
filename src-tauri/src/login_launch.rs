@@ -82,9 +82,21 @@ fn xdg_quoted(arg: &str) -> String {
     out
 }
 
+/// Debug builds and harness nodes must not touch the user's real sign-in
+/// entry: it would point at `target\debug`, or at a test node's data.
+fn touches_nothing() -> bool {
+    cfg!(debug_assertions)
+        || std::env::var(crate::storage::paths::EMBER_DATA_DIR_ENV)
+            .is_ok_and(|value| !value.trim().is_empty())
+}
+
 /// Register or remove the OS entry. Registering also clears a Task Manager
 /// "Disabled" on Windows, which is what an explicit switch-on asks for.
 pub fn apply(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    if touches_nothing() {
+        tracing::info!("Not changing the launch-at-sign-in entry from a debug build or harness node");
+        return Ok(());
+    }
     let launcher = launcher(app)?;
     let result = if enabled {
         launcher.enable()
@@ -103,9 +115,7 @@ pub fn apply(app: &AppHandle, enabled: bool) -> Result<(), String> {
 /// Not for debug builds or harness nodes, which must not touch the user's real
 /// sign-in entry.
 pub fn reconcile_at_launch(app: &AppHandle, enabled: bool) {
-    let harness = std::env::var(crate::storage::paths::EMBER_DATA_DIR_ENV)
-        .is_ok_and(|value| !value.trim().is_empty());
-    if enabled || cfg!(debug_assertions) || harness {
+    if enabled || touches_nothing() {
         return;
     }
     let app = app.clone();

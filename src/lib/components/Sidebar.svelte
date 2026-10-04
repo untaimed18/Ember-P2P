@@ -23,6 +23,7 @@
   import { shortcutModAria, shortcutModSymbol } from '$lib/platform';
   import { isShortcutLetter } from '$lib/shortcutKey';
   import { appSettings } from '$lib/stores/settings';
+  import { runLatestUndo } from '$lib/stores/toast';
   import { onMount } from 'svelte';
 
   let aboutOpen = $state(false);
@@ -295,6 +296,8 @@
   function isTypingTarget(t: EventTarget | null): boolean {
     if (!(t instanceof HTMLElement)) return false;
     const tag = t.tagName;
+    // A checkbox, radio or button input takes no text.
+    if (t instanceof HTMLInputElement && ['checkbox', 'radio', 'button', 'submit', 'reset'].includes(t.type)) return false;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
     if (t.isContentEditable) return true;
     return false;
@@ -326,6 +329,14 @@
       return;
     }
     if (modalOpen) return;
+    // Ctrl/Cmd+Z takes the newest Undo toast (a cancel, a removal), which is
+    // otherwise the last thing in the tab order. Typing keeps the field's own
+    // undo.
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isShortcutLetter(e, 'z')) {
+      if (isTypingTarget(e.target)) return;
+      if (runLatestUndo()) e.preventDefault();
+      return;
+    }
     // Ctrl/Cmd+B toggles the sidebar. Matches VS Code/Slack/Discord
     // convention and frees up horizontal space for data-dense pages
     // without the user needing to reach for the mouse. Blocked while

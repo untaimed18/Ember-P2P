@@ -9,10 +9,11 @@
 //! clock: a webview hidden in the tray is throttled and cannot be trusted to
 //! end a countdown on time, or at all.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
 use crate::app_state::AppState;
 use crate::commands::errors::coded;
@@ -23,6 +24,7 @@ use crate::types::{Transfer, TransferDirection, TransferStatus};
 const COUNTDOWN: Duration = Duration::from_secs(60);
 
 const STATUS_EVENT: &str = "ember:finish-action";
+const SLEEP_FAILED_EVENT: &str = "ember:finish-action-sleep-failed";
 
 /// The tray's "Cancel exit" / "Cancel sleep" entry, shown while the countdown runs.
 pub const TRAY_CANCEL_ID: &str = "tray_finish_action_cancel";
@@ -141,9 +143,8 @@ pub const fn sleep_supported() -> bool {
 }
 
 /// Downloads that will still finish on their own. Paused and stopped rows wait
-/// for the user, and a disk-full one for free space, so none of those holds
-/// the action back — otherwise one forgotten paused file would keep the
-/// machine awake all night.
+/// for the user, and a disk-full one for free space. What holds the action
+/// back is [`outstanding_downloads`].
 pub fn pending_downloads(manager: &TransferManager) -> usize {
     pending_download_rows(manager).count()
 }
@@ -155,16 +156,47 @@ pub fn pending_download_rows(manager: &TransferManager) -> impl Iterator<Item = 
         .values()
         .chain(manager.queue.iter())
         .filter(|t| t.direction == TransferDirection::Download)
-        .filter(|t| {
-            !matches!(
-                t.status,
-                TransferStatus::Paused
-                    | TransferStatus::Stopped
-                    | TransferStatus::Insufficient
-                    | TransferStatus::Completed
-                    | TransferStatus::Failed
-            )
-        })
+        .filter(|t| !is_parked(t) && !matches!(t.status, TransferStatus::Insufficient))
+        .filter(|t| !matches!(t.status, TransferStatus::Completed | TransferStatus::Failed))
+}
+
+fn is_parked(t: &Transfer) -> bool {
+    matches!(t.status, TransferStatus::Paused | TransferStatus::Stopped)
+}
+
+/// Downloads seen running since the action was armed. One of those paused or
+/// stopped since holds the action back: Pause all in the tray during a call is
+/// not the list finishing, and must not put the machine to sleep. A row parked
+/// all along does not — one paused before the choice was made, one added
+/// paused, one restored paused from the last session — or a single forgotten
+/// file would keep the machine awake all night.
+static RAN_SINCE_ARM: parking_lot::Mutex<Option<HashSet<String>>> = parking_lot::Mutex::new(None);
+
+/// What the action waits on: [`pending_downloads`], plus the downloads parked
+/// after running since it was armed.
+pub fn outstanding_downloads(manager: &TransferManager) -> usize {
+    count_outstanding(manager, RAN_SINCE_ARM.lock().get_or_insert_with(HashSet::new))
+}
+
+pub(crate) fn count_outstanding(manager: &TransferManager, ran_since_arm: &mut HashSet<String>) -> usize {
+    let mut outstanding = 0;
+    for t in manager.active.values().chain(manager.queue.iter()) {
+        if t.direction != TransferDirection::Download {
+            continue;
+        }
+        if is_parked(t) {
+            if ran_since_arm.contains(&t.id) {
+                outstanding += 1;
+            }
+        } else if !matches!(
+            t.status,
+            TransferStatus::Insufficient | TransferStatus::Completed | TransferStatus::Failed
+        ) {
+            outstanding += 1;
+            ran_since_arm.insert(t.id.clone());
+        }
+    }
+    outstanding
 }
 
 /// Seconds left on the countdown, for the tray tooltip.
@@ -185,7 +217,7 @@ fn publish(app: &AppHandle, status: &FinishActionStatus) {
     }
 }
 
-/// One step of the monitor. `pending` is [`pending_downloads`] right now.
+/// One step of the monitor. `pending` is [`outstanding_downloads`] right now.
 pub fn tick(app: &AppHandle, pending: usize) {
     let (step, status) = {
         let mut machine = MACHINE.lock();
@@ -211,23 +243,24 @@ fn run(app: &AppHandle, action: FinishAction) {
         FinishAction::None => {}
         FinishAction::Exit => {
             tracing::info!("Downloads finished; exiting as asked");
-            if let Some(state) = app.try_state::<AppState>() {
-                state
-                    .quit_confirmed
-                    .store(true, std::sync::atomic::Ordering::Release);
-            }
-            app.exit(0);
+            crate::commands::settings::exit_app(app);
         }
         FinishAction::Sleep => {
             tracing::info!("Downloads finished; putting the computer to sleep as asked");
             *SLEEP_REQUESTED_AT.lock() = Some(Instant::now());
-            tauri::async_runtime::spawn_blocking(|| {
+            let app = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
                 // Long enough for the monitor's next tick to let go of the
                 // sleep inhibitor it holds while uploads run; logind refuses
                 // a suspend while a block lock is held, ours included.
                 std::thread::sleep(WAKE_LOCK_RELEASE);
                 if let Err(error) = suspend() {
                     tracing::warn!("Could not put the computer to sleep: {error}");
+                    // Said where it will be seen: whoever comes back to an
+                    // awake machine should not have to guess why.
+                    if let Err(error) = app.emit(SLEEP_FAILED_EVENT, ()) {
+                        tracing::debug!("Could not report the failed sleep: {error}");
+                    }
                 }
             });
         }
@@ -299,7 +332,11 @@ pub async fn set_finish_action(
             "Sleep is not supported on this platform",
         ));
     }
-    let pending = pending_downloads(&*state.transfer_manager.read().await);
+    let pending = {
+        let manager = state.transfer_manager.read().await;
+        let mut ran_since_arm = RAN_SINCE_ARM.lock();
+        count_outstanding(&manager, ran_since_arm.insert(HashSet::new()))
+    };
     let status = {
         let mut machine = MACHINE.lock();
         machine.arm(action);

@@ -1848,6 +1848,10 @@ pub struct AppSettings {
     /// A launch at sign-in comes up in the tray rather than on the desktop.
     #[serde(default = "default_true")]
     pub start_hidden_at_login: bool,
+    /// Reopen the main window where it was when Ember last quit
+    /// (`window-state.json`). Off opens it the default way.
+    #[serde(default = "default_true")]
+    pub remember_window_position: bool,
 
     /// When the window gains focus with eD2K links on the clipboard, offer to
     /// add them. Off unless asked for: it reads the clipboard without a
@@ -2463,6 +2467,7 @@ impl Default for AppSettings {
             alt_max_download_speed: default_alt_max_download_speed(),
             launch_at_login: false,
             start_hidden_at_login: true,
+            remember_window_position: true,
             watch_clipboard_links: false,
             low_disk_warning_mb: default_low_disk_warning_mb(),
         }

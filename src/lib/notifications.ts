@@ -66,8 +66,9 @@ const CATEGORY_SETTING: Record<NotifyCategory, keyof AppSettings> = {
   silent_update: 'notifications_enabled',
   // Likewise the warning before "when downloads finish" exits or sleeps.
   finish_action: 'notifications_enabled',
-  // Downloads stop when the drive fills, so it goes with their failures.
-  disk_space: 'notify_download_failed',
+  // Has its own switch, the threshold in Settings ("Never warn"), so only the
+  // master switch silences it here.
+  disk_space: 'notifications_enabled',
 };
 
 /** Identical notifications inside this window collapse into one. */

@@ -47,10 +47,11 @@
   } from '$lib/api/security';
   import type { AntiLeechSnapshot } from '$lib/types';
   import { invoke } from '@tauri-apps/api/core';
-  import { goto, replaceState } from '$app/navigation';
+  import { afterNavigate, goto, replaceState } from '$app/navigation';
   import { page } from '$app/stores';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { relaunch } from '@tauri-apps/plugin-process';
+  import { flushToastActionsBeforeExit } from '$lib/stores/toast';
   import {
     discardPendingRestore,
     exportBackup,
@@ -805,6 +806,17 @@
   }
 
   let activeSection: SettingsSection = $state(initialSection());
+  // A link to a section followed while already on Settings (the status bar's
+  // "More in Settings") reuses this page, so `initialSection` never sees it.
+  // Only real navigations land here: `selectSection` writes the URL with
+  // `replaceState`, which does not.
+  afterNavigate((navigation) => {
+    const requested = navigation.to?.url.searchParams.get('section');
+    if (requested && (sections as string[]).includes(requested) && requested !== activeSection) {
+      activeSection = requested as SettingsSection;
+      settingsFilter = '';
+    }
+  });
   /// The import card scans eMule's folder when it mounts, so it waits until
   /// the section is first opened rather than running on every Settings visit.
   let importOpened = $state(false);
@@ -1620,8 +1632,9 @@
     restarting = true;
     try {
       // Brief delay so the overlay has time to paint before the process
-      // dies — purely cosmetic, matches the wizard.
-      await new Promise(r => setTimeout(r, 600));
+      // dies — purely cosmetic, matches the wizard. Spent sending anything
+      // still behind an Undo toast.
+      await Promise.all([new Promise(r => setTimeout(r, 600)), flushToastActionsBeforeExit()]);
       await relaunch();
     } catch (e) {
       restarting = false;
@@ -2723,6 +2736,13 @@
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">
+              <span class="toggle-title">{m.settings_remember_window_label()}</span>
+              <span class="hint">{m.settings_remember_window_hint()}</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.remember_window_position} ariaLabel={m.settings_remember_window_label()} />
+          </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
               <span class="toggle-title">{m.settings_launch_at_login_label()}</span>
               <span class="hint">{m.settings_launch_at_login_hint()}</span>
             </div>
@@ -3422,16 +3442,35 @@
                 })}
               </span>
             </div>
+          {:else if runtimeStatus?.alt_speed}
+            <!-- Switched on from the tray or the status bar, the alternative
+                 limits replace the fields below and the schedule, which
+                 otherwise look as if they had stopped working. -->
+            <div class="schedule-active-banner" role="status">
+              <span class="live-dot" aria-hidden="true"></span>
+              <span>{m.settings_alt_speed_active_banner()}</span>
+              <span class="schedule-active-limits">
+                {m.schedule_active_limits({
+                  up: runtimeStatus.effective_upload_speed === 0
+                    ? m.schedule_unlimited()
+                    : formatSpeed(runtimeStatus.effective_upload_speed),
+                  down: runtimeStatus.effective_download_speed === 0
+                    ? m.schedule_unlimited()
+                    : formatSpeed(runtimeStatus.effective_download_speed),
+                })}
+              </span>
+            </div>
           {/if}
           <div
-            class="field"
+            class="field manual-speed-limit"
+            class:is-inactive={settings.alt_speed_enabled}
             onfocusin={() => (uploadCapEditing = true)}
             onfocusout={() => (uploadCapEditing = false)}
           >
             <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} />
             <span class="hint">{m.settings_max_upload_speed_hint()}</span>
           </div>
-          <div class="field">
+          <div class="field manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
             <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} />
           </div>
           <div class="field toggle-row">
@@ -3481,7 +3520,7 @@
                blocked with nothing on screen to fix. Shown dimmed in that case:
                still not in force, but reachable. -->
           {#if settings.bandwidth_schedule_enabled || scheduleHasError}
-            <div class="field schedule-editor" class:is-inactive={!settings.bandwidth_schedule_enabled}>
+            <div class="field schedule-editor" class:is-inactive={!settings.bandwidth_schedule_enabled || settings.alt_speed_enabled}>
               {#if settings.bandwidth_schedule.length === 0}
                 <p class="schedule-empty">{m.schedule_empty()}</p>
               {:else}
@@ -6163,7 +6202,8 @@
      save, so the editor is showing solely to be corrected. Dimmed to keep
      saying what it said before: these rules are not in force. */
   .schedule-editor.is-inactive,
-  .alt-speed-limits.is-inactive {
+  .alt-speed-limits.is-inactive,
+  .manual-speed-limit.is-inactive {
     opacity: 0.62;
   }
 

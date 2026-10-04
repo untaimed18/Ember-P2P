@@ -9,6 +9,8 @@
   } from '$lib/relatedSearch';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { getSettings } from '$lib/api/settings';
+  import { libraryHashesAmong } from '$lib/api/sharing';
+  import { isUploadCounterPhase } from '$lib/sharedFileStats';
   import { getEmberDiagnostics } from '$lib/api/ember';
   import { startDownload } from '$lib/api/transfers';
   import { transfers } from '$lib/stores/transfers';
@@ -1578,10 +1580,6 @@
     for (const r of visibleResults) {
       if (r.is_spam) spamCount++;
       if (spamHidden && r.is_spam) continue;
-      if (ownedHidden && alreadyHave(r)) {
-        ownedCount++;
-        continue;
-      }
       if (hasType && resultType(r) !== filterType) continue;
       if (hasExt && (r.file.extension ?? '').toLowerCase() !== ext) continue;
       if (minBytes > 0 && r.file.size < minBytes) continue;
@@ -1601,6 +1599,12 @@
         && (r.file.complete_sources ?? 0) < minComplete
       ) continue;
       if (isFilteredByText(r)) continue;
+      // Last, so the count is of rows only this filter hides: "Show files I
+      // already have" must bring back as many as it says.
+      if (ownedHidden && alreadyHave(r)) {
+        ownedCount++;
+        continue;
+      }
       out.push(r);
     }
 
@@ -1666,10 +1670,109 @@
   let ownedHiddenCount = $derived(filterPass.ownedCount);
 
   /** Already in the library. A download still in progress, or a finished one
-   *  whose file has since left the library, is not something we have. */
+   *  whose file has since left the library, is not something we have. Judged
+   *  by hash against the library as it is now: the `Local` tag a row got when
+   *  the search started is only a fallback until that has been asked, since
+   *  it neither follows the library nor covers a copy under another name. */
   function alreadyHave(r: SearchResult): boolean {
+    const hash = r.file.hash?.toLowerCase();
+    const known = hash ? ownedCache.get(hash) : undefined;
+    if (known !== undefined) return known;
     return !!r.result_origin?.includes('Local');
   }
+
+  /** Library membership by hash, for every tab, until the library changes.
+   *  Replaced rather than mutated so the filter pass sees each answer. */
+  let ownedCache = $state.raw(new Map<string, boolean>());
+  let ownedCheckTimer: ReturnType<typeof setTimeout> | undefined;
+  /** When the first check still waiting was asked for: results streaming in
+   *  every few hundred ms would otherwise push a plain debounce back forever. */
+  let ownedCheckWaitingSince: number | null = null;
+  let ownedCacheGeneration = 0;
+  const OWNED_CHECK_DEBOUNCE_MS = 500;
+  const OWNED_CHECK_MAX_WAIT_MS = 2000;
+  const OWNED_CACHE_MAX = 100_000;
+
+  function scheduleOwnedCheck(delayMs = OWNED_CHECK_DEBOUNCE_MS) {
+    const now = Date.now();
+    ownedCheckWaitingSince ??= now;
+    const left = OWNED_CHECK_MAX_WAIT_MS - (now - ownedCheckWaitingSince);
+    clearTimeout(ownedCheckTimer);
+    ownedCheckTimer = setTimeout(() => void checkOwned(), Math.max(0, Math.min(delayMs, left)));
+  }
+
+  async function checkOwned() {
+    ownedCheckWaitingSince = null;
+    if (!hideOwned) return;
+    const generation = ownedCacheGeneration;
+    const unchecked = [...new Set(
+      visibleResults.map((r) => r.file.hash?.toLowerCase()).filter((h): h is string => !!h && !ownedCache.has(h)),
+    )];
+    if (unchecked.length === 0) return;
+    try {
+      const owned = await libraryHashesAmong(unchecked);
+      if (generation !== ownedCacheGeneration) return;
+      // Bounded: a long session of broad searches starts over rather than
+      // holding every hash it ever saw.
+      const next = ownedCache.size > OWNED_CACHE_MAX ? new Map<string, boolean>() : new Map(ownedCache);
+      for (const hash of unchecked) next.set(hash, owned.has(hash));
+      ownedCache = next;
+    } catch (e) {
+      console.warn('search: could not check which results are in the library', e);
+    }
+  }
+
+  /** The library changed, so every answer may be out of date. The old ones
+   *  stay on screen until the re-check lands, rather than every row falling
+   *  back to its `Local` tag in between. */
+  async function recheckOwned() {
+    const generation = ++ownedCacheGeneration;
+    const hashes = [...ownedCache.keys()];
+    if (!hideOwned || hashes.length === 0) {
+      ownedCache = new Map();
+      return;
+    }
+    try {
+      const owned = await libraryHashesAmong(hashes);
+      if (generation !== ownedCacheGeneration) return;
+      ownedCache = new Map(hashes.map((hash) => [hash, owned.has(hash)]));
+    } catch (e) {
+      console.warn('search: could not re-check the library', e);
+      if (generation === ownedCacheGeneration) ownedCache = new Map();
+    }
+    // A check discarded by the generation bump left its hashes unasked.
+    if (generation === ownedCacheGeneration) scheduleOwnedCheck();
+  }
+
+  // Results stream in and the filter can be switched on at any time; checked
+  // in batches rather than per arriving row.
+  $effect(() => {
+    void visibleResults;
+    if (!hideOwned) return;
+    untrack(() => scheduleOwnedCheck());
+  });
+
+  // A download finishing into the library, or a file leaving it, changes what
+  // the filter hides in tabs already open.
+  onMount(() => {
+    let unlisten: (() => void) | null = null;
+    let live = true;
+    let changeTimer: ReturnType<typeof setTimeout> | undefined;
+    listen('shared-files-changed', (event) => {
+      if (isUploadCounterPhase(event.payload)) return;
+      // Hashing emits these in a stream; one re-check once it settles.
+      clearTimeout(changeTimer);
+      changeTimer = setTimeout(() => void recheckOwned(), 1000);
+    })
+      .then((fn) => { if (live) unlisten = fn; else fn(); })
+      .catch((e) => console.warn('search: could not watch the library', e));
+    return () => {
+      live = false;
+      unlisten?.();
+      clearTimeout(changeTimer);
+      clearTimeout(ownedCheckTimer);
+    };
+  });
 
   /* --- Row windowing ---------------------------------------------------
    *
@@ -3079,6 +3182,34 @@
   let cursorIndex = $derived(
     cursorKey ? filteredResults.findIndex((r) => resultKey(r) === cursorKey) : -1,
   );
+  /** Where the cursor last was, for when a filter hides its row. */
+  let lastCursorIndex = -1;
+  // Another tab is another list; the cursor does not carry over by position.
+  // On the id alone: the tab object itself is replaced as results arrive.
+  const cursorTabId = $derived(activeTab?.id);
+  $effect(() => {
+    void cursorTabId;
+    untrack(() => {
+      cursorKey = null;
+      lastCursorIndex = -1;
+    });
+  });
+  // The cursor's row hidden by a filter moves the cursor to the row now in
+  // its place, rather than leaving the next ↓ to jump back to the top.
+  $effect(() => {
+    const idx = cursorIndex;
+    if (idx >= 0) {
+      lastCursorIndex = idx;
+      return;
+    }
+    if (cursorKey === null) return;
+    const rows = filteredResults;
+    untrack(() => {
+      cursorKey = lastCursorIndex >= 0 && rows.length > 0
+        ? resultKey(rows[Math.min(lastCursorIndex, rows.length - 1)])
+        : null;
+    });
+  });
 
   /** Scroll a row into view. The table is windowed, so the row may not be
    *  mounted; its position follows from the measured row height. */
@@ -3136,6 +3267,17 @@
       }
       cursorKey = resultKey(next);
       revealResultRow(nextIdx);
+      // A checkbox or button clicked earlier (in a row, the header, the
+      // toolbar) keeps focus, and would take the Space or Enter meant for the
+      // row the cursor is now on. Text fields never get here.
+      const focused = document.activeElement;
+      if (
+        focused instanceof HTMLButtonElement
+        || (focused instanceof HTMLInputElement && focused.type === 'checkbox')
+        || (focused instanceof HTMLElement && resultsBodyEl?.contains(focused))
+      ) {
+        (focused as HTMLElement).blur();
+      }
       return true;
     }
     if (isActivationTarget(e.target)) return false;
@@ -3462,8 +3604,9 @@
     (filterMaxSize !== null ? 1 : 0) +
     (filterExtension !== '' ? 1 : 0) +
     (filterMinSources !== null ? 1 : 0) +
-    (filterMinComplete !== null ? 1 : 0) +
-    (hideOwned ? 1 : 0)
+    // Not Hide spam or Hide files I already have: standing preferences, kept
+    // across sessions, which Clear filters leaves alone too.
+    (filterMinComplete !== null ? 1 : 0)
   );
 
 </script>
@@ -3544,6 +3687,8 @@
   );
   if (typing || confirmOpen || networkAlertOpen || selectedResult || contextMenu || showColumnMenu) return;
   if (target?.closest('.chat-dock') || document.querySelector('[aria-modal="true"]')) return;
+  // Non-modal overlays too: the status bar's speed limits, the syntax help.
+  if (target?.closest('[role="dialog"]') || syntaxHelpEl?.open) return;
   if (handleResultsKeydown(e)) e.preventDefault();
 }} />
 
@@ -3956,7 +4101,9 @@
           {#if filteredResults.length > 0}
             {plural(filteredResults.length, { one: m.search_showing_one, other: () => m.search_showing_other({ count: formatNumber(filteredResults.length) }) })}{#if resultsHidden > 0} {m.search_filtered_from({ total: formatNumber(visibleResults.length) })}{/if}
           {:else if visibleResults.length > 0 && !hasActiveFilters}
-            {allHiddenSpamLabel}
+            {@const spamHides = hideSpam && spamHiddenCount > 0}
+            {@const ownedHides = hideOwned && ownedHiddenCount > 0}
+            {spamHides && ownedHides ? m.search_no_results_filters() : spamHides ? allHiddenSpamLabel : allHiddenOwnedLabel}
           {:else if visibleResults.length > 0}
             {plural(visibleResults.length, {
               one: () => m.search_zero_of_one({ what: m.search_filters_word() }),
@@ -4141,6 +4288,9 @@
                 checked={checkedKeys.has(rKey)}
                 onclick={(e) => {
                   e.stopPropagation();
+                  // The row's own click is stopped above, and the keyboard
+                  // cursor must still land here.
+                  cursorKey = rKey;
                   toggleCheck(rKey, idx, e.shiftKey);
                   // The native click has already flipped the DOM. Shift-clicking
                   // a row that is *inside* the range extends the selection

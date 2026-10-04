@@ -57,4 +57,13 @@
     RmDir "$APPDATA\ember"
     RmDir "$LOCALAPPDATA\ember"
   ${EndIf}
+
+  ; "Launch at sign-in" (login_launch.rs) writes a per-user Run value named
+  ; after the product, which would otherwise outlive the app and sit in Task
+  ; Manager's Startup list pointing at a missing exe. Not on an update: the
+  ; reinstall that follows keeps the user's choice, and the path is the same.
+  ${If} $UpdateMode <> 1
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCTNAME}"
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "${PRODUCTNAME}"
+  ${EndIf}
 !macroend

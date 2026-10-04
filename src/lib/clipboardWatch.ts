@@ -7,22 +7,46 @@
 
 import { get, writable } from 'svelte/store';
 import { goto } from '$app/navigation';
+import { page } from '$app/stores';
 import * as m from '$lib/paraglide/messages';
 import { readClipboardText } from '$lib/api/system';
-import { parseEd2kLinks } from '$lib/api/search';
+import { distinctLinks, parseEd2kLinks } from '$lib/api/search';
+import { libraryHashesAmong } from '$lib/api/sharing';
 import { appSettings } from '$lib/stores/settings';
+import { transfers } from '$lib/stores/transfers';
 import { addActionToast } from '$lib/stores/toast';
 import { isOwnClipboardText } from '$lib/clipboardOwn';
+import { plural } from '$lib/plural';
 
-/** Set when the Transfers page should open Add links, which fills itself
- *  from the clipboard. */
-export const addLinksRequested = writable(false);
+/** The links the Transfers page should open Add links with: the text that was
+ *  offered, not whatever the clipboard holds by the time the page is up. */
+export const addLinksRequested = writable<string | null>(null);
 
 /** Focus and visibility both fire when the window comes back. */
 const SETTLE_MS = 250;
+/** As much as Add links accepts; a larger clipboard would open it empty. */
+export const MAX_LINKS_TEXT_BYTES = 256 * 1024;
 
 let lastOffered: string | null = null;
 let checking = false;
+
+/** How many of the clipboard's files are neither on the transfer list nor in
+ *  the library: offering to add a file already there ends in "already listed". */
+async function newFileCount(text: string): Promise<number> {
+  const batch = await parseEd2kLinks(text);
+  const hashes = distinctLinks(batch.links).map((link) => link.hash.toLowerCase());
+  if (hashes.length === 0) return 0;
+  const listed = new Set(get(transfers).map((t) => t.file_hash.toLowerCase()));
+  const fresh = hashes.filter((hash) => !listed.has(hash));
+  if (fresh.length === 0) return 0;
+  try {
+    const owned = await libraryHashesAmong(fresh);
+    return fresh.filter((hash) => !owned.has(hash)).length;
+  } catch (e) {
+    console.warn('clipboard watch: could not check the library', e);
+    return fresh.length;
+  }
+}
 
 async function check(): Promise<void> {
   if (checking || !get(appSettings)?.watch_clipboard_links) return;
@@ -33,16 +57,26 @@ async function check(): Promise<void> {
     if (!text || text === lastOffered || isOwnClipboardText(text)) return;
     if (!/ed2k:\/\/\|file\|/i.test(text)) return;
     lastOffered = text;
-    const batch = await parseEd2kLinks(text);
-    if (batch.links.length === 0) return;
+    if (new TextEncoder().encode(text).length > MAX_LINKS_TEXT_BYTES) return;
+    const count = await newFileCount(text);
+    if (count === 0) return;
     addActionToast(
       'info',
-      m.clipboard_links_found(),
+      plural(count, {
+        one: m.clipboard_links_found_one,
+        other: () => m.clipboard_links_found_other({ count }),
+      }),
       {
         label: m.clipboard_links_add(),
         run: () => {
-          addLinksRequested.set(true);
-          void goto('/transfers');
+          // Asked for only once Transfers is reached: a navigation the
+          // unsaved-changes prompt held back must not leave the request to
+          // open Add links the next time the page is visited.
+          void goto('/transfers')
+            .then(() => {
+              if (get(page).url.pathname.startsWith('/transfers')) addLinksRequested.set(text);
+            })
+            .catch((e: unknown) => console.warn('clipboard watch: could not open Transfers', e));
         },
       },
       () => {},

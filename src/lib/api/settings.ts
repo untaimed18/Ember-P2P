@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import * as m from '$lib/paraglide/messages';
 import type { AppSettings, WebService } from '$lib/types';
+import { flushToastActionsBeforeExit } from '$lib/stores/toast';
 
 export type SettingsUpdateOutcome = 'applied' | 'restart_required' | 'deferred';
 export type LiveApplyOutcome = 'applied' | 'deferred' | 'failed';
@@ -91,9 +92,20 @@ export async function hideToTray(): Promise<void> {
 
 /** Fully exit Ember. Routes through `app.exit(0)` on the Rust side so the
  *  existing network/save shutdown sequence (the same one triggered by
- *  File → Exit) runs before the process dies. */
+ *  File → Exit) runs before the process dies. A cancel or removal still
+ *  behind an Undo toast is sent first. */
 export async function quitApp(): Promise<void> {
+  await flushToastActionsBeforeExit();
   return invoke('quit_app');
+}
+
+/** Exits decided outside the window (the tray, "exit" on close, "when
+ *  downloads finish") ask through this to have pending Undo actions sent. */
+export const QUIT_REQUESTED_EVENT = 'ember:quit-requested';
+
+/** Whether a cancel or removal is waiting behind an Undo toast. */
+export async function setPendingUndo(pending: boolean): Promise<void> {
+  return invoke('set_pending_undo', { pending });
 }
 
 /** Persist the close-button behavior without serialising the whole

@@ -3760,4 +3760,31 @@ mod tests {
         let promoted = manager.stop("run");
         assert_eq!(promoted.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["d"], "the front starts next");
     }
+
+    #[test]
+    fn a_download_parked_after_the_finish_action_was_armed_holds_it_back() {
+        let mut manager = TransferManager::new(5);
+        for id in ["forgotten", "running", "other"] {
+            manager.enqueue(download(id));
+        }
+        manager.pause_many(&["forgotten".to_string()]);
+        let mut ran = HashSet::new();
+        let count = |m: &TransferManager, r: &mut HashSet<String>| {
+            crate::finish_action::count_outstanding(m, r)
+        };
+        assert_eq!(count(&manager, &mut ran), 2, "paused before arming does not count");
+
+        manager.pause_many(&["running".to_string(), "other".to_string()]);
+        assert_eq!(count(&manager, &mut ran), 2, "Pause all is not the list finishing");
+
+        let mut added_paused = download("added");
+        added_paused.status = TransferStatus::Paused;
+        manager.enqueue(added_paused);
+        assert_eq!(count(&manager, &mut ran), 2, "added paused, it never ran: does not count");
+
+        manager.resume_many(&["forgotten".to_string()], true);
+        assert_eq!(count(&manager, &mut ran), 3);
+        manager.pause_many(&["forgotten".to_string()]);
+        assert_eq!(count(&manager, &mut ran), 3, "run again, then parked, it holds too");
+    }
 }

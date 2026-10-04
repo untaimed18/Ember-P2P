@@ -20,7 +20,8 @@
 //! starts slipping. This task only reads shared state — the config lock, the
 //! transfer manager, the bandwidth limiter — and never sends a network command.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -41,9 +42,15 @@ const MIB: u64 = 1024 * 1024;
 /// Set when the main window gains focus. Whatever had failed has had a chance
 /// to be seen, so the taskbar stops asking for attention over it.
 static MAIN_WINDOW_FOCUSED: AtomicBool = AtomicBool::new(false);
+/// Whether the main window has focus now. A download that fails while the
+/// user is looking at Ember has been seen as it happened.
+static MAIN_WINDOW_HAS_FOCUS: AtomicBool = AtomicBool::new(false);
 
-pub fn note_main_window_focused() {
-    MAIN_WINDOW_FOCUSED.store(true, Ordering::Release);
+pub fn note_main_window_focus(focused: bool) {
+    MAIN_WINDOW_HAS_FOCUS.store(focused, Ordering::Release);
+    if focused {
+        MAIN_WINDOW_FOCUSED.store(true, Ordering::Release);
+    }
 }
 
 /// Housekeeping cadence. One second matches the limiter's own speed tick, and
@@ -167,21 +174,31 @@ async fn run(app: tauri::AppHandle) {
         }
 
         let working = count_working_transfers(&state).await;
-        let (pending, progress, failed, insufficient, restored) = {
+        let disk_check_due = ticks.is_multiple_of(DISK_CHECK_EVERY);
+        let (pending, outstanding, progress, failed, insufficient, restored, part_folders) = {
             let manager = state.transfer_manager.read().await;
             let (failed, insufficient) = needs_attention(&manager);
+            let part_folders: Vec<PathBuf> = if disk_check_due {
+                crate::finish_action::pending_download_rows(&manager)
+                    .filter_map(|t| crate::storage::part_folders::located_folder(&t.id))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             (
                 crate::finish_action::pending_downloads(&manager),
+                crate::finish_action::outstanding_downloads(&manager),
                 download_progress(&manager),
                 failed,
                 insufficient,
                 manager.restored,
+                part_folders,
             )
         };
-        crate::finish_action::tick(&app, pending);
+        crate::finish_action::tick(&app, outstanding);
 
         let focused = MAIN_WINDOW_FOCUSED.swap(false, Ordering::AcqRel);
-        if focused || !restored {
+        if focused || MAIN_WINDOW_HAS_FOCUS.load(Ordering::Acquire) || !restored {
             failures_seen = restored.then_some(failed);
         }
         if focused {
@@ -198,7 +215,12 @@ async fn run(app: tauri::AppHandle) {
             applied_taskbar = Some(taskbar);
         }
 
-        if let Some(warning) = disk.tick(ticks, pending > 0, low_disk_mb, &download_folder).await {
+        let disk_due = (disk_check_due && pending > 0).then(|| {
+            let mut folders = vec![PathBuf::from(&download_folder)];
+            folders.extend(part_folders);
+            folders
+        });
+        for warning in disk.tick(disk_due, pending > 0, low_disk_mb).await {
             if let Err(error) = app.emit("disk-space-low", &warning) {
                 tracing::debug!("Could not emit the low disk space warning: {error}");
             }
@@ -380,45 +402,122 @@ struct DiskSpaceLow {
     free_bytes: u64,
 }
 
-/// Free space on the download drive, read off the monitor's own task: a
-/// network drive can take a long time to answer.
+/// One drive's free space, as read through the first folder found on it.
+struct VolumeReading {
+    volume: String,
+    path: String,
+    free: u64,
+}
+
+/// Free space on the drives downloads are written to, read off the monitor's
+/// own task: a network drive can take a long time to answer.
 #[derive(Default)]
 struct DiskWatch {
-    probe: Option<tokio::task::JoinHandle<(String, Option<u64>)>>,
-    warned: bool,
+    probe: Option<tokio::task::JoinHandle<Vec<VolumeReading>>>,
+    /// Drives already warned about, by [`volume_key`].
+    warned: HashSet<String>,
 }
 
 impl DiskWatch {
+    /// `due` carries the folders to read when a reading is due: the download
+    /// folder and every earlier one still holding a download's part files.
     async fn tick(
         &mut self,
-        ticks: u32,
+        due: Option<Vec<PathBuf>>,
         downloading: bool,
         threshold_mb: u32,
-        folder: &str,
-    ) -> Option<DiskSpaceLow> {
+    ) -> Vec<DiskSpaceLow> {
         let threshold = u64::from(threshold_mb).saturating_mul(MIB);
-        let mut warning = None;
+        let mut warnings = Vec::new();
         if let Some(probe) = self.probe.take_if(|probe| probe.is_finished()) {
-            if let Ok((path, Some(free))) = probe.await {
-                if crossed_below(&mut self.warned, free, threshold) {
-                    warning = Some(DiskSpaceLow {
-                        path,
-                        free_bytes: free,
-                    });
+            if let Ok(readings) = probe.await {
+                // A drive no longer downloaded to is forgotten, so going back
+                // to it while it is still low warns again.
+                self.warned
+                    .retain(|volume| readings.iter().any(|r| &r.volume == volume));
+                for reading in readings {
+                    let mut warned = self.warned.contains(&reading.volume);
+                    if crossed_below(&mut warned, reading.free, threshold) {
+                        warnings.push(DiskSpaceLow {
+                            path: reading.path,
+                            free_bytes: reading.free,
+                        });
+                    }
+                    if warned {
+                        self.warned.insert(reading.volume);
+                    } else {
+                        self.warned.remove(&reading.volume);
+                    }
                 }
             }
         }
-        if threshold == 0 {
-            self.warned = false;
-        } else if downloading && self.probe.is_none() && ticks % DISK_CHECK_EVERY == 0 {
-            let folder = folder.to_string();
-            self.probe = Some(tokio::task::spawn_blocking(move || {
-                let free = free_space(Path::new(&folder));
-                (folder, free)
-            }));
+        // With nothing downloading there are no readings to clear a warning,
+        // so a drive that recovered meanwhile would never warn again.
+        if threshold == 0 || !downloading {
+            self.warned.clear();
+        } else if let Some(folders) = due.filter(|_| self.probe.is_none()) {
+            self.probe = Some(tokio::task::spawn_blocking(move || read_volumes(folders)));
         }
-        warning
+        warnings
     }
+}
+
+/// Free space per drive, each drive read once however many folders are on it.
+fn read_volumes(folders: Vec<PathBuf>) -> Vec<VolumeReading> {
+    let mut readings: Vec<VolumeReading> = Vec::new();
+    for folder in folders {
+        let Some(existing) = existing_ancestor(&folder) else {
+            continue;
+        };
+        let Some(volume) = volume_key(existing) else {
+            continue;
+        };
+        if readings.iter().any(|r| r.volume == volume) {
+            continue;
+        }
+        if let Ok(free) = fs2::available_space(existing) {
+            readings.push(VolumeReading {
+                volume,
+                path: folder.to_string_lossy().into_owned(),
+                free,
+            });
+        }
+    }
+    readings
+}
+
+/// What tells two folders' drives apart: the device on Unix, the drive or
+/// share on Windows.
+#[cfg(unix)]
+fn volume_key(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.dev().to_string())
+}
+
+#[cfg(windows)]
+fn volume_key(path: &Path) -> Option<String> {
+    use std::path::Prefix;
+    let std::path::Component::Prefix(prefix) = path.components().next()? else {
+        return None;
+    };
+    // `\\?\C:` and `C:` are one drive, as are `\\?\UNC\server\share` and
+    // `\\server\share`.
+    Some(match prefix.kind() {
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+            format!("{}:", char::from(letter).to_ascii_uppercase())
+        }
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => format!(
+            r"\\{}\{}",
+            server.to_string_lossy().to_uppercase(),
+            share.to_string_lossy().to_uppercase()
+        ),
+        _ => prefix.as_os_str().to_string_lossy().to_uppercase(),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn volume_key(path: &Path) -> Option<String> {
+    Some(path.to_string_lossy().into_owned())
 }
 
 /// Whether `free` has just gone under `threshold`. Once warned, it has to
@@ -442,11 +541,9 @@ fn crossed_below(warned: &mut bool, free: u64, threshold: u64) -> bool {
 
 /// The nearest part of `path` that exists: the folder may not have been
 /// created yet.
-fn free_space(path: &Path) -> Option<u64> {
-    let existing = path
-        .ancestors()
-        .find(|p| !p.as_os_str().is_empty() && p.exists())?;
-    fs2::available_space(existing).ok()
+fn existing_ancestor(path: &Path) -> Option<&Path> {
+    path.ancestors()
+        .find(|p| !p.as_os_str().is_empty() && p.exists())
 }
 
 /// Tooltip for the tray icon: the current rates, or just the app name when
@@ -648,6 +745,28 @@ mod tests {
         assert!(!crossed_below(&mut warned, 1250, threshold));
         assert!(crossed_below(&mut warned, 900, threshold), "climbed clear, then fell again");
         assert!(!crossed_below(&mut warned, 0, 0), "off");
+    }
+
+    #[test]
+    fn folders_on_one_drive_are_read_and_warned_about_once() {
+        let base = std::env::temp_dir();
+        let readings = read_volumes(vec![
+            base.join("ember-not-created-yet").join("Downloads"),
+            base.clone(),
+        ]);
+        assert_eq!(readings.len(), 1, "one drive, one reading");
+        assert!(readings[0].path.ends_with("Downloads"), "named by the first folder on it");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_path_is_the_same_drive_as_the_plain_one() {
+        assert_eq!(volume_key(Path::new(r"\\?\c:\Downloads")), volume_key(Path::new(r"C:\Other")));
+        assert_eq!(
+            volume_key(Path::new(r"\\?\UNC\nas\media\a")),
+            volume_key(Path::new(r"\\NAS\Media\b"))
+        );
+        assert_ne!(volume_key(Path::new(r"C:\")), volume_key(Path::new(r"D:\")));
     }
 
     #[test]

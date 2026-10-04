@@ -4,6 +4,7 @@
   // route: nothing to see or edit before a batch was queued, and nothing at
   // all when the links were in a page the clipboard could not reach.
   import * as m from '$lib/paraglide/messages';
+  import { untrack } from 'svelte';
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import { inertBackground, trapTabKey } from '$lib/a11y';
@@ -13,11 +14,14 @@
 
   let {
     open = $bindable(false),
+    initialText = null,
     busy = false,
     maxLength,
     onsubmit,
   }: {
     open?: boolean;
+    /** Links to open with in place of the clipboard's. */
+    initialText?: string | null;
     busy?: boolean;
     maxLength: number;
     onsubmit: (text: string) => void | Promise<void>;
@@ -53,7 +57,8 @@
     text = '';
     batch = null;
     let cancelled = false;
-    void readFromClipboard().then((clip) => {
+    const given = untrack(() => initialText);
+    void (given !== null ? Promise.resolve(given) : readFromClipboard()).then((clip) => {
       if (cancelled || !clip || !/ed2k:\/\//i.test(clip) || overLimit(clip)) return;
       if (text === '') text = clip.trim();
     });

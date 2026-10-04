@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx, CMD_REPLY_TIMEOUT};
@@ -1330,11 +1330,20 @@ fn check_batch_size(transfer_ids: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// How long a held pause keeps its slots before queued downloads may have
+/// them: well past the Undo toast, which can be held open by hovering it.
+const HELD_PAUSE_RELEASE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// `hold` pauses without giving the freed download slots to queued rows: the
+/// pause before a cancel the user can still undo, so Undo finds its slot free
+/// and the download running again rather than queued behind one started in
+/// its place. The cancel promotes once it goes through.
 #[tauri::command]
 pub async fn pause_transfers_batch(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
+    hold: Option<bool>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
     let (paused, promoted) = {
@@ -1351,7 +1360,23 @@ pub async fn pause_transfers_batch(
                 control.cancel();
             }
         }
-        manager.pause_and_promote_many(&transfer_ids)
+        if hold.unwrap_or(false) {
+            // Should neither the cancel nor the Undo ever come (the page
+            // reloaded under its toast), the slots are not left empty for
+            // good. After an Undo they are taken again, and this finds none.
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(HELD_PAUSE_RELEASE).await;
+                let Some(state) = app.try_state::<AppState>() else {
+                    return;
+                };
+                let promoted = state.transfer_manager.write().await.promote_available();
+                start_promoted_downloads(&state, &promoted).await;
+            });
+            (manager.pause_many(&transfer_ids), Vec::new())
+        } else {
+            manager.pause_and_promote_many(&transfer_ids)
+        }
     };
     let statuses: Vec<(String, TransferStatus)> = paused
         .iter()
@@ -2318,6 +2343,21 @@ pub async fn set_transfer_priority(
         manager.set_priority(&transfer_id, &priority);
     }
     Ok(())
+}
+
+/// The downloads waiting in the download queue, front first. A paused row
+/// that was running is not among them: it keeps its place among the running.
+#[tauri::command]
+pub async fn get_download_queue_ids(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    Ok(state
+        .transfer_manager
+        .read()
+        .await
+        .queue
+        .iter()
+        .filter(|t| t.direction == crate::types::TransferDirection::Download)
+        .map(|t| t.id.clone())
+        .collect())
 }
 
 /// Move queued downloads to the front or the back of the download queue.

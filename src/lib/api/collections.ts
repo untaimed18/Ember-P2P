@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { takeBackPendingCancels } from '$lib/stores/pendingCancels';
 
 export interface CollectionFile {
   name: string;
@@ -38,5 +39,6 @@ export async function createCollectionWithDialog(
 }
 
 export async function downloadCollectionFiles(files: CollectionFile[]): Promise<CollectionDownloadResult> {
+  await takeBackPendingCancels(files.map((f) => f.hash));
   return invoke('download_collection_files', { files });
 }

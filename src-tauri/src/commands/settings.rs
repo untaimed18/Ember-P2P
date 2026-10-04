@@ -2335,6 +2335,64 @@ pub fn quit_app(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Res
     Ok(())
 }
 
+/// Whether the main window holds a cancel or remove the user can still undo.
+/// Nothing reaches the backend until its Undo toast expires, so an exit
+/// started here first lets the window send it.
+static PENDING_UNDO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set once an exit has asked the window to send what is pending.
+static QUIT_FLUSH_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub const QUIT_REQUESTED_EVENT: &str = "ember:quit-requested";
+/// How long an exit waits for the window to send what is pending.
+const PENDING_UNDO_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
+
+#[tauri::command]
+pub fn set_pending_undo(pending: bool) {
+    PENDING_UNDO.store(pending, std::sync::atomic::Ordering::Release);
+}
+
+/// Exit Ember for a quit decided outside the window (the tray, "exit" as the
+/// close behavior, "when downloads finish"). With an Undo pending, the window
+/// is asked to commit it and exit through `quit_app`; it gets a few seconds
+/// before Ember exits regardless.
+pub fn exit_app(app: &tauri::AppHandle) {
+    let confirm_and_exit = |app: &tauri::AppHandle| {
+        if let Some(state) = app.try_state::<AppState>() {
+            state
+                .quit_confirmed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        app.exit(0);
+    };
+    if !PENDING_UNDO.load(std::sync::atomic::Ordering::Acquire) {
+        confirm_and_exit(app);
+        return;
+    }
+    // A second request (the X clicked again while nothing seems to happen)
+    // must not exit under the window's feet; the first one's fallback below
+    // still bounds the wait.
+    if QUIT_FLUSH_STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    if app.emit(QUIT_REQUESTED_EVENT, ()).is_err() {
+        confirm_and_exit(app);
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(PENDING_UNDO_FLUSH_WAIT).await;
+        // The window's `quit_app` got there first, and the shutdown is under
+        // way; a second exit could cut a slow one short.
+        let quitting = app
+            .try_state::<AppState>()
+            .is_some_and(|state| state.quit_confirmed.load(std::sync::atomic::Ordering::Acquire));
+        if quitting {
+            return;
+        }
+        tracing::warn!("The window did not finish its pending Undo actions in time; exiting");
+        confirm_and_exit(&app);
+    });
+}
+
 /// Consume a close request that arrived before the frontend listener was
 /// ready. `swap(false)` makes the handoff one-shot while allowing a later
 /// native close to set the latch again.

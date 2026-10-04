@@ -31,6 +31,7 @@
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { relaunch } from '@tauri-apps/plugin-process';
+  import { flushToastActionsBeforeExit } from '$lib/stores/toast';
   import * as m from '$lib/paraglide/messages';
 
   let diag = $state<EmberDiagnostics | null>(null);
@@ -146,7 +147,8 @@
     restartError = '';
     restarting = true;
     try {
-      await new Promise((r) => setTimeout(r, 600));
+      // Also sends anything still behind an Undo toast.
+      await Promise.all([new Promise((r) => setTimeout(r, 600)), flushToastActionsBeforeExit()]);
       await relaunch();
     } catch (e) {
       restarting = false;

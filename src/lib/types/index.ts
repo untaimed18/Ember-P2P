@@ -1069,6 +1069,8 @@ export interface AppSettings {
   launch_at_login: boolean;
   /** A launch at sign-in comes up in the tray rather than on the desktop. */
   start_hidden_at_login: boolean;
+  /** Reopen the main window where it was when Ember last quit. */
+  remember_window_position: boolean;
   /** Offer to add eD2K links found on the clipboard when the window gains focus. */
   watch_clipboard_links: boolean;
   /** Free space, in MB, under which the download drive is reported low; 0 off. */

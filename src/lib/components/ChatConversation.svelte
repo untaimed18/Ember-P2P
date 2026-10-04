@@ -610,10 +610,15 @@
     return editClockNow / 1000 - msg.timestamp <= EDIT_WINDOW_SECS;
   }
 
-  function startEdit(msg: ConvMessage) {
+  /** The edit was opened with ↑ from the composer, so closing it goes back
+   *  there: the reader was typing, not reading back. */
+  let editFromComposer = false;
+
+  function startEdit(msg: ConvMessage, fromComposer = false) {
     editingId = msg.id;
     editDraft = msg.message;
     editError = null;
+    editFromComposer = fromComposer;
   }
 
   function cancelEdit() {
@@ -629,9 +634,18 @@
    * when the reader has already moved on to something else.
    */
   function restoreFocusAfterEdit(id: number) {
+    const toComposer = editFromComposer;
+    editFromComposer = false;
     void tick().then(() => {
       const active = document.activeElement;
       if (active && active !== document.body) return;
+      if (toComposer) {
+        // The newest line is the one that was edited, so the bottom is
+        // where the reader was and still is.
+        jumpToLatest();
+        focusComposer();
+        return;
+      }
       const edit = messagesContainerEl?.querySelector<HTMLElement>(
         `[data-msg-id="${id}"] .bubble-edit-btn`,
       );
@@ -2526,7 +2540,7 @@
       const lastOwn = messages.findLast((line) => line.direction === 'sent');
       if (lastOwn && canEdit(lastOwn)) {
         e.preventDefault();
-        startEdit(lastOwn);
+        startEdit(lastOwn, true);
       }
       return;
     }

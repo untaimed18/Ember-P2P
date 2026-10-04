@@ -6,11 +6,26 @@
   import { chatDockOpen } from '$lib/stores/chatTabs';
   import IconX from './IconX.svelte';
   import { isChatWindow } from '$lib/windowRole';
+  import { shortcutModAria } from '$lib/platform';
 
   /** The chat window is all dock, so there is no dock beside it to clear. */
   const besideDock = !isChatWindow();
 
   const flyParams = () => ({ x: prefersReducedMotion.current ? 0 : 24, duration: prefersReducedMotion.current ? 0 : 200 });
+
+  let container = $state<HTMLDivElement>();
+  /** The Undo Ctrl+Z takes: the newest. */
+  const latestUndoId = $derived($toasts.findLast((t) => t.action?.undo)?.id);
+
+  /** Chromium fires no `focusout` for a focused button removed with its
+   *  toast, so the countdowns of the toasts left would stay held. */
+  function afterRemoving(fn: () => void) {
+    fn();
+    queueMicrotask(() => {
+      if (!container) return;
+      if (!container.contains(document.activeElement) && !container.matches(':hover')) resumeToastDismiss();
+    });
+  }
 </script>
 
 {#if $toasts.length > 0}
@@ -26,6 +41,7 @@
        does not exist. The container is deliberately role-less (see above), and
        the keyboard equivalent is `focusin`/`focusout` rather than a click. -->
   <div
+    bind:this={container}
     class="toast-container"
     class:dock-open={besideDock && $chatDockOpen}
     data-a11y-no-inert
@@ -72,12 +88,18 @@
             </svg>
           {/if}
         </span>
-        <span class="toast-msg">{toast.message}</span>
+        <span class="toast-msg" id="toast-msg-{toast.id}">{toast.message}</span>
         {#if toast.action}
           {@const action = toast.action}
-          <button type="button" class="toast-action" onclick={() => action.run()}>{action.label}</button>
+          <button
+            type="button"
+            class="toast-action"
+            aria-describedby="toast-msg-{toast.id}"
+            aria-keyshortcuts={toast.id === latestUndoId ? `${shortcutModAria()}+Z` : undefined}
+            onclick={() => afterRemoving(() => action.run())}
+          >{action.label}</button>
         {/if}
-        <button type="button" class="toast-close" onclick={() => removeToast(toast.id)} title={m.common_dismiss()} aria-label={m.common_dismiss()}>
+        <button type="button" class="toast-close" onclick={() => afterRemoving(() => removeToast(toast.id))} title={m.common_dismiss()} aria-label={m.common_dismiss()}>
           <IconX size={13} />
         </button>
       </div>

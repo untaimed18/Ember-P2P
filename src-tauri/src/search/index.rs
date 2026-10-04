@@ -367,6 +367,19 @@ impl LocalIndex {
             .collect()
     }
 
+    /// The paths of every indexed copy of `hash`.
+    pub fn paths_for_hash(&self, hash: &str) -> Vec<String> {
+        self.hash_map
+            .get(hash)
+            .map(|indices| {
+                indices
+                    .iter()
+                    .filter_map(|&idx| self.files.get(idx).map(|f| f.path.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn get_by_hash(&self, hash: &str) -> Option<&FileInfo> {
         // When multiple shares have the same MD4 (e.g. the user re-added
         // the same file from two folders), pick a deterministic winner

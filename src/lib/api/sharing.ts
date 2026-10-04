@@ -143,6 +143,22 @@ export async function getSharedFiles(): Promise<FileInfo[]> {
   return invoke('get_shared_files');
 }
 
+/** The backend's cap on one `library_hashes_among` request. */
+const MAX_LIBRARY_HASH_QUERY = 20_000;
+
+/** Which of `hashes` (eD2K hex) name a file in the library, without pulling
+ *  the library over. */
+export async function libraryHashesAmong(hashes: string[]): Promise<Set<string>> {
+  const found = new Set<string>();
+  for (let i = 0; i < hashes.length; i += MAX_LIBRARY_HASH_QUERY) {
+    const chunk = hashes.slice(i, i + MAX_LIBRARY_HASH_QUERY);
+    for (const hash of await invoke<string[]>('library_hashes_among', { hashes: chunk })) {
+      found.add(hash.toLowerCase());
+    }
+  }
+  return found;
+}
+
 /** `files` is `null` when the library still matches `etag`. */
 export interface SharedFilesSnapshot {
   etag: string;

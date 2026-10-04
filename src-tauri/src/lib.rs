@@ -1235,14 +1235,7 @@ pub fn run() {
                             auto_update::silent::rebuild_tray_menu(&app);
                         });
                     }
-                    "tray_quit" => {
-                        if let Some(state) = app.try_state::<AppState>() {
-                            state
-                                .quit_confirmed
-                                .store(true, std::sync::atomic::Ordering::Release);
-                        }
-                        app.exit(0);
-                    }
+                    "tray_quit" => commands::settings::exit_app(app),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -1292,7 +1285,10 @@ pub fn run() {
             // how the *next* launch opens.
             let launch_window = resume_window.or_else(|| {
                 window_state::for_launch(
-                    window_state::load(&data_dir),
+                    settings
+                        .remember_window_position
+                        .then(|| window_state::load(&data_dir))
+                        .flatten(),
                     settings.launch_maximized,
                     login_launch::launched_at_login() && settings.start_hidden_at_login,
                 )
@@ -2317,6 +2313,7 @@ pub fn run() {
             commands::transfers::get_transfer_sources,
             commands::transfers::set_transfer_priority,
             commands::transfers::move_transfers_in_queue,
+            commands::transfers::get_download_queue_ids,
             commands::transfers::set_transfer_category,
             commands::transfers::rename_transfer,
             commands::transfers::set_preview_priority,
@@ -2348,6 +2345,7 @@ pub fn run() {
             commands::sharing::dismiss_dropped_folders,
             commands::sharing::remove_shared_folder,
             commands::sharing::get_shared_files,
+            commands::sharing::library_hashes_among,
             commands::sharing::get_shared_files_if_changed,
             commands::sharing::get_shared_file_count,
             commands::sharing::library_has_hashes,
@@ -2487,6 +2485,7 @@ pub fn run() {
             commands::settings::hide_to_tray,
             commands::settings::show_main_window,
             commands::settings::quit_app,
+            commands::settings::set_pending_undo,
             commands::settings::set_close_behavior,
             commands::settings::set_quick_limits,
             commands::settings::take_pending_close_request,
@@ -2628,9 +2627,11 @@ pub fn run() {
                 return;
             }
 
-            if let tauri::WindowEvent::Focused(true) = event {
-                auto_update::resume::on_main_window_focused(window);
-                background::note_main_window_focused();
+            if let tauri::WindowEvent::Focused(focused) = event {
+                if *focused {
+                    auto_update::resume::on_main_window_focused(window);
+                }
+                background::note_main_window_focus(*focused);
                 return;
             }
 
@@ -2693,10 +2694,7 @@ pub fn run() {
                     // The same path as `quit_app`, so `RunEvent::Exit` still
                     // runs the shutdown.
                     api.prevent_close();
-                    state
-                        .quit_confirmed
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    app_handle.exit(0);
+                    commands::settings::exit_app(app_handle);
                 }
                 "tray" => {
                     api.prevent_close();
@@ -2754,6 +2752,7 @@ pub fn run() {
                 window_state::save(app_handle);
             }
             if let tauri::RunEvent::Exit = event {
+                window_state::save(app_handle);
                 // Exit is delivered on the main thread, outside the async
                 // runtime, and the process is torn down the moment this
                 // returns — block here until the teardown has finished

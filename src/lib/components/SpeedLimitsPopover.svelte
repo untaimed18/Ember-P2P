@@ -39,7 +39,7 @@
   let draft = $state<Limits>({ up: 0, down: 0, altUp: 0, altDown: 0 });
   /** What the draft was seeded from, so a change saved elsewhere only replaces
    *  the fields not edited here. */
-  let baseline: Limits = { up: 0, down: 0, altUp: 0, altDown: 0 };
+  let baseline = $state<Limits>({ up: 0, down: 0, altUp: 0, altDown: 0 });
   let loaded = $state(false);
   let saving = $state(false);
   let scheduleLabel = $state<string | null>(null);
@@ -121,6 +121,15 @@
   }
 
   function toggleAlt(on: boolean) {
+    // The set of limits the switch hides drops its unapplied edits: Apply
+    // must not save numbers that are no longer on screen.
+    if (on) {
+      draft.up = baseline.up;
+      draft.down = baseline.down;
+    } else {
+      draft.altUp = baseline.altUp;
+      draft.altDown = baseline.altDown;
+    }
     void save({ alt_speed_enabled: on });
   }
 

@@ -93,6 +93,7 @@
         { keys: ['?'], label: () => m.shortcuts_show_shortcuts() },
         { keys: ['F1'], label: () => m.shortcuts_show_shortcuts() },
         { keys: [modifierKey, 'B'], label: () => m.shortcuts_toggle_sidebar() },
+        { keys: [modifierKey, 'Z'], label: () => m.shortcuts_undo_latest() },
         ...navShortcuts,
         ...(settingsHasNavDigit
           ? []

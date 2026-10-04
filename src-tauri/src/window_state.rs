@@ -14,8 +14,15 @@ use crate::auto_update::resume::{self, Visibility, WindowSnapshot};
 pub const FILE: &str = "window-state.json";
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 
-/// Record the main window as it is now. Best-effort.
+static SAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record the main window as it is now, once per run. Best-effort. Called on
+/// `ExitRequested` and again on `Exit`, which is the only one of the two a
+/// Windows shutdown or sign-out delivers.
 pub fn save(app: &AppHandle) {
+    if SAVED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
     let dir = match crate::storage::paths::ensure_data_dir() {
         Ok(dir) => dir,
         Err(error) => {

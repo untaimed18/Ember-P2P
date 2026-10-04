@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { withTimeout } from '$lib/utils';
+import { takeBackPendingCancels } from '$lib/stores/pendingCancels';
 import * as m from '$lib/paraglide/messages';
 import type {
   Transfer,
@@ -60,6 +61,7 @@ export async function startDownload(
   if (!fileHash?.trim()) {
     throw new Error(m.error_transfers_invalid_file_hash());
   }
+  await takeBackPendingCancels([fileHash]);
   return invoke('start_download', {
     fileHash,
     fileName,
@@ -191,6 +193,11 @@ export async function clearCompleted(transferIds?: string[]): Promise<number> {
   return cleared;
 }
 
+/** Ids of the downloads waiting in the download queue, front first. */
+export async function getDownloadQueueIds(): Promise<string[]> {
+  return invoke('get_download_queue_ids');
+}
+
 /** Move queued downloads to the front or back of the download queue.
  *  Returns how many were waiting there; a running one is not. */
 export async function moveTransfersInQueue(transferIds: string[], toFront: boolean): Promise<number> {
@@ -233,14 +240,16 @@ const MAX_BATCH_TRANSFER_IDS = 500;
 
 /** Send `transferIds` through a batch command in backend-sized chunks, in
  *  order, stopping at the first chunk that fails. */
-async function invokeChunked(command: string, transferIds: string[]): Promise<void> {
+async function invokeChunked(command: string, transferIds: string[], extra: Record<string, unknown> = {}): Promise<void> {
   for (let i = 0; i < transferIds.length; i += MAX_BATCH_TRANSFER_IDS) {
-    await invoke<void>(command, { transferIds: transferIds.slice(i, i + MAX_BATCH_TRANSFER_IDS) });
+    await invoke<void>(command, { ...extra, transferIds: transferIds.slice(i, i + MAX_BATCH_TRANSFER_IDS) });
   }
 }
 
-export async function pauseTransfersBatch(transferIds: string[]): Promise<void> {
-  return invokeChunked('pause_transfers_batch', transferIds);
+/** `hold` keeps the freed download slots empty instead of starting queued
+ *  rows in them: the pause before a cancel the user can still undo. */
+export async function pauseTransfersBatch(transferIds: string[], options: { hold?: boolean } = {}): Promise<void> {
+  return invokeChunked('pause_transfers_batch', transferIds, options.hold ? { hold: true } : {});
 }
 
 export async function resumeTransfersBatch(transferIds: string[]): Promise<void> {

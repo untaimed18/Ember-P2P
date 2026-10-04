@@ -491,6 +491,8 @@
   type ShareScopeFilter = 'all' | 'friends_only' | 'unpublished' | 'hashing';
   const VALID_SHARE_SCOPES = new Set<ShareScopeFilter>(['all', 'friends_only', 'unpublished', 'hashing']);
   let shareScopeFilter = $state<ShareScopeFilter>('all');
+  /** A saved sharing-state filter waiting for the library to load. */
+  let pendingShareScope = $state<Exclude<ShareScopeFilter, 'all'> | null>(null);
 
   /**
    * The one sharing state a row is in, if any of the filterable ones.
@@ -1411,6 +1413,16 @@
     return counts;
   });
 
+  $effect(() => {
+    const pending = pendingShareScope;
+    if (!pending || !initialLoadDone) return;
+    const matches = shareScopeCounts[pending] > 0;
+    untrack(() => {
+      pendingShareScope = null;
+      if (matches) shareScopeFilter = pending;
+    });
+  });
+
   let hasActiveLibraryFilters = $derived(!!filterFolder || !!searchQuery.trim() || typeFilter !== 'All' || showDuplicatesOnly || showMissingOnly || shareScopeFilter !== 'all');
   let libraryHashedCount = $derived.by(() => {
     let hashed = 0;
@@ -1430,6 +1442,7 @@
     showDuplicatesOnly = false;
     showMissingOnly = false;
     shareScopeFilter = 'all';
+    pendingShareScope = null;
   }
 
   // --- Multi-select ---
@@ -2752,8 +2765,15 @@
         if (typeof parsed.showDuplicatesOnly === 'boolean') {
           showDuplicatesOnly = parsed.showDuplicatesOnly;
         }
-        if (typeof parsed.shareScopeFilter === 'string' && VALID_SHARE_SCOPES.has(parsed.shareScopeFilter as ShareScopeFilter)) {
-          shareScopeFilter = parsed.shareScopeFilter as ShareScopeFilter;
+        // Deferred like "missing only" below: put back once the library is
+        // loaded, and only if it still matches something. "Still hashing"
+        // restored after the hashing finished would open on an empty list.
+        if (
+          typeof parsed.shareScopeFilter === 'string'
+          && parsed.shareScopeFilter !== 'all'
+          && VALID_SHARE_SCOPES.has(parsed.shareScopeFilter as ShareScopeFilter)
+        ) {
+          pendingShareScope = parsed.shareScopeFilter as Exclude<ShareScopeFilter, 'all'>;
         }
         // Restore "missing only" only if the user actually has missing
         // files; otherwise the toggle would re-enable a filter that
@@ -2801,7 +2821,7 @@
         sortAsc,
         showDuplicatesOnly,
         showMissingOnly,
-        shareScopeFilter,
+        shareScopeFilter: pendingShareScope ?? shareScopeFilter,
         topPanelOpen,
         topPanelMetric,
         topPanelScope,
@@ -2813,7 +2833,7 @@
   $effect(() => {
     if (!filtersRestored) return;
     // Track dependencies explicitly so this effect re-runs when any filter/sort changes.
-    void typeFilter; void filterFolder; void searchQuery; void sortField; void sortAsc; void showDuplicatesOnly; void showMissingOnly; void shareScopeFilter;
+    void typeFilter; void filterFolder; void searchQuery; void sortField; void sortAsc; void showDuplicatesOnly; void showMissingOnly; void shareScopeFilter; void pendingShareScope;
     void topPanelOpen; void topPanelMetric; void topPanelScope; void expandedFolders;
     persistFilters();
   });
@@ -3266,7 +3286,7 @@
         <option value={opt}>{fileTypeFilterLabel(opt)}</option>
       {/each}
     </select>
-    <select class="filter-type" bind:value={shareScopeFilter} aria-label={m.library_scope_filter_aria()}>
+    <select class="filter-type" bind:value={shareScopeFilter} onchange={() => (pendingShareScope = null)} aria-label={m.library_scope_filter_aria()}>
       <option value="all">{m.library_scope_all()}</option>
       <option value="friends_only">{m.library_scope_friends_only()} ({formatNumber(shareScopeCounts.friends_only)})</option>
       <option value="unpublished">{m.library_scope_unpublished()} ({formatNumber(shareScopeCounts.unpublished)})</option>

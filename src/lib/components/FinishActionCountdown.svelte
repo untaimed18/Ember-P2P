@@ -38,8 +38,14 @@
   const timeText = $derived(`${Math.floor(secondsLeft / 60)}:${String(secondsLeft % 60).padStart(2, '0')}`);
 
   function answer(action: () => Promise<void>) {
-    answeredFor = endsAt;
-    void action().catch((e) => toastError(translateError(e, m.error_operation_failed())));
+    const answered = endsAt;
+    answeredFor = answered;
+    void action().catch((e) => {
+      toastError(translateError(e, m.error_operation_failed()));
+      // Still counting down: put the dialog back rather than leave the user
+      // thinking it was cancelled.
+      if (answeredFor === answered) answeredFor = null;
+    });
   }
 </script>
 

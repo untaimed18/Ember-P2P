@@ -5412,6 +5412,57 @@ pub async fn get_shared_files(state: tauri::State<'_, AppState>) -> Result<Vec<F
     Ok(cached.clone())
 }
 
+/// Most hashes one [`library_hashes_among`] call may ask about: a search tab's
+/// results or a clipboard's links, never the whole library.
+const MAX_LIBRARY_HASH_QUERY: usize = 20_000;
+
+/// Which of `hashes` (eD2K, hex) name a file the user still has: indexed in
+/// the library, with at least one copy still on disk. A file deleted outside
+/// Ember stays indexed until it is removed from the Library, and must not hide
+/// the search result that would download it again. For "hide files I already
+/// have" in Search and the clipboard links offer, which would otherwise pull
+/// every library row over IPC to answer a yes or no.
+#[tauri::command]
+pub async fn library_hashes_among(
+    state: tauri::State<'_, AppState>,
+    hashes: Vec<String>,
+) -> Result<Vec<String>, String> {
+    if hashes.len() > MAX_LIBRARY_HASH_QUERY {
+        return Err(coded_ctx(
+            "sharing_hash_query_too_large",
+            "Too many hashes in a single request",
+            hashes.len(),
+        ));
+    }
+    let candidates: Vec<(String, Vec<String>)> = {
+        let index = state.local_index.read().await;
+        hashes
+            .into_iter()
+            .filter(|hash| hash.len() == 32)
+            .filter_map(|hash| {
+                let paths = [hash.clone(), hash.to_ascii_lowercase(), hash.to_ascii_uppercase()]
+                    .iter()
+                    .map(|key| index.paths_for_hash(key))
+                    .find(|paths| !paths.is_empty())?;
+                Some((hash, paths))
+            })
+            .collect()
+    };
+    // Off the runtime: a library on a network drive can be slow to answer.
+    tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .filter(|(_, paths)| paths.iter().any(|p| std::path::Path::new(p).is_file()))
+            .map(|(hash, _)| hash)
+            .collect::<Vec<String>>()
+    })
+    .await
+    .or_else(|e| {
+        warn!("library_hashes_among: the disk check failed: {e}");
+        Ok(Vec::new())
+    })
+}
+
 /// [`get_shared_files`] for a caller that already holds a copy.
 #[derive(serde::Serialize)]
 pub struct SharedFilesSnapshot {
