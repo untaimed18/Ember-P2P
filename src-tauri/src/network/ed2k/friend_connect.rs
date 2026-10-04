@@ -488,6 +488,9 @@ pub async fn run_friend_session_over_transport(
         EmberSessionHandle::new_secure(outbound_tx.clone(), peer_pk, peer_ember_hash)
             .via_relay(relayed)
             .with_peer_addr((!relayed).then_some(addr));
+    // Subscribed before any await: a receiver taken later counts a revocation
+    // already sent as seen, and the session would outlive the friendship.
+    let mut session_shutdown = ember_session_handle.subscribe_shutdown();
     {
         let mut sessions = ember_sessions.write().await;
         // The user may have gone offline while this dial was in flight.
@@ -617,7 +620,6 @@ pub async fn run_friend_session_over_transport(
     let session_ul_event_tx = ul_event_tx.clone();
     let session_friend_hashes = friend_hashes.clone();
     let session_listen_port = listen_port;
-    let mut session_shutdown = ember_session_handle.subscribe_shutdown();
     let session_our_ed25519_secret = our_sk;
     let session_peer_ember_pubkey = peer_pk;
     tokio::spawn(async move {
@@ -1240,7 +1242,7 @@ pub async fn connect_friend_with_fallback(
             ctx.nat_type,
             ctx.external_addr,
             ctx.quic_endpoint.clone(),
-            ctx.quic_public_port,
+            ctx.quic_public_port(),
         )
     };
 

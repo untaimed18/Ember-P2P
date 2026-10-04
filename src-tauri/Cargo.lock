@@ -1478,7 +1478,7 @@ checksum = "4ef6b89e5b37196644d8796de5268852ff179b44e96276cf4290264843743bb7"
 
 [[package]]
 name = "ember"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1511,6 +1511,7 @@ dependencies = [
  "opener",
  "parking_lot",
  "quinn",
+ "quinn-proto",
  "rand 0.8.7",
  "rcgen",
  "regex",
@@ -1544,6 +1545,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "x25519-dalek",
  "x509-cert",
+ "zbus",
  "zeroize",
  "zip 8.6.0",
 ]

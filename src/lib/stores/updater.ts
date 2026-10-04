@@ -2,7 +2,7 @@ import { get, writable } from 'svelte/store';
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { relaunch } from '@tauri-apps/plugin-process';
 import * as m from '$lib/paraglide/messages';
-import { translateError } from '$lib/i18n';
+import { codedErrorOf, translateError } from '$lib/i18n';
 
 // Shared auto-update state. Both the corner `UpdateNotice` banner and the
 // Settings → About card read and drive this single store, so a check started
@@ -76,7 +76,7 @@ interface SecureUpdateInfo {
   date: string | null;
 }
 
-interface SecureUpdateCheckResult {
+export interface SecureUpdateCheckResult {
   update: SecureUpdateInfo | null;
   pendingRetained: boolean;
   error?: string | null;
@@ -105,58 +105,16 @@ const INITIAL: UpdaterState = {
 
 export const updater = writable<UpdaterState>({ ...INITIAL });
 
-export type UpdateCheckFrequency = 'daily' | 'weekly' | 'monthly';
-
-const FREQUENCY_MS: Record<UpdateCheckFrequency, number> = {
-  daily: 24 * 60 * 60 * 1000,
-  weekly: 7 * 24 * 60 * 60 * 1000,
-  monthly: 30 * 24 * 60 * 60 * 1000,
-};
-
-// When the automatic startup check last ran, kept in the webview's
-// localStorage rather than in `AppSettings`/config.json: it's a bookkeeping
-// cache ("did we already check recently?"), not a user preference, and the
-// entire update-check flow already lives on the frontend with no backend
-// awareness of checks at all (see the module doc above). A manual check
-// from Settings → About also updates it, since that makes an automatic
-// check redundant until the configured interval elapses again.
-const LAST_CHECK_STORAGE_KEY = 'ember.updater.lastCheckedAt';
-// A stamp further ahead than this was written while the clock was wrong. Taken
-// at face value it keeps `Date.now() - last` negative, and so silences every
-// silent check, until wall time catches up — months, for a clock set a year out.
-const MAX_LAST_CHECK_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
+// Automatic checks are scheduled by the backend (`auto_update::scheduler`),
+// which also keeps the last-checked stamp, so a long-running Ember keeps
+// checking while its webview sits hidden and throttled in the tray. Their
+// results arrive through `applyBackgroundCheckResult`.
 const DISMISSED_UPDATE_STORAGE_KEY = 'ember.updater.dismissedUpdate';
 const LEGACY_DISMISSED_VERSION_STORAGE_KEY = 'ember.updater.dismissedVersion';
 
 interface DismissedUpdateIdentity {
   securityEpoch: number;
   version: string;
-}
-
-function readLastCheckedAt(): number {
-  try {
-    const raw = localStorage.getItem(LAST_CHECK_STORAGE_KEY);
-    const parsed = raw === null ? NaN : Number(raw);
-    if (!Number.isFinite(parsed)) return 0;
-    if (parsed > Date.now() + MAX_LAST_CHECK_FUTURE_SKEW_MS) {
-      localStorage.removeItem(LAST_CHECK_STORAGE_KEY);
-      return 0;
-    }
-    return parsed;
-  } catch {
-    // Storage unavailable (private mode / disabled) — treat as "never
-    // checked" so callers fall back to a safe (if more frequent) default.
-    return 0;
-  }
-}
-
-function recordCheckedNow(): void {
-  try {
-    localStorage.setItem(LAST_CHECK_STORAGE_KEY, String(Date.now()));
-  } catch {
-    // Quota or storage failure — worst case we check more often than the
-    // configured frequency on this device; not worth surfacing to the user.
-  }
 }
 
 function normalizeSecurityEpoch(value: unknown): number | null {
@@ -210,18 +168,6 @@ function recordDismissedUpdate(securityEpoch: number, version: string): void {
   }
 }
 
-/**
- * True when no check has ever been recorded, or enough time has passed
- * since the last one (manual or silent) for the given `frequency`. The
- * startup flow in `+layout.svelte` uses this to decide whether the silent
- * background check should run at all this launch.
- */
-export function isUpdateCheckDue(frequency: UpdateCheckFrequency): boolean {
-  const last = readLastCheckedAt();
-  if (last <= 0) return true;
-  return Date.now() - last >= FREQUENCY_MS[frequency];
-}
-
 // The native updater service owns the non-serializable, signed Update handle.
 // The renderer only tracks whether that service has a verified pending update;
 // it cannot supply URLs, targets, proxies, or downgrade options.
@@ -240,16 +186,34 @@ let checkInFlight = false;
 /**
  * True while `checkUpdateHandoff` is awaiting the backend.
  *
- * The two run on independent startup timers 2.5 s apart, and the hand-off status
- * call is not cheap: it reads, hashes and signature-checks the whole staged
- * installer, on a freshly written unsigned executable — exactly the file an
- * antivirus stops to scan, on exactly the machines this feature exists for. If
- * it overruns that gap the check starts first, `takeStagedSnapshot` finds the
- * store still `idle` and captures nothing, and the hand-off's `stalled` result is
- * then overwritten by the check — reinstating the regression the snapshot was
- * added to fix. Ordering the timers cannot fix that; only a guard can.
+ * The hand-off query runs 1.5 s after mount and the backend's first automatic
+ * check lands about 15 s after launch, and the hand-off status call is not
+ * cheap: it reads, hashes and signature-checks the whole staged installer, on a
+ * freshly written unsigned executable — exactly the file an antivirus stops to
+ * scan, on exactly the machines this feature exists for. If it overruns that gap
+ * the check result arrives first, `takeStagedSnapshot` finds the store still
+ * `idle` and captures nothing, and the hand-off's `stalled` result is then
+ * overwritten by the check — reinstating the regression the snapshot was added
+ * to fix. Ordering the timers cannot fix that; only a guard can.
  */
 let handoffInFlight = false;
+
+/**
+ * Set once an install or an installer run failed after Ember had stopped its
+ * network services for it. Only a restart brings them back, so the error that
+ * says so must outlast the next automatic check.
+ */
+let servicesStopped = false;
+
+const SERVICES_STOPPED_CODES = new Set([
+  'updater_install_failed_services_stopped',
+  'updater_launch_failed_services_stopped',
+]);
+
+function noteServicesStopped(e: unknown): void {
+  const code = codedErrorOf(e)?.code;
+  if (code && SERVICES_STOPPED_CODES.has(code)) servicesStopped = true;
+}
 
 async function disposePending(): Promise<void> {
   pending = false;
@@ -272,15 +236,12 @@ function toMessage(e: unknown): string {
 /**
  * Check the configured endpoint for a newer version.
  *
- * `silent` (used by the startup check) swallows failures back to `idle` so a
- * missing network / unreachable manifest never surfaces UI noise. A manual
- * check leaves the error in the store for the Settings card to display.
+ * `silent` swallows failures back to `idle` so a missing network / unreachable
+ * manifest never surfaces UI noise. A manual check leaves the error in the
+ * store for the Settings card to display.
  *
- * Every call (silent or manual) records "checked now" for
- * {@link isUpdateCheckDue}, regardless of outcome — an attempt counts even
- * if it fails, matching how "check weekly" is normally understood (retry
- * roughly on that cadence, not on every launch just because the last
- * attempt happened to fail).
+ * The backend stamps every attempt for its automatic cadence, whatever the
+ * outcome, so a manual check also postpones the next automatic one.
  *
  * Returns true when an update is available.
  */
@@ -292,7 +253,6 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
   // dispose the first check's result (or the currently-available pending).
   if (installInFlight || checkInFlight || handoffInFlight) return false;
   checkInFlight = true;
-  recordCheckedNow();
   // A staged installer waiting after a failed hand-off has to survive this
   // check. Every exit below either replaces the whole store or resets it to
   // INITIAL, so without capturing it first the `stalled` notice — and the only
@@ -302,100 +262,7 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
   updater.update((s) => ({ ...s, phase: 'checking', error: null, signatureMissing: false }));
   try {
     const result = await invoke<SecureUpdateCheckResult>('secure_updater_check');
-    const found = result.update;
-    if (found && staged && staged.installerReady && found.version === staged.version) {
-      // The check found the same version we already have staged and verified on
-      // disk. Offering "Install" here would re-download it and repeat the silent
-      // hand-off that just failed, so keep the recovery offer instead.
-      //
-      // Only while the staged copy is actually usable, though. Preferring an
-      // unusable one shut the door: the recovery notice offers "Run installer"
-      // and Settings offers nothing, so every check returned to a notice with no
-      // action and the release stayed unreachable until the marker aged out
-      // weeks later. Falling through re-offers it as an ordinary download, which
-      // replaces the staged copy anyway.
-      pending = true;
-      restoreStaged(staged);
-      return true;
-    }
-    if (found) {
-      // Native retention is authoritative: empty re-checks and check errors that
-      // still keep a verified artifact re-offer UpdateInfo so Install survives
-      // even after a prior IPC failure cleared the local pending flag.
-      pending = true;
-      const securityEpoch = normalizeSecurityEpoch(found.securityEpoch);
-      updater.set({
-        phase: 'available',
-        version: found.version,
-        securityEpoch,
-        notes: found.notes,
-        date: found.date,
-        downloaded: 0,
-        total: null,
-        error: opts.silent || !result.error ? null : toMessage(result.error),
-        // Unknown/malformed epoch metadata must fail visible, never reuse a
-        // potentially stale dismissal identity.
-        dismissed: isUpdateDismissed(securityEpoch, found.version),
-        // Only meaningful for `stalled`; a fresh update replaces any staged
-        // installer rather than offering the old one.
-        installerReady: false,
-        fromHandoff: false,
-        signatureMissing: false,
-      });
-      return true;
-    }
-    await disposePending();
-    if (result.signatureMissing) {
-      retryAction = 'check';
-      if (staged) {
-        // The recovery offer is worth more than the error text (see the
-        // `result.error` branch below), but the missing signature is a security
-        // fact about the *new* release and must survive the restore.
-        restoreStaged(staged, true);
-        return false;
-      }
-      updater.set({
-        ...INITIAL,
-        phase: opts.silent ? 'idle' : 'error',
-        error: m.updater_signature_missing(),
-        signatureMissing: true,
-      });
-      return false;
-    }
-    if (result.error && !opts.silent) {
-      retryAction = 'check';
-      // A check that failed says nothing about the staged installer either, and
-      // the recovery offer is worth more to the user than the error text.
-      // `secure_updater_check` reports failures in-band rather than rejecting,
-      // so an ordinary offline check lands here, not in the `catch` below that
-      // already restores. Falling through to `error` was therefore the common
-      // way to lose the offer: `takeStagedSnapshot` only reads the `stalled`
-      // phase, so once the phase changes the "Run installer" button cannot come
-      // back for the rest of the run, and the staged bytes are only reachable
-      // by digging through the data folder by hand. The `stalled` notice does
-      // not render `error`, so there is nothing to be gained by carrying it.
-      if (staged) {
-        restoreStaged(staged);
-        return false;
-      }
-      updater.update((s) => ({
-        ...s,
-        phase: 'error',
-        // `secure_updater_check` reports failures in-band rather than
-        // rejecting, so this string is a coded envelope too and needs the same
-        // decoding as the `catch` path below.
-        error: result.error ? toMessage(result.error) : null,
-      }));
-      return false;
-    }
-    // Finding nothing new says nothing about the staged installer: it is for a
-    // version we are still not running, and it is still sitting there.
-    if (staged) {
-      restoreStaged(staged);
-      return false;
-    }
-    updater.set({ ...INITIAL, phase: opts.silent ? 'idle' : 'uptodate' });
-    return false;
+    return await applyCheckResult(result, opts.silent === true, staged);
   } catch (e) {
     retryAction = 'check';
     // Hard invoke failures (IPC) leave native state unknown — fail closed on
@@ -415,6 +282,157 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
   } finally {
     checkInFlight = false;
   }
+}
+
+/** Latest automatic result that arrived while the hand-off query was running. */
+let deferredBackgroundResult: SecureUpdateCheckResult | null = null;
+
+/**
+ * Apply the result of an automatic check the backend scheduler ran and
+ * emitted, exactly as a silent check run from here would be applied.
+ *
+ * A live check or install owns the store until it finishes, and its own result
+ * is newer than this one, so this is dropped while either runs. It is held back
+ * rather than dropped while the startup hand-off query is running, because
+ * applying it first would let that query's `stalled` result overwrite an offer
+ * — or this overwrite the `stalled` one, depending on which lands last.
+ */
+export async function applyBackgroundCheckResult(result: SecureUpdateCheckResult): Promise<void> {
+  if (installInFlight || checkInFlight) return;
+  if (handoffInFlight) {
+    deferredBackgroundResult = result;
+    return;
+  }
+  const phase = get(updater).phase;
+  // Mid-install or installed-awaiting-restart: nothing a check found changes
+  // what the user is in the middle of.
+  if (phase === 'downloading' || phase === 'installing' || phase === 'ready') return;
+  if (phase === 'error' && servicesStopped) return;
+  await applyCheckResult(result, true, takeStagedSnapshot());
+}
+
+/**
+ * Apply the backend's last check result, for a webview that was not listening
+ * when it was emitted: one still starting up when the first automatic check
+ * landed, or one reloaded since. The next check may be a month away. Call once
+ * the event listener is registered, so nothing falls between the two.
+ */
+export async function loadLastBackgroundCheckResult(): Promise<void> {
+  let result: SecureUpdateCheckResult | null;
+  try {
+    result = await invoke<SecureUpdateCheckResult | null>('get_last_update_check_result');
+  } catch {
+    return;
+  }
+  if (result) await applyBackgroundCheckResult(result);
+}
+
+/**
+ * Put a check's result into the store.
+ *
+ * `staged` is the `stalled` offer captured before the check started, if any,
+ * so every path below can put it back.
+ */
+async function applyCheckResult(
+  result: SecureUpdateCheckResult,
+  silent: boolean,
+  staged: StagedSnapshot | null,
+): Promise<boolean> {
+  const found = result.update;
+  if (found && staged && staged.installerReady && found.version === staged.version) {
+    // The check found the same version we already have staged and verified on
+    // disk. Offering "Install" here would re-download it and repeat the silent
+    // hand-off that just failed, so keep the recovery offer instead.
+    //
+    // Only while the staged copy is actually usable, though. Preferring an
+    // unusable one shut the door: the recovery notice offers "Run installer"
+    // and Settings offers nothing, so every check returned to a notice with no
+    // action and the release stayed unreachable until the marker aged out
+    // weeks later. Falling through re-offers it as an ordinary download, which
+    // replaces the staged copy anyway.
+    pending = true;
+    restoreStaged(staged);
+    return true;
+  }
+  if (found) {
+    // Native retention is authoritative: empty re-checks and check errors that
+    // still keep a verified artifact re-offer UpdateInfo so Install survives
+    // even after a prior IPC failure cleared the local pending flag.
+    pending = true;
+    const securityEpoch = normalizeSecurityEpoch(found.securityEpoch);
+    updater.set({
+      phase: 'available',
+      version: found.version,
+      securityEpoch,
+      notes: found.notes,
+      date: found.date,
+      downloaded: 0,
+      total: null,
+      error: silent || !result.error ? null : toMessage(result.error),
+      // Unknown/malformed epoch metadata must fail visible, never reuse a
+      // potentially stale dismissal identity.
+      dismissed: isUpdateDismissed(securityEpoch, found.version),
+      // Only meaningful for `stalled`; a fresh update replaces any staged
+      // installer rather than offering the old one.
+      installerReady: false,
+      fromHandoff: false,
+      signatureMissing: false,
+    });
+    return true;
+  }
+  await disposePending();
+  if (result.signatureMissing) {
+    retryAction = 'check';
+    if (staged) {
+      // The recovery offer is worth more than the error text (see the
+      // `result.error` branch below), but the missing signature is a security
+      // fact about the *new* release and must survive the restore.
+      restoreStaged(staged, true);
+      return false;
+    }
+    updater.set({
+      ...INITIAL,
+      phase: silent ? 'idle' : 'error',
+      error: m.updater_signature_missing(),
+      signatureMissing: true,
+    });
+    return false;
+  }
+  if (result.error && !silent) {
+    retryAction = 'check';
+    // A check that failed says nothing about the staged installer either, and
+    // the recovery offer is worth more to the user than the error text.
+    // `secure_updater_check` reports failures in-band rather than rejecting,
+    // so an ordinary offline check lands here, not in the `catch` in
+    // `checkForUpdates` that already restores. Falling through to `error` was
+    // therefore the common way to lose the offer: `takeStagedSnapshot` only
+    // reads the `stalled` phase, so once the phase changes the "Run installer"
+    // button cannot come back for the rest of the run, and the staged bytes
+    // are only reachable by digging through the data folder by hand. The
+    // `stalled` notice does not render `error`, so there is nothing to be
+    // gained by carrying it.
+    if (staged) {
+      restoreStaged(staged);
+      return false;
+    }
+    updater.update((s) => ({
+      ...s,
+      phase: 'error',
+      // `secure_updater_check` reports failures in-band rather than
+      // rejecting, so this string is a coded envelope too and needs the same
+      // decoding as the `catch` path in `checkForUpdates`.
+      error: result.error ? toMessage(result.error) : null,
+    }));
+    return false;
+  }
+  // Finding nothing new says nothing about the staged installer: it is for a
+  // version we are still not running, and it is still sitting there.
+  if (staged) {
+    restoreStaged(staged);
+    return false;
+  }
+  updater.set({ ...INITIAL, phase: silent ? 'idle' : 'uptodate' });
+  return false;
 }
 
 /**
@@ -451,8 +469,11 @@ export async function installUpdate(): Promise<void> {
     onEvent.onmessage = (event) => {
       switch (event.event) {
         case 'Started':
+          // Can come twice: once for a background download this install
+          // waited on, again for the copy it then stages or fetches itself.
           total = event.data.contentLength;
-          updater.update((s) => ({ ...s, phase: 'downloading', total, downloaded: 0 }));
+          downloaded = 0;
+          updater.update((s) => ({ ...s, phase: 'downloading', total, downloaded }));
           break;
         case 'Progress':
           downloaded += event.data.chunkLength;
@@ -471,6 +492,7 @@ export async function installUpdate(): Promise<void> {
     await disposePending();
   } catch (e) {
     retryAction = 'install';
+    noteServicesStopped(e);
     updater.update((s) => ({ ...s, phase: 'error', error: toMessage(e) }));
   } finally {
     installInFlight = false;
@@ -559,6 +581,9 @@ export async function checkUpdateHandoff(): Promise<boolean> {
     return false;
   } finally {
     handoffInFlight = false;
+    const deferred = deferredBackgroundResult;
+    deferredBackgroundResult = null;
+    if (deferred) void applyBackgroundCheckResult(deferred);
   }
 }
 
@@ -577,6 +602,7 @@ export async function runStagedInstaller(): Promise<void> {
   try {
     await invoke('secure_updater_run_saved_installer');
   } catch (e) {
+    noteServicesStopped(e);
     // `install` would have been wrong here: nothing was checked this session, so
     // `pending` is false and Retry fell through to a fresh check — which offers
     // the same version again and re-downloads the installer already sitting

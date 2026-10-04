@@ -1,4 +1,4 @@
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use tracing::{debug, info, trace};
@@ -172,6 +172,76 @@ fn keep_nearest<T>(entries: &mut Vec<([u8; 16], usize, T)>, count: usize) {
     entries.sort_unstable_by_key(|e| (e.0, e.1));
 }
 
+/// Contacts one /24 may take in a k-set the table hands out, while others are
+/// available to take the slot instead.
+const K_SET_MAX_PER_SUBNET: usize = 3;
+/// The same for one address.
+const K_SET_MAX_PER_IP: usize = 2;
+
+/// [`keep_nearest`], but a single /24 or address takes no more than its share
+/// of the result while contacts from elsewhere can fill the slots; whatever is
+/// still short is then filled nearest-first from what was passed over, so the
+/// set stays `count` long on a network with little diversity to offer.
+///
+/// The table's admission caps bound a /24 per bucket, which near a far key
+/// works as a bound on the k-set too, since everything close to it shares one
+/// bucket. Near our own id it does not: the closest contacts spread over many
+/// buckets, and a few addresses with ground keypairs held every slot of our
+/// self-lookup, our `FOUND_NODE` answers and the store-responsibility check.
+fn keep_nearest_diverse(entries: &mut Vec<([u8; 16], usize, &EmberContact)>, count: usize) {
+    if count == 0 || entries.len() <= count {
+        keep_nearest(entries, count);
+        return;
+    }
+    let key = |e: &([u8; 16], usize, &EmberContact)| (e.0, e.1);
+    // Enough of the nearest to fill a diverse set in all but a deliberate
+    // flood, partitioned to the front in place; the whole list is only sorted
+    // when that is not enough.
+    let prefix = count.saturating_mul(4).min(entries.len());
+    entries.select_nth_unstable_by_key(prefix - 1, key);
+    entries[..prefix].sort_unstable_by_key(key);
+    let (mut taken, mut passed) = pick_diverse(&entries[..prefix], count);
+    if taken.len() < count && prefix < entries.len() {
+        entries.sort_unstable_by_key(key);
+        (taken, passed) = pick_diverse(entries, count);
+    }
+    let short = count - taken.len();
+    taken.extend(passed.into_iter().take(short));
+    taken.sort_unstable_by_key(|e| (e.0, e.1));
+    *entries = taken;
+}
+
+/// Walk `pool`, nearest first, taking up to `count` within the per-/24 and
+/// per-address shares; returns what was taken and what was passed over.
+#[allow(clippy::type_complexity)]
+fn pick_diverse<'a>(
+    pool: &[([u8; 16], usize, &'a EmberContact)],
+    count: usize,
+) -> (
+    Vec<([u8; 16], usize, &'a EmberContact)>,
+    Vec<([u8; 16], usize, &'a EmberContact)>,
+) {
+    let mut per_subnet: HashMap<u64, usize> = HashMap::new();
+    let mut per_ip: HashMap<IpAddr, usize> = HashMap::new();
+    let mut taken = Vec::with_capacity(count);
+    let mut passed = Vec::new();
+    for entry in pool {
+        if taken.len() == count {
+            break;
+        }
+        let subnet = per_subnet.entry(entry.2.subnet_key()).or_insert(0);
+        let ip = per_ip.entry(entry.2.addr.ip()).or_insert(0);
+        if *subnet < K_SET_MAX_PER_SUBNET && *ip < K_SET_MAX_PER_IP {
+            *subnet += 1;
+            *ip += 1;
+            taken.push(*entry);
+        } else {
+            passed.push(*entry);
+        }
+    }
+    (taken, passed)
+}
+
 /// Ember DHT routing table: 128 buckets indexed by XOR distance bit position.
 pub struct RoutingTable {
     local_id: EmberNodeId,
@@ -312,7 +382,12 @@ impl RoutingTable {
     /// the pass is done; the rest were dropped.
     pub fn enforce_scale_quotas(&mut self) -> usize {
         let verified = self.verified_len();
-        let floor = scale::NetworkScale::from_contacts(verified.saturating_mul(5) / 4);
+        // Relaxing counts the verified contacts this pass demoted to the caches
+        // as well. They are not gone, only over quota, and measuring residents
+        // alone let a large demotion lower the very count that decides to relax:
+        // the next tick loosened to the tier just enforced away, promotion
+        // re-admitted everyone, and the tick after demoted them again.
+        let floor = scale::NetworkScale::from_contacts(self.verified_held().saturating_mul(5) / 4);
         if floor < self.enforced_scale {
             self.enforced_scale = floor;
         }
@@ -1537,7 +1612,7 @@ impl RoutingTable {
             }
         }
 
-        keep_nearest(&mut all, count);
+        keep_nearest_diverse(&mut all, count);
         all.into_iter().map(|(_, _, c)| c.clone()).collect()
     }
 
@@ -1551,34 +1626,30 @@ impl RoutingTable {
     /// [`EmberContact`] clones per record, up to sixty-four times for one
     /// datagram, for a value the caller compares and drops.
     ///
-    /// A bounded max-heap of `k` distances answers the same question in one pass
-    /// with no clone and no sort: the largest of the `k` smallest is the root
-    /// once every contact has been offered. Contacts at equal distance can swap
-    /// places against the scan-order tie-break `find_closest` uses, which is
-    /// invisible here because only the distance leaves this function.
+    /// It picks the set the same way, diversity included, so an address or a
+    /// /24 crowding the space near a key cannot pull this distance in and make
+    /// us refuse stores for keys we are in fact among the closest to. No
+    /// contact is cloned, and the selection sorts only a short prefix.
     pub fn kth_closest_distance(&self, target: &EmberNodeId, k: usize) -> Option<EmberNodeId> {
         if k == 0 {
             return None;
         }
         let verified_only = self.verified_len() > 0;
 
-        let mut furthest: BinaryHeap<[u8; 16]> = BinaryHeap::with_capacity(k);
+        let mut all: Vec<([u8; 16], usize, &EmberContact)> = Vec::new();
         for bucket in &self.buckets {
             for contact in &bucket.contacts {
                 if verified_only && !contact.is_verified() {
                     continue;
                 }
-                let dist = target.distance(&contact.node_id).0;
-                if furthest.len() < k {
-                    furthest.push(dist);
-                } else if furthest.peek().is_some_and(|worst| dist < *worst) {
-                    furthest.pop();
-                    furthest.push(dist);
-                }
+                all.push((target.distance(&contact.node_id).0, all.len(), contact));
             }
         }
-
-        (furthest.len() == k).then(|| EmberNodeId(furthest.pop().expect("k contacts, k > 0")))
+        if all.len() < k {
+            return None;
+        }
+        keep_nearest_diverse(&mut all, k);
+        all.last().map(|(dist, _, _)| EmberNodeId(*dist))
     }
 
     /// What the table contributes to the bootstrap cache, closest-to-home first.
@@ -1804,6 +1875,16 @@ impl RoutingTable {
             let newcomer_unpromotable = unpromotable(&contact);
             let bucket = &mut self.buckets[bucket_idx];
             match ineligible {
+                // A newcomer the caps would refuse too gains nothing by the
+                // swap, and a flood from one saturated /24 used to cycle the
+                // cache through it. Only proof of contact outranks the victim.
+                Some(pos)
+                    if newcomer_unpromotable
+                        && !(contact.is_verified()
+                            && !bucket.replacement_cache[pos].is_verified()) =>
+                {
+                    return;
+                }
                 Some(pos) => {
                     bucket.replacement_cache.remove(pos);
                 }
@@ -2139,6 +2220,90 @@ mod tests {
             resident_on_shared_ip,
             scale::NetworkScale::Small.max_contacts_per_ip(),
             "promotion re-admitted the share the quota pass had just reclaimed"
+        );
+    }
+
+    /// A few addresses with keypairs ground close to our id no longer own the
+    /// k-set near it while there are others to answer with; with nobody else,
+    /// the set is still filled.
+    #[test]
+    fn one_subnet_cannot_fill_the_k_closest_to_our_id() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        // Twelve contacts on three addresses in one /24, each in a bucket near us.
+        for j in 0..12usize {
+            let mut id = [0u8; 16];
+            id[15] = 1 << (j % 8);
+            id[14] = (j / 8 + 1) as u8;
+            let ip = Ipv4Addr::new(80, 9, 9, 1 + (j % 3) as u8);
+            rt.add_contact(contact_with(id, ip));
+        }
+        let crowd = |ids: &[EmberContact]| {
+            ids.iter().filter(|c| c.addr.ip().to_string().starts_with("80.9.9.")).count()
+        };
+        let only_crowd = rt.find_closest(&local, K_BUCKET_SIZE);
+        assert_eq!(only_crowd.len(), crowd(&only_crowd), "no one else: the set is still filled");
+
+        // Farther away, on distinct networks.
+        for j in 0..20u8 {
+            let mut id = [0u8; 16];
+            id[j as usize % 8] = 0x80 >> (j / 8);
+            id[15] = j;
+            rt.add_contact(contact_with(id, Ipv4Addr::new(100 + j, 1, 1, 1)));
+        }
+        let mixed = rt.find_closest(&local, K_BUCKET_SIZE);
+        assert_eq!(mixed.len(), K_BUCKET_SIZE);
+        assert!(crowd(&mixed) <= K_SET_MAX_PER_SUBNET, "{} from one /24", crowd(&mixed));
+        assert_eq!(
+            rt.kth_closest_distance(&local, K_BUCKET_SIZE),
+            mixed.last().map(|c| local.distance(&c.node_id)),
+            "the proximity check reads the same set"
+        );
+    }
+
+    /// A demotion large enough to lower the resident count below the tier it
+    /// enforced must not read, on the next tick, as a table that lost its peers:
+    /// the demoted contacts are still held, only over quota.
+    #[test]
+    fn a_large_demotion_is_not_undone_on_the_next_tick() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        // One contact per bucket, so the per-IP cap is the only one that binds.
+        let id_in_bucket = |j: usize| {
+            let mut id = [0u8; 16];
+            id[j / 8] = 0x80 >> (j % 8);
+            id[15] |= 0x01;
+            id
+        };
+        // Four per address while the table is small enough to admit them.
+        for j in 0..80usize {
+            let ip = Ipv4Addr::new(30 + (j / 4) as u8, 1, 1, 1);
+            assert!(matches!(rt.add_contact(contact_with(id_in_bucket(j), ip)), AddResult::Added));
+        }
+        for j in 80..100usize {
+            let ip = Ipv4Addr::new(60, j as u8, 1, 1);
+            assert!(matches!(rt.add_contact(contact_with(id_in_bucket(j), ip)), AddResult::Added));
+        }
+        assert_eq!(rt.verified_len(), 100);
+        let per_ip_max = |rt: &RoutingTable| {
+            let mut counts: HashMap<IpAddr, usize> = HashMap::new();
+            for c in rt.buckets.iter().flat_map(|b| b.contacts.iter()) {
+                *counts.entry(c.addr.ip()).or_default() += 1;
+            }
+            counts.values().copied().max().unwrap_or(0)
+        };
+
+        assert!(rt.enforce_scale_quotas() > 0);
+        assert_eq!(per_ip_max(&rt), scale::NetworkScale::Established.max_contacts_per_ip());
+
+        // The next maintenance tick: quota pass, then promotion.
+        rt.enforce_scale_quotas();
+        rt.promote_cached_contacts();
+        assert_eq!(rt.admission_scale(), scale::NetworkScale::Established);
+        assert_eq!(
+            per_ip_max(&rt),
+            scale::NetworkScale::Established.max_contacts_per_ip(),
+            "promotion must not re-admit what the last pass demoted"
         );
     }
 
@@ -2517,6 +2682,36 @@ mod tests {
                 "firsthand observation {i} was flushed by gossip"
             );
         }
+    }
+
+    /// A newcomer the caps would refuse is no better than the unpromotable entry
+    /// it would displace, so a flood from a saturated /24 cannot cycle a proven
+    /// demotee out of the cache.
+    #[test]
+    fn a_flood_from_a_saturated_subnet_cannot_flush_the_cache() {
+        let mut rt = RoutingTable::new(make_id(0), false);
+        for i in 0..(K_BUCKET_SIZE as u8 - 4) {
+            rt.add_contact(contact_at(0x80 + i, 80, i, 1, 1));
+        }
+        for i in 0..4u8 {
+            rt.add_contact(contact_at(0xF0 + i, 9, 9, 9, 1 + i));
+        }
+        assert_eq!(rt.total_contacts(), K_BUCKET_SIZE);
+
+        let demotee = contact_at(0xE0, 9, 9, 9, 50);
+        rt.add_contact(demotee.clone());
+        assert!(rt.get_contact(&demotee.node_id).is_some(), "parked in the cache");
+
+        for i in 0..(2 * K_BUCKET_SIZE as u8) {
+            let mut lead = contact_at(0xA0 + (i % 0x20), 9, 9, 9, 100 + i);
+            lead.node_id.0[1] = i;
+            lead.last_seen = 0;
+            rt.add_contact(lead);
+        }
+        assert!(
+            rt.get_contact(&demotee.node_id).is_some(),
+            "unpromotable hearsay must not displace an unpromotable contact we have reached"
+        );
     }
 
     /// Preferring proven cache entries is only safe if one that has since gone
@@ -4066,12 +4261,36 @@ mod tests {
 
     /// `find_closest` and `find_closest_prefer_verified` select rather than
     /// sort the whole table; the answer has to be exactly what a stable sort
-    /// by distance gives.
+    /// by distance gives — for `find_closest`, followed by the k-set diversity
+    /// rule: nearest first within each /24's and address's share, then the
+    /// passed-over nearest to fill.
     #[test]
     fn bounded_selection_matches_a_full_stable_sort() {
         fn by_sort(mut v: Vec<(EmberNodeId, EmberContact)>, count: usize) -> Vec<EmberNodeId> {
             v.sort_by_key(|a| a.0 .0);
             v.into_iter().take(count).map(|(_, c)| c.node_id).collect()
+        }
+        fn by_diverse_sort(mut v: Vec<(EmberNodeId, EmberContact)>, count: usize) -> Vec<EmberNodeId> {
+            v.sort_by_key(|a| a.0 .0);
+            let mut per_subnet: HashMap<u64, usize> = HashMap::new();
+            let mut per_ip: HashMap<IpAddr, usize> = HashMap::new();
+            let (mut taken, mut passed) = (Vec::new(), Vec::new());
+            for (dist, c) in v {
+                let s = per_subnet.entry(c.subnet_key()).or_insert(0);
+                let i = per_ip.entry(c.addr.ip()).or_insert(0);
+                if *s < K_SET_MAX_PER_SUBNET && *i < K_SET_MAX_PER_IP {
+                    *s += 1;
+                    *i += 1;
+                    taken.push((dist, c.node_id));
+                } else {
+                    passed.push((dist, c.node_id));
+                }
+            }
+            taken.truncate(count);
+            let short = count - taken.len();
+            taken.extend(passed.into_iter().take(short));
+            taken.sort_by_key(|a| a.0 .0);
+            taken.into_iter().map(|(_, id)| id).collect()
         }
         let ids = |v: Vec<EmberContact>| v.into_iter().map(|c| c.node_id).collect::<Vec<_>>();
 
@@ -4107,7 +4326,7 @@ mod tests {
                 for count in (0..=K_BUCKET_SIZE + 2).chain([all.len() - 1, all.len() + 5]) {
                     assert_eq!(
                         ids(rt.find_closest(&target, count)),
-                        by_sort(tagged(&|c| !verified_only || c.is_verified()), count),
+                        by_diverse_sort(tagged(&|c| !verified_only || c.is_verified()), count),
                         "find_closest, count {count}"
                     );
                     let mut expected = by_sort(tagged(&|c| c.is_verified()), count);

@@ -39,8 +39,22 @@ pub struct SharedFoldersWatcher {
     /// registered, so this is what lets the retry loop tell "not requested"
     /// apart from "requested but unavailable".
     desired: Mutex<Vec<String>>,
+    /// Folders whose watch ran into the OS limit on watches (Linux inotify's
+    /// `fs.inotify.max_user_watches`). The minute retry leaves them alone:
+    /// each attempt walks the whole tree again only to fail at the same
+    /// directory. Adding or removing a shared folder tries them again, since
+    /// that is when watches may have been freed.
+    over_limit: Mutex<HashSet<PathBuf>>,
     pending: Arc<Mutex<PendingRescan>>,
     reload_tx: mpsc::Sender<()>,
+}
+
+const WATCH_LIMIT_HINT: &str = "the system limit on watched folders is reached. \
+     On Linux raise it with `sudo sysctl fs.inotify.max_user_watches=524288` \
+     (add it to /etc/sysctl.conf to keep it); until then, changes there need a manual reload";
+
+fn is_watch_limit(error: &notify::Error) -> bool {
+    matches!(error.kind, notify::ErrorKind::MaxFilesWatch)
 }
 
 /// Distinct paths one scoped rescan takes on before a full reload is cheaper
@@ -416,6 +430,9 @@ impl SharedFoldersWatcher {
                     }
                 }
             }
+            Err(e) if is_watch_limit(&e) => {
+                warn!("FS watcher: a new folder is not watched: {WATCH_LIMIT_HINT}")
+            }
             Err(e) => warn!("FS watcher error: {e:?}"),
         }) {
             Ok(watcher) => watcher,
@@ -429,6 +446,7 @@ impl SharedFoldersWatcher {
             watched: Mutex::new(HashSet::new()),
             watcher: Mutex::new(Some(watcher)),
             desired: Mutex::new(initial_paths),
+            over_limit: Mutex::new(HashSet::new()),
             pending,
             reload_tx,
         });
@@ -496,6 +514,7 @@ impl SharedFoldersWatcher {
         // `sync_paths` — which the add/remove folder commands call — for the
         // same stretch.
         let watched_now: HashSet<PathBuf> = self.watched.lock().iter().cloned().collect();
+        let over_limit: HashSet<PathBuf> = self.over_limit.lock().clone();
         let vanished: Vec<PathBuf> = watched_now
             .iter()
             .filter(|path| !path.exists())
@@ -509,7 +528,9 @@ impl SharedFoldersWatcher {
         let reappeared = desired
             .iter()
             .map(PathBuf::from)
-            .any(|path| !watched_now.contains(&path) && path.exists());
+            .any(|path| {
+                !watched_now.contains(&path) && !over_limit.contains(&path) && path.exists()
+            });
 
         if !vanished.is_empty() {
             // Release the OS watch before forgetting the path. Dropping it
@@ -541,6 +562,21 @@ impl SharedFoldersWatcher {
             // installed while we were probing. `apply_watches` re-reads the
             // list itself once its probes are done.
             self.apply_watches(&desired);
+            // A watch reports changes from now on, not what the folder holds:
+            // one offline at launch was never indexed, and one that went away
+            // missed whatever changed meanwhile. Scan the newly watched roots,
+            // as `start` does for the first watches.
+            let returned: Vec<PathBuf> = self
+                .watched
+                .lock()
+                .iter()
+                .filter(|path| !watched_now.contains(*path))
+                .cloned()
+                .collect();
+            if !returned.is_empty() {
+                self.pending.lock().note_paths(returned);
+                let _ = self.reload_tx.try_send(());
+            }
         }
     }
 
@@ -566,6 +602,7 @@ impl SharedFoldersWatcher {
         // Remember the full request, including paths that are offline right
         // now, so `resync_unwatched` can pick them up when they reappear.
         *self.desired.lock() = desired.to_vec();
+        self.over_limit.lock().clear();
         // Everything below is blocking syscalls: `exists()` on an offline
         // SMB/NFS share sits for as long as the OS takes to give up, and so can
         // `watch()`. Every call site is an async Tauri command running on a
@@ -624,15 +661,28 @@ impl SharedFoldersWatcher {
             }
             current.remove(path);
         }
+        let mut over_limit = self.over_limit.lock();
         for path in &to_add {
+            if over_limit.contains(path) {
+                continue;
+            }
             match watcher.watch(path, RecursiveMode::Recursive) {
                 Ok(()) => {
                     current.insert(path.clone());
                     debug!("FS watcher: watching {}", path.display());
                 }
+                Err(e) if is_watch_limit(&e) => {
+                    // A recursive watch that stops partway keeps the watches it
+                    // did add. They are of no use on their own and are exactly
+                    // what another, smaller folder could have watched with.
+                    let _ = watcher.unwatch(path);
+                    over_limit.insert(path.clone());
+                    warn!("FS watcher: not watching {}: {WATCH_LIMIT_HINT}", path.display());
+                }
                 Err(e) => warn!("FS watcher: failed to watch {}: {e}", path.display()),
             }
         }
+        drop(over_limit);
 
         if !to_add.is_empty() || !to_remove.is_empty() {
             info!(

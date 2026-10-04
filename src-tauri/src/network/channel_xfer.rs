@@ -59,6 +59,34 @@ pub(super) async fn send_xfer_frame(
     peer: [u8; 32],
     plain: &[u8],
 ) -> bool {
+    send_xfer_frame_via(socket, state, db, channel_id, peer, plain, false).await
+}
+
+/// [`send_xfer_frame`] for a frame every member carrying it can read: the
+/// plain offer. Its overlay rung goes through members only, never the
+/// non-member hops the ladder otherwise falls back to. In a public room those
+/// can read it too, and a hand-off to them counts as not sent, so each retry
+/// would give it to more of them.
+pub(super) async fn send_xfer_frame_within_room(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    channel_id: [u8; 16],
+    peer: [u8; 32],
+    plain: &[u8],
+) -> bool {
+    send_xfer_frame_via(socket, state, db, channel_id, peer, plain, true).await
+}
+
+async fn send_xfer_frame_via(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    channel_id: [u8; 16],
+    peer: [u8; 32],
+    plain: &[u8],
+    members_only: bool,
+) -> bool {
     let Some(view) = cached_channel_view(state, db, channel_id) else {
         return false;
     };
@@ -94,7 +122,11 @@ pub(super) async fn send_xfer_frame(
         }
     }
     let roster = channel_member_pubkeys_cached(state, db, channel_id);
-    overlay_forward_channel_gossip(socket, state, &channel_id, &body, &[peer], &roster).await
+    let (hops, via_members) = overlay_channel_hops(state, &[peer], &roster);
+    if members_only && !via_members {
+        return false;
+    }
+    overlay_send_channel_gossip(socket, state, &channel_id, &body, &[peer], &hops, via_members).await
 }
 
 // --- QUIC streams ------------------------------------------------------------
@@ -749,11 +781,13 @@ async fn sync_xfer_streams(
         let Some(send) = state.xfer_send.get_mut(&xfer_id) else {
             continue;
         };
-        send.note_streamed(position);
+        let question_down = send.note_streamed(position);
         if send.progress_step().is_some() {
             let (channel_id, peer, name, size, sent) =
                 (send.channel_id, send.peer, send.name.clone(), send.size, send.bytes_sent());
             emit_xfer_update(app_handle, &xfer_id, &channel_id, &peer, "send", &name, size, sent, "active");
+        } else if question_down {
+            emit_xfer_send_update(app_handle, &xfer_id, send);
         }
     }
 
@@ -990,18 +1024,217 @@ pub(super) fn emit_xfer_update(
 ) {
     let _ = app_handle.emit(
         "ember:xfer-update",
-        serde_json::json!({
-            "xfer_id": hex::encode(xfer_id),
-            "channel_id": hex::encode(channel_id),
-            "peer_pubkey": hex::encode(peer),
-            "direction": direction,
-            "name": name,
-            "size": size,
-            "transferred": transferred,
-            "status": status,
-            "risky": crate::security::is_dangerous_extension(name),
-        }),
+        xfer_update_payload(xfer_id, channel_id, peer, direction, name, size, transferred, status),
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn xfer_update_payload(
+    xfer_id: &[u8; 16],
+    channel_id: &[u8; 16],
+    peer: &[u8; 32],
+    direction: &str,
+    name: &str,
+    size: u64,
+    transferred: u64,
+    status: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "xfer_id": hex::encode(xfer_id),
+        "channel_id": hex::encode(channel_id),
+        "peer_pubkey": hex::encode(peer),
+        "direction": direction,
+        "name": name,
+        "size": size,
+        "transferred": transferred,
+        "status": status,
+        "risky": crate::security::is_dangerous_extension(name),
+    })
+}
+
+/// [`emit_xfer_update`] for a send, saying whether the user is being asked to
+/// send its plain offer. Every other update leaves that out, which the page
+/// reads as no.
+pub(super) fn emit_xfer_send_update(
+    app_handle: &tauri::AppHandle,
+    xfer_id: &[u8; 16],
+    send: &ember::xfer::SendState,
+) {
+    let mut payload = xfer_update_payload(
+        xfer_id,
+        &send.channel_id,
+        &send.peer,
+        "send",
+        &send.name,
+        send.size,
+        send.bytes_sent().min(send.size),
+        if send.accepted { "active" } else { "offered" },
+    );
+    payload["awaiting_consent"] = send.awaiting_consent().into();
+    let _ = app_handle.emit("ember:xfer-update", payload);
+}
+
+/// Proof older than this is written again when it is seen again.
+const SEALED_OFFER_READER_REWRITE_SECS: i64 = 24 * 3600;
+/// Bounds [`NetworkState::sealed_offer_readers`]. Only a write-saver: the
+/// database still answers for anyone it drops.
+const SEALED_OFFER_READER_CACHE_CAP: usize = 4096;
+
+/// Members proven to read sealed offers, with when that was last written to
+/// the database (or queued to be). Spares a write for every frame that proves
+/// it again.
+#[derive(Default)]
+pub(super) struct SealedOfferReaders {
+    written: HashMap<[u8; 32], i64>,
+    /// Insertion order of `written`, so the cap drops the member proven
+    /// longest ago rather than everyone. A renewed member is pushed again and
+    /// its older row skipped at pop time.
+    order: std::collections::VecDeque<([u8; 32], i64)>,
+    writes: Arc<SealedOfferReaderWrites>,
+}
+
+/// Proofs waiting for the database, written off the network loop in one
+/// transaction per batch by whichever blocking task holds `flushing`.
+#[derive(Default)]
+struct SealedOfferReaderWrites {
+    proofs: parking_lot::Mutex<HashMap<[u8; 32], i64>>,
+    flushing: std::sync::atomic::AtomicBool,
+}
+
+impl SealedOfferReaders {
+    fn get(&self, member: &[u8; 32]) -> Option<i64> {
+        self.written.get(member).copied().or_else(|| self.writes.proofs.lock().get(member).copied())
+    }
+
+    fn insert(&mut self, member: [u8; 32], at: i64) {
+        if self.written.insert(member, at).is_none() {
+            while self.written.len() > SEALED_OFFER_READER_CACHE_CAP {
+                let Some((oldest, oldest_at)) = self.order.pop_front() else {
+                    break;
+                };
+                if self.written.get(&oldest) == Some(&oldest_at) {
+                    self.written.remove(&oldest);
+                }
+            }
+        }
+        self.order.push_back((member, at));
+        if self.order.len() > 2 * SEALED_OFFER_READER_CACHE_CAP {
+            let written = &self.written;
+            self.order.retain(|(m, at)| written.get(m) == Some(at));
+        }
+    }
+
+    /// Queue `member`'s proof for the database. Past
+    /// [`ember::xfer::SEALED_OFFER_READERS_MAX`] waiting, a proof is held only
+    /// in memory: the table keeps no more than that many anyway.
+    fn queue_write(&self, db: &Arc<Database>, member: [u8; 32], at: i64) {
+        {
+            let mut proofs = self.writes.proofs.lock();
+            if proofs.len() >= ember::xfer::SEALED_OFFER_READERS_MAX && !proofs.contains_key(&member) {
+                return;
+            }
+            proofs.insert(member, at);
+        }
+        if self.writes.flushing.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let writes = self.writes.clone();
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || flush_sealed_offer_readers(&writes, &db));
+    }
+}
+
+fn flush_sealed_offer_readers(writes: &SealedOfferReaderWrites, db: &Database) {
+    use std::sync::atomic::Ordering;
+    loop {
+        let proofs: Vec<([u8; 32], i64)> = writes.proofs.lock().drain().collect();
+        if proofs.is_empty() {
+            writes.flushing.store(false, Ordering::Release);
+            // A proof queued between the drain and the store above saw the
+            // flag still set and left it to this task.
+            if writes.proofs.lock().is_empty() || writes.flushing.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            continue;
+        }
+        let members: Vec<(String, i64)> = proofs.iter().map(|(m, at)| (hex::encode(m), *at)).collect();
+        let members: Vec<(&str, i64)> = members.iter().map(|(m, at)| (m.as_str(), *at)).collect();
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = db.note_sealed_offer_readers(
+            &members,
+            now,
+            now.saturating_sub(ember::xfer::SEALED_OFFER_READER_KEEP_SECS),
+            ember::xfer::SEALED_OFFER_READERS_MAX,
+        ) {
+            warn!("Ember Transfer: could not remember {} member(s) that read sealed offers: {e}", members.len());
+            // Back in the queue for the next flush, which the next proof starts:
+            // the cache already counts these as written and will not queue them
+            // again for a day. Retrying here would spin on a database that is
+            // refusing writes.
+            {
+                let mut pending = writes.proofs.lock();
+                for (member, at) in proofs {
+                    if pending.len() >= ember::xfer::SEALED_OFFER_READERS_MAX {
+                        break;
+                    }
+                    pending.entry(member).or_insert(at);
+                }
+            }
+            writes.flushing.store(false, Ordering::Release);
+            return;
+        }
+    }
+}
+
+/// Remember that `member` reads sealed offers, and take down any question
+/// about sending them a plain offer.
+///
+/// Call only for a frame 1.6.x never sends whose authentication names
+/// `member` — its signature, or the pairwise transfer key — so that a member
+/// forwarding it cannot have made it. Only members on the room's roster are
+/// written. A public room's roster takes fresh identities for free, so the
+/// table also keeps only the newest [`ember::xfer::SEALED_OFFER_READERS_MAX`].
+pub(super) fn note_sealed_offer_reader(
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    channel_id: [u8; 16],
+    member: &[u8; 32],
+) {
+    if *member == state.local_ed25519_pubkey
+        || !channel_member_on_roster(state, db, channel_id, member)
+    {
+        return;
+    }
+    for (xfer_id, send) in state.xfer_send.iter_mut() {
+        if send.heard_from(member) {
+            emit_xfer_send_update(app_handle, xfer_id, send);
+        }
+    }
+    let now = chrono::Utc::now().timestamp();
+    if state.sealed_offer_readers.get(member).is_some_and(|at| {
+        ember::xfer::sealed_offer_reader_current(Some(at), now)
+            && now.saturating_sub(at) < SEALED_OFFER_READER_REWRITE_SECS
+    }) {
+        return;
+    }
+    state.sealed_offer_readers.queue_write(db, *member, now);
+    state.sealed_offer_readers.insert(*member, now);
+}
+
+/// Whether `member` has recently proven it reads sealed offers, so it is
+/// neither held a plain offer nor asked about.
+pub(super) fn member_reads_sealed_offers(
+    state: &NetworkState,
+    db: &Database,
+    member: &[u8; 32],
+) -> bool {
+    let last_seen = state.sealed_offer_readers.get(member).or_else(|| {
+        db.sealed_offer_reader_seen_at(&hex::encode(member))
+            .ok()
+            .flatten()
+    });
+    ember::xfer::sealed_offer_reader_current(last_seen, chrono::Utc::now().timestamp())
 }
 
 /// Whether `peer` is allowed to put an offer in front of the user.
@@ -1138,6 +1371,38 @@ fn xfer_sender_protected(
         || channel_roster_snapshot(state, db, channel_id).is_moderator(peer)
 }
 
+/// What becomes of an authenticated offer before anything about the file is
+/// looked at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum XferOfferGate {
+    /// From a banned member, or one the room does not show: dropped.
+    Refused,
+    /// Over the sender's rate: dropped, and its gossip id let go.
+    Shed,
+    /// Taken further, with "seen" sent back first when it was sealed.
+    Admitted { send_seen: bool },
+}
+
+/// Ban, then roster, then rate, each asked only once the one before passed, so
+/// a refused offer spends none of its sender's allowance. "Seen" is owed only
+/// past all three: any earlier, it would answer a banned or absent member, or
+/// be an echo anyone over their rate could draw for free.
+pub(super) fn xfer_offer_gate<S>(
+    ctx: &mut S,
+    sealed: bool,
+    banned: impl FnOnce(&mut S) -> bool,
+    on_roster: impl FnOnce(&mut S) -> bool,
+    rate_ok: impl FnOnce(&mut S) -> bool,
+) -> XferOfferGate {
+    if banned(ctx) || !on_roster(ctx) {
+        return XferOfferGate::Refused;
+    }
+    if !rate_ok(ctx) {
+        return XferOfferGate::Shed;
+    }
+    XferOfferGate::Admitted { send_seen: sealed }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn apply_xfer_offer(
     socket: &UdpSocket,
@@ -1148,21 +1413,40 @@ pub(super) async fn apply_xfer_offer(
     gossip: &ember::channel::ChannelGossip,
     offer: ember::channel::XferOffer,
     key: [u8; 32],
+    sealed: bool,
 ) {
     let sender_hex = hex::encode(offer.sender);
-    if channel_member_banned(state, db, gossip.channel_id, &offer.sender) {
-        return;
-    }
-    // Only someone we can see in the room may offer. Without this a member
-    // who left, or was never here, could still put a dialog on screen.
-    if !channel_member_pubkeys_cached(state, db, gossip.channel_id).contains(&offer.sender) {
-        return;
-    }
-    // An offer costs the recipient a prompt, so it is rate-limited exactly
-    // like a chat line from the same author.
-    if !channel_author_gossip_ok(state, gossip.channel_id, &offer.sender) {
-        forget_channel_gossip(state, &gossip.msg_id);
-        return;
+    let channel_id = gossip.channel_id;
+    let gate = xfer_offer_gate(
+        state,
+        sealed,
+        |state| channel_member_banned(state, db, channel_id, &offer.sender),
+        // Only someone we can see in the room may offer. Without this a member
+        // who left, or was never here, could still put a dialog on screen.
+        |state| channel_member_pubkeys_cached(state, db, channel_id).contains(&offer.sender),
+        // An offer costs the recipient a prompt, so it is rate-limited exactly
+        // like a chat line from the same author.
+        |state| channel_author_gossip_ok(state, channel_id, &offer.sender),
+    );
+    match gate {
+        XferOfferGate::Refused => return,
+        XferOfferGate::Shed => {
+            forget_channel_gossip(state, &gossip.msg_id);
+            return;
+        }
+        // At once, and ahead of the checks below: the sender only needs to
+        // know it need not ask about the plain offer, whatever becomes of
+        // this one.
+        XferOfferGate::Admitted { send_seen: true } => {
+            let seen = ember::channel::encode_xfer_seen(
+                &key,
+                &state.local_ed25519_pubkey,
+                &offer.sender,
+                &offer.xfer_id,
+            );
+            send_xfer_frame(socket, state, db, channel_id, offer.sender, &seen).await;
+        }
+        XferOfferGate::Admitted { send_seen: false } => {}
     }
     let name = crate::security::sanitize_filename(&offer.name);
     if name.is_empty() {
@@ -1648,6 +1932,20 @@ pub(super) async fn apply_xfer_finish(
     );
 }
 
+/// Remember an offer declined here like a receive that ended, so a later
+/// copy of it (the plain offer a sender falls back to, or a retransmit) gets
+/// the decline again instead of a second prompt.
+pub(super) fn remember_declined_xfer(
+    xfer_id: [u8; 16],
+    channel_id: [u8; 16],
+    peer: [u8; 32],
+    reply: Vec<u8>,
+) {
+    finished_xfers()
+        .lock()
+        .record(xfer_id, channel_id, peer, reply, std::time::Instant::now());
+}
+
 /// Receives that have ended here, with the verdict their sender was sent.
 /// Beside the event loop's state rather than in it because only the transfer
 /// handlers read it.
@@ -1670,12 +1968,15 @@ pub(super) async fn answer_finished_xfer(
     xfer_id: [u8; 16],
     sender: [u8; 32],
 ) -> bool {
-    let answer = finished_xfers()
-        .lock()
-        .answer(&xfer_id, &sender, std::time::Instant::now());
-    let Some((channel_id, verdict)) = answer else {
-        return false;
+    let now = std::time::Instant::now();
+    let answer = {
+        let mut finished = finished_xfers().lock();
+        match finished.answer(&xfer_id, &sender, now) {
+            Some(answer) => answer,
+            None => return finished.remembers(&xfer_id, &sender, now),
+        }
     };
+    let (channel_id, verdict) = answer;
     send_xfer_frame(socket, state, db, channel_id, sender, &verdict).await;
     true
 }
@@ -1792,6 +2093,15 @@ pub(super) async fn drive_channel_transfers(
     }
     let now = std::time::Instant::now();
     let me = state.local_ed25519_pubkey;
+
+    // Sealed offers nobody said they could read. The recipient may be on
+    // v1.6.x, but every member the plain offer is forwarded through can read
+    // the file's name and size in it, so the user is asked instead.
+    for (xfer_id, send) in state.xfer_send.iter_mut() {
+        if send.plain_offer_came_due(now) {
+            emit_xfer_send_update(app_handle, xfer_id, send);
+        }
+    }
 
     // Offers nobody answered. Dropping them keeps a stale dialog from
     // accepting into a transfer the other side has long forgotten.
@@ -2179,6 +2489,126 @@ mod xfer_offer_admission_tests {
             xfer_offer_admission(&[], XFER_MAX_ACTIVE, &member(1), true, Instant::now()),
             XferOfferAdmission::Busy
         );
+    }
+}
+
+#[cfg(test)]
+mod xfer_offer_gate_tests {
+    use super::{xfer_offer_gate, XferOfferGate};
+
+    /// Which checks ran, in order.
+    #[derive(Default)]
+    struct Asked(Vec<&'static str>);
+
+    fn gate(sealed: bool, banned: bool, on_roster: bool, rate_ok: bool) -> (XferOfferGate, Vec<&'static str>) {
+        let mut asked = Asked::default();
+        let verdict = xfer_offer_gate(
+            &mut asked,
+            sealed,
+            |a| {
+                a.0.push("ban");
+                banned
+            },
+            |a| {
+                a.0.push("roster");
+                on_roster
+            },
+            |a| {
+                a.0.push("rate");
+                rate_ok
+            },
+        );
+        (verdict, asked.0)
+    }
+
+    /// "Seen" goes back only for a sealed offer, and only once the ban, roster
+    /// and rate checks have all passed.
+    #[test]
+    fn seen_is_owed_only_for_a_sealed_offer_past_every_check() {
+        assert_eq!(
+            gate(true, false, true, true),
+            (XferOfferGate::Admitted { send_seen: true }, vec!["ban", "roster", "rate"])
+        );
+        assert_eq!(gate(false, false, true, true).0, XferOfferGate::Admitted { send_seen: false });
+        assert_eq!(gate(true, true, true, true), (XferOfferGate::Refused, vec!["ban"]));
+        assert_eq!(gate(true, false, false, true), (XferOfferGate::Refused, vec!["ban", "roster"]));
+        assert_eq!(gate(true, false, true, false).0, XferOfferGate::Shed);
+    }
+
+    /// A refused offer does not spend its sender's rate allowance.
+    #[test]
+    fn a_refused_offer_is_never_rate_counted() {
+        for (banned, on_roster) in [(true, true), (true, false), (false, false)] {
+            let (_, asked) = gate(true, banned, on_roster, true);
+            assert!(!asked.contains(&"rate"), "{asked:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sealed_offer_reader_tests {
+    use super::{SealedOfferReaders, SEALED_OFFER_READER_CACHE_CAP};
+    use crate::storage::database::Database;
+    use std::sync::Arc;
+
+    fn member(i: usize) -> [u8; 32] {
+        let mut m = [0u8; 32];
+        m[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        m
+    }
+
+    /// At the cap the member proven longest ago makes way, rather than the
+    /// whole cache emptying and every member costing a write again.
+    #[test]
+    fn a_full_cache_drops_its_oldest_member_only() {
+        let mut readers = SealedOfferReaders::default();
+        for i in 0..SEALED_OFFER_READER_CACHE_CAP {
+            readers.insert(member(i), i as i64);
+        }
+        readers.insert(member(0), 10_000);
+        readers.insert(member(SEALED_OFFER_READER_CACHE_CAP), 10_001);
+        assert_eq!(readers.written.len(), SEALED_OFFER_READER_CACHE_CAP);
+        assert_eq!(readers.get(&member(0)), Some(10_000), "renewed, so kept");
+        assert_eq!(readers.get(&member(1)), None, "the oldest made way");
+        assert_eq!(readers.get(&member(2)), Some(2));
+        assert_eq!(readers.get(&member(SEALED_OFFER_READER_CACHE_CAP)), Some(10_001));
+        assert!(readers.order.len() <= 2 * SEALED_OFFER_READER_CACHE_CAP);
+    }
+
+    /// Proofs reach the database from a blocking task, not the caller.
+    #[tokio::test]
+    async fn queued_proofs_reach_the_database() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-sealed-readers-flush-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Arc::new(Database::open_at(&path).expect("open db"));
+        let readers = SealedOfferReaders::default();
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..3 {
+            readers.queue_write(&db, member(i), now - i as i64);
+        }
+        for _ in 0..200 {
+            if !readers.writes.flushing.load(std::sync::atomic::Ordering::Acquire)
+                && readers.writes.proofs.lock().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        for i in 0..3 {
+            assert_eq!(
+                db.sealed_offer_reader_seen_at(&hex::encode(member(i))).unwrap(),
+                Some(now - i as i64)
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 }
 

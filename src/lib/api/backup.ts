@@ -33,13 +33,25 @@ export interface PendingRestoreStatus {
   pending: boolean;
   /** Unix seconds; 0 when nothing is staged. */
   staged_at: number;
+  /** Unix seconds after which a launch discards the restore instead of
+   *  applying it; 0 when nothing is staged or the restore never expires. */
+  expires_at: number;
   app_version: string;
   files: number;
 }
 
-/** Write an encrypted profile backup. The save location is chosen in a native dialog. */
-export async function exportBackup(passphrase: string): Promise<BackupSummary | null> {
-  return invoke('export_backup', { passphrase });
+/** Write an encrypted profile backup. The save location is chosen in a native
+ *  dialog. `webviewPrefs` is the window's own preferences, from `collectBackupPrefs`. */
+export async function exportBackup(
+  passphrase: string,
+  webviewPrefs: Record<string, string> | null,
+): Promise<BackupSummary | null> {
+  return invoke('export_backup', { passphrase, webviewPrefs });
+}
+
+/** The window preferences a restore applied at this launch brought back, once. */
+export async function takePendingRestoredPrefs(): Promise<Record<string, string> | null> {
+  return invoke('take_pending_restored_prefs');
 }
 
 /** Native open-dialog for restore. Returns the display path, or null if cancelled. */

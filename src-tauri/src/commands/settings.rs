@@ -99,11 +99,14 @@ pub(crate) fn persist_with_root_transaction(
 /// always restores these values from the authoritative in-memory config.
 const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     "shared_folders",
+    "previous_download_folders",
     "default_shared_folder_seeded",
     "folder_priorities",
     "pending_share_states",
     "pending_file_priorities",
+    "pending_friends_only",
     "pending_folder_allowlists",
+    "withheld_folder_files",
     "shared_folder_scan_cursors",
     // Historical one-shot marker; the overlay is now always on, but the
     // renderer still must not clear it (it would re-run the migration).
@@ -119,6 +122,9 @@ const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     // a friend lookup that silently stops working, which is exactly the kind
     // of change no renderer needs to make.
     "rendezvous_url",
+    // `config.json` only, like the URL above: the escape hatch back to a
+    // separate QUIC socket is an operator's call, not the renderer's.
+    "quic_shares_udp_port",
 ];
 
 fn merge_renderer_settings(
@@ -512,7 +518,7 @@ pub async fn pick_preview_player(
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
-fn normalized_path_components(path: &std::path::Path) -> Vec<String> {
+pub(crate) fn normalized_path_components(path: &std::path::Path) -> Vec<String> {
     path.components()
         .map(|component| {
             let value = component.as_os_str().to_string_lossy().into_owned();
@@ -667,7 +673,13 @@ fn prune_removed_shared_folder_state(
         .pending_file_priorities
         .retain(|path, _| !is_under_removed_root(path));
     settings
+        .pending_friends_only
+        .retain(|path| !is_under_removed_root(path));
+    settings
         .pending_folder_allowlists
+        .retain(|folder, _| !is_under_removed_root(folder));
+    settings
+        .withheld_folder_files
         .retain(|folder, _| !is_under_removed_root(folder));
     settings
         .shared_folder_scan_cursors
@@ -689,6 +701,47 @@ const MAX_SHARED_FOLDERS: usize = 512;
 const MAX_URL_LEN: usize = 2 * 1024;
 const MAX_FILENAME_CLEANUPS_LEN: usize = 16 * 1024;
 use crate::bandwidth::MAX_CONFIGURED_SPEED_BPS;
+use crate::network::ed2k::sources::MIN_SOURCES_PER_FILE;
+
+/// Longest download category name, in characters; the menu and the filter chip
+/// show it whole.
+const DOWNLOAD_CATEGORY_MAX_CHARS: usize = 40;
+const MAX_DOWNLOAD_CATEGORIES: usize = 32;
+/// The category values the Transfers page ships with. A user category of the
+/// same name would be one filter shown twice.
+const BUILTIN_DOWNLOAD_CATEGORIES: [&str; 7] =
+    ["None", "Audio", "Video", "Image", "Archive", "Document", "Program"];
+
+/// The user's download categories, cleaned: invisible and control characters
+/// dropped, whitespace collapsed, names cut to length, and empty, built-in and
+/// case-insensitively repeated names removed, keeping the first of each.
+fn normalize_download_categories(names: &[String]) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for name in names {
+        let visible: String = name
+            .chars()
+            .filter(|c| !crate::security::is_invisible_or_bidi_control_pub(*c))
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let collapsed = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+        let cut: String = collapsed.chars().take(DOWNLOAD_CATEGORY_MAX_CHARS).collect();
+        let cleaned = cut.trim_end();
+        if cleaned.is_empty() {
+            continue;
+        }
+        let folded = cleaned.to_lowercase();
+        let taken = BUILTIN_DOWNLOAD_CATEGORIES.iter().any(|b| b.to_lowercase() == folded)
+            || kept.iter().any(|k| k.to_lowercase() == folded);
+        if taken {
+            continue;
+        }
+        kept.push(cleaned.to_string());
+        if kept.len() == MAX_DOWNLOAD_CATEGORIES {
+            break;
+        }
+    }
+    kept
+}
 
 fn clamp_assign<T: Ord + Copy>(value: &mut T, min: T, max: T) -> bool {
     let clamped = (*value).clamp(min, max);
@@ -768,11 +821,18 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     }
 
     let freq = settings.update_check_frequency.trim().to_ascii_lowercase();
-    if freq != "daily" && freq != "weekly" && freq != "monthly" {
+    if !crate::auto_update::record::CHECK_FREQUENCIES.contains(&freq.as_str()) {
         settings.update_check_frequency = "daily".to_string();
         changed = true;
     } else if freq != settings.update_check_frequency {
         settings.update_check_frequency = freq;
+        changed = true;
+    }
+
+    // Silent updates act on what the automatic checks find, so without those
+    // checks there is nothing for them to install.
+    if settings.silent_update_enabled && !settings.auto_check_updates {
+        settings.silent_update_enabled = false;
         changed = true;
     }
 
@@ -801,7 +861,7 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
     changed |= clamp_assign(&mut settings.download_queue_wait_secs, 60, 14400);
-    changed |= clamp_assign(&mut settings.max_sources_per_file, 1, 2000);
+    changed |= clamp_assign(&mut settings.max_sources_per_file, MIN_SOURCES_PER_FILE, 2000);
     changed |= clamp_assign(&mut settings.max_connections, 1, 2000);
     // 0 is meaningful here — it turns the burst gate off — so it is clamped
     // from above only.
@@ -828,6 +888,12 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     // whole configuration, and an inert rule was never throttling anything.
     changed |= crate::bandwidth::schedule::repair(&mut settings.bandwidth_schedule);
 
+    let categories = normalize_download_categories(&settings.download_categories);
+    if categories != settings.download_categories {
+        settings.download_categories = categories;
+        changed = true;
+    }
+
     // Drop shared folders that would fail validate (sensitive segments) or that
     // contain / are the Ember data directory. Older builds allowed some AppData
     // paths; rejecting them in validate alone would wipe the entire config.
@@ -852,15 +918,11 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         let canonical = path.canonicalize().ok();
         let scan_paths = std::iter::once(path.to_path_buf()).chain(canonical);
         for scan_path in scan_paths {
-            for component in scan_path.components() {
-                if let std::path::Component::Normal(seg) = component {
-                    if crate::sharing::is_sensitive_dir_name(&seg.to_string_lossy()) {
-                        tracing::warn!(
-                            "Removing shared folder with sensitive path segment on load: {folder}"
-                        );
-                        return false;
-                    }
-                }
+            if crate::sharing::path_has_sensitive_component(&scan_path) {
+                tracing::warn!(
+                    "Removing shared folder with sensitive path segment on load: {folder}"
+                );
+                return false;
             }
         }
         true
@@ -869,7 +931,79 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    changed |= repair_previous_download_folders(settings);
+
     changed
+}
+
+fn is_filesystem_root(path: &std::path::Path) -> bool {
+    path.has_root()
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// What the download folder may neither be nor resolve to: a filesystem root
+/// or a system directory. The earlier download folders get the same check,
+/// at startup, on what they resolve to.
+pub(crate) fn resolved_download_folder_refused(path: &std::path::Path) -> bool {
+    is_filesystem_root(path) || crate::sharing::path_has_sensitive_component(path)
+}
+
+/// The download folder's checks that need only its text: set, within the
+/// length limit, no `..`, and not refused as written.
+fn download_folder_text_acceptable(folder: &str) -> bool {
+    let path = std::path::Path::new(folder);
+    !folder.is_empty()
+        && folder.len() <= MAX_PATH_LEN
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        && !resolved_download_folder_refused(path)
+}
+
+/// Drop the earlier download folders whose text fails the download folder's
+/// own checks, and keep the rest once each, newest first and at most
+/// [`MAX_PREVIOUS_DOWNLOAD_FOLDERS`]. Each one is an approved root, and
+/// startup approves all of them after a restore, so a crafted backup must not
+/// be able to list a drive root or a system folder here. Dropped rather than
+/// refused: one bad entry is not worth resetting every other setting. Kept as
+/// written: the approved-root registry knows a root by that string, and a
+/// resolved spelling would read as a different root. Touches no disk, as a
+/// config load must not wait on an offline share: what each one resolves to
+/// is checked at startup, within a time limit
+/// (`storage::part_folders::forget_finished_previous_folders`).
+///
+/// [`MAX_PREVIOUS_DOWNLOAD_FOLDERS`]: crate::storage::part_folders::MAX_PREVIOUS_DOWNLOAD_FOLDERS
+fn repair_previous_download_folders(settings: &mut AppSettings) -> bool {
+    if settings.previous_download_folders.is_empty() {
+        return false;
+    }
+    let mut taken = vec![normalized_path_components(std::path::Path::new(
+        &settings.download_folder,
+    ))];
+    let mut kept: Vec<String> = Vec::new();
+    for folder in &settings.previous_download_folders {
+        if kept.len() == crate::storage::part_folders::MAX_PREVIOUS_DOWNLOAD_FOLDERS {
+            tracing::warn!("Too many earlier download folders in config; keeping the newest");
+            break;
+        }
+        if !download_folder_text_acceptable(folder) {
+            tracing::warn!("Removing earlier download folder that cannot be a download folder on load: {folder}");
+            continue;
+        }
+        let key = normalized_path_components(std::path::Path::new(folder));
+        if taken.contains(&key) {
+            continue;
+        }
+        taken.push(key);
+        kept.push(folder.clone());
+    }
+    if kept == settings.previous_download_folders {
+        return false;
+    }
+    settings.previous_download_folders = kept;
+    true
 }
 
 pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
@@ -910,13 +1044,12 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB,
         ));
     }
-    if settings.update_check_frequency != "daily"
-        && settings.update_check_frequency != "weekly"
-        && settings.update_check_frequency != "monthly"
+    if !crate::auto_update::record::CHECK_FREQUENCIES
+        .contains(&settings.update_check_frequency.as_str())
     {
         return Err(coded(
             "settings_update_check_frequency_invalid",
-            "Update check frequency must be 'daily', 'weekly', or 'monthly'",
+            "Update check frequency must be 'hourly', 'daily', 'weekly', or 'monthly'",
         ));
     }
     // Checked whether or not the timetable is switched on: the rules persist
@@ -1049,10 +1182,10 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "Download queue wait must be between 60 and 14400 seconds",
         ));
     }
-    if !(1..=2000).contains(&settings.max_sources_per_file) {
+    if !(MIN_SOURCES_PER_FILE..=2000).contains(&settings.max_sources_per_file) {
         return Err(coded(
             "settings_max_sources_per_file_invalid",
-            "Max sources per file must be between 1 and 2000",
+            format!("Max sources per file must be between {MIN_SOURCES_PER_FILE} and 2000"),
         ));
     }
     if !(1..=2000).contains(&settings.max_connections) {
@@ -1112,12 +1245,6 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
     if !settings.channel_username.is_empty() {
         crate::commands::channels::sanitize_channel_username(&settings.channel_username)?;
     }
-    let is_filesystem_root = |path: &std::path::Path| {
-        path.has_root()
-            && !path
-                .components()
-                .any(|c| matches!(c, std::path::Component::Normal(_)))
-    };
     // Rejected rather than skipped. An empty value used to bypass the whole
     // path-safety block below, then compose the *relative* path `Downloads`
     // against the process CWD, while `lib.rs` skipped both `create_dir_all` and
@@ -1165,16 +1292,12 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         let canonical = path.canonicalize().ok();
         let scan_paths = std::iter::once(path.to_path_buf()).chain(canonical);
         for scan_path in scan_paths {
-            for component in scan_path.components() {
-                if let std::path::Component::Normal(seg) = component {
-                    if crate::sharing::is_sensitive_dir_name(&seg.to_string_lossy()) {
-                        return Err(coded_ctx(
-                            "settings_download_folder_system_dir",
-                            "Cannot use system directory as download folder",
-                            &settings.download_folder,
-                        ));
-                    }
-                }
+            if crate::sharing::path_has_sensitive_component(&scan_path) {
+                return Err(coded_ctx(
+                    "settings_download_folder_system_dir",
+                    "Cannot use system directory as download folder",
+                    &settings.download_folder,
+                ));
             }
         }
     }
@@ -1234,16 +1357,12 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         let canonical = path.canonicalize().ok();
         let scan_paths = std::iter::once(path.to_path_buf()).chain(canonical.clone());
         for scan_path in scan_paths {
-            for component in scan_path.components() {
-                if let std::path::Component::Normal(seg) = component {
-                    if crate::sharing::is_sensitive_dir_name(&seg.to_string_lossy()) {
-                        return Err(coded_ctx(
-                            "settings_shared_folder_system_dir",
-                            "Cannot share system directory",
-                            folder,
-                        ));
-                    }
-                }
+            if crate::sharing::path_has_sensitive_component(&scan_path) {
+                return Err(coded_ctx(
+                    "settings_shared_folder_system_dir",
+                    "Cannot share system directory",
+                    folder,
+                ));
             }
         }
         // Refuse Ember's own data directory (or a parent that covers it).
@@ -1321,6 +1440,11 @@ pub async fn update_settings(
     settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
     settings.channel_file_offers = settings.channel_file_offers.trim().to_ascii_lowercase();
     settings.update_check_frequency = settings.update_check_frequency.trim().to_ascii_lowercase();
+    // Silent updates act on what the automatic checks find; the Settings page
+    // switches the two together, and this holds the rule for any other caller.
+    if !settings.auto_check_updates {
+        settings.silent_update_enabled = false;
+    }
     // Web services are URL templates the user curates, so they are normalised
     // here rather than trusted: each is checked for a http/https scheme, a host
     // and no embedded credentials, duplicates by URL are dropped, and the list
@@ -1335,6 +1459,7 @@ pub async fn update_settings(
         warn!("Dropping web service {name:?} from settings: {reason}");
     }
     settings.web_services = kept_services;
+    settings.download_categories = normalize_download_categories(&settings.download_categories);
     // Not exposed in Settings UI — always keep friend sessions encrypted.
     settings.friend_session_encryption = true;
     // Ember overlay is always on. The Settings / Ember-page switches stay
@@ -1489,6 +1614,25 @@ pub async fn update_settings(
     // removes the existing mapping, because shutdown tears down on the value it
     // started with.
     let upnp_changed = settings.upnp_enabled != old_settings.upnp_enabled;
+    let download_folder_changed = !settings.download_folder.is_empty()
+        && normalized_path_components(std::path::Path::new(&settings.download_folder))
+            != normalized_path_components(std::path::Path::new(&old_settings.download_folder));
+    if download_folder_changed {
+        // Unfinished downloads stay where they are, so the folder they are in
+        // has to stay listed, and approved, until they are done.
+        let old_current = old_settings.download_folder.clone();
+        let old_previous = old_settings.previous_download_folders.clone();
+        let new_current = settings.download_folder.clone();
+        settings.previous_download_folders = tokio::task::spawn_blocking(move || {
+            crate::storage::part_folders::previous_after_change(
+                &old_current,
+                &old_previous,
+                &new_current,
+            )
+        })
+        .await
+        .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?;
+    }
 
     let save_data = {
         let config = state.config.read().await;
@@ -1501,15 +1645,9 @@ pub async fn update_settings(
         })?
     };
     {
-        let mut roots = settings.shared_folders.clone();
-        if !settings.download_folder.is_empty() {
-            roots.push(settings.download_folder.clone());
-        }
+        let roots = settings.configured_roots();
         let mut explicit_additions = added_shared_folders.clone();
-        if !settings.download_folder.is_empty()
-            && normalized_path_components(std::path::Path::new(&settings.download_folder))
-                != normalized_path_components(std::path::Path::new(&old_settings.download_folder))
-        {
+        if download_folder_changed {
             // Moving the download folder approves a new sandbox root and
             // redirects every future download, so the path must have come from
             // `pick_download_folder`, not from whatever the renderer submitted.
@@ -1670,14 +1808,15 @@ pub async fn update_settings(
     //
     // Waits briefly for room rather than giving up at once. By now the
     // approved-root set already names the new download folder and no longer
-    // names the old one, so a dropped update left the loop starting every
-    // download in a folder it could no longer write to until a restart. A full
-    // queue is a busy loop, not a dead one, and a few seconds is normally enough.
+    // names the old one unless downloads are left in it, so a dropped update
+    // left the loop starting every download in a folder it could no longer
+    // write to until a restart. A full queue is a busy loop, not a dead one,
+    // and a few seconds is normally enough.
     let runtime_update_deferred = match state
         .network_tx
         .send_timeout(
             NetworkCommand::UpdateSettings {
-                settings: settings.clone(),
+                settings: Box::new(settings.clone()),
             },
             std::time::Duration::from_secs(5),
         )
@@ -2095,6 +2234,20 @@ pub async fn download_ipfilter(
 
 #[tauri::command]
 pub fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
+    if !crate::tray::reachable() {
+        // Hidden with no visible tray icon, the window could not be reached
+        // again; minimized, it stays on the taskbar and in the window switcher.
+        if let Some(window) = app.get_webview_window("main") {
+            window.minimize().map_err(|e| {
+                coded_ctx(
+                    "settings_hide_window_failed",
+                    "Failed to hide main window",
+                    e,
+                )
+            })?;
+        }
+        return Ok(());
+    }
     crate::commands::chat_window::set_chat_window_visible(&app, false);
     if let Some(window) = app.get_webview_window("main") {
         window.hide().map_err(|e| {
@@ -2176,6 +2329,54 @@ pub fn take_pending_restore_failed_notice(
     Ok(state
         .pending_restore_failed_notice
         .swap(false, std::sync::atomic::Ordering::AcqRel))
+}
+
+/// Consume the "a staged restore was too old and was discarded" notice, if
+/// startup raised one. One-shot for the same reason as the latch above.
+#[tauri::command]
+pub fn take_pending_restore_expired_notice(
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    Ok(state
+        .pending_restore_expired_notice
+        .swap(false, std::sync::atomic::Ordering::AcqRel))
+}
+
+const KNOWN_MET_NOTICE_NONE: u8 = 0;
+const KNOWN_MET_NOTICE_UNREADABLE: u8 = 1;
+const KNOWN_MET_NOTICE_RESET: u8 = 2;
+static PENDING_KNOWN_MET_NOTICE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(KNOWN_MET_NOTICE_NONE);
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct KnownMetNotice {
+    /// The catalog was lost and sharing reset to fail-closed, rather than
+    /// unreadable this session.
+    pub reset: bool,
+}
+
+/// Latch the "known.met could not be read" notice for the frontend to take.
+pub(crate) fn raise_known_met_notice(reset: bool) {
+    let notice = if reset {
+        KNOWN_MET_NOTICE_RESET
+    } else {
+        KNOWN_MET_NOTICE_UNREADABLE
+    };
+    PENDING_KNOWN_MET_NOTICE.store(notice, std::sync::atomic::Ordering::Release);
+}
+
+/// Consume the known.met notice, if the deferred catalog load raised one.
+/// Its event is emitted once, seconds into the session, and a webview still
+/// starting or reloading then would leave sharing failing closed unexplained.
+#[tauri::command]
+pub fn take_pending_known_met_notice() -> Result<Option<KnownMetNotice>, String> {
+    let notice =
+        PENDING_KNOWN_MET_NOTICE.swap(KNOWN_MET_NOTICE_NONE, std::sync::atomic::Ordering::AcqRel);
+    Ok(match notice {
+        KNOWN_MET_NOTICE_UNREADABLE => Some(KnownMetNotice { reset: false }),
+        KNOWN_MET_NOTICE_RESET => Some(KnownMetNotice { reset: true }),
+        _ => None,
+    })
 }
 
 #[tauri::command]
@@ -2849,6 +3050,22 @@ pub async fn open_ember_share(target: String, text: String) -> Result<(), String
 mod tests {
     use super::*;
 
+    #[test]
+    fn known_met_notice_waits_for_the_frontend_and_is_taken_once() {
+        raise_known_met_notice(false);
+        assert_eq!(
+            take_pending_known_met_notice().unwrap(),
+            Some(KnownMetNotice { reset: false })
+        );
+        assert_eq!(take_pending_known_met_notice().unwrap(), None);
+        raise_known_met_notice(true);
+        assert_eq!(
+            take_pending_known_met_notice().unwrap(),
+            Some(KnownMetNotice { reset: true })
+        );
+        assert_eq!(take_pending_known_met_notice().unwrap(), None);
+    }
+
     /// Removing one root must not prune state that belongs to a whole-drive
     /// share still in the list, and removing the drive share prunes its own.
     #[cfg(windows)]
@@ -3076,6 +3293,126 @@ mod tests {
         }
     }
 
+    /// A restored backup's config is loaded through soft repair, and startup
+    /// approves every earlier download folder it lists, so each one gets the
+    /// download folder's checks — and a bad one costs only itself.
+    #[test]
+    fn earlier_download_folders_in_a_loaded_config_are_checked_like_the_download_folder() {
+        let (current, kept_a, kept_b, root, system) = if cfg!(windows) {
+            (
+                r"Q:\Ember Now",
+                r"Q:\Ember Old\One",
+                r"Q:\Ember Old\Two",
+                r"Q:\",
+                r"Q:\Windows\Ember",
+            )
+        } else {
+            ("/srv/ember-now", "/srv/ember-old/one", "/srv/ember-old/two", "/", "/etc/ember")
+        };
+        let escaping = format!("{kept_a}{}..", std::path::MAIN_SEPARATOR);
+        let respelled = if cfg!(windows) {
+            r"q:\ember old\one\".to_string()
+        } else {
+            format!("{kept_a}/")
+        };
+        let mut settings = AppSettings {
+            download_folder: current.into(),
+            previous_download_folders: vec![
+                kept_a.into(),
+                root.into(),
+                system.into(),
+                escaping,
+                "x".repeat(MAX_PATH_LEN + 1),
+                respelled,
+                current.into(),
+                String::new(),
+                kept_b.into(),
+            ],
+            ..AppSettings::default()
+        };
+
+        assert!(soft_repair_settings(&mut settings));
+        assert_eq!(settings.previous_download_folders, [kept_a, kept_b]);
+        assert!(validate_settings(&settings).is_ok());
+        assert!(
+            !soft_repair_settings(&mut settings),
+            "a clean list is left alone"
+        );
+    }
+
+    /// An earlier download folder is held to exactly the download folder's
+    /// rules, no stricter: one that was a valid download folder — the home
+    /// folder, holding Ember's data directory, included — stays valid once
+    /// the user picks another.
+    #[test]
+    fn an_earlier_download_folder_is_valid_exactly_when_it_could_be_the_download_folder() {
+        let home = directories::UserDirs::new()
+            .map(|dirs| dirs.home_dir().to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let candidates = if cfg!(windows) {
+            vec![
+                r"Q:\Ember Old".to_string(),
+                r"Q:\".to_string(),
+                r"Q:\Windows\Ember".to_string(),
+                r"Q:\Ember Old\..\x".to_string(),
+                "relative\\old".to_string(),
+                "x".repeat(MAX_PATH_LEN + 1),
+                String::new(),
+                home,
+            ]
+        } else {
+            vec![
+                "/srv/ember-old".to_string(),
+                "/".to_string(),
+                "/etc/ember".to_string(),
+                "/srv/ember-old/../x".to_string(),
+                "relative/old".to_string(),
+                "x".repeat(MAX_PATH_LEN + 1),
+                String::new(),
+                home,
+            ]
+        };
+        let current = if cfg!(windows) { r"Q:\Ember Now" } else { "/srv/ember-now" };
+        for candidate in candidates {
+            let as_download_folder = AppSettings {
+                download_folder: candidate.clone(),
+                ..AppSettings::default()
+            };
+            let mut as_previous = AppSettings {
+                download_folder: current.into(),
+                previous_download_folders: vec![candidate.clone()],
+                ..AppSettings::default()
+            };
+            soft_repair_settings(&mut as_previous);
+            assert_eq!(
+                validate_settings(&as_download_folder).is_ok(),
+                as_previous.previous_download_folders == [candidate.clone()],
+                "{candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_loaded_config_keeps_at_most_the_newest_earlier_download_folders() {
+        let max = crate::storage::part_folders::MAX_PREVIOUS_DOWNLOAD_FOLDERS;
+        let folder = |i: usize| {
+            if cfg!(windows) {
+                format!(r"Q:\Ember Old\{i}")
+            } else {
+                format!("/srv/ember-old/{i}")
+            }
+        };
+        let mut settings = AppSettings {
+            previous_download_folders: (0..max + 5).map(folder).collect(),
+            ..AppSettings::default()
+        };
+        assert!(soft_repair_settings(&mut settings));
+        assert_eq!(
+            settings.previous_download_folders,
+            (0..max).map(folder).collect::<Vec<_>>()
+        );
+    }
+
     /// Tightening the Channel username to 2–12 alphanumerics made every
     /// handle stored under the old 32-byte rule fail `validate_settings` — and
     /// on load that answer backs up `config.json` and resets *every* setting.
@@ -3210,6 +3547,51 @@ mod tests {
         };
         assert!(soft_repair_settings(&mut settings));
         assert!(settings.friend_session_encryption);
+    }
+
+    #[test]
+    fn max_sources_per_file_below_the_floor_is_raised_on_load_and_refused_on_save() {
+        let mut settings = AppSettings {
+            max_sources_per_file: 20,
+            ..AppSettings::default()
+        };
+        let err = validate_settings(&settings).expect_err("below the floor must fail");
+        assert!(
+            err.contains("settings_max_sources_per_file_invalid"),
+            "unexpected error: {err}"
+        );
+        assert!(soft_repair_settings(&mut settings));
+        assert_eq!(settings.max_sources_per_file, MIN_SOURCES_PER_FILE);
+        assert!(validate_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn download_categories_are_cleaned_on_load() {
+        let long = "x".repeat(DOWNLOAD_CATEGORY_MAX_CHARS + 5);
+        let mut settings = AppSettings {
+            download_categories: vec![
+                "  Linux   ISOs ".into(),
+                "linux isos".into(),
+                "video".into(),
+                "\u{202E}Films\t".into(),
+                "   ".into(),
+                long,
+            ],
+            ..AppSettings::default()
+        };
+        assert!(soft_repair_settings(&mut settings));
+        assert_eq!(
+            settings.download_categories,
+            vec![
+                "Linux ISOs".to_string(),
+                "Films".to_string(),
+                "x".repeat(DOWNLOAD_CATEGORY_MAX_CHARS),
+            ]
+        );
+        assert!(!soft_repair_settings(&mut settings), "a clean list is left alone");
+
+        let many: Vec<String> = (0..MAX_DOWNLOAD_CATEGORIES + 3).map(|i| format!("Cat {i}")).collect();
+        assert_eq!(normalize_download_categories(&many).len(), MAX_DOWNLOAD_CATEGORIES);
     }
 
     #[test]
@@ -3371,6 +3753,7 @@ mod tests {
         let mut authoritative = AppSettings {
             shared_folders: vec!["/trusted/share".into()],
             default_shared_folder_seeded: true,
+            previous_download_folders: vec!["/trusted/old-downloads".into()],
             ..AppSettings::default()
         };
         authoritative
@@ -3421,8 +3804,16 @@ mod tests {
             "shared_folder_scan_cursors".into(),
             serde_json::json!({"/renderer/injected": "stolen"}),
         );
+        object.insert(
+            "previous_download_folders".into(),
+            serde_json::json!(["/renderer/injected"]),
+        );
 
         let merged = merge_renderer_settings(renderer, &authoritative).unwrap();
+        assert_eq!(
+            merged.previous_download_folders,
+            authoritative.previous_download_folders
+        );
         assert_eq!(merged.nickname, "Allowed change");
         assert_eq!(merged.shared_folders, authoritative.shared_folders);
         assert_eq!(

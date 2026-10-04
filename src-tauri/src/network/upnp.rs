@@ -403,6 +403,37 @@ impl UpnpMappings {
         ok
     }
 
+    /// Record the QUIC UDP port without mapping it, so the next [`Self::maintain`]
+    /// maps it: a new port makes the renewal due at once rather than a lease
+    /// period later.
+    ///
+    /// Deliberately not a revision change. The endpoint binds while a startup
+    /// or maintenance pass may still be running, and a bump would discard that
+    /// pass's result, gateway discovery and all; [`Self::adopt`] carries the
+    /// port into it instead.
+    pub fn record_quic_port(&mut self, quic_port: u16) {
+        if self.quic_port == Some(quic_port) {
+            return;
+        }
+        self.quic_port = Some(quic_port);
+        if quic_port == self.udp_port {
+            self.quic_mapped = self.udp_mapped;
+        } else {
+            self.quic_mapped = false;
+            self.last_map_attempt = None;
+        }
+        self.publish_forwarding();
+    }
+
+    /// Take the mappings a finished pass produced, keeping a QUIC port recorded
+    /// after the pass cloned these.
+    pub fn adopt(&mut self, mut finished: UpnpMappings) {
+        if let Some(port) = self.quic_port {
+            finished.record_quic_port(port);
+        }
+        *self = finished;
+    }
+
     /// Discover the gateway and add all known mappings. Returns true when at
     /// least the TCP or KAD UDP mapping succeeded. On discovery failure the
     /// retry backoff is advanced; `maintain` retries when it elapses.
@@ -731,6 +762,42 @@ mod tests {
         m.udp_mapped = true;
         assert!(m.map_quic_port(4672).await);
         assert!(m.quic_mapped);
+    }
+
+    /// The QUIC endpoint can bind while a pass is running on a clone taken
+    /// before it existed. Recording the port must leave that pass's result
+    /// current, the result must keep the port, and the next maintain must map
+    /// it rather than wait out the lease.
+    #[test]
+    fn a_quic_port_recorded_during_a_pass_survives_its_result() {
+        let mut live = UpnpMappings::new(4662, 4672);
+        let mut in_flight = live.clone();
+        let revision = live.revision();
+
+        live.record_quic_port(4662);
+        assert_eq!(live.revision(), revision, "the running pass stays current");
+        assert_eq!(live.quic_port, Some(4662));
+
+        in_flight.tcp_mapped = true;
+        in_flight.udp_mapped = true;
+        in_flight.last_map_attempt = Some(Instant::now());
+        in_flight.revision += 1;
+        live.adopt(in_flight);
+        assert!(live.tcp_mapped && live.udp_mapped, "the pass's own results are kept");
+        assert_eq!(live.quic_port, Some(4662), "and so is the port it did not know");
+        assert!(!live.quic_mapped);
+        assert!(live.last_map_attempt.is_none(), "the next maintain maps it");
+    }
+
+    #[test]
+    fn recording_the_udp_port_as_quic_needs_no_mapping_of_its_own() {
+        let mut m = UpnpMappings::new(4662, 4672);
+        m.udp_mapped = true;
+        let attempted = Instant::now();
+        m.last_map_attempt = Some(attempted);
+        m.record_quic_port(4672);
+        assert!(m.quic_mapped);
+        assert_eq!(m.last_map_attempt, Some(attempted), "nothing new to map");
     }
 
     #[tokio::test]

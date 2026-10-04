@@ -22,6 +22,7 @@
 #![allow(clippy::type_complexity)]
 
 mod app_state;
+mod auto_update;
 mod background;
 mod bandwidth;
 mod commands;
@@ -34,6 +35,7 @@ pub mod security;
 mod session_end;
 mod sharing;
 mod storage;
+mod tray;
 mod types;
 mod webservices;
 
@@ -41,7 +43,7 @@ use futures::FutureExt;
 use tauri::Emitter;
 
 use std::sync::Arc;
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 use tokio::sync::{mpsc, RwLock};
@@ -110,6 +112,71 @@ fn repair_legacy_data_acls(data_dir: &std::path::Path) {
         if let Err(error) = security::atomic_write(&marker, b"2\n", true) {
             eprintln!("Failed to persist Ember ACL repair marker: {error}");
         }
+    }
+}
+
+/// Raise the soft open-file limit toward the hard one.
+///
+/// Every peer connection, `.part` file and database handle is a descriptor,
+/// `max_connections` allows up to 2000, and the soft limit a Linux desktop
+/// session starts with is commonly 1024. Running out shows up as `EMFILE` on
+/// accepts and on opening a download, long before the connection cap. Capped
+/// rather than taken to the hard limit, which can be in the millions, because
+/// every child process (`xdg-open`, the media player) inherits it.
+#[cfg(target_os = "linux")]
+fn raise_open_file_limit() {
+    const WANTED: libc::rlim_t = 65_536;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` only writes the struct it is handed.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        tracing::warn!(
+            "Could not read the open-file limit: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let target = WANTED.min(limit.rlim_max);
+    if limit.rlim_cur >= target {
+        return;
+    }
+    let raised = libc::rlimit {
+        rlim_cur: target,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: `setrlimit` only reads the struct it is handed.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+        tracing::info!(
+            "Raised the open-file limit from {} to {target}",
+            limit.rlim_cur
+        );
+    } else {
+        tracing::warn!(
+            "Could not raise the open-file limit from {}: {}",
+            limit.rlim_cur,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// The tray icon's menu, in the language the frontend last sent (`tray`).
+/// `cancel` is the silent-update countdown's "Cancel update" entry, shown above
+/// the others while the countdown runs.
+pub(crate) fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(
+    manager: &M,
+    cancel: Option<&MenuItem<R>>,
+) -> tauri::Result<Menu<R>> {
+    let labels = tray::labels();
+    let show_item = MenuItem::with_id(manager, "tray_show", &labels.show, true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(manager, "tray_quit", &labels.quit, true, None::<&str>)?;
+    match cancel {
+        Some(cancel) => {
+            let separator = PredefinedMenuItem::separator(manager)?;
+            Menu::with_items(manager, &[cancel, &separator, &show_item, &quit_item])
+        }
+        None => Menu::with_items(manager, &[&show_item, &quit_item]),
     }
 }
 
@@ -302,6 +369,13 @@ pub(crate) async fn run_graceful_shutdown(
     state.db.mark_clean_shutdown();
 }
 
+/// Run as the update watchdog if this process was started as one
+/// (`auto_update::watchdog`). Returns whether it was, in which case the process
+/// should exit rather than start Ember.
+pub fn run_update_watchdog_if_requested() -> bool {
+    auto_update::watchdog::run_if_requested()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Give async tasks a larger worker-thread stack than tokio's 2 MiB default.
@@ -463,6 +537,9 @@ pub fn run() {
         std::env::consts::ARCH,
     );
 
+    #[cfg(target_os = "linux")]
+    raise_open_file_limit();
+
     // Multi-instance harness path: when `EMBER_DATA_DIR` is set, every
     // launched process is meant to be an *isolated* node (own config,
     // identity, database, downloads). The `tauri-plugin-single-instance`
@@ -482,7 +559,13 @@ pub fn run() {
             // a new process with the payload in argv, which this plugin routes
             // here before closing the duplicate. Forward any payload to the
             // existing instance; otherwise just focus the window (the user
-            // re-launched the app to bring it to the front).
+            // re-launched the app to bring it to the front). An update's
+            // relaunch arrives here when another launch beat it, and the links
+            // it carries are the replaced process's.
+            // Only the Windows plugin joins and re-splits argv on `|`; elsewhere
+            // argv arrives whole, and rejoining would drop what follows a link.
+            #[cfg(windows)]
+            let args = commands::deeplink::rejoin_forwarded_args(args);
             let payloads = commands::deeplink::extract_deep_link_payloads(&args);
             if payloads.is_empty() {
                 commands::chat_window::set_chat_window_visible(app, true);
@@ -492,7 +575,10 @@ pub fn run() {
                     let _ = window.set_focus();
                 }
             } else {
-                commands::deeplink::dispatch_deep_links(app, payloads);
+                commands::deeplink::dispatch_deep_links(
+                    app,
+                    auto_update::resume::without_replayed_links(app, payloads),
+                );
             }
         }));
     } else {
@@ -520,6 +606,7 @@ pub fn run() {
     );
     builder
         .manage(commands::updater::UpdaterService::default())
+        .manage(auto_update::resume::ResumeService::default())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -527,6 +614,17 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let app_handle = app.handle().clone();
+
+            // First, before anything slow: an update watchdog judges "Ember is
+            // running again" by this lock, and a first launch of a new version
+            // can spend minutes in migrations or an antivirus scan before
+            // reaching the rest of setup.
+            {
+                let lock_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
+                if std::fs::create_dir_all(&lock_dir).is_ok() {
+                    auto_update::watchdog::hold_instance_lock(&lock_dir);
+                }
+            }
 
             // Associate the `ed2k://` scheme with this executable.
             //
@@ -544,15 +642,18 @@ pub fn run() {
             // only needed for dev builds, which aren't installed and so have no
             // installer to register the scheme — hence the `debug_assertions`
             // gate on Windows. Linux has no standard installer-side mechanism,
-            // so it registers at runtime there. macOS reads the association
-            // from the bundle's Info.plist and needs neither path.
-            #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
+            // so it registers at runtime there, but only while no other client
+            // holds the scheme. macOS reads the association from the bundle's
+            // Info.plist and needs neither path.
+            #[cfg(all(debug_assertions, windows))]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 if let Err(e) = app.deep_link().register_all() {
                     tracing::warn!("Failed to register ed2k:// deep link scheme: {e}");
                 }
             }
+            #[cfg(target_os = "linux")]
+            commands::deeplink::register_scheme_unless_taken(&app_handle);
 
             // Show the running version in the main window title so users
             // can confirm which build they're on at a glance (matches the
@@ -587,25 +688,28 @@ pub fn run() {
             // are latched for a blocking UI notice — logging alone left users
             // running on mixed or pre-restore files with no explanation.
             let mut restore_failed_notice = false;
+            let mut restore_expired_notice = false;
             let mut restore_applied = false;
             match storage::paths::ensure_data_dir_with_app(&app_handle) {
                 Ok(dir) => {
+                    use commands::backup::StartupRestore;
                     match commands::backup::apply_pending_restore(&dir) {
                         Err(e) => {
                             tracing::error!("Failed to apply the staged restore: {e}");
                             restore_failed_notice = true;
                         }
-                        // `Ok(Some(_))` applied. A leftover marker is a failed
+                        // A leftover marker after `Applied` is a failed
                         // staging-dir cleanup, not a failed restore — the
                         // toast would wrongly say we are on previous files.
-                        // `Ok(None)` with a marker still on disk is schema-
+                        // `NotApplied` with a marker still on disk is schema-
                         // too-new or a mid-apply abort left for retry.
-                        Ok(None) => {
+                        Ok(StartupRestore::NotApplied) => {
                             if commands::backup::pending_restore_still_staged(&dir) {
                                 restore_failed_notice = true;
                             }
                         }
-                        Ok(Some(_)) => restore_applied = true,
+                        Ok(StartupRestore::Applied) => restore_applied = true,
+                        Ok(StartupRestore::Expired) => restore_expired_notice = true,
                     }
                 }
                 Err(e) => tracing::error!("Failed to prepare the data dir: {e}"),
@@ -624,11 +728,17 @@ pub fn run() {
             })?;
             let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
             std::fs::create_dir_all(&data_dir)?;
+            // Before the network task starts and before the window is shown:
+            // both come back the way an update restart left them.
+            auto_update::watchdog::schedule_cleanup(&data_dir);
+            let resume_window = auto_update::resume::begin_launch(&app_handle, &data_dir);
+            auto_update::silent::note_launch_outcome(&app_handle);
             // An eMule import staged last session. Here because it rewrites
             // what the identity, the approved roots, the credit store and the
             // network all read below, and none of them can take a change once
             // they have.
             let emule_import = emule_import::apply::apply_pending(&data_dir, &db, &mut config);
+            storage::part_folders::forget_finished_previous_folders(&db, &mut config);
             let settings = config.settings.clone();
             // Best-effort, never fatal. A download folder on an unplugged USB
             // drive, an offline NAS or an unmapped share makes these fail, and
@@ -651,10 +761,7 @@ pub fn run() {
                     }
                 }
             }
-            let mut configured_roots = settings.shared_folders.clone();
-            if !settings.download_folder.is_empty() {
-                configured_roots.push(settings.download_folder.clone());
-            }
+            let configured_roots = settings.configured_roots();
             let mut import_roots =
                 emule_import::apply::pending_root_additions(&data_dir, emule_import.as_ref());
             // The backup deliberately leaves out `approved_roots.json`, whose
@@ -739,19 +846,6 @@ pub fn run() {
                     policy_scope,
                 )
             });
-
-            // Honour the "launch maximized" preference. The window is
-            // created at its configured size (per `tauri.conf.json`); we
-            // maximize it here, once at startup, when the user has opted in.
-            // It's intentionally a launch-time preference — toggling it in
-            // Settings only changes how the *next* launch opens.
-            if settings.launch_maximized {
-                if let Some(window) = app.get_webview_window("main") {
-                    if let Err(e) = window.maximize() {
-                        tracing::warn!("Failed to apply launch-maximized preference: {e}");
-                    }
-                }
-            }
 
             let spam_data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
             let spam_filter = Arc::new(RwLock::new(
@@ -937,6 +1031,9 @@ pub fn run() {
                 pending_restore_failed_notice: Arc::new(std::sync::atomic::AtomicBool::new(
                     restore_failed_notice,
                 )),
+                pending_restore_expired_notice: Arc::new(std::sync::atomic::AtomicBool::new(
+                    restore_expired_notice,
+                )),
                 close_behavior: Arc::new(parking_lot::RwLock::new(
                     settings.close_to_tray_behavior.clone(),
                 )),
@@ -956,6 +1053,7 @@ pub fn run() {
                 background::apply_effective_limits(&app_handle, &state, &settings);
             }
             background::spawn(app_handle.clone());
+            auto_update::scheduler::spawn(app_handle.clone());
 
             // Non-silent recovery notice: if config.json was corrupt at load,
             // tell the user (their settings were reset to defaults; the original
@@ -1001,10 +1099,15 @@ pub fn run() {
             // file that launched Ember arrives in our own process args. Buffer
             // it now (AppState is managed above) — the frontend drains the
             // buffer once it mounts the deep-link handler. Done after
-            // `app.manage` so `dispatch_deep_links` can reach the buffer.
+            // `app.manage` so `dispatch_deep_links` can reach the buffer. An
+            // update restart carries the replaced process's args, whose links
+            // were offered then.
             {
                 let args: Vec<String> = std::env::args().collect();
-                let payloads = commands::deeplink::extract_deep_link_payloads(&args);
+                let payloads = auto_update::resume::without_replayed_links(
+                    &app_handle,
+                    commands::deeplink::extract_deep_link_payloads(&args),
+                );
                 if !payloads.is_empty() {
                     commands::deeplink::dispatch_deep_links(&app_handle, payloads);
                 }
@@ -1018,21 +1121,7 @@ pub fn run() {
             // window would orphan the process. The menu also exposes an
             // explicit Quit entry that routes through `app.exit(0)` so the
             // existing `RunEvent::Exit` shutdown sequence still runs.
-            let show_item = MenuItem::with_id(
-                app,
-                "tray_show",
-                "Show Ember",
-                true,
-                None::<&str>,
-            )?;
-            let quit_item = MenuItem::with_id(
-                app,
-                "tray_quit",
-                "Quit Ember",
-                true,
-                None::<&str>,
-            )?;
-            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let tray_menu = build_tray_menu(app, None)?;
 
             let tray_icon = app
                 .default_window_icon()
@@ -1056,6 +1145,7 @@ pub fn run() {
                             let _ = window.set_focus();
                         }
                     }
+                    auto_update::silent::TRAY_CANCEL_ID => auto_update::silent::postpone(),
                     "tray_quit" => {
                         if let Some(state) = app.try_state::<AppState>() {
                             state
@@ -1087,6 +1177,7 @@ pub fn run() {
                     }
                 })
                 .build(app);
+            let tray_available = tray_result.is_ok();
             if let Err(e) = tray_result {
                 // No session bus / AppIndicator host (WSL, some live sessions,
                 // GNOME without the extension). Failing `setup` here would
@@ -1102,9 +1193,28 @@ pub fn run() {
                     return Err(e.into());
                 }
             }
+            tray::note_built(tray_available);
+
+            // The window is created hidden (`tauri.conf.json`) and shown here,
+            // once the tray exists, so a session an update restart left in the
+            // tray comes back there instead of flashing onto the desktop. The
+            // "launch maximized" preference is applied here too: it is a
+            // launch-time preference, so toggling it in Settings only changes
+            // how the *next* launch opens.
+            auto_update::resume::show_main_window(
+                &app_handle,
+                resume_window.as_ref(),
+                tray::reachable(),
+                settings.launch_maximized,
+            );
+            auto_update::silent::spawn(app_handle.clone());
 
             let index_clone = local_index.clone();
             let shared_folders = settings.shared_folders.clone();
+            let startup_allowlists = sharing::indexer::discovery_lists(
+                &settings.pending_folder_allowlists,
+                &settings.withheld_folder_files,
+            );
             let startup_scanning = scanning_count.clone();
             let startup_scan_coordination = scan_coordination.clone();
             let csf = cached_shared_files.clone();
@@ -1115,6 +1225,7 @@ pub fn run() {
             let startup_scan_handle = tauri::async_runtime::handle().inner().spawn(async move {
                 if shared_folders.is_empty() {
                     info!("Indexed 0 files from 0 shared folders");
+                    let _ = net_tx.send(network::NetworkCommand::StartupLibraryIndexed).await;
                     return;
                 }
                 // Held for the whole scan and released when this task ends. It is
@@ -1145,20 +1256,45 @@ pub fn run() {
                         // scan at the first page; successful startup persists
                         // a fresh cursor for the next live reload.
                         let cursor: Option<String> = None;
+                        let scope =
+                            sharing::indexer::DiscoveryScope::for_root(&f, &startup_allowlists);
                         (
                             folder.clone(),
                             tokio::task::spawn_blocking(move || {
-                                FileIndexer::discover_directory_page(&f, cursor.as_deref())
+                                match FileIndexer::refuse_unapproved_root(&f) {
+                                    Some(refused) => (true, refused),
+                                    None => (
+                                        false,
+                                        FileIndexer::discover_directory_page_in(
+                                            &f,
+                                            cursor.as_deref(),
+                                            scope.as_ref(),
+                                        ),
+                                    ),
+                                }
                             }),
                         )
                     })
                     .collect();
                 let mut all_discovered: Vec<crate::types::FileInfo> = Vec::new();
                 let mut startup_cursor_updates = std::collections::HashMap::new();
+                // Not walked until re-approved, so not filled in from known.met
+                // either: what is at the path now is not what was approved.
+                let mut refused_roots: Vec<String> = Vec::new();
                 for (folder, handle) in discovery_handles {
                     match handle.await {
-                        Ok(result) => {
-                            if result.truncated {
+                        Ok((refused, result)) => {
+                            if refused {
+                                refused_roots.push(folder);
+                                continue;
+                            }
+                            // An unreachable folder (a drive not plugged in)
+                            // says nothing about where its paging stood; a
+                            // `None` here erased the cursor it had.
+                            if result.saw_nothing() {
+                                continue;
+                            }
+                            if result.reached_file_cap() {
                                 tracing::warn!(
                                     "Startup discovery reached the per-folder file cap; some files will wait for a later scan"
                                 );
@@ -1174,7 +1310,15 @@ pub fn run() {
                             startup_cursor_updates.insert(folder, result.next_cursor);
                             all_discovered.extend(result.files);
                         }
-                        Err(e) => tracing::error!("discover_directory panicked for folder: {e}"),
+                        Err(e) => {
+                            tracing::error!("discover_directory panicked for folder: {e}");
+                            // The rest of the library still loads; this folder
+                            // is simply missing from it, and the user is told.
+                            let _ = startup_app.emit(
+                                "shared-folder-scan-failed",
+                                serde_json::json!({ "folder": folder }),
+                            );
+                        }
                     }
                 }
 
@@ -1229,8 +1373,14 @@ pub fn run() {
                 // folder default has since changed, matching `set_file_priority`'s
                 // per-file-override contract.
                 let mut new_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let known_lookup = known_list.name_size_lookup();
                 for file in &mut all_discovered {
-                    if let Some(record) = known_list.find_by_path_and_meta(&file.path, file.size, file.modified_at) {
+                    if let Some(record) = known_list.find_by_path_and_meta_in(
+                        &known_lookup,
+                        &file.path,
+                        file.size,
+                        file.modified_at,
+                    ) {
                         let hash = hex::encode(record.file_hash);
                         file.id = hash.clone();
                         file.hash = hash;
@@ -1277,6 +1427,7 @@ pub fn run() {
                         // ordinary entry. ed2k comes out identical either way;
                         // only the missing digests are filled.
                     } else {
+                        commands::sharing::carry_scope_at_path(file, &known_list);
                         new_paths.insert(crate::search::index::normalize_path_key(&file.path));
                         files_to_hash.push(file.clone());
                     }
@@ -1333,7 +1484,15 @@ pub fn run() {
                         .collect::<std::collections::HashSet<_>>();
                     let hydration_records = known_list.all_records().cloned().collect::<Vec<_>>();
                     let hydration_folders = current_shared_folders.clone();
+                    let hydration_refused = refused_roots.clone();
                     let hydration_paths = known_paths.clone();
+                    let hydration_allowlists = {
+                        let state = startup_app.state::<AppState>();
+                        let cfg = state.config.read().await;
+                        crate::sharing::indexer::AllowlistOffers::new(
+                            &cfg.settings.pending_folder_allowlists,
+                        )
+                    };
                     let hydrated_records = tokio::task::spawn_blocking(move || {
                         hydration_records
                             .into_iter()
@@ -1348,7 +1507,17 @@ pub fn run() {
                                         &record.file_path,
                                         &hydration_folders,
                                     )
+                                    || hydration_refused.iter().any(|root| {
+                                        crate::security::path_within_dir(&record.file_path, root)
+                                    })
                                 {
+                                    return false;
+                                }
+                                // Discovery walks a partly shared folder's list
+                                // alone, so a record it does not offer is one
+                                // left by an earlier share of the folder, and
+                                // its flag in known.met may still say shared.
+                                if !hydration_allowlists.offers(&record.file_path) {
                                     return false;
                                 }
                                 // Re-apply discovery's exclusions. Hydration
@@ -1359,6 +1528,10 @@ pub fn run() {
                                 // back into the shared and announced index.
                                 let record_path = std::path::Path::new(&record.file_path);
                                 if crate::sharing::indexer::is_excluded_share_file_name(record_path)
+                                    || crate::sharing::indexer::under_private_receive_dir(
+                                        &hydration_folders,
+                                        record_path,
+                                    )
                                     || crate::sharing::indexer::is_excluded_share_location(
                                         record_path,
                                     )
@@ -1467,6 +1640,7 @@ pub fn run() {
                     folder_priorities,
                     pending_share_states,
                     pending_file_priorities,
+                    pending_friends_only,
                     pending_folder_allowlists,
                 ) = {
                     let state = startup_app.state::<AppState>();
@@ -1475,6 +1649,7 @@ pub fn run() {
                         cfg.settings.folder_priorities.clone(),
                         cfg.settings.pending_share_states.clone(),
                         cfg.settings.pending_file_priorities.clone(),
+                        cfg.settings.pending_friends_only.clone(),
                         cfg.settings.pending_folder_allowlists.clone(),
                     )
                 };
@@ -1483,11 +1658,16 @@ pub fn run() {
                     &mut files_to_hash,
                     &pending_folder_allowlists,
                 );
+                commands::sharing::withhold_unlisted_known_files(
+                    &mut all_discovered,
+                    &pending_folder_allowlists,
+                );
                 commands::sharing::apply_pending_intents(
                     &mut all_discovered,
                     &mut files_to_hash,
                     &pending_share_states,
                     &pending_file_priorities,
+                    &pending_friends_only,
                 );
                 {
                     let mut index = index_clone.write().await;
@@ -1522,6 +1702,9 @@ pub fn run() {
                     }
                 }
                 commands::sharing::refresh_file_cache(&index_clone, &csf).await;
+                // Every file known from last session is in the index now, with
+                // its hash; only new ones wait for hashing.
+                let _ = net_tx.send(network::NetworkCommand::StartupLibraryIndexed).await;
 
                 let _ = startup_app.emit("shared-files-changed", serde_json::json!({
                     "phase": "discovered",
@@ -1539,7 +1722,6 @@ pub fn run() {
                 let mut last_known_met_persist = std::time::Instant::now();
                 let mut hashed_since_persist = 0usize;
                 let mut was_cancelled = false;
-                let mut page_complete = true;
 
                 // Same scheduler the folder-add and reload passes use: one read
                 // at a time per physical drive, more only where a drive has
@@ -1548,6 +1730,9 @@ pub fn run() {
                 // file at a time and leave every other drive idle — the same
                 // waste the reload path was fixed for, on the path that runs
                 // before anything else in the app works.
+                // Paced like the scans' progress: one event per file flooded
+                // the IPC bridge on a cold start of many small files.
+                let mut hash_progress = commands::sharing::HashProgressEmitter::new(&files_to_hash);
                 let mut pipeline = commands::sharing::HashLookahead::new(
                     &files_to_hash,
                     cancel_flag.clone(),
@@ -1586,11 +1771,7 @@ pub fn run() {
 
                     tracing::debug!("Startup hashing {}/{}: {}", hashed + 1, total_to_hash, file.name);
 
-                    let _ = startup_app.emit("file-hash-progress", serde_json::json!({
-                        "current": hashed + 1,
-                        "total": total_to_hash,
-                        "file_name": file.name,
-                    }));
+                    hash_progress.emit(&startup_app, hashed + 1, total_to_hash, &file.name);
 
                     let hash_result = commands::sharing::await_hash(
                         &mut hash_task,
@@ -1617,17 +1798,7 @@ pub fn run() {
                             updated.ember_file_hash = ember_file_hash;
                             updated.size = hashed_size;
                             updated.modified_at = hashed_modified_at;
-                            if let Ok(bytes) = hex::decode(&updated.hash) {
-                                if bytes.len() == 16 {
-                                    let mut hash = [0u8; 16];
-                                    hash.copy_from_slice(&bytes);
-                                    updated.shared =
-                                        storage::share_intent::effective_shared(
-                                            &hash,
-                                            updated.shared,
-                                        );
-                                }
-                            }
+                            commands::sharing::restore_known_hash_flags(&mut updated, &known_list);
                             let still_shared = {
                                 let state = startup_app.state::<AppState>();
                                 let cfg = state.config.read().await;
@@ -1705,7 +1876,7 @@ pub fn run() {
                             commands::sharing::release_in_flight_hash(&file.path, hash_claim);
                         }
                         Ok(Ok(Err(e))) => {
-                            if e.to_string().contains("cancelled") {
+                            if commands::sharing::is_hash_cancellation(&e, &cancel_flag) {
                                 info!("Startup hashing cancelled mid-file");
                                 was_cancelled = true;
                                 let mut idx = index_clone.write().await;
@@ -1715,7 +1886,6 @@ pub fn run() {
                                 break;
                             }
                             tracing::warn!("Startup hash failed for {}: {e}", file.name);
-                            page_complete = false;
                             let mut idx = index_clone.write().await;
                             idx.abandon_hash_placeholder(&file_temp_id);
                             drop(idx);
@@ -1723,7 +1893,6 @@ pub fn run() {
                         }
                         Ok(Err(e)) => {
                             tracing::error!("Startup hash task panicked for {}: {e}", file.name);
-                            page_complete = false;
                             let mut idx = index_clone.write().await;
                             idx.abandon_hash_placeholder(&file_temp_id);
                             drop(idx);
@@ -1736,14 +1905,12 @@ pub fn run() {
                             // it recurred on every launch because the queue is
                             // walked in a stable order — the same failure the
                             // "leaving pending for retry" behaviour was written to
-                            // prevent. Leave the row pending, mark the page
-                            // incomplete so nothing is reconciled away, and move on.
+                            // prevent. Leave the row pending and move on.
                             tracing::warn!(
                                 "Startup hash of {} read nothing for {} min (file may be on cloud storage or locked); leaving pending for retry",
                                 file.name,
                                 commands::sharing::HASH_STALL_TIMEOUT.as_secs() / 60
                             );
-                            page_complete = false;
                             // Drain the abandoned blocking hash and release its
                             // claim only once it really ends. It must hold no
                             // scan lease: the read may be stuck in the kernel
@@ -1782,10 +1949,9 @@ pub fn run() {
                 pipeline.abandon();
                 // A file another pass still held was never hashed here, so this
                 // page is unfinished and nothing may be reconciled away on the
-                // strength of it.
-                if pipeline.skipped() > 0 {
-                    page_complete = false;
-                }
+                // strength of it. One that failed or stalled is retried by the
+                // next walk of the page; see the reload loop.
+                let page_complete = pipeline.skipped() == 0;
 
                 {
                     let mut idx = index_clone.write().await;
@@ -1799,16 +1965,27 @@ pub fn run() {
                     let app_state = startup_app.state::<AppState>();
                     // Startup always rescans page 1, so its cursor must never
                     // move a reload's further-advanced cursor backward.
-                    if let Err(error) = commands::sharing::persist_scan_cursors(
+                    match commands::sharing::persist_scan_cursors(
                         &app_state,
                         &startup_cursor_updates,
                         true,
                     )
                     .await
                     {
-                        tracing::warn!(
+                        // The later pages came back from known.met, which has
+                        // nothing added to them while Ember was closed; only a
+                        // walk finds that. Queued like a reload's own pages.
+                        Ok(()) if startup_cursor_updates.values().any(Option::is_some) => {
+                            commands::sharing::schedule_chained_scan_page(
+                                startup_app.clone(),
+                                commands::sharing::MAX_CHAINED_SCAN_PAGES - 1,
+                            )
+                            .await;
+                        }
+                        Ok(()) => {}
+                        Err(error) => tracing::warn!(
                             "Startup shared-folder pages were indexed but scan cursors were not saved: {error}"
-                        );
+                        ),
                     }
                 }
                 commands::sharing::refresh_file_cache(&index_clone, &csf).await;
@@ -1999,6 +2176,7 @@ pub fn run() {
             commands::backup::import_backup,
             commands::backup::pending_restore_status,
             commands::backup::discard_pending_restore,
+            commands::backup::take_pending_restored_prefs,
             commands::search::search_files,
             commands::search::plan_related_search,
             commands::search::related_search_supported,
@@ -2091,6 +2269,7 @@ pub fn run() {
             commands::sharing::share_file,
             commands::sharing::unshare_folder,
             commands::sharing::get_scan_status,
+            commands::sharing::get_hashing_paused,
             commands::sharing::get_library_scan_truncated,
             commands::sharing::stop_hashing,
             commands::sharing::preview_stop_hashing,
@@ -2192,6 +2371,7 @@ pub fn run() {
             commands::channels::pick_and_offer_channel_transfer,
             commands::channels::respond_channel_transfer,
             commands::channels::cancel_channel_transfer,
+            commands::channels::send_channel_transfer_standard_offer,
             commands::channels::list_channel_transfers,
             commands::settings::get_settings,
             commands::settings::update_settings,
@@ -2213,6 +2393,8 @@ pub fn run() {
             commands::settings::take_pending_close_request,
             commands::settings::take_pending_ember_default_on_notice,
             commands::settings::take_pending_restore_failed_notice,
+            commands::settings::take_pending_restore_expired_notice,
+            commands::settings::take_pending_known_met_notice,
             commands::settings::open_ember_website,
             commands::settings::get_ember_website_url,
             commands::settings::open_ember_share,
@@ -2264,9 +2446,20 @@ pub fn run() {
             commands::deeplink::preview_deep_link,
             commands::deeplink::open_pending_collection,
             commands::updater::secure_updater_check,
+            commands::updater::get_last_update_check_result,
             commands::updater::secure_updater_install,
             commands::updater::secure_updater_handoff_status,
             commands::updater::secure_updater_run_saved_installer,
+            auto_update::resume::submit_resume_ui_snapshot,
+            auto_update::resume::take_update_resume_ui,
+            auto_update::silent::get_silent_update_status,
+            auto_update::silent::silent_update_now,
+            auto_update::silent::silent_update_postpone,
+            auto_update::silent::silent_update_skip,
+            auto_update::silent::silent_update_resume,
+            auto_update::silent::note_user_activity,
+            auto_update::silent::take_update_outcome,
+            tray::set_tray_labels,
                     ]
                 };
             }
@@ -2296,6 +2489,11 @@ pub fn run() {
             }
         })
         .on_window_event(|window, event| {
+            // Someone came back to an Ember window: a silent update waits for
+            // them to be away again.
+            if let tauri::WindowEvent::Focused(true) = event {
+                auto_update::silent::note_user_activity_now();
+            }
             // Title-bar X handler. Decides whether to fully exit, hide to
             // the system tray, or hand off to the frontend dialog based on
             // the user's saved `close_to_tray_behavior`. Only the main
@@ -2324,6 +2522,11 @@ pub fn run() {
                 return;
             }
             if window.label() != "main" {
+                return;
+            }
+
+            if let tauri::WindowEvent::Focused(true) = event {
+                auto_update::resume::on_main_window_focused(window);
                 return;
             }
 
@@ -2387,6 +2590,13 @@ pub fn run() {
                 }
                 "tray" => {
                     api.prevent_close();
+                    if !tray::reachable() {
+                        // Nothing would show the icon that brings it back.
+                        if let Err(e) = window.minimize() {
+                            tracing::warn!("Failed to minimize window for close-to-tray: {e}");
+                        }
+                        return;
+                    }
                     commands::chat_window::set_chat_window_visible(app_handle, false);
                     if let Err(e) = window.hide() {
                         tracing::warn!("Failed to hide window for close-to-tray: {e}");

@@ -10,7 +10,9 @@
     Image: 'var(--type-image)',
     Archive: 'var(--type-archive)',
     Document: 'var(--type-document)',
+    Program: 'var(--type-program)',
     'CD/DVD': 'var(--type-disc)',
+    Collection: 'var(--type-collection)',
   };
   let tone = $derived(kind ? TONES[kind] : 'var(--type-document)');
 </script>
@@ -32,9 +34,17 @@
       <rect x="2.5" y="3.5" width="15" height="4" rx="1"/>
       <path d="M4 7.5v8a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-8"/>
       <path d="M8.5 11h3"/>
+    {:else if kind === 'Program'}
+      <rect x="3" y="3.5" width="14" height="13" rx="1.5"/>
+      <path d="M3 7.5h14"/>
+      <path d="M6.5 11h4"/>
     {:else if kind === 'CD/DVD'}
       <circle cx="10" cy="10" r="7.5"/>
       <circle cx="10" cy="10" r="2"/>
+    {:else if kind === 'Collection'}
+      <path d="M7 3.5h8.5a1 1 0 0 1 1 1V15"/>
+      <rect x="3.5" y="6" width="10" height="10.5" rx="1"/>
+      <path d="M6 9.5h5M6 12.5h3"/>
     {:else}
       <path d="M11.5 2.5H6a1.5 1.5 0 0 0-1.5 1.5v12A1.5 1.5 0 0 0 6 17.5h8a1.5 1.5 0 0 0 1.5-1.5V6.5z"/>
       <path d="M11.5 2.5v4h4"/>

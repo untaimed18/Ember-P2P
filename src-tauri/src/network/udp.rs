@@ -86,7 +86,8 @@ fn remember_reask_parts(transfer_id: &str, total_size: u64, epoch: u64, parts: O
 
 /// Rebuild one entry from disk on the blocking pool; at most one rebuild per
 /// transfer is in flight, however many reasks arrive for it.
-fn spawn_reask_parts_refresh(transfer_id: String, total_size: u64, part_path: PathBuf) {
+/// `part_paths` lists where the `.part` may be, one per download folder.
+fn spawn_reask_parts_refresh(transfer_id: String, total_size: u64, part_paths: Vec<PathBuf>) {
     if !reask_parts_cache()
         .lock()
         .refreshing
@@ -103,8 +104,8 @@ fn spawn_reask_parts_refresh(transfer_id: String, total_size: u64, part_path: Pa
     tokio::task::spawn_blocking(move || {
         let _done = RefreshDone(transfer_id.clone());
         let epoch = ed2k::part_tracker::verification_epoch();
-        let parts = part_path.exists().then(|| {
-            ed2k::part_tracker::PartTracker::new(total_size, &part_path).serveable_parts()
+        let parts = part_paths.iter().find(|path| path.exists()).map(|part_path| {
+            ed2k::part_tracker::PartTracker::new(total_size, part_path).serveable_parts()
         });
         remember_reask_parts(&transfer_id, total_size, epoch, parts.as_deref());
     });
@@ -594,9 +595,7 @@ pub(super) async fn handle_udp_packet_inner(
                                 spawn_reask_parts_refresh(
                                     transfer_id.clone(),
                                     total_size,
-                                    PathBuf::from(&settings.download_folder)
-                                        .join("Temp")
-                                        .join(format!("{transfer_id}.part")),
+                                    settings.download_folders().part_paths(&transfer_id),
                                 );
                             }
                             match lookup {
@@ -793,6 +792,19 @@ pub(super) async fn handle_udp_packet_inner(
                     // 29 minutes, for as long as the download ran. `QUEUEFULL` is
                     // deliberately excluded: that peer *has* the file.
                     if !is_banned && opcode != ed2k::messages::OP_QUEUEFULL_UDP {
+                        // And `RemoveSource`, as the comment above says eMule
+                        // does. The dead-source entry lapses after 45 minutes,
+                        // and a `Failed` row is still due for a UDP reask, so a
+                        // row kept here was asked the same question again about
+                        // once an hour. A later discovery may add it back.
+                        if let Some(pfs) = state
+                            .per_file_sources
+                            .values_mut()
+                            .find(|pfs| pfs.file_hash == file_hash)
+                        {
+                            pfs.sources
+                                .retain(|src| !(src.ip == v4 && src.udp_port == from.port()));
+                        }
                         for tcp_port in tcp_ports {
                             state
                                 .dead_sources
@@ -2113,6 +2125,11 @@ pub(super) async fn handle_udp_packet_inner(
                 _ => None,
             };
 
+            // A completed search is still taken until the poll tick finalizes
+            // it. A node answers in several SEARCH_RES packets, and the first
+            // one from the last pending node is what completes the search: the
+            // rest of its answer arrives a few milliseconds later and used to
+            // be turned away here.
             let mut search_ids: Vec<SearchId> = sender_ip_port
                 .map(|(ip, port)| {
                     state
@@ -2121,7 +2138,6 @@ pub(super) async fn handle_udp_packet_inner(
                         .iter()
                         .filter(|(_, s)| {
                             s.target == target
-                                && !s.completed
                                 && s.search_type.accepts_search_results()
                                 && s.tried.contains_key(&(ip, port))
                         })
@@ -2141,7 +2157,6 @@ pub(super) async fn handle_udp_packet_inner(
                             .iter()
                             .filter(|(_, s)| {
                                 s.target == target
-                                    && !s.completed
                                     && s.search_type.accepts_search_results()
                                     && s.tried.keys().any(|(tip, _)| *tip == ip)
                             })
@@ -2455,7 +2470,7 @@ pub(super) async fn handle_udp_packet_inner(
                         if queue.len() >= 128 {
                             queue.pop_front();
                         }
-                        queue.push_back(rtt_ms);
+                        queue.push_back(crate::bandwidth::UssRttSample { host: from, rtt_ms });
                         state.uss_missed_pongs = 0;
                         debug!("USS RTT from {from}: {rtt_ms:.1}ms");
                     }
@@ -3429,9 +3444,9 @@ mod udp_reask_cache_tests {
     async fn udp_reask_refresh_runs_off_the_caller_and_records_a_missing_part() {
         let id = unique_id("missing");
         let part_path = std::env::temp_dir().join(format!("{id}.part"));
-        spawn_reask_parts_refresh(id.clone(), 100, part_path.clone());
+        spawn_reask_parts_refresh(id.clone(), 100, vec![part_path.clone()]);
         // A second request while one is in flight must not queue another read.
-        spawn_reask_parts_refresh(id.clone(), 100, part_path);
+        spawn_reask_parts_refresh(id.clone(), 100, vec![part_path]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             match cached_reask_parts(&id, 100) {
@@ -3443,7 +3458,7 @@ mod udp_reask_cache_tests {
                     spawn_reask_parts_refresh(
                         id.clone(),
                         100,
-                        std::env::temp_dir().join(format!("{id}.part")),
+                        vec![std::env::temp_dir().join(format!("{id}.part"))],
                     );
                 }
                 _ => panic!("a download with no .part must cache as absent"),

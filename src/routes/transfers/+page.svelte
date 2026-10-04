@@ -2,7 +2,9 @@
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import PartsBar from '$lib/components/PartsBar.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
-  import { transfers, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
+  import AddLinksDialog from '$lib/components/AddLinksDialog.svelte';
+  import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
+  import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
@@ -11,7 +13,7 @@
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
     getUploadQueue, getKnownClients, getKnownClientCounts, getDownloadFileDetails,
   } from '$lib/api/transfers';
-  import { findSources, parseEd2kLinks, formatEd2kLink, formatEd2kLinks } from '$lib/api/search';
+  import { distinctLinks, findSources, parseEd2kLinks, formatEd2kLink, formatEd2kLinks } from '$lib/api/search';
   import { startRelatedSearch } from '$lib/relatedSearch';
   import { previewFile } from '$lib/api/preview';
   import { addFriend, getFriends } from '$lib/api/friends';
@@ -20,7 +22,7 @@
   import { getPeerReputationBatch, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
   import {
     formatSize, formatSpeed, formatDate, formatDateWithYear, formatDurationSecs,
-    formatRemaining, formatRelativeTime, copyToClipboard, readFromClipboard,
+    formatRemaining, formatRelativeTime, formatNumber, copyToClipboard, readFromClipboard,
   } from '$lib/utils';
   import { onMount, onDestroy, untrack } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
@@ -33,8 +35,8 @@
   import { scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
-  import { appSettings } from '$lib/stores/settings';
-  import { openWebService } from '$lib/api/settings';
+  import { appSettings, setAppSettings } from '$lib/stores/settings';
+  import { getSettings, openWebService, updateSettings } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
   import { mapSettledWithLimit } from '$lib/concurrency';
   import * as m from '$lib/paraglide/messages';
@@ -52,6 +54,8 @@
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import IconX from '$lib/components/IconX.svelte';
+  import { TableWindow } from '$lib/tableWindow.svelte';
+  import { isShortcutLetter } from '$lib/shortcutKey';
 
   function countryFlagSrc(code: string | undefined): string | null {
     if (!code || code.length !== 2) return null;
@@ -1233,12 +1237,8 @@
       // Force-refresh Trust badges so manual bans / score changes appear
       // without leaving the tab.
       //
-      // Every displayed row, every poll: `getPeerReputationBatch` is one
-      // command for the whole page, so the cost no longer scales with the row
-      // count and there is nothing left to ration. The rotating window this
-      // replaces existed only to bound a per-row fan-out, and its side effect
-      // was that rows outside the current slice sat on "—" with a "Fetching…"
-      // tooltip for up to eighty seconds.
+      // Every mounted row, every poll, in one `getPeerReputationBatch` command.
+      // Rows scrolled into view between polls are fetched as they appear.
       if (refreshBadges) {
         const hashes = displayedKnownClients.map((k) => k.user_hash);
         if (hashes.length > 0) {
@@ -1285,14 +1285,16 @@
    *  clients) and keeps the dependent computations reactive. */
   let reputationMap = $state<Record<string, PeerReputationInfo | null>>({});
   let reputationInFlight = new Set<string>();
+  /** Hashes a fetch has answered, a `null` "no record" included. */
+  const reputationAnswered = new Set<string>();
 
   async function refreshReputations(hashes: string[], force = false) {
-    // Skip hashes currently in flight. Non-null cache entries are
-    // re-fetched when `force` is set (Known Clients poll) so score /
-    // ban changes surface without a full page reload; otherwise only
-    // missing/`null` entries are eligible (first paint).
+    // Skip hashes currently in flight. Answered hashes are re-fetched only
+    // when `force` is set (Known Clients poll), so score / ban changes and a
+    // peer the tracker only later records surface on the poll's cadence;
+    // otherwise only hashes never answered are eligible (rows scrolled in).
     const targets = hashes.filter(
-      (h) => (force || reputationMap[h] == null) && !reputationInFlight.has(h),
+      (h) => (force || !reputationAnswered.has(h)) && !reputationInFlight.has(h),
     );
     if (targets.length === 0) return;
     for (const h of targets) reputationInFlight.add(h);
@@ -1304,6 +1306,7 @@
     let fetched: Record<string, PeerReputationInfo | null> = {};
     try {
       fetched = await getPeerReputationBatch(targets);
+      for (const h of targets) reputationAnswered.add(h);
     } catch (e) {
       // Leave the cache as it was; the poll retries. Clearing entries here
       // would flash every badge back to "unknown" on one transient failure.
@@ -1394,7 +1397,6 @@
   // copied), last IP, country code, the peer's Hello name, its client
   // software, or — when the row is a friend — the friend nickname. Empty
   // filter passes through everything.
-  const KNOWN_CLIENT_DISPLAY_LIMIT = 1000;
   let filteredKnownClients = $derived.by(() => {
     const q = knownFilter.trim().toLowerCase();
     if (!q) return sortedKnownClients;
@@ -1412,9 +1414,35 @@
       return false;
     });
   });
-  let displayedKnownClients = $derived.by(() =>
-    filteredKnownClients.slice(0, KNOWN_CLIENT_DISPLAY_LIMIT)
-  );
+  // The upload queue and the known-peers ledger run to thousands of rows, so
+  // only those near the viewport are mounted. The whole ledger is reachable;
+  // it used to stop at its first 1,000 rows.
+  let bottomPaneEl: HTMLDivElement | undefined = $state(undefined);
+  const queueWindow = new TableWindow(() => sortedUploadQueueClients.length, {
+    minRows: 150,
+    rowHeight: 28,
+    rowSelector: 'tr.queue-row',
+  });
+  const knownWindow = new TableWindow(() => filteredKnownClients.length, {
+    minRows: 150,
+    rowHeight: 30,
+    rowSelector: 'tr.client-row',
+  });
+  $effect(() => {
+    queueWindow.scroller = bottomPaneEl;
+    knownWindow.scroller = bottomPaneEl;
+  });
+  let displayedKnownClients = $derived(knownWindow.slice(filteredKnownClients));
+  // Trust badges for rows scrolled into view; the poll refreshes the rest.
+  // Once scrolling settles: every step of the window would otherwise take a
+  // slot in the backend's shared command channel.
+  $effect(() => {
+    if (!knownLedgerActive) return;
+    const hashes = displayedKnownClients.map((k) => k.user_hash);
+    if (hashes.length === 0) return;
+    const timer = setTimeout(() => void refreshReputations(hashes), 250);
+    return () => clearTimeout(timer);
+  });
 
   // Top-line stats for the active known-peers tab. Computed off the
   // unfiltered split (eD2K or Ember) so totals match that tab's ledger
@@ -1714,6 +1742,7 @@
     });
     return sorted;
   });
+  let windowedQueueClients = $derived(queueWindow.slice(sortedUploadQueueClients));
 
   // --- Sorting ---
   type DlSortField = 'file_name' | 'total_size' | 'transferred' | 'completed_size' | 'speed' | 'progress' | 'sources' | 'priority' | 'status' | 'remaining' | 'last_seen_complete' | 'last_received' | 'category' | 'started_at';
@@ -2002,11 +2031,8 @@
       case 'total_size': cmp = a.total_size - b.total_size; break;
       case 'transferred': cmp = a.transferred - b.transferred; break;
       case 'completed_size': cmp = (a.completed_size || 0) - (b.completed_size || 0); break;
-      case 'speed': {
-        const la = liveSpeed(a), lb = liveSpeed(b);
-        cmp = (la > 0 ? la : a.speed) - (lb > 0 ? lb : b.speed);
-        break;
-      }
+      // The rate the cell prints; see `displaySpeed`.
+      case 'speed': cmp = displaySpeed(a) - displaySpeed(b); break;
       case 'progress': cmp = a.progress - b.progress; break;
       case 'sources': cmp = a.sources - b.sources; break;
       case 'priority': cmp = (priorityOrder[a.priority] ?? 2) - (priorityOrder[b.priority] ?? 2); break;
@@ -2031,10 +2057,63 @@
     return [...completedDownloads].sort(compareDownloads);
   });
 
+  // --- Categories ---
+  const BUILTIN_CATEGORIES = ['Audio', 'Video', 'Image', 'Archive', 'Document', 'Program'] as const;
+  let userCategories = $derived($appSettings?.download_categories ?? []);
+  let categoryCounts = $derived.by(() => {
+    const counts: Record<string, number> = {};
+    for (const t of allDownloads) {
+      if (t.category) counts[t.category] = (counts[t.category] ?? 0) + 1;
+    }
+    return counts;
+  });
+  /** The filter chips: the built-in categories in use, then the user's own
+   *  even while empty, then any other a download still carries (one the user
+   *  has since deleted, say). */
+  let categoryChips = $derived.by(() => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const add = (cat: string) => {
+      if (!seen.has(cat)) { seen.add(cat); out.push(cat); }
+    };
+    for (const cat of BUILTIN_CATEGORIES) if (categoryCounts[cat]) add(cat);
+    for (const cat of userCategories) add(cat);
+    for (const cat of Object.keys(categoryCounts).sort(sortCollator.compare)) add(cat);
+    return out;
+  });
+  const CATEGORY_FILTER_KEY = 'transfers-category-filter';
+  let categoryFilter = $state((() => {
+    try { return localStorage.getItem(CATEGORY_FILTER_KEY) ?? ''; } catch { return ''; }
+  })());
+  $effect(() => {
+    try { localStorage.setItem(CATEGORY_FILTER_KEY, categoryFilter); } catch { /* ignore */ }
+  });
+  /** The saved filter only applies while its chip exists, so a category that
+   *  emptied out cannot leave the list blank with nothing to click. */
+  let activeCategory = $derived(categoryChips.includes(categoryFilter) ? categoryFilter : '');
+  // And is forgotten once the chips are known, or a download filed under it
+  // days later would narrow the list, and the bulk actions, by itself.
+  // Not before: until the settings load and the backend has restored the last
+  // session's unfinished downloads, a chip that is coming may be missing.
+  $effect(() => {
+    if (!$transfersLoaded || $appSettings === null) return;
+    if (categoryFilter && !categoryChips.includes(categoryFilter)) categoryFilter = '';
+  });
+  let downloadsNarrowed = $derived(Boolean(transferFilter.trim() || activeCategory));
+  /** How the bulk actions and their prompts name the narrowed view. */
+  let narrowLabel = $derived(
+    [activeCategory ? categoryLabel(activeCategory) : '', transferFilter.trim()].filter(Boolean).join(' · '),
+  );
+  function clearDownloadFilters() {
+    transferFilter = '';
+    categoryFilter = '';
+  }
+
   let filteredActiveDownloads = $derived.by(() => {
     const query = transferFilter.trim().toLowerCase();
-    if (!query) return sortedActiveDownloads;
-    return sortedActiveDownloads.filter((t) =>
+    const pool = activeCategory ? sortedActiveDownloads.filter((t) => t.category === activeCategory) : sortedActiveDownloads;
+    if (!query) return pool;
+    return pool.filter((t) =>
       t.file_name.toLowerCase().includes(query)
       || t.file_hash.toLowerCase().includes(query)
       || (t.category || '').toLowerCase().includes(query)
@@ -2047,8 +2126,9 @@
   });
   let filteredCompletedDownloads = $derived.by(() => {
     const query = transferFilter.trim().toLowerCase();
-    if (!query) return sortedCompletedDownloads;
-    return sortedCompletedDownloads.filter((t) =>
+    const pool = activeCategory ? sortedCompletedDownloads.filter((t) => t.category === activeCategory) : sortedCompletedDownloads;
+    if (!query) return pool;
+    return pool.filter((t) =>
       t.file_name.toLowerCase().includes(query)
       || t.file_hash.toLowerCase().includes(query)
       || (t.category || '').toLowerCase().includes(query)
@@ -2615,8 +2695,22 @@
     return t.status !== 'completed' && t.status !== 'failed' && t.status !== 'stopped';
   }
 
-  function canResume(t: Transfer): boolean {
+  function isPausedState(t: Transfer): boolean {
     return t.status === 'paused' || t.status === 'stopped' || t.status === 'insufficient';
+  }
+
+  /** Waiting for the drive with its progress. Resume starts it over in the
+   *  current download folder, as its status text says. */
+  function isHeldForDrive(t: Transfer): boolean {
+    return (
+      t.direction === 'download'
+      && t.failure_code === 'part_folder_offline'
+      && (t.status === 'searching' || t.status === 'queued')
+    );
+  }
+
+  function canResume(t: Transfer): boolean {
+    return isPausedState(t) || isHeldForDrive(t);
   }
 
   // Not while the file is being hashed or moved: completion has already read
@@ -2717,7 +2811,70 @@
   let ctxPrioritySub = $state(false);
   let ctxCategorySub = $state(false);
   let ctxWebSub = $state(false);
-  const CATEGORY_OPTIONS = ['None', 'Audio', 'Video', 'Image', 'Archive', 'Document', 'Program'] as const;
+  let categoryOptions = $derived(['None', ...BUILTIN_CATEGORIES, ...userCategories]);
+
+  let categoriesDialog = $state<{ open: boolean; assignIds: string[] }>({ open: false, assignIds: [] });
+
+  /** A category set from the menu goes to the whole selection when the
+   *  clicked row is part of it, as in eMule. */
+  function categoryTargets(t: Transfer): Transfer[] {
+    return selectedDlIdSet.has(t.id) && selectedBatchTransfers.length > 1 ? selectedBatchTransfers : [t];
+  }
+
+  async function assignCategory(targets: Transfer[], category: string) {
+    const done = new Set<string>();
+    try {
+      for (const target of targets) {
+        await setTransferCategory(target.id, category);
+        done.add(target.id);
+      }
+    } finally {
+      // The backend sends no event for this; show what it accepted right away.
+      if (done.size > 0) setLocalCategory(done, category);
+    }
+  }
+
+  function isCategoryTaken(name: string): boolean {
+    const folded = name.toLocaleLowerCase();
+    return ['None', ...BUILTIN_CATEGORIES].some(
+      (cat) => cat.toLocaleLowerCase() === folded || categoryLabel(cat).toLocaleLowerCase() === folded,
+    ) || userCategories.some((cat) => cat.toLocaleLowerCase() === folded);
+  }
+
+  /** Edits the categories as the backend holds them now, not as this page last saw them. */
+  async function saveUserCategories(edit: (current: string[]) => string[]): Promise<{ before: string[]; saved: string[] }> {
+    const current = await getSettings();
+    const before = current.download_categories ?? [];
+    const result = await updateSettings({ ...current, download_categories: edit(before) });
+    setAppSettings(result.settings);
+    return { before, saved: result.settings.download_categories ?? [] };
+  }
+
+  async function addUserCategory(name: string) {
+    const { before, saved } = await saveUserCategories((current) => [...current, name]);
+    // The name as the backend kept it, which may be trimmed or cut; none when
+    // it cleaned the name into one that already exists.
+    const kept = saved.find((cat) => !before.includes(cat));
+    if (!kept) throw new Error(m.transfers_categories_exists());
+    const ids = new Set(categoriesDialog.assignIds);
+    if (ids.size > 0) {
+      await assignCategory(allDownloads.filter((t) => ids.has(t.id)), kept);
+    }
+  }
+
+  async function removeUserCategory(name: string) {
+    const members = allDownloads.filter((t) => t.category === name);
+    if (members.length > 0) await assignCategory(members, '');
+    await saveUserCategories((current) => current.filter((cat) => cat !== name));
+    if (categoryFilter === name) categoryFilter = '';
+  }
+
+  function openNewCategory(t: Transfer) {
+    const targets = categoryTargets(t);
+    closeCtx();
+    categoriesDialog = { open: true, assignIds: targets.map((x) => x.id) };
+  }
+
   // Empty until settings load, which is the honest default: the submenu then
   // shows its "configure these in Settings" hint rather than a stale list.
   let webServices = $derived($appSettings?.web_services ?? []);
@@ -3026,7 +3183,9 @@
   }
   async function ctxAction(action: string, extra?: string) {
     if (!ctxMenu) return;
-    const t = ctxMenu.transfer;
+    // The row the menu was drawn from, which can have gained fields (an Ember
+    // hash, say) since the right-click.
+    const t = ctxTransfer ?? ctxMenu.transfer;
     closeCtx();
     try {
       switch (action) {
@@ -3110,7 +3269,7 @@
           ]);
           break;
         }
-        case 'set_category': if (extra !== undefined) await setTransferCategory(t.id, extra === 'None' ? '' : extra); break;
+        case 'set_category': if (extra !== undefined) await assignCategory(categoryTargets(t), extra === 'None' ? '' : extra); break;
         case 'add_friend': {
           const emberHash = emberHashForUpload(t);
           if (!emberHash) { transferError = m.transfers_no_ember_hash(); break; }
@@ -3145,7 +3304,7 @@
     const ids = globalDownloadTargets().filter((t) => canPause(t)).map((t) => t.id);
     if (!ids.length) { showInfo(m.transfers_nothing_to_pause()); return; }
     const ok = await runBatchCommand(ids, pauseTransfersBatch, m.transfers_batch_label_paused());
-    const filter = transferFilter.trim();
+    const filter = narrowLabel;
     if (filter && ok) {
       showInfo(plural(ids.length, {
         one: () => m.transfers_paused_matching_one({ filter }),
@@ -3154,10 +3313,10 @@
     }
   }
   async function handleResumeAll() {
-    const ids = globalDownloadTargets().filter((t) => canResume(t)).map((t) => t.id);
+    const ids = globalDownloadTargets().filter((t) => isPausedState(t)).map((t) => t.id);
     if (!ids.length) { showInfo(m.transfers_nothing_to_resume()); return; }
     const ok = await runBatchCommand(ids, resumeTransfersBatch, m.transfers_batch_label_resumed());
-    const filter = transferFilter.trim();
+    const filter = narrowLabel;
     if (filter && ok) {
       showInfo(plural(ids.length, {
         one: () => m.transfers_resumed_matching_one({ filter }),
@@ -3257,11 +3416,13 @@
       return;
     }
 
+    // A file pasted twice is one download; its copies count as already listed.
+    const links = distinctLinks(batch.links);
     let queued = 0;
-    let already = 0;
+    let already = batch.links.length - links.length;
     let failed = 0;
     let firstError: unknown;
-    for (const info of batch.links) {
+    for (const info of links) {
       try {
         // Do not pass `info.ember` into startDownload. A pasted link is
         // untrusted; pinning that digest would make the first writer we hear
@@ -3291,15 +3452,15 @@
     // One link on its own keeps the by-name messaging it has always had,
     // including the real error, whether or not it succeeded.
     const ignored = batch.invalid + batch.skipped + failed;
-    if (batch.links.length === 1 && batch.invalid === 0 && batch.skipped === 0) {
+    if (links.length === 1 && batch.invalid === 0 && batch.skipped === 0) {
       if (firstError !== undefined) {
         transferError = toErrorMsg(firstError);
         return;
       }
-      const only = batch.links[0];
-      showInfo(already > 0
-        ? m.transfers_already_in_list({ name: only.name })
-        : m.transfers_queued_from_clipboard({ name: only.name }));
+      const only = links[0];
+      showInfo(queued > 0
+        ? m.transfers_queued_from_clipboard({ name: only.name })
+        : m.transfers_already_in_list({ name: only.name }));
       return;
     }
     showInfo(m.transfers_paste_summary({
@@ -3310,7 +3471,23 @@
     }));
   }
 
-  // The single entry point for every Paste-link affordance (header button,
+  /** The Add eD2K Links dialog: the header button opens it; Ctrl+V and the
+   *  pane and row menus still paste straight from the clipboard. */
+  let addLinksOpen = $state(false);
+
+  async function queueLinksFromDialog(text: string) {
+    if (pasteLinkBusy) return;
+    pasteLinkBusy = true;
+    try {
+      await queuePastedLinks(text);
+    } catch (e: unknown) {
+      transferError = toErrorMsg(e);
+    } finally {
+      pasteLinkBusy = false;
+    }
+  }
+
+  // The single entry point for every one-step Paste-link affordance (Ctrl+V,
   // pane menu, row context menu). Re-entrancy is guarded here rather than at
   // the call sites so a second paste cannot start a concurrent batch of up to
   // 256 downloads alongside the first and double-count the same links.
@@ -3469,7 +3646,13 @@
     selectedDownloadIds = selectedDownloadIds.filter((id) => !idSet.has(id));
     if (lastClickedDlId && idSet.has(lastClickedDlId)) lastClickedDlId = null;
     const failed: { id: string; name: string; error: string }[] = [];
-    const results = await mapSettledWithLimit(ids, REMOVE_CONCURRENCY, (id) => removeTransfer(id));
+    // Re-marked as each call starts: the backend drops a row only then, and a
+    // large batch reaches its later rows after the 10 s tombstone set above
+    // has lapsed, so a poll put them back until their own remove landed.
+    const results = await mapSettledWithLimit(ids, REMOVE_CONCURRENCY, (id) => {
+      markDownloadRemoved(id);
+      return removeTransfer(id);
+    });
     results.forEach((r, i) => {
       if (r.status === 'rejected') {
         failed.push({ id: ids[i], name: byId.get(ids[i]) ?? '', error: toErrorMsg(r.reason) });
@@ -3520,7 +3703,7 @@
    *  them: an "all" that reaches rows the user cannot see is how people lose
    *  downloads they meant to keep. */
   function globalDownloadTargets(): Transfer[] {
-    return transferFilter.trim() ? filteredActiveDownloads : activeDownloads;
+    return downloadsNarrowed ? filteredActiveDownloads : activeDownloads;
   }
 
   /** Rows "Clear completed" applies to, scoped the same way. It was the one
@@ -3528,7 +3711,7 @@
    *  it cleared every finished download, including rows the current view never
    *  showed. */
   function clearCompletedTargets(): Transfer[] {
-    const pool = transferFilter.trim() ? filteredCompletedDownloads : completedDownloads;
+    const pool = downloadsNarrowed ? filteredCompletedDownloads : completedDownloads;
     return pool.filter((t) => t.status === 'completed');
   }
 
@@ -3536,7 +3719,7 @@
     const targets = clearCompletedTargets();
     confirmClearCompleted = {
       open: true,
-      filter: transferFilter.trim(),
+      filter: narrowLabel,
       count: targets.length,
     };
   }
@@ -3545,7 +3728,7 @@
     const ids = globalDownloadTargets().filter((t) => canStop(t)).map((t) => t.id);
     if (!ids.length) { showInfo(m.transfers_nothing_to_stop()); return; }
     const ok = await runBatchCommand(ids, stopTransfersBatch, m.transfers_batch_label_stopped());
-    const filter = transferFilter.trim();
+    const filter = narrowLabel;
     if (filter && ok) {
       showInfo(plural(ids.length, {
         one: () => m.transfers_stopped_matching_one({ filter }),
@@ -3563,7 +3746,7 @@
       ids,
       count: ids.length,
       removeIds: [],
-      filter: transferFilter.trim(),
+      filter: narrowLabel,
     };
   }
 
@@ -4430,6 +4613,9 @@
           reputationInFlight.delete(hash);
         }
       }
+      for (const hash of [...reputationAnswered]) {
+        if (!liveHashes.has(hash)) reputationAnswered.delete(hash);
+      }
       if (mutated) {
         reputationMap = { ...reputationMap };
       }
@@ -4531,6 +4717,13 @@
   }
   // File Details is modal: the list behind it keeps its selection.
   if (fileDetailsId) return;
+  // Paste eD2K links, as in eMule. Only outside a text field (guarded above),
+  // where a native paste has nowhere to go anyway, and on an empty list too.
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isShortcutLetter(e, 'v')) {
+    e.preventDefault();
+    void pasteLinksFromClipboard();
+    return;
+  }
   if (filteredSelectableDownloads.length === 0) return;
   const currentId = selectedDownloadIds[selectedDownloadIds.length - 1];
   const idx = currentId ? filteredSelectableDownloads.findIndex((t) => t.id === currentId) : -1;
@@ -4560,9 +4753,9 @@
   <div class="header-actions">
     <button
       class="ghost paste-link-btn"
-      onclick={pasteLinksFromClipboard}
+      onclick={() => (addLinksOpen = true)}
       disabled={pasteLinkBusy}
-      title={m.transfers_paste_link_title()}
+      title={m.transfers_add_links_button_title()}
     >
       <span class="paste-link-icon" aria-hidden="true">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -4572,10 +4765,21 @@
           <line x1="6.5" y1="10" x2="9.5" y2="10"/>
         </svg>
       </span>
-      {pasteLinkBusy ? m.transfers_pasting() : m.transfers_paste_link()}
+      {pasteLinkBusy ? m.transfers_pasting() : m.transfers_add_links_button()}
     </button>
   </div>
 </div>
+
+<AddLinksDialog bind:open={addLinksOpen} busy={pasteLinkBusy} maxLength={MAX_PASTE_LEN} onsubmit={queueLinksFromDialog} />
+<CategoriesDialog
+  bind:open={categoriesDialog.open}
+  categories={userCategories}
+  counts={categoryCounts}
+  assignCount={categoriesDialog.assignIds.length}
+  isTaken={isCategoryTaken}
+  onadd={addUserCategory}
+  onremove={removeUserCategory}
+/>
 
 {#if transferError}
   <div class="error-banner" role="alert">
@@ -4618,6 +4822,31 @@
         {/if}
       </label>
     </div>
+    {#if categoryChips.length > 0}
+      <div class="category-chips" role="group" aria-label={m.transfers_category_filter_aria()}>
+        <button
+          type="button"
+          class="category-chip"
+          class:active={!activeCategory}
+          aria-pressed={!activeCategory}
+          onclick={() => (categoryFilter = '')}
+        >{m.transfers_category_filter_all()} <span class="category-chip-count">{formatNumber(allDownloads.length)}</span></button>
+        {#each categoryChips as cat (cat)}
+          <button
+            type="button"
+            class="category-chip"
+            class:active={activeCategory === cat}
+            aria-pressed={activeCategory === cat}
+            onclick={() => (categoryFilter = activeCategory === cat ? '' : cat)}
+          >{categoryLabel(cat)} <span class="category-chip-count">{formatNumber(categoryCounts[cat] ?? 0)}</span></button>
+        {/each}
+        <button
+          type="button"
+          class="category-chip category-chip-edit"
+          onclick={() => (categoriesDialog = { open: true, assignIds: [] })}
+        >{m.transfers_category_edit()}</button>
+      </div>
+    {/if}
     <div class="pane-toolbar">
       <span class="pane-title">{m.transfers_downloading_count({ shown: filteredActiveDownloads.length, total: activeDownloads.length })}</span>
       <div class="toolbar-actions">
@@ -5000,7 +5229,7 @@
                   <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                 </svg>
                 <p class="empty-title">{m.transfers_empty_no_matches()}</p>
-                <button class="secondary empty-action" type="button" onclick={() => (transferFilter = '')}>{m.transfers_known_clear_filter()}</button>
+                <button class="secondary empty-action" type="button" onclick={clearDownloadFilters}>{m.transfers_known_clear_filter()}</button>
               </div>
             </td></tr>
           {/if}
@@ -5183,6 +5412,7 @@
     <div
       class="pane-content scroll-shadows"
       id="bottom-pane-content"
+      bind:this={bottomPaneEl}
       oncontextmenu={onUploadsPaneCtx}
       role="tabpanel"
       tabindex={-1}
@@ -5399,9 +5629,12 @@
               {/each}
             </tr>
           </thead>
-          <tbody>
-            {#each sortedUploadQueueClients as q (q.user_hash + ':' + q.peer_ip + ':' + q.peer_port + ':' + q.file_hash)}
-              <tr class="ul-row">
+          <tbody bind:this={queueWindow.body}>
+            {#if queueWindow.topPad > 0}
+              <tr class="vpad-row" aria-hidden="true" style="height: {queueWindow.topPad}px;"><td colspan={queueColCount}></td></tr>
+            {/if}
+            {#each windowedQueueClients as q, i (q.user_hash + ':' + q.peer_ip + ':' + q.peer_port + ':' + q.file_hash)}
+              <tr class="ul-row queue-row win-row" class:row-alt={((queueWindow.start + i) & 1) === 1}>
                 {#each visibleQueueColumns as column (column.key)}
                   {#if column.key === 'country'}
                     <td class="flag-cell" title={q.country_code ?? ''}>{#if countryFlagSrc(q.country_code ?? undefined)}<img src={countryFlagSrc(q.country_code ?? undefined)} alt={q.country_code ?? ''} class="flag-img" />{/if}</td>
@@ -5434,6 +5667,9 @@
                 {/each}
               </tr>
             {/each}
+            {#if queueWindow.bottomPad > 0}
+              <tr class="vpad-row" aria-hidden="true" style="height: {queueWindow.bottomPad}px;"><td colspan={queueColCount}></td></tr>
+            {/if}
             {#if uploadQueueClients.length === 0}
               <tr class="empty-row"><td colspan={queueColCount} class="empty-cell">
                 {#if uploadQueueLoadFailed}
@@ -5518,11 +5754,7 @@
               <span class="known-stat" title={m.transfers_known_total_down_title()}>
                 &darr; <strong>{formatSize(knownStats.totalDown)}</strong>
               </span>
-              {#if displayedKnownClients.length < filteredKnownClients.length}
-                <span class="known-stat known-stat-match" aria-live="polite">
-                  {m.transfers_known_showing_label()} <strong>{displayedKnownClients.length}</strong> / <strong>{filteredKnownClients.length}</strong>
-                </span>
-              {:else if knownFilter && filteredKnownClients.length !== knownStats.total}
+              {#if knownFilter && filteredKnownClients.length !== knownStats.total}
                 <span class="known-stat known-stat-match" aria-live="polite">
                   {m.transfers_known_showing_label()} <strong>{filteredKnownClients.length}</strong>
                 </span>
@@ -5577,14 +5809,18 @@
               {/each}
             </tr>
           </thead>
-          <tbody>
-            {#each displayedKnownClients as kc (kc.user_hash)}
+          <tbody bind:this={knownWindow.body}>
+            {#if knownWindow.topPad > 0}
+              <tr class="vpad-row" aria-hidden="true" style="height: {knownWindow.topPad}px;"><td colspan={knownColCount}></td></tr>
+            {/if}
+            {#each displayedKnownClients as kc, i (kc.user_hash)}
               {@const emberKey = kc.ember_hash?.toLowerCase()}
               {@const isFriend = kc.is_friend || (!!emberKey && friendHashSet.has(emberKey))}
               {@const friendNick = (emberKey ? friendNickById[emberKey] : undefined) || (kc.nickname || undefined)}
               {@const shownHash = showingEmberKnown ? (kc.ember_hash || kc.user_hash) : kc.user_hash}
               <tr
-                class="client-row"
+                class="client-row win-row"
+                class:row-alt={((knownWindow.start + i) & 1) === 1}
                 class:client-row-friend={isFriend}
                 oncontextmenu={(e) => onKnownCtx(e, kc)}
               >
@@ -5659,6 +5895,9 @@
                 {/each}
               </tr>
             {/each}
+            {#if knownWindow.bottomPad > 0}
+              <tr class="vpad-row" aria-hidden="true" style="height: {knownWindow.bottomPad}px;"><td colspan={knownColCount}></td></tr>
+            {/if}
             {#if filteredKnownClients.length === 0}
               <tr class="empty-row"><td colspan={knownColCount} class="empty-cell">
                 {#if !knownClientsLoaded}
@@ -6050,7 +6289,7 @@
         </button>
         {#if ctxCategorySub}
           <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
-            {#each CATEGORY_OPTIONS as cat}
+            {#each categoryOptions as cat (cat)}
               <button
                 class="ctx-item"
                 role="menuitemradio"
@@ -6058,6 +6297,8 @@
                 onclick={() => ctxAction('set_category', cat)}
               >{categoryLabel(cat)}</button>
             {/each}
+            <div class="ctx-sep" role="separator"></div>
+            <button class="ctx-item" role="menuitem" onclick={() => ctxTransfer && openNewCategory(ctxTransfer)}>{m.transfers_ctx_category_new()}</button>
           </div>
         {/if}
       </div>
@@ -6191,6 +6432,10 @@
   danger={true}
   onconfirm={async () => {
     const id = confirmCancel.id;
+    // Re-read: a download can finish while the dialog is open, and the
+    // backend still cancels a finished row, recording it in the download
+    // history as cancelled over its completed entry.
+    if ($transfers.some((x) => x.id === id && isFinished(x))) return;
     let snapshot: Transfer | undefined;
     transfers.update((list) => {
       snapshot = list.find((x) => x.id === id);
@@ -6248,7 +6493,7 @@
   onconfirm={async () => {
     let markedIds: string[] = [];
     try {
-      if (transferFilter.trim()) {
+      if (downloadsNarrowed) {
         await removeTransfersBatch(clearCompletedTargets().map((t) => t.id), false);
       } else {
         markedIds = $transfers.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id);
@@ -6293,8 +6538,16 @@
   confirmLabel={m.transfers_confirm_batch_cancel_label()}
   danger={true}
   onconfirm={async () => {
-    const ids = confirmBatchCancel.ids; const idSet = new Set(ids);
-    const removeIds = confirmBatchCancel.removeIds;
+    // As for a single cancel: rows that finished while the dialog was open
+    // are removed from the list like the finished rows already in it, not
+    // cancelled.
+    const finishedNow = new Set($transfers.filter((x) => isFinished(x)).map((x) => x.id));
+    const ids = confirmBatchCancel.ids.filter((id) => !finishedNow.has(id));
+    const idSet = new Set(ids);
+    const removeIds = [
+      ...confirmBatchCancel.removeIds,
+      ...confirmBatchCancel.ids.filter((id) => finishedNow.has(id)),
+    ];
     let snapshots: Transfer[] = [];
     // Optimistic remove — same rationale as single cancel above.
     transfers.update((list) => {
@@ -6776,6 +7029,51 @@
     color: var(--text-muted);
     margin-right: 2px;
   }
+  /* One row that scrolls sideways, so many categories never push the list down. */
+  .category-chips {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+  .category-chip {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
+    background: var(--bg-primary);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    white-space: nowrap;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+  }
+  .category-chip:hover:not(.active) {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+  }
+  .category-chip.active {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+  .category-chip-count {
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+  }
+  .category-chip.active .category-chip-count {
+    color: inherit;
+  }
+  .category-chip-edit {
+    margin-left: auto;
+    border-style: dashed;
+  }
   /* The Known Clients search, at the right of the downloads overview bar. */
   .pill-search.dl-filter {
     margin-left: auto;
@@ -6881,10 +7179,15 @@
   .toolbar-more-menu button.menu-danger:hover {
     background: color-mix(in srgb, var(--danger) 14%, transparent);
   }
+  /* Both panes window their tables behind spacer rows. Scroll anchoring would
+     answer each spacer resize by nudging scrollTop, which moves the window
+     again; a scrollbar drag turns that into a loop (see `.results-scroll` on
+     the search page). */
   .pane-content {
     flex: 1;
     overflow: auto;
     min-height: 0;
+    overflow-anchor: none;
   }
 
   /* --- Bottom pane tabs --- */
@@ -7130,12 +7433,13 @@
     text-overflow: ellipsis;
     border-bottom: 1px solid var(--table-row-divider);
   }
-  .transfer-table tbody tr:nth-child(even of :not(.source-child-row):not(.section-divider-row):not(.src-failed-summary):not(.dl-row):not(.vpad-row)) {
+  .transfer-table tbody tr:nth-child(even of :not(.source-child-row):not(.section-divider-row):not(.src-failed-summary):not(.dl-row):not(.vpad-row):not(.win-row)) {
     background: var(--table-row-alt);
   }
-  /* Download rows are windowed, so which of them is an even child changes
-     as the table scrolls; they carry their stripe from their list index. */
-  .transfer-table tbody tr.dl-row.row-alt {
+  /* Windowed rows change which child they are as the table scrolls, so they
+     carry their stripe from their list index. */
+  .transfer-table tbody tr.dl-row.row-alt,
+  .transfer-table tbody tr.win-row.row-alt {
     background: var(--table-row-alt);
   }
   .transfer-table tbody tr.vpad-row,

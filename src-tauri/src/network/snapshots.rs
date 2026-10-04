@@ -289,6 +289,7 @@ pub(super) async fn upload_queue_snapshot(
     queue: &ed2k::upload::UploadQueueRef,
     credit_manager: &Arc<RwLock<ed2k::credits::CreditManager>>,
     local_index: &Arc<RwLock<LocalIndex>>,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
     friend_hashes: &crate::app_state::SharedFriendHashes,
     geoip: &crate::geoip::GeoIpReader,
 ) -> Vec<crate::types::UploadQueueClient> {
@@ -312,33 +313,27 @@ pub(super) async fn upload_queue_snapshot(
     if queue_snapshot.is_empty() {
         return Vec::new();
     }
+    // Peers also queue for files we are still downloading, which the shared
+    // index does not hold. Read before the other locks and released at once.
+    let downloading_names: HashMap<String, String> = {
+        let wanted: HashSet<String> =
+            queue_snapshot.iter().map(|e| hex::encode(e.file_hash)).collect();
+        let mgr = transfer_manager.read().await;
+        mgr.active
+            .values()
+            .chain(mgr.queue.iter())
+            .filter(|t| t.direction == TransferDirection::Download && wanted.contains(&t.file_hash))
+            .map(|t| (t.file_hash.clone(), t.file_name.clone()))
+            .collect()
+    };
     let cm = credit_manager.read().await;
     let idx = local_index.read().await;
     let friends = friend_hashes.read().await;
 
+    let ranks = ed2k::upload::compute_queue_ranks(&cm, &idx, &queue_snapshot);
     let mut out = Vec::with_capacity(queue_snapshot.len());
-    for entry in &queue_snapshot {
+    for (entry, &rank) in queue_snapshot.iter().zip(&ranks) {
         let wait_secs = entry.join_time.elapsed().as_secs();
-        let score = ed2k::upload::score_queue_entry(
-            &cm,
-            &idx,
-            &entry.user_hash,
-            entry.file_hash,
-            wait_secs,
-            entry.current_addr,
-            entry.emule_version,
-            entry.is_friend_slot,
-            entry.ember_pubkey.as_ref(),
-            entry.ember_verified,
-        );
-        let rank = ed2k::upload::compute_queue_rank(
-            &cm,
-            &idx,
-            &queue_snapshot,
-            &entry.identity,
-            score,
-            entry.join_time,
-        );
         // Every waiting peer has a rank, so every row gets one.
         //
         // This used to be withheld whenever `current_addr` was `None`, on the
@@ -346,7 +341,7 @@ pub(super) async fn upload_queue_snapshot(
         // for a callback. It does not: eMule's `?` is for *our* position in a
         // *remote* peer's queue, which we genuinely do not know until they
         // send `OP_QUEUERANKING`. Our own queue is the one place the number is
-        // never in doubt — `compute_queue_rank` above scores the whole queue
+        // never in doubt — `compute_queue_ranks` above scores the whole queue
         // and does not care whether a socket happens to be open.
         //
         // And `current_addr` is `None` for almost every row: a peer that has
@@ -416,6 +411,7 @@ pub(super) async fn upload_queue_snapshot(
         let file_name = idx
             .get_by_hash(&file_hash_hex)
             .map(|f| f.name.clone())
+            .or_else(|| downloading_names.get(&file_hash_hex).cloned())
             .unwrap_or_else(|| String::from("(unknown file)"));
 
         // Resolved from the full address, not a v4-mapped copy of it, so a

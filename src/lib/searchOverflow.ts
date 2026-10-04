@@ -68,3 +68,31 @@ export function shedWeakestRows(results: SearchResult[], keep: number): void {
   for (let i = 0; i < keep; i++) results[i] = ordered[i].row;
   results.length = keep;
 }
+
+/** Dropped rows a tab remembers, so that one which comes back and is dropped
+ *  again counts once. Past this the oldest are forgotten, and may count twice. */
+export const MAX_REMEMBERED_SHED = 15_000;
+
+/**
+ * Remember the rows an overflow just dropped: the keys `before` held that
+ * `after` does not. Returns how many of them `shed` did not hold already,
+ * which is what the tab's count of dropped rows grows by.
+ */
+export function rememberShed(
+  shed: Set<string>,
+  before: Iterable<string>,
+  after: ReadonlyMap<string, unknown>,
+  limit = MAX_REMEMBERED_SHED,
+): number {
+  let added = 0;
+  for (const key of before) {
+    if (after.has(key) || shed.has(key)) continue;
+    shed.add(key);
+    added += 1;
+  }
+  for (const key of shed) {
+    if (shed.size <= limit) break;
+    shed.delete(key);
+  }
+  return added;
+}

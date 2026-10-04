@@ -40,7 +40,7 @@ const ARTIFACT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const CURRENT_SECURITY_EPOCH: u64 = 1;
 const STATE_FILE: &str = "updater-security-state.json";
 /// Records that we handed a verified installer to the OS and expected not to
-/// come back. See [`save_handoff`].
+/// come back. See [`write_handoff_record`].
 const HANDOFF_FILE: &str = "update-handoff.json";
 /// Where the verified installer is kept so a failed hand-off leaves something
 /// the user can still run.
@@ -89,10 +89,39 @@ fn is_missing_updater_resource(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<UpdaterResourceMissing>().is_some())
 }
 
+/// Locks are taken in the order `operation`, `staging`, `pending`, and
+/// `pending` is only ever held briefly outside an install.
 #[derive(Default)]
 pub struct UpdaterService {
+    /// One check or install at a time.
     operation: Mutex<()>,
+    /// Held by whoever downloads an artifact into the staging folder or
+    /// otherwise changes what is in it, so a background preparation and a
+    /// manual install never write the same file at once. A download holds only
+    /// this, which leaves checks and installs free while it runs.
+    staging: Mutex<()>,
     pending: Mutex<Option<PendingUpdate>>,
+    /// `(received, size)` of the artifact being downloaded right now, so an
+    /// install waiting for a background download can show how far it is.
+    download_progress: parking_lot::Mutex<Option<(u64, u64)>>,
+}
+
+/// The last update check's result, for a webview that missed the event.
+static LAST_CHECK: parking_lot::Mutex<Option<SecureUpdateCheckResult>> =
+    parking_lot::Mutex::new(None);
+
+/// Proof that the caller holds [`UpdaterService`]'s operation lock.
+pub(crate) struct OperationGuard<'a> {
+    _held: tokio::sync::MutexGuard<'a, ()>,
+}
+
+/// The operation lock, if no check or install holds it right now.
+pub(crate) fn try_lock_operation(service: &UpdaterService) -> Option<OperationGuard<'_>> {
+    service
+        .operation
+        .try_lock()
+        .ok()
+        .map(|held| OperationGuard { _held: held })
 }
 
 struct PendingUpdate {
@@ -108,6 +137,10 @@ struct PendingUpdate {
     /// later recovery can keep them — see [`UpdateHandoff::manifest`].
     manifest: String,
     manifest_signature: String,
+    /// Where [`prepare_staged`] left the verified artifact. Staged bytes are
+    /// re-verified before anything installs them, since they may sit for days
+    /// waiting for a quiet moment.
+    prepared: Option<PreparedArtifact>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -152,7 +185,36 @@ pub struct SecureUpdateCheckResult {
     signature_missing: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+impl SecureUpdateCheckResult {
+    /// A check that could not produce a result at all, reported in-band the way
+    /// every other failure is.
+    pub(crate) fn failed(error: String) -> Self {
+        Self {
+            update: None,
+            pending_retained: false,
+            error: Some(error),
+            signature_missing: false,
+        }
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// This result with its offer brought up to date: `pending` is what the
+    /// updater holds now, which an install or a floor rise may have changed
+    /// since the check. Every check reports exactly the pending update's
+    /// metadata, so nothing else needs reconciling.
+    fn brought_up_to_date(self, pending: Option<&UpdateInfo>) -> Self {
+        Self {
+            update: pending.cloned(),
+            pending_retained: pending.is_some(),
+            ..self
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", content = "data")]
 pub enum UpdateProgress {
     Started {
@@ -780,16 +842,40 @@ fn pending_dir(app: &AppHandle) -> Result<PathBuf> {
         .join(PENDING_DIR))
 }
 
-/// The installer's name on disk, built from values we control rather than from
-/// anything the marker file says, so the path can only ever land inside
+/// The staged artifact's name on disk, built from values we control rather than
+/// from anything the marker file says, so the path can only ever land inside
 /// [`PENDING_DIR`].
 fn installer_name(version: &str, kind: &str) -> String {
     let safe_version: String = version
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
         .collect();
-    let safe_kind = if kind == "msi" { "msi" } else { "exe" };
+    let safe_kind = match kind {
+        "msi" => "msi",
+        "exe" => "exe",
+        _ => "bin",
+    };
     format!("Ember_{safe_version}_update.{safe_kind}")
+}
+
+/// The version a staged artifact's file name claims, for housekeeping only.
+fn staged_version_from_name(name: &str) -> Option<&str> {
+    name.strip_prefix("Ember_")?
+        .rsplit_once('.')?
+        .0
+        .strip_suffix("_update")
+}
+
+/// What a staged artifact is called on this platform. Windows keeps the
+/// installer's own extension because hand-off recovery runs it directly;
+/// elsewhere the bytes only ever go back through the updater plugin, so the
+/// name carries no meaning.
+fn staged_kind(url: &Url) -> &'static str {
+    if cfg!(windows) {
+        installer_kind(url)
+    } else {
+        "bin"
+    }
 }
 
 /// `exe` unless the signed URL clearly names an MSI.
@@ -811,19 +897,62 @@ fn read_handoff(path: &Path) -> Result<Option<UpdateHandoff>> {
     }
 }
 
-/// Persist the verified installer and the record of handing it over.
+/// Where a verified update is kept between preparing and installing it.
+enum PreparedArtifact {
+    /// On disk in [`PENDING_DIR`]. The normal case, and the only one hand-off
+    /// recovery can use.
+    Staged(PathBuf),
+    /// Staging failed (a full disk, an antivirus holding the folder). An update
+    /// the user asked for is not refused over a missing safety net, so the
+    /// verified bytes are kept here instead.
+    InMemory(Vec<u8>),
+}
+
+/// Write verified artifact bytes to `path` in the staging directory, replacing
+/// whatever an earlier preparation left there.
+fn stage_artifact(path: &Path, artifact: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .context("the update staging path has no directory")?;
+    std::fs::create_dir_all(dir).context("failed to create the update staging directory")?;
+
+    // Only ever one staged artifact: whatever a previous attempt left behind is
+    // either already installed or superseded by this one.
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.path() != path {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    crate::security::atomic_write(path, artifact, true)
+        .context("failed to stage the verified update")
+}
+
+/// Read a staged artifact back and check it against the signed size, hash and
+/// signature it was staged under.
+///
+/// The bytes may have sat on disk for days waiting for a quiet moment, so they
+/// are treated exactly like bytes off the network: nothing is installed on the
+/// strength of having written it earlier.
+fn read_verified_staged(path: &Path, platform: &SignedPlatform, public_key: &str) -> Result<Vec<u8>> {
+    let bytes = std::fs::read(path).context("the staged update is no longer present")?;
+    if bytes.len() as u64 != platform.size {
+        bail!("the staged update is not its signed size");
+    }
+    if hex::encode(Sha256::digest(&bytes)) != platform.sha256 {
+        bail!("the staged update no longer matches its signed hash");
+    }
+    verify_minisign(&bytes, platform.signature.as_bytes(), public_key)?;
+    Ok(bytes)
+}
+
+/// Record that the staged installer is about to be handed to the OS.
 ///
 /// Best-effort by design: the caller carries on installing if this fails, since
-/// a missing safety net is not a reason to refuse an update the user asked for.
-fn save_handoff(
-    app: &AppHandle,
-    platform: &SignedPlatform,
-    version: &str,
-    security_epoch: u64,
-    manifest: &str,
-    manifest_signature: &str,
-    artifact: &[u8],
-) -> Result<()> {
+/// a missing safety net is not a reason to refuse an update.
+fn write_handoff_record(app: &AppHandle, update: &PendingUpdate) -> Result<()> {
     // Windows only, because the dead end being recovered from is a Windows one.
     // There `Update::install` hands the bundle to NSIS/MSI and then calls
     // `exit(0)`, so a refusal to run the freshly written installer is
@@ -831,47 +960,31 @@ fn save_handoff(
     // installs in-process instead — `dpkg -i` behind a pkexec prompt for the
     // `.deb`, an in-place rewrite for the AppImage — and returns a `Result` the
     // caller already turns into a visible error, so there is nothing silent to
-    // recover from and no reason to keep a second copy of a 100 MB bundle.
+    // recover from.
     //
-    // Staging there would also have nothing coherent to offer: re-running a
+    // A record there would also have nothing coherent to offer: re-running a
     // staged AppImage just runs the new version out of the data folder without
     // installing anything, and leaves the old one in place. Refusing at the top
-    // is what keeps `installer_kind` and `installer_name` total as well — they
-    // only ever name an `exe` or an `msi` because only Windows reaches them.
+    // is what keeps `installer_kind` total as well — a record only ever names an
+    // `exe` or an `msi` because only Windows writes one.
     //
     // `cfg!` rather than `#[cfg]` so the body below stays type-checked
     // everywhere this compiles.
     if !cfg!(windows) {
         tracing::debug!(
-            "Not staging a hand-off record: an install failure is reported directly on this platform"
+            "Not writing a hand-off record: an install failure is reported directly on this platform"
         );
         return Ok(());
     }
-    let kind = installer_kind(&platform.url);
-    let dir = pending_dir(app)?;
-    std::fs::create_dir_all(&dir).context("failed to create the update staging directory")?;
-
-    // Only ever one saved installer: whatever a previous attempt left behind is
-    // either already installed or superseded by this one.
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-
-    let path = dir.join(installer_name(version, kind));
-    crate::security::atomic_write(&path, artifact, true)
-        .context("failed to stage the verified installer")?;
-
     let record = UpdateHandoff {
-        version: version.to_string(),
-        security_epoch,
+        version: update.info.version.clone(),
+        security_epoch: update.info.security_epoch,
         from_version: app.package_info().version.to_string(),
-        kind: kind.to_string(),
-        sha256: platform.sha256.clone(),
-        signature: platform.signature.clone(),
-        manifest: manifest.to_string(),
-        manifest_signature: manifest_signature.to_string(),
+        kind: installer_kind(&update.platform.url).to_string(),
+        sha256: update.platform.sha256.clone(),
+        signature: update.platform.signature.clone(),
+        manifest: update.manifest.clone(),
+        manifest_signature: update.manifest_signature.clone(),
         attempted_at: chrono::Utc::now().timestamp(),
     };
     let bytes = serde_json::to_vec(&record).context("failed to serialize the hand-off record")?;
@@ -879,13 +992,104 @@ fn save_handoff(
         .context("failed to persist the hand-off record")
 }
 
-/// Forget a hand-off and delete the installer it refers to.
-fn clear_handoff(app: &AppHandle) {
-    if let Ok(path) = handoff_path(app) {
-        let _ = std::fs::remove_file(path);
-    }
+/// Delete everything staged. For an install that has already happened in
+/// process, where the copy has done its job.
+fn discard_staged(app: &AppHandle) {
     if let Ok(dir) = pending_dir(app) {
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// What housekeeping in the staging folder must not delete, beyond what the
+/// file names say.
+#[derive(Default)]
+struct StagedKeep {
+    /// The pending update's staged file, or the one it would reuse.
+    pending: Option<String>,
+    /// The highest signed release observed. A file of its version is judged
+    /// by its epoch, which may authorize a version no higher than the running
+    /// one.
+    floor: Option<RollbackState>,
+}
+
+impl StagedKeep {
+    fn epoch_of(&self, staged: &Version) -> u64 {
+        self.floor
+            .as_ref()
+            .filter(|floor| Version::parse(&floor.highest_version).is_ok_and(|floor| floor == *staged))
+            .map_or(CURRENT_SECURITY_EPOCH, |floor| floor.security_epoch)
+    }
+
+    fn is_pending(&self, name: &str) -> bool {
+        self.pending.as_deref() == Some(name)
+    }
+}
+
+/// What the staging folder must keep, given the name the pending update is
+/// staged under.
+fn staged_keep(app: &AppHandle, pending: Option<String>) -> StagedKeep {
+    let floor = state_path(app)
+        .ok()
+        .and_then(|path| load_rollback_state(&path).ok().flatten());
+    StagedKeep { pending, floor }
+}
+
+/// Remove artifacts a preparation staged and never installed, once they are no
+/// longer newer than the running build.
+///
+/// Nothing here is a failed install anyone needs to hear about. The version
+/// comes from the file name, which is untrusted, but it is only ever used to
+/// decide what to delete: the worst a rewritten name can do is cost a
+/// re-download or keep one stale file. Call with the staging lock held.
+fn sweep_stale_staged(app: &AppHandle, keep: &StagedKeep) {
+    if let Ok(dir) = pending_dir(app) {
+        sweep_stale_staged_in(&dir, &app.package_info().version.to_string(), keep);
+    }
+}
+
+fn sweep_stale_staged_in(dir: &Path, running: &str, keep: &StagedKeep) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        // `atomic_write` writes through a dot-named temporary beside the file.
+        if name.to_string_lossy().starts_with('.') || name.to_str().is_some_and(|name| keep.is_pending(name)) {
+            continue;
+        }
+        let newer = name
+            .to_str()
+            .and_then(staged_version_from_name)
+            .and_then(|version| Version::parse(version).ok())
+            .is_some_and(|staged| staged_claim_is_an_upgrade(keep.epoch_of(&staged), &staged, running));
+        if !newer {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Forget a hand-off and delete the installer it refers to, which is `claim`'s
+/// when the marker could be verified. One that could not names nothing we can
+/// trust, so only what is no longer an upgrade goes. Anything else in the
+/// staging folder, such as a newer release prepared since, stays, and so does
+/// the pending update's own copy whatever the hand-off says. Call with the
+/// staging lock held.
+fn clear_handoff(app: &AppHandle, claim: Option<&HandoffClaim>, keep: &StagedKeep) {
+    let (Ok(marker), Ok(dir)) = (handoff_path(app), pending_dir(app)) else {
+        return;
+    };
+    let own = claim.map(|claim| installer_name(&claim.version.to_string(), claim.kind));
+    clear_handoff_in(&marker, &dir, own.as_deref(), &app.package_info().version.to_string(), keep);
+}
+
+fn clear_handoff_in(marker: &Path, dir: &Path, own: Option<&str>, running: &str, keep: &StagedKeep) {
+    let _ = std::fs::remove_file(marker);
+    match own {
+        Some(name) if keep.is_pending(name) => {}
+        Some(name) => {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        None => sweep_stale_staged_in(dir, running, keep),
     }
 }
 
@@ -1359,14 +1563,24 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
             info,
             manifest: manifest_text,
             manifest_signature,
+            prepared: None,
         },
     )))
 }
 
+/// Whether two signed platform entries name exactly the same artifact.
+fn same_artifact(a: &SignedPlatform, b: &SignedPlatform) -> bool {
+    a.url == b.url && a.sha256 == b.sha256 && a.size == b.size && a.signature.trim() == b.signature.trim()
+}
+
+/// Progress sink for an artifact download: the frontend's channel for a manual
+/// install, or nothing for one prepared in the background.
+type ProgressSink<'a> = &'a (dyn Fn(UpdateProgress) + Sync);
+
 async fn download_artifact(
     platform: &SignedPlatform,
     public_key: &str,
-    on_event: &Channel<UpdateProgress>,
+    on_event: ProgressSink<'_>,
 ) -> Result<Vec<u8>> {
     validate_url(&platform.url, NetworkPolicy::PRODUCTION)?;
     let expected_size = usize::try_from(platform.size)
@@ -1389,7 +1603,7 @@ async fn download_artifact(
         bail!("updater artifact Content-Length differed from signed size");
     }
 
-    let _ = on_event.send(UpdateProgress::Started {
+    on_event(UpdateProgress::Started {
         content_length: platform.size,
     });
     let mut artifact = Vec::with_capacity(expected_size.min(16 * 1024 * 1024));
@@ -1405,7 +1619,7 @@ async fn download_artifact(
         }
         hasher.update(&chunk);
         artifact.extend_from_slice(&chunk);
-        let _ = on_event.send(UpdateProgress::Progress {
+        on_event(UpdateProgress::Progress {
             chunk_length: chunk.len() as u64,
         });
     }
@@ -1417,8 +1631,335 @@ async fn download_artifact(
         bail!("updater artifact SHA-256 did not match signed metadata");
     }
     verify_minisign(&artifact, platform.signature.as_bytes(), public_key)?;
-    let _ = on_event.send(UpdateProgress::Finished);
+    on_event(UpdateProgress::Finished);
     Ok(artifact)
+}
+
+/// The pending update's artifact, copied out so it can be downloaded without
+/// holding the pending update.
+struct PrepareTarget {
+    platform: SignedPlatform,
+    version: String,
+    path: PathBuf,
+}
+
+/// The name the pending update is staged under in [`PENDING_DIR`].
+fn staged_name(update: &PendingUpdate) -> String {
+    installer_name(&update.info.version, staged_kind(&update.platform.url))
+}
+
+/// What the updater holds, at a glance.
+enum PendingLook {
+    Nothing,
+    /// It fell below the signed security floor and has been dropped.
+    BelowFloor,
+    Prepared { version: String },
+    Unprepared(PrepareTarget),
+}
+
+async fn look_at_pending(app: &AppHandle, service: &UpdaterService) -> Result<PendingLook> {
+    let mut pending = service.pending.lock().await;
+    let Some(update) = pending.as_ref() else {
+        return Ok(PendingLook::Nothing);
+    };
+    if !pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)? {
+        pending.take();
+        return Ok(PendingLook::BelowFloor);
+    }
+    if update.prepared.is_some() {
+        return Ok(PendingLook::Prepared {
+            version: update.info.version.clone(),
+        });
+    }
+    let path = pending_dir(app)?.join(staged_name(update));
+    Ok(PendingLook::Unprepared(PrepareTarget {
+        platform: update.platform.clone(),
+        version: update.info.version.clone(),
+        path,
+    }))
+}
+
+/// Download, verify and stage `target`, so that installing it later needs no
+/// network and the downtime is only shutdown, install and relaunch. Holds only
+/// the staging lock (`_staging`), then records the result against the pending
+/// update if that is still the same artifact. Returns whether the pending
+/// update is now prepared.
+///
+/// A copy already staged for the same signed artifact — by an earlier
+/// preparation, possibly in an earlier session — is reused once it re-verifies.
+async fn prepare_staged(
+    service: &UpdaterService,
+    _staging: &tokio::sync::MutexGuard<'_, ()>,
+    target: PrepareTarget,
+    public_key: &str,
+    on_event: ProgressSink<'_>,
+) -> Result<bool> {
+    // A check may have replaced the target, or someone else prepared it, while
+    // this waited for the staging lock.
+    match service.pending.lock().await.as_ref() {
+        Some(update) if same_artifact(&update.platform, &target.platform) => {
+            if update.prepared.is_some() {
+                report_already_staged(target.platform.size, on_event);
+                return Ok(true);
+            }
+        }
+        _ => return Ok(false),
+    }
+
+    let prepared = if read_verified_staged(&target.path, &target.platform, public_key).is_ok() {
+        report_already_staged(target.platform.size, on_event);
+        PreparedArtifact::Staged(target.path.clone())
+    } else {
+        let track = |event: UpdateProgress| {
+            note_download_progress(&service.download_progress, &event);
+            on_event(event);
+        };
+        let downloaded = {
+            // Also when the download is dropped half way, as a background one
+            // is when silent updates are switched off.
+            let _clear = ClearOnDrop(&service.download_progress);
+            download_artifact(&target.platform, public_key, &track).await
+        };
+        let artifact = downloaded?;
+        match stage_artifact(&target.path, &artifact) {
+            Ok(()) => PreparedArtifact::Staged(target.path.clone()),
+            Err(error) => {
+                tracing::warn!("Could not stage the verified update; keeping it in memory: {error:#}");
+                PreparedArtifact::InMemory(artifact)
+            }
+        }
+    };
+
+    let mut pending = service.pending.lock().await;
+    match pending.as_mut() {
+        Some(update) if same_artifact(&update.platform, &target.platform) => {
+            if update.prepared.is_none() {
+                update.prepared = Some(prepared);
+            }
+            Ok(true)
+        }
+        _ => {
+            // Superseded while it downloaded. Nothing else can have staged
+            // anything meanwhile, since this held the staging lock.
+            tracing::info!(
+                "Discarding the prepared update for {}: a check replaced it while it downloaded",
+                target.version
+            );
+            if let PreparedArtifact::Staged(path) = prepared {
+                let _ = std::fs::remove_file(path);
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// Report an artifact already staged the way a download of it would be, so a
+/// progress UI moves on to installing.
+fn report_already_staged(size: u64, on_event: ProgressSink<'_>) {
+    on_event(UpdateProgress::Started {
+        content_length: size,
+    });
+    on_event(UpdateProgress::Progress { chunk_length: size });
+    on_event(UpdateProgress::Finished);
+}
+
+/// Forgets the download progress it guards when dropped.
+struct ClearOnDrop<'a>(&'a parking_lot::Mutex<Option<(u64, u64)>>);
+
+impl Drop for ClearOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.lock().take();
+    }
+}
+
+fn note_download_progress(progress: &parking_lot::Mutex<Option<(u64, u64)>>, event: &UpdateProgress) {
+    let mut progress = progress.lock();
+    match *event {
+        UpdateProgress::Started { content_length } => *progress = Some((0, content_length)),
+        UpdateProgress::Progress { chunk_length } => {
+            if let Some((received, _)) = progress.as_mut() {
+                *received = received.saturating_add(chunk_length);
+            }
+        }
+        UpdateProgress::Finished => {}
+    }
+}
+
+/// How often an install waiting for someone else's download passes its
+/// progress on.
+const PROGRESS_FORWARD_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Turns snapshots of another download's progress into the event stream a
+/// progress UI expects.
+#[derive(Default)]
+struct ProgressForward {
+    size: Option<u64>,
+    sent: u64,
+}
+
+impl ProgressForward {
+    fn forward(&mut self, progress: Option<(u64, u64)>, on_event: ProgressSink<'_>) {
+        let Some((received, size)) = progress else {
+            return;
+        };
+        if self.size != Some(size) {
+            on_event(UpdateProgress::Started {
+                content_length: size,
+            });
+            self.size = Some(size);
+            self.sent = 0;
+        }
+        if received > self.sent {
+            on_event(UpdateProgress::Progress {
+                chunk_length: received - self.sent,
+            });
+            self.sent = received;
+        }
+    }
+}
+
+/// The staging lock, passing on the progress of whatever download holds it
+/// meanwhile, so an Install pressed during a background download shows that
+/// download moving instead of sitting still.
+async fn lock_staging_reporting<'a>(
+    service: &'a UpdaterService,
+    on_event: ProgressSink<'_>,
+) -> tokio::sync::MutexGuard<'a, ()> {
+    if let Ok(guard) = service.staging.try_lock() {
+        return guard;
+    }
+    let lock = service.staging.lock();
+    tokio::pin!(lock);
+    let mut ticker = tokio::time::interval(PROGRESS_FORWARD_INTERVAL);
+    let mut forward = ProgressForward::default();
+    loop {
+        tokio::select! {
+            guard = &mut lock => return guard,
+            _ = ticker.tick() => {
+                let progress = *service.download_progress.lock();
+                forward.forward(progress, on_event);
+            }
+        }
+    }
+}
+
+/// Hand the prepared update to the installer.
+///
+/// On Windows a successful install does not return: the plugin launches the
+/// installer and exits the process. Elsewhere it installs in process and
+/// returns, and the caller is expected to restart.
+async fn install_locked(
+    app: &AppHandle,
+    pending: &mut Option<PendingUpdate>,
+    public_key: &str,
+    reason: crate::auto_update::resume::ResumeReason,
+) -> Result<(), String> {
+    let Some(update) = pending.as_mut() else {
+        return Err(coded(
+            "updater_no_pending_update",
+            "No verified update is ready to install.",
+        ));
+    };
+    // Re-read here: another process may have observed a newer signed floor
+    // while this one was downloading or waiting for a quiet moment.
+    if !pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)
+        .map_err(|error| public_failure(UpdaterOperation::Install, error))?
+    {
+        pending.take();
+        return Err(coded(
+            "updater_superseded_while_downloading",
+            "A newer signed update was observed while downloading. Check for updates again.",
+        ));
+    }
+    let artifact = match update.prepared.as_ref() {
+        Some(PreparedArtifact::Staged(path)) => {
+            match read_verified_staged(path, &update.platform, public_key) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    // Gone or altered since it was staged. Forget it so the next
+                    // attempt downloads a fresh copy rather than failing the same
+                    // way.
+                    update.prepared = None;
+                    return Err(public_failure(UpdaterOperation::Install, error));
+                }
+            }
+        }
+        Some(PreparedArtifact::InMemory(bytes)) => bytes.clone(),
+        None => {
+            return Err(coded(
+                "updater_no_pending_update",
+                "No verified update is ready to install.",
+            ))
+        }
+    };
+    // Record the attempt before handing the bytes over. `install` does not come
+    // back on success, so this is the only chance to leave behind anything a
+    // later launch could act on. Only with a staged copy, which is what the
+    // recovery would run.
+    if matches!(update.prepared, Some(PreparedArtifact::Staged(_))) {
+        if let Err(error) = write_handoff_record(app, update) {
+            tracing::warn!("Could not record the update hand-off: {error:#}");
+        }
+    }
+    // While the window, the server connection and the frontend are all still
+    // live: after the shutdown below there is nothing left to ask.
+    crate::auto_update::resume::write_before_install(app, reason, &update.info.version).await;
+
+    // `Update::install` never comes back on Windows: it hands the bundle to the
+    // NSIS/MSI installer and then calls `std::process::exit(0)`. The plugin's
+    // own `on_before_exit` hook is `AppHandle::cleanup_before_exit`, which only
+    // clears tray icons/resource tables and hides windows — `RunEvent::Exit` is
+    // never dispatched, so without this every installed update would abandon
+    // the .part.met gap maps, nodes.dat, the known.met checkpoint that exists
+    // precisely so AICH doesn't rehash from scratch, sources.met, server.met,
+    // reputation and stats at their last periodic save, and would skip graceful
+    // ed2k-server / rendezvous deregistration.
+    //
+    // Done here rather than by overriding `on_before_exit`, because that hook
+    // runs synchronously on a runtime worker inside `install`: bridging back to
+    // async from there means blocking that worker while another thread drives
+    // the shutdown, and on a single-worker runtime that starves the very
+    // network task we would be waiting on. Awaiting from the command yields the
+    // worker instead. `run_graceful_shutdown` is internally bounded and safe to
+    // run again from a later `RunEvent::Exit`; the outer timeout is the
+    // backstop for a lock inside it that never becomes available.
+    if timeout(
+        crate::SHUTDOWN_WAIT + Duration::from_secs(15),
+        crate::run_graceful_shutdown(app, crate::SHUTDOWN_WAIT),
+    )
+    .await
+    .is_err()
+    {
+        tracing::error!(
+            "Graceful shutdown did not complete before the update install deadline; proceeding with a possibly truncated flush"
+        );
+    }
+
+    // On Windows this process ends inside `install`, and the installer only
+    // relaunches Ember when it succeeds. The watchdog is what brings Ember back
+    // when it does not.
+    crate::auto_update::watchdog::spawn_for_install();
+    if let Err(error) = update.update.install(&artifact) {
+        tracing::warn!("Secure updater install failed: {error}");
+        // A manual install that failed leaves this Ember running and the user
+        // in charge of it; the watchdog must not relaunch it after they quit.
+        // A silent one restarts itself, which the watchdog then sees.
+        if reason == crate::auto_update::resume::ResumeReason::Manual {
+            crate::auto_update::watchdog::stand_down();
+        }
+        // Distinct from `public_failure`: the teardown above already stopped
+        // Ember's network services, so this process is no longer transferring
+        // even though the window is still up.
+        return Err(coded(
+            "updater_install_failed_services_stopped",
+            "Secure update install failed. Ember stopped its network services for the update; restart Ember to resume transfers.",
+        ));
+    }
+    // Only reached where the install ran in process: the new version is in
+    // place, so the staged copy has done its job.
+    discard_staged(app);
+    pending.take();
+    Ok(())
 }
 
 /// Which updater operation a failure is being reported for.
@@ -1485,10 +2026,61 @@ pub async fn secure_updater_check(
     app: AppHandle,
     service: State<'_, UpdaterService>,
 ) -> Result<SecureUpdateCheckResult, String> {
+    run_check(&app, &service).await
+}
+
+/// One update check, from the Check button or the backend scheduler alike.
+///
+/// Every attempt is stamped for the scheduler's cadence whatever its outcome,
+/// so a manual check also postpones the next automatic one.
+pub(crate) async fn run_check(
+    app: &AppHandle,
+    service: &UpdaterService,
+) -> Result<SecureUpdateCheckResult, String> {
     let _operation = service.operation.lock().await;
-    match secure_check(&app).await {
-        Ok(Some((info, pending))) => {
-            *service.pending.lock().await = Some(pending);
+    crate::auto_update::record::note_check_attempt();
+    let result = check_and_retain(app, service).await;
+    *LAST_CHECK.lock() = Some(match &result {
+        Ok(result) => result.clone(),
+        Err(error) => SecureUpdateCheckResult::failed(error.clone()),
+    });
+    result
+}
+
+/// The last update check's result as it applies now, or nothing before the
+/// first check. For a webview that was not listening when the scheduler's
+/// result was emitted: one still starting up, or one reloaded since.
+#[tauri::command]
+pub fn get_last_update_check_result(
+    service: State<'_, UpdaterService>,
+) -> Option<SecureUpdateCheckResult> {
+    let last = LAST_CHECK.lock().clone()?;
+    // Held for long only by an install, which is about to end this process.
+    match service.pending.try_lock() {
+        Ok(pending) => {
+            Some(last.brought_up_to_date(pending.as_ref().map(|update| &update.info)))
+        }
+        Err(_) => Some(last),
+    }
+}
+
+async fn check_and_retain(
+    app: &AppHandle,
+    service: &UpdaterService,
+) -> Result<SecureUpdateCheckResult, String> {
+    match secure_check(app).await {
+        Ok(Some((info, mut pending))) => {
+            let mut slot = service.pending.lock().await;
+            // The same signed artifact found again keeps what was prepared for
+            // it. Dropping it made every check re-hash a staged 100 MB bundle,
+            // and a check landing during a silent-update countdown restarted
+            // the countdown and its warning.
+            if let Some(previous) = slot.take() {
+                if same_artifact(&previous.platform, &pending.platform) {
+                    pending.prepared = previous.prepared;
+                }
+            }
+            *slot = Some(pending);
             Ok(SecureUpdateCheckResult {
                 update: Some(info),
                 pending_retained: true,
@@ -1543,6 +2135,72 @@ pub async fn secure_updater_check(
     }
 }
 
+/// The verified update waiting to be installed, if any, and whether it is
+/// already staged: what the silent-update scheduler plans around.
+///
+/// Never waits: the outer `None` means something is swapping the pending update
+/// right now, and the caller should look again on its next tick.
+pub(crate) fn try_pending_update_state(service: &UpdaterService) -> Option<Option<(String, bool)>> {
+    let pending = service.pending.try_lock().ok()?;
+    Some(
+        pending
+            .as_ref()
+            .map(|update| (update.info.version.clone(), update.prepared.is_some())),
+    )
+}
+
+/// Whether the pending update's staged copy is on disk, to tell a copy that is
+/// gone from one that changed. `None` when nothing is pending, the updater is
+/// busy, or the folder cannot be looked at.
+pub(crate) fn try_staged_copy_present(app: &AppHandle, service: &UpdaterService) -> Option<bool> {
+    let pending = service.pending.try_lock().ok()?;
+    let name = staged_name(pending.as_ref()?);
+    drop(pending);
+    pending_dir(app).ok()?.join(name).try_exists().ok()
+}
+
+/// Download, verify and stage the pending update in the background, with no
+/// progress UI. `Ok(None)` when nothing is pending, it has fallen below the
+/// signed floor since it was checked, or a check replaced it while it
+/// downloaded.
+///
+/// Holds no operation lock, so a check or an install pressed meanwhile is not
+/// stuck behind a download that may take half an hour.
+pub(crate) async fn prepare_pending_update(
+    app: &AppHandle,
+    service: &UpdaterService,
+) -> Result<Option<String>, String> {
+    let fail = |error: anyhow::Error| public_failure(UpdaterOperation::Install, error);
+    let target = match look_at_pending(app, service).await.map_err(fail)? {
+        PendingLook::Nothing | PendingLook::BelowFloor => return Ok(None),
+        PendingLook::Prepared { version } => return Ok(Some(version)),
+        PendingLook::Unprepared(target) => target,
+    };
+    let config = embedded_updater_config().map_err(fail)?;
+    let version = target.version.clone();
+    let staging = service.staging.lock().await;
+    let prepared = prepare_staged(service, &staging, target, &config.public_key, &|_| {})
+        .await
+        .map_err(fail)?;
+    Ok(prepared.then_some(version))
+}
+
+/// Install the update [`prepare_pending_update`] staged, for the silent path,
+/// which has already taken the operation lock (`_operation`) so that nothing
+/// it checked before committing can change underneath it. Does not return on
+/// Windows when it succeeds.
+pub(crate) async fn install_prepared_update(
+    app: &AppHandle,
+    service: &UpdaterService,
+    _operation: OperationGuard<'_>,
+    reason: crate::auto_update::resume::ResumeReason,
+) -> Result<(), String> {
+    let mut pending = service.pending.lock().await;
+    let config = embedded_updater_config()
+        .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
+    install_locked(app, &mut pending, &config.public_key, reason).await
+}
+
 #[tauri::command]
 pub async fn secure_updater_install(
     app: AppHandle,
@@ -1550,96 +2208,47 @@ pub async fn secure_updater_install(
     on_event: Channel<UpdateProgress>,
 ) -> Result<(), String> {
     let _operation = service.operation.lock().await;
-    let mut pending = service.pending.lock().await;
-    let Some(update) = pending.as_ref() else {
-        return Err(coded(
-            "updater_no_pending_update",
-            "No verified update is ready to install.",
-        ));
+    let fail = |error: anyhow::Error| public_failure(UpdaterOperation::Install, error);
+    let target = match look_at_pending(&app, &service).await.map_err(fail)? {
+        PendingLook::Nothing => {
+            return Err(coded(
+                "updater_no_pending_update",
+                "No verified update is ready to install.",
+            ))
+        }
+        PendingLook::BelowFloor => {
+            return Err(coded(
+                "updater_pending_below_floor",
+                "The previously checked update is older than the signed security floor. Check for updates again.",
+            ))
+        }
+        PendingLook::Prepared { .. } => None,
+        PendingLook::Unprepared(target) => Some(target),
     };
-    if !pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)
-        .map_err(|error| public_failure(UpdaterOperation::Install, error))?
-    {
-        pending.take();
-        return Err(coded(
-            "updater_pending_below_floor",
-            "The previously checked update is older than the signed security floor. Check for updates again.",
-        ));
-    }
-    let config = embedded_updater_config()
-        .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
-    let artifact = download_artifact(&update.platform, &config.public_key, &on_event)
-        .await
-        .map_err(|error| public_failure(UpdaterOperation::Install, error))?;
-    // Record the attempt and keep the verified bytes before handing them over.
-    // `install` does not come back on success, so this is the only chance to
-    // leave behind anything that a later launch could act on. A failure here is
-    // logged and ignored: losing the safety net is not a reason to refuse the
-    // update itself.
-    if let Err(error) = save_handoff(
+    let config = embedded_updater_config().map_err(fail)?;
+    let report = |event: UpdateProgress| {
+        let _ = on_event.send(event);
+    };
+    // A background preparation of this same update may be downloading it:
+    // wait for it and use its copy rather than fetch a second one beside it.
+    let _staging = match target {
+        Some(target) => {
+            let staging = lock_staging_reporting(&service, &report).await;
+            prepare_staged(&service, &staging, target, &config.public_key, &report)
+                .await
+                .map_err(fail)?;
+            Some(staging)
+        }
+        None => None,
+    };
+    let mut pending = service.pending.lock().await;
+    install_locked(
         &app,
-        &update.platform,
-        &update.info.version,
-        update.info.security_epoch,
-        &update.manifest,
-        &update.manifest_signature,
-        &artifact,
-    ) {
-        tracing::warn!("Could not stage the update hand-off record: {error:#}");
-    }
-    // Re-read after the long download as well. Another process may have
-    // observed a newer signed floor while this process was downloading.
-    if !pending_meets_persisted_floor(&update.rollback_path, &update.candidate_state)
-        .map_err(|error| public_failure(UpdaterOperation::Install, error))?
-    {
-        pending.take();
-        return Err(coded(
-            "updater_superseded_while_downloading",
-            "A newer signed update was observed while downloading. Check for updates again.",
-        ));
-    }
-    // `Update::install` never comes back on Windows: it hands the bundle to the
-    // NSIS/MSI installer and then calls `std::process::exit(0)`. The plugin's
-    // own `on_before_exit` hook is `AppHandle::cleanup_before_exit`, which only
-    // clears tray icons/resource tables and hides windows — `RunEvent::Exit` is
-    // never dispatched, so without this every installed update would abandon
-    // the .part.met gap maps, nodes.dat, the known.met checkpoint that exists
-    // precisely so AICH doesn't rehash from scratch, sources.met, server.met,
-    // reputation and stats at their last periodic save, and would skip graceful
-    // ed2k-server / rendezvous deregistration.
-    //
-    // Done here rather than by overriding `on_before_exit`, because that hook
-    // runs synchronously on a runtime worker inside `install`: bridging back to
-    // async from there means blocking that worker while another thread drives
-    // the shutdown, and on a single-worker runtime that starves the very
-    // network task we would be waiting on. Awaiting from the command yields the
-    // worker instead. `run_graceful_shutdown` is internally bounded and safe to
-    // run again from a later `RunEvent::Exit`; the outer timeout is the
-    // backstop for a lock inside it that never becomes available.
-    if timeout(
-        crate::SHUTDOWN_WAIT + Duration::from_secs(15),
-        crate::run_graceful_shutdown(&app, crate::SHUTDOWN_WAIT),
+        &mut pending,
+        &config.public_key,
+        crate::auto_update::resume::ResumeReason::Manual,
     )
     .await
-    .is_err()
-    {
-        tracing::error!(
-            "Graceful shutdown did not complete before the update install deadline; proceeding with a possibly truncated flush"
-        );
-    }
-
-    if let Err(error) = update.update.install(&artifact) {
-        tracing::warn!("Secure updater install failed: {error}");
-        // Distinct from `public_failure`: the teardown above already stopped
-        // Ember's network services, so this process is no longer transferring
-        // even though the window is still up.
-        return Err(coded(
-            "updater_install_failed_services_stopped",
-            "Secure update install failed. Ember stopped its network services for the update; restart Ember to resume transfers.",
-        ));
-    }
-    pending.take();
-    Ok(())
 }
 
 /// Whether the last hand-off to an installer failed to produce the new version.
@@ -1661,17 +2270,41 @@ pub async fn secure_updater_install(
 #[tauri::command]
 pub async fn secure_updater_handoff_status(
     app: AppHandle,
+    service: State<'_, UpdaterService>,
 ) -> Result<Option<UpdateHandoffReport>, String> {
+    // Never waits for the staging lock: a background download holds it for up
+    // to half an hour, and the frontend holds every update check back until
+    // this answers, which every page load asks. Only the cleanup needs it, and
+    // is left for a later load while a download runs, or while an install
+    // holds the pending update whose copy the cleanup must spare.
+    let staging = service.staging.try_lock().ok();
+    let keep = staging
+        .as_ref()
+        .and_then(|_| service.pending.try_lock().ok().map(|pending| pending.as_ref().map(staged_name)))
+        .map(|pending| staged_keep(&app, pending));
+    let clear = |claim: Option<&HandoffClaim>| {
+        if let Some(keep) = &keep {
+            clear_handoff(&app, claim, keep);
+        }
+    };
     let path =
         handoff_path(&app).map_err(|error| public_failure(UpdaterOperation::HandoffCheck, error))?;
     let record = match read_handoff(&path) {
         Ok(Some(record)) => record,
-        Ok(None) => return Ok(None),
+        Ok(None) => {
+            // Nothing was handed over. Whatever is staged was prepared and never
+            // installed; keep it only while it is still an upgrade, so the next
+            // preparation can reuse it instead of downloading again.
+            if let Some(keep) = &keep {
+                sweep_stale_staged(&app, keep);
+            }
+            return Ok(None);
+        }
         Err(error) => {
             // An unreadable marker is not worth surfacing, and keeping it would
             // make every launch retry the same parse.
             tracing::warn!("Discarding an unreadable update hand-off record: {error:#}");
-            clear_handoff(&app);
+            clear(None);
             return Ok(None);
         }
     };
@@ -1683,7 +2316,7 @@ pub async fn secure_updater_handoff_status(
             // manifest does not contain. Nothing here can be offered, and keeping
             // it would make every launch repeat the same work.
             tracing::warn!("Discarding an unverifiable update hand-off record: {error:#}");
-            clear_handoff(&app);
+            clear(None);
             return Ok(None);
         }
     };
@@ -1697,7 +2330,7 @@ pub async fn secure_updater_handoff_status(
             claim.version,
             app.package_info().version
         );
-        clear_handoff(&app);
+        clear(Some(&claim));
         return Ok(None);
     }
 
@@ -1705,7 +2338,7 @@ pub async fn secure_updater_handoff_status(
         .timestamp()
         .saturating_sub(record.attempted_at);
     if !(0..=HANDOFF_MAX_AGE_SECS).contains(&age) {
-        clear_handoff(&app);
+        clear(Some(&claim));
         return Ok(None);
     }
 
@@ -1719,7 +2352,7 @@ pub async fn secure_updater_handoff_status(
                 "Discarding the staged installer for {}: it is below the signed security floor",
                 claim.version
             );
-            clear_handoff(&app);
+            clear(Some(&claim));
             return Ok(None);
         }
         // No floor, or one we could not read: say nothing and keep the bytes. The
@@ -1776,7 +2409,15 @@ pub async fn secure_updater_handoff_status(
 /// the invisible one, and if something is going to refuse this binary the user
 /// should be able to see it happen and answer whatever prompt appears.
 #[tauri::command]
-pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), String> {
+pub async fn secure_updater_run_saved_installer(
+    app: AppHandle,
+    service: State<'_, UpdaterService>,
+) -> Result<(), String> {
+    // The operation lock as well, so this and a silent install cannot both shut
+    // Ember down and start an installer.
+    let _operation = service.operation.lock().await;
+    let _staging = service.staging.lock().await;
+    let keep = staged_keep(&app, service.pending.lock().await.as_ref().map(staged_name));
     let path = handoff_path(&app)
         .map_err(|error| public_failure(UpdaterOperation::InstallerLaunch, error))?;
     let Some(record) = read_handoff(&path)
@@ -1791,7 +2432,7 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
     // record's own fields are not evidence — see `verified_handoff_claim`.
     let claim = verified_handoff_claim(&record).map_err(|error| {
         tracing::warn!("Refusing to run the staged installer: {error:#}");
-        clear_handoff(&app);
+        clear_handoff(&app, None, &keep);
         coded(
             "updater_staged_unverified",
             "The staged installer could not be verified against its signed manifest. Check for updates again.",
@@ -1801,7 +2442,7 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
     // not the same question as a permitted version, and a permitted version is
     // not the same question as a newer one.
     if !handoff_is_an_upgrade(&app, &claim) {
-        clear_handoff(&app);
+        clear_handoff(&app, Some(&claim), &keep);
         return Err(coded(
             "updater_staged_not_newer",
             "The staged update is not newer than the version already installed.",
@@ -1812,7 +2453,7 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
     {
         Some(true) => {}
         Some(false) => {
-            clear_handoff(&app);
+            clear_handoff(&app, Some(&claim), &keep);
             return Err(coded(
                 "updater_staged_below_floor",
                 "The staged update is older than the signed security floor. Check for updates again.",
@@ -1837,6 +2478,16 @@ pub async fn secure_updater_run_saved_installer(app: AppHandle) -> Result<(), St
             "The staged installer is missing or no longer matches its signature. Check for updates again.",
         )
     })?;
+
+    // As the install path does, while the window and the frontend are still
+    // live: the Ember the installer starts, or the one the user starts after
+    // cancelling it, comes back the way they left this one.
+    crate::auto_update::resume::write_before_install(
+        &app,
+        crate::auto_update::resume::ResumeReason::Manual,
+        &claim.version.to_string(),
+    )
+    .await;
 
     // Same reasoning as the install path: the installer replaces files this
     // process has open, so flush and stop everything we own first.
@@ -1959,6 +2610,296 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
     fn signed_payload_verification_rejects_tampering() {
         verify_minisign(b"test", TEST_SIGNATURE.as_bytes(), TEST_PUBLIC_KEY).unwrap();
         assert!(verify_minisign(b"tampered", TEST_SIGNATURE.as_bytes(), TEST_PUBLIC_KEY).is_err());
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let unique = format!(
+            "ember-updater-{}-{}-{name}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A platform entry whose signed artifact is the bytes `test`.
+    fn platform_for_test_payload() -> SignedPlatform {
+        SignedPlatform {
+            target: "windows-x86_64".to_string(),
+            url: Url::parse("https://example.com/Ember_9.9.9_x64-setup.exe").unwrap(),
+            signature: TEST_SIGNATURE.to_string(),
+            sha256: hex::encode(Sha256::digest(b"test")),
+            size: 4,
+        }
+    }
+
+    #[test]
+    fn only_the_same_signed_artifact_keeps_its_preparation() {
+        let a = platform_for_test_payload();
+        assert!(same_artifact(&a, &a.clone()));
+        let other_hash = SignedPlatform { sha256: "0".repeat(64), ..a.clone() };
+        assert!(!same_artifact(&a, &other_hash));
+        let other_url = SignedPlatform {
+            url: Url::parse("https://example.com/Ember_9.9.10_x64-setup.exe").unwrap(),
+            ..a.clone()
+        };
+        assert!(!same_artifact(&a, &other_url));
+    }
+
+    #[test]
+    fn staged_names_stay_inside_the_staging_folder_and_parse_back() {
+        assert_eq!(installer_name("1.8.0", "exe"), "Ember_1.8.0_update.exe");
+        assert_eq!(installer_name("1.8.0", "msi"), "Ember_1.8.0_update.msi");
+        assert_eq!(installer_name("1.8.0", "bin"), "Ember_1.8.0_update.bin");
+        assert_eq!(installer_name("../../1.8.0", "sh"), "Ember_....1.8.0_update.bin");
+        assert_eq!(staged_version_from_name("Ember_1.8.0_update.exe"), Some("1.8.0"));
+        assert_eq!(staged_version_from_name("Ember_1.8.0-rc.1_update.bin"), Some("1.8.0-rc.1"));
+        assert_eq!(staged_version_from_name("ember-update-watchdog.exe"), None);
+    }
+
+    /// Staged bytes can sit for days before they are installed, so they are
+    /// re-verified from disk exactly as a download would be.
+    #[test]
+    fn a_staged_update_is_reverified_before_use() {
+        let dir = scratch_dir("reverify");
+        let path = dir.join(installer_name("9.9.9", "exe"));
+        let platform = platform_for_test_payload();
+
+        stage_artifact(&path, b"test").unwrap();
+        assert_eq!(read_verified_staged(&path, &platform, TEST_PUBLIC_KEY).unwrap(), b"test");
+
+        std::fs::write(&path, b"tset").unwrap();
+        assert!(read_verified_staged(&path, &platform, TEST_PUBLIC_KEY).is_err(), "tampered");
+
+        std::fs::write(&path, b"test!").unwrap();
+        assert!(read_verified_staged(&path, &platform, TEST_PUBLIC_KEY).is_err(), "wrong size");
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_verified_staged(&path, &platform, TEST_PUBLIC_KEY).is_err(), "missing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_replaces_whatever_an_earlier_preparation_left() {
+        let dir = scratch_dir("replace");
+        let old = dir.join(installer_name("9.9.8", "exe"));
+        std::fs::write(&old, b"old").unwrap();
+        let new = dir.join(installer_name("9.9.9", "exe"));
+
+        stage_artifact(&new, b"test").unwrap();
+        assert!(!old.exists());
+        assert_eq!(std::fs::read(&new).unwrap(), b"test");
+
+        // Re-staging the same file keeps it rather than deleting it first.
+        stage_artifact(&new, b"test").unwrap();
+        assert!(new.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sweep_keeps_only_staged_upgrades() {
+        let dir = scratch_dir("sweep");
+        let newer = dir.join(installer_name("1.8.0", "exe"));
+        let same = dir.join(installer_name("1.7.1", "exe"));
+        let older = dir.join(installer_name("1.6.0", "bin"));
+        let foreign = dir.join("something-else.tmp");
+        // What `atomic_write` names the file while it is still being written.
+        let writing = crate::security::unique_tmp_path(&dir.join(installer_name("1.8.1", "exe")));
+        for path in [&newer, &same, &older, &foreign, &writing] {
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        sweep_stale_staged_in(&dir, "1.7.1", &StagedKeep::default());
+        assert!(newer.exists());
+        assert!(!same.exists());
+        assert!(!older.exists());
+        assert!(!foreign.exists());
+        assert!(writing.exists(), "a staging write in progress is left alone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An emergency release bumps the epoch to authorize a version no higher
+    /// than the running one. Swept as stale, the prepared copy would be gone
+    /// at install time and the release barred from installing silently.
+    #[test]
+    fn the_sweep_keeps_the_pending_copy_and_an_epoch_upgrade() {
+        let dir = scratch_dir("sweep-epoch");
+        let pending = dir.join(installer_name("1.7.0", "exe"));
+        let emergency = dir.join(installer_name("1.6.9", "exe"));
+        let stale = dir.join(installer_name("1.6.0", "exe"));
+        for path in [&pending, &emergency, &stale] {
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        let keep = StagedKeep {
+            pending: Some(installer_name("1.7.0", "exe")),
+            floor: Some(observed_rollback_state(CURRENT_SECURITY_EPOCH + 1, &Version::parse("1.6.9").unwrap())),
+        };
+        sweep_stale_staged_in(&dir, "1.7.1", &keep);
+        assert!(pending.exists(), "the pending update's own copy");
+        assert!(emergency.exists(), "the floor's release, judged by the floor's epoch");
+        assert!(!stale.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_a_handoff_keeps_what_was_staged_since() {
+        let dir = scratch_dir("clear-handoff");
+        let staging = dir.join(PENDING_DIR);
+        std::fs::create_dir_all(&staging).unwrap();
+        let marker = dir.join(HANDOFF_FILE);
+        let handed_off = staging.join(installer_name("1.8.0", "exe"));
+        let newer = staging.join(installer_name("1.8.1", "exe"));
+        for path in [&marker, &handed_off, &newer] {
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        let nothing = StagedKeep::default();
+        clear_handoff_in(&marker, &staging, Some(&installer_name("1.8.0", "exe")), "1.8.0", &nothing);
+        assert!(!marker.exists());
+        assert!(!handed_off.exists());
+        assert!(newer.exists(), "a newer release prepared since is not the hand-off's");
+
+        // A marker that could not be verified names nothing to trust: only
+        // what is no longer an upgrade goes.
+        std::fs::write(&marker, b"x").unwrap();
+        std::fs::write(&handed_off, b"x").unwrap();
+        clear_handoff_in(&marker, &staging, None, "1.8.0", &nothing);
+        assert!(!marker.exists());
+        assert!(!handed_off.exists());
+        assert!(newer.exists());
+
+        // A hand-off long forgotten whose version is staged again for the
+        // pending update.
+        std::fs::write(&marker, b"x").unwrap();
+        let keep = StagedKeep { pending: Some(installer_name("1.8.1", "exe")), floor: None };
+        clear_handoff_in(&marker, &staging, Some(&installer_name("1.8.1", "exe")), "1.7.1", &keep);
+        assert!(!marker.exists());
+        assert!(newer.exists(), "the pending update's copy is not the hand-off's to delete");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn info(version: &str) -> UpdateInfo {
+        UpdateInfo {
+            version: version.to_string(),
+            security_epoch: 1,
+            notes: None,
+            date: None,
+        }
+    }
+
+    /// A webview that missed the scheduler's event is handed the last result,
+    /// but offering what the updater no longer holds would put up an Install
+    /// button that fails.
+    #[test]
+    fn a_cached_check_result_offers_only_what_is_still_pending() {
+        let found = SecureUpdateCheckResult {
+            update: Some(info("1.8.0")),
+            pending_retained: true,
+            error: None,
+            signature_missing: false,
+        };
+        let still = found.clone().brought_up_to_date(Some(&info("1.8.0")));
+        assert_eq!(still.update.map(|update| update.version).as_deref(), Some("1.8.0"));
+        assert!(still.pending_retained);
+
+        let gone = found.brought_up_to_date(None);
+        assert!(gone.update.is_none());
+        assert!(!gone.pending_retained);
+
+        let failed = SecureUpdateCheckResult {
+            signature_missing: true,
+            ..SecureUpdateCheckResult::failed("offline".to_string())
+        };
+        let failed = failed.brought_up_to_date(Some(&info("1.8.0")));
+        assert_eq!(failed.error(), Some("offline"));
+        assert!(failed.signature_missing, "what the check learned is kept");
+        assert!(failed.pending_retained);
+    }
+
+    #[test]
+    fn download_progress_is_tracked_for_whoever_waits_on_it() {
+        let progress = parking_lot::Mutex::new(None);
+        note_download_progress(&progress, &UpdateProgress::Progress { chunk_length: 5 });
+        assert_eq!(*progress.lock(), None, "nothing before the download starts");
+        note_download_progress(&progress, &UpdateProgress::Started { content_length: 100 });
+        note_download_progress(&progress, &UpdateProgress::Progress { chunk_length: 30 });
+        note_download_progress(&progress, &UpdateProgress::Progress { chunk_length: 20 });
+        note_download_progress(&progress, &UpdateProgress::Finished);
+        assert_eq!(*progress.lock(), Some((50, 100)));
+    }
+
+    #[test]
+    fn forwarded_progress_reads_like_a_download_of_ones_own() {
+        let events = parking_lot::Mutex::new(Vec::new());
+        let sink = |event: UpdateProgress| events.lock().push(event);
+        let mut forward = ProgressForward::default();
+        forward.forward(None, &sink);
+        forward.forward(Some((10, 100)), &sink);
+        forward.forward(Some((10, 100)), &sink);
+        forward.forward(Some((60, 100)), &sink);
+        // A download that started over, for a different artifact.
+        forward.forward(Some((5, 200)), &sink);
+        assert_eq!(
+            *events.lock(),
+            vec![
+                UpdateProgress::Started { content_length: 100 },
+                UpdateProgress::Progress { chunk_length: 10 },
+                UpdateProgress::Progress { chunk_length: 50 },
+                UpdateProgress::Started { content_length: 200 },
+                UpdateProgress::Progress { chunk_length: 5 },
+            ]
+        );
+    }
+
+    /// `Driver::install` takes the operation lock only through this, and hands
+    /// the tick back while a check holds it rather than sitting in "Installing"
+    /// with the countdown and its tray entry gone. The driver itself needs a
+    /// running app, so only the lock's side is checked here.
+    #[tokio::test]
+    async fn the_operation_lock_is_taken_without_waiting_behind_a_check() {
+        let service = UpdaterService::default();
+        let check = service.operation.lock().await;
+        assert!(try_lock_operation(&service).is_none());
+        drop(check);
+        assert!(try_lock_operation(&service).is_some());
+    }
+
+    /// Install pressed while a background download holds the staging folder
+    /// waits for it and shows it moving, rather than sitting on nothing.
+    #[tokio::test]
+    async fn an_install_waiting_on_a_background_download_shows_its_progress() {
+        let service = UpdaterService::default();
+        let background = service.staging.lock().await;
+        *service.download_progress.lock() = Some((10, 100));
+        let events = parking_lot::Mutex::new(Vec::new());
+        let sink = |event: UpdateProgress| events.lock().push(event);
+
+        let waiting = lock_staging_reporting(&service, &sink);
+        tokio::pin!(waiting);
+        tokio::select! {
+            _ = &mut waiting => panic!("took the staging lock from a running download"),
+            _ = tokio::time::sleep(PROGRESS_FORWARD_INTERVAL * 2) => {}
+        }
+        *service.download_progress.lock() = Some((100, 100));
+        tokio::select! {
+            _ = &mut waiting => panic!("took the staging lock from a running download"),
+            _ = tokio::time::sleep(PROGRESS_FORWARD_INTERVAL * 2) => {}
+        }
+        drop(background);
+        let _staging = waiting.await;
+        assert_eq!(
+            *events.lock(),
+            vec![
+                UpdateProgress::Started { content_length: 100 },
+                UpdateProgress::Progress { chunk_length: 10 },
+                UpdateProgress::Progress { chunk_length: 90 },
+            ]
+        );
     }
 
     /// A staged installer with the version its own signed manifest declares.

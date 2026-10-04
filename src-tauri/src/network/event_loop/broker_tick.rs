@@ -22,7 +22,7 @@ pub(in crate::network) async fn on_broker_tick(
     if let Some(ref mut rx) = state.broker_event_rx {
         while let Ok(event) = rx.try_recv() {
             match event {
-                ember::broker::BrokerEvent::StartRelay { ref attempt_key, source_ip, source_port, file_hash, relay_addr, relay_attestation_hash, relay_ember_hash, .. } => {
+                ember::broker::BrokerEvent::StartRelay { ref attempt_key, source_ip, source_port, target_quic_port, target_node_id, file_hash, relay_addr, relay_attestation_hash, relay_ember_hash } => {
                     tracing::info!("Broker: initiating relay for {} -> {}:{} (relay={:?})", attempt_key, source_ip, source_port, relay_addr);
 
                     let attempt_key_owned = attempt_key.clone();
@@ -53,6 +53,8 @@ pub(in crate::network) async fn on_broker_tick(
                                     reason: "no QUIC endpoint".into(),
                                     // Our endpoint, not their fault.
                                     relay_at_fault: false,
+                                    refused_us: false,
+                                    relay_busy: false,
                                 }) {
                                     tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
                                 }
@@ -101,6 +103,8 @@ pub(in crate::network) async fn on_broker_tick(
                                     reason: "missing relay attestation hash".into(),
                                     // Missing on our side, before we ever dialled.
                                     relay_at_fault: false,
+                                    refused_us: false,
+                                    relay_busy: false,
                                 }) {
                                     tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
                                 }
@@ -110,7 +114,8 @@ pub(in crate::network) async fn on_broker_tick(
                                 &endpoint,
                                 relay_addr,
                                 source_ip,
-                                source_port,
+                                target_quic_port,
+                                target_node_id,
                                 &file_hash,
                                 &attestation_hash,
                                 &ed25519_pubkey,
@@ -143,6 +148,8 @@ pub(in crate::network) async fn on_broker_tick(
                                             // the relay, a proper refusal
                                             // does not.
                                             relay_at_fault: e.relay_at_fault,
+                                            refused_us: e.refused_us,
+                                            relay_busy: e.relay_busy,
                                             reason: e.reason,
                                         }) {
                                         tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
@@ -162,6 +169,8 @@ pub(in crate::network) async fn on_broker_tick(
                                 reason: "anonymous LowID sources cannot use server relay".into(),
                                 // No relay was involved at all.
                                 relay_at_fault: false,
+                                refused_us: false,
+                                relay_busy: false,
                             }) {
                                 tracing::debug!("Broker: dropping relay failure event (queue full/closed): {send_err}");
                             }
@@ -170,8 +179,23 @@ pub(in crate::network) async fn on_broker_tick(
                 }
                 ember::broker::BrokerEvent::ConnectionReady(conn) => {
                     tracing::info!("Broker: connection ready for transfer {} from {}:{} via {:?}", conn.transfer_id, conn.source_ip, conn.source_port, conn.method);
-                    let method = conn.method;
                     let key = format!("{}:{}:{}", conn.transfer_id, conn.source_ip, conn.source_port);
+                    // An attempt that already timed out was failed then, and
+                    // its source has moved on; greeting the stream now would
+                    // count the same attempt as a success too.
+                    if !state.connection_broker.as_ref().is_some_and(|b| b.has_attempt(&key)) {
+                        tracing::debug!("Broker: dropping a relayed stream for {key} that arrived after its attempt ended");
+                        continue;
+                    }
+                    // The Hello below is part of the attempt; restart its clock
+                    // so a slow dial does not leave it to expire mid-greeting.
+                    let Some(broker) = state.connection_broker.as_mut() else {
+                        continue;
+                    };
+                    broker.set_greeting_phase(&key);
+                    let greet_time_left = broker.attempt_time_left(&key).unwrap_or_default();
+                    let greet_broker_tx = broker.event_sender();
+                    let bridge = broker.bridge_token(&key);
 
                     // The broker stream is freshly established and
                     // NOT yet greeted: WE initiated it (QUIC
@@ -218,51 +242,57 @@ pub(in crate::network) async fn on_broker_tick(
                     let greet_peer_ip = conn.source_ip;
                     let greet_peer_port = conn.source_port;
                     let greet_file_hash = conn.file_hash;
-                    let mut greet_reader = conn.reader;
+                    let greet_attempt_key = key.clone();
+                    let mut greet_reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
+                        Box::new(ember::broker::BridgedReader::new(conn.reader, bridge));
                     let mut greet_writer = conn.writer;
                     tokio::spawn(async move {
-                        match ed2k::multi_source::perform_outbound_hello(
-                            &mut *greet_reader,
-                            &mut *greet_writer,
-                            &greet_user_hash,
-                            greet_client_id,
-                            greet_tcp_port,
-                            greet_udp_port,
-                            &greet_nickname,
+                        let greeted = ember::broker::greet_within_attempt(
+                            ed2k::multi_source::perform_outbound_hello(
+                                &mut *greet_reader,
+                                &mut *greet_writer,
+                                &greet_user_hash,
+                                greet_client_id,
+                                greet_tcp_port,
+                                greet_udp_port,
+                                &greet_nickname,
+                            ),
+                            greet_time_left,
+                            greet_attempt_key,
+                            &greet_broker_tx,
                         )
-                        .await
-                        {
-                            Ok((peer_user_hash, peer_caps)) => {
-                                let parts = upload_server::KadCallbackParts {
-                                    peer_ip: greet_peer_ip,
-                                    peer_port: greet_peer_port,
-                                    peer_hello_port: 0,
-                                    peer_user_hash,
-                                    file_hash: greet_file_hash,
-                                    reader: greet_reader,
-                                    writer: greet_writer,
-                                    emule_info_done: false,
-                                    peer_caps,
-                                    friend_ember_hash: None,
-                                    origin: None,
-                                };
-                                if let Err(e) = greet_tx.send(parts).await {
-                                    tracing::debug!(
-                                        "Broker: kad-callback channel closed; dropping greeted connection for {greet_peer_ip}:{greet_peer_port}: {e}"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    "Broker: Ember client Hello failed for {greet_peer_ip}:{greet_peer_port}: {e}"
-                                );
-                            }
+                        .await;
+                        let Some((peer_user_hash, peer_caps)) = greeted else {
+                            return;
+                        };
+                        let parts = upload_server::KadCallbackParts {
+                            peer_ip: greet_peer_ip,
+                            peer_port: greet_peer_port,
+                            peer_hello_port: 0,
+                            peer_user_hash,
+                            file_hash: greet_file_hash,
+                            reader: greet_reader,
+                            writer: greet_writer,
+                            emule_info_done: false,
+                            peer_caps,
+                            friend_ember_hash: None,
+                            origin: None,
+                        };
+                        if let Err(e) = greet_tx.send(parts).await {
+                            tracing::debug!(
+                                "Broker: kad-callback channel closed; dropping greeted connection for {greet_peer_ip}:{greet_peer_port}: {e}"
+                            );
                         }
                     });
-
-                    if let Some(ref mut broker) = state.connection_broker {
-                        broker.mark_succeeded(&key, method);
+                }
+                ember::broker::BrokerEvent::RelayGreeted { ref attempt_key, live } => {
+                    let still_live = state.connection_broker.as_mut().is_some_and(|broker| {
+                        broker.mark_succeeded(attempt_key, ember::broker::ConnectionMethod::PeerRelay)
+                    });
+                    if !still_live {
+                        tracing::debug!("Broker: dropping a greeted stream for {attempt_key} whose attempt already ended");
                     }
+                    let _ = live.send(still_live);
                 }
                 ember::broker::BrokerEvent::ConnectionFailed { ref transfer_id, source_ip, source_port, ref reason } => {
                     tracing::debug!("Broker: all methods failed for {}:{} (transfer {}): {}", source_ip, source_port, transfer_id, reason);
@@ -277,9 +307,15 @@ pub(in crate::network) async fn on_broker_tick(
                         pfs.set_low_to_low(source_ip, source_port, None);
                     }
                 }
-                ember::broker::BrokerEvent::RelayFailed { ref attempt_key, ref reason, relay_at_fault } => {
+                ember::broker::BrokerEvent::RelayFailed { ref attempt_key, ref reason, relay_at_fault, refused_us, relay_busy } => {
                     if let Some(ref mut broker) = state.connection_broker {
-                        broker.relay_failed(attempt_key, reason, relay_at_fault).await;
+                        if refused_us {
+                            broker.relay_refused_us(attempt_key, reason).await;
+                        } else if relay_busy {
+                            broker.relay_was_busy(attempt_key, reason, relay_at_fault).await;
+                        } else {
+                            broker.relay_failed(attempt_key, reason, relay_at_fault).await;
+                        }
                     }
                 }
             }

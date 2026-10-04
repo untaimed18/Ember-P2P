@@ -11,6 +11,7 @@ vi.mock('$lib/api/system', () => ({
 
 const { showNotification } = await import('$lib/api/system');
 const { appSettings } = await import('$lib/stores/settings');
+const { chatWindowPresence } = await import('$lib/windowRole');
 const { notify, shouldNotify, resetNotificationThrottleForTest } = await import(
   './notifications'
 );
@@ -82,6 +83,22 @@ describe('shouldNotify', () => {
 
     appSettings.set(settingsWith({ notifications_only_when_unfocused: false }));
     expect(shouldNotify('friend_message')).toBe(true);
+  });
+
+  it('counts the chat window having focus as Ember focused, except for the update warning', () => {
+    // The main window, hidden in the tray, while the user works in the chat.
+    (globalThis as { document?: unknown }).document = {
+      visibilityState: 'hidden',
+      hasFocus: () => false,
+    };
+    chatWindowPresence.set({ activeHash: null, visible: true, focused: true });
+    try {
+      expect(shouldNotify('friend_message')).toBe(false);
+      // Its countdown dialog is drawn only in the main window.
+      expect(shouldNotify('silent_update')).toBe(true);
+    } finally {
+      chatWindowPresence.set(null);
+    }
   });
 
   it('notifies for a visible-but-unfocused window', () => {

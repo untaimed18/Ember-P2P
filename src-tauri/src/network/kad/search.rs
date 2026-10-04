@@ -174,10 +174,15 @@ pub struct SearchState {
     /// Binary search expression for keyword searches (eMule AND tree format).
     /// Sent in KADEMLIA2_SEARCH_KEY_REQ so remote nodes filter results server-side.
     pub search_terms_data: Vec<u8>,
-    /// eMule InUse tracking: contact IDs referenced by this search. Released
-    /// when the search is removed to allow dead-contact cleanup.
+    /// eMule InUse tracking: contact IDs this search has marked in use on the
+    /// routing table. Released when the search is removed to allow
+    /// dead-contact cleanup — so it must hold only marks actually applied.
     pub in_use_ids: Vec<KadId>,
-    /// Newly discovered in-use IDs since last drain (for mid-lookup contacts).
+    /// IDs referenced since the last [`SearchManager::drain_pending_in_use`],
+    /// not yet marked; the drain moves them into `in_use_ids`. A search
+    /// removed first takes these with it unmarked. Releasing them too took a
+    /// mark some other search held, and marking them after the removal left
+    /// one nothing would ever release.
     pub new_in_use_ids: Vec<KadId>,
     /// Next start_position for pagination: re-fetch contacts that returned a
     /// full page (200 results) with an incremented offset to get more.
@@ -359,7 +364,7 @@ impl SearchState {
             if !self.queried.contains(&c.id)
                 && !self.closest.iter().any(|existing| existing.id == c.id)
             {
-                self.in_use_ids.push(c.id);
+                self.new_in_use_ids.push(c.id);
                 self.closest.push(c);
             }
         }
@@ -739,7 +744,6 @@ impl SearchState {
         for c in contacts {
             if c.id != self.target && !self.queried.contains(&c.id) {
                 if !self.closest.iter().any(|existing| existing.id == c.id) {
-                    self.in_use_ids.push(c.id);
                     self.new_in_use_ids.push(c.id);
                     new_contacts.push(c.clone());
                     self.closest.push(c);
@@ -1278,9 +1282,6 @@ pub struct SearchManager {
     /// Keyed by the full search type so concurrent `FindSource` requests for
     /// the same hash but different file sizes cannot overwrite each other.
     target_map: HashMap<(KadId, SearchType), SearchId>,
-    /// Contact IDs that need to be marked in-use on the routing table.
-    /// Accumulated by start_search, drained by the caller via `drain_in_use_ids`.
-    pending_in_use: Vec<KadId>,
     /// In-use contact IDs of searches that were removed *outside* the normal
     /// `cleanup()` / `start_search` return path. Reserved for future callers;
     /// search-storm eviction now returns released ids directly from
@@ -1316,7 +1317,6 @@ impl SearchManager {
             next_id: 1,
             active: HashMap::new(),
             target_map: HashMap::new(),
-            pending_in_use: Vec::new(),
             pending_release: Vec::new(),
         }
     }
@@ -1330,9 +1330,9 @@ impl SearchManager {
     /// keyed by those ids are cleared. `released_in_use` are the evicted
     /// searches' routing-table in-use marks (pass them to finalize together
     /// with the ids). `preserved_results` carries any FindKeyword / FindSource /
-    /// FindNotes entries collected before eviction so finalize can deliver or
-    /// inject them instead of answering with empty success. When nothing is
-    /// evicted the vecs/map are empty.
+    /// FindNotes entries collected before eviction, with the search's target,
+    /// so finalize can deliver or inject them instead of answering with empty
+    /// success. When nothing is evicted the vecs/map are empty.
     pub fn start_search(
         &mut self,
         target: KadId,
@@ -1342,7 +1342,7 @@ impl SearchManager {
         SearchId,
         Vec<SearchId>,
         Vec<KadId>,
-        HashMap<SearchId, Vec<SearchResultEntry>>,
+        HashMap<SearchId, (KadId, Vec<SearchResultEntry>)>,
     ) {
         let key = (target, search_type);
         if Self::reuses_existing_search(search_type) {
@@ -1363,7 +1363,8 @@ impl SearchManager {
         const MAX_ACTIVE_SEARCHES: usize = 20;
         let mut evicted_ids: Vec<SearchId> = Vec::new();
         let mut released_in_use: Vec<KadId> = Vec::new();
-        let mut preserved_results: HashMap<SearchId, Vec<SearchResultEntry>> = HashMap::new();
+        let mut preserved_results: HashMap<SearchId, (KadId, Vec<SearchResultEntry>)> =
+            HashMap::new();
         let active = self.active_count();
         if active >= MAX_ACTIVE_SEARCHES {
             let completed: Vec<SearchId> = self
@@ -1382,7 +1383,7 @@ impl SearchManager {
                     // marks go back via `released_in_use` (not pending_release)
                     // so finalize can release them immediately.
                     if s.search_type.accepts_search_results() && !s.results.is_empty() {
-                        preserved_results.insert(s.id, std::mem::take(&mut s.results));
+                        preserved_results.insert(s.id, (s.target, std::mem::take(&mut s.results)));
                     }
                     released_in_use.extend(s.in_use_ids);
                     evicted_ids.push(id);
@@ -1413,7 +1414,8 @@ impl SearchManager {
                             self.target_map.remove(&old_key);
                         }
                         if state.search_type.accepts_search_results() && !state.results.is_empty() {
-                            preserved_results.insert(state.id, std::mem::take(&mut state.results));
+                            preserved_results
+                                .insert(state.id, (state.target, std::mem::take(&mut state.results)));
                         }
                         released_in_use.extend(state.in_use_ids);
                         evicted_ids.push(id);
@@ -1439,10 +1441,8 @@ impl SearchManager {
 
         let mut state = SearchState::new(id, target, search_type);
         state.seed(initial_contacts);
-        let in_use = state.in_use_ids.clone();
         self.target_map.insert(key, id);
         self.active.insert(id, state);
-        self.pending_in_use.extend(in_use);
         debug!("Started search {}: target={}", id.0, target);
         (id, evicted_ids, released_in_use, preserved_results)
     }
@@ -1687,15 +1687,17 @@ impl SearchManager {
         (to_remove, released_ids)
     }
 
-    /// Drain contact IDs that need to be marked in-use on the routing table.
-    /// Called periodically by the main loop to sync with RoutingTable.
-    /// Also collects any new in-use IDs accumulated by active searches
-    /// (e.g. contacts discovered mid-lookup via handle_response).
+    /// Drain contact IDs that need to be marked in-use on the routing table:
+    /// the seeds of new searches and contacts discovered mid-lookup. The
+    /// caller must mark every returned id, as each is now in its search's
+    /// `in_use_ids` and will be released with it. Called periodically by the
+    /// main loop to sync with RoutingTable.
     pub fn drain_pending_in_use(&mut self) -> Vec<KadId> {
-        let mut ids = std::mem::take(&mut self.pending_in_use);
+        let mut ids = Vec::new();
         for search in self.active.values_mut() {
             if !search.new_in_use_ids.is_empty() {
-                ids.append(&mut search.new_in_use_ids);
+                ids.extend_from_slice(&search.new_in_use_ids);
+                search.in_use_ids.append(&mut search.new_in_use_ids);
             }
         }
         ids
@@ -2070,6 +2072,29 @@ mod tests {
             !state.store_search_exhausted(),
             "an unpublished in-tolerance responder is still a valid publish candidate"
         );
+    }
+
+    /// A search's `in_use_ids` are what its removal releases, so they must be
+    /// exactly the marks the drain handed out to be applied.
+    #[test]
+    fn in_use_marks_are_released_only_once_applied() {
+        let contacts = vec![contact(kad_id(0x41), 1), contact(kad_id(0x42), 2)];
+        let mut manager = SearchManager::new();
+
+        // Cancelled before the first poll tick: nothing marked, nothing to release.
+        let (early, ..) = manager.start_search(kad_id(7), SearchType::FindKeyword, contacts.clone());
+        let removed = manager.remove(&early).expect("search exists");
+        assert!(removed.in_use_ids.is_empty());
+        assert!(manager.drain_pending_in_use().is_empty(), "no mark left to apply later");
+
+        // Drained: every id handed out is one the removal gives back.
+        let (sid, ..) = manager.start_search(kad_id(8), SearchType::FindKeyword, contacts);
+        let mut marked = manager.drain_pending_in_use();
+        assert_eq!(marked.len(), 2);
+        let mut released = manager.remove(&sid).expect("search exists").in_use_ids;
+        marked.sort_by_key(|id| id.0);
+        released.sort_by_key(|id| id.0);
+        assert_eq!(released, marked);
     }
 
     #[test]

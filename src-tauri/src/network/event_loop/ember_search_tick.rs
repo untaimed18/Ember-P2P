@@ -102,6 +102,7 @@ pub(in crate::network) async fn on_ember_search_tick(
         && state.ember_pending_channel_handoff.is_empty()
         && state.ember_pending_channel_epoch.is_empty()
         && state.ember_pending_channel_claim.is_empty()
+        && state.ember_channel_ingest.is_none()
         // The batch publisher is on an entirely separate path from
         // the maps above — `flush_ember_batch_publish` only ever
         // writes `in_flight` — and `expire()` below is its only
@@ -328,6 +329,11 @@ pub(in crate::network) async fn on_ember_search_tick(
             Vec::new();
         let mut callback_jobs: Vec<([u8; 16], ember::dht::publish::DiscoveredSource)> =
             Vec::new();
+        let mut relay_targets: HashMap<(Ipv4Addr, u16), ember::broker::RelayTarget> =
+            HashMap::new();
+        // Whether the target held for an address came from a record whose
+        // buddy we could corroborate.
+        let mut relay_target_trusted: HashMap<(Ipv4Addr, u16), bool> = HashMap::new();
         let now_ts = chrono::Utc::now().timestamp();
         for (fh, sources) in &entries {
             let mut rest = Vec::new();
@@ -369,6 +375,40 @@ pub(in crate::network) async fn on_ember_search_tick(
                             .ember_dht_buddy_uncorroborated
                             .saturating_add(1);
                     }
+                    if src.flags & ember::SOURCE_FLAG_FIREWALLED != 0 {
+                        // The node id is the record's signer, so a relay
+                        // pinned to it reaches that publisher or nobody. A
+                        // firewalled record is not bound to its sender's
+                        // address, so anyone can sign one naming this one:
+                        // a record whose buddy we corroborated wins, and two
+                        // that disagree at the same trust pin nothing, which
+                        // dials the address as an unpinned relay always has.
+                        let key = (src.ip, src.tcp_port);
+                        let target = ember::broker::RelayTarget {
+                            quic_port: src.quic_port,
+                            node_id: (src.publisher_id != [0u8; 16]).then_some(src.publisher_id),
+                        };
+                        let trusted = buddy_corroborated
+                            && src
+                                .buddy
+                                .is_some_and(|b| b.endorsement_covers(&src.publisher_id, now_ts));
+                        match relay_target_trusted.get(&key).copied() {
+                            None => {
+                                relay_targets.insert(key, target);
+                                relay_target_trusted.insert(key, trusted);
+                            }
+                            Some(false) if trusted => {
+                                relay_targets.insert(key, target);
+                                relay_target_trusted.insert(key, true);
+                            }
+                            Some(held_trusted) if held_trusted == trusted => {
+                                if relay_targets.get(&key) != Some(&target) {
+                                    relay_targets.insert(key, ember::broker::RelayTarget::default());
+                                }
+                            }
+                            Some(_) => {}
+                        }
+                    }
                     rest.push((src.ip, src.tcp_port, src.udp_port, src.flags));
                 }
             }
@@ -382,10 +422,11 @@ pub(in crate::network) async fn on_ember_search_tick(
         //     purely by ed2k hash) get promoted below — there is no
         //     server/KAD here to drive promotion — and it stores the
         //     connect options so the eventual c2c dial can obfuscate
-        //     when the source advertised it. The DHT record's IP is
-        //     already bound to the publisher's observed sender IP by
-        //     the storer's anti-reflection check, so a forged
-        //     third-party/special-use address can't reach us here.
+        //     when the source advertised it. An honest storer bound
+        //     the record's IP to its publisher's sender address, but a
+        //     responder need not be honest, so `parse_ember_source_records`
+        //     caps what one responder can name; the filter and ban
+        //     checks below still apply to every address.
         {
             let mut sm = source_manager.write().await;
             for (fh, sources) in &entries {
@@ -438,6 +479,7 @@ pub(in crate::network) async fn on_ember_search_tick(
                 "ember-dht",
                 true,
                 we_are_unreachable,
+                &relay_targets,
             )
             .await;
         }
@@ -504,7 +546,7 @@ pub(in crate::network) async fn on_ember_search_tick(
                 };
                 for tid in &matching_ids {
                     let pfs = state.per_file_sources.entry(tid.clone()).or_insert_with(
-                        || ed2k::sources::PerFileSourceList::new(fh),
+                        || ed2k::sources::PerFileSourceList::new(fh, state.max_sources_per_file),
                     );
                     let added = pfs.add_source_with_identity(
                         src.ip,
@@ -531,7 +573,6 @@ pub(in crate::network) async fn on_ember_search_tick(
                 }
                 {
                     let mut mgr = transfer_manager.write().await;
-                    let now_ts = chrono::Utc::now().timestamp();
                     for tid in &matching_ids {
                         let ip_s = upload_server::kad_callback_display_key(
                             src.ip,
@@ -563,7 +604,7 @@ pub(in crate::network) async fn on_ember_search_tick(
                         }
                         state.callback_row_pending_since.insert(
                             (tid.clone(), ip_s, src.tcp_port),
-                            now_ts,
+                            std::time::Instant::now(),
                         );
                         if !callback_tids.contains(tid) {
                             callback_tids.push(tid.clone());
@@ -733,13 +774,32 @@ pub(in crate::network) async fn on_ember_search_tick(
             // filter: those records have been considered, and not
             // moving the cursor would re-examine them every tick.
             kw.last_streamed_count = gathered;
-            let built = build_ember_keyword_built(
+            // A publisher an earlier slice counted for a file is not counted
+            // again; see `streamed_publishers`. Only what the build counted is
+            // recorded, so a record it refused — forged, under another key,
+            // failing the query — cannot hide that publisher's valid one.
+            let records: Vec<_> = records
+                .into_iter()
+                .filter(|record| {
+                    ember_record_publisher(&record.data)
+                        .is_none_or(|pair| !kw.streamed_publishers.contains(&pair))
+                })
+                .collect();
+            let mut built = build_ember_keyword_built(
                 &records,
                 &kw.keywords,
                 kw.query_expr.as_ref(),
             );
-            for row in &built.results {
+            kw.streamed_publishers
+                .extend(built.counted_publishers.drain(..));
+            for row in &mut built.results {
                 kw.streamed_files.insert(row.file.hash.clone());
+                // A slice's plurality digest is a partial answer, and only the
+                // closing rebuild can say a digest is contested: it does so
+                // with an empty field, which a merge cannot tell from "no
+                // claim" and so would leave the slice's digest pinned — the one
+                // a click enforces at completion. Only that rebuild sets it.
+                row.file.ember_file_hash.clear();
             }
             // Streamed pages deliberately do not seed the enforced
             // digest map. Corroboration is computed per batch, so a
@@ -858,18 +918,46 @@ pub(in crate::network) async fn on_ember_search_tick(
             }
         }
     }
-    if !state.ember_pending_channel_presence.is_empty() {
-        let pending = std::mem::take(&mut state.ember_pending_channel_presence);
+    if state
+        .ember_channel_ingest
+        .as_ref()
+        .is_some_and(|job| job.is_finished())
+    {
+        if let Some(job) = state.ember_channel_ingest.take() {
+            match job.await {
+                Ok(results) => {
+                    apply_channel_ingest_results(udp_socket, state, db, app_handle, results)
+                        .await
+                }
+                Err(e) => tracing::warn!("channel lookup ingest failed: {e}"),
+            }
+        }
+    }
+    if state.ember_channel_ingest.is_none() {
+        if let Some(batch) = ChannelIngestBatch::take(state) {
+            let db = db.clone();
+            let identity = identity.clone();
+            state.ember_channel_ingest = Some(tokio::task::spawn_blocking(move || {
+                run_channel_ingest(&db, &identity, &ed25519_pubkey, batch)
+            }));
+        }
+    }
+}
+
+/// Act on what a [`run_channel_ingest`] job wrote: roster emits, re-dialling
+/// new neighbours, and dropping a banned room's transfers.
+async fn apply_channel_ingest_results(
+    udp_socket: &Arc<UdpSocket>,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    results: ChannelIngestResults,
+) {
+    if !results.presence.is_empty() {
         let mut any_new = false;
         let mut updated_ids = HashSet::new();
-        for (channel_id, records) in pending {
-            let ingest = ingest_channel_presence_records(
-                state,
-                db,
-                &ed25519_pubkey,
-                channel_id,
-                &records,
-            );
+        for (channel_id, ingest) in results.presence {
+            ingest.apply(state, channel_id);
             if ingest.new_neighbors {
                 any_new = true;
                 // Members we did not know a moment ago, who
@@ -898,84 +986,42 @@ pub(in crate::network) async fn on_ember_search_tick(
             );
         }
     }
-    if !state.ember_pending_channel_moderation.is_empty() {
-        let pending = std::mem::take(&mut state.ember_pending_channel_moderation);
-        let checked_at = chrono::Utc::now().timestamp();
-        for (channel_id, records, answered) in pending {
-            // Only a search some peer actually answered counts as
-            // having looked. Finding no owner record because nobody
-            // replied is not evidence the owner has gone, and
-            // succession is the one feature that acts on absence.
-            if answered > 0 {
-                let _ = db.touch_channel_moderation_checked(
-                    &hex::encode(channel_id),
-                    checked_at,
-                );
-            }
-            if ingest_channel_moderation_records(db, channel_id, &records) {
-                // The snapshot carries the owner's whole ban list, so
-                // this is where most bans actually land on a member's
-                // device — and a ban has to reach the transfer engine
-                // and not just the roster.
-                drop_banned_channel_transfers(
-                    state,
-                    db,
-                    app_handle,
-                    channel_id,
-                );
-                let _ = app_handle.emit(
-                    "ember:channel-moderation",
-                    serde_json::json!({ "channel_id": hex::encode(channel_id) }),
-                );
-            }
-        }
+    for channel_id in results.moderated {
+        // The snapshot carries the owner's whole ban list, so this is where
+        // most bans actually land on a member's device — and a ban has to
+        // reach the transfer engine and not just the roster.
+        drop_banned_channel_transfers(state, db, app_handle, channel_id);
+        let _ = app_handle.emit(
+            "ember:channel-moderation",
+            serde_json::json!({ "channel_id": hex::encode(channel_id) }),
+        );
     }
-    if !state.ember_pending_channel_claim.is_empty() {
-        let pending = std::mem::take(&mut state.ember_pending_channel_claim);
-        for (channel_id, records) in pending {
-            if let Some(successor_id) =
-                ingest_channel_claim_records(db, channel_id, &records)
-            {
-                let _ = app_handle.emit(
-                    "ember:channel-handoff",
-                    serde_json::json!({
-                        "channel_id": hex::encode(channel_id),
-                        "successor_id": hex::encode(successor_id),
-                        "phase": "claimed",
-                    }),
-                );
-            }
-        }
+    for (channel_id, successor_id) in results.claimed {
+        let _ = app_handle.emit(
+            "ember:channel-handoff",
+            serde_json::json!({
+                "channel_id": hex::encode(channel_id),
+                "successor_id": hex::encode(successor_id),
+                "phase": "claimed",
+            }),
+        );
     }
-    if !state.ember_pending_channel_epoch.is_empty() {
-        let pending = std::mem::take(&mut state.ember_pending_channel_epoch);
-        for (channel_id, epoch, records) in pending {
-            if ingest_channel_epoch_records(db, identity, channel_id, epoch, &records)
-            {
-                // The room is readable again, so the list's badges
-                // and the composer state want refreshing.
-                let _ = app_handle.emit(
-                    "ember:channel-moderation",
-                    serde_json::json!({ "channel_id": hex::encode(channel_id) }),
-                );
-            }
-        }
+    // The room is readable again, so the list's badges and the composer state
+    // want refreshing.
+    for channel_id in results.rekeyed {
+        let _ = app_handle.emit(
+            "ember:channel-moderation",
+            serde_json::json!({ "channel_id": hex::encode(channel_id) }),
+        );
     }
-    if !state.ember_pending_channel_handoff.is_empty() {
-        let pending = std::mem::take(&mut state.ember_pending_channel_handoff);
-        for (channel_id, records) in pending {
-            if let Some(successor_id) =
-                ingest_channel_handoff_records(db, channel_id, &records)
-            {
-                let _ = app_handle.emit(
-                    "ember:channel-handoff",
-                    serde_json::json!({
-                        "channel_id": hex::encode(channel_id),
-                        "successor_id": hex::encode(successor_id),
-                        "phase": "followed",
-                    }),
-                );
-            }
-        }
+    for (channel_id, successor_id) in results.followed {
+        let _ = app_handle.emit(
+            "ember:channel-handoff",
+            serde_json::json!({
+                "channel_id": hex::encode(channel_id),
+                "successor_id": hex::encode(successor_id),
+                "phase": "followed",
+            }),
+        );
     }
 }

@@ -9,6 +9,14 @@ use super::messages::build_answer_sources1_versioned;
 use super::transfer::is_filtered_source_ip;
 
 const MAX_SOURCES_PER_FILE: usize = 500;
+/// Lowest `max_sources_per_file` honoured; Settings and `validate_settings`
+/// refuse anything below it.
+pub const MIN_SOURCES_PER_FILE: u32 = 50;
+
+/// The per-file source cap a `max_sources_per_file` setting stands for.
+pub fn max_sources_per_file(setting: u32) -> usize {
+    setting.max(MIN_SOURCES_PER_FILE) as usize
+}
 
 /// eMule `RARE_FILE` (`Opcodes.h:114`): at or below this many known sources a
 /// file counts as rare, and source exchange is allowed to ask more often.
@@ -486,13 +494,30 @@ impl DownloadSourceEntry {
 pub struct PerFileSourceList {
     pub file_hash: [u8; 16],
     pub sources: Vec<DownloadSourceEntry>,
+    /// The user's Max sources per file (eMule `GetMaxSources()`).
+    max_sources: usize,
 }
 
 impl PerFileSourceList {
-    pub fn new(file_hash: [u8; 16]) -> Self {
+    pub fn new(file_hash: [u8; 16], max_sources: usize) -> Self {
         Self {
             file_hash,
             sources: Vec::new(),
+            max_sources,
+        }
+    }
+
+    /// Apply a changed Max sources per file. A lowered cap drops at once the
+    /// rows a newcomer could evict; the rest leave as they fail or finish.
+    pub fn set_max_sources(&mut self, max_sources: usize) {
+        self.max_sources = max_sources;
+        while self.sources.len() > self.max_sources {
+            match self.evictable_parked_index() {
+                Some(idx) => {
+                    self.sources.remove(idx);
+                }
+                None => break,
+            }
         }
     }
 
@@ -669,12 +694,12 @@ impl PerFileSourceList {
         // (`LowToLowIp`, `EmberRelay`, and `WaitCallbackKad` on an unverified
         // publisher claim) are never dialed, so they never accumulate a single
         // failure. Ember DHT / EPX firewalled records create exactly those
-        // rows and cost the publisher nothing, so 500 of them sealed a file's
-        // source list for the rest of the session and every genuinely dialable
-        // peer discovered afterwards was silently dropped. `purge_dead_sources`
-        // also only runs for *pending* downloads, so an active one never
-        // prunes at all.
-        if self.sources.len() >= MAX_SOURCES_PER_FILE {
+        // rows and cost the publisher nothing, so a list full of them sealed a
+        // file's source list for the rest of the session and every genuinely
+        // dialable peer discovered afterwards was silently dropped.
+        // `purge_dead_sources` also only runs for *pending* downloads, so an
+        // active one never prunes at all.
+        if self.sources.len() >= self.max_sources {
             match self.evictable_parked_index() {
                 Some(idx) => {
                     self.sources.remove(idx);
@@ -714,10 +739,24 @@ impl PerFileSourceList {
             // Tier 1: nothing is permanently parked, so fall back to the
             // worst-performing row — but only one that has actually earned it.
             .or_else(|| {
+                // The live states are excluded by state, not left to the
+                // count: one Permanent failure adds 4 and a queue rank takes
+                // back only 1, and a redial keeps the count, so a row near the
+                // front of a peer's queue, or connecting, still qualified.
+                let live = |s: &DownloadSourceEntry| {
+                    matches!(
+                        s.state,
+                        DownloadSourceState::Connecting
+                            | DownloadSourceState::OnQueue { .. }
+                            | DownloadSourceState::Downloading
+                            | DownloadSourceState::WaitCallbackKad
+                            | DownloadSourceState::FriendConnect
+                    )
+                };
                 self.sources
                     .iter()
                     .enumerate()
-                    .filter(|(_, s)| s.fail_count >= 3)
+                    .filter(|(_, s)| s.fail_count >= 3 && !live(s))
                     .max_by_key(|(_, s)| s.fail_count)
                     .map(|(i, _)| i)
             })
@@ -1386,12 +1425,16 @@ pub struct SourceEntry {
     pub connect_options: u8,
     /// LowID server-assigned client ID (0 = HighID, connectable directly)
     pub client_id: u32,
-    /// Timestamp of last OP_REASKFILEPING sent to this source (0 = never asked)
-    pub last_asked: i64,
-    /// When we last sent OP_REQUESTSOURCES to this source (0 = never)
-    pub last_sx_sent: i64,
-    /// When we last sent OP_CALLBACKREQUEST for this LowID source (0 = never)
-    pub last_callback_at: i64,
+    // The three request stamps below pace what we send, and are monotonic: on
+    // the wall clock a step back held every reask, source request and callback
+    // for the length of the step. None of them is persisted. `last_seen` is,
+    // so it stays a wall time.
+    /// When we last sent OP_REASKFILEPING to this source (`None` = never asked)
+    pub last_asked: Option<Instant>,
+    /// When we last sent OP_REQUESTSOURCES to this source (`None` = never)
+    pub last_sx_sent: Option<Instant>,
+    /// When we last sent OP_CALLBACKREQUEST for this LowID source (`None` = never)
+    pub last_callback_at: Option<Instant>,
     /// Inbound TCP source port from a callback / push-grant adoption — the
     /// peer's ephemeral outbound port for this session, not its listening
     /// port. Kept in-memory for live identity lookups (`get_user_hash_by_addr`)
@@ -1431,7 +1474,7 @@ fn source_eviction_index(entries: &[SourceEntry]) -> usize {
     entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.last_asked == 0)
+        .filter(|(_, e)| e.last_asked.is_none())
         .min_by_key(|(_, e)| e.last_seen)
         .map(|(i, _)| i)
         .unwrap_or_else(|| {
@@ -1442,6 +1485,27 @@ fn source_eviction_index(entries: &[SourceEntry]) -> usize {
                 .map(|(i, _)| i)
                 .unwrap_or(0)
         })
+}
+
+/// Cut `entries` to `max`, dropping rows in the order repeated
+/// [`source_eviction_index`] calls would.
+fn trim_sources(entries: &mut Vec<SourceEntry>, max: usize) {
+    let excess = entries.len().saturating_sub(max);
+    if excess == 0 {
+        return;
+    }
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| (entries[i].last_asked.is_some(), entries[i].last_seen));
+    let mut drop = vec![false; entries.len()];
+    for &i in &order[..excess] {
+        drop[i] = true;
+    }
+    let mut idx = 0;
+    entries.retain(|_| {
+        let keep = !drop[idx];
+        idx += 1;
+        keep
+    });
 }
 
 fn origin_to_persist_byte(origin: crate::types::SourceOrigin) -> u8 {
@@ -1471,7 +1535,7 @@ pub struct SourceManager {
     /// `last_sx_sent` for a `(file, ip, port)` we asked for sources but hold no
     /// row for, so [`Self::can_request_sources_for`] can apply its intervals to
     /// it too. Runtime only, bounded by [`MAX_UNREGISTERED_SX_STAMPS`].
-    unregistered_sx_sent: HashMap<([u8; 16], Ipv4Addr, u16), i64>,
+    unregistered_sx_sent: HashMap<([u8; 16], Ipv4Addr, u16), Instant>,
 }
 
 impl Default for SourceManager {
@@ -1490,7 +1554,27 @@ impl SourceManager {
     }
 
     pub fn set_max_per_file(&mut self, max: u32) {
-        self.max_per_file = (max as usize).max(50);
+        self.max_per_file = max_sources_per_file(max);
+        for entries in self.sources.values_mut() {
+            trim_sources(entries, self.max_per_file);
+        }
+    }
+
+    /// eMule `GetMaxSourcePerFileUDP()`: keep discovering (server UDP and TCP
+    /// source requests, KAD and Ember DHT re-searches) until a file knows this
+    /// many sources, then stop asking. eMule takes three quarters of the
+    /// per-file cap and also caps that at 50; Ember drops the 50 to feed the
+    /// "queue on many sources" model, where a popular file is queued on
+    /// hundreds of peers kept by UDP reasks, so the pool must grow well past
+    /// the held-connection count. The per-channel reask intervals (KAD
+    /// backoff, 30-minute server UDP) stay the politeness gate, not this count.
+    pub fn max_sources_for_udp(&self) -> usize {
+        self.max_per_file * 3 / 4
+    }
+
+    /// Whether discovery should still look for sources of `file_hash`.
+    pub fn wants_more_sources(&self, file_hash: &[u8; 16]) -> bool {
+        self.source_count(file_hash) < self.max_sources_for_udp()
     }
 
     /// Drop every remembered source for `file_hash` (friends-only retract).
@@ -1793,9 +1877,9 @@ impl SourceManager {
             user_hash,
             connect_options,
             client_id: 0,
-            last_asked: 0,
-            last_sx_sent: 0,
-            last_callback_at: 0,
+            last_asked: None,
+            last_sx_sent: None,
+            last_callback_at: None,
             not_for_reconnect,
             origin,
         });
@@ -2061,9 +2145,11 @@ impl SourceManager {
     /// finally granted the slot.
     pub fn cleanup_expired(&mut self) {
         let now = chrono::Utc::now().timestamp();
+        let expiry = Duration::from_secs(SOURCE_EXPIRY_SECS as u64);
         for entries in self.sources.values_mut() {
             entries.retain(|e| {
-                now.saturating_sub(e.last_seen.max(e.last_asked)) < SOURCE_EXPIRY_SECS
+                now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
+                    || e.last_asked.is_some_and(|at| at.elapsed() < expiry)
             });
         }
         self.sources.retain(|_, v| !v.is_empty());
@@ -2079,7 +2165,7 @@ impl SourceManager {
     /// reloaded from `sources.met` accumulated on top of the live swarm and
     /// the per-download total latched monotonically — so the number grew on
     /// each close/reopen. Filtering by expiry here keeps the count honest and
-    /// also stops discovery gates (`MAX_SOURCES_FOR_UDP`) from tripping on
+    /// also stops discovery gates ([`Self::max_sources_for_udp`]) from tripping on
     /// stale entries.
     pub fn source_count(&self, file_hash: &[u8; 16]) -> usize {
         let now = chrono::Utc::now().timestamp();
@@ -2131,9 +2217,9 @@ impl SourceManager {
     /// Return UDP sources due for a re-ask (eMule: SOURCECLIENTREASKS interval).
     /// Only returns sources whose `last_asked` is older than `reask_interval` seconds ago.
     ///
-    /// `last_asked == 0` means "never asked" (see [`source_eviction_index`] —
-    /// only we ever set it), and it must NOT count as due. A plain
-    /// `now - last_asked` reads the sentinel as overdue by decades, so the
+    /// `last_asked == None` means "never asked" (see [`source_eviction_index`] —
+    /// only we ever set it), and it must NOT count as due. When that was a 0
+    /// sentinel, a plain `now - last_asked` read it as overdue by decades, so the
     /// first `OP_REASKFILEPING` went out on the next 5 s timer tick — seconds
     /// after our TCP file request for the same hash, and far inside eMule's
     /// `MIN_REQUESTTIME`. That is the reask rate uploaders ban a user hash
@@ -2141,13 +2227,25 @@ impl SourceManager {
     /// `MIN_REQUESTTIME_SECS`. A UDP reask only maintains a queue position we
     /// already hold, so having never asked, there is nothing to maintain.
     /// The sibling predicates (`can_request_sources_for`,
-    /// `get_lowid_sources_needing_callback`) special-case zero the same way.
+    /// `get_lowid_sources_needing_callback`) special-case `None` the same way.
     pub fn get_udp_sources_due_for_reask(
         &self,
         file_hash: &[u8; 16],
         reask_interval: i64,
     ) -> Vec<(Ipv4Addr, u16, u16)> {
+        self.get_udp_sources_due_for_reask_at(file_hash, reask_interval, Instant::now())
+    }
+
+    /// [`Self::get_udp_sources_due_for_reask`] with the reask clock read as
+    /// `asked_now`; `last_seen` is still judged against the wall clock.
+    fn get_udp_sources_due_for_reask_at(
+        &self,
+        file_hash: &[u8; 16],
+        reask_interval: i64,
+        asked_now: Instant,
+    ) -> Vec<(Ipv4Addr, u16, u16)> {
         let now = chrono::Utc::now().timestamp();
+        let interval = Duration::from_secs(reask_interval.max(0) as u64);
         self.sources
             .get(file_hash)
             .map(|entries| {
@@ -2157,8 +2255,8 @@ impl SourceManager {
                         now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
                             && e.udp_port > 0
                             && !e.not_for_reconnect
-                            && e.last_asked != 0
-                            && now.saturating_sub(e.last_asked) >= reask_interval
+                            && e.last_asked
+                                .is_some_and(|at| asked_now.saturating_duration_since(at) >= interval)
                     })
                     .map(|e| (e.ip, e.tcp_port, e.udp_port))
                     .collect()
@@ -2168,13 +2266,12 @@ impl SourceManager {
 
     /// Mark a source as asked (update `last_asked` timestamp).
     pub fn mark_asked(&mut self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) {
-        let now = chrono::Utc::now().timestamp();
         if let Some(entries) = self.sources.get_mut(file_hash) {
             if let Some(entry) = entries
                 .iter_mut()
                 .find(|e| e.ip == ip && e.tcp_port == port)
             {
-                entry.last_asked = now;
+                entry.last_asked = Some(Instant::now());
             }
         }
     }
@@ -2220,7 +2317,18 @@ impl SourceManager {
     /// same rules through [`Self::unregistered_sx_sent`]; answering yes for it
     /// unconditionally asked that peer again on every connection.
     pub fn can_request_sources_for(&self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) -> bool {
-        let now = chrono::Utc::now().timestamp();
+        self.can_request_sources_for_at(file_hash, ip, port, Instant::now())
+    }
+
+    /// [`Self::can_request_sources_for`] as of `now`. Tests move `now` forward
+    /// rather than stamps back, since an `Instant` cannot go earlier than boot.
+    fn can_request_sources_for_at(
+        &self,
+        file_hash: &[u8; 16],
+        ip: Ipv4Addr,
+        port: u16,
+        now: Instant,
+    ) -> bool {
         let entries = self.sources.get(file_hash).map_or(&[][..], Vec::as_slice);
         let unregistered = self
             .unregistered_sx_sent
@@ -2245,28 +2353,21 @@ impl SourceManager {
             return false;
         }
 
+        let elapsed_secs = |at: Instant| {
+            i64::try_from(now.saturating_duration_since(at).as_secs()).unwrap_or(i64::MAX)
+        };
         let source_stamp = entries
             .iter()
             .find(|e| e.ip == ip && e.tcp_port == port)
-            .map_or(0, |e| e.last_sx_sent)
-            .max(
-                self.unregistered_sx_sent
-                    .get(&(*file_hash, ip, port))
-                    .copied()
-                    .unwrap_or(0),
-            );
-        let since_source = if source_stamp == 0 {
-            i64::MAX
-        } else {
-            now - source_stamp
-        };
+            .and_then(|e| e.last_sx_sent)
+            .max(self.unregistered_sx_sent.get(&(*file_hash, ip, port)).copied());
+        let since_source = source_stamp.map_or(i64::MAX, elapsed_secs);
         let since_file = entries
             .iter()
-            .map(|e| e.last_sx_sent)
+            .filter_map(|e| e.last_sx_sent)
             .chain(unregistered.map(|(_, stamp)| *stamp))
             .max()
-            .filter(|stamp| *stamp != 0)
-            .map_or(i64::MAX, |stamp| now - stamp);
+            .map_or(i64::MAX, elapsed_secs);
 
         if known <= RARE_FILE_SOURCES {
             // Rare: the per-source interval alone, plus the per-file floor once
@@ -2279,16 +2380,15 @@ impl SourceManager {
         }
     }
 
-    /// Test seam for the source-exchange gates: backdate a source's last
-    /// request so the intervals can be exercised without sleeping through
-    /// forty minutes of them.
+    /// Test seam for the source-exchange gates: set a source's last request,
+    /// where it has one, so the intervals can be exercised against a later
+    /// `now` without sleeping through forty minutes of them.
     #[cfg(test)]
-    fn backdate_sx(&mut self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16, secs_ago: i64) {
-        let when = chrono::Utc::now().timestamp() - secs_ago;
+    fn set_sx_stamp(&mut self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16, when: Instant) {
         if let Some(entries) = self.sources.get_mut(file_hash) {
             for entry in entries.iter_mut() {
                 if entry.ip == ip && entry.tcp_port == port {
-                    entry.last_sx_sent = when;
+                    entry.last_sx_sent = Some(when);
                 }
             }
         }
@@ -2299,13 +2399,13 @@ impl SourceManager {
 
     /// Record that an SX request was sent to this source.
     pub fn mark_sx_sent(&mut self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) {
-        let now = chrono::Utc::now().timestamp();
+        let now = Instant::now();
         if let Some(entry) = self
             .sources
             .get_mut(file_hash)
             .and_then(|entries| entries.iter_mut().find(|e| e.ip == ip && e.tcp_port == port))
         {
-            entry.last_sx_sent = now;
+            entry.last_sx_sent = Some(now);
             self.unregistered_sx_sent.remove(&(*file_hash, ip, port));
             return;
         }
@@ -2314,8 +2414,11 @@ impl SourceManager {
             && self.unregistered_sx_sent.len() >= MAX_UNREGISTERED_SX_STAMPS
         {
             // A stamp older than the longest interval gates nothing any more.
-            let horizon = now - SOURCECLIENTREASKS_I64.saturating_mul(MINCOMMONPENALTY);
-            self.unregistered_sx_sent.retain(|_, stamp| *stamp > horizon);
+            let horizon = Duration::from_secs(
+                SOURCECLIENTREASKS_I64.saturating_mul(MINCOMMONPENALTY).max(0) as u64,
+            );
+            self.unregistered_sx_sent
+                .retain(|_, stamp| now.saturating_duration_since(*stamp) < horizon);
             if self.unregistered_sx_sent.len() >= MAX_UNREGISTERED_SX_STAMPS {
                 if let Some(oldest) = self
                     .unregistered_sx_sent
@@ -2803,9 +2906,9 @@ impl SourceManager {
                     user_hash,
                     connect_options,
                     client_id,
-                    last_asked: 0,
-                    last_sx_sent: 0,
-                    last_callback_at: 0,
+                    last_asked: None,
+                    last_sx_sent: None,
+                    last_callback_at: None,
                     not_for_reconnect: false,
                     // Filled from the trailing `EORG` section after every v1
                     // record is in, so a v1-only file still loads.
@@ -2981,9 +3084,9 @@ impl SourceManager {
             user_hash,
             connect_options,
             client_id,
-            last_asked: 0,
-            last_sx_sent: 0,
-            last_callback_at: 0,
+            last_asked: None,
+            last_sx_sent: None,
+            last_callback_at: None,
             not_for_reconnect: false,
             origin,
         });
@@ -3018,6 +3121,7 @@ impl SourceManager {
         min_interval_secs: i64,
     ) -> Vec<u32> {
         let now = chrono::Utc::now().timestamp();
+        let min_interval = Duration::from_secs(min_interval_secs.max(0) as u64);
         self.sources
             .get(file_hash)
             .map(|entries| {
@@ -3028,8 +3132,7 @@ impl SourceManager {
                             && now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
                             && e.server_ip == server_ip
                             && e.server_port == server_port
-                            && (e.last_callback_at == 0
-                                || now.saturating_sub(e.last_callback_at) >= min_interval_secs)
+                            && e.last_callback_at.is_none_or(|at| at.elapsed() >= min_interval)
                     })
                     .map(|e| e.client_id)
                     .collect()
@@ -3055,6 +3158,7 @@ impl SourceManager {
         min_interval_secs: i64,
     ) -> Vec<([u8; 16], u32)> {
         let now = chrono::Utc::now().timestamp();
+        let min_interval = Duration::from_secs(min_interval_secs.max(0) as u64);
         let mut out = Vec::new();
         for (file_hash, entries) in &self.sources {
             for e in entries {
@@ -3067,9 +3171,7 @@ impl SourceManager {
                 if now.saturating_sub(e.last_seen) >= SOURCE_EXPIRY_SECS {
                     continue;
                 }
-                if e.last_callback_at != 0
-                    && now.saturating_sub(e.last_callback_at) < min_interval_secs
-                {
+                if e.last_callback_at.is_some_and(|at| at.elapsed() < min_interval) {
                     continue;
                 }
                 out.push((*file_hash, e.client_id));
@@ -3092,6 +3194,7 @@ impl SourceManager {
         min_interval_secs: i64,
     ) -> Vec<(u32, u16, Vec<u32>)> {
         let now = chrono::Utc::now().timestamp();
+        let min_interval = Duration::from_secs(min_interval_secs.max(0) as u64);
         let entries = match self.sources.get(file_hash) {
             Some(e) => e,
             None => return Vec::new(),
@@ -3108,8 +3211,7 @@ impl SourceManager {
             if e.server_ip == 0 || e.server_port == 0 {
                 continue;
             }
-            if e.last_callback_at != 0 && now.saturating_sub(e.last_callback_at) < min_interval_secs
-            {
+            if e.last_callback_at.is_some_and(|at| at.elapsed() < min_interval) {
                 continue;
             }
             grouped
@@ -3133,10 +3235,10 @@ impl SourceManager {
     /// different server's identically-numbered row merely defers its callback by
     /// one `FILEREASKTIME` window — far better than a callback-spam loop.
     pub fn mark_callback_sent(&mut self, file_hash: &[u8; 16], client_id: u32) {
-        let now = chrono::Utc::now().timestamp();
+        let now = Instant::now();
         if let Some(entries) = self.sources.get_mut(file_hash) {
             for entry in entries.iter_mut().filter(|e| e.client_id == client_id) {
-                entry.last_callback_at = now;
+                entry.last_callback_at = Some(now);
             }
         }
     }
@@ -3278,18 +3380,20 @@ mod tests {
         let mut sm = SourceManager::new();
         let peer = Ipv4Addr::new(10, 0, 0, 1);
 
+        let t0 = Instant::now();
+        let after = |s: i64| t0 + Duration::from_secs(s as u64);
+
         // A rare file: one source, never asked. Always allowed.
         sm.register_source(hash, peer, 4662, None);
-        assert!(sm.can_request_sources_for(&hash, peer, 4662));
+        assert!(sm.can_request_sources_for_at(&hash, peer, 4662, t0));
 
         // Asked recently — the per-source interval holds it off either way.
-        sm.backdate_sx(&hash, peer, 4662, 60);
-        assert!(!sm.can_request_sources_for(&hash, peer, 4662));
+        sm.set_sx_stamp(&hash, peer, 4662, t0);
+        assert!(!sm.can_request_sources_for_at(&hash, peer, 4662, after(60)));
 
         // Past the per-source interval, still rare, so it may ask again.
-        sm.backdate_sx(&hash, peer, 4662, SOURCECLIENTREASKS_I64 + 1);
         assert!(
-            sm.can_request_sources_for(&hash, peer, 4662),
+            sm.can_request_sources_for_at(&hash, peer, 4662, after(SOURCECLIENTREASKS_I64 + 1)),
             "a rare file may re-ask on the plain 40-minute interval"
         );
 
@@ -3298,18 +3402,16 @@ mod tests {
         for i in 0..RARE_FILE_SOURCES as u32 {
             sm.register_source(hash, Ipv4Addr::from(0x0B00_0000 + i), 4662, None);
         }
-        sm.backdate_sx(&hash, peer, 4662, SOURCECLIENTREASKS_I64 + 1);
         assert!(
-            !sm.can_request_sources_for(&hash, peer, 4662),
+            !sm.can_request_sources_for_at(&hash, peer, 4662, after(SOURCECLIENTREASKS_I64 + 1)),
             "a common file must wait SOURCECLIENTREASKS * MINCOMMONPENALTY"
         );
-        sm.backdate_sx(
+        assert!(sm.can_request_sources_for_at(
             &hash,
             peer,
             4662,
-            SOURCECLIENTREASKS_I64 * MINCOMMONPENALTY + 1,
-        );
-        assert!(sm.can_request_sources_for(&hash, peer, 4662));
+            after(SOURCECLIENTREASKS_I64 * MINCOMMONPENALTY + 1),
+        ));
     }
 
     /// The other half: past the soft cap a file has enough sources and asking
@@ -3348,8 +3450,14 @@ mod tests {
             !sm.can_request_sources_for(&hash, stranger, 4662),
             "the per-source interval applies without a row"
         );
-        sm.backdate_sx(&hash, stranger, 4662, SOURCECLIENTREASKS_I64 + 1);
-        assert!(sm.can_request_sources_for(&hash, stranger, 4662));
+        let t0 = Instant::now();
+        sm.set_sx_stamp(&hash, stranger, 4662, t0);
+        assert!(sm.can_request_sources_for_at(
+            &hash,
+            stranger,
+            4662,
+            t0 + Duration::from_secs(SOURCECLIENTREASKS_I64 as u64 + 1),
+        ));
 
         // The stamp also feeds the per-file floor once the file is not very rare.
         for i in 0..(RARE_FILE_SOURCES / 5 + 1) as u32 {
@@ -3398,7 +3506,7 @@ mod tests {
     fn failure_score_decays_after_queue_progress() {
         let hash = [0x11; 16];
         let ip = Ipv4Addr::new(1, 2, 3, 4);
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_full(ip, 4662, 4672));
 
         pfs.set_failed_with_penalty(ip, 4662, 4, None);
@@ -3416,7 +3524,7 @@ mod tests {
         let hash = [0x22; 16];
         let a = Ipv4Addr::new(1, 1, 1, 1);
         let b = Ipv4Addr::new(2, 2, 2, 2);
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_full(a, 4662, 4672));
         assert!(pfs.add_source_full(b, 4663, 4673));
 
@@ -3433,7 +3541,7 @@ mod tests {
         let hash = [0x33; 16];
         let keep_ip = Ipv4Addr::new(3, 3, 3, 3);
         let drop_ip = Ipv4Addr::new(4, 4, 4, 4);
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_full(keep_ip, 4662, 0));
         assert!(pfs.add_source_full(drop_ip, 4663, 0));
 
@@ -3485,7 +3593,7 @@ mod tests {
         let hash = [0x44; 16];
         let ip = Ipv4Addr::new(5, 5, 5, 5);
         let buddy = Ipv4Addr::new(6, 6, 6, 6);
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_full(ip, 4662, 0));
         pfs.set_kad_callback_buddy(ip, 4662, buddy, 4672, [0xAA; 16], Some([0xBB; 16]), true);
         assert!(pfs.callback_reask_due(ip, 4662, None));
@@ -3498,7 +3606,7 @@ mod tests {
         let hash = [0x45; 16];
         let ip = Ipv4Addr::new(5, 5, 5, 5);
         let buddy = Ipv4Addr::new(6, 6, 6, 6);
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_full(ip, 4662, 0));
         pfs.set_ember_callback_buddy(
             ip,
@@ -3531,7 +3639,7 @@ mod tests {
         let hash = [0x4A; 16];
         let ip = Ipv4Addr::new(5, 5, 5, 7);
         let buddy = Ipv4Addr::new(6, 6, 6, 8);
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_full(ip, 4662, 0));
         pfs.set_ember_callback_buddy(
             ip,
@@ -3565,7 +3673,7 @@ mod tests {
         let hash = [0x49; 16];
         let ip = Ipv4Addr::new(5, 5, 5, 6);
         let buddy = Ipv4Addr::new(6, 6, 6, 7);
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_full(ip, 4662, 0));
         pfs.set_ember_callback_buddy(
             ip,
@@ -3602,7 +3710,7 @@ mod tests {
         let kad_buddy = Ipv4Addr::new(9, 9, 9, 9);
         let user = [0xBBu8; 16];
 
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_with_identity(peer, 4662, 0, Some(user)));
 
         pfs.set_ember_callback_buddy(
@@ -3656,7 +3764,7 @@ mod tests {
         let hash = [0x48; 16];
         let peer = Ipv4Addr::new(10, 0, 0, 9);
         let buddy = Ipv4Addr::new(8, 8, 8, 8);
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_full(peer, 4662, 0));
         pfs.set_kad_callback_buddy(peer, 4662, buddy, 4672, [0xAA; 16], None, true);
 
@@ -3707,7 +3815,7 @@ mod tests {
         // A routable address, so nothing but the provenance rule can refuse it.
         let claimed = Ipv4Addr::new(9, 9, 9, 9);
         let buddy = Ipv4Addr::new(8, 8, 8, 8);
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
 
         // The record itself creates the row: `add_source_with_identity` reports
         // `true`, which is what marks the address as claim-only.
@@ -3747,7 +3855,7 @@ mod tests {
 
         // Positive control for the case the budget *was* written for: a row that
         // already existed when the firewalled record arrived does rejoin.
-        let mut pfs2 = PerFileSourceList::new(hash);
+        let mut pfs2 = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         let peer = Ipv4Addr::new(7, 7, 7, 7);
         assert!(pfs2.add_source_with_identity(peer, 4662, 4672, Some([0xCCu8; 16])));
         let rediscovered =
@@ -3788,7 +3896,7 @@ mod tests {
         let kad_fw = Ipv4Addr::new(10, 0, 0, 10);
         let parked = Ipv4Addr::new(8, 8, 8, 8);
         let buddy = Ipv4Addr::new(8, 8, 4, 4);
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_full(highid, 4662, 0));
         assert!(pfs.add_source_full(ember_fw, 4662, 0));
         assert!(pfs.add_source_full(kad_fw, 4662, 0));
@@ -3832,7 +3940,7 @@ mod tests {
         let hash = [0x55; 16];
         let uh_a = [0xAA; 16];
         let uh_b = [0xBB; 16];
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_with_identity(Ipv4Addr::UNSPECIFIED, 0, 0, Some(uh_a)));
         assert!(pfs.add_source_with_identity(Ipv4Addr::UNSPECIFIED, 0, 0, Some(uh_b)));
         assert_eq!(pfs.sources.len(), 2);
@@ -3870,7 +3978,7 @@ mod tests {
     fn friend_connect_parks_source_then_releases_it_for_reask() {
         let hash = [0x57; 16];
         let ip = Ipv4Addr::new(8, 8, 8, 8);
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_full(ip, 4662, 0));
 
         pfs.set_friend_connect(ip, 4662, None);
@@ -3905,7 +4013,7 @@ mod tests {
         let known = Ipv4Addr::new(10, 0, 0, 1);
         let anonymous = Ipv4Addr::new(10, 0, 0, 2);
         let peer = [0xC3u8; 16];
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
 
         assert!(pfs.add_source_with_identity(known, 4662, 0, Some(peer)));
         assert!(pfs.add_source_full(anonymous, 4663, 0));
@@ -3931,7 +4039,7 @@ mod tests {
     #[test]
     fn a_full_source_list_evicts_a_permanent_park_to_admit_a_real_peer() {
         let hash = [0x5C; 16];
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
 
         // Fill the list with rows parked on a route that can never open.
         for i in 0..MAX_SOURCES_PER_FILE {
@@ -3955,7 +4063,7 @@ mod tests {
     #[test]
     fn a_full_list_of_healthy_sources_refuses_rather_than_evicting_one() {
         let hash = [0x5D; 16];
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         for i in 0..MAX_SOURCES_PER_FILE {
             let ip = Ipv4Addr::new(10, (i / 256) as u8, (i % 256) as u8, 2);
             assert!(pfs.add_source_full(ip, 4662, 0));
@@ -3965,6 +4073,68 @@ mod tests {
         assert_eq!(pfs.sources.len(), MAX_SOURCES_PER_FILE);
     }
 
+    /// Max sources per file caps a download's own list, not only the
+    /// source-exchange cache, and lowering it drops at once only what a
+    /// newcomer could have evicted.
+    #[test]
+    fn the_max_sources_setting_caps_and_trims_a_download_list() {
+        let mut pfs = PerFileSourceList::new([0x5E; 16], 60);
+        for i in 0..60u32 {
+            let ip = Ipv4Addr::from(0x0A00_0000 + i);
+            assert!(pfs.add_source_full(ip, 4662, 0));
+            if i < 30 {
+                pfs.set_low_to_low(ip, 4662, None);
+            } else {
+                pfs.set_on_queue(ip, 4662, Some(5), None);
+            }
+        }
+        assert_eq!(pfs.sources.len(), 60);
+
+        pfs.set_max_sources(50);
+        assert_eq!(pfs.sources.len(), 50);
+        pfs.set_max_sources(20);
+        assert_eq!(pfs.sources.len(), 30, "rows on a peer's queue are kept");
+        assert!(pfs
+            .sources
+            .iter()
+            .all(|s| matches!(s.state, DownloadSourceState::OnQueue { .. })));
+        assert!(!pfs.add_source_full(Ipv4Addr::new(203, 0, 113, 80), 4662, 0));
+    }
+
+    #[test]
+    fn the_max_sources_setting_has_a_floor_and_sets_the_udp_target() {
+        assert_eq!(max_sources_per_file(1), MIN_SOURCES_PER_FILE as usize);
+        assert_eq!(max_sources_per_file(1200), 1200);
+        let mut sm = SourceManager::new();
+        sm.set_max_per_file(400);
+        assert_eq!(sm.max_sources_for_udp(), 300);
+        sm.set_max_per_file(2000);
+        assert_eq!(sm.max_sources_for_udp(), 1500);
+    }
+
+    /// Lowering the setting shrinks the source-exchange cache too, dropping
+    /// never-contacted rows before ones we have asked.
+    #[test]
+    fn lowering_max_sources_trims_the_source_cache() {
+        let hash = [0xA6u8; 16];
+        let mut sm = SourceManager::new();
+        sm.set_max_per_file(400);
+        for i in 0..400u32 {
+            sm.register_source(hash, Ipv4Addr::from(0x0B00_0000 + i), 4662, None);
+        }
+        for i in 0..40u32 {
+            sm.mark_asked(&hash, Ipv4Addr::from(0x0B00_0000 + i), 4662);
+        }
+        assert_eq!(sm.source_count(&hash), 400);
+        assert!(!sm.wants_more_sources(&hash));
+
+        sm.set_max_per_file(50);
+        assert_eq!(sm.source_count(&hash), 50);
+        let entries = &sm.sources[&hash];
+        assert_eq!(entries.iter().filter(|e| e.last_asked.is_some()).count(), 40);
+        assert!(!sm.wants_more_sources(&hash));
+    }
+
     /// `Banned` was terminal in every direction at once — no reask, no dial, and
     /// no `fail_count` bump for `purge_dead_sources` to act on — so a source that
     /// our own expiring IP ban touched stayed dead for the rest of the session.
@@ -3972,7 +4142,7 @@ mod tests {
     fn a_banned_source_is_released_once_its_park_expires() {
         let hash = [0x5B; 16];
         let ip = Ipv4Addr::new(6, 6, 6, 6);
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_full(ip, 4662, 0));
         pfs.set_banned(ip, 4662, None);
 
@@ -4000,7 +4170,7 @@ mod tests {
     fn clear_friend_connect_leaves_other_states_alone() {
         let hash = [0x58; 16];
         let ip = Ipv4Addr::new(9, 8, 7, 6);
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_full(ip, 4662, 0));
 
         pfs.set_downloading(ip, 4662, None);
@@ -4015,7 +4185,7 @@ mod tests {
     #[test]
     fn a_finished_transfer_waits_a_full_reask_instead_of_tripping_the_watchdog() {
         let ip = Ipv4Addr::new(7, 7, 7, 8);
-        let mut pfs = PerFileSourceList::new([0x57; 16]);
+        let mut pfs = PerFileSourceList::new([0x57; 16], MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_full(ip, 4662, 0));
         pfs.set_downloading(ip, 4662, None);
         let long_session = Instant::now() + Duration::from_secs(3600);
@@ -4032,7 +4202,7 @@ mod tests {
     fn set_low_to_low_targets_real_ip_when_specified() {
         let hash = [0x56; 16];
         let ip = Ipv4Addr::new(7, 7, 7, 7);
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_full(ip, 4662, 0));
         pfs.set_low_to_low(ip, 4662, None);
         assert!(matches!(
@@ -4052,7 +4222,7 @@ mod tests {
         let hash = [0x58; 16];
         let dialable = Ipv4Addr::new(7, 7, 7, 7);
         let parked = Ipv4Addr::new(8, 8, 8, 8);
-        let mut pfs = PerFileSourceList::new(hash);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
         assert!(pfs.add_source_full(dialable, 4662, 0));
         assert!(pfs.add_source_full(parked, 4662, 0));
 
@@ -4603,7 +4773,7 @@ mod tests {
             for e in entries.iter_mut() {
                 if e.ip == identified_ip {
                     e.last_seen -= 1000;
-                    e.last_asked = chrono::Utc::now().timestamp();
+                    e.last_asked = Some(Instant::now());
                 }
             }
         }
@@ -4655,7 +4825,7 @@ mod tests {
             for e in entries.iter_mut() {
                 if e.ip == contacted_ip {
                     e.last_seen -= 1000;
-                    e.last_asked = chrono::Utc::now().timestamp();
+                    e.last_asked = Some(Instant::now());
                 }
             }
         }
@@ -4765,8 +4935,8 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
-    /// `last_asked == 0` is the "we have never asked this peer" sentinel, so a
-    /// plain `now - last_asked` read it as overdue by decades and the first
+    /// `last_asked == None` is "we have never asked this peer". It was a 0
+    /// sentinel, which a plain `now - last_asked` read as overdue by decades: the first
     /// `OP_REASKFILEPING` went out on the next 5 s timer tick — right after our
     /// TCP file request for the same hash, and far inside eMule's
     /// `MIN_REQUESTTIME`. That is exactly the reask rate that gets a user hash
@@ -4793,11 +4963,9 @@ mod tests {
             .is_empty());
 
         // ...and due once a full reask interval has passed.
-        if let Some(entries) = sm.sources.get_mut(&hash) {
-            entries[0].last_asked = chrono::Utc::now().timestamp() - FILEREASKTIME_SECS - 1;
-        }
+        let later = Instant::now() + Duration::from_secs(FILEREASKTIME_SECS as u64 + 1);
         assert_eq!(
-            sm.get_udp_sources_due_for_reask(&hash, FILEREASKTIME_SECS),
+            sm.get_udp_sources_due_for_reask_at(&hash, FILEREASKTIME_SECS, later),
             vec![(ip, 4662, 4672)]
         );
     }

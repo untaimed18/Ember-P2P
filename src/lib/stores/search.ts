@@ -4,7 +4,7 @@ import type { SearchResult } from '$lib/types';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { SearchMethod, SearchFilters, RelationKind } from '$lib/api/search';
 import { cancelSearch, rescoreSearchResults } from '$lib/api/search';
-import { shedWeakestRows } from '$lib/searchOverflow';
+import { rememberShed, shedWeakestRows } from '$lib/searchOverflow';
 import {
   PERSIST_RETRY_LIMITS,
   SEARCH_STORAGE_KEY,
@@ -50,6 +50,13 @@ export type SearchTab = {
   isSearching: boolean;
   progress: { nodes_contacted: number; results_so_far: number; phase: string } | null;
   error: string | null;
+  /** Results dropped because the tab reached its cap, least available first.
+   *  Shown, so a broad search does not look as if it lost hits for no reason. */
+  shed?: number;
+  /** Keys of the dropped results, while the search can still send them
+   *  again: one that comes back is shown and no longer dropped, and one
+   *  dropped twice is counted once. Bounded by `MAX_REMEMBERED_SHED`. */
+  shedKeys?: Set<string>;
 };
 
 /**
@@ -129,6 +136,34 @@ const persistedSearch = parsePersistedSearch(readPersistedSearch());
 export const searchTabs = writable<SearchTab[]>(persistedSearch.tabs);
 export const activeSearchTabId = writable<string | null>(persistedSearch.activeId);
 
+/**
+ * The tabs to carry across an update restart, in the same shape a reload keeps.
+ *
+ * Needed because session storage does not survive the process ending, which is
+ * exactly what an update does. `null` when there is nothing worth carrying.
+ */
+export function searchResumeSnapshot(): string | null {
+  const tabs = get(searchTabs);
+  if (tabs.length === 0) return null;
+  try {
+    return JSON.stringify(buildPersistPayload(tabs, get(activeSearchTabId)));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Put back the tabs an update restart carried over, through the same validation
+ * a reload's restore uses. Tabs that already exist win: they are newer.
+ */
+export function restoreSearchFromResume(raw: string): void {
+  if (get(searchTabs).length > 0) return;
+  const restored = parsePersistedSearch(raw);
+  if (restored.tabs.length === 0) return;
+  searchTabs.set(restored.tabs);
+  activeSearchTabId.set(restored.activeId);
+}
+
 if (typeof window !== 'undefined') {
   // `pagehide` covers the reload and the window going away; the hidden branch
   // of `visibilitychange` is the backstop for paths that do not fire it.
@@ -168,7 +203,13 @@ let initialized = false;
 let unlisteners: UnlistenFn[] = [];
 let unsubSettings: Unsubscriber | null = null;
 let lastSpamSettingsKey: string | null = null;
-let searchNonce = 0;
+// Seeded from the clock rather than 0: the backend outlives a webview reload,
+// and a leg still running for the last page's request — an Ember walk emits
+// its closing batch up to a minute on — would otherwise name an id this page
+// is about to hand out again, and stream into that search. Searches are far
+// rarer than milliseconds, so the ids keep rising across reloads, and stay
+// well inside `Number.MAX_SAFE_INTEGER` and the backend's u64.
+let searchNonce = Date.now();
 // Bumped by `cleanupSearchStore`; see the matching comment in
 // `stores/network.ts` for why `initSearchStore` needs to re-check this
 // after its async listener registration before adopting the results.
@@ -494,10 +535,13 @@ function mergeIntoTab(tab: SearchTab, incoming: SearchResult[]): SearchTab {
     index = new Map<string, number>();
     for (let i = 0; i < results.length; i++) index.set(resultKey(results[i]), i);
   }
+  let shed = tab.shed ?? 0;
+  let shedKeys = tab.shedKeys;
   for (const result of incoming) {
     const key = resultKey(result);
     const at = index.get(key);
     if (at === undefined) {
+      if (shedKeys?.delete(key)) shed -= 1;
       index.set(key, results.length);
       results.push({
         ...result,
@@ -513,10 +557,13 @@ function mergeIntoTab(tab: SearchTab, incoming: SearchResult[]): SearchTab {
   }
   if (results.length > MAX_TAB_RESULTS) {
     shedWeakestRows(results, TAB_RESULTS_LOW_WATER);
-    index.clear();
-    for (let i = 0; i < results.length; i++) index.set(resultKey(results[i]), i);
+    const kept = new Map<string, number>();
+    for (let i = 0; i < results.length; i++) kept.set(resultKey(results[i]), i);
+    shedKeys ??= new Set();
+    shed += rememberShed(shedKeys, index.keys(), kept);
+    index = kept;
   }
-  return { ...tab, results, resultIndex: index };
+  return { ...tab, results, resultIndex: index, shed, shedKeys };
 }
 
 function updateTabByRequestId(
@@ -541,8 +588,11 @@ export function patchSearchTabByRequestId(requestId: number, fn: (tab: SearchTab
  *  step, which a caller assembling `results` itself would not. */
 export function appendSearchResults(requestId: number, incoming: SearchResult[]) {
   if (!Array.isArray(incoming) || incoming.length === 0) return;
+  const activeId = get(activeSearchTabId);
+  // The invoke reply can land after `search-complete` already trimmed an idle
+  // background tab; the trim applies to what it brings too.
   searchTabs.update((tabs) =>
-    updateTabByRequestId(tabs, requestId, (t) => mergeIntoTab(t, incoming)),
+    updateTabByRequestId(tabs, requestId, (t) => trimIdleTab(mergeIntoTab(t, incoming), activeId)),
   );
 }
 
@@ -694,7 +744,9 @@ function trimIdleTab(tab: SearchTab, activeId: string | null): SearchTab {
   shedWeakestRows(results, IDLE_TAB_RESULTS);
   const resultIndex = new Map<string, number>();
   for (let i = 0; i < results.length; i++) resultIndex.set(resultKey(results[i]), i);
-  return { ...tab, results, resultIndex };
+  const shed = (tab.shed ?? 0) + (tab.results.length - results.length);
+  // Finished, so nothing will come back to be told apart.
+  return { ...tab, results, resultIndex, shed, shedKeys: undefined };
 }
 
 function trimIdleTabs(tabs: SearchTab[], activeId: string | null): SearchTab[] {
@@ -1193,6 +1245,12 @@ export function cleanupSearchStore() {
   spamMarkRescorePending = null;
   spamUserOverrides.clear();
   spamFilterEpoch.update((n) => n + 1);
+  // Save the tabs before dropping them, and leave the emptied store unsaved.
+  // The init-failure screen runs this and then offers Retry, which is a
+  // reload: its `pagehide` persisted the empty list, deleting the saved tabs
+  // the reload was going to restore.
+  persistSearch();
   searchTabs.set([]);
   activeSearchTabId.set(null);
+  persistDirty = false;
 }

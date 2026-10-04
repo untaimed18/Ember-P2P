@@ -51,23 +51,53 @@ fn drain_fresh_part_hashes(
 }
 
 /// Transfer ids whose `.part` existed at the last probe, for the reconcile's
-/// OP_OFFERFILES change check. The probe runs on the blocking pool after the
-/// check reads this, so a check sees the previous pass's answer; a download
-/// that is unknown or stale here only makes the check request an offer drain
-/// that recomputes the list itself and finds nothing new to send.
+/// OP_OFFERFILES change check and the offer drain's partial files. The probe
+/// runs on the blocking pool after they read this, so each sees the previous
+/// pass's answer. A download stale here makes the check request a drain that
+/// finds nothing new to send; one the probe finds for the first time sets
+/// `grew`, which requests a drain that offers it.
 #[derive(Default)]
-struct PartPresence {
+pub(in crate::network) struct PartPresence {
     generation: u64,
-    present: HashSet<String>,
+    pub(in crate::network) present: HashSet<String>,
+    grew: bool,
 }
 
-fn part_presence() -> &'static parking_lot::Mutex<PartPresence> {
+impl PartPresence {
+    fn land(&mut self, generation: u64, present: HashSet<String>) {
+        // Probes can finish out of order; an older one must not overwrite a
+        // newer answer.
+        if generation <= self.generation {
+            return;
+        }
+        self.generation = generation;
+        if present.iter().any(|id| !self.present.contains(id)) {
+            self.grew = true;
+        }
+        self.present = present;
+    }
+}
+
+pub(in crate::network) fn part_presence() -> &'static parking_lot::Mutex<PartPresence> {
     static PRESENCE: std::sync::OnceLock<parking_lot::Mutex<PartPresence>> =
         std::sync::OnceLock::new();
     PRESENCE.get_or_init(Default::default)
 }
 
-fn spawn_part_presence_probe(candidates: Vec<(String, PathBuf)>) {
+/// Whether a probe has found a `.part` it had not seen since this was last
+/// asked.
+pub(in crate::network) fn take_part_presence_grew() -> bool {
+    std::mem::take(&mut part_presence().lock().grew)
+}
+
+/// The roots a cancelled download's tracker may delete its `.part.met` under.
+/// The tracker names the file in the folder its `.part` is in, which is an
+/// earlier download folder for a download started before the folder changed.
+fn met_delete_roots(settings: &AppSettings) -> Vec<String> {
+    settings.download_roots()
+}
+
+pub(in crate::network) fn spawn_part_presence_probe(candidates: Vec<(String, PathBuf)>) {
     static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     tokio::task::spawn_blocking(move || {
@@ -76,13 +106,7 @@ fn spawn_part_presence_probe(candidates: Vec<(String, PathBuf)>) {
             .filter(|(_, path)| path.exists())
             .map(|(id, _)| id)
             .collect();
-        let mut slot = part_presence().lock();
-        // Probes can finish out of order; an older one must not overwrite a
-        // newer answer.
-        if generation > slot.generation {
-            slot.generation = generation;
-            slot.present = present;
-        }
+        part_presence().lock().land(generation, present);
     });
 }
 
@@ -523,7 +547,15 @@ async fn handle_command_inner(
                     kad_skip_phase = Some("KadBusy");
                     break 'kad false;
                 };
-                let Some(primary_keyword) = keywords.iter().max_by_key(|k| k.len()) else {
+                // Longest term every match contains, so the one key walked
+                // holds all of them; only an OR with no shared term falls
+                // back to a key that can see just part of the answer.
+                let required = query_expr.required_terms();
+                let Some(primary_keyword) = required
+                    .iter()
+                    .max_by_key(|k| k.len())
+                    .or_else(|| keywords.iter().max_by_key(|k| k.len()))
+                else {
                     kad_skip_phase = Some("KadBusy");
                     break 'kad false;
                 };
@@ -626,7 +658,9 @@ async fn handle_command_inner(
             // rather than being skipped, which keeps a momentarily empty
             // table from silently dropping the Ember leg of a search.
             if legs.ember && settings.ember_native_enabled {
-                let query = active_request.keywords.join(" ");
+                // Walk a term every match contains when there is one, as the
+                // KAD leg does. Without an OR that is every positive term.
+                let query = ember_walk_query(&active_request.keywords, query_expr.as_ref());
                 let hashed = ember::dht::search::compute_keyword_hashes(&query);
                 if let Some((primary_hash, _)) = hashed.first() {
                     // AND-only: remaining keyword hashes ride on FIND_VALUE so
@@ -695,6 +729,7 @@ async fn handle_command_inner(
                                 min_availability: active_request.min_availability,
                                 last_streamed_count: 0,
                                 streamed_files: HashSet::new(),
+                                streamed_publishers: HashSet::new(),
                             },
                         );
                         active_request.ember_pending = true;
@@ -812,10 +847,11 @@ async fn handle_command_inner(
             // Cancel (delete) clears known sources; Stop preserves them for resume.
             if deleting {
                 state.per_file_sources.remove(&transfer_id);
-                let met_path = PathBuf::from(&settings.download_folder)
-                    .join("Temp")
-                    .join(format!("{transfer_id}.part.met"));
-                ed2k::part_tracker::mark_met_saves_suppressed(&met_path);
+                for part_path in settings.download_folders().part_paths(&transfer_id) {
+                    ed2k::part_tracker::mark_met_saves_suppressed(
+                        &part_path.with_extension("part.met"),
+                    );
+                }
             }
             let cancel_tracker = if deleting {
                 state.tracker_registry.lock().remove(&transfer_id)
@@ -849,7 +885,7 @@ async fn handle_command_inner(
                 // in-memory state with no such dependency.
                 let ack = cleanup_ack.take();
                 let tid = transfer_id.clone();
-                let delete_roots = deleting.then(|| vec![settings.download_folder.clone()]);
+                let delete_roots = deleting.then(|| met_delete_roots(settings));
                 tokio::spawn(async move {
                     if let Some(tracker) = stop_tracker {
                         save_part_tracker_snapshot(tracker, &tid, "cancel/stop").await;
@@ -873,7 +909,7 @@ async fn handle_command_inner(
                     }
                 });
             } else if let Some(tracker) = cancel_tracker {
-                let allowed = vec![settings.download_folder.clone()];
+                let allowed = met_delete_roots(settings);
                 tokio::spawn(async move {
                     if let Ok(t) =
                         tokio::time::timeout(std::time::Duration::from_secs(2), tracker.read())
@@ -918,8 +954,14 @@ async fn handle_command_inner(
             // hint additionally outlives the friendship, so a stale one could
             // park a stranger's source as the friend's; the status clock's map
             // is inert once the row is gone but grew for the process lifetime.
+            // Only once the row is gone: a stopped row keeps it, or a status
+            // write still queued from before the Stop ("searching") lands
+            // after "stopped" unchallenged and the download restarts itself
+            // on the next launch.
             state.transfer_friend_hint.remove(&transfer_id);
-            transfer_status_write_clock().forget(&transfer_id);
+            if deleting {
+                transfer_status_write_clock().forget(&transfer_id);
+            }
 
             if removed_pending.is_some() || !search_ids.is_empty() {
                 info!(
@@ -1288,7 +1330,6 @@ async fn handle_command_inner(
                 // Queued / add-paused: keep seeds in SourceManager and run
                 // full-network discovery without starting dial workers.
                 if discovery_only {
-                    let now = chrono::Utc::now().timestamp();
                     let pending_priority = {
                         let mgr = transfer_manager.read().await;
                         mgr.get_transfer(&transfer_id)
@@ -1342,11 +1383,17 @@ async fn handle_command_inner(
                             expected_aich: expected_aich.clone(),
                             control,
                             search_count: if kad_search_started { 1 } else { 0 },
-                            last_search_at: if kad_search_started { now } else { 0 },
+                            last_search_at: kad_search_started.then(std::time::Instant::now),
                             priority: pending_priority,
                         },
                     );
-                    queue_server_source_ask(state, &transfer_id, hash_bytes, file_size, now);
+                    queue_server_source_ask(
+                        state,
+                        &transfer_id,
+                        hash_bytes,
+                        file_size,
+                        std::time::Instant::now(),
+                    );
                     if network_ready_for_sources(state) {
                         let packets = build_all_getsources_packets(state, &hash_bytes, file_size);
                         if !packets.is_empty() {
@@ -1509,7 +1556,7 @@ async fn handle_command_inner(
                             expected_aich: expected_aich.clone(),
                             control,
                             search_count: 0,
-                            last_search_at: 0,
+                            last_search_at: None,
                             priority: pending_priority,
                         },
                     );
@@ -1537,7 +1584,7 @@ async fn handle_command_inner(
                         file_name,
                         file_size,
                         sources: download_sources,
-                        download_dir: PathBuf::from(&settings.download_folder),
+                        download_folders: state.download_folders.clone(),
                         user_hash: state.user_hash,
                         nickname: settings.nickname.clone(),
                         tcp_port: advertised_tcp_port(state),
@@ -1677,7 +1724,6 @@ async fn handle_command_inner(
                 // file stuck. Match the `has_source = false` branch's
                 // behavior so the moment a download starts, every
                 // source-discovery channel is already in flight.
-                let now_ts = chrono::Utc::now().timestamp();
                 let ask = ask_networks_for_sources(
                     socket,
                     state,
@@ -1694,18 +1740,19 @@ async fn handle_command_inner(
                 // re-firing immediately. A leg with nowhere to send this ask
                 // records (now, 0), which lets its sweep retry as soon as that
                 // network is available again.
+                let asked_at = std::time::Instant::now();
                 state
                     .active_kad_search_state
-                    .insert(transfer_id.clone(), (now_ts, u32::from(ask.kad)));
+                    .insert(transfer_id.clone(), (asked_at, u32::from(ask.kad)));
                 state
                     .ember_source_search_state
-                    .insert(transfer_id.clone(), (now_ts, u32::from(ask.ember)));
+                    .insert(transfer_id.clone(), (asked_at, u32::from(ask.ember)));
                 // Empty-seed pending was inserted with search_count=0; stamp the
                 // fan-out so the 5s retry timer does not start a duplicate FindSource.
                 if ask.kad {
                     if let Some(pd) = state.pending_downloads.get_mut(&transfer_id) {
                         pd.search_count = pd.search_count.max(1);
-                        pd.last_search_at = now_ts;
+                        pd.last_search_at = Some(std::time::Instant::now());
                     }
                 }
             } else {
@@ -1827,7 +1874,7 @@ async fn handle_command_inner(
                 // already taken once the download starts moving.
                 state
                     .ember_source_search_state
-                    .insert(transfer_id.clone(), (now, u32::from(ask.ember)));
+                    .insert(transfer_id.clone(), (std::time::Instant::now(), u32::from(ask.ember)));
 
                 // Look up actual priority from the transfer manager if this
                 // is a promoted/re-started download, otherwise default to normal.
@@ -1848,7 +1895,7 @@ async fn handle_command_inner(
                         expected_aich,
                         control,
                         search_count: u32::from(ask.kad),
-                        last_search_at: if ask.kad { now } else { 0 },
+                        last_search_at: ask.kad.then(std::time::Instant::now),
                         priority: pending_priority,
                     },
                 );
@@ -2283,6 +2330,7 @@ async fn handle_command_inner(
             let (ember_contacts, ember_verified) = ember_dht_ui_contact_counts(state);
             state.stats.ember_dht_contacts = ember_contacts;
             state.stats.ember_dht_verified_contacts = ember_verified;
+            state.stats.ed2k_low_id = state.server_connected.then_some(state.low_id);
             let _ = tx.send(state.stats.clone());
         }
 
@@ -2994,7 +3042,7 @@ async fn handle_command_inner(
             let key_hex = hex::encode(record.keyword_hash);
             let publish_id = match state
                 .ember_publish
-                .start_publish(record, state.ember_dht.routing())
+                .start_publish(*record, state.ember_dht.routing())
             {
                 Some(id) => id,
                 None => {
@@ -3201,22 +3249,32 @@ async fn handle_command_inner(
                 let _ = tx.send(Err(coded("channels_member_invalid", "Invalid member key")));
                 return;
             };
-            state.xfer_send.insert(
+            let offer = ember::channel::XferOffer {
+                sender: state.local_ed25519_pubkey,
+                target: peer,
                 xfer_id,
-                ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path.clone()),
-            );
-            let plain = ember::channel::encode_xfer_offer(
-                &key,
-                &ember::channel::XferOffer {
-                    sender: state.local_ed25519_pubkey,
-                    target: peer,
-                    xfer_id,
-                    size,
-                    root,
-                    name: name.clone(),
-                },
-            );
-            let sent = send_xfer_frame(socket, state, db, channel_id, peer, &plain).await;
+                size,
+                root,
+                name: name.clone(),
+            };
+            // Sealed only, so the members it is forwarded through cannot read
+            // the file's name and size. A recipient on v1.6.x cannot read it
+            // either, so unless this one is known to, the plain offer is kept
+            // and the user is asked about it if the recipient stays silent.
+            let mut send =
+                ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path.clone());
+            if ember::xfer::holds_plain_offer(size, member_reads_sealed_offers(state, db, &peer)) {
+                send.hold_plain_offer(
+                    ember::channel::encode_xfer_offer(&key, &offer),
+                    std::time::Instant::now()
+                        + std::time::Duration::from_secs(
+                            ember::channel::XFER_PLAIN_OFFER_FALLBACK_SECS,
+                        ),
+                );
+            }
+            state.xfer_send.insert(xfer_id, send);
+            let sealed = ember::channel::encode_xfer_offer_sealed(&key, &offer);
+            let sent = send_xfer_frame(socket, state, db, channel_id, peer, &sealed).await;
             if !sent {
                 state.xfer_send.remove(&xfer_id);
                 let _ = tx.send(Err(coded(
@@ -3237,8 +3295,8 @@ async fn handle_command_inner(
                 "offered",
             );
             let _ = tx.send(Ok(()));
-            // After the offer, so a recipient on an older build has the
-            // offer it understands before a frame it will drop.
+            // After the offer, so the recipient has the offer before the port
+            // it belongs to.
             offer_xfer_stream(socket, state, db, channel_id, peer, xfer_id, key, path, size, root)
                 .await;
         }
@@ -3364,6 +3422,10 @@ async fn handle_command_inner(
                 // task and this handler holds `&mut`), so the capacity and ban
                 // checks above still hold on the far side.
                 let allowed_roots = vec![download_folder.to_string_lossy().into_owned()];
+                crate::storage::part_folders::note_part_owner(&format!(
+                    "ember-xfer-{}",
+                    hex::encode(xfer_id)
+                ));
                 let part_name = format!("ember-xfer-{}.part", hex::encode(xfer_id));
                 let prepared = tokio::task::spawn_blocking({
                     let root = download_folder.clone();
@@ -3451,6 +3513,9 @@ async fn handle_command_inner(
                 return;
             }
             state.xfer_pending.remove(&xfer_id);
+            if !accept {
+                super::channel_xfer::remember_declined_xfer(xfer_id, offer.channel_id, offer.peer, plain);
+            }
             emit_xfer_update(
                 app_handle,
                 &xfer_id,
@@ -3545,6 +3610,46 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(()));
         }
 
+        NetworkCommand::SendChannelTransferPlainOffer { xfer_id, tx } => {
+            let me = state.local_ed25519_pubkey;
+            let Some(send) = state.xfer_send.get_mut(&xfer_id) else {
+                let _ = tx.send(Err(coded(
+                    "channels_xfer_not_found",
+                    "That transfer is no longer running",
+                )));
+                return;
+            };
+            let (channel_id, peer) = (send.channel_id, send.peer);
+            // Nothing held means the recipient read the sealed offer in the
+            // meantime, or the plain one already went: either way it has one.
+            let Some(frame) = send.take_consented_plain_offer() else {
+                let _ = tx.send(Ok(()));
+                return;
+            };
+            if ember::channel::xfer_frame_peek(&frame) != Some((me, peer, xfer_id)) {
+                let _ = tx.send(Err(coded(
+                    "channels_xfer_not_found",
+                    "That transfer is no longer running",
+                )));
+                return;
+            }
+            if !send_xfer_frame_within_room(socket, state, db, channel_id, peer, &frame).await {
+                if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
+                    send.ask_again(frame);
+                }
+                let _ = tx.send(Err(coded(
+                    "channels_xfer_unreachable",
+                    "Could not reach that member right now",
+                )));
+                return;
+            }
+            if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
+                send.plain_offer_sent(std::time::Instant::now());
+                emit_xfer_send_update(app_handle, &xfer_id, send);
+            }
+            let _ = tx.send(Ok(()));
+        }
+
         NetworkCommand::DropChannelTransfers { channel_id, member } => {
             // `delete_owned_channel` tombstones the row and then sends this, so
             // it is the point at which the network task learns a room it may be
@@ -3580,6 +3685,7 @@ async fn handle_command_inner(
                     transferred: 0,
                     status: "awaiting".into(),
                     risky: crate::security::is_dangerous_extension(&offer.name),
+                    awaiting_consent: false,
                 });
             }
             for (xfer_id, recv) in &state.xfer_recv {
@@ -3593,6 +3699,7 @@ async fn handle_command_inner(
                     transferred: recv.bytes_received(),
                     status: "active".into(),
                     risky: crate::security::is_dangerous_extension(&recv.name),
+                    awaiting_consent: false,
                 });
             }
             for (xfer_id, send) in &state.xfer_send {
@@ -3609,6 +3716,7 @@ async fn handle_command_inner(
                         .min(send.size),
                     status: if send.accepted { "active" } else { "offered" }.into(),
                     risky: crate::security::is_dangerous_extension(&send.name),
+                    awaiting_consent: send.awaiting_consent(),
                 });
             }
             let _ = tx.send(out);
@@ -3665,15 +3773,27 @@ async fn handle_command_inner(
             let _ = tx.send(true);
         }
         NetworkCommand::GetUploadQueueSnapshot { tx } => {
-            let snap = upload_queue_snapshot(
-                upload_queue,
-                credit_manager,
-                local_index,
-                friend_hashes,
-                geoip,
-            )
-            .await;
-            let _ = tx.send(snap);
+            // Off the network task, as for the Known Clients snapshot below:
+            // it scores up to `HARD_UPLOAD_QUEUE_SIZE` rows and the Transfers
+            // page polls it.
+            let upload_queue = upload_queue.clone();
+            let credit_manager = credit_manager.clone();
+            let local_index = local_index.clone();
+            let transfer_manager = transfer_manager.clone();
+            let friend_hashes = friend_hashes.clone();
+            let geoip = geoip.clone();
+            tokio::spawn(async move {
+                let snap = upload_queue_snapshot(
+                    &upload_queue,
+                    &credit_manager,
+                    &local_index,
+                    &transfer_manager,
+                    &friend_hashes,
+                    &geoip,
+                )
+                .await;
+                let _ = tx.send(snap);
+            });
         }
 
         NetworkCommand::GetKnownClientsSnapshot { tx } => {
@@ -3859,7 +3979,7 @@ async fn handle_command_inner(
                 file_size,
             )
             .await;
-            let now_ts = chrono::Utc::now().timestamp();
+            let asked_at = std::time::Instant::now();
             // Stamp both sweeps so the ask the user just made counts as this
             // round's ask: without it the periodic sweep sees a file it has not
             // asked about recently and immediately asks again, which on a
@@ -3867,14 +3987,14 @@ async fn handle_command_inner(
             // download's turn.
             state
                 .active_kad_search_state
-                .insert(transfer_id.clone(), (now_ts, u32::from(outcome.kad)));
+                .insert(transfer_id.clone(), (asked_at, u32::from(outcome.kad)));
             state
                 .ember_source_search_state
-                .insert(transfer_id.clone(), (now_ts, u32::from(outcome.ember)));
+                .insert(transfer_id.clone(), (asked_at, u32::from(outcome.ember)));
             if outcome.kad {
                 if let Some(pd) = state.pending_downloads.get_mut(&transfer_id) {
                     pd.search_count = pd.search_count.max(1);
-                    pd.last_search_at = now_ts;
+                    pd.last_search_at = Some(std::time::Instant::now());
                 }
             }
             info!(
@@ -4715,7 +4835,7 @@ async fn handle_command_inner(
                                 expected_aich: t.expected_aich.clone(),
                                 control,
                                 search_count: 0,
-                                last_search_at: 0,
+                                last_search_at: None,
                                 priority: priority_str_to_u32(&t.priority),
                             },
                         );
@@ -5182,6 +5302,29 @@ async fn handle_command_inner(
             let _ = tx.send(connected_server_info(state));
         }
 
+        NetworkCommand::GetEmberTransferActivity { tx } => {
+            // A chat attachment arriving counts too: its bytes bypass the
+            // bandwidth limiter, and a restart fails it and deletes its part.
+            let _ = tx.send(
+                state.xfer_send.len()
+                    + state.xfer_recv.len()
+                    + state.xfer_streams.len()
+                    + state.xfer_finish_in_flight
+                    + super::chat_attach::running_fetches(state),
+            );
+        }
+
+        NetworkCommand::GetEd2kServerIntent { tx } => {
+            let wanted = state.server_connected
+                || state.pending_server_connect.is_some()
+                || state.server_auto_reconnect;
+            let _ = tx.send(
+                wanted
+                    .then(|| state.preferred_ed2k_server.clone())
+                    .flatten(),
+            );
+        }
+
         NetworkCommand::SetUploadPriorities {
             file_hashes,
             priority,
@@ -5207,13 +5350,13 @@ async fn handle_command_inner(
                 };
                 let mut hash = [0u8; 16];
                 hash.copy_from_slice(&hash_bytes);
-                if known_files.find_by_hash(&hash).is_none() {
-                    let _ = tx.send(Err(format!(
-                        "No known.met record for file hash {file_hash_hex}"
-                    )));
-                    return;
+                // A file a running scan has just hashed gets its record only at
+                // that scan's reconcile, which seeds the priority from the
+                // index row the command already changed. Refusing it failed
+                // the whole batch for every file hashed since the scan began.
+                if known_files.find_by_hash(&hash).is_some() {
+                    parsed.push(hash);
                 }
-                parsed.push(hash);
             }
             if !parsed.is_empty() {
                 let before = known_files.clone();
@@ -5255,11 +5398,10 @@ async fn handle_command_inner(
                     Ok(bytes) if bytes.len() == 16 => {
                         let mut hash = [0u8; 16];
                         hash.copy_from_slice(&bytes);
-                        if known_files.find_by_hash(&hash).is_none() {
-                            error =
-                                Some(format!("No known.met record for file hash {file_hash_hex}"));
-                            break;
-                        }
+                        // A file a running scan has just hashed gets its record
+                        // only at that scan's reconcile, which takes its flag
+                        // from the index row; until then the share intent
+                        // below is all that holds the choice.
                         parsed.push((hash, shared));
                     }
                     Ok(bytes) => {
@@ -5280,13 +5422,17 @@ async fn handle_command_inner(
                 return;
             }
             let before = known_files.clone();
+            let mut recorded = false;
             for (hash, shared) in &parsed {
                 if let Some(record) = known_files.find_by_hash_mut(hash) {
                     record.is_shared = *shared;
+                    recorded = true;
                 }
             }
             if !parsed.is_empty() {
-                known_files.mark_dirty();
+                if recorded {
+                    known_files.mark_dirty();
+                }
                 // Ordered by restrictiveness rather than by file, because the
                 // two stores are only consistent if a crash between them leaves
                 // the pair no *less* restrictive than either of them says.
@@ -5326,16 +5472,20 @@ async fn handle_command_inner(
                 // See SetUploadPriorities: persist before acknowledging so
                 // share/unshare cannot appear successful and then revert on
                 // the next application start.
-                let ownership = state.known_met_save_lock.clone().lock_owned().await;
-                let known_path = state.data_dir.join("known.met");
-                let mut snapshot = known_files.clone();
-                let save_result = tokio::task::spawn_blocking(move || {
-                    let _ownership = ownership;
-                    snapshot.save(&known_path)
-                })
-                .await
-                .map_err(|e| format!("known.met share-state save task failed: {e}"))
-                .and_then(|result| result.map_err(|e| e.to_string()));
+                let save_result = if recorded {
+                    let ownership = state.known_met_save_lock.clone().lock_owned().await;
+                    let known_path = state.data_dir.join("known.met");
+                    let mut snapshot = known_files.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ownership = ownership;
+                        snapshot.save(&known_path)
+                    })
+                    .await
+                    .map_err(|e| format!("known.met share-state save task failed: {e}"))
+                    .and_then(|result| result.map_err(|e| e.to_string()))
+                } else {
+                    Ok(())
+                };
                 if let Err(e) = save_result {
                     // Withdraw only the allows that made a previously unshared
                     // file shared. An allow for a file the catalog already had
@@ -5515,6 +5665,16 @@ async fn handle_command_inner(
             let _ = tx.send(result);
         }
 
+        NetworkCommand::ForgetKnownPaths { paths } => {
+            let forgotten = known_files.forget_paths(&paths);
+            debug!("known.met forgot {forgotten} of {} gone paths", paths.len());
+        }
+
+        NetworkCommand::ForgetKnownPathsUnder { root, keep_roots } => {
+            let forgotten = known_files.forget_paths_under(&root, &keep_roots);
+            debug!("known.met forgot {forgotten} paths under a removed folder");
+        }
+
         NetworkCommand::SetFilesFriendsOnly { updates, tx } => {
             let mut parsed = Vec::with_capacity(updates.len());
             let mut error = None;
@@ -5523,11 +5683,10 @@ async fn handle_command_inner(
                     Ok(bytes) if bytes.len() == 16 => {
                         let mut hash = [0u8; 16];
                         hash.copy_from_slice(&bytes);
-                        if known_files.find_by_hash(&hash).is_none() {
-                            error =
-                                Some(format!("No known.met record for file hash {file_hash_hex}"));
-                            break;
-                        }
+                        // No record yet: a file a running scan has just hashed.
+                        // Its reconcile ORs in the index row's scope, which the
+                        // command already set, and both upload and publishing
+                        // read that row meanwhile; see `SetUploadPriorities`.
                         parsed.push((hash, friends_only));
                     }
                     Ok(bytes) => {
@@ -5548,12 +5707,16 @@ async fn handle_command_inner(
                 return;
             }
             let before = known_files.clone();
+            let mut unrecorded = Vec::new();
             for (hash, friends_only) in &parsed {
                 if let Some(record) = known_files.find_by_hash_mut(hash) {
                     record.friends_only = *friends_only;
+                } else {
+                    unrecorded.push(hex::encode(hash));
                 }
             }
-            if !parsed.is_empty() {
+            // Nothing to save when no hash had a record.
+            if parsed.len() > unrecorded.len() {
                 known_files.mark_dirty();
                 // Persist before acknowledging, exactly as SetFilesShared
                 // does. Restricting a file to friends is a privacy decision:
@@ -5564,15 +5727,24 @@ async fn handle_command_inner(
                 let mut snapshot = known_files.clone();
                 let save_result = tokio::task::spawn_blocking(move || {
                     let _ownership = ownership;
-                    snapshot.save(&known_path)
+                    snapshot.save_reporting(&known_path)
                 })
                 .await
                 .map_err(|e| format!("known.met share-scope save task failed: {e}"))
                 .and_then(|result| result.map_err(|e| e.to_string()));
-                if let Err(e) = save_result {
-                    *known_files = before;
-                    let _ = tx.send(Err(format!("Failed to persist file share scope: {e}")));
-                    return;
+                match save_result {
+                    Err(e) => {
+                        *known_files = before;
+                        let _ = tx.send(Err(format!("Failed to persist file share scope: {e}")));
+                        return;
+                    }
+                    // Declined (known.met not loaded yet, or unreadable past a
+                    // prefix): the change holds in memory, and the caller's
+                    // pending intents are all that carry it to the next start.
+                    Ok(false) => {
+                        unrecorded = parsed.iter().map(|(hash, _)| hex::encode(hash)).collect();
+                    }
+                    Ok(true) => {}
                 }
             }
             let restricted: HashSet<[u8; 16]> = parsed
@@ -5588,7 +5760,7 @@ async fn handle_command_inner(
                 }
             }
             sync_shared_friends_only_hashes(shared_friends_only_hashes, known_files);
-            let _ = tx.send(Ok(parsed.len()));
+            let _ = tx.send(Ok(unrecorded));
         }
 
         NetworkCommand::UnpublishEmberFiles { file_hashes, tx } => {
@@ -5610,6 +5782,22 @@ async fn handle_command_inner(
                 );
             }
             let _ = tx.send(retracted.len());
+        }
+
+        NetworkCommand::StartupLibraryIndexed => {
+            // The first moment the index says which files we serve, so when last
+            // session's waiters can rejoin the upload queue. Not any reconcile:
+            // a settings save can send one while discovery is still running.
+            if let Some(pending) = state.restored_upload_queue.as_mut() {
+                pending.make_due();
+            }
+            ed2k::upload_queue_store::merge_when_ready(
+                &mut state.restored_upload_queue,
+                upload_queue,
+                local_index,
+                transfer_manager,
+            )
+            .await;
         }
 
         NetworkCommand::SharedFilesChangedAck { tx: reconcile_ack } => {
@@ -5642,6 +5830,8 @@ async fn handle_command_inner(
                     // rationale — short version, this breaks the "permanent
                     // rehash loop" that surfaces whenever an external process
                     // touches a shared file's metadata.
+                    // A row restricted by a pending intent alone (a save
+                    // known.met declined) is written through the same way.
                     if known_files.record_needs_refresh(
                         &fh,
                         &f.path,
@@ -5650,7 +5840,9 @@ async fn handle_command_inner(
                         &f.name,
                         &f.aich_hash,
                         &f.ember_file_hash,
-                    ) {
+                    ) || (f.friends_only
+                        && known_files.find_by_hash(&fh).is_some_and(|r| !r.friends_only))
+                    {
                         drifted.push((fh, f.clone()));
                     }
                 }
@@ -5886,8 +6078,8 @@ async fn handle_command_inner(
                 // Re-add active partial downloads to KAD publish, and collect
                 // the partial OP_OFFERFILES candidates in the same pass.
                 let mut partial_count = 0u32;
-                let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
-                let mut partial_offers: Vec<(String, PathBuf, ed2k::server::OfferFile)> =
+                let download_folders = settings.download_folders();
+                let mut partial_offers: Vec<(String, Vec<PathBuf>, ed2k::server::OfferFile)> =
                     Vec::new();
                 {
                     let mgr = transfer_manager.read().await;
@@ -5934,7 +6126,7 @@ async fn handle_command_inner(
                         if collect_offers && seen_offer_hashes.insert(transfer.file_hash.clone()) {
                             partial_offers.push((
                                 transfer.id.clone(),
-                                temp_dir.join(format!("{}.part", transfer.id)),
+                                download_folders.part_paths(&transfer.id),
                                 ed2k::server::OfferFile {
                                     hash: raw,
                                     name: transfer.file_name.clone(),
@@ -5973,7 +6165,9 @@ async fn handle_command_inner(
                 if collect_offers {
                     let probe: Vec<(String, PathBuf)> = partial_offers
                         .iter()
-                        .map(|(id, path, _)| (id.clone(), path.clone()))
+                        .flat_map(|(id, paths, _)| {
+                            paths.iter().map(move |path| (id.clone(), path.clone()))
+                        })
                         .collect();
                     {
                         let presence = part_presence().lock();
@@ -6026,12 +6220,8 @@ async fn handle_command_inner(
             file_hash,
             rating,
             comment,
+            tx,
         } => {
-            state.comment_manager.write().await.set_our_comment(
-                &file_hash,
-                rating,
-                comment.clone(),
-            );
             // `save_file_comment` is a synchronous `rusqlite` write behind
             // `Database`'s `Mutex<Connection>`, so calling it on this thread
             // held the runtime worker running this loop for however long
@@ -6047,15 +6237,34 @@ async fn handle_command_inner(
             // the right answer was gone.
             let comment_db = db.clone();
             let comment_hash = file_hash.clone();
+            let saved_comment = comment.clone();
             let saved = tokio::task::spawn_blocking(move || {
-                if let Err(e) = comment_db.save_file_comment(&comment_hash, rating, &comment) {
-                    warn!("Failed to save comment for {comment_hash}: {e}");
-                }
+                comment_db.save_file_comment(&comment_hash, rating, &saved_comment)
             })
             .await;
-            if let Err(e) = saved {
-                warn!("Comment persistence task for {file_hash} failed: {e}");
-            }
+            // Reported rather than only logged: the Library shows "Saved" on
+            // success, and a comment that never reached the database is gone
+            // after a restart. Taken into memory only once saved, so what the
+            // app shows and shares is what a restart will have.
+            let result = match saved {
+                Ok(Ok(())) => {
+                    state
+                        .comment_manager
+                        .write()
+                        .await
+                        .set_our_comment(&file_hash, rating, comment);
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    warn!("Failed to save comment for {file_hash}: {e}");
+                    Err(format!("Failed to save comment: {e}"))
+                }
+                Err(e) => {
+                    warn!("Comment persistence task for {file_hash} failed: {e}");
+                    Err(format!("Comment persistence task failed: {e}"))
+                }
+            };
+            let _ = tx.send(result);
         }
 
         NetworkCommand::GetFileComments { file_hash, tx } => {
@@ -6096,7 +6305,7 @@ async fn handle_command_inner(
             tx,
             single_flight,
         } => {
-            let download_folder = settings.download_folder.clone();
+            let download_folders = settings.download_folders();
             let preview_player = settings.preview_player.clone();
             let tm = transfer_manager.clone();
             tokio::spawn(async move {
@@ -6115,8 +6324,7 @@ async fn handle_command_inner(
                     let tid = transfer.id.clone();
                     drop(mgr_guard);
 
-                    let temp_dir = PathBuf::from(&download_folder).join("Temp");
-                    let part_path = temp_dir.join(format!("{tid}.part"));
+                    let part_path = download_folders.part_path_for(&tid);
 
                     if !part_path.exists() {
                         return Err(
@@ -6126,7 +6334,7 @@ async fn handle_command_inner(
 
                     let part_path = crate::security::filesystem::verify_existing_path(
                         &part_path,
-                        std::slice::from_ref(&download_folder),
+                        &download_folders.roots(),
                     )
                     .map_err(|e| format!("Invalid or changed part-file path: {e}"))?;
                     let file_name_for_preview = file_name.clone();
@@ -7389,6 +7597,40 @@ mod reconcile_helper_tests {
     use super::*;
 
     #[test]
+    fn cancel_deletes_the_part_met_in_the_earlier_folder_its_part_is_in() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-cancel-met-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let (old, new, data) = (base.join("old"), base.join("new"), base.join("data"));
+        for dir in [old.join("Temp"), new.join("Temp"), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let settings = AppSettings {
+            download_folder: new.to_string_lossy().into_owned(),
+            previous_download_folders: vec![old.to_string_lossy().into_owned()],
+            ..AppSettings::default()
+        };
+        crate::security::filesystem::initialize_approved_roots(&data, &settings.download_roots())
+            .unwrap();
+        let part = old
+            .join("Temp")
+            .join(format!("{}.part", uuid::Uuid::new_v4()));
+        std::fs::write(&part, vec![0u8; 16]).unwrap();
+        let met = part.with_extension("part.met");
+        std::fs::write(&met, b"met").unwrap();
+        let tracker = ed2k::part_tracker::PartTracker::new(16, &part);
+
+        tracker.delete_met(std::slice::from_ref(&settings.download_folder));
+        assert!(met.exists(), "the current folder alone does not reach it");
+        tracker.delete_met(&met_delete_roots(&settings));
+        assert!(!met.exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn drain_removes_every_indexed_handoff_and_returns_only_wanted() {
         let (kept, unused, foreign) = ([1u8; 16], [2u8; 16], [3u8; 16]);
         let mut fresh = HashMap::from([
@@ -7430,5 +7672,26 @@ mod reconcile_helper_tests {
         }
         assert!(!part_presence().lock().present.contains(&absent_id));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_part_found_for_the_first_time_asks_for_another_drain() {
+        let ids = |list: &[&str]| list.iter().map(|id| id.to_string()).collect::<HashSet<_>>();
+        let mut presence = PartPresence::default();
+        presence.land(1, ids(&["a"]));
+        assert!(std::mem::take(&mut presence.grew));
+
+        presence.land(2, ids(&["a"]));
+        assert!(!presence.grew, "the same answer again offers nothing new");
+        presence.land(3, ids(&[]));
+        assert!(!presence.grew, "nor does a part going away");
+
+        presence.land(2, ids(&["b"]));
+        assert!(!presence.grew, "an older probe landing late is ignored");
+        assert!(presence.present.is_empty());
+
+        presence.land(4, ids(&["b"]));
+        assert!(presence.grew);
+        assert_eq!(presence.present, ids(&["b"]));
     }
 }

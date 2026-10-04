@@ -72,7 +72,9 @@ pub(super) async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkSt
         // whole shortlist without dialling anyone. "Known bad" is the right
         // question for whether to dial; the routing table draws the same
         // distinction for admission versus eviction.
-        if state.ember_dht.routing().definitely_blocked(&contact.addr) {
+        if state.ember_dht.routing().definitely_blocked(&contact.addr)
+            || ember_addr_banned(state, contact.addr)
+        {
             debug!(
                 "Ember search {search_id}: refusing to query {} — the IP policy blocks it",
                 contact.addr
@@ -480,7 +482,19 @@ pub(super) fn parse_ember_source_records(
     // them and take the corroborated plurality below (same defence the keyword
     // path applies) instead of believing whichever record parsed last.
     let mut publisher_digests = EmberDigestVotes::new();
-    for held_record in held {
+    // Every HighID source here is an address we are about to dial, and a
+    // responder is not an honest storer that checked it: it can mint keys and
+    // name any host. Records two independent responders returned, or our own
+    // store bound to the storer's address, go first, and the rest are capped
+    // per responder, so one node answering a popular hash cannot aim every
+    // downloader of it at a victim.
+    let vouched = |record: &ember::dht::search::SearchResultRecord| {
+        record.confirmed_by.is_some() || record.from_local_store
+    };
+    let mut order: Vec<&ember::dht::search::SearchResultRecord> = held.iter().collect();
+    order.sort_by_key(|record| !vouched(record));
+    let mut unconfirmed_from: HashMap<EmberResponder, usize> = HashMap::new();
+    for held_record in order {
         let Some(rec) = ember::dht::publish::SignedRecord::from_value_blob(&held_record.data)
         else {
             continue;
@@ -514,6 +528,17 @@ pub(super) fn parse_ember_source_records(
         if ours || sc.tcp_port == 0 {
             continue;
         }
+        if out.len() >= MAX_EMBER_SOURCES_PER_LOOKUP {
+            continue;
+        }
+        if !vouched(held_record) && sc.flags & ember::SOURCE_FLAG_FIREWALLED == 0 {
+            let responder = EmberResponder::of(held_record.from_node, held_record.from_subnet);
+            let taken = unconfirmed_from.entry(responder).or_insert(0);
+            if *taken >= MAX_UNCONFIRMED_SOURCES_PER_RESPONDER {
+                continue;
+            }
+            *taken += 1;
+        }
         if sc.udp_port != 0 && sc.noise_pub != [0u8; 32] {
             // Firewalled contacts skip the STORE IP-bind, so their claimed
             // address is unauthenticated. Caching that (ip, udp) → noise_pub
@@ -538,6 +563,7 @@ pub(super) fn parse_ember_source_records(
             callback_token: sc.callback_token,
             publisher_id: ember::crypto::node_id_from_ed25519_bytes(&rec.publisher_key)
                 .unwrap_or([0u8; 16]),
+            quic_port: sc.quic_port,
         });
     }
     // Only ever on corroboration, and only if this plurality rests on more
@@ -568,6 +594,37 @@ pub(super) struct EmberKeywordBuilt {
     /// bound. The count travels with the digest so a later or more complete
     /// walk can supersede a pin made on thinner evidence.
     pub(super) corroborated: Vec<([u8; 16], [u8; 32], usize)>,
+    /// `(file hash, publisher key)` of every publisher a row's `availability`
+    /// counts — verified, under the walked key, and past the query filter.
+    pub(super) counted_publishers: Vec<([u8; 16], [u8; 32])>,
+}
+
+/// `(file hash, publisher key)` of a keyword-record value blob, read without
+/// the signature check: [`build_ember_keyword_built`] makes that one anyway.
+pub(super) fn ember_record_publisher(blob: &[u8]) -> Option<([u8; 16], [u8; 32])> {
+    let split = blob.len().checked_sub(64)?;
+    let (data, signature) = blob.split_at(split);
+    let rec =
+        ember::dht::publish::SignedRecord::parse_unverified(data, signature.try_into().ok()?)?;
+    Some((rec.file_hash, rec.publisher_key))
+}
+
+/// The text an Ember keyword search hashes its walk key from: the terms every
+/// match contains when there are any ([`QueryExpr::required_terms`]), else
+/// every positive keyword. The lookup and [`build_ember_keyword_built`] both
+/// take the key from here, because a record under any other key is dropped.
+///
+/// [`QueryExpr::required_terms`]: crate::search::query::QueryExpr::required_terms
+pub(super) fn ember_walk_query(
+    keywords: &[String],
+    query_expr: Option<&crate::search::query::QueryExpr>,
+) -> String {
+    let required = query_expr.map(|e| e.required_terms()).unwrap_or_default();
+    if required.is_empty() {
+        keywords.join(" ")
+    } else {
+        required.join(" ")
+    }
 }
 
 /// Build search rows from Ember DHT keyword `FIND_VALUE` blobs (slice 10).
@@ -622,8 +679,10 @@ pub(super) fn build_ember_keyword_built(
     // length (a stable descending sort keeps the first, `max_by_key` returns
     // the last), which silently dropped every hit for queries like
     // "ubuntu server".
-    let primary_hash = ember::dht::search::compute_keyword_hashes(&keywords.join(" "))
-        .first()
+    let primary_hash = ember::dht::search::compute_keyword_hashes(&ember_walk_query(
+        keywords, query_expr,
+    ))
+    .first()
         .map(|(h, _)| *h);
     // file_hash -> (result, publisher_key -> ember digest votes)
     let mut dedup: HashMap<[u8; 16], (SearchResult, EmberDigestVotes)> = HashMap::new();
@@ -651,7 +710,7 @@ pub(super) fn build_ember_keyword_built(
         // matched the primary keyword, so the rest of the query is applied
         // against the file name here.
         if let Some(expr) = expr {
-            if !expr.matches(&file_name.to_lowercase()) {
+            if !expr.matches_name(&file_name) {
                 continue;
             }
         } else if kw_lower.len() > 1 {
@@ -745,6 +804,7 @@ pub(super) fn build_ember_keyword_built(
     // on click (user-chosen pin, even a plurality of one). Automatic fills
     // of ember_content_hashes still require corroboration.
     let mut corroborated = Vec::new();
+    let mut counted_publishers = Vec::new();
     for (hash, (result, votes)) in dedup.iter_mut() {
         let plurality = majority_ember_digest(votes);
         // A click pins whatever the row carries, so a contested row carries
@@ -775,10 +835,14 @@ pub(super) fn build_ember_keyword_built(
         } else {
             plurality
         };
-        let sources = votes
-            .values()
-            .filter(|vote| vote.digest == [0u8; 32] || Some(vote.digest) == counted)
-            .count() as u32;
+        let before = counted_publishers.len();
+        counted_publishers.extend(
+            votes
+                .iter()
+                .filter(|(_, vote)| vote.digest == [0u8; 32] || Some(vote.digest) == counted)
+                .map(|(publisher, _)| (*hash, *publisher)),
+        );
+        let sources = (counted_publishers.len() - before) as u32;
         result.availability = sources;
         result.file.complete_sources = sources;
         if let Some((digest, responders)) = corroborated_ember_digest_with_count(votes) {
@@ -788,16 +852,44 @@ pub(super) fn build_ember_keyword_built(
     EmberKeywordBuilt {
         results: dedup.into_values().map(|(sr, _)| sr).collect(),
         corroborated,
+        counted_publishers,
     }
 }
+
+/// Sources one source lookup hands to the download. KAD takes 20
+/// (`SEARCHFINDSOURCE_TOTAL`); a little more, since Ember records are signed
+/// and a real swarm under one key can be larger than a KAD answer.
+const MAX_EMBER_SOURCES_PER_LOOKUP: usize = 50;
+/// HighID sources one responder may contribute that no other responder also
+/// returned. Enough for the honest storer that happens to hold a key alone.
+pub(super) const MAX_UNCONFIRMED_SOURCES_PER_RESPONDER: usize = 10;
 
 /// One publisher's digest claim and the responders that carried it.
 #[derive(Debug, Clone, Default)]
 pub(super) struct EmberDigestVote {
     /// The digest this publisher named; all zero when it named none.
     pub(super) digest: [u8; 32],
-    /// Every node that returned one of this publisher's records.
-    pub(super) responders: Vec<ember::dht::EmberNodeId>,
+    /// Every responder that returned one of this publisher's records.
+    pub(super) responders: Vec<EmberResponder>,
+}
+
+/// One independent party behind a record, for counting how many stand behind a
+/// claim. A /24 where the search knows it: node ids are keypairs, so counting
+/// them let one host answering under three keys corroborate a digest alone. A
+/// node falls back to its own id when its address is unknown, which is also
+/// how our own store counts, once. Honest storers sharing one /24 (a LAN, one
+/// CGNAT pool) count once too, so a digest they alone hold does not
+/// corroborate; that fails safe, since the eD2K and AICH checks still run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum EmberResponder {
+    Subnet(u64),
+    Node(ember::dht::EmberNodeId),
+}
+
+impl EmberResponder {
+    fn of(node: ember::dht::EmberNodeId, subnet: Option<u64>) -> Self {
+        subnet.map_or(Self::Node(node), Self::Subnet)
+    }
 }
 
 /// Digest votes keyed by publisher key.
@@ -815,9 +907,13 @@ pub(super) fn note_ember_digest_vote(
     if digest != [0u8; 32] {
         vote.digest = digest;
     }
-    for node in std::iter::once(held.from_node).chain(held.confirmed_by) {
-        if !vote.responders.contains(&node) {
-            vote.responders.push(node);
+    let first = EmberResponder::of(held.from_node, held.from_subnet);
+    let second = held
+        .confirmed_by
+        .map(|node| EmberResponder::of(node, held.confirmed_subnet));
+    for responder in std::iter::once(first).chain(second) {
+        if !vote.responders.contains(&responder) {
+            vote.responders.push(responder);
         }
     }
 }
@@ -847,8 +943,7 @@ pub(super) fn majority_ember_digest(publisher_digests: &EmberDigestVotes) -> Opt
 fn ember_digest_tallies(
     publisher_digests: &EmberDigestVotes,
 ) -> impl Iterator<Item = ([u8; 32], usize, usize)> {
-    let mut tallies: HashMap<[u8; 32], (usize, HashSet<ember::dht::EmberNodeId>)> =
-        HashMap::new();
+    let mut tallies: HashMap<[u8; 32], (usize, HashSet<EmberResponder>)> = HashMap::new();
     for vote in publisher_digests.values() {
         if vote.digest != [0u8; 32] {
             let (publishers, responders) = tallies.entry(vote.digest).or_default();
@@ -1059,19 +1154,45 @@ mod ember_digest_corroboration_tests {
                     [*publisher; 32],
                     EmberDigestVote {
                         digest: [*digest; 32],
-                        responders: vec![ember::dht::EmberNodeId([*publisher; 16])],
+                        responders: vec![EmberResponder::Subnet(u64::from(*publisher))],
                     },
                 )
             })
             .collect()
     }
 
+    /// A record from `node`, confirmed by another; each in a /24 of its own.
     fn held_from(node: u8, confirmed_by: Option<u8>) -> ember::dht::search::SearchResultRecord {
         ember::dht::search::SearchResultRecord {
             data: Vec::new(),
             from_node: ember::dht::EmberNodeId([node; 16]),
             confirmed_by: confirmed_by.map(|n| ember::dht::EmberNodeId([n; 16])),
+            from_subnet: Some(u64::from(node)),
+            confirmed_subnet: confirmed_by.map(u64::from),
+            from_local_store: false,
         }
+    }
+
+    /// One host answering under several keypairs is one responder: node ids
+    /// are free, a /24 is not.
+    #[test]
+    fn keypairs_in_one_subnet_do_not_corroborate() {
+        let mut votes = EmberDigestVotes::new();
+        for (publisher, node) in [(1u8, 1u8), (2, 2), (3, 3)] {
+            let held = ember::dht::search::SearchResultRecord {
+                from_subnet: Some(0xC0FFEE),
+                ..held_from(node, None)
+            };
+            note_ember_digest_vote(&mut votes, [publisher; 32], [0xEE; 32], &held);
+        }
+        assert_eq!(corroborated_ember_digest(&votes), None, "three keys, one host");
+
+        let other_host = ember::dht::search::SearchResultRecord {
+            from_subnet: Some(0xBEEF),
+            ..held_from(4, None)
+        };
+        note_ember_digest_vote(&mut votes, [4; 32], [0xEE; 32], &other_host);
+        assert_eq!(corroborated_ember_digest(&votes), Some([0xEE; 32]));
     }
 
     /// Publisher keys are free, so any number of them agreeing means nothing
@@ -1265,6 +1386,9 @@ mod ember_digest_corroboration_tests {
             data,
             from_node: ember::dht::EmberNodeId([node; 16]),
             confirmed_by: None,
+            from_subnet: None,
+            confirmed_subnet: None,
+            from_local_store: false,
         };
         let mut held = Vec::new();
         for invented in 0..10u16 {
@@ -1291,6 +1415,108 @@ mod ember_source_self_filter_tests {
     /// Before our external IP is confirmed, or after it changes, the IP check
     /// cannot recognise it; the Noise key still does, so we neither cache our
     /// own key as a peer's nor offer ourselves as a source.
+    /// One responder naming many HighID sources that nobody else returned gets
+    /// a few of them dialled, not all; sources a second responder confirmed
+    /// are taken regardless, and first.
+    #[test]
+    fn one_responder_cannot_aim_a_lookup_at_every_address_it_names() {
+        let file_hash = [0x62u8; 16];
+        let record = |i: u8, confirmed: bool| {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[i.wrapping_add(90); 32]);
+            let rec = ember::dht::publish::SignedRecord::source(
+                file_hash,
+                [0u8; 32],
+                1,
+                "big.iso",
+                ember::dht::publish::SourceContact {
+                    ip: Ipv4Addr::new(81, 7, 7, i),
+                    tcp_port: 4662,
+                    flags: 0,
+                    ..Default::default()
+                },
+                &sk,
+            );
+            let mut data = rec.data.clone();
+            data.extend_from_slice(&rec.signature);
+            ember::dht::search::SearchResultRecord {
+                data,
+                from_node: ember::dht::EmberNodeId([1; 16]),
+                confirmed_by: confirmed.then_some(ember::dht::EmberNodeId([2; 16])),
+                from_subnet: Some(1),
+                confirmed_subnet: confirmed.then_some(2),
+                from_local_store: false,
+            }
+        };
+        let mut held: Vec<_> = (1..=40u8).map(|i| record(i, false)).collect();
+        held.extend((41..=43u8).map(|i| record(i, true)));
+
+        let sources = parse_ember_source_records(
+            &held,
+            file_hash,
+            None,
+            &[0u8; 32],
+            &mut crate::types::EmberDiagnostics::default(),
+            &mut HashMap::new(),
+            &HashSet::new(),
+            &mut HashMap::new(),
+        );
+        assert_eq!(sources.len(), 3 + MAX_UNCONFIRMED_SOURCES_PER_RESPONDER);
+        for confirmed in 41..=43u8 {
+            assert!(sources.iter().any(|s| s.ip == Ipv4Addr::new(81, 7, 7, confirmed)));
+        }
+    }
+
+    /// Our own store took each HighID source only from the address it names,
+    /// so on a network of two or three nodes a file's whole swarm is dialled
+    /// rather than the ten one remote responder would be allowed.
+    #[test]
+    fn our_own_stores_sources_are_not_capped_as_one_responder() {
+        let file_hash = [0x63u8; 16];
+        let record = |i: u8, local: bool| {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[i.wrapping_add(90); 32]);
+            let rec = ember::dht::publish::SignedRecord::source(
+                file_hash,
+                [0u8; 32],
+                1,
+                "big.iso",
+                ember::dht::publish::SourceContact {
+                    ip: Ipv4Addr::new(81, 7, 8, i),
+                    tcp_port: 4662,
+                    flags: 0,
+                    ..Default::default()
+                },
+                &sk,
+            );
+            let mut data = rec.data.clone();
+            data.extend_from_slice(&rec.signature);
+            ember::dht::search::SearchResultRecord {
+                data,
+                from_node: ember::dht::EmberNodeId([u8::from(!local); 16]),
+                confirmed_by: None,
+                from_subnet: (!local).then_some(1),
+                confirmed_subnet: None,
+                from_local_store: local,
+            }
+        };
+        let mut held: Vec<_> = (1..=20u8).map(|i| record(i, false)).collect();
+        held.extend((21..=45u8).map(|i| record(i, true)));
+
+        let sources = parse_ember_source_records(
+            &held,
+            file_hash,
+            None,
+            &[0u8; 32],
+            &mut crate::types::EmberDiagnostics::default(),
+            &mut HashMap::new(),
+            &HashSet::new(),
+            &mut HashMap::new(),
+        );
+        assert_eq!(sources.len(), 25 + MAX_UNCONFIRMED_SOURCES_PER_RESPONDER);
+        for local in 21..=45u8 {
+            assert!(sources.iter().any(|s| s.ip == Ipv4Addr::new(81, 7, 8, local)));
+        }
+    }
+
     #[test]
     fn our_own_source_record_is_skipped_by_its_noise_key() {
         let ours = [0x5Cu8; 32];
@@ -1317,6 +1543,9 @@ mod ember_source_self_filter_tests {
             data: blob,
             from_node: ember::dht::EmberNodeId([1; 16]),
             confirmed_by: None,
+            from_subnet: None,
+            confirmed_subnet: None,
+            from_local_store: false,
         }];
 
         let parse = |self_ip: Option<Ipv4Addr>, local: [u8; 32]| {
@@ -1364,6 +1593,9 @@ mod ember_keyword_sanitize_tests {
             data: blob,
             from_node: ember::dht::EmberNodeId([1; 16]),
             confirmed_by: None,
+            from_subnet: None,
+            confirmed_subnet: None,
+            from_local_store: false,
         }
     }
 

@@ -36,6 +36,43 @@ impl SharedFileStats {
     }
 }
 
+/// The counters of `hash_hex`'s index rows, by path, for [`copy_counters_to_cache`].
+fn index_counters(
+    index: &crate::search::index::LocalIndex,
+    hash_hex: &str,
+) -> HashMap<String, SharedFileStats> {
+    index
+        .files_with_hash(hash_hex)
+        .map(|f| (crate::search::index::normalize_path_key(&f.path), SharedFileStats::of(f)))
+        .collect()
+}
+
+/// Copy index counters onto the cached snapshot's matching rows, absolute.
+///
+/// The cache used to be bumped by the same delta as the index, separately. A
+/// cache refresh landing between the two counted that delta twice, and one
+/// landing just before the index bump lost it, until the next refresh.
+fn copy_counters_to_cache(
+    cached: &mut [FileInfo],
+    hash_hex: &str,
+    counters: &HashMap<String, SharedFileStats>,
+) -> Option<SharedFileStats> {
+    let mut updated = None;
+    for file in cached.iter_mut().filter(|f| f.hash.eq_ignore_ascii_case(hash_hex)) {
+        let Some(c) = counters.get(&crate::search::index::normalize_path_key(&file.path)) else {
+            continue;
+        };
+        file.requests = c.requests;
+        file.accepted = c.accepted;
+        file.bytes_transferred = c.bytes_transferred;
+        file.alltime_requests = c.alltime_requests;
+        file.alltime_accepted = c.alltime_accepted;
+        file.alltime_transferred = c.alltime_transferred;
+        updated = Some(SharedFileStats::of(file));
+    }
+    updated
+}
+
 const SHARED_FILE_STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// `Some` while a flush is scheduled; the flush task takes the batch.
@@ -68,6 +105,29 @@ fn queue_shared_file_stats(app_handle: &tauri::AppHandle, stats: SharedFileStats
             );
         }
     });
+}
+
+/// Hashes of library files already reported as missing from known.met.
+static WARNED_NO_KNOWN_RECORD: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
+
+/// Report upload counters known.met had no record to take. A file served from
+/// a download still in progress has none until it completes, which is routine
+/// and arrives with every progress update, so it stays at debug. A completed
+/// library file without one is worth a warning, once per file.
+fn note_no_known_record(index: &LocalIndex, hash_hex: &str, what: &str) {
+    let hash = hash_hex.to_ascii_lowercase();
+    if index.get_by_hash(&hash).is_none() {
+        debug!("{what} for {hash} is a download in progress, with no known.met record yet");
+        return;
+    }
+    let first = WARNED_NO_KNOWN_RECORD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .insert(hash.clone());
+    if first {
+        warn!("{what} for library file {hash} has no known.met record; keeping session stats only");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -145,37 +205,23 @@ pub(in crate::network) async fn on_upload_event(
                 file_hash.copy_from_slice(&bytes);
                 let persisted_alltime = known_files
                     .add_all_time_transferred(&file_hash, uploaded_bytes);
-                if !persisted_alltime {
-                    warn!(
-                        "Upload progress for {hash_hex} has no known.met record; keeping session stats only"
-                    );
-                }
-                {
+                let counters = {
                     let mut index = local_index.write().await;
+                    if !persisted_alltime {
+                        note_no_known_record(&index, &hash_hex, "Upload progress");
+                    }
                     index.apply_upload_completed_bytes(
                         &hash_hex,
                         uploaded_bytes,
                         persisted_alltime,
                     );
-                }
-                let updated = {
-                    let mut cached = shared_files.write().await;
-                    let mut updated = None;
-                    for file in cached.iter_mut() {
-                        if file.hash.eq_ignore_ascii_case(&hash_hex) {
-                            file.bytes_transferred = file
-                                .bytes_transferred
-                                .saturating_add(uploaded_bytes);
-                            if persisted_alltime {
-                                file.alltime_transferred = file
-                                    .alltime_transferred
-                                    .saturating_add(uploaded_bytes);
-                            }
-                            updated = Some(SharedFileStats::of(file));
-                        }
-                    }
-                    updated
+                    index_counters(&index, &hash_hex)
                 };
+                let updated = copy_counters_to_cache(
+                    &mut shared_files.write().await,
+                    &hash_hex,
+                    &counters,
+                );
                 if let Some(stats) = updated {
                     queue_shared_file_stats(app_handle, stats);
                 }
@@ -222,20 +268,19 @@ pub(in crate::network) async fn on_upload_event(
                         inc_requests,
                         inc_accepted,
                     );
-                    if !persisted_alltime {
-                        warn!(
-                            "Upload interest for {file_hash} has no known.met record"
-                        );
-                    }
-                    {
+                    let counters = {
                         let mut idx = local_index.write().await;
+                        if !persisted_alltime {
+                            note_no_known_record(&idx, file_hash, "Upload interest");
+                        }
                         idx.apply_upload_share_deltas(
                             file_hash,
                             inc_requests,
                             inc_accepted,
                             persisted_alltime,
                         );
-                    }
+                        index_counters(&idx, file_hash)
+                    };
                     // Target-update only the matching rows in the
                     // cached snapshot rather than cloning the
                     // entire file list. The old `all_files().to_vec()`
@@ -243,26 +288,11 @@ pub(in crate::network) async fn on_upload_event(
                     // of entries with strings) for every peer file
                     // request; counters on the one file that
                     // changed are all the UI needs.
-                    let updated = {
-                        let mut cached = shared_files.write().await;
-                        let mut updated = None;
-                        for f in cached.iter_mut() {
-                            if f.hash == *file_hash {
-                                f.requests = f.requests.saturating_add(inc_requests);
-                                f.accepted = f.accepted.saturating_add(inc_accepted);
-                                if persisted_alltime {
-                                    f.alltime_requests = f
-                                        .alltime_requests
-                                        .saturating_add(inc_requests);
-                                    f.alltime_accepted = f
-                                        .alltime_accepted
-                                        .saturating_add(inc_accepted);
-                                }
-                                updated = Some(SharedFileStats::of(f));
-                            }
-                        }
-                        updated
-                    };
+                    let updated = copy_counters_to_cache(
+                        &mut shared_files.write().await,
+                        file_hash,
+                        &counters,
+                    );
                     if let Some(stats) = updated {
                         queue_shared_file_stats(app_handle, stats);
                     }
@@ -485,7 +515,7 @@ pub(in crate::network) async fn on_upload_event(
     // Inject Ember Peer Exchange sources from upload-side peers
     if let UploadEventKind::EmberSources { ref entries, ref aich_roots, ref ember_peers, ref relay_attestations, from_ember_hash } = event.kind {
         let we_are_unreachable = state.firewalled || state.low_id;
-        handle_epx_sources(state, transfer_manager, source_manager, local_index, entries, aich_roots, ember_peers, relay_attestations, from_ember_hash, "upload", false, we_are_unreachable).await;
+        handle_epx_sources(state, transfer_manager, source_manager, local_index, entries, aich_roots, ember_peers, relay_attestations, from_ember_hash, "upload", false, we_are_unreachable, &HashMap::new()).await;
     }
 
     if let UploadEventKind::EmberPeerDiscovered { ip, tcp_port, udp_port } = event.kind {

@@ -427,6 +427,11 @@ fn apply_settings(
     let mut new_roots = Vec::new();
     if let Some(folder) = changes.download_folder.clone() {
         if folder != settings.download_folder {
+            settings.previous_download_folders = crate::storage::part_folders::previous_after_change(
+                &settings.download_folder,
+                &settings.previous_download_folders,
+                &folder,
+            );
             settings.download_folder = folder.clone();
             new_roots.push(folder);
         }

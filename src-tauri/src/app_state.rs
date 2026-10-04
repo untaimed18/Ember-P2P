@@ -181,6 +181,10 @@ pub struct AppState {
     /// layout consumes this latch and shows a sticky warning; Settings >
     /// Backup can retry or discard.
     pub pending_restore_failed_notice: Arc<AtomicBool>,
+    /// Set when startup discarded a staged restore unapplied because it had
+    /// waited longer than a launch will apply one. Consumed like the latch
+    /// above: the staging directory is already gone, so it is the only trace.
+    pub pending_restore_expired_notice: Arc<AtomicBool>,
     /// Mirror of `config.settings.close_to_tray_behavior` behind a synchronous
     /// `parking_lot::RwLock` so the `WindowEvent::CloseRequested` handler can
     /// read it from the main UI thread without blocking on the async tokio

@@ -519,7 +519,7 @@ async fn persist_channel_username(state: &AppState, username: &str) -> Result<()
     let _ = state
         .network_tx
         .try_send(NetworkCommand::UpdateSettings {
-            settings: new_settings,
+            settings: Box::new(new_settings),
         });
     apply_channel_username_locally(state, username);
     Ok(())
@@ -5256,7 +5256,10 @@ async fn queue_signed_record(state: &AppState, record: SignedRecord) -> Result<(
     let (tx, _rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
-        .try_send(NetworkCommand::PublishEmberRecord { record, tx })
+        .try_send(NetworkCommand::PublishEmberRecord {
+            record: Box::new(record),
+            tx,
+        })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     Ok(())
 }
@@ -5268,7 +5271,10 @@ async fn start_signed_record(
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
-        .try_send(NetworkCommand::PublishEmberRecord { record, tx })
+        .try_send(NetworkCommand::PublishEmberRecord {
+            record: Box::new(record),
+            tx,
+        })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     await_reply(rx, "channels_publish_failed", "No response from network").await?
 }
@@ -5877,6 +5883,25 @@ pub async fn cancel_channel_transfer(
     state
         .network_tx
         .try_send(NetworkCommand::CancelChannelTransfer { xfer_id, tx })
+        .map_err(|_| coded("channels_xfer_failed", "Network is busy"))?;
+    await_reply(rx, "channels_xfer_failed", "No response from network").await??;
+    Ok(())
+}
+
+/// Send the standard offer for a file you offered whose recipient has not
+/// answered the private one. Every member it is forwarded through can read the
+/// file's name and size, so this only runs when the user asks for it.
+#[tauri::command]
+pub async fn send_channel_transfer_standard_offer(
+    state: tauri::State<'_, AppState>,
+    xfer_id: String,
+) -> Result<(), String> {
+    require_ember(&state).await?;
+    let xfer_id = parse_xfer_id(&xfer_id)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::SendChannelTransferPlainOffer { xfer_id, tx })
         .map_err(|_| coded("channels_xfer_failed", "Network is busy"))?;
     await_reply(rx, "channels_xfer_failed", "No response from network").await??;
     Ok(())

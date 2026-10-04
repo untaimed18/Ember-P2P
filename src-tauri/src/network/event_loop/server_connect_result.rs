@@ -102,7 +102,7 @@ pub(in crate::network) async fn on_server_connect_result(
                 }
             }
             *last_server_activity_at = chrono::Utc::now().timestamp();
-            state.server_connected_at = *last_server_activity_at;
+            state.server_logged_in_at = Some(std::time::Instant::now());
             state.server_addr = Some(addr);
             *shared_server_addr.write().await = Some(addr);
 
@@ -301,57 +301,30 @@ pub(in crate::network) async fn on_server_connect_result(
                         .collect();
                     (offer_files, restricted)
                 };
-                let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
-                {
-                    let mgr = transfer_manager.read().await;
-                    for transfer in mgr.active.values().chain(mgr.queue.iter()) {
-                        if transfer.direction != TransferDirection::Download {
-                            continue;
-                        }
-                        if matches!(
-                            transfer.status,
-                            TransferStatus::Completed | TransferStatus::Failed
-                        ) {
-                            continue;
-                        }
-                        if !transfer_may_advertise_partial(known_files, &restricted, transfer) {
-                            continue;
-                        }
-                        if transfer.file_hash.is_empty()
-                            || !seen_offer_hashes.insert(transfer.file_hash.clone())
-                        {
-                            continue;
-                        }
-                        let hash_bytes = match hex::decode(&transfer.file_hash) {
-                            Ok(bytes) if bytes.len() >= 16 => bytes,
-                            _ => continue,
-                        };
-                        let part_path = temp_dir.join(format!("{}.part", transfer.id));
-                        if !part_path.exists() {
-                            continue;
-                        }
-                        let mut h = [0u8; 16];
-                        h.copy_from_slice(&hash_bytes[..16]);
-                        offer_files.push(ed2k::server::OfferFile {
-                            hash: h,
-                            name: transfer.file_name.clone(),
-                            size: transfer.total_size,
-                            is_complete: false,
-                            file_type: ed2k::server::offer_file_type(&transfer.file_name),
-                        });
-                    }
-                }
+                offer_files.extend(
+                    super::offer_files::partial_download_offers(
+                        transfer_manager,
+                        settings,
+                        known_files,
+                        &restricted,
+                        &mut seen_offer_hashes,
+                    )
+                    .await,
+                );
+                // This TCP session has never published to this server.
+                // Leftover hashes from a disconnect that skipped
+                // `reset_ed2k_server_session` would make incremental skip the
+                // opening dump entirely, and the last session's packet pacing,
+                // which that reset cannot reach, would hold back this
+                // session's first offer by up to a minute, including one that
+                // comes later because the login had nothing to offer yet.
+                state.offered_ed2k_hashes.clear();
+                *next_offer_packet_at = None;
                 if offer_files.is_empty() {
                     warn!("No files to offer to server after login — check shared folders");
                     *pending_offer_files = None;
                     *pending_offer_signature = None;
                 } else {
-                    // This TCP session has never published to this
-                    // server. Leftover hashes from a disconnect that
-                    // skipped `reset_ed2k_server_session` would make
-                    // incremental skip the opening dump entirely.
-                    state.offered_ed2k_hashes.clear();
-                    *next_offer_packet_at = None;
                     let limit = conn.offer_files_chunk_limit();
                     let signature = offer_files_signature(&offer_files);
                     let incremental =
@@ -383,11 +356,11 @@ pub(in crate::network) async fn on_server_connect_result(
             // so the first OP_GETSOURCES batch goes out once the server
             // is ready (it already covers every pending + active
             // download). The on-demand warm-start / starved-re-ask
-            // paths below are likewise gated on `server_connected_at`.
+            // paths below are likewise gated on `server_logged_in_at`.
             state.server_tcp_getsources_cursor = 0;
             // A new connection carries no spent credit, so the first
             // frame may go out as soon as the welcome has settled.
-            state.server_tcp_srcreq_next_at = 0;
+            state.server_tcp_srcreq_next_at = None;
             server_tcp_source_timer.reset_after(std::time::Duration::from_secs(
                 SERVER_SOURCE_SETTLE_SECS as u64,
             ));

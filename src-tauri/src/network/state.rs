@@ -132,7 +132,10 @@ pub(super) struct PendingDownload {
     pub(super) expected_aich: Option<String>,
     pub(super) control: Arc<TransferControl>,
     pub(super) search_count: u32,
-    pub(super) last_search_at: i64,
+    /// When sources were last searched for (`None` = due now). Monotonic: on
+    /// the wall clock a step back held the next search for the length of the
+    /// step.
+    pub(super) last_search_at: Option<std::time::Instant>,
     /// Download priority: 0 = low, 1 = normal, 2 = high
     pub(super) priority: u32,
 }
@@ -152,6 +155,35 @@ pub(super) struct EmberPendingProxyOverlay {
 
 pub(super) const EMBER_PROXY_OVERLAY_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 pub(super) const MAX_EMBER_PENDING_PROXY_OVERLAY: usize = 256;
+
+/// How long a client `OP_REASKFILEPING` waits for its answer before its
+/// `pending_udp_reasks` entry counts as unanswered.
+const UDP_REASK_ANSWER_SECS: i64 = 30;
+
+/// Whether `key` still awaits the answer to a reask about another file.
+///
+/// The answers (`OP_REASKACK`, `OP_FILENOTFOUND`, `OP_QUEUEFULL`) name no
+/// file, so a second reask to the same peer replaced the first one's entry and
+/// the first answer was credited to the second file: a healthy source written
+/// off for a file it still had, or one file's rank and part bitmap put on the
+/// other's row. Leave the second reask due until this one is answered or
+/// stale.
+pub(super) fn udp_reask_awaits_other_file(
+    pending: &HashMap<(Ipv4Addr, u16), ([u8; 16], std::time::Instant)>,
+    key: (Ipv4Addr, u16),
+    file_hash: &[u8; 16],
+    now: std::time::Instant,
+) -> bool {
+    pending.get(&key).is_some_and(|(pending_hash, sent_at)| {
+        pending_hash != file_hash && !udp_reask_unanswered(*sent_at, now)
+    })
+}
+
+/// Whether a reask sent at `sent_at` has gone unanswered for good.
+pub(super) fn udp_reask_unanswered(sent_at: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(sent_at)
+        >= std::time::Duration::from_secs(UDP_REASK_ANSWER_SECS as u64)
+}
 
 pub(super) struct NetworkState {
     pub(super) local_id: KadId,
@@ -228,6 +260,10 @@ pub(super) struct NetworkState {
     /// Serializes every known.met writer, including shutdown, so a timed-out
     /// periodic snapshot cannot rename over a newer authoritative save.
     pub(super) known_met_save_lock: Arc<tokio::sync::Mutex<()>>,
+    /// A change that should not wait for the periodic writer (a friends-only
+    /// download completing): the catalog is saved right after the event, or
+    /// as soon as a save already running finishes.
+    pub(super) known_met_save_soon: bool,
     /// Monotonic generation for async `server.met` writes (latest wins).
     pub(super) server_met_save_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Serializes async `server.met` writers so a superseded snapshot cannot
@@ -383,6 +419,19 @@ pub(super) struct NetworkState {
     /// mapping open but cannot re-read this port: quinn never surfaces
     /// non-QUIC datagrams.
     pub(super) quic_public_port: Option<u16>,
+    /// Whether QUIC runs on the KAD / Ember UDP socket (see
+    /// [`super::ember::udp_mux`]). When it does, `quic_port` is `udp_port` and
+    /// the port a peer dials is the KAD socket's advertised one, so
+    /// `quic_public_port` stays `None`.
+    pub(super) quic_shares_udp: bool,
+    /// The QUIC half of the shared socket, until the endpoint takes it.
+    pub(super) quic_shared_socket: Option<ember::udp_mux::SharedQuicSocket>,
+    /// The key the shared socket's classifier and the endpoint's connection
+    /// ids agree on.
+    pub(super) quic_cid_key: Option<ember::udp_mux::CidKey>,
+    /// The listener left on `tcp_port` beside a shared socket (see
+    /// `build_legacy_endpoint`), held for its mapping keep-alive.
+    pub(super) quic_legacy_endpoint: Option<Arc<quinn::Endpoint>>,
     pub(super) upnp_mapped: bool,
     /// IP filter for blocking known-bad ranges (eMule ipfilter.dat compatible)
     pub(super) ip_filter: IpFilter,
@@ -442,13 +491,15 @@ pub(super) struct NetworkState {
     pub(super) udp_source_queue: VecDeque<(Vec<u8>, std::net::SocketAddr)>,
     /// Last UDP source request per `(server_ip, server_tcp_port, file_hash)`.
     /// Enforces eMule's 30-minute UDP source reask cadence per server/file.
-    pub(super) server_udp_source_reask_at: HashMap<(String, u16, [u8; 16]), i64>,
+    pub(super) server_udp_source_reask_at: HashMap<(String, u16, [u8; 16]), std::time::Instant>,
     /// Pending client UDP OP_REASKFILEPING context. OP_REASKACK carries no
     /// file hash, so correlate by sender endpoint to update only one file list.
     /// Value is `(file_hash, sent_at)` — the timestamp lets the cap-eviction
     /// pass below drop the oldest (most likely dead/unreachable) entries
     /// instead of nuking every in-flight reask whenever the table fills up.
-    pub(super) pending_udp_reasks: HashMap<(Ipv4Addr, u16), ([u8; 16], i64)>,
+    /// See [`udp_reask_awaits_other_file`] before inserting. `sent_at` is
+    /// monotonic, so a clock step cannot make an old reask look pending.
+    pub(super) pending_udp_reasks: HashMap<(Ipv4Addr, u16), ([u8; 16], std::time::Instant)>,
     /// Order-independent fingerprint `(entry_count, xor_fold)` of the last
     /// `OP_OFFERFILES` list actually sent from the `SharedFilesChanged`
     /// handler, so a re-fire whose offer set is byte-for-byte identical to
@@ -468,24 +519,19 @@ pub(super) struct NetworkState {
     pub(super) offered_ed2k_hashes: HashSet<[u8; 16]>,
     /// Round-robin cursor for TCP OP_GETSOURCES batching across downloads.
     pub(super) server_tcp_getsources_cursor: usize,
-    /// Earliest unix-second at which another TCP `OP_GETSOURCES` frame may go
+    /// Earliest instant at which another TCP `OP_GETSOURCES` frame may go
     /// out, shared by every path that sends one. eMule's `m_dwNextTCPSrcReq`;
     /// see `SERVER_TCP_SRCREQ_INTERVAL_SECS` for the server-credit accounting
-    /// this protects. 0 means "may send now".
-    pub(super) server_tcp_srcreq_next_at: i64,
-    /// Unix second each file last went out in a TCP `OP_GETSOURCES`, whatever
+    /// this protects. `None` means "may send now". The server source-request
+    /// clocks are monotonic; see `server_tcp_srcreq_frame_open`.
+    pub(super) server_tcp_srcreq_next_at: Option<std::time::Instant>,
+    /// When each file last went out in a TCP `OP_GETSOURCES`, whatever
     /// the path — eMule's per-file `m_LastSearchTime`. Deliberately kept
     /// across server sessions, as eMule's is, so a reconnect does not re-ask
     /// the new server for everything at once. See
     /// `SERVER_TCP_SRCREQ_FILE_REASK_SECS`.
-    pub(super) server_tcp_srcreq_file_at: HashMap<[u8; 16], i64>,
-    /// Downloads that asked for the connected server's sources outside the
-    /// periodic sweep — a new download, Find Sources — as `(transfer_id,
-    /// file_hash, file_size)`, served first by the next frame. eMule's
-    /// `m_localServerReqQueue`: nothing sends `OP_GETSOURCES` on its own, so
-    /// these share the frame budget like every other request.
-    pub(super) server_tcp_srcreq_asks: VecDeque<(String, [u8; 16], u64)>,
-    /// Unix-seconds timestamp of the most recent successful server login.
+    pub(super) server_tcp_srcreq_file_at: HashMap<[u8; 16], std::time::Instant>,
+    /// The most recent successful server login (`None` before the first).
     /// Server source requests (OP_GETSOURCES) are held off until the
     /// connection has settled for `SERVER_SOURCE_SETTLE_SECS` so we don't
     /// blast a burst at the server before it has finished its post-login
@@ -494,8 +540,16 @@ pub(super) struct NetworkState {
     /// loop rather than firing them the instant OP_IDCHANGE arrives; sending
     /// too early risks the server's flood protection silently dropping the
     /// request (and, on some servers, the rest of the session's source
-    /// replies). 0 means "no server connected".
-    pub(super) server_connected_at: i64,
+    /// replies). Also how long the session lasted when it drops. Monotonic:
+    /// on the wall clock a step back closed the source-request frame, and read
+    /// a long session as one that dropped at once, for the length of the step.
+    pub(super) server_logged_in_at: Option<std::time::Instant>,
+    /// Downloads that asked for the connected server's sources outside the
+    /// periodic sweep — a new download, Find Sources — as `(transfer_id,
+    /// file_hash, file_size)`, served first by the next frame. eMule's
+    /// `m_localServerReqQueue`: nothing sends `OP_GETSOURCES` on its own, so
+    /// these share the frame budget like every other request.
+    pub(super) server_tcp_srcreq_asks: VecDeque<(String, [u8; 16], u64)>,
     /// Per-file (hash hex) timestamp of the last *starved* fast re-ask of the
     /// connected server for sources. eMule keeps pulling the connected
     /// server's (growing) source list for a download that has no working
@@ -503,7 +557,7 @@ pub(super) struct NetworkState {
     /// when the initial source set is dead. This map throttles the fast
     /// re-ask to a flood-safe per-file interval (see
     /// `STARVED_SERVER_REASK_SECS`).
-    pub(super) starved_server_reask_at: std::collections::HashMap<String, i64>,
+    pub(super) starved_server_reask_at: std::collections::HashMap<String, std::time::Instant>,
     /// Round-robin cursor for fair KAD search slot distribution across downloads.
     pub(super) kad_source_search_cursor: usize,
     /// Dead source tracking (prevents reconnecting to failing sources)
@@ -514,10 +568,15 @@ pub(super) struct NetworkState {
     pub(super) aich_recovery_pending: ed2k::transfer::SharedAichPending,
     /// eMule-style persistent source lists per download (survives connection failures)
     pub(super) per_file_sources: HashMap<String, ed2k::sources::PerFileSourceList>,
+    /// Cap for each list in `per_file_sources`, from Max sources per file.
+    pub(super) max_sources_per_file: usize,
     /// KAD search state for active downloads not in pending_downloads.
     /// Tracks (last_kad_search_at, search_count) so we periodically search
     /// for additional sources via KAD even while the download is running.
-    pub(super) active_kad_search_state: HashMap<String, (i64, u32)>,
+    /// `(last search, searches so far)`. Monotonic, as is
+    /// `ember_source_search_state`: on the wall clock a step back held each
+    /// download's next search for the length of the step.
+    pub(super) active_kad_search_state: HashMap<String, (std::time::Instant, u32)>,
     /// Senders for injecting new sources into active multi-source downloads
     pub(super) active_source_senders: HashMap<String, mpsc::Sender<DownloadSource>>,
     /// UDP source-discovery diagnostic counters. Surfaced in the
@@ -617,6 +676,11 @@ pub(super) struct NetworkState {
     pub(super) last_tcp_remap_reconnect_at: Option<std::time::Instant>,
     /// Background server connection task (non-blocking)
     pub(super) pending_server_connect: Option<tokio::task::JoinHandle<ServerConnectResult>>,
+    /// Upload waiters saved by the last session, held until the startup scan's
+    /// first reconcile says which files we serve (see
+    /// `ed2k::upload_queue_store`). Taken once.
+    pub(super) restored_upload_queue:
+        Option<crate::network::ed2k::upload_queue_store::PendingRestore>,
     /// Shared set of user hashes expected as incoming buddy connections (checked by upload listener)
     pub(super) pending_buddy_hashes: PendingBuddySet,
     /// Shared buddy info for Hello tags (updated when buddy connects/disconnects)
@@ -681,6 +745,9 @@ pub(super) struct NetworkState {
     pub(super) obfuscation_enabled_shared: Arc<std::sync::atomic::AtomicBool>,
     /// Shared "skip video compression" flag for the upload sender loop.
     pub(super) skip_compress_video_shared: Arc<std::sync::atomic::AtomicBool>,
+    /// The download folders, live: download workers and the upload listener
+    /// hold this rather than the folder they were started with.
+    pub(super) download_folders: crate::storage::part_folders::SharedDownloadFolders,
     /// Shared "filter incoming connections via IP filter" flag for the
     /// TCP accept loop.
     pub(super) filter_incoming_shared: Arc<std::sync::atomic::AtomicBool>,
@@ -781,6 +848,14 @@ pub(super) struct NetworkState {
     /// placed at least one record, so the round counts as published however
     /// its last key resolves.
     pub(super) ember_publish_placed: HashSet<([u8; 16], EmberPublishKind)>,
+    /// Rounds in `ember_publish_unplaced` in which at least one key failed on
+    /// every replica, so a round that also placed others comes back soon for
+    /// the one that did not.
+    pub(super) ember_publish_partial: HashSet<([u8; 16], EmberPublishKind)>,
+    /// Files whose keyword rounds have used up their partial retries, so a
+    /// round that loses a key again waits out the full interval. Cleared by a
+    /// round that places every key.
+    pub(super) ember_keyword_retries_spent: HashSet<[u8; 16]>,
     /// Consecutive publish rounds each file has left unconfirmed, driving the
     /// [`EMBER_PUBLISH_MAX_ATTEMPTS`] backoff.
     pub(super) ember_publish_attempts: HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
@@ -973,8 +1048,10 @@ pub(super) struct NetworkState {
     pub(super) antileech: crate::security::antileech::SharedAntiLeechFilter,
     /// Mapping of ed2k file hash → AICH root hash for EPX payload
     pub(super) aich_root_map: HashMap<[u8; 16], [u8; 20]>,
-    /// When each callback placeholder row was inserted (epoch seconds).
-    pub(super) callback_row_pending_since: HashMap<(String, String, u16), i64>,
+    /// When each callback placeholder row was inserted. Monotonic: on the wall
+    /// clock a step back kept a placeholder that would never resolve on screen
+    /// for the length of the step.
+    pub(super) callback_row_pending_since: HashMap<(String, String, u16), std::time::Instant>,
     /// Semaphore limiting concurrent outgoing TCP connections for firewall checks
     pub(super) firewall_connect_semaphore: Arc<tokio::sync::Semaphore>,
     /// Global admission protects both the UDP response and TCP connect-back
@@ -1175,6 +1252,9 @@ pub(super) struct NetworkState {
     pub(super) ember_dht_protection: ember::dht::protection::DhtProtection,
     /// Slice 19: observed-IP voting from PONG payloads (NAT self-discovery).
     pub(super) ember_observed_votes: ember::dht::observed::EmberObservedIpVotes,
+    /// Set when the votes confirm an address other than `external_ip`, so the
+    /// event loop asks STUN again even when the activity gate would not.
+    pub(super) ember_observed_ip_moved: bool,
     /// Expected Ember BLAKE3 digests a transfer will enforce at completion
     /// (ed2k -> digest plus the evidence behind it). Seeded from DHT records,
     /// from the row the user clicked, and from locally hashed files; conflicts
@@ -1245,6 +1325,10 @@ pub(super) struct NetworkState {
     /// schedule but is driven independently of KAD connectivity so it works
     /// on a KAD-less network. A file with no entry is due now.
     pub(super) ember_source_publish_at: HashMap<[u8; 16], std::time::Instant>,
+    /// The buddy our firewalled source records last named. When it changes,
+    /// every record naming the old one is republished rather than left
+    /// pointing searchers at it until its own republish comes round.
+    pub(super) ember_named_source_buddy: Option<ember::dht::EmberNodeId>,
     /// Unix-second copy of the source-publish stamps, written to known.met
     /// so a restart does not treat the whole library as never-published.
     pub(super) ember_source_publish_unix: HashMap<[u8; 16], u32>,
@@ -1287,7 +1371,7 @@ pub(super) struct NetworkState {
     /// `active_kad_search_state`: the `search_count` drives the
     /// `ember_source_search_interval` backoff so a long-running download
     /// queries the DHT eagerly at first, then progressively less often.
-    pub(super) ember_source_search_state: HashMap<String, (i64, u32)>,
+    pub(super) ember_source_search_state: HashMap<String, (std::time::Instant, u32)>,
     /// Sources parsed from completed Ember DHT source lookups, awaiting
     /// async injection into the matching downloads (slice 9). The
     /// completion point (`maybe_finish_ember_search`) is synchronous, but
@@ -1397,6 +1481,10 @@ pub(super) struct NetworkState {
     pub(super) ember_channel_presence_buffer: HashMap<[u8; 16], Vec<Vec<u8>>>,
     /// Presence blobs waiting for DB upsert + UI emit (async drain).
     pub(super) ember_pending_channel_presence: Vec<([u8; 16], Vec<Vec<u8>>)>,
+    /// The room lookup results being written off the loop. One at a time, so
+    /// batches land in the order their lookups finished.
+    pub(super) ember_channel_ingest:
+        Option<tokio::task::JoinHandle<super::channel_membership::ChannelIngestResults>>,
     /// Last presence FIND_VALUE start per channel.
     pub(super) channel_presence_fetch_at: HashMap<[u8; 16], i64>,
     /// The one room the user currently has open, if any.
@@ -1483,6 +1571,8 @@ pub(super) struct NetworkState {
     pub(super) local_ed25519_seed: [u8; 32],
     /// Ember Transfer: files we have offered or are sending, by transfer id.
     pub(super) xfer_send: HashMap<[u8; 16], ember::xfer::SendState>,
+    /// See [`super::channel_xfer::note_sealed_offer_reader`].
+    pub(super) sealed_offer_readers: super::channel_xfer::SealedOfferReaders,
     /// Ember Transfer: files we accepted and are pulling in.
     pub(super) xfer_recv: HashMap<[u8; 16], ember::xfer::RecvState>,
     /// Where [`finish_xfer_recv`] posts a verified transfer back to the event

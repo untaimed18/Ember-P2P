@@ -11,7 +11,9 @@ use tracing::{debug, info, warn};
 const MSG_RELAY_REQUEST: u8 = 0x01;
 const MSG_RELAY_ACCEPT: u8 = 0x02;
 const MSG_RELAY_CONNECT: u8 = 0x03;
-const MSG_RELAY_CLOSE: u8 = 0x05;
+// 0x05 was RELAY_CLOSE, which a relay sent after ACCEPT when it could not
+// reach the target. Current relays answer REJECT instead; 1.7.0 relays still
+// send it, so the number is retired, not free.
 const MSG_RELAY_REJECT: u8 = 0x06;
 
 /// Wire version for signed RELAY_REQUEST payloads (PoP).
@@ -19,13 +21,23 @@ pub const RELAY_REQUEST_VERSION: u8 = 2;
 /// Fixed payload size for v2: version(1) + target(6) + file(16) +
 /// attestation_hash(32) + pubkey(32) + ember_hash(16) + nonce(16) + sig(64).
 pub const RELAY_REQUEST_V2_PAYLOAD_LEN: usize = 183;
+/// v2 plus the target's node id, which the relay requires the far end of its
+/// dial to prove. Sent only to relays whose attestation carries
+/// [`super::RELAY_ATTESTATION_CAP_PINNED_TARGET`]: a 1.7.0 relay accepts no
+/// length but v2's.
+pub const RELAY_REQUEST_VERSION_PINNED: u8 = 3;
+pub const RELAY_REQUEST_V3_PAYLOAD_LEN: usize = RELAY_REQUEST_V2_PAYLOAD_LEN + 16;
 const RELAY_REQUEST_NONCE_LEN: usize = 16;
 const RELAY_REQUEST_SIGNATURE_DOMAIN: &[u8] = b"ember-relay-request-v2\0";
+const RELAY_REQUEST_PINNED_SIGNATURE_DOMAIN: &[u8] = b"ember-relay-request-v3\0";
 /// Reject reasons for RELAY_REJECT payload.
 const REJECT_CAPACITY: u8 = 0x01;
 const REJECT_BAD_TARGET: u8 = 0x02;
 const REJECT_AUTH: u8 = 0x03;
 const REJECT_BAD_SIGNATURE: u8 = 0x04;
+/// The relay could not reach the target. A 1.7.0 initiator reads an unknown
+/// reason as a plain refusal, which is also the right reading.
+const REJECT_TARGET_UNREACHABLE: u8 = 0x05;
 /// How long a (requester pubkey, nonce) pair is remembered to block replays.
 const RELAY_REQUEST_NONCE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Nonces remembered per requester identity, and identities tracked at once.
@@ -110,14 +122,31 @@ const MAX_CONCURRENT_RELAY_SESSIONS: usize = 4;
 /// sensible donation, low enough that a typo in config.json cannot turn the
 /// node into an unbounded proxy.
 const MAX_RELAY_SESSIONS_CEILING: usize = 64;
+/// Sessions one requester may hold at once. Below the default total so that one
+/// friend, however many transfers it has queued, leaves the others a slot.
+pub(super) const MAX_RELAY_SESSIONS_PER_REQUESTER: usize = 2;
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const RELAY_MAX_DURATION: Duration = Duration::from_secs(7200);
+/// Age at which cleanup reaps an active session. Past the longest a bridge can
+/// run counted from its session's creation: the target connect and the ACCEPT
+/// write come before the bridge's own `RELAY_MAX_DURATION`.
+const RELAY_ACTIVE_BACKSTOP: Duration = Duration::from_secs(RELAY_MAX_DURATION.as_secs() + 600);
+/// How long a bridge may move nothing in either direction before it is torn
+/// down. eMule drops a silent client socket well inside this, so an eD2K session
+/// that is still alive has sent something by then.
+const RELAY_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const RELAY_BRIDGE_IDLE_CHECK: Duration = Duration::from_secs(10);
+/// How long an ended bridge waits for each peer to acknowledge what was still
+/// on its way to it.
+const RELAY_BRIDGE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WS_RELAY_FRAME: usize = 16 * 1024;
 
 /// A relay session between two LowID peers through an intermediary.
 #[derive(Debug)]
 pub struct RelaySession {
     pub session_id: u32,
+    /// The requester's handshake-proven Ember node id.
+    pub requester: [u8; 16],
     pub initiator_ip: Ipv4Addr,
     pub initiator_port: u16,
     pub target_ip: Ipv4Addr,
@@ -140,6 +169,7 @@ pub enum RelaySessionState {
 impl RelaySession {
     pub fn new(
         session_id: u32,
+        requester: [u8; 16],
         initiator_ip: Ipv4Addr,
         initiator_port: u16,
         target_ip: Ipv4Addr,
@@ -149,6 +179,7 @@ impl RelaySession {
         let now = Instant::now();
         Self {
             session_id,
+            requester,
             initiator_ip,
             initiator_port,
             target_ip,
@@ -161,12 +192,20 @@ impl RelaySession {
         }
     }
 
-    pub fn is_expired(&self) -> bool {
-        if self.created.elapsed() > RELAY_MAX_DURATION {
-            return true;
+    /// An active session is ended and credited by its bridge task, whose
+    /// `RELAY_MAX_DURATION` starts only after ACCEPT, so reaping it on this
+    /// session's clock lost its bytes and freed its slot while it still ran.
+    /// [`RELAY_ACTIVE_BACKSTOP`] only catches a bridge task that ended without
+    /// removing it.
+    fn is_expired_at(&self, now: Instant) -> bool {
+        let age = now.saturating_duration_since(self.created);
+        match self.state {
+            RelaySessionState::WaitingForTarget => {
+                age > RELAY_MAX_DURATION
+                    || now.saturating_duration_since(self.last_activity) > RELAY_IDLE_TIMEOUT
+            }
+            RelaySessionState::Active => age > RELAY_ACTIVE_BACKSTOP,
         }
-        self.state == RelaySessionState::WaitingForTarget
-            && self.last_activity.elapsed() > RELAY_IDLE_TIMEOUT
     }
 
     pub fn mark_active(&mut self) {
@@ -336,6 +375,7 @@ impl RelayManager {
     /// Create a new relay session if capacity allows.
     pub fn create_session(
         &mut self,
+        requester: [u8; 16],
         initiator_ip: Ipv4Addr,
         initiator_port: u16,
         target_ip: Ipv4Addr,
@@ -354,12 +394,25 @@ impl RelayManager {
             );
             return None;
         }
+        let held = self
+            .sessions
+            .values()
+            .filter(|session| session.requester == requester)
+            .count();
+        if held >= MAX_RELAY_SESSIONS_PER_REQUESTER {
+            debug!(
+                "RelayManager: requester {} already holds {held} sessions",
+                hex::encode(requester)
+            );
+            return None;
+        }
 
         let id = self.next_session_id;
         self.next_session_id = self.next_session_id.wrapping_add(1);
 
         let session = RelaySession::new(
             id,
+            requester,
             initiator_ip,
             initiator_port,
             target_ip,
@@ -390,10 +443,14 @@ impl RelayManager {
 
     /// Clean up expired sessions.
     pub fn cleanup(&mut self) -> Vec<u32> {
+        self.cleanup_at(Instant::now())
+    }
+
+    fn cleanup_at(&mut self, now: Instant) -> Vec<u32> {
         let expired: Vec<u32> = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.is_expired())
+            .filter(|(_, s)| s.is_expired_at(now))
             .map(|(id, _)| *id)
             .collect();
 
@@ -421,7 +478,7 @@ impl RelayManager {
 /// Encode a relay protocol message.
 pub fn encode_relay_message(msg_type: u8, session_id: u32, payload: &[u8]) -> Vec<u8> {
     // The wire framing uses a u16 length prefix. Every relay control message
-    // stays well under that — ACCEPT/CLOSE are empty, REJECT is 1 byte,
+    // stays well under that — ACCEPT is empty, REJECT is 1 byte,
     // CONNECT carries a 16-byte file hash, and REQUEST is a fixed 183-byte
     // signed v2 payload — but assert it so a future caller that overflows
     // the prefix (which would silently corrupt the framing) is caught in
@@ -473,18 +530,22 @@ pub fn decode_relay_header(data: &[u8]) -> Option<(u8, u32, u16)> {
     Some((msg_type, session_id, payload_len))
 }
 
-/// Parsed + verified v2 RELAY_REQUEST fields (signature already checked).
+/// Parsed + verified RELAY_REQUEST fields (signature already checked).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelayRequestV2 {
+pub struct RelayRequest {
     pub target_ip: Ipv4Addr,
+    /// The port the relay dials over QUIC.
     pub target_port: u16,
     pub file_hash: [u8; 16],
     pub attestation_hash: [u8; 32],
     pub requester_pubkey: [u8; 32],
     pub requester_ember_hash: [u8; 16],
     pub nonce: [u8; 16],
+    /// v3 only: the node id the target must prove in the QUIC handshake.
+    pub target_node_id: Option<[u8; 16]>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_relay_request_signed_message(
     session_id: u32,
     attestation_hash: &[u8; 32],
@@ -494,11 +555,15 @@ fn build_relay_request_signed_message(
     requester_pubkey: &[u8; 32],
     requester_ember_hash: &[u8; 16],
     nonce: &[u8; 16],
+    target_node_id: Option<&[u8; 16]>,
 ) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(
-        RELAY_REQUEST_SIGNATURE_DOMAIN.len() + 4 + 32 + 4 + 2 + 16 + 32 + 16 + 16,
-    );
-    msg.extend_from_slice(RELAY_REQUEST_SIGNATURE_DOMAIN);
+    let domain = if target_node_id.is_some() {
+        RELAY_REQUEST_PINNED_SIGNATURE_DOMAIN
+    } else {
+        RELAY_REQUEST_SIGNATURE_DOMAIN
+    };
+    let mut msg = Vec::with_capacity(domain.len() + 4 + 32 + 4 + 2 + 16 + 32 + 16 + 16 + 16);
+    msg.extend_from_slice(domain);
     msg.extend_from_slice(&session_id.to_le_bytes());
     msg.extend_from_slice(attestation_hash);
     msg.extend_from_slice(&target_ip.octets());
@@ -507,16 +572,21 @@ fn build_relay_request_signed_message(
     msg.extend_from_slice(requester_pubkey);
     msg.extend_from_slice(requester_ember_hash);
     msg.extend_from_slice(nonce);
+    if let Some(node_id) = target_node_id {
+        msg.extend_from_slice(node_id);
+    }
     msg
 }
 
-/// Build a signed v2 RELAY_REQUEST (proof-of-possession).
+/// Build a signed RELAY_REQUEST (proof-of-possession): v3 when
+/// `target_node_id` is given, v2 otherwise.
 ///
 /// The requester signs a domain-separated message binding session id,
 /// the relay's public ERAT attestation hash, target, file hash, and a
 /// fresh nonce. The attestation hash alone is no longer accepted as a
 /// bearer credential.
-pub fn build_relay_request_v2(
+#[allow(clippy::too_many_arguments)]
+pub fn build_relay_request(
     session_id: u32,
     target_ip: Ipv4Addr,
     target_port: u16,
@@ -525,6 +595,7 @@ pub fn build_relay_request_v2(
     requester_pubkey: &[u8; 32],
     requester_ember_hash: &[u8; 16],
     requester_secret_key: &[u8; 32],
+    target_node_id: Option<&[u8; 16]>,
 ) -> Vec<u8> {
     use rand::RngCore;
 
@@ -540,12 +611,18 @@ pub fn build_relay_request_v2(
         requester_pubkey,
         requester_ember_hash,
         &nonce,
+        target_node_id,
     );
     let signing_key = super::crypto::signing_key_from_bytes(requester_secret_key);
     let signature = super::crypto::sign(&signing_key, &signed);
 
-    let mut payload = Vec::with_capacity(RELAY_REQUEST_V2_PAYLOAD_LEN);
-    payload.push(RELAY_REQUEST_VERSION);
+    let (version, len) = if target_node_id.is_some() {
+        (RELAY_REQUEST_VERSION_PINNED, RELAY_REQUEST_V3_PAYLOAD_LEN)
+    } else {
+        (RELAY_REQUEST_VERSION, RELAY_REQUEST_V2_PAYLOAD_LEN)
+    };
+    let mut payload = Vec::with_capacity(len);
+    payload.push(version);
     payload.extend_from_slice(&target_ip.octets());
     payload.extend_from_slice(&target_port.to_le_bytes());
     payload.extend_from_slice(file_hash);
@@ -553,25 +630,35 @@ pub fn build_relay_request_v2(
     payload.extend_from_slice(requester_pubkey);
     payload.extend_from_slice(requester_ember_hash);
     payload.extend_from_slice(&nonce);
+    if let Some(node_id) = target_node_id {
+        payload.extend_from_slice(node_id);
+    }
     payload.extend_from_slice(&signature);
-    debug_assert_eq!(payload.len(), RELAY_REQUEST_V2_PAYLOAD_LEN);
+    debug_assert_eq!(payload.len(), len);
     encode_relay_message(MSG_RELAY_REQUEST, session_id, &payload)
 }
 
-/// Parse and cryptographically verify a v2 RELAY_REQUEST payload.
+/// Whether `len` is the payload length of a RELAY_REQUEST version we accept.
+fn relay_request_payload_len_ok(len: usize) -> bool {
+    len == RELAY_REQUEST_V2_PAYLOAD_LEN || len == RELAY_REQUEST_V3_PAYLOAD_LEN
+}
+
+/// Parse and cryptographically verify a v2 or v3 RELAY_REQUEST payload.
 ///
 /// Does **not** check attestation-hash membership or nonce replay —
 /// those are policy checks owned by [`RelayManager`] on the accept path.
-pub fn parse_and_verify_relay_request_v2(
+pub fn parse_and_verify_relay_request(
     session_id: u32,
     payload: &[u8],
-) -> Result<RelayRequestV2, &'static str> {
-    if payload.len() != RELAY_REQUEST_V2_PAYLOAD_LEN {
-        return Err("unexpected relay request payload length");
-    }
-    if payload[0] != RELAY_REQUEST_VERSION {
-        return Err("unsupported relay request version");
-    }
+) -> Result<RelayRequest, &'static str> {
+    let pinned = match (payload.first(), payload.len()) {
+        (Some(&RELAY_REQUEST_VERSION), RELAY_REQUEST_V2_PAYLOAD_LEN) => false,
+        (Some(&RELAY_REQUEST_VERSION_PINNED), RELAY_REQUEST_V3_PAYLOAD_LEN) => true,
+        (Some(&RELAY_REQUEST_VERSION | &RELAY_REQUEST_VERSION_PINNED), _) => {
+            return Err("unexpected relay request payload length");
+        }
+        _ => return Err("unsupported relay request version"),
+    };
     let target_ip = Ipv4Addr::new(payload[1], payload[2], payload[3], payload[4]);
     let target_port = u16::from_le_bytes([payload[5], payload[6]]);
     let mut file_hash = [0u8; 16];
@@ -584,8 +671,14 @@ pub fn parse_and_verify_relay_request_v2(
     requester_ember_hash.copy_from_slice(&payload[87..103]);
     let mut nonce = [0u8; 16];
     nonce.copy_from_slice(&payload[103..119]);
+    let target_node_id = pinned.then(|| {
+        let mut node_id = [0u8; 16];
+        node_id.copy_from_slice(&payload[119..135]);
+        node_id
+    });
+    let sig_at = if pinned { 135 } else { 119 };
     let mut signature = [0u8; 64];
-    signature.copy_from_slice(&payload[119..183]);
+    signature.copy_from_slice(&payload[sig_at..sig_at + 64]);
 
     if !super::crypto::verify_ember_hash_binding(&requester_pubkey, &requester_ember_hash) {
         return Err("requester pubkey does not bind to ember_hash");
@@ -602,11 +695,12 @@ pub fn parse_and_verify_relay_request_v2(
         &requester_pubkey,
         &requester_ember_hash,
         &nonce,
+        target_node_id.as_ref(),
     );
     if !super::crypto::verify(&vk, &signed, &signature) {
         return Err("bad relay request signature");
     }
-    Ok(RelayRequestV2 {
+    Ok(RelayRequest {
         target_ip,
         target_port,
         file_hash,
@@ -614,6 +708,7 @@ pub fn parse_and_verify_relay_request_v2(
         requester_pubkey,
         requester_ember_hash,
         nonce,
+        target_node_id,
     })
 }
 
@@ -627,15 +722,27 @@ pub fn build_relay_reject(session_id: u32, reason: u8) -> Vec<u8> {
     encode_relay_message(MSG_RELAY_REJECT, session_id, &[reason])
 }
 
+/// How long a relay holds a connection open for its REJECT to be read.
+const REJECT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Send a REJECT and keep the connection until the initiator has read it.
+///
+/// Returning drops the last handle on the connection, and quinn closes it on
+/// the spot, discarding what is still queued, so the initiator saw the
+/// connection drop instead of the answer. It then counted a working relay as
+/// unreachable and never learned that the relay had refused it.
+async fn send_relay_reject(send: &mut quinn::SendStream, session_id: u32, reason: u8) {
+    let reject = build_relay_reject(session_id, reason);
+    if write_relay_control(send, &reject, "send reject").await.is_ok() {
+        let _ = send.finish();
+        let _ = tokio::time::timeout(REJECT_DELIVERY_TIMEOUT, send.stopped()).await;
+    }
+}
+
 /// Build a RELAY_CONNECT message sent to the target peer,
 /// carrying the file_hash so the target knows what to serve.
 pub fn build_relay_connect(session_id: u32, file_hash: &[u8; 16]) -> Vec<u8> {
     encode_relay_message(MSG_RELAY_CONNECT, session_id, file_hash)
-}
-
-/// Build a RELAY_CLOSE message.
-pub fn build_relay_close(session_id: u32) -> Vec<u8> {
-    encode_relay_message(MSG_RELAY_CLOSE, session_id, &[])
 }
 
 const PUNCH_RDV_DOMAIN: &[u8] = b"ember-rdv-v1";
@@ -1157,6 +1264,8 @@ mod dial_error_tests {
     fn only_unreachable_or_misbehaving_dials_blame_the_relay() {
         assert!(RelayDialError::unreachable("handshake failed").relay_at_fault);
         assert!(!RelayDialError::refused("at capacity").relay_at_fault);
+        let busy = RelayDialError::busy("at capacity");
+        assert!(busy.relay_busy && !busy.relay_at_fault && !busy.refused_us);
         // Carries its text through for logging either way.
         assert_eq!(
             RelayDialError::refused("at capacity").to_string(),
@@ -1178,6 +1287,12 @@ pub struct RelayDialError {
     /// first, and one unreachable source could walk the whole candidate list
     /// and empty it.
     pub relay_at_fault: bool,
+    /// The relay declined *us*, not this request: it serves only its friends,
+    /// so asking it again will get the same answer.
+    pub refused_us: bool,
+    /// The relay is at capacity, overall or for us, so asking it again soon
+    /// will get the same answer.
+    pub relay_busy: bool,
 }
 
 impl RelayDialError {
@@ -1186,6 +1301,8 @@ impl RelayDialError {
         Self {
             reason: reason.into(),
             relay_at_fault: true,
+            refused_us: false,
+            relay_busy: false,
         }
     }
 
@@ -1194,6 +1311,24 @@ impl RelayDialError {
         Self {
             reason: reason.into(),
             relay_at_fault: false,
+            refused_us: false,
+            relay_busy: false,
+        }
+    }
+
+    /// The relay answered properly and will not serve this requester at all.
+    fn refused_requester(reason: impl Into<String>) -> Self {
+        Self {
+            refused_us: true,
+            ..Self::refused(reason)
+        }
+    }
+
+    /// The relay answered properly that it has no session to spare.
+    fn busy(reason: impl Into<String>) -> Self {
+        Self {
+            relay_busy: true,
+            ..Self::refused(reason)
         }
     }
 }
@@ -1206,11 +1341,18 @@ impl std::fmt::Display for RelayDialError {
 
 /// Connect to a relay-capable peer over QUIC and negotiate a relay session.
 /// Returns the QUIC streams on success.
+///
+/// `target_port` is the port the relay dials over QUIC. `target_node_id`, when
+/// given, sends a v3 request the relay pins its dial to, so it must only be
+/// given for a relay that advertises
+/// [`super::RELAY_ATTESTATION_CAP_PINNED_TARGET`].
+#[allow(clippy::too_many_arguments)]
 pub async fn connect_to_peer_relay(
     endpoint: &quinn::Endpoint,
     relay_addr: SocketAddr,
     target_ip: Ipv4Addr,
     target_port: u16,
+    target_node_id: Option<[u8; 16]>,
     file_hash: &[u8; 16],
     attestation_hash: &[u8; 32],
     requester_pubkey: &[u8; 32],
@@ -1223,17 +1365,44 @@ pub async fn connect_to_peer_relay(
     // The pinned handshake is where a fabricated attestation comes apart: it
     // names an address whose occupant cannot present the signing identity. That
     // makes this failure the relay's, and the one worth counting.
-    let conn = super::quic::connect_pinned(endpoint, relay_addr, "ember-relay", pin)
-        .await
-        .map_err(|e| RelayDialError::unreachable(format!("relay QUIC handshake failed: {e}")))?;
+    // Bounded so the whole dial, handshake plus the relay's answer, fits the
+    // broker's 30 s attempt timeout; left to quinn's idle timeout, a late answer
+    // found its attempt already expired and was dropped.
+    let conn = tokio::time::timeout(
+        RELAY_HANDSHAKE_TIMEOUT,
+        super::quic::connect_pinned(endpoint, relay_addr, "ember-relay", pin),
+    )
+    .await
+    .map_err(|_| RelayDialError::unreachable("relay QUIC handshake timed out"))?
+    .map_err(|e| {
+        // A relay refuses a handshake when it is full, but the refusal comes
+        // before any certificate, so anyone at the address can send it: the
+        // relay is passed over for a while and still charged.
+        let refused = matches!(
+            e.downcast_ref::<quinn::ConnectionError>(),
+            Some(quinn::ConnectionError::ConnectionClosed(close))
+                if close.error_code == quinn::TransportErrorCode::CONNECTION_REFUSED
+        );
+        RelayDialError {
+            relay_busy: refused,
+            ..RelayDialError::unreachable(format!("relay QUIC handshake failed: {e}"))
+        }
+    })?;
+    let lost = |reason: String| {
+        if relay_closed_for_capacity(&conn) {
+            RelayDialError::busy(format!("relay at capacity: {reason}"))
+        } else {
+            RelayDialError::unreachable(reason)
+        }
+    };
 
     let (mut send, mut recv) = tokio::time::timeout(RELAY_CONTROL_TIMEOUT, conn.open_bi())
         .await
         .map_err(|_| RelayDialError::unreachable("relay open_bi timed out"))?
-        .map_err(|e| RelayDialError::unreachable(format!("relay open_bi failed: {e}")))?;
+        .map_err(|e| lost(format!("relay open_bi failed: {e}")))?;
 
     let session_id = rand::random::<u32>();
-    let request = build_relay_request_v2(
+    let request = build_relay_request(
         session_id,
         target_ip,
         target_port,
@@ -1242,12 +1411,13 @@ pub async fn connect_to_peer_relay(
         requester_pubkey,
         requester_ember_hash,
         requester_secret_key,
+        target_node_id.as_ref(),
     );
 
     tokio::time::timeout(RELAY_CONTROL_TIMEOUT, send.write_all(&request))
         .await
         .map_err(|_| RelayDialError::unreachable("relay write request timed out"))?
-        .map_err(|e| RelayDialError::unreachable(format!("relay write request: {e}")))?;
+        .map_err(|e| lost(format!("relay write request: {e}")))?;
 
     // Read header first (always 7 bytes: msg_type | session_id | payload_len),
     // then drain the payload by length so we don't desynchronize the
@@ -1256,9 +1426,9 @@ pub async fn connect_to_peer_relay(
     // to avoid reading an attacker-chosen huge `payload_len` into
     // memory.
     let mut resp_header = [0u8; 7];
-    read_relay_control(&mut recv, &mut resp_header, "relay read response")
+    read_relay_control_within(&mut recv, &mut resp_header, "relay read response", RELAY_RESPONSE_TIMEOUT)
         .await
-        .map_err(RelayDialError::unreachable)?;
+        .map_err(lost)?;
     let payload_len = u16::from_le_bytes([resp_header[5], resp_header[6]]) as usize;
     if payload_len > 64 * 1024 {
         return Err(RelayDialError::unreachable(format!(
@@ -1269,7 +1439,7 @@ pub async fn connect_to_peer_relay(
     if payload_len > 0 {
         read_relay_control(&mut recv, &mut payload_buf, "relay read response payload")
             .await
-            .map_err(RelayDialError::unreachable)?;
+            .map_err(lost)?;
     }
     let mut full = Vec::with_capacity(7 + payload_len);
     full.extend_from_slice(&resp_header);
@@ -1280,19 +1450,29 @@ pub async fn connect_to_peer_relay(
 
     if msg_type == MSG_RELAY_REJECT {
         // Payload is a single reason byte (see `build_relay_reject`):
-        // 0x01 capacity, 0x02 bad target, 0x03 auth/attestation, 0x04 bad PoP.
+        // 0x01 capacity, 0x02 bad target, 0x03 auth/attestation, 0x04 bad PoP,
+        // 0x05 target unreachable.
         //
         // All of these are a working relay answering us, so none is counted
         // against it. Capacity in particular is what the most-used relays say,
         // and a bad target is a statement about the source we named.
         let reason = payload.first().copied();
+        // `REJECT_AUTH` is also the answer to a non-friend requester, which is
+        // most of the relays public EPX tells us about.
+        if reason == Some(REJECT_AUTH) {
+            return Err(RelayDialError::refused_requester(
+                "relay peer rejected request: not a friend, or unknown attestation",
+            ));
+        }
+        if reason == Some(REJECT_CAPACITY) {
+            return Err(RelayDialError::busy("relay peer rejected request: at capacity"));
+        }
         return Err(RelayDialError::refused(match reason {
-            Some(REJECT_CAPACITY) => "relay peer rejected request: at capacity".to_string(),
             Some(REJECT_BAD_TARGET) => {
                 "relay peer rejected request: invalid/non-public target".to_string()
             }
-            Some(REJECT_AUTH) => {
-                "relay peer rejected request: unauthenticated or unknown attestation".to_string()
+            Some(REJECT_TARGET_UNREACHABLE) => {
+                "relay peer rejected request: could not reach the source".to_string()
             }
             Some(REJECT_BAD_SIGNATURE) => {
                 "relay peer rejected request: bad requester signature or replay".to_string()
@@ -1497,7 +1677,28 @@ impl AsyncWrite for WsStream {
 }
 
 /// Timeout for the relay node to connect to the target peer.
-const RELAY_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+///
+/// The relay answers the request only after this, so it stays inside a 1.7.0
+/// initiator's [`RELAY_CONTROL_TIMEOUT`] read and our own
+/// [`RELAY_RESPONSE_TIMEOUT`].
+const RELAY_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long an initiator waits for the relay's answer, which a current relay
+/// sends once it has reached the target.
+const RELAY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long an initiator gives the QUIC handshake to a relay.
+const RELAY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+// The relay must answer inside both initiators' reads: a 1.7.0 initiator's
+// control read and our own response read.
+const _: () = assert!(
+    RELAY_TARGET_CONNECT_TIMEOUT.as_secs() < RELAY_CONTROL_TIMEOUT.as_secs()
+        && RELAY_TARGET_CONNECT_TIMEOUT.as_secs() < RELAY_RESPONSE_TIMEOUT.as_secs()
+);
+const _: () = assert!(
+    RELAY_ACTIVE_BACKSTOP.as_secs()
+        > RELAY_TARGET_CONNECT_TIMEOUT.as_secs()
+            + RELAY_CONTROL_TIMEOUT.as_secs()
+            + RELAY_MAX_DURATION.as_secs()
+);
 /// Bound every control-plane stream open/read/write after the QUIC handshake.
 /// Data-plane relay copies remain governed by `RELAY_MAX_DURATION`.
 const RELAY_CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1507,7 +1708,16 @@ async fn read_relay_control(
     buffer: &mut [u8],
     context: &str,
 ) -> Result<(), String> {
-    tokio::time::timeout(RELAY_CONTROL_TIMEOUT, recv.read_exact(buffer))
+    read_relay_control_within(recv, buffer, context, RELAY_CONTROL_TIMEOUT).await
+}
+
+async fn read_relay_control_within(
+    recv: &mut quinn::RecvStream,
+    buffer: &mut [u8],
+    context: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    tokio::time::timeout(timeout, recv.read_exact(buffer))
         .await
         .map_err(|_| format!("{context}: timed out"))?
         .map_err(|e| format!("{context}: {e}"))
@@ -1592,16 +1802,10 @@ fn relay_requester_refusal(
 /// fired, which `REJECT_BAD_TARGET` alone cannot (a port-0 typo and a
 /// deliberate LAN probe are the same byte on the wire).
 ///
-/// Deliberately *not* decided here: the operator's `ipfilter.dat` ranges and
-/// the enforced ban set. Both live on the network task's `NetworkState` and
-/// the QUIC accept task holds no shared handle to either, so an address the
-/// operator has explicitly blocked is currently kept out only by the friend
-/// gate applied to the *requester* on the RELAY_REQUEST path. Threading a
-/// `kad::ip_filter::SharedIpFilter` plus an `ed2k::upload::SharedBannedIps`
-/// into this function — both are already published for the upload listener,
-/// which applies exactly this pair to inbound eD2K TCP — is what closes the
-/// remaining half: without it a friend can still name a blocked host and the
-/// relay will dial it.
+/// Not decided here: the operator's `ipfilter.dat` ranges and the enforced
+/// ban set. The accept path applies those next, through
+/// [`RelayAddressPolicy::outbound_refusal`], unconditionally on the filter because
+/// a relay target is an outbound dial to an address a remote peer chose.
 fn relay_target_refusal(
     target_ip: Ipv4Addr,
     target_port: u16,
@@ -1746,6 +1950,22 @@ const QUIC_PENDING_PER_IP: usize = 4;
 const QUIC_ACTIVE_PER_PRINCIPAL: usize = 4;
 const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const QUIC_FIRST_STREAM_TIMEOUT: Duration = Duration::from_secs(8);
+/// Close reasons for a connection the accept loop has no room for. It closes
+/// before reading a request, so no REJECT can carry that answer, and 1.7.0
+/// relays send the same bytes.
+const CLOSE_FRIEND_RESERVE: &[u8] = b"friend reserve requires pinned identity";
+const CLOSE_NO_SESSION_CAPACITY: &[u8] = b"no session capacity";
+const CLOSE_PRINCIPAL_CAP: &[u8] = b"active principal session cap reached";
+
+/// Whether the relay closed `conn` for want of room.
+fn relay_closed_for_capacity(conn: &quinn::Connection) -> bool {
+    matches!(
+        conn.close_reason(),
+        Some(quinn::ConnectionError::ApplicationClosed(close))
+            if [CLOSE_FRIEND_RESERVE, CLOSE_NO_SESSION_CAPACITY, CLOSE_PRINCIPAL_CAP]
+                .contains(&close.reason.as_ref())
+    )
+}
 
 enum PreSessionPermit {
     Ordinary(tokio::sync::OwnedSemaphorePermit),
@@ -1871,11 +2091,9 @@ const RELAY_PACE_CHUNK: usize = 16 * 1024;
 /// before the session is torn down.
 ///
 /// Pacing makes starvation reachable: with a small cap and busy file-upload
-/// slots, `yield_then_take_upload` can wait indefinitely. An `Active` session
-/// is exempt from `RELAY_IDLE_TIMEOUT` (see `RelaySession::is_expired`) and is
-/// only reaped at `RELAY_MAX_DURATION`, so a starved bridge would otherwise
-/// squat one of `MAX_CONCURRENT_RELAY_SESSIONS` for two hours while moving
-/// nothing. Failing out frees the slot and logs the cause.
+/// slots, `yield_then_take_upload` can wait indefinitely. The bridge watchdog
+/// ([`relay_bridge_stalled`]) would end such a session too; failing here first
+/// names the cause.
 const RELAY_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Copy `reader` → `writer`, yielding to file-upload slots when a cap is set.
@@ -1884,11 +2102,16 @@ const RELAY_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// top of the token bucket file uploads already live in. HighID nodes that
 /// serve as a Kad buddy are also the nodes that donate relay, so an
 /// unmetered bridge looked like "buddy serving killed my upload speed".
+///
+/// Each chunk is also added to `moved` as it lands, which is what the bridge's
+/// progress watchdog reads and what the session is credited with when it ends
+/// in an error, as most eD2K sessions do.
 async fn copy_yielding_to_file_uploads<R, W>(
     reader: &mut R,
     writer: &mut W,
     limiter: &crate::bandwidth::limiter::BandwidthLimiter,
     max_bytes: u64,
+    moved: &std::sync::atomic::AtomicU64,
 ) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -1916,8 +2139,33 @@ where
         }
         writer.write_all(&buf[..n]).await?;
         copied += n as u64;
+        moved.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(copied)
+}
+
+/// Resolves once `moved` has stood still for `idle`, checking every `check`.
+///
+/// Covers what neither copy direction can see alone: a read that never returns
+/// because the far side went silent, and a write parked on flow control
+/// because nobody is reading.
+async fn relay_bridge_stalled(
+    moved: &std::sync::atomic::AtomicU64,
+    idle: Duration,
+    check: Duration,
+) {
+    let mut seen = moved.load(std::sync::atomic::Ordering::Relaxed);
+    let mut since = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(check).await;
+        let now = moved.load(std::sync::atomic::Ordering::Relaxed);
+        if now != seen {
+            seen = now;
+            since = tokio::time::Instant::now();
+        } else if since.elapsed() >= idle {
+            return;
+        }
+    }
 }
 
 /// What the accept loop needs in order to serve a chat attachment.
@@ -2081,6 +2329,14 @@ async fn attachment_delivered(send: &quinn::SendStream) -> bool {
     }
 }
 
+/// The next connection on `endpoint`, or never when there is none.
+async fn accept_or_wait(endpoint: Option<&quinn::Endpoint>) -> Option<quinn::Incoming> {
+    match endpoint {
+        Some(endpoint) => endpoint.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Run the QUIC accept loop. Handles five kinds of inbound QUIC connections:
 ///   4. **Chat attachment** — a friend is fetching a file we offered them in
 ///      chat. Dispatched on [`super::attach::ATTACH_STREAM_MSG_TYPE`] and
@@ -2102,8 +2358,12 @@ async fn attachment_delivered(send: &quinn::SendStream) -> bool {
 /// path rather than `kad_callback_tx` (which only adopts sources for *our
 /// own* pending downloads and has no consumer for a connection with no
 /// matching active download).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_quic_accept_loop(
     endpoint: std::sync::Arc<quinn::Endpoint>,
+    // Accepted from on the same terms and under the same caps, which is why
+    // one loop takes both rather than each endpoint running its own.
+    legacy_endpoint: Option<std::sync::Arc<quinn::Endpoint>>,
     relay_manager: std::sync::Arc<tokio::sync::Mutex<RelayManager>>,
     inbound_stream_tx: tokio::sync::mpsc::Sender<
         crate::network::ed2k::upload::InboundStreamRequest,
@@ -2127,12 +2387,15 @@ pub async fn run_quic_accept_loop(
         usize,
     >::new()));
     loop {
-        let incoming = match endpoint.accept().await {
-            Some(inc) => inc,
-            None => {
-                info!("QUIC accept loop: endpoint closed");
-                break;
-            }
+        let incoming = tokio::select! {
+            accepted = endpoint.accept() => match accepted {
+                Some(inc) => inc,
+                None => {
+                    info!("QUIC accept loop: endpoint closed");
+                    break;
+                }
+            },
+            Some(inc) = accept_or_wait(legacy_endpoint.as_deref()) => inc,
         };
 
         if quic_incoming_address_policy(incoming.remote_address_validated())
@@ -2234,7 +2497,7 @@ pub async fn run_quic_accept_loop(
                 PreSessionPermit::Ordinary(permit) => permit,
                 PreSessionPermit::HandshakeOverflow(_overflow) => {
                     if !known_friend {
-                        conn.close(0u32.into(), b"friend reserve requires pinned identity");
+                        conn.close(0u32.into(), CLOSE_FRIEND_RESERVE);
                         return;
                     }
                     match reserved_sem.try_acquire_owned() {
@@ -2242,7 +2505,7 @@ pub async fn run_quic_accept_loop(
                         Err(_) => match ordinary_sem.try_acquire_owned() {
                             Ok(permit) => permit,
                             Err(_) => {
-                                conn.close(0u32.into(), b"no session capacity");
+                                conn.close(0u32.into(), CLOSE_NO_SESSION_CAPACITY);
                                 return;
                             }
                         },
@@ -2255,7 +2518,7 @@ pub async fn run_quic_accept_loop(
             };
             let Some(active_session_guard) = try_acquire_active_session(&active_counts, principal)
             else {
-                conn.close(0u32.into(), b"active principal session cap reached");
+                conn.close(0u32.into(), CLOSE_PRINCIPAL_CAP);
                 return;
             };
             // The same shared guard follows handed-off streams into the upload
@@ -2305,6 +2568,15 @@ pub async fn run_quic_accept_loop(
                 // BLAKE3(ed25519_pub)[..16] — the same sixteen bytes a friend is
                 // known by. The grant is then looked up for *that* peer, so a
                 // friend cannot spend another friend's transfer.
+                // Only friends are ever granted a chat attachment, and the
+                // handshake already said whether this is one. A stranger is
+                // closed here, before the request is read or any grant looked
+                // up for them.
+                if !known_friend {
+                    debug!("QUIC accept: attachment stream from {remote} refused: not a friend");
+                    conn.close(0u32.into(), b"attachments are for friends");
+                    return;
+                }
                 let Some(ctx) = attach_serve else {
                     debug!("QUIC accept: attachment stream from {remote} but attachments are off");
                     return;
@@ -2383,13 +2655,12 @@ pub async fn run_quic_accept_loop(
                         return;
                     }
                 };
-                if payload_len as usize != RELAY_REQUEST_V2_PAYLOAD_LEN {
+                if !relay_request_payload_len_ok(payload_len as usize) {
                     debug!(
-                        "QUIC accept: RELAY_REQUEST from {remote} has unexpected payload_len {payload_len} (want {RELAY_REQUEST_V2_PAYLOAD_LEN}; v1 hash-only requests are rejected)"
+                        "QUIC accept: RELAY_REQUEST from {remote} has unexpected payload_len {payload_len} (want {RELAY_REQUEST_V2_PAYLOAD_LEN} or {RELAY_REQUEST_V3_PAYLOAD_LEN}; v1 hash-only requests are rejected)"
                     );
                     // Echo reject when we can (session id is in the header).
-                    let reject = build_relay_reject(peer_session_id, REJECT_AUTH);
-                    let _ = write_relay_control(&mut init_send, &reject, "send reject").await;
+                    send_relay_reject(&mut init_send, peer_session_id, REJECT_AUTH).await;
                     return;
                 }
 
@@ -2406,13 +2677,11 @@ pub async fn run_quic_accept_loop(
                 }
 
                 let verified =
-                    match parse_and_verify_relay_request_v2(peer_session_id, &payload_buf) {
+                    match parse_and_verify_relay_request(peer_session_id, &payload_buf) {
                         Ok(req) => req,
                         Err(reason) => {
                             debug!("QUIC accept: refusing relay request from {remote}: {reason}");
-                            let reject = build_relay_reject(peer_session_id, REJECT_BAD_SIGNATURE);
-                            let _ = write_relay_control(&mut init_send, &reject, "send reject")
-                                .await;
+                            send_relay_reject(&mut init_send, peer_session_id, REJECT_BAD_SIGNATURE).await;
                             return;
                         }
                     };
@@ -2429,8 +2698,7 @@ pub async fn run_quic_accept_loop(
                         "QUIC accept: refusing relay request from {remote} ({}): {reason}",
                         hex::encode(verified.requester_ember_hash)
                     );
-                    let reject = build_relay_reject(peer_session_id, REJECT_AUTH);
-                    let _ = write_relay_control(&mut init_send, &reject, "send reject").await;
+                    send_relay_reject(&mut init_send, peer_session_id, REJECT_AUTH).await;
                     return;
                 }
 
@@ -2447,8 +2715,7 @@ pub async fn run_quic_accept_loop(
                         "QUIC accept: refusing relay to target {}:{} from {remote}: {reason}",
                         verified.target_ip, verified.target_port
                     );
-                    let reject = build_relay_reject(peer_session_id, REJECT_BAD_TARGET);
-                    let _ = write_relay_control(&mut init_send, &reject, "send reject").await;
+                    send_relay_reject(&mut init_send, peer_session_id, REJECT_BAD_TARGET).await;
                     return;
                 }
 
@@ -2475,190 +2742,21 @@ pub async fn run_quic_accept_loop(
                     }
                 };
                 if let Some(reason) = reject_reason {
-                    let reject = build_relay_reject(peer_session_id, reason);
-                    let _ = write_relay_control(&mut init_send, &reject, "send reject").await;
+                    send_relay_reject(&mut init_send, peer_session_id, reason).await;
                     return;
                 }
 
-                let initiator_ip = match remote.ip() {
-                    std::net::IpAddr::V4(v4) => v4,
-                    _ => {
-                        debug!("QUIC accept: non-IPv4 remote {remote}");
-                        return;
-                    }
-                };
-                let initiator_port = remote.port();
-                let target_ip = verified.target_ip;
-                let target_port = verified.target_port;
-                let file_hash = verified.file_hash;
-
-                // Same rule as the reject above: the capacity refusal must not
-                // write while holding the manager lock.
-                let session_id = {
-                    let created = {
-                        let mut mgr_lock = mgr.lock().await;
-                        mgr_lock.create_session(
-                            initiator_ip,
-                            initiator_port,
-                            target_ip,
-                            target_port,
-                            file_hash,
-                        )
-                    };
-                    match created {
-                        Some(sid) => sid,
-                        None => {
-                            let reject = build_relay_reject(peer_session_id, REJECT_CAPACITY);
-                            let _ = write_relay_control(&mut init_send, &reject, "send reject")
-                                .await;
-                            debug!("QUIC accept: at capacity, rejected relay from {remote}");
-                            return;
-                        }
-                    }
-                };
-
-                let accept_msg = build_relay_accept(peer_session_id);
-                if let Err(e) =
-                    write_relay_control(&mut init_send, &accept_msg, "send ACCEPT").await
-                {
-                    debug!("QUIC accept: failed to send ACCEPT to {remote}: {e}");
-                    mgr.lock().await.remove_session(session_id);
-                    return;
-                }
-
-                info!(
-                    "Relay session {session_id}: accepted from {initiator_ip}:{initiator_port}, connecting to target {target_ip}:{target_port}"
-                );
-
-                let target_addr = SocketAddr::new(std::net::IpAddr::V4(target_ip), target_port);
-
-                let target_result = tokio::time::timeout(
-                    RELAY_TARGET_CONNECT_TIMEOUT,
-                    connect_relay_target(
-                        &ep,
-                        target_addr,
-                        session_id,
-                        &file_hash,
-                        verified.requester_ember_hash,
-                    ),
+                bridge_relay_request(
+                    &mgr,
+                    &ep,
+                    init_send,
+                    init_recv,
+                    peer_session_id,
+                    verified,
+                    remote,
+                    &limiter,
                 )
                 .await;
-
-                let (mut tgt_send, tgt_recv) = match target_result {
-                    Ok(Ok(streams)) => streams,
-                    Ok(Err(e)) => {
-                        info!("Relay session {session_id}: target connect failed: {e}");
-                        let close = build_relay_close(peer_session_id);
-                        let _ = write_relay_control(&mut init_send, &close, "send CLOSE").await;
-                        mgr.lock().await.remove_session(session_id);
-                        return;
-                    }
-                    Err(_) => {
-                        info!("Relay session {session_id}: target connect timed out");
-                        let close = build_relay_close(peer_session_id);
-                        let _ = write_relay_control(&mut init_send, &close, "send CLOSE").await;
-                        mgr.lock().await.remove_session(session_id);
-                        return;
-                    }
-                };
-
-                let session_present = {
-                    let mut mgr_lock = mgr.lock().await;
-                    if let Some(session) = mgr_lock.get_session_mut(session_id) {
-                        session.mark_active();
-                        info!(
-                            "Relay session {session_id}: bridging ({} active sessions)",
-                            mgr_lock.active_count()
-                        );
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if !session_present {
-                    // Cleanup can reap the slot while ACCEPT/target-connect
-                    // is still in flight; bridging without it would leave
-                    // the later `remove_session` as a no-op. Same CLOSE as
-                    // the target-connect failure paths: the initiator already
-                    // returned from ACCEPT and treats the stream as eD2K, so
-                    // CLOSE is abort signalling rather than a parsed control
-                    // frame, matching those siblings.
-                    let close = build_relay_close(peer_session_id);
-                    let _ = write_relay_control(&mut init_send, &close, "send CLOSE").await;
-                    let _ = init_send.finish();
-                    let _ = tgt_send.finish();
-                    return;
-                }
-
-                let bw_limit = RELAY_MAX_BYTES_PER_DIRECTION;
-                let relay_result = tokio::time::timeout(RELAY_MAX_DURATION, async {
-                    let mut i2t_limited = init_recv.take(bw_limit);
-                    let mut t2i_limited = tgt_recv.take(bw_limit);
-                    let i2t = copy_yielding_to_file_uploads(
-                        &mut i2t_limited,
-                        &mut tgt_send,
-                        &limiter,
-                        bw_limit,
-                    );
-                    let t2i = copy_yielding_to_file_uploads(
-                        &mut t2i_limited,
-                        &mut init_send,
-                        &limiter,
-                        bw_limit,
-                    );
-
-                    match tokio::try_join!(i2t, t2i) {
-                        Ok((i2t_bytes, t2i_bytes)) => {
-                            let total = i2t_bytes + t2i_bytes;
-                            if i2t_bytes >= bw_limit || t2i_bytes >= bw_limit {
-                                info!(
-                                    "Relay session {session_id}: per-direction byte ceiling reached (i→t: {i2t_bytes}B, t→i: {t2i_bytes}B)"
-                                );
-                            } else {
-                                info!(
-                                    "Relay session {session_id}: completed (i→t: {i2t_bytes}B, t→i: {t2i_bytes}B)"
-                                );
-                            }
-                            total
-                        }
-                        Err(e) => {
-                            debug!("Relay session {session_id}: IO error during relay: {e}");
-                            0
-                        }
-                    }
-                })
-                .await;
-
-                let total_bytes = match relay_result {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
-                        debug!("Relay session {session_id}: max duration reached");
-                        0
-                    }
-                };
-
-                let _ = init_send.finish();
-                let _ = tgt_send.finish();
-
-                {
-                    let mut mgr_lock = mgr.lock().await;
-                    // Record the final byte count on the still-active
-                    // session *before* removing it, so `remove_session`'s
-                    // fold into the manager's cumulative
-                    // `total_bytes_relayed` counter actually includes
-                    // this session's bytes instead of the pre-transfer 0.
-                    if let Some(session) = mgr_lock.get_session_mut(session_id) {
-                        session.add_relayed_bytes(total_bytes);
-                    }
-                    if let Some(session) = mgr_lock.remove_session(session_id) {
-                        info!(
-                            "Relay session {session_id} ended: {} bytes relayed ({} active, {} total relayed)",
-                            session.bytes_relayed,
-                            mgr_lock.active_count(),
-                            mgr_lock.total_bytes_relayed(),
-                        );
-                    }
-                }
             } else if msg_type == MSG_RELAY_CONNECT {
                 // === Relay target: a relay node is forwarding a client to us ===
                 let payload_len = u16::from_le_bytes([header[5], header[6]]) as usize;
@@ -2733,6 +2831,231 @@ pub async fn run_quic_accept_loop(
             }
         });
     }
+    // The main endpoint closing is what ends the loop; the legacy one goes
+    // with it, so its sessions close cleanly too.
+    if let Some(legacy) = legacy_endpoint {
+        legacy.close(0u32.into(), b"shutting down");
+    }
+}
+
+/// Serve a RELAY_REQUEST that has passed every check on who is asking and
+/// where to: take a session, reach the target, and only then ACCEPT and bridge.
+#[allow(clippy::too_many_arguments)]
+async fn bridge_relay_request(
+    mgr: &tokio::sync::Mutex<RelayManager>,
+    ep: &quinn::Endpoint,
+    mut init_send: quinn::SendStream,
+    init_recv: quinn::RecvStream,
+    peer_session_id: u32,
+    verified: RelayRequest,
+    remote: SocketAddr,
+    limiter: &crate::bandwidth::limiter::BandwidthLimiter,
+) {
+    let initiator_ip = match remote.ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        _ => {
+            debug!("QUIC accept: non-IPv4 remote {remote}");
+            return;
+        }
+    };
+    let initiator_port = remote.port();
+    let target_ip = verified.target_ip;
+    let target_port = verified.target_port;
+    let file_hash = verified.file_hash;
+
+    // As for the accept path's rejects: the capacity refusal must not
+    // write while holding the manager lock.
+    let session_id = {
+        let created = {
+            let mut mgr_lock = mgr.lock().await;
+            mgr_lock.create_session(
+                verified.requester_ember_hash,
+                initiator_ip,
+                initiator_port,
+                target_ip,
+                target_port,
+                file_hash,
+            )
+        };
+        match created {
+            Some(sid) => sid,
+            None => {
+                send_relay_reject(&mut init_send, peer_session_id, REJECT_CAPACITY).await;
+                debug!("QUIC accept: at capacity, rejected relay from {remote}");
+                return;
+            }
+        }
+    };
+
+    info!(
+        "Relay session {session_id}: request from {initiator_ip}:{initiator_port}, connecting to target {target_ip}:{target_port}"
+    );
+
+    // Target first, ACCEPT after. The initiator takes ACCEPT as a
+    // working relay and starts speaking eD2K on the stream, so an
+    // ACCEPT sent before the target answered turned every unreachable
+    // target into a recorded success: its CLOSE arrived as the reply
+    // to the initiator's Hello, and the relay's failure count was
+    // cleared each time.
+    let target_addr = SocketAddr::new(std::net::IpAddr::V4(target_ip), target_port);
+
+    let target_result = tokio::time::timeout(
+        RELAY_TARGET_CONNECT_TIMEOUT,
+        connect_relay_target(
+            ep,
+            target_addr,
+            session_id,
+            &file_hash,
+            verified.requester_ember_hash,
+            verified.target_node_id,
+        ),
+    )
+    .await;
+
+    let unreachable = match &target_result {
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => Some(format!("target connect failed: {e}")),
+        Err(_) => Some("target connect timed out".to_string()),
+    };
+    if let Some(why) = unreachable {
+        info!("Relay session {session_id}: {why}");
+        mgr.lock().await.remove_session(session_id);
+        send_relay_reject(&mut init_send, peer_session_id, REJECT_TARGET_UNREACHABLE).await;
+        return;
+    }
+    let Ok(Ok((mut tgt_send, tgt_recv))) = target_result else {
+        return;
+    };
+
+    let session_present = {
+        let mut mgr_lock = mgr.lock().await;
+        if let Some(session) = mgr_lock.get_session_mut(session_id) {
+            session.mark_active();
+            info!(
+                "Relay session {session_id}: bridging ({} active sessions)",
+                mgr_lock.active_count()
+            );
+            true
+        } else {
+            false
+        }
+    };
+    if !session_present {
+        // Cleanup can reap the slot while the target connect is in
+        // flight; bridging without it would leave the later
+        // `remove_session` as a no-op. Nothing is accepted yet, so
+        // the initiator still reads this as a refusal.
+        let _ = tgt_send.finish();
+        send_relay_reject(&mut init_send, peer_session_id, REJECT_CAPACITY).await;
+        return;
+    }
+
+    let accept_msg = build_relay_accept(peer_session_id);
+    if let Err(e) =
+        write_relay_control(&mut init_send, &accept_msg, "send ACCEPT").await
+    {
+        debug!("QUIC accept: failed to send ACCEPT to {remote}: {e}");
+        mgr.lock().await.remove_session(session_id);
+        let _ = tgt_send.finish();
+        return;
+    }
+
+    let bw_limit = RELAY_MAX_BYTES_PER_DIRECTION;
+    let moved = std::sync::atomic::AtomicU64::new(0);
+    let relay_result = tokio::time::timeout(RELAY_MAX_DURATION, async {
+        let mut i2t_limited = init_recv.take(bw_limit);
+        let mut t2i_limited = tgt_recv.take(bw_limit);
+        // Each direction's end is passed on when it is reached, not once both
+        // are: a peer that finishes and waits for the other side to do the same
+        // would otherwise hold the session until the idle timeout.
+        let i2t = async {
+            let copied = copy_yielding_to_file_uploads(
+                &mut i2t_limited,
+                &mut tgt_send,
+                limiter,
+                bw_limit,
+                &moved,
+            )
+            .await?;
+            let _ = tgt_send.finish();
+            Ok::<_, std::io::Error>(copied)
+        };
+        let t2i = async {
+            let copied = copy_yielding_to_file_uploads(
+                &mut t2i_limited,
+                &mut init_send,
+                limiter,
+                bw_limit,
+                &moved,
+            )
+            .await?;
+            let _ = init_send.finish();
+            Ok::<_, std::io::Error>(copied)
+        };
+
+        tokio::select! {
+            joined = async { tokio::try_join!(i2t, t2i) } => match joined {
+                Ok((i2t_bytes, t2i_bytes)) => {
+                    if i2t_bytes >= bw_limit || t2i_bytes >= bw_limit {
+                        info!(
+                            "Relay session {session_id}: per-direction byte ceiling reached (i→t: {i2t_bytes}B, t→i: {t2i_bytes}B)"
+                        );
+                    } else {
+                        info!(
+                            "Relay session {session_id}: completed (i→t: {i2t_bytes}B, t→i: {t2i_bytes}B)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    debug!("Relay session {session_id}: IO error during relay: {e}");
+                }
+            },
+            () = relay_bridge_stalled(
+                &moved,
+                RELAY_BRIDGE_IDLE_TIMEOUT,
+                RELAY_BRIDGE_IDLE_CHECK,
+            ) => {
+                info!(
+                    "Relay session {session_id}: nothing moved for {}s, closing the bridge",
+                    RELAY_BRIDGE_IDLE_TIMEOUT.as_secs()
+                );
+            }
+        }
+    })
+    .await;
+    if relay_result.is_err() {
+        debug!("Relay session {session_id}: max duration reached");
+    }
+    let total_bytes = moved.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Returning drops both connections, and quinn discards whatever they still
+    // hold unsent, as it did the REJECT in `send_relay_reject`.
+    let _ = init_send.finish();
+    let _ = tgt_send.finish();
+    let _ = tokio::time::timeout(RELAY_BRIDGE_DRAIN_TIMEOUT, async {
+        tokio::join!(init_send.stopped(), tgt_send.stopped())
+    })
+    .await;
+
+    {
+        let mut mgr_lock = mgr.lock().await;
+        // Record the final byte count on the still-active
+        // session *before* removing it, so `remove_session`'s
+        // fold into the manager's cumulative
+        // `total_bytes_relayed` counter actually includes
+        // this session's bytes instead of the pre-transfer 0.
+        if let Some(session) = mgr_lock.get_session_mut(session_id) {
+            session.add_relayed_bytes(total_bytes);
+        }
+        if let Some(session) = mgr_lock.remove_session(session_id) {
+            info!(
+                "Relay session {session_id} ended: {} bytes relayed ({} active, {} total relayed)",
+                session.bytes_relayed,
+                mgr_lock.active_count(),
+                mgr_lock.total_bytes_relayed(),
+            );
+        }
+    }
 }
 
 /// Connect to a target peer for relay bridging. Sends RELAY_CONNECT to
@@ -2740,12 +3063,15 @@ pub async fn run_quic_accept_loop(
 ///
 /// `requester_node_id` is the handshake-proven identity of the peer that asked
 /// for the bridge, used to establish that the far end is somebody else.
+/// `expected_target` is the identity a v3 request names, which the far end
+/// must then be.
 async fn connect_relay_target(
     endpoint: &quinn::Endpoint,
     target_addr: SocketAddr,
     session_id: u32,
     file_hash: &[u8; 16],
     requester_node_id: [u8; 16],
+    expected_target: Option<[u8; 16]>,
 ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
     let conn = endpoint
         .connect(target_addr, "ember-relay")
@@ -2759,18 +3085,22 @@ async fn connect_relay_target(
     // the certificate quinn has already proved possession of, rather than
     // treating "something completed TLS on that port" as the target.
     //
-    // The v2 RELAY_REQUEST carries no expected node id for the target, so this
-    // cannot yet be a pin — an initiator that names the wrong address reaches
-    // whichever Ember node lives there. Extending the request to carry the
-    // target's node id (the initiator learns it from the same source metadata
-    // it dials) would let this comparison become an equality check and remove
-    // the last caller-chosen degree of freedom from the dial.
+    // A v2 RELAY_REQUEST carries no expected node id, so for those this is not
+    // a pin: an initiator that names the wrong address reaches whichever Ember
+    // node lives there.
     let Some(target_node_id) = super::quic::connection_node_id(&conn) else {
         conn.close(0u32.into(), b"relay target has no ember identity");
         return Err(format!(
             "target {target_addr} has no verifiable Ember identity"
         ));
     };
+    if expected_target.is_some_and(|expected| expected != target_node_id) {
+        conn.close(0u32.into(), b"relay target is not the named node");
+        return Err(format!(
+            "target {target_addr} is {}, not the node the request named",
+            hex::encode(target_node_id)
+        ));
+    }
     // A target that turns out to be the requester itself — same identity on a
     // different address, so the address-level check on the accept path cannot
     // see it — is asking this node to loop its bytes back to it, at the cost
@@ -2882,7 +3212,14 @@ pub async fn connect_server_relay(
         tokio_tungstenite::client_async_tls_with_config(
             request,
             tcp_stream,
-            None,
+            // Enforced as frames are read. The defaults allow 64 MiB, which
+            // tungstenite buffers in full before the `MAX_WS_RELAY_FRAME`
+            // check on the read path ever sees it.
+            Some(
+                tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                    .max_message_size(Some(MAX_WS_RELAY_FRAME))
+                    .max_frame_size(Some(MAX_WS_RELAY_FRAME)),
+            ),
             None,
         ),
     )
@@ -2928,7 +3265,7 @@ mod tests {
         let ember_hash = super::super::crypto::node_id_from_public_key(&sk.verifying_key());
         let secret = sk.to_bytes();
 
-        let msg = build_relay_request_v2(
+        let msg = build_relay_request(
             1,
             ip,
             port,
@@ -2937,18 +3274,66 @@ mod tests {
             &pk,
             &ember_hash,
             &secret,
+            None,
         );
         let (msg_type, sid, payload) = decode_relay_message(&msg).unwrap();
         assert_eq!(msg_type, MSG_RELAY_REQUEST);
         assert_eq!(sid, 1);
         assert_eq!(payload.len(), RELAY_REQUEST_V2_PAYLOAD_LEN);
-        let parsed = parse_and_verify_relay_request_v2(1, payload).unwrap();
+        let parsed = parse_and_verify_relay_request(1, payload).unwrap();
         assert_eq!(parsed.target_ip, ip);
         assert_eq!(parsed.target_port, port);
         assert_eq!(parsed.file_hash, file_hash);
         assert_eq!(parsed.attestation_hash, attestation_hash);
         assert_eq!(parsed.requester_pubkey, pk);
         assert_eq!(parsed.requester_ember_hash, ember_hash);
+        assert_eq!(parsed.target_node_id, None);
+    }
+
+    /// v3 carries the target's node id under the signature, and the two
+    /// versions' signatures cannot stand in for each other.
+    #[test]
+    fn relay_request_v3_carries_a_signed_target_id() {
+        let sk = super::super::crypto::signing_key_from_bytes(&[8u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let ember_hash = super::super::crypto::node_id_from_public_key(&sk.verifying_key());
+        let secret = sk.to_bytes();
+        let target = [0x5Au8; 16];
+        let msg = build_relay_request(
+            3,
+            Ipv4Addr::new(1, 2, 3, 4),
+            4700,
+            &[0xAA; 16],
+            &[0xBB; 32],
+            &pk,
+            &ember_hash,
+            &secret,
+            Some(&target),
+        );
+        let (_, sid, payload) = decode_relay_message(&msg).unwrap();
+        assert_eq!(payload.len(), RELAY_REQUEST_V3_PAYLOAD_LEN);
+        let parsed = parse_and_verify_relay_request(sid, payload).unwrap();
+        assert_eq!(parsed.target_node_id, Some(target));
+        assert_eq!(parsed.target_port, 4700);
+
+        let mut other_target = payload.to_vec();
+        other_target[119] ^= 0x01;
+        assert!(
+            parse_and_verify_relay_request(sid, &other_target).is_err(),
+            "the target id is under the signature"
+        );
+
+        // A v3 body relabelled v2 and cut to v2's length keeps v2's layout up
+        // to the nonce, but the signature bytes are the node id and the domain
+        // differs, so it cannot verify.
+        let mut downgraded = payload[..RELAY_REQUEST_V2_PAYLOAD_LEN].to_vec();
+        downgraded[0] = RELAY_REQUEST_VERSION;
+        downgraded[119..183].copy_from_slice(&payload[135..199]);
+        assert!(parse_and_verify_relay_request(sid, &downgraded).is_err());
+
+        let mut wrong_length = payload.to_vec();
+        wrong_length[0] = RELAY_REQUEST_VERSION;
+        assert!(parse_and_verify_relay_request(sid, &wrong_length).is_err());
     }
 
     #[test]
@@ -2957,7 +3342,7 @@ mod tests {
         let pk = sk.verifying_key().to_bytes();
         let ember_hash = super::super::crypto::node_id_from_public_key(&sk.verifying_key());
         let secret = sk.to_bytes();
-        let msg = build_relay_request_v2(
+        let msg = build_relay_request(
             42,
             Ipv4Addr::new(8, 8, 8, 8),
             4662,
@@ -2966,11 +3351,12 @@ mod tests {
             &pk,
             &ember_hash,
             &secret,
+            None,
         );
         let (_, sid, payload) = decode_relay_message(&msg).unwrap();
         let mut bad = payload.to_vec();
         bad[7] ^= 0xFF; // flip a file_hash byte under the signature
-        assert!(parse_and_verify_relay_request_v2(sid, &bad).is_err());
+        assert!(parse_and_verify_relay_request(sid, &bad).is_err());
     }
 
     #[test]
@@ -2979,7 +3365,7 @@ mod tests {
         let pk = sk.verifying_key().to_bytes();
         let secret = sk.to_bytes();
         let wrong_hash = [0xABu8; 16];
-        let msg = build_relay_request_v2(
+        let msg = build_relay_request(
             7,
             Ipv4Addr::new(1, 1, 1, 1),
             4662,
@@ -2988,9 +3374,10 @@ mod tests {
             &pk,
             &wrong_hash,
             &secret,
+            None,
         );
         let (_, sid, payload) = decode_relay_message(&msg).unwrap();
-        assert!(parse_and_verify_relay_request_v2(sid, payload).is_err());
+        assert!(parse_and_verify_relay_request(sid, payload).is_err());
     }
 
     /// A verified signature is proof of identity, not of a relationship. The
@@ -3290,19 +3677,20 @@ mod tests {
     fn active_relay_ignores_waiting_session_idle_timeout() {
         let mut session = RelaySession::new(
             1,
+            [0xA1; 16],
             Ipv4Addr::new(1, 2, 3, 4),
             4662,
             Ipv4Addr::new(5, 6, 7, 8),
             4663,
             [1u8; 16],
         );
-        session.last_activity = Instant::now() - RELAY_IDLE_TIMEOUT - Duration::from_secs(1);
-        assert!(session.is_expired());
+        let idle = session.last_activity + RELAY_IDLE_TIMEOUT + Duration::from_secs(1);
+        assert!(session.is_expired_at(idle));
 
         session.mark_active();
-        session.last_activity = Instant::now() - RELAY_IDLE_TIMEOUT - Duration::from_secs(1);
+        let idle = session.last_activity + RELAY_IDLE_TIMEOUT + Duration::from_secs(1);
         assert!(
-            !session.is_expired(),
+            !session.is_expired_at(idle),
             "active bridges remain tracked until the hard duration cap"
         );
     }
@@ -3323,6 +3711,7 @@ mod tests {
 
         let sid = mgr
             .create_session(
+                [0xA1; 16],
                 Ipv4Addr::new(1, 2, 3, 4),
                 4662,
                 Ipv4Addr::new(5, 6, 7, 8),
@@ -3349,6 +3738,7 @@ mod tests {
 
         let sid = mgr
             .create_session(
+                [0xA1; 16],
                 Ipv4Addr::new(1, 2, 3, 4),
                 4662,
                 Ipv4Addr::new(5, 6, 7, 8),
@@ -3370,6 +3760,7 @@ mod tests {
         // A second session's bytes accumulate on top rather than replacing.
         let sid2 = mgr
             .create_session(
+                [0xA2; 16],
                 Ipv4Addr::new(9, 9, 9, 9),
                 4662,
                 Ipv4Addr::new(5, 6, 7, 8),
@@ -3390,6 +3781,7 @@ mod tests {
             ip_bytes[3] = (i + 1) as u8;
             assert!(mgr
                 .create_session(
+                    [i as u8; 16],
                     Ipv4Addr::from(ip_bytes),
                     4662,
                     Ipv4Addr::new(10, 10, 10, 10),
@@ -3401,6 +3793,7 @@ mod tests {
         // Next one should fail
         assert!(mgr
             .create_session(
+                [0xFF; 16],
                 Ipv4Addr::new(99, 99, 99, 99),
                 4662,
                 Ipv4Addr::new(10, 10, 10, 10),
@@ -3408,6 +3801,82 @@ mod tests {
                 [0xFF; 16],
             )
             .is_none());
+    }
+
+    /// One requester, however many transfers it has, cannot take every slot.
+    #[test]
+    fn one_requester_holds_at_most_its_share_of_the_relay() {
+        let mut mgr = RelayManager::new();
+        let greedy = [0xB1; 16];
+        let open = |mgr: &mut RelayManager, requester: [u8; 16], port: u16| {
+            mgr.create_session(
+                requester,
+                Ipv4Addr::new(1, 2, 3, 4),
+                port,
+                Ipv4Addr::new(10, 10, 10, 10),
+                4663,
+                [7u8; 16],
+            )
+        };
+        let mut held = Vec::new();
+        for port in 0..MAX_RELAY_SESSIONS_PER_REQUESTER as u16 {
+            held.push(open(&mut mgr, greedy, 5000 + port).expect("within its share"));
+        }
+        assert!(open(&mut mgr, greedy, 6000).is_none(), "over its share");
+        assert!(
+            open(&mut mgr, [0xB2; 16], 6001).is_some(),
+            "another requester still gets a slot"
+        );
+        mgr.remove_session(held[0]);
+        assert!(open(&mut mgr, greedy, 6002).is_some(), "an ended session frees its slot");
+    }
+
+    /// A bridge that moves nothing is closed after the idle limit, and one that
+    /// keeps moving is not.
+    #[tokio::test]
+    async fn a_silent_bridge_is_closed_and_a_busy_one_is_not() {
+        let idle = Duration::from_millis(200);
+        let check = Duration::from_millis(20);
+        let moved = std::sync::atomic::AtomicU64::new(0);
+        let started = tokio::time::Instant::now();
+        relay_bridge_stalled(&moved, idle, check).await;
+        assert!(started.elapsed() >= idle);
+
+        let moved = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let feeder = {
+            let moved = moved.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(check).await;
+                    moved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        };
+        let busy =
+            tokio::time::timeout(idle * 4, relay_bridge_stalled(&moved, idle, check)).await;
+        feeder.abort();
+        assert!(busy.is_err(), "a bridge still moving bytes is left alone");
+    }
+
+    /// The bytes a session is credited with are the ones that crossed, even when
+    /// it ends in an error rather than a clean close.
+    #[tokio::test]
+    async fn copied_bytes_are_counted_as_they_land() {
+        let limiter = crate::bandwidth::limiter::BandwidthLimiter::new(0, 0);
+        let moved = std::sync::atomic::AtomicU64::new(0);
+        let mut reader: &[u8] = &[5u8; RELAY_PACE_CHUNK * 3 + 17];
+        let mut writer = Vec::new();
+        let copied = copy_yielding_to_file_uploads(
+            &mut reader,
+            &mut writer,
+            &limiter,
+            u64::MAX,
+            &moved,
+        )
+        .await
+        .unwrap();
+        assert_eq!(copied, (RELAY_PACE_CHUNK * 3 + 17) as u64);
+        assert_eq!(moved.load(std::sync::atomic::Ordering::Relaxed), copied);
     }
 
     #[test]
@@ -3530,5 +3999,398 @@ mod tests {
             quic_incoming_address_policy(true),
             QuicIncomingAddressPolicy::ApplyAdmissionLimits
         );
+    }
+
+    /// A bridge still inside its own two hours outlives its session's clock,
+    /// which started before the target connect; cleanup leaves it for the
+    /// bridge to credit and remove, and reaps only one whose task is gone.
+    #[test]
+    fn cleanup_leaves_an_active_bridge_to_credit_its_own_bytes() {
+        // Judged from ahead rather than with sessions dated back, which a
+        // machine up for less than two hours cannot do.
+        let past_max = |created: Instant| created + RELAY_MAX_DURATION + Duration::from_secs(25);
+        let past_backstop = |created: Instant| created + RELAY_ACTIVE_BACKSTOP + Duration::from_secs(1);
+        let mut mgr = RelayManager::new();
+        let open = |mgr: &mut RelayManager, requester: u8| {
+            mgr.create_session(
+                [requester; 16],
+                Ipv4Addr::new(1, 2, 3, 4),
+                4662,
+                Ipv4Addr::new(5, 6, 7, 8),
+                4663,
+                [1u8; 16],
+            )
+            .unwrap()
+        };
+
+        let bridging = open(&mut mgr, 1);
+        let session = mgr.get_session_mut(bridging).unwrap();
+        session.mark_active();
+        let at = past_max(session.created);
+        assert!(mgr.cleanup_at(at).is_empty(), "the bridge still owns this session");
+        mgr.get_session_mut(bridging).unwrap().add_relayed_bytes(1234);
+        mgr.remove_session(bridging);
+        assert_eq!(mgr.total_bytes_relayed(), 1234);
+
+        let orphaned = open(&mut mgr, 2);
+        let session = mgr.get_session_mut(orphaned).unwrap();
+        session.mark_active();
+        let at = past_backstop(session.created);
+        assert_eq!(mgr.cleanup_at(at), vec![orphaned], "a session no bridge removed is reaped");
+
+        let waiting = open(&mut mgr, 3);
+        let session = mgr.get_session_mut(waiting).unwrap();
+        let at = past_max(session.created);
+        session.last_activity = at;
+        assert_eq!(mgr.cleanup_at(at), vec![waiting], "a session never bridged keeps the old limit");
+    }
+
+    struct LoopbackPeer {
+        secret: [u8; 32],
+        pubkey: [u8; 32],
+        node_id: [u8; 16],
+        endpoint: quinn::Endpoint,
+        addr: SocketAddr,
+    }
+
+    async fn loopback_peer() -> LoopbackPeer {
+        let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let secret = signing.to_bytes();
+        let (cert, key) = super::super::quic::generate_self_signed_cert(&secret).unwrap();
+        let (endpoint, _) = super::super::quic::build_server_client_endpoint(&cert, &key, 0, false)
+            .await
+            .unwrap();
+        let addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            endpoint.local_addr().unwrap().port(),
+        );
+        LoopbackPeer {
+            secret,
+            pubkey: signing.verifying_key().to_bytes(),
+            node_id: super::super::crypto::node_id_from_public_key(&signing.verifying_key()),
+            endpoint,
+            addr,
+        }
+    }
+
+    /// Ask `relay` over the real initiator path to bridge to `target`, naming
+    /// `target_node_id` so the relay pins its dial.
+    async fn request_relay(
+        initiator: &LoopbackPeer,
+        relay: &LoopbackPeer,
+        target: &LoopbackPeer,
+        target_node_id: [u8; 16],
+    ) -> Result<(quinn::SendStream, quinn::RecvStream), RelayDialError> {
+        connect_to_peer_relay(
+            &initiator.endpoint,
+            relay.addr,
+            Ipv4Addr::LOCALHOST,
+            target.addr.port(),
+            Some(target_node_id),
+            &[0x42; 16],
+            &[0x33; 32],
+            &initiator.pubkey,
+            &initiator.node_id,
+            &initiator.secret,
+            None,
+        )
+        .await
+    }
+
+    /// The relay's half of one RELAY_REQUEST, past the checks on who is asking
+    /// and where to, which refuse any loopback target.
+    async fn serve_one_relay_request(
+        relay: quinn::Endpoint,
+        mgr: std::sync::Arc<tokio::sync::Mutex<RelayManager>>,
+    ) {
+        let conn = relay.accept().await.unwrap().await.unwrap();
+        let (send, mut recv) = conn.accept_bi().await.unwrap();
+        let mut header = [0u8; 7];
+        recv.read_exact(&mut header).await.unwrap();
+        let (_, session_id, len) = decode_relay_header(&header).unwrap();
+        let mut payload = vec![0u8; len as usize];
+        recv.read_exact(&mut payload).await.unwrap();
+        let verified = parse_and_verify_relay_request(session_id, &payload).unwrap();
+        let limiter = crate::bandwidth::limiter::BandwidthLimiter::new(0, 0);
+        bridge_relay_request(
+            &mgr,
+            &relay,
+            send,
+            recv,
+            session_id,
+            verified,
+            conn.remote_address(),
+            &limiter,
+        )
+        .await;
+    }
+
+    /// ACCEPT is what the initiator takes as a working relay, so it must not
+    /// arrive before the relay has reached the target. The target holds its
+    /// handshake back; an ACCEPT sent first would be read while it waits. The
+    /// session is then bridged and credited with what crossed it.
+    #[tokio::test]
+    async fn the_relay_accepts_only_once_the_target_is_reached() {
+        let initiator = loopback_peer().await;
+        let relay = loopback_peer().await;
+        let target = loopback_peer().await;
+        let answering = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let target_task = {
+            let endpoint = target.endpoint.clone();
+            let answering = answering.clone();
+            tokio::spawn(async move {
+                let incoming = endpoint.accept().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                answering.store(true, std::sync::atomic::Ordering::SeqCst);
+                let conn = incoming.await.unwrap();
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                let mut connect = [0u8; 23];
+                recv.read_exact(&mut connect).await.unwrap();
+                assert_eq!(connect[0], MSG_RELAY_CONNECT);
+                assert_eq!(&connect[7..], &[0x42; 16]);
+                let mut ping = [0u8; 4];
+                recv.read_exact(&mut ping).await.unwrap();
+                send.write_all(&ping).await.unwrap();
+                send.finish().unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await;
+            })
+        };
+        let mgr = std::sync::Arc::new(tokio::sync::Mutex::new(RelayManager::new()));
+        let relay_task = tokio::spawn(serve_one_relay_request(relay.endpoint.clone(), mgr.clone()));
+
+        let (mut send, mut recv) = request_relay(&initiator, &relay, &target, target.node_id)
+            .await
+            .expect("the relay reached the target");
+        assert!(
+            answering.load(std::sync::atomic::Ordering::SeqCst),
+            "ACCEPT arrived before the target was reached"
+        );
+
+        send.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(10), recv.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&echoed, b"ping");
+        send.finish().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), relay_task)
+            .await
+            .expect("the bridge ends once both sides have finished")
+            .unwrap();
+        let mgr = mgr.lock().await;
+        assert_eq!(mgr.active_count(), 0);
+        assert_eq!(mgr.total_bytes_relayed(), 8);
+        target_task.abort();
+    }
+
+    /// A target that cannot be reached, here one proving another node than the
+    /// request named, is answered with REJECT and never ACCEPT, so the
+    /// initiator does not blame the relay and the session slot is released.
+    #[tokio::test]
+    async fn the_relay_rejects_when_it_cannot_reach_the_target() {
+        let initiator = loopback_peer().await;
+        let relay = loopback_peer().await;
+        let target = loopback_peer().await;
+        let target_task = {
+            let endpoint = target.endpoint.clone();
+            tokio::spawn(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        conn.closed().await;
+                    }
+                }
+            })
+        };
+        let mgr = std::sync::Arc::new(tokio::sync::Mutex::new(RelayManager::new()));
+        let relay_task = tokio::spawn(serve_one_relay_request(relay.endpoint.clone(), mgr.clone()));
+
+        let refused = request_relay(&initiator, &relay, &target, [0xEE; 16])
+            .await
+            .expect_err("the relay must not accept");
+        assert!(!refused.relay_at_fault, "{}", refused.reason);
+        assert!(refused.reason.contains("could not reach the source"), "{}", refused.reason);
+        tokio::time::timeout(Duration::from_secs(10), relay_task).await.unwrap().unwrap();
+        assert_eq!(mgr.lock().await.active_count(), 0);
+        target_task.abort();
+    }
+
+    /// The REJECT is read by the initiator even though the relay drops the
+    /// connection straight after sending it, which would otherwise discard it
+    /// and look like an unreachable relay.
+    #[tokio::test]
+    async fn a_reject_reaches_the_initiator_before_the_connection_closes() {
+        let initiator = loopback_peer().await;
+        let relay = loopback_peer().await;
+        let target = loopback_peer().await;
+        let relay_task = {
+            let endpoint = relay.endpoint.clone();
+            tokio::spawn(async move {
+                let conn = endpoint.accept().await.unwrap().await.unwrap();
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                let mut header = [0u8; 7];
+                recv.read_exact(&mut header).await.unwrap();
+                let (_, session_id, len) = decode_relay_header(&header).unwrap();
+                let mut payload = vec![0u8; len as usize];
+                recv.read_exact(&mut payload).await.unwrap();
+                send_relay_reject(&mut send, session_id, REJECT_CAPACITY).await;
+            })
+        };
+
+        let refused = request_relay(&initiator, &relay, &target, target.node_id)
+            .await
+            .expect_err("the relay refused");
+        assert!(refused.relay_busy, "{}", refused.reason);
+        assert!(!refused.relay_at_fault, "{}", refused.reason);
+        relay_task.await.unwrap();
+    }
+
+    /// A relay with no room turns a dial away before any REJECT can be sent:
+    /// by refusing the handshake, which anyone at its address could send and so
+    /// is still charged to it, or by closing the connection the handshake
+    /// proved is its own, which is a busy relay and nothing more.
+    #[tokio::test]
+    async fn a_relay_turning_a_dial_away_for_room_reads_as_busy() {
+        let initiator = loopback_peer().await;
+        let relay = loopback_peer().await;
+        let target = loopback_peer().await;
+        let relay_task = {
+            let endpoint = relay.endpoint.clone();
+            tokio::spawn(async move {
+                endpoint.accept().await.unwrap().refuse();
+                let conn = endpoint.accept().await.unwrap().await.unwrap();
+                conn.close(0u32.into(), CLOSE_PRINCIPAL_CAP);
+            })
+        };
+
+        let refused = request_relay(&initiator, &relay, &target, target.node_id)
+            .await
+            .expect_err("the handshake was refused");
+        assert!(refused.relay_busy && refused.relay_at_fault, "{}", refused.reason);
+        let closed = request_relay(&initiator, &relay, &target, target.node_id)
+            .await
+            .expect_err("the connection was closed");
+        assert!(closed.relay_busy && !closed.relay_at_fault, "{}", closed.reason);
+        relay_task.await.unwrap();
+    }
+
+    /// A direction the target finishes is passed on at once, while the
+    /// initiator's is still open, and what the relay still holds for the
+    /// initiator when the bridge ends arrives instead of going down with the
+    /// connection.
+    #[tokio::test]
+    async fn a_finished_direction_reaches_the_initiator_whole_and_at_once() {
+        const REPLY_LEN: usize = 1024 * 1024;
+        for initiator_finishes_first in [false, true] {
+            let initiator = loopback_peer().await;
+            let relay = loopback_peer().await;
+            let target = loopback_peer().await;
+            let target_task = {
+                let endpoint = target.endpoint.clone();
+                tokio::spawn(async move {
+                    let conn = endpoint.accept().await.unwrap().await.unwrap();
+                    let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                    let mut connect_and_ping = [0u8; 23 + 4];
+                    recv.read_exact(&mut connect_and_ping).await.unwrap();
+                    send.write_all(&vec![0x5A; REPLY_LEN]).await.unwrap();
+                    send.finish().unwrap();
+                    let _ = send.stopped().await;
+                    let _ = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await;
+                })
+            };
+            let mgr = std::sync::Arc::new(tokio::sync::Mutex::new(RelayManager::new()));
+            let relay_task =
+                tokio::spawn(serve_one_relay_request(relay.endpoint.clone(), mgr.clone()));
+
+            let (mut send, mut recv) = request_relay(&initiator, &relay, &target, target.node_id)
+                .await
+                .expect("the relay reached the target");
+            send.write_all(b"ping").await.unwrap();
+            let bridge_ended = async {
+                tokio::time::timeout(Duration::from_secs(10), relay_task)
+                    .await
+                    .expect("the bridge ends once both sides have finished")
+                    .unwrap();
+            };
+            let reply = if initiator_finishes_first {
+                send.finish().unwrap();
+                bridge_ended.await;
+                recv.read_to_end(REPLY_LEN).await
+            } else {
+                let reply = tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(REPLY_LEN))
+                    .await
+                    .expect("the target's end was passed on");
+                send.finish().unwrap();
+                bridge_ended.await;
+                reply
+            };
+            assert_eq!(
+                reply.expect("everything the target sent arrived").len(),
+                REPLY_LEN,
+                "initiator_finishes_first={initiator_finishes_first}"
+            );
+            assert_eq!(mgr.lock().await.total_bytes_relayed(), (4 + REPLY_LEN) as u64);
+            target_task.abort();
+        }
+    }
+
+    /// With a v3 request the relay bridges only to the node it names: a
+    /// certificate proving any other identity at that address is refused, and
+    /// the named one is reached and told which file is wanted.
+    #[tokio::test]
+    async fn connect_relay_target_refuses_a_target_proving_another_node() {
+        let relay = loopback_peer().await;
+        let target = loopback_peer().await;
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel::<[u8; 23]>(4);
+        let target_task = {
+            let endpoint = target.endpoint.clone();
+            tokio::spawn(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    let seen_tx = seen_tx.clone();
+                    tokio::spawn(async move {
+                        let Ok(conn) = incoming.await else { return };
+                        if let Ok((_send, mut recv)) = conn.accept_bi().await {
+                            let mut connect = [0u8; 23];
+                            if recv.read_exact(&mut connect).await.is_ok() {
+                                let _ = seen_tx.send(connect).await;
+                            }
+                        }
+                        conn.closed().await;
+                    });
+                }
+            })
+        };
+        let requester = [0xAA; 16];
+
+        let wrong = connect_relay_target(
+            &relay.endpoint,
+            target.addr,
+            7,
+            &[0x42; 16],
+            requester,
+            Some([0xEE; 16]),
+        )
+        .await;
+        assert!(wrong.is_err_and(|e| e.contains("not the node the request named")));
+
+        let (_send, _recv) = connect_relay_target(
+            &relay.endpoint,
+            target.addr,
+            7,
+            &[0x42; 16],
+            requester,
+            Some(target.node_id),
+        )
+        .await
+        .expect("the named node is reached");
+        let connect = tokio::time::timeout(Duration::from_secs(10), seen_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_relay_message(&connect),
+            Some((MSG_RELAY_CONNECT, 7, &[0x42u8; 16][..]))
+        );
+        target_task.abort();
     }
 }

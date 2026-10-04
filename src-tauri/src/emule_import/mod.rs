@@ -591,12 +591,7 @@ fn classify_shared_folders(
         if out.iter().any(|(p, _)| *p == canonical) {
             continue;
         }
-        let sensitive = canonical.components().any(|c| match c {
-            std::path::Component::Normal(seg) => {
-                crate::sharing::is_sensitive_dir_name(&seg.to_string_lossy())
-            }
-            _ => false,
-        });
+        let sensitive = crate::sharing::path_has_sensitive_component(&canonical);
         let covers_data = data_canon == canonical || data_canon.starts_with(&canonical);
         let status = if sensitive || covers_data {
             FolderStatus::Refused

@@ -21,7 +21,11 @@ pub(in crate::network) async fn on_mapping_keepalive_tick(
     udp_map_ka_started_at: &mut Option<tokio::time::Instant>,
 ) {
     let now = tokio::time::Instant::now();
-    if !state.stun_keepalive_enabled {
+    // Idle is a reason not to run too: the results are only applied while
+    // something needs the mapping (`stun_keepalive_should_run`), so a cycle
+    // started without one sent STUN and up to seven TCP connects every 20 s to
+    // be thrown away.
+    if !state.stun_keepalive_enabled || !mapping_probe_has_active_reason(state) {
         state.stats.stun_keepalive_active = false;
         *next_mapping_ka_at = now
             + ember::mapping_keepalive::MAPPING_KEEPALIVE_INTERVAL;
@@ -105,11 +109,18 @@ pub(in crate::network) async fn on_mapping_keepalive_tick(
             mapped,
         });
     });
-    if let Some(quic_ep) = state
-        .connection_broker
-        .as_ref()
-        .and_then(|b| b.quic_endpoint().cloned())
-    {
+    // A shared socket is the KAD socket, whose mapping the UDP cycle above
+    // already holds. The legacy listener beside it never sends on its own, so
+    // without this a NAT keeps no mapping for the relays that dial it.
+    let quic_ep = if state.quic_shares_udp {
+        state.quic_legacy_endpoint.clone()
+    } else {
+        state
+            .connection_broker
+            .as_ref()
+            .and_then(|b| b.quic_endpoint().cloned())
+    };
+    if let Some(quic_ep) = quic_ep {
         let quic_index = ka_index.wrapping_add(1);
         tokio::spawn(async move {
             ember::mapping_keepalive::quic_mapping_keepalive(quic_ep, quic_index)

@@ -418,9 +418,16 @@ export async function initNetworkStore() {
     // changes are user-visible (forwarding rules, advertised port) so
     // popping a toast lets users correct their router / settings
     // instead of wondering why peer reachability is lower than expected.
-    registered.push(await listen<{ message: string }>('network-warning', (event) => {
-      const msg = event.payload?.message;
-      if (msg) {
+    registered.push(await listen<{
+      message: string;
+      code?: string;
+      configured?: number;
+      bound?: number;
+    }>('network-warning', (event) => {
+      const { message: msg, code, configured, bound } = event.payload ?? {};
+      if (code === 'udp_port_fallback' && typeof configured === 'number' && typeof bound === 'number') {
+        toastWarning(m.network_warning_udp_port_fallback({ configured, bound }));
+      } else if (msg) {
         toastWarning(translateError(msg, msg));
       }
     }));
@@ -457,6 +464,10 @@ export async function initNetworkStore() {
       // same status is how a reconnect to a different server arrives — so every
       // one of these is worth a re-read, not only the transitions.
       if (status) setServerStatus(status, true);
+      // So is the HighID/LowID, which is the last server's until a poll brings
+      // this one's: show none meanwhile, and let the next tick ask at once.
+      networkStats.update((s) => (s.ed2k_low_id == null ? s : { ...s, ed2k_low_id: null }));
+      statsPumpOnNextVisible = true;
     }));
     registered.push(await listen('server-auto-connect-failed', () => {
       toastWarning(m.toast_server_auto_connect_failed());

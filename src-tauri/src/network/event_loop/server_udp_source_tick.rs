@@ -49,7 +49,7 @@ pub(in crate::network) async fn on_server_udp_source_tick(
     {
         let sm = source_manager.read().await;
         for (fh, file_size) in all_for_udp {
-            if sm.source_count(&fh) < MAX_SOURCES_FOR_UDP {
+            if sm.wants_more_sources(&fh) {
                 need_sources.push((fh, file_size));
             }
         }

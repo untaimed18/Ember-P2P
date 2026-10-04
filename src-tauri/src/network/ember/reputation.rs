@@ -110,6 +110,17 @@ impl ReputationEvent {
             ReputationEvent::ProtocolViolation => SCORE_PROTOCOL_VIOLATION,
         }
     }
+
+    /// What also counts toward the penalty goodwill cannot offset: proof of
+    /// misbehaviour. Timeouts and failed chunks are what an honest peer on a
+    /// poor link produces, and with nothing to offset them a few an hour
+    /// would decay toward a ban on their own.
+    fn penalty_delta(self) -> i32 {
+        match self {
+            ReputationEvent::CorruptData | ReputationEvent::ProtocolViolation => self.score_delta(),
+            _ => 0,
+        }
+    }
 }
 
 /// Per-peer reputation record.
@@ -122,6 +133,30 @@ pub struct PeerReputation {
     pub last_interaction: u64,
     pub first_seen: u64,
     pub banned_until: Option<u64>,
+    /// The corrupt-data and protocol-violation strikes alone, decaying like
+    /// `score`.
+    ///
+    /// Good and bad share `score`, which is clamped at +1000, so a peer that
+    /// first banked goodwill by downloading from us needed twenty-four
+    /// corrupt-data strikes to reach the ban instead of four. This is what the
+    /// ban also reads, so goodwill cannot cancel corruption.
+    #[serde(default)]
+    pub penalty: i32,
+}
+
+/// Decay `value` toward zero by `intervals` hours: multiply, truncate toward
+/// zero, and move at least one step, so a small score does not settle at ±10
+/// where `10 × 0.95` rounds back to 10.
+fn decayed(value: i32, intervals: u32) -> i32 {
+    if intervals == 0 || value == 0 {
+        return value;
+    }
+    // Capped so the exponent cannot wrap negative on a pathological interval
+    // count; 0.95 to the ten thousandth is already zero.
+    let factor = DECAY_FACTOR.powi(intervals.min(10_000) as i32);
+    let scaled = (value as f64 * factor).trunc() as i32;
+    let stepped = if scaled == value { value - value.signum() } else { scaled };
+    stepped.clamp(MIN_REPUTATION, MAX_REPUTATION)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +165,9 @@ pub struct IpReputation {
     pub score: i32,
     pub last_interaction: u64,
     pub banned_until: Option<u64>,
+    /// As [`PeerReputation::penalty`], across every identity at this address.
+    #[serde(default)]
+    pub penalty: i32,
 }
 
 impl IpReputation {
@@ -139,16 +177,19 @@ impl IpReputation {
             score: DEFAULT_REPUTATION,
             last_interaction: now,
             banned_until: None,
+            penalty: 0,
         }
     }
 
     fn apply_event(&mut self, event: ReputationEvent, now: u64) {
         let delta = event.score_delta();
         self.score = (self.score + delta).clamp(MIN_REPUTATION, MAX_REPUTATION);
+        self.penalty = (self.penalty + event.penalty_delta()).max(MIN_REPUTATION);
         self.last_interaction = now;
         // See `PeerReputation::apply_event` for why this is gated on a
         // negative delta and on not already being banned.
-        if delta < 0 && self.score <= IP_BAN_THRESHOLD && !self.is_banned(now) {
+        let banworthy = self.score <= IP_BAN_THRESHOLD || self.penalty <= IP_BAN_THRESHOLD;
+        if delta < 0 && banworthy && !self.is_banned(now) {
             self.banned_until = Some(now + BAN_DURATION.as_secs());
         }
     }
@@ -158,13 +199,8 @@ impl IpReputation {
     }
 
     fn apply_decay(&mut self, intervals: u32) {
-        if intervals == 0 || self.score == 0 {
-            return;
-        }
-        let factor = DECAY_FACTOR.powi(intervals.min(10_000) as i32);
-        self.score = (self.score as f64 * factor)
-            .round()
-            .clamp(MIN_REPUTATION as f64, MAX_REPUTATION as f64) as i32;
+        self.score = decayed(self.score, intervals);
+        self.penalty = decayed(self.penalty, intervals);
     }
 }
 
@@ -178,6 +214,7 @@ impl PeerReputation {
             last_interaction: now,
             first_seen: now,
             banned_until: None,
+            penalty: 0,
         }
     }
 
@@ -188,6 +225,7 @@ impl PeerReputation {
     fn apply_event(&mut self, event: ReputationEvent, now: u64) {
         let delta = event.score_delta();
         self.score = (self.score + delta).clamp(MIN_REPUTATION, MAX_REPUTATION);
+        self.penalty = (self.penalty + event.penalty_delta()).max(MIN_REPUTATION);
         self.last_interaction = now;
 
         match event {
@@ -208,28 +246,15 @@ impl PeerReputation {
         // arming a fresh ban for a record that is below the threshold but
         // unbanned — a peer loaded from disk that way, or one whose ban
         // lapsed before `lift_expired_bans` next ran.
-        if delta < 0 && self.score <= BAN_THRESHOLD && !self.is_banned(now) {
+        let banworthy = self.score <= BAN_THRESHOLD || self.penalty <= BAN_THRESHOLD;
+        if delta < 0 && banworthy && !self.is_banned(now) {
             self.banned_until = Some(now + BAN_DURATION.as_secs());
         }
     }
 
     fn apply_decay(&mut self, intervals: u32) {
-        if intervals == 0 || self.score == 0 {
-            return;
-        }
-        // L5: cap the exponent before casting to i32. `intervals` is a
-        // u32 derived from `elapsed / DECAY_INTERVAL` which can in
-        // pathological cases (clock skew, persisted-state replay)
-        // exceed `i32::MAX`. Casting wraps to a negative exponent and
-        // sends `factor` to infinity, then `score * factor` is NaN ⇒
-        // 0 after the cast. Saturating to a generous ceiling keeps
-        // decay monotonic-toward-zero and bounded — `DECAY_FACTOR`
-        // raised to ~10000 is already numerically zero, so any
-        // larger exponent lands at the same fixed point regardless.
-        let exp = intervals.min(10_000) as i32;
-        let factor = DECAY_FACTOR.powi(exp);
-        self.score = (self.score as f64 * factor).round() as i32;
-        self.score = self.score.clamp(MIN_REPUTATION, MAX_REPUTATION);
+        self.score = decayed(self.score, intervals);
+        self.penalty = decayed(self.penalty, intervals);
     }
 }
 
@@ -388,6 +413,7 @@ impl ReputationManager {
             if peer.score <= BAN_THRESHOLD {
                 peer.score = BAN_THRESHOLD + 1;
             }
+            peer.penalty = peer.penalty.max(BAN_THRESHOLD + 1);
             self.touch();
             true
         } else {
@@ -406,6 +432,7 @@ impl ReputationManager {
             if entry.score <= IP_BAN_THRESHOLD {
                 entry.score = IP_BAN_THRESHOLD + 1;
             }
+            entry.penalty = entry.penalty.max(IP_BAN_THRESHOLD + 1);
             self.touch();
             true
         } else {
@@ -471,6 +498,7 @@ impl ReputationManager {
                 if now >= until {
                     peer.banned_until = None;
                     peer.score = (peer.score / 2).max(BAN_THRESHOLD + 1);
+                    peer.penalty = (peer.penalty / 2).max(BAN_THRESHOLD + 1);
                     lifted += 1;
                 }
             }
@@ -479,6 +507,7 @@ impl ReputationManager {
             if ip.banned_until.is_some_and(|until| now >= until) {
                 ip.banned_until = None;
                 ip.score = (ip.score / 2).max(IP_BAN_THRESHOLD + 1);
+                ip.penalty = (ip.penalty / 2).max(IP_BAN_THRESHOLD + 1);
                 lifted += 1;
             }
         }
@@ -589,6 +618,7 @@ impl ReputationManager {
         let mut newest_interaction = 0u64;
         for mut entry in entries {
             entry.score = entry.score.clamp(MIN_REPUTATION, MAX_REPUTATION);
+            entry.penalty = entry.penalty.clamp(MIN_REPUTATION, 0);
             entry.banned_until =
                 entry
                     .banned_until
@@ -599,6 +629,7 @@ impl ReputationManager {
         let mut ips = HashMap::with_capacity(ip_entries.len());
         for mut entry in ip_entries {
             entry.score = entry.score.clamp(MIN_REPUTATION, MAX_REPUTATION);
+            entry.penalty = entry.penalty.clamp(MIN_REPUTATION, 0);
             entry.banned_until =
                 entry
                     .banned_until
@@ -661,7 +692,7 @@ impl ReputationManager {
                 (
                     *ip,
                     record.is_banned(now),
-                    record.score,
+                    record.score.min(record.penalty),
                     record.last_interaction,
                 )
             })
@@ -699,7 +730,9 @@ impl ReputationManager {
             if p.is_banned(now) {
                 banned.push((*id, p.banned_until.unwrap_or(0)));
             } else {
-                non_banned.push((*id, p.score, p.last_interaction));
+                // Strikes count as the score they would be without goodwill,
+                // or evicting the peer would forgive them.
+                non_banned.push((*id, p.score.min(p.penalty), p.last_interaction));
             }
         }
         // Evicting a peer forgets it completely: `get_score` on an unknown id
@@ -940,6 +973,55 @@ mod tests {
         rep2.apply_decay(10);
         assert!(rep2.score > -100);
         assert!(rep2.score < 0);
+    }
+
+    /// One interval at a time, as the hourly tick runs it, a small score still
+    /// reaches zero. Rounding `10 × 0.95` gave 10 back, so every score used to
+    /// settle at ±10 and stay there.
+    #[test]
+    fn hourly_decay_reaches_zero() {
+        for start in [10, -10, 3, -1, 250] {
+            let mut rep = PeerReputation::new([11u8; 16], test_now());
+            rep.score = start;
+            for _ in 0..200 {
+                rep.apply_decay(1);
+            }
+            assert_eq!(rep.score, 0, "from {start}");
+        }
+    }
+
+    /// Goodwill banked by downloading from us does not cancel corruption: four
+    /// corrupt-data strikes ban a peer whatever its score.
+    #[test]
+    fn banked_goodwill_does_not_delay_a_corruption_ban() {
+        let mut mgr = ReputationManager::new();
+        let peer = [12u8; 16];
+        for _ in 0..400 {
+            mgr.record_event(&peer, ReputationEvent::SuccessfulHandshake);
+        }
+        for _ in 0..3 {
+            mgr.record_event(&peer, ReputationEvent::CorruptData);
+        }
+        assert!(!mgr.is_banned(&peer), "three strikes are not enough");
+        mgr.record_event(&peer, ReputationEvent::CorruptData);
+        assert!(mgr.is_banned(&peer), "the fourth bans it despite its score");
+    }
+
+    /// Timeouts and failed chunks are a poor link, not misbehaviour: a peer
+    /// whose goodwill outweighs them is not banned for them.
+    #[test]
+    fn a_poor_link_offset_by_goodwill_is_not_banned() {
+        let mut mgr = ReputationManager::new();
+        let peer = [13u8; 16];
+        for _ in 0..60 {
+            for _ in 0..3 {
+                mgr.record_event(&peer, ReputationEvent::SuccessfulHandshake);
+            }
+            mgr.record_event(&peer, ReputationEvent::FailedChunk);
+            mgr.record_event(&peer, ReputationEvent::Timeout);
+        }
+        assert!(!mgr.is_banned(&peer));
+        assert_eq!(mgr.peers[&peer].penalty, 0);
     }
 
     #[test]

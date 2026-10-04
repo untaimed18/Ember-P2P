@@ -702,12 +702,12 @@ pub fn encode_message(
     include_pub_key: bool,
     sender_noise_pub: &[u8; 32],
 ) -> Vec<u8> {
-    let mut payload_bytes = encode_payload(&msg.payload);
-    // The length prefix is a u16 and the peer drops anything over the
-    // datagram cap, so an oversized payload used to be written with a
-    // truncated length and signed over the mismatch — a frame that is
-    // self-consistently wrong. Every encoder is bounded, so reaching this is
-    // a bug; clamp so the frame stays coherent and say so loudly.
+    let payload_bytes = encode_payload(&msg.payload);
+    // Every encoder is bounded, so reaching either refusal is a bug in a
+    // caller. The frame is not built: truncating it, as this once did, still
+    // produced one every receiver refuses, only now signed over counts that
+    // no longer matched its body. Empty is what `prepare_outgoing` declines
+    // to send.
     if payload_bytes.len() > MAX_DELIVERABLE_PAYLOAD {
         debug_assert!(
             false,
@@ -716,12 +716,19 @@ pub fn encode_message(
             MAX_DELIVERABLE_PAYLOAD
         );
         tracing::error!(
-            "Ember DHT: truncating oversized {} payload ({} > {})",
+            "Ember DHT: not sending oversized {} payload ({} > {})",
             msg.msg_type,
             payload_bytes.len(),
             MAX_DELIVERABLE_PAYLOAD
         );
-        payload_bytes.truncate(MAX_DELIVERABLE_PAYLOAD);
+        return Vec::new();
+    }
+    if let Some(len) = oversized_store_record(&msg.payload) {
+        tracing::error!(
+            "Ember DHT: not sending {} carrying a {len}-byte record (max {MAX_STORE_RECORD_BYTES})",
+            msg.msg_type
+        );
+        return Vec::new();
     }
     let payload_len = payload_bytes.len();
 
@@ -751,6 +758,21 @@ pub fn encode_message(
     buf.write_all(&sig).unwrap();
 
     buf
+}
+
+/// The length of a record body in a store payload that every receiver's
+/// decoder refuses, if there is one.
+fn oversized_store_record(payload: &DhtPayload) -> Option<usize> {
+    match payload {
+        DhtPayload::StoreRecord { record, .. } | DhtPayload::ProxyStore { record, .. } => {
+            Some(record.len()).filter(|len| *len > MAX_STORE_RECORD_BYTES)
+        }
+        DhtPayload::StoreBatch { records } => records
+            .iter()
+            .map(|r| r.record.len())
+            .find(|len| *len > MAX_STORE_RECORD_BYTES),
+        _ => None,
+    }
 }
 
 /// Domain tag mixed into every DHT frame signature.
@@ -2917,13 +2939,26 @@ mod tests {
     }
 
     /// A STORE body that cannot pack into a FOUND_VALUE even as the only blob
-    /// must be refused at decode, or it stores-but-hides.
+    /// must be refused at decode, or it stores-but-hides. Our own encoder
+    /// refuses to build one at all.
     #[test]
     fn a_store_body_over_the_found_value_budget_is_refused() {
         let (sk, id) = test_keypair();
         let too_big = vec![0u8; MAX_STORE_RECORD_BYTES + 1];
-        let msg = build_store_record(id, 1, [0xAB; 16], too_big, [0u8; 64]);
-        let encoded = encode_message(&msg, &sk, true, &TEST_NOISE_PUB);
+        let msg = build_store_record(id, 1, [0xAB; 16], too_big.clone(), [0u8; 64]);
+        assert!(encode_message(&msg, &sk, true, &TEST_NOISE_PUB).is_empty());
+
+        // As another client could still send it.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xAB; 16]);
+        body.extend_from_slice(&(too_big.len() as u16).to_le_bytes());
+        body.extend_from_slice(&too_big);
+        body.extend_from_slice(&[0u8; 64]);
+        let forged = DhtMessage {
+            payload: DhtPayload::Unknown(body),
+            ..build_store_record(id, 1, [0xAB; 16], Vec::new(), [0u8; 64])
+        };
+        let encoded = encode_message(&forged, &sk, true, &TEST_NOISE_PUB);
         assert!(decode_message(&encoded, true, &TEST_NOISE_PUB).is_err());
 
         let fits = vec![0u8; MAX_STORE_RECORD_BYTES];

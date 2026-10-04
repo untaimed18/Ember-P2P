@@ -104,6 +104,19 @@
     };
   });
 
+  // HighID/LowID while connected to an eD2K server, nothing otherwise.
+  const ed2kId = $derived(
+    $serverStatus === 'connected' && typeof $networkStats.ed2k_low_id === 'boolean'
+      ? ($networkStats.ed2k_low_id ? 'low' : 'high')
+      : null,
+  );
+
+  function ed2kTitle(status: string, id: 'low' | 'high' | null): string {
+    const base = m.statusbar_ed2k_title({ status: statusLabel(status) });
+    if (!id) return base;
+    return `${base} · ${id === 'low' ? m.servers_lowid() : m.servers_highid()}`;
+  }
+
   // Source exchange rides the Ember overlay, not KAD. Keying this off
   // `stats.status` (the KAD light) made the Ember tooltip say "network
   // offline" while Ember itself was connected.
@@ -217,11 +230,18 @@
       <button
         type="button"
         class="status-label"
-        title={m.statusbar_ed2k_title({ status: statusLabel($serverStatus) })}
+        title={ed2kTitle($serverStatus, ed2kId)}
         onclick={() => openPage('/servers')}
       >
         {m.statusbar_ed2k_label()}
         <span class="dot {$serverStatus}" aria-label={statusLabel($serverStatus)}></span>
+        {#if ed2kId}
+          <!-- The one number eMule users check first: a LowID is why
+               downloads crawl, and it used to live only on the Servers page. -->
+          <span class="ed2k-id" class:low={ed2kId === 'low'}>
+            {ed2kId === 'low' ? m.servers_lowid() : m.servers_highid()}
+          </span>
+        {/if}
       </button>
     </div>
     <button
@@ -243,16 +263,18 @@
       is tracked on the Statistics page — these numbers intentionally differ
       from a full "network bytes" view.
     -->
-    <span class="status-item upload" title={m.statusbar_upload_title()}>
+    <!-- Buttons like the network dots: "why is it slow?" is answered on
+         Transfers, so the rates go there. -->
+    <button type="button" class="status-label status-item upload" title={m.statusbar_upload_title()} onclick={() => openPage('/transfers')}>
       <span aria-hidden="true">↑</span>
       <span class="sr-only">{m.statusbar_upload_sr()}</span>
       {formatSpeed($networkStats.upload_speed)}
-    </span>
-    <span class="status-item download" title={m.statusbar_download_title()}>
+    </button>
+    <button type="button" class="status-label status-item download" title={m.statusbar_download_title()} onclick={() => openPage('/transfers')}>
       <span aria-hidden="true">↓</span>
       <span class="sr-only">{m.statusbar_download_sr()}</span>
       {formatSpeed($networkStats.download_speed)}
-    </span>
+    </button>
     <span class="status-item muted status-totals" role="img" title={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })} aria-label={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })}>
       <span aria-hidden="true">↑</span> {formatBytes($networkStats.total_uploaded)} / <span aria-hidden="true">↓</span> {formatBytes($networkStats.total_downloaded)}
     </span>
@@ -329,6 +351,16 @@
     flex-shrink: 0;
   }
 
+  .ed2k-id {
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    color: var(--status-connected);
+  }
+
+  .ed2k-id.low {
+    color: var(--warning);
+  }
+
   .shared-count,
   .shared-size {
     color: var(--text-primary);
@@ -371,6 +403,11 @@
 
   .status-item.download {
     color: var(--accent);
+  }
+
+  .status-item.upload:hover,
+  .status-item.download:hover {
+    color: var(--text-primary);
   }
 
   .status-item.muted {

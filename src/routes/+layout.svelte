@@ -10,6 +10,9 @@
   import ChatDock from '$lib/components/ChatDock.svelte';
   import ErrorBoundary from '$lib/components/ErrorBoundary.svelte';
   import UpdateNotice from '$lib/components/UpdateNotice.svelte';
+  import SilentUpdateCountdown from '$lib/components/SilentUpdateCountdown.svelte';
+  import { initSilentUpdate, reportUpdateOutcome } from '$lib/stores/silentUpdate';
+  import { startUserActivityReporting } from '$lib/userActivity';
 
   import { initNetworkStore, cleanupNetworkStore, startStatsPoll } from '$lib/stores/network';
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
@@ -30,8 +33,16 @@
     takePendingCloseRequest,
     takePendingEmberDefaultOnNotice,
     takePendingRestoreFailedNotice,
+    takePendingRestoreExpiredNotice,
+    takePendingKnownMetNotice,
   } from '$lib/api/settings';
-  import { checkForUpdates, checkUpdateHandoff, isUpdateCheckDue } from '$lib/stores/updater';
+  import {
+    applyBackgroundCheckResult,
+    checkUpdateHandoff,
+    loadLastBackgroundCheckResult,
+    type SecureUpdateCheckResult,
+  } from '$lib/stores/updater';
+  import { setTrayLabels } from '$lib/api/system';
   import {
     acknowledgeSecurityPolicyReset,
     getSecurityPolicyState,
@@ -49,6 +60,7 @@
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import ChatWindowShell from '$lib/components/ChatWindowShell.svelte';
   import { initChatPopoutMain } from '$lib/chatPopout';
+  import { applyUpdateResume, initUpdateResume } from '$lib/updateResume';
   import { isChatWindow } from '$lib/windowRole';
 
   /** This document is the popped-out chat window, which draws the chat and
@@ -281,14 +293,19 @@
     let mounted = true;
     let revealTimer: number | undefined;
     let hideTimer: number | undefined;
-    let updateCheckTimer: number | undefined;
     let handoffCheckTimer: number | undefined;
+    let unlistenUpdateCheck: UnlistenFn | null = null;
+    let unlistenUpdateResume: UnlistenFn | null = null;
+    let unlistenSilentUpdate: UnlistenFn | null = null;
+    const stopActivityReporting = startUserActivityReporting();
     let unlistenClose: UnlistenFn | null = null;
     let unlistenConfigCorrupt: UnlistenFn | null = null;
     let unlistenDbCorrupt: UnlistenFn | null = null;
+    let unlistenKnownMet: UnlistenFn | null = null;
     let unlistenPolicyReset: UnlistenFn | null = null;
     let unlistenFoldersAdded: UnlistenFn | null = null;
     let unlistenFoldersFailed: UnlistenFn | null = null;
+    let unlistenScanFailed: UnlistenFn | null = null;
     let unlistenDropPending: UnlistenFn | null = null;
     let unlistenDropRejected: UnlistenFn | null = null;
     let unlistenDownloadFolder: UnlistenFn | null = null;
@@ -353,6 +370,25 @@
       .then((fn) => { if (mounted) unlistenDbCorrupt = fn; else fn(); })
       .catch((e) => console.error('Failed to register db-corrupt listener:', e));
 
+    // known.met could not be read: nothing is published and only friends are
+    // uploaded to this session, which used to show nowhere but the log.
+    // Pulled from a backend latch, with the event only a wake-up: it is emitted
+    // once, and a webview still starting or reloading then would miss it.
+    const showKnownMetNotice = () => {
+      if (!mounted) return;
+      takePendingKnownMetNotice()
+        .then((notice) => {
+          if (mounted && notice) {
+            toastWarning(notice.reset ? m.layout_known_met_reset() : m.layout_known_met_unreadable());
+          }
+        })
+        .catch((e) => console.error('Failed to consume the known-met latch:', e));
+    };
+    listen('known-met-unreadable', showKnownMetNotice)
+      .then((fn) => { if (mounted) unlistenKnownMet = fn; else fn(); })
+      .catch((e) => console.error('Failed to register known-met listener:', e))
+      .finally(showKnownMetNotice);
+
     // An eMule import staged before this launch was applied during startup.
     // Marked seen as it is read, so the notice shows once; the full report
     // stays in Settings → Import.
@@ -384,6 +420,14 @@
         if (mounted && pending) addToast('warning', m.layout_restore_failed(), 0);
       })
       .catch((e) => console.error('Failed to consume the restore-failed latch:', e));
+
+    // Sticky: the user restarted expecting a restore, and the staging it lived
+    // in is already gone, so this is the only place they learn it did not land.
+    takePendingRestoreExpiredNotice()
+      .then((expired) => {
+        if (mounted && expired) addToast('warning', m.layout_restore_expired(), 0);
+      })
+      .catch((e) => console.error('Failed to consume the restore-expired latch:', e));
 
     listen<{ loaded: boolean; resetRequired: boolean; reason?: string }>(
       'security-policy-reset-required',
@@ -430,6 +474,52 @@
     })
       .then((fn) => { if (mounted) unlistenFoldersFailed = fn; else fn(); })
       .catch((e) => console.error('Failed to register shared-folders-add-failed listener:', e));
+
+    // A folder scan that failed outright used to be logged and nothing else, so
+    // the Library just looked idle with files missing.
+    listen<{ folder?: string | null }>('shared-folder-scan-failed', (event) => {
+      if (!mounted) return;
+      const folder = event.payload?.folder;
+      toastWarning(folder ? m.library_scan_failed_folder({ folder }) : m.library_scan_failed());
+    })
+      .then((fn) => { if (mounted) unlistenScanFailed = fn; else fn(); })
+      .catch((e) => console.error('Failed to register shared-folder-scan-failed listener:', e));
+
+    // Automatic update checks run in the backend on the user's
+    // hourly/daily/weekly/monthly cadence, at launch and for as long as Ember stays
+    // open (release builds only). Their results are applied exactly as a
+    // silent check's would be, and surface non-blockingly via <UpdateNotice />.
+    listen<SecureUpdateCheckResult>('ember:updater-check-result', (event) => {
+      if (mounted) void applyBackgroundCheckResult(event.payload);
+    })
+      .then((fn) => {
+        if (!mounted) {
+          fn();
+          return;
+        }
+        unlistenUpdateCheck = fn;
+        void loadLastBackgroundCheckResult();
+      })
+      .catch((e) => console.error('Failed to register updater-check-result listener:', e));
+
+    // The tray menu is built by the backend, which cannot know the language.
+    void setTrayLabels({
+      show: m.tray_show(),
+      quit: m.tray_quit(),
+      cancelUpdate: m.tray_cancel_update({ time: '{time}' }),
+    }).catch((e) => console.error('Failed to set the tray labels:', e));
+
+    // An update restart asks for the page and search tabs just before it shuts
+    // Ember down, so the launch after it can put them back.
+    initUpdateResume()
+      .then((fn) => { if (mounted) unlistenUpdateResume = fn; else fn(); })
+      .catch((e) => console.error('Failed to register update-resume listener:', e));
+
+    // Silent updates: the countdown dialog, the desktop warning and the
+    // Settings card all read this.
+    initSilentUpdate()
+      .then((fn) => { if (mounted) unlistenSilentUpdate = fn; else fn(); })
+      .catch((e) => console.error('Failed to register silent-update listener:', e));
 
     // Downloads re-queue on their own once the folder is fixed, so without this
     // the only sign of a folder Ember cannot write is rows that never start.
@@ -582,36 +672,23 @@
 
           releaseSplashWhenReady();
 
-          // Silent background update check, deferred so it never competes
-          // with first paint or store init. Production only: in a dev build
-          // the running version is the dev version and the GitHub manifest
-          // would spuriously report an "update". Gated on the user's
-          // auto-update preference and on `isUpdateCheckDue` so the chosen
-          // daily/weekly/monthly cadence is honored across launches, not
-          // just "once per app start" (falls back to the pre-setting
-          // always-on/daily behavior if settings failed to load). Any
-          // failure (offline, unreachable manifest) is swallowed by the
-          // store's silent mode, and a result surfaces non-blockingly via
-          // <UpdateNotice />.
-          const autoCheckEnabled = settings?.auto_check_updates ?? true;
-          const checkFrequency = settings?.update_check_frequency ?? 'daily';
-          if (!import.meta.env.DEV && autoCheckEnabled && isUpdateCheckDue(checkFrequency)) {
-            updateCheckTimer = window.setTimeout(() => {
-              if (mounted) void checkForUpdates({ silent: true });
-            }, 4000);
-          }
-          // Before any of that: did the last install actually happen? A
+          // Coming back from an update restart: the page and search tabs the
+          // session had, and — for a silent update — whether it landed.
+          // Nothing to do on an ordinary launch.
+          void applyUpdateResume();
+          void reportUpdateOutcome();
+
+          // Did the last install actually happen? A
           // hand-off to the installer ends this process, so if the installer
           // never ran there was nobody left to say so and the user just saw
           // Ember close. This is the first opportunity to tell them. Runs
           // regardless of the auto-check preference and of the cadence — it
           // reports on something they already asked for — and it resolves to
-          // nothing in the normal case where the update landed. Running first
-          // is only so the notice appears promptly. Two things in the store stop
-          // the check above from overwriting the result, because ordering these
-          // timers cannot: an in-flight guard, for the case where this call
-          // overruns the 2.5 s gap and the check starts before there is anything
-          // to capture, and `takeStagedSnapshot`, for every check after that.
+          // nothing in the normal case where the update landed. Two things in
+          // the store stop the backend's first automatic check from
+          // overwriting the result, because ordering the two cannot: an
+          // in-flight guard that holds a result arriving while this call runs,
+          // and `takeStagedSnapshot`, for every check after that.
           if (!import.meta.env.DEV) {
             handoffCheckTimer = window.setTimeout(() => {
               if (mounted) void checkUpdateHandoff();
@@ -641,8 +718,11 @@
       window.removeEventListener('unhandledrejection', onUnhandledRejection);
       if (revealTimer !== undefined) window.clearTimeout(revealTimer);
       if (hideTimer !== undefined) window.clearTimeout(hideTimer);
-      if (updateCheckTimer !== undefined) window.clearTimeout(updateCheckTimer);
       if (handoffCheckTimer !== undefined) window.clearTimeout(handoffCheckTimer);
+      if (unlistenUpdateCheck) unlistenUpdateCheck();
+      if (unlistenUpdateResume) unlistenUpdateResume();
+      if (unlistenSilentUpdate) unlistenSilentUpdate();
+      stopActivityReporting();
       if (stopPoll) stopPoll();
       if (stopTransferPoll) stopTransferPoll();
       cleanupTheme();
@@ -656,9 +736,11 @@
       if (unlistenClose) unlistenClose();
       if (unlistenConfigCorrupt) unlistenConfigCorrupt();
       if (unlistenDbCorrupt) unlistenDbCorrupt();
+      if (unlistenKnownMet) unlistenKnownMet();
       if (unlistenPolicyReset) unlistenPolicyReset();
       if (unlistenFoldersAdded) unlistenFoldersAdded();
       if (unlistenFoldersFailed) unlistenFoldersFailed();
+      if (unlistenScanFailed) unlistenScanFailed();
       if (unlistenDropPending) unlistenDropPending();
       if (unlistenDropRejected) unlistenDropRejected();
       if (unlistenDownloadFolder) unlistenDownloadFolder();
@@ -728,6 +810,7 @@
   {#if initialized && !initError && !showWizard}
     <!-- Non-blocking auto-update banner, driven by the shared updater store. -->
     <UpdateNotice />
+    <SilentUpdateCountdown />
     <!-- Headless: routes OS-delivered ed2k:// links and .emulecollection
     files into the app once the shell is ready (settings loaded, no wizard). -->
     <DeepLinkHandler />

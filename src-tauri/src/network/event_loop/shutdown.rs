@@ -33,6 +33,7 @@ pub(in crate::network) async fn save_on_shutdown(
     upnp_enabled: bool,
     upnp_mappings: &mut upnp::UpnpMappings,
     xfer_finish_rx: &mut mpsc::UnboundedReceiver<XferFinishResult>,
+    upload_queue: &ed2k::upload::UploadQueueRef,
 ) {
     // Apply any transfer verification the blocking pool is still working on,
     // before anything below tears down the paths its completion frame needs.
@@ -86,6 +87,14 @@ pub(in crate::network) async fn save_on_shutdown(
         .and_then(|broker| broker.quic_endpoint())
     {
         endpoint.close(0u32.into(), b"shutting down");
+        // Briefly, so peers get the CONNECTION_CLOSE instead of waiting out
+        // an idle timeout. This does not release the socket: the driver lives
+        // until every `Endpoint` handle is dropped.
+        let _ = tokio::time::timeout_at(
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(1)),
+            endpoint.wait_idle(),
+        )
+        .await;
     }
 
     if let Some(handle) = cache_write_handle.take() {
@@ -201,6 +210,32 @@ pub(in crate::network) async fn save_on_shutdown(
              {rotations} slow-source rotations",
         );
     }
+    // The upload waiting queue, so the peers queued here keep their place
+    // across a restart (`ed2k::upload_queue_store`). Taken now, while the
+    // sessions that hold rows are still up, and written after the saves that
+    // matter more. Bounded like every phase here: the listener may still hold
+    // the lock, and a queue that cannot be saved in time costs the waiters
+    // their place, not the user their data.
+    let queue_lock_deadline =
+        shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(2));
+    let live_entries = match tokio::time::timeout_at(queue_lock_deadline, upload_queue.lock()).await {
+        Ok(queue) => Some(queue.clone()),
+        Err(_) => {
+            warn!("The upload queue stayed locked into shutdown; saving only waiters still held from the last session");
+            None
+        }
+    };
+    // Last session's waiters, if this one ended before they could rejoin.
+    let queue_entries = match (live_entries, state.restored_upload_queue.take()) {
+        (Some(mut live), Some(pending)) => {
+            ed2k::upload_queue_store::fold_for_save(&mut live, pending);
+            live
+        }
+        (Some(live), None) => live,
+        (None, Some(pending)) => pending.into_entries(),
+        (None, None) => Vec::new(),
+    };
+
     let contacts = state.routing_table.export_bootstrap_contacts(200);
     let nodes_path = state.data_dir.join("nodes.dat");
     match tokio::time::timeout_at(
@@ -354,38 +389,6 @@ pub(in crate::network) async fn save_on_shutdown(
             Err(_) => warn!(
                 "Skipping the Ember source-address shutdown save: a periodic save still holds \
                  the lock"
-            ),
-        }
-    }
-
-    // Persist the record store so the next session starts holding what this one
-    // held. Shutdown only, deliberately: the store can be several megabytes and
-    // writing that every few minutes is the disk hitch the peer-list save was
-    // changed to avoid. An abnormal exit falls back to replication refilling the
-    // store, which is what happened on every exit before this.
-    let ember_records = state
-        .ember_dht
-        .persistable_records(EMBER_PERSIST_MAX_RECORDS);
-    let store_ember_path = state.data_dir.join("store_ember.dat");
-    let ember_store_loaded = state.ember_store_loaded;
-    if tokio::time::Instant::now() >= shutdown_deadline {
-        error!(
-            "Shutdown deadline exhausted before store_ember.dat save; shutdown result is explicitly truncated"
-        );
-    } else {
-        let writer = tokio::task::spawn_blocking(move || {
-            ember::dht::bootstrap::save_store(
-                &store_ember_path,
-                &ember_records,
-                ember_store_loaded,
-            )
-        });
-        match tokio::time::timeout_at(shutdown_deadline, writer).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(e))) => error!("Failed to save store_ember.dat on shutdown: {e}"),
-            Ok(Err(e)) => error!("store_ember.dat shutdown writer failed: {e}"),
-            Err(_) => error!(
-                "Shutdown deadline exhausted joining store_ember.dat writer; shutdown result is explicitly truncated"
             ),
         }
     }
@@ -790,6 +793,62 @@ pub(in crate::network) async fn save_on_shutdown(
         error!(
             "Shutdown deadline exhausted before server.met; shutdown result is explicitly truncated"
         );
+    }
+
+    if !queue_entries.is_empty() && tokio::time::Instant::now() >= shutdown_deadline {
+        warn!("Shutdown deadline exhausted before the upload queue save");
+    } else if !queue_entries.is_empty() {
+        let dir = state.data_dir.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            ed2k::upload_queue_store::save(&dir, &queue_entries)
+        });
+        let queue_phase_deadline =
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(2));
+        match tokio::time::timeout_at(queue_phase_deadline, writer).await {
+            Ok(Ok(Ok(count))) => info!("Saved {count} upload queue waiter(s) on shutdown"),
+            Ok(Ok(Err(e))) => error!("Failed to save the upload queue on shutdown: {e}"),
+            Ok(Err(e)) => error!("Upload queue shutdown writer failed: {e}"),
+            Err(_) => warn!("Upload queue save did not finish within its shutdown phase"),
+        }
+    }
+
+    // Persist the record store so the next session starts holding what this one
+    // held. Shutdown only, deliberately: the store can be several megabytes and
+    // writing that every few minutes is the disk hitch the peer-list save was
+    // changed to avoid. An abnormal exit falls back to replication refilling the
+    // store, which is what happened on every exit before this.
+    //
+    // Last, and in a phase of its own: it is the one save here that
+    // replication can replace, and it used to run first with the whole
+    // remaining deadline, so a slow disk spent the time the ban save needed and
+    // a restart silently lifted automatic bans.
+    let ember_records = state
+        .ember_dht
+        .persistable_records(EMBER_PERSIST_MAX_RECORDS);
+    let store_ember_path = state.data_dir.join("store_ember.dat");
+    let ember_store_loaded = state.ember_store_loaded;
+    if tokio::time::Instant::now() >= shutdown_deadline {
+        error!(
+            "Shutdown deadline exhausted before store_ember.dat save; shutdown result is explicitly truncated"
+        );
+    } else {
+        let writer = tokio::task::spawn_blocking(move || {
+            ember::dht::bootstrap::save_store(
+                &store_ember_path,
+                &ember_records,
+                ember_store_loaded,
+            )
+        });
+        let store_deadline =
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(3));
+        match tokio::time::timeout_at(store_deadline, writer).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => error!("Failed to save store_ember.dat on shutdown: {e}"),
+            Ok(Err(e)) => error!("store_ember.dat shutdown writer failed: {e}"),
+            Err(_) => error!(
+                "store_ember.dat writer still running at the end of its shutdown phase; the next session refills the store by replication"
+            ),
+        }
     }
 
     // Unregister from the rendezvous server LAST and with a short bound.

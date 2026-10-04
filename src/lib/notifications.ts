@@ -44,7 +44,8 @@ export type NotifyCategory =
   | 'friend_message'
   | 'friend_request'
   | 'shares_browsed'
-  | 'channel_message';
+  | 'channel_message'
+  | 'silent_update';
 
 const CATEGORY_SETTING: Record<NotifyCategory, keyof AppSettings> = {
   download_complete: 'notify_download_complete',
@@ -57,6 +58,10 @@ const CATEGORY_SETTING: Record<NotifyCategory, keyof AppSettings> = {
   friend_request: 'notify_friend_request',
   shares_browsed: 'notify_shares_browsed',
   channel_message: 'notify_channel_message',
+  // The one-minute warning before a silent update has no switch of its own:
+  // the user turned silent updates on, and the warning is how they get to
+  // cancel one. Only the master switch silences it.
+  silent_update: 'notifications_enabled',
 };
 
 /** Identical notifications inside this window collapse into one. */
@@ -90,10 +95,13 @@ let deliveryUnavailable = false;
  * conversation" test for the unread badge and the in-app toast, and gating the
  * notification on *that* put the second-monitor case straight back — the
  * handler returned before this check was ever consulted.
+ *
+ * The silent-update countdown is drawn in the main window only, so for its
+ * warning the chat window having focus is not the user having seen it.
  */
-function emberIsFocused(): boolean {
+function emberIsFocused(category: NotifyCategory): boolean {
   if (typeof document === 'undefined') return false;
-  if (chatWindowFocused()) return true;
+  if (category !== 'silent_update' && chatWindowFocused()) return true;
   return document.visibilityState === 'visible' && document.hasFocus();
 }
 
@@ -145,7 +153,7 @@ export function shouldNotify(category: NotifyCategory): boolean {
   if (!settings) return false;
   if (!settings.notifications_enabled) return false;
   if (!settings[CATEGORY_SETTING[category]]) return false;
-  if (settings.notifications_only_when_unfocused && emberIsFocused()) return false;
+  if (settings.notifications_only_when_unfocused && emberIsFocused(category)) return false;
   return true;
 }
 

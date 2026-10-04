@@ -162,9 +162,8 @@ pub(super) async fn try_connect_server(
     Ok((conn, addr))
 }
 
-/// Clear per-session eD2K identity and in-flight TCP search state. Does not
-/// touch `udp_search_queue` (throttled global multi-server search) or the
-/// connection fields.
+/// Clear per-session eD2K identity and in-flight search state. Does not touch
+/// the connection fields.
 pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &tauri::AppHandle) {
     // No session means no server capabilities; leaving the mirror set would
     // have a related search keep planning around a co-share request that can no
@@ -207,6 +206,9 @@ pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &t
         if active.udp_pending {
             active.udp_pending = false;
             state.server_udp_search_age = 0;
+            // With the leg over, every reply is refused; the rest of the
+            // queue would only be sent to be ignored.
+            state.udp_search_queue.clear();
             changed = true;
         }
         if active.server_pending {
@@ -228,9 +230,9 @@ pub(super) async fn handle_server_disconnect(
     debug!("Server connection lost: {reason}");
     emit_server_log(app_handle, &format!("Server disconnected: {reason}"));
     if state.server_connected {
-        let session_secs = chrono::Utc::now()
-            .timestamp()
-            .saturating_sub(state.server_connected_at);
+        let session_secs = state
+            .server_logged_in_at
+            .map_or(0, |at| i64::try_from(at.elapsed().as_secs()).unwrap_or(i64::MAX));
         state.server_reconnect_failures =
             reconnect_failures_after_session(state.server_reconnect_failures, session_secs);
         if session_secs < SHORT_SERVER_SESSION_SECS {

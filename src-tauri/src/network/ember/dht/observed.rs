@@ -6,7 +6,7 @@
 //! from peers. The port rides along as the most-reported one, and callers that
 //! would use it can ask whether it has a quorum of its own.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,12 @@ const VOTE_TTL: Duration = Duration::from_secs(15 * 60);
 /// can report a different address on each reply, so the map is capped and the
 /// least-recently-updated entry is dropped.
 const MAX_TRACKED_ADDRS: usize = 64;
+
+/// Reporter nets remembered as having voted for the confirmed address, the
+/// most recent kept when there are more. Keeping the first ones instead left a
+/// long uptime remembering only the nets of its first hours, which are not the
+/// peers that see the address move.
+const MAX_TRACKED_BACKERS: usize = 256;
 
 /// The diversity unit one vote is charged to.
 ///
@@ -76,6 +82,17 @@ impl AddrVotes {
     }
 }
 
+/// A confirmation that lapsed for want of fresh votes.
+#[derive(Debug)]
+struct LapsedConfirmation {
+    addr: IpAddr,
+    /// The most distinct nets that backed it at once.
+    peak: usize,
+    /// The nets that voted for it while it stood.
+    backers: HashSet<ReporterNet>,
+    at: Instant,
+}
+
 #[derive(Debug, Default)]
 pub struct EmberObservedIpVotes {
     votes: HashMap<IpAddr, AddrVotes>,
@@ -83,6 +100,22 @@ pub struct EmberObservedIpVotes {
     /// The port [`Self::confirmed`] reports, re-read after every vote and prune
     /// with itself as the incumbent.
     confirmed_port: Option<u16>,
+    /// The most distinct nets that backed [`Self::confirmed`] at once.
+    confirmed_peak: usize,
+    /// The nets that have voted for [`Self::confirmed`] while it stood, and
+    /// when each last did, up to [`MAX_TRACKED_BACKERS`].
+    confirmed_backers: HashMap<ReporterNet, Instant>,
+    /// The last confirmation to lapse, for one vote lifetime.
+    ///
+    /// Honest peers that talk to us constantly rarely need to ask, so their
+    /// votes age out, while a quiet peer we ping votes every time. Counting a
+    /// lapsed incumbent as zero let any three /24s take the address over at
+    /// that moment, so a rival has to beat its peak instead — unless a quorum
+    /// of the rival's nets are ones that backed the lapsed address. That is
+    /// what a genuine address change looks like, the same peers now seeing us
+    /// somewhere else, and on a network with no more nets than the old peak it
+    /// is the only way the change can confirm before the lapse ages out.
+    lapsed: Option<LapsedConfirmation>,
 }
 
 impl EmberObservedIpVotes {
@@ -189,15 +222,47 @@ impl EmberObservedIpVotes {
         // address that still has a live quorum. Switch only when nothing is
         // confirmed (prune already dropped a lapsed one) or the new address
         // has strictly more distinct nets.
+        if self.confirmed == Some(reported_ip) {
+            self.confirmed_peak = self.confirmed_peak.max(new_count);
+            if self.confirmed_backers.len() >= MAX_TRACKED_BACKERS
+                && !self.confirmed_backers.contains_key(&net)
+            {
+                let oldest = self
+                    .confirmed_backers
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(n, _)| *n);
+                if let Some(oldest) = oldest {
+                    self.confirmed_backers.remove(&oldest);
+                }
+            }
+            self.confirmed_backers.insert(net, now);
+        }
         if quorum && self.confirmed != Some(reported_ip) {
-            let current_count = self
-                .confirmed
-                .and_then(|ip| self.votes.get(&ip))
-                .map(|v| v.nets.len())
-                .unwrap_or(0);
-            if current_count == 0 || new_count > current_count {
+            let rival_nets = || {
+                self.votes
+                    .get(&reported_ip)
+                    .into_iter()
+                    .flat_map(|v| v.nets.iter())
+                    .map(|(net, (at, _))| (*net, *at))
+            };
+            let displaces = match self.confirmed {
+                Some(ip) => new_count > self.votes.get(&ip).map_or(0, |v| v.nets.len()),
+                None => match self.lapsed.as_ref().filter(|l| l.addr != reported_ip) {
+                    None => true,
+                    Some(lapsed) => {
+                        new_count > lapsed.peak
+                            || rival_nets().filter(|(n, _)| lapsed.backers.contains(n)).count()
+                                >= MIN_OBSERVED_IP_VOTES
+                    }
+                },
+            };
+            if displaces {
+                self.confirmed_backers = rival_nets().take(MAX_TRACKED_BACKERS).collect();
                 self.confirmed = Some(reported_ip);
                 self.confirmed_port = None;
+                self.confirmed_peak = new_count;
+                self.lapsed = None;
                 self.refresh_confirmed_port();
                 return self.confirmed();
             }
@@ -222,7 +287,21 @@ impl EmberObservedIpVotes {
                 .unwrap_or(false);
             if !still_backed {
                 self.confirmed = None;
+                self.lapsed = Some(LapsedConfirmation {
+                    addr,
+                    peak: self.confirmed_peak,
+                    backers: std::mem::take(&mut self.confirmed_backers).into_keys().collect(),
+                    at: now,
+                });
+                self.confirmed_peak = 0;
             }
+        }
+        if self
+            .lapsed
+            .as_ref()
+            .is_some_and(|l| now.saturating_duration_since(l.at) >= VOTE_TTL)
+        {
+            self.lapsed = None;
         }
         self.refresh_confirmed_port();
     }
@@ -421,15 +500,133 @@ mod tests {
             Some(first)
         );
 
+        // Just after the lapse a rival has to beat the old peak of three.
         let later = t0 + VOTE_TTL + Duration::from_secs(1);
         votes.record_vote_at(second, reporter(8, 8, 1), later);
         votes.record_vote_at(second, reporter(8, 8, 2), later);
         assert_eq!(
             votes.record_vote_at(second, reporter(9, 9, 1), later),
+            None,
+            "three nets only tie the lapsed incumbent"
+        );
+        assert_eq!(
+            votes.record_vote_at(second, reporter(9, 9, 2), later),
             Some(second),
-            "after the old quorum lapses a new address may confirm"
+            "four beat it"
         );
         assert_eq!(votes.confirmed(), Some(second));
+
+        // Once the lapse is a vote lifetime old, an ordinary quorum is enough.
+        let mut votes = EmberObservedIpVotes::new();
+        votes.record_vote_at(first, reporter(1, 0, 1), t0);
+        votes.record_vote_at(first, reporter(1, 1, 1), t0);
+        votes.record_vote_at(first, reporter(1, 2, 1), t0);
+        let lapse = t0 + VOTE_TTL + Duration::from_secs(1);
+        votes.record_vote_at(second, reporter(8, 8, 1), lapse);
+        let much_later = lapse + VOTE_TTL + Duration::from_secs(1);
+        votes.record_vote_at(second, reporter(8, 8, 2), much_later);
+        votes.record_vote_at(second, reporter(8, 8, 3), much_later);
+        assert_eq!(
+            votes.record_vote_at(second, reporter(9, 9, 1), much_later),
+            Some(second)
+        );
+    }
+
+    /// On a network with no more nets than the old peak nothing can beat it,
+    /// so a genuine address change sat unconfirmed until the lapse aged out.
+    /// The peers that used to see us at the old address now reporting the new
+    /// one is that change, and confirms it; strangers are still held to the
+    /// peak.
+    #[test]
+    fn the_old_addresss_own_reporters_move_it_without_waiting_out_the_lapse() {
+        let mut votes = EmberObservedIpVotes::new();
+        let first = addr(50, 4672);
+        let second = addr(51, 4672);
+        let t0 = Instant::now();
+        for net in 0..4u8 {
+            votes.record_vote_at(first, reporter(1, net, 1), t0);
+        }
+        assert_eq!(votes.confirmed(), Some(first));
+
+        let later = t0 + VOTE_TTL + Duration::from_secs(1);
+        votes.record_vote_at(second, reporter(1, 0, 1), later);
+        votes.record_vote_at(second, reporter(1, 1, 1), later);
+        assert_eq!(votes.confirmed(), None, "the old address has lapsed");
+        assert_eq!(
+            votes.record_vote_at(second, reporter(1, 2, 1), later),
+            Some(second),
+            "three of its four reporters moved, which a peak of four cannot outvote"
+        );
+
+        let mut votes = EmberObservedIpVotes::new();
+        for net in 0..4u8 {
+            votes.record_vote_at(first, reporter(1, net, 1), t0);
+        }
+        votes.record_vote_at(second, reporter(1, 0, 1), later);
+        votes.record_vote_at(second, reporter(1, 1, 1), later);
+        assert_eq!(
+            votes.record_vote_at(second, reporter(8, 8, 1), later),
+            None,
+            "two former reporters and a stranger are not a quorum of them"
+        );
+        votes.record_vote_at(second, reporter(8, 8, 2), later);
+        assert_eq!(
+            votes.record_vote_at(second, reporter(8, 8, 3), later),
+            Some(second),
+            "but five nets beat the peak of four"
+        );
+    }
+
+    /// The backers list used to keep the first nets that voted and nothing
+    /// after them, so once a long uptime had filled it the peers still talking
+    /// to us when the address moved were not in it, and the shortcut above
+    /// never fired.
+    #[test]
+    fn the_former_reporters_are_the_most_recent_ones() {
+        let mut votes = EmberObservedIpVotes::new();
+        let first = addr(50, 4672);
+        let second = addr(51, 4672);
+        let t0 = Instant::now();
+        for net in 0..=255u8 {
+            votes.record_vote_at(first, reporter(1, net, 1), t0);
+        }
+        assert_eq!(votes.confirmed(), Some(first));
+
+        // Long after those voted, the peers we talk to now keep it confirmed.
+        let mid = t0 + VOTE_TTL / 2;
+        for net in 0..3u8 {
+            votes.record_vote_at(first, reporter(2, net, 1), mid);
+        }
+        let later = t0 + VOTE_TTL + Duration::from_secs(1);
+        votes.record_vote_at(first, reporter(2, 0, 1), later);
+        assert_eq!(votes.confirmed(), Some(first), "still backed by the newer nets");
+
+        // Then the address moves and those same peers report the new one.
+        let moved = mid + VOTE_TTL + Duration::from_secs(1);
+        votes.record_vote_at(second, reporter(2, 1, 1), moved);
+        votes.record_vote_at(second, reporter(2, 2, 1), moved);
+        assert_eq!(votes.confirmed(), None, "the old address has lapsed");
+        assert_eq!(
+            votes.record_vote_at(second, reporter(2, 0, 1), moved),
+            Some(second),
+            "three of the peers that backed it most recently moved it"
+        );
+    }
+
+    /// The incumbent that lapsed is not held to its own bar: its peers voting
+    /// again restore it.
+    #[test]
+    fn a_lapsed_incumbent_reconfirms_on_its_own_votes() {
+        let mut votes = EmberObservedIpVotes::new();
+        let first = addr(50, 4672);
+        let t0 = Instant::now();
+        votes.record_vote_at(first, reporter(1, 0, 1), t0);
+        votes.record_vote_at(first, reporter(1, 1, 1), t0);
+        votes.record_vote_at(first, reporter(1, 2, 1), t0);
+        let later = t0 + VOTE_TTL + Duration::from_secs(1);
+        votes.record_vote_at(first, reporter(1, 0, 1), later);
+        votes.record_vote_at(first, reporter(1, 1, 1), later);
+        assert_eq!(votes.record_vote_at(first, reporter(1, 2, 1), later), Some(first));
     }
 
     /// The quorum has to be contemporaneous: three votes spread across hours

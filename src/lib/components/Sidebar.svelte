@@ -21,6 +21,7 @@
     type NavItem,
   } from '$lib/navItems';
   import { shortcutModAria, shortcutModSymbol } from '$lib/platform';
+  import { isShortcutLetter } from '$lib/shortcutKey';
   import { appSettings } from '$lib/stores/settings';
   import { onMount } from 'svelte';
 
@@ -329,7 +330,7 @@
     // convention and frees up horizontal space for data-dense pages
     // without the user needing to reach for the mouse. Blocked while
     // typing so it doesn't fight with rich-text bold shortcuts.
-    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.key === 'b' || e.key === 'B')) {
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isShortcutLetter(e, 'b')) {
       if (isTypingTarget(e.target)) return;
       e.preventDefault();
       toggleCollapsed();

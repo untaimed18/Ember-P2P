@@ -1,6 +1,6 @@
 [package]
 name = "ember"
-version = "1.7.0"
+version = "1.7.1"
 description = "A decentralized P2P file sharing application"
 authors = ["untaimed18"]
 license = "GPL-3.0-only"
@@ -114,6 +114,9 @@ ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 snow = "0.9"
 chacha20poly1305 = "0.10"
 quinn = "0.11"
+# The version quinn already pulls in, named directly for `InvalidCid`, which
+# quinn does not re-export and a custom connection-id generator must return.
+quinn-proto = "0.11"
 rcgen = "0.14"
 rustls = { version = "0.23", features = ["ring"] }
 # Used to robustly parse a peer's QUIC/TLS certificate and extract its
@@ -161,6 +164,10 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["sync-secret-service"] }
+# D-Bus for the sleep inhibitor (`src/power.rs`) and the tray-host probe
+# (`src/tray_host.rs`). The same crate and major version `notify-rust` already
+# links for desktop notifications, so this adds no second D-Bus stack.
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

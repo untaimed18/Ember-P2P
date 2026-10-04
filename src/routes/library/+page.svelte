@@ -8,6 +8,7 @@
     reapproveSharedFolder,
     reloadSharedFiles,
     getScanStatus,
+    getHashingPaused,
     getLibraryScanTruncated,
     stopHashing,
     previewStopHashing,
@@ -84,6 +85,7 @@
   import { serviceAvailableFor } from '$lib/webServices';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import { createMaxWaitDebounce } from '$lib/debounce';
+  import { isShortcutLetter } from '$lib/shortcutKey';
   import {
     applySharedFileStats,
     isUploadCounterPhase,
@@ -114,6 +116,11 @@
     matchPath: string;
   };
   let files: LibraryRow[] = $state.raw([]);
+  /** `files` as of the last full load. Upload counters patch `files` about
+   *  once a second while anything uploads, and what is built from paths,
+   *  sizes and hashes alone — the folder tree, duplicate detection — has no
+   *  use for them, so it reads this and is not rebuilt on every tick. */
+  let treeFiles: LibraryRow[] = $state.raw([]);
   let aggregateStats = $state<TransferStats | null>(null);
   let scanning = $state(false);
   /** `[done, total]` while the background digest pass is running. Not part of
@@ -161,6 +168,9 @@
    *  the files stay shared and servable throughout, and it never runs again. */
   let hashProgress: { current: number; total: number; file_name: string; upgrading: number } | null = $state(null);
   let stoppedByUser = $state(false);
+  /** Bumped whenever an action or event decides `stoppedByUser`, so the
+   *  mount-time `getHashingPaused` answer cannot undo a Resume made first. */
+  let hashingStateEpoch = 0;
   let fileByPath = $derived.by(() => {
     const map = new Map<string, FileInfo>();
     for (const f of files) map.set(f.path, f);
@@ -482,6 +492,8 @@
   let missingScanTruncated = $state(false);
   let missingTotalCount = $state(0);
   let missingScanInFlight = $state(false);
+  let missingScansRunning = 0;
+  let missingScanGen = 0;
   // `scanMissingFiles` stats every shared file on disk, so it must not run on
   // every data refresh — and `refresh()` itself fires every 3s while hashing.
   // Throttle background scans to once per interval; user-initiated paths pass
@@ -497,13 +509,19 @@
   let pendingRestoreMissingOnly = false;
 
   async function refreshMissingSet(force = false) {
-    if (missingScanInFlight) return;
+    // A forced scan runs even with one in flight, and the newest wins: the
+    // in-flight one may predate a removal, and returning early left its list,
+    // still naming the paths just removed, to land afterwards and bring the
+    // count and the Remove button back.
+    if (missingScansRunning > 0 && !force) return;
     if (!force && Date.now() - lastMissingScanAt < MISSING_SCAN_MIN_INTERVAL_MS) return;
+    const gen = ++missingScanGen;
+    missingScansRunning += 1;
     missingScanInFlight = true;
     lastMissingScanAt = Date.now();
     try {
       const result = await scanMissingFiles();
-      if (!mounted) return;
+      if (!mounted || gen !== missingScanGen) return;
       missingPathSet = new Set(result.paths);
       missingScanTruncated = result.truncated;
       missingTotalCount = result.totalMissing;
@@ -520,12 +538,13 @@
     } catch {
       // Non-fatal: leave previous set in place. Toast once until a scan
       // succeeds again so hashing-driven refresh() doesn't spam warnings.
-      if (mounted && !missingScanFailToasted) {
+      if (mounted && gen === missingScanGen && !missingScanFailToasted) {
         missingScanFailToasted = true;
         toastWarning(m.library_missing_scan_failed());
       }
     } finally {
-      if (mounted) missingScanInFlight = false;
+      missingScansRunning -= 1;
+      if (mounted) missingScanInFlight = missingScansRunning > 0;
     }
   }
 
@@ -588,7 +607,7 @@
 
   let duplicateHashes = $derived.by(() => {
     const counts = new Map<string, number>();
-    for (const f of files) {
+    for (const f of treeFiles) {
       if (!f.hash) continue;
       counts.set(f.hash, (counts.get(f.hash) ?? 0) + 1);
     }
@@ -601,7 +620,7 @@
   let duplicateFileCount = $derived.by(() => {
     if (duplicateHashes.size === 0) return 0;
     let n = 0;
-    for (const f of files) if (f.hash && duplicateHashes.has(f.hash)) n++;
+    for (const f of treeFiles) if (f.hash && duplicateHashes.has(f.hash)) n++;
     return n;
   });
 
@@ -721,6 +740,17 @@
   let initialLoadDone = $state(false);
   let firstLoadSlow = $state(false);
   let pendingRefresh = false;
+  /** Callers of `refresh` waiting for the load queued behind a running one. */
+  let refreshWaiters: Array<() => void> = [];
+  /** Callers the load in flight answers. A forced load that replaces it takes
+   *  them over: the replaced load's rows are discarded, so releasing them
+   *  then sent them on with the rows from before their own change. */
+  let answeringNow: Array<() => void> = [];
+  /** A load that never settles must not hold its callers (a bulk action's
+   *  buttons, the Stop flow) forever; past this they go on with what is shown. */
+  const REFRESH_WAIT_CAP_MS = 30_000;
+  /** The load in flight is past that cap: later callers are not held either. */
+  let loadStalled = false;
   const refreshDebounce = createMaxWaitDebounce(() => { refresh(); });
   let loadGen = 0;
   /** Etag of the backend rows `files` was last built from. A refresh passes it
@@ -770,11 +800,28 @@
     if (!mounted) return;
     if (busy && !force) {
       pendingRefresh = true;
-      return;
+      if (loadStalled) return;
+      // Settled by the load run for this call, which starts after the one in
+      // flight. Returning at once let a caller that awaits — a bulk action
+      // re-enabling its buttons, the drawer redrawing a switch it just
+      // flipped — carry on with the rows from before its own change.
+      return new Promise<void>((resolve) => refreshWaiters.push(resolve));
     }
     const gen = ++loadGen;
     busy = true;
     pendingRefresh = false;
+    // This load reads everything a debounced one scheduled before it would.
+    refreshDebounce.cancel();
+    // Everyone who asked before this load started is answered by it.
+    const answering = answeringNow.concat(refreshWaiters);
+    answeringNow = answering;
+    refreshWaiters = [];
+    loadStalled = false;
+    const releaseId = setTimeout(() => {
+      if (gen === loadGen) loadStalled = true;
+      for (const resolve of answering) resolve();
+      for (const resolve of refreshWaiters) resolve();
+    }, REFRESH_WAIT_CAP_MS);
     if (!initialLoadDone) firstLoadSlow = false;
     const work = Promise.all([
       getSharedFolders(),
@@ -782,8 +829,10 @@
       getScanStatus(),
       getFolderPriorities(),
       getLibraryScanTruncated(),
-      getStatistics().catch(() => null),
-      getUnapprovedSharedFolders().catch(() => [] as string[]),
+      // `undefined` on failure, so a transient error keeps what is shown: as
+      // null and [] it read as "0 B uploaded" and hid every Re-approve button.
+      getStatistics().catch(() => undefined),
+      getUnapprovedSharedFolders().catch(() => undefined),
     ]);
     // The watchdog must not discard the in-flight result. A large library can
     // take longer than 5s, and racing Promise.race used to drop that payload
@@ -802,16 +851,19 @@
       const [newFolders, snapshot, isScanning, newPriorities, newScanTruncated, newAggregateStats, newUnapproved] = await work;
       if (!mounted || gen !== loadGen) return;
       folders = newFolders;
-      unapprovedFolders = newUnapproved;
+      if (newUnapproved !== undefined) unapprovedFolders = newUnapproved;
       if (!stoppedByUser) scanning = isScanning;
       // The library is the offer list. A file that is not offered stays on
       // disk and stays out of this view; sharing it again is the folder window.
       const offered = snapshot.files ? snapshot.files.filter((f) => f.shared) : null;
-      if (offered) files = offered.map(withMatchKeys);
+      if (offered) {
+        files = offered.map(withMatchKeys);
+        treeFiles = files;
+      }
       filesEtag = snapshot.etag;
       folderPriorities = newPriorities;
       scanTruncated = newScanTruncated;
-      aggregateStats = newAggregateStats;
+      if (newAggregateStats !== undefined) aggregateStats = newAggregateStats;
       initialLoadDone = true;
       firstLoadSlow = false;
       // Successful load: clear a previously-surfaced load error (but leave
@@ -860,11 +912,23 @@
       }
     } finally {
       clearTimeout(timeoutId);
-      if (mounted && gen === loadGen) {
+      clearTimeout(releaseId);
+      if (gen === loadGen || !mounted) {
+        for (const resolve of answering) resolve();
+        if (answeringNow === answering) answeringNow = [];
+      }
+      if (!mounted) {
+        for (const resolve of refreshWaiters) resolve();
+        refreshWaiters = [];
+      } else if (gen === loadGen) {
         busy = false;
+        loadStalled = false;
         if (pendingRefresh) {
           pendingRefresh = false;
-          debouncedRefresh();
+          // Someone is waiting on the next load: run it now, not after the
+          // scan-time debounce of up to 15 s.
+          if (refreshWaiters.length > 0) void refresh();
+          else debouncedRefresh();
         }
         void refreshMissingSet();
       }
@@ -1071,6 +1135,7 @@
         return;
       }
       stoppedByUser = false;
+      hashingStateEpoch += 1;
       scanning = true;
       scanTruncated = false;
       if (mounted) await refresh();
@@ -1149,6 +1214,7 @@
     // leaving the reload to run invisibly while the "hashing stopped"
     // banner lingers.
     stoppedByUser = false;
+    hashingStateEpoch += 1;
     scanning = true;
     scanTruncated = false;
     try {
@@ -1260,6 +1326,7 @@
       // count, until Resume / Reload / Add folder or a revisit.
       hashTopUp = null;
       stoppedByUser = true;
+      hashingStateEpoch += 1;
       // Keep `stoppedByUser` true: it's exactly what gates the "Resume
       // hashing" banner. Clearing it here (the old behaviour) meant the
       // banner never appeared after a successful stop, so a half-hashed
@@ -1275,6 +1342,7 @@
 
   async function handleResume() {
     stoppedByUser = false;
+    hashingStateEpoch += 1;
     scanning = true;
     scanTruncated = false;
     try {
@@ -1703,7 +1771,7 @@
   // One pass over the library builds the whole sidebar: the tree's top level
   // is the shared folders, each carrying the count and size of everything
   // beneath it, with a file attributed to the deepest share that contains it.
-  let folderTree = $derived(buildLibraryFolderTree(folders, files, normalizePathForMatch));
+  let folderTree = $derived(buildLibraryFolderTree(folders, treeFiles, normalizePathForMatch));
   /** Files under each shared folder, for the remove-folder confirmation. */
   let shareFileCounts = $derived.by(() => {
     const counts = new Map<string, number>();
@@ -1902,7 +1970,7 @@
     mediaFetchTimer = setTimeout(() => {
       mediaFetchTimer = null;
       if (selectedPath !== path) return;
-      getFileMediaMetadata(path).then((media) => {
+      getFileMediaMetadata(path, () => selectedPath === path).then((media) => {
         if (selectedPath !== path) return;
         selectedMedia = media;
       }).catch(() => {
@@ -1928,6 +1996,11 @@
       : `${m2}:${String(sec).padStart(2, '0')}`;
   }
 
+  /** eMule's `MAXFILECOMMENTLEN`. Its clients cut a received comment to this
+   *  many characters (UTF-16 units, as `length` counts), so a longer one is
+   *  kept in full here and on other Ember peers but shown short on eMule. */
+  const EMULE_COMMENT_LIMIT = 128;
+
   async function handleSaveComment() {
     const hash = selectedHash;
     if (!hash) return;
@@ -1937,16 +2010,21 @@
     if (commentLoading) return;
     commentSaveState = 'saving';
     commentSaveMessage = m.library_saving();
+    // What is being saved, not what the editor holds when the save returns:
+    // text typed meanwhile is unsaved, and taking it as the baseline cleared
+    // the unsaved mark, disabled Save and let navigation drop it unasked.
+    const savedRating = ourRating;
+    const savedText = ourComment;
     try {
-      await setFileComment(hash, ourRating, ourComment);
+      await setFileComment(hash, savedRating, savedText);
       const info = await getFileComments(hash);
       if (selectedHash !== hash) return;
       commentInfo = info;
       commentSaveState = 'saved';
       commentSaveMessage = m.library_saved();
       commentLastSavedAt = Date.now();
-      commentBaselineRating = ourRating;
-      commentBaselineText = ourComment;
+      commentBaselineRating = savedRating;
+      commentBaselineText = savedText;
       if (commentSaveTimer) clearTimeout(commentSaveTimer);
       commentSaveTimer = setTimeout(() => {
         commentSaveState = 'idle';
@@ -2187,8 +2265,10 @@
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
-        if (addFolderOpen) addFolderOpen = false;
-        else if (stopConfirmVisible) handleStopCancel();
+        // Share Folders handles its own Escape and refuses it mid-share;
+        // closing it from here unmounted it while the selection was still
+        // being added, with no report of what had landed.
+        if (stopConfirmVisible && !addFolderOpen) handleStopCancel();
       }
       return;
     }
@@ -2242,7 +2322,7 @@
     // designed to persist across filter changes (see `checkedHiddenCount`),
     // so a blanket `new Set()` here would silently drop any checks hidden by
     // the current filter.
-    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'a' || e.key === 'A')) {
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && isShortcutLetter(e, 'a')) {
       if (sortedFiles.length === 0) return;
       e.preventDefault();
       checkedPaths = new Set([...checkedPaths, ...sortedFiles.map(f => f.path)]);
@@ -2251,7 +2331,7 @@
     }
 
     // Ctrl/Cmd+D clears the check selection.
-    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'd' || e.key === 'D')) {
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && isShortcutLetter(e, 'd')) {
       if (checkedPaths.size === 0) return;
       e.preventDefault();
       clearChecked();
@@ -2259,7 +2339,7 @@
     }
 
     // Ctrl/Cmd+C copies links for the current check selection or selected row.
-    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'c' || e.key === 'C')) {
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && isShortcutLetter(e, 'c')) {
       // Selected text (a path or comment in the drawer) keeps the normal copy.
       if (window.getSelection()?.toString()) return;
       const hasChecked = checkedCount > 0;
@@ -2771,6 +2851,19 @@
 
   onMount(() => {
     mounted = true;
+    // A Stop outlives this page: the backend keeps hashing held until Resume,
+    // Reload or Add folder. Without this the Resume banner was gone on the
+    // next visit while nothing hashed, rows said "hashing" for good, and new
+    // files in watched folders were deferred with no way shown to restart.
+    const epochAtMount = hashingStateEpoch;
+    void getHashingPaused()
+      .then((paused) => {
+        if (mounted && paused && hashingStateEpoch === epochAtMount) {
+          stoppedByUser = true;
+          scanning = false;
+        }
+      })
+      .catch(() => {});
     // localStorage can throw in private mode / quota-exceeded; wrap
     // the read so a storage failure doesn't abort onMount and leave
     // the library page without its event listeners attached.
@@ -2948,6 +3041,7 @@
           if (!mounted) return;
           if ((event.payload?.count ?? 0) <= 0) return;
           stoppedByUser = false;
+          hashingStateEpoch += 1;
           scanning = true;
           scanTruncated = false;
           void refresh();
@@ -4224,6 +4318,7 @@
                     bind:value={ourComment}
                     maxlength="4096"
                     rows="2"
+                    aria-describedby={ourComment.length > EMULE_COMMENT_LIMIT ? 'comment-limit-note' : undefined}
                     onkeydown={(e) => {
                       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
                         e.preventDefault();
@@ -4246,6 +4341,11 @@
                     {commentSaveState === 'saving' ? m.library_saving() : m.common_save()}
                   </button>
                 </div>
+                {#if ourComment.length > EMULE_COMMENT_LIMIT}
+                  <div class="comment-limit-note" id="comment-limit-note">
+                    {m.library_comment_emule_limit({ count: ourComment.length, limit: EMULE_COMMENT_LIMIT })}
+                  </div>
+                {/if}
                 {#if commentSaveState !== 'idle'}
                   <div class="comment-save-state" class:error={commentSaveState === 'error'}>
                     {commentSaveMessage}
@@ -4405,7 +4505,11 @@
           disabled={!relatedSearchReady}
           onclick={() => ctxAction('find_related_selected')}
           title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
-        >{m.search_ctx_find_related_selected({ count: checkedCount })}</button>
+        >{m.search_ctx_find_related_selected({
+          // The search sends the clicked row plus the checked ones, so an
+          // unchecked clicked row is one more than the checked count.
+          count: checkedPaths.has(ctxMenu.file.path) ? checkedCount : checkedCount + 1,
+        })}</button>
       {/if}
       <div class="ctx-sep" role="separator"></div>
       {#if ctxMenu.file.shared}
@@ -5840,6 +5944,11 @@
   }
   .comment-save-state.error {
     color: var(--danger);
+  }
+  .comment-limit-note {
+    margin-top: 6px;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
   }
   .comment-peers {
     margin-top: 4px;

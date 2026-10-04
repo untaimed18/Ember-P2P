@@ -77,8 +77,10 @@ pub struct BootstrapCache {
     loaded: HashSet<EmberNodeId>,
     /// Entries already handed to the routing table this session, so a batch is
     /// offered once rather than re-offered every time its contents are evicted.
-    /// See [`Self::seed_batch`]. Cleared by [`Self::rearm_offers`].
-    offered: HashSet<EmberNodeId>,
+    /// See [`Self::seed_batch`]. Cleared by [`Self::rearm_offers`], and aged
+    /// out by [`Self::rearm_stale_offers`]. Keyed to when each was offered, in
+    /// unix seconds.
+    offered: HashMap<EmberNodeId, i64>,
     /// Entries the table actually accepted this session.
     ///
     /// Deliberately separate from `offered`, which carries a different meaning
@@ -109,7 +111,7 @@ impl BootstrapCache {
         Self {
             entries: HashMap::new(),
             loaded: HashSet::new(),
-            offered: HashSet::new(),
+            offered: HashMap::new(),
             dialled: HashSet::new(),
             session_started_at: chrono::Utc::now().timestamp(),
         }
@@ -232,7 +234,7 @@ impl BootstrapCache {
     /// the rest of the address book — the entries with real history — never
     /// gets dialled at all.
     pub fn offers_outstanding(&self, held_leads: &HashSet<EmberNodeId>) -> usize {
-        self.offered.iter().filter(|id| held_leads.contains(id)).count()
+        self.offered.keys().filter(|id| held_leads.contains(id)).count()
     }
 
     /// How many addresses the book holds.
@@ -264,6 +266,21 @@ impl BootstrapCache {
         self.offered.clear();
     }
 
+    /// Let entries offered at least `after_secs` ago be offered again, so a
+    /// thin table keeps retrying its address book. Returns how many.
+    ///
+    /// [`Self::rearm_offers`] only fires once the table is empty, and holding a
+    /// single contact, or one unproven lead, is not empty. On a network of a
+    /// handful of nodes that left every other remembered peer undialled for
+    /// the rest of the session, however many of them had come back online.
+    /// Anything the table still holds is excluded by `seed_batch` anyway, and
+    /// the ranking puts addresses that keep missing at the back.
+    pub fn rearm_stale_offers(&mut self, now: i64, after_secs: i64) -> usize {
+        let before = self.offered.len();
+        self.offered.retain(|_, at| now.saturating_sub(*at) < after_secs);
+        before - self.offered.len()
+    }
+
     /// Record that the routing table accepted these addresses, so their silence
     /// counts against them at shutdown. See the `dialled` field.
     pub fn note_offered(&mut self, admitted: impl Iterator<Item = EmberNodeId>) {
@@ -292,7 +309,7 @@ impl BootstrapCache {
         // The side sets are keyed by the same ids, so they have to shrink with
         // them or they accumulate ids for entries that no longer exist — which
         // over a long session is exactly the unbounded growth this bounds.
-        self.offered.retain(|id| keep.contains(id));
+        self.offered.retain(|id, _| keep.contains(id));
         self.dialled.retain(|id| keep.contains(id));
         self.loaded.retain(|id| keep.contains(id));
         before - self.entries.len()
@@ -374,7 +391,7 @@ impl BootstrapCache {
             .entries
             .values()
             .filter(|entry| {
-                !self.offered.contains(&entry.contact.node_id)
+                !self.offered.contains_key(&entry.contact.node_id)
                     && !held.contains(&entry.contact.node_id)
             })
             .collect();
@@ -389,8 +406,9 @@ impl BootstrapCache {
                 ..entry.contact.clone()
             })
             .collect();
+        let now = chrono::Utc::now().timestamp();
         for contact in &batch {
-            self.offered.insert(contact.node_id);
+            self.offered.insert(contact.node_id, now);
         }
         batch
     }
@@ -826,6 +844,27 @@ mod tests {
             cache.seed_batch(&local, &HashSet::new(), 2).is_empty(),
             "and the walk stops once the book is exhausted"
         );
+    }
+
+    /// A thin table that still holds someone never empties, so the collapse
+    /// re-arm never fires; offers age out instead, and a peer that has come
+    /// back is dialled again. Anything the table holds stays excluded.
+    #[test]
+    fn a_spent_book_is_offered_again_once_its_offers_age() {
+        let local = EmberNodeId([0; 16]);
+        let mut cache = cache_started_at(1_000);
+        cache.load((1..=3).map(|i| CachedContact::new(contact(i, 0))).collect());
+        let first = cache.seed_batch(&local, &HashSet::new(), 3);
+        assert_eq!(first.len(), 3);
+        assert!(cache.seed_batch(&local, &HashSet::new(), 3).is_empty());
+
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(cache.rearm_stale_offers(now, 1800), 0, "too recent to retry");
+        assert_eq!(cache.rearm_stale_offers(now + 1800, 1800), 3);
+        let still_held: HashSet<EmberNodeId> = std::iter::once(first[0].node_id).collect();
+        let again = cache.seed_batch(&local, &still_held, 3);
+        assert_eq!(again.len(), 2);
+        assert!(again.iter().all(|c| c.node_id != first[0].node_id));
     }
 
     /// Ranking decides what survives the cap, so the peers most likely to

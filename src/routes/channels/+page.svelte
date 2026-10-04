@@ -64,6 +64,7 @@
     pickAndOfferChannelTransfer,
     removeChannelModerator,
     respondChannelTransfer,
+    sendChannelTransferStandardOffer,
     rotateChannelRoomKey,
     setChannelInvitePolicy,
     setChannelSlowMode,
@@ -125,6 +126,7 @@
     unreadBadgeTone,
     channelTransfers,
     mergeChannelTransfers,
+    xferNeedsConsent,
     type ChannelNotifyLevel,
   } from '$lib/stores/channels';
   import {
@@ -135,6 +137,7 @@
     sectionRooms,
   } from '$lib/channelSections';
   import { isApplePlatform, shortcutModAria } from '$lib/platform';
+  import { isShortcutLetter } from '$lib/shortcutKey';
 
   let channelList = $derived($channelsStore.filter((c) => !c.deleted));
   let joinedCount = $derived(channelList.filter((c) => c.in_room).length);
@@ -725,7 +728,7 @@
       e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey
       && (e.key === 'ArrowUp' || e.key === 'ArrowDown');
     const searchKey =
-      (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.key === 'k' || e.key === 'K');
+      (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isShortcutLetter(e, 'k');
     // Everything below costs a DOM query, and this runs on every keypress.
     if (!menuKey && !roomStep && !searchKey) return;
     if (document.querySelector('[aria-modal="true"]')) return;
@@ -2138,6 +2141,18 @@
     }
   }
 
+  async function handleSendStandardOffer(xferId: string) {
+    if (respondingTo.includes(xferId)) return;
+    respondingTo = [...respondingTo, xferId];
+    try {
+      await sendChannelTransferStandardOffer(xferId);
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      respondingTo = respondingTo.filter((id) => id !== xferId);
+    }
+  }
+
   /** Transfers belonging to the room on screen. A transfer is between two
    *  people in one room, so showing another room's would be noise. */
   /** Offers waiting on an answer come first — they are the only rows that
@@ -2163,7 +2178,9 @@
       case 'awaiting':
         return m.channels_xfer_awaiting({ name: who });
       case 'offered':
-        return m.channels_xfer_offered({ name: who });
+        return xferNeedsConsent(t)
+          ? m.channels_xfer_no_reply({ name: who })
+          : m.channels_xfer_offered({ name: who });
       case 'accepted':
       case 'active':
         return t.direction === 'send'
@@ -2246,7 +2263,11 @@
     return () => clearInterval(timer);
   });
 
-  let roomOffersWaiting = $derived(roomTransfers.filter((t) => t.status === 'awaiting').length);
+  /** Offers waiting on this user: one to answer, or their own one asking
+   *  whether to send the standard offer. */
+  let roomOffersWaiting = $derived(
+    roomTransfers.filter((t) => t.status === 'awaiting' || xferNeedsConsent(t)).length,
+  );
   let membersToggleLabel = $derived.by(() => {
     if (membersOpen) return m.channels_hide_members();
     if (roomOffersWaiting === 0) return m.channels_show_members();
@@ -2269,17 +2290,28 @@
   /** A new offer in the room on screen brings the members pane out with the
    *  drawer open, where Accept and Deny are. Not on narrow layouts, where
    *  the pane covers the conversation: there the badge on the toggle says it. */
+  function bringOutXferDrawer() {
+    xferCollapsed = false;
+    if (!membersOpen && typeof window !== 'undefined' && !window.matchMedia(MQ_MAX_LG).matches) {
+      membersOpen = true;
+    }
+  }
   const offersSeen = new Set<string>();
   $effect(() => {
     const fresh = roomTransfers.filter((t) => t.status === 'awaiting' && !offersSeen.has(t.xfer_id));
     if (fresh.length === 0) return;
     for (const t of fresh) offersSeen.add(t.xfer_id);
-    untrack(() => {
-      xferCollapsed = false;
-      if (!membersOpen && typeof window !== 'undefined' && !window.matchMedia(MQ_MAX_LG).matches) {
-        membersOpen = true;
-      }
-    });
+    untrack(bringOutXferDrawer);
+  });
+
+  /** The question about a standard offer is brought out the same way, since
+   *  its button is in the drawer too. */
+  const consentAsked = new Set<string>();
+  $effect(() => {
+    const fresh = roomTransfers.filter((t) => xferNeedsConsent(t) && !consentAsked.has(t.xfer_id));
+    if (fresh.length === 0) return;
+    for (const t of fresh) consentAsked.add(t.xfer_id);
+    untrack(bringOutXferDrawer);
   });
 </script>
 
@@ -3360,6 +3392,9 @@
                           </p>
                         {/if}
                         <p class="xfer-status">{transferLabel(t)}</p>
+                        {#if xferNeedsConsent(t)}
+                          <p class="xfer-note">{m.channels_xfer_standard_offer_hint()}</p>
+                        {/if}
                         {#if t.status === 'accepted' || t.status === 'active'}
                           <div
                             class="xfer-progress"
@@ -3409,6 +3444,25 @@
                               onclick={() => handleRespondTransfer(t.xfer_id, false)}
                             >
                               {m.channels_xfer_decline()}
+                            </button>
+                          </div>
+                        {:else if xferNeedsConsent(t)}
+                          <div class="xfer-actions two">
+                            <button
+                              type="button"
+                              class="secondary"
+                              disabled={busy}
+                              onclick={() => handleSendStandardOffer(t.xfer_id)}
+                            >
+                              {m.channels_xfer_send_standard_offer()}
+                            </button>
+                            <button
+                              type="button"
+                              class="ghost xfer-cancel"
+                              disabled={busy}
+                              onclick={() => handleCancelTransfer(t.xfer_id)}
+                            >
+                              {m.common_cancel()}
                             </button>
                           </div>
                         {:else if tone === 'moving'}
@@ -4980,6 +5034,14 @@
 
   .xfer-card.tone-done .xfer-status { color: var(--success); }
   .xfer-card.tone-failed .xfer-status { color: var(--danger); }
+
+  .xfer-note {
+    margin: 0;
+    font-size: var(--font-size-xs);
+    line-height: 1.4;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+  }
 
   .xfer-progress {
     position: relative;

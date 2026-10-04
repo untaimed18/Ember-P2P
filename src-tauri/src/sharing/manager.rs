@@ -322,6 +322,10 @@ pub struct TransferManager {
     queue_generation: u64,
     queue_index: std::sync::Mutex<QueueIndex>,
     revisions: std::sync::Mutex<TransferRevisions>,
+    /// Whether the downloads the last session left unfinished are back in
+    /// the lists. They arrive only once `known.met` and their `.part` files
+    /// have been read, well after the first poll can be answered.
+    pub restored: bool,
 }
 
 /// Declares the closed set of health explanations a download row can show,
@@ -486,6 +490,9 @@ pub struct TransferDelta {
     pub full: bool,
     pub transfers: Vec<Transfer>,
     pub removed: Vec<String>,
+    /// [`TransferManager::restored`]: until it is set, a row the caller has
+    /// not seen yet may still be on its way.
+    pub restored: bool,
 }
 
 struct RowRevision {
@@ -651,6 +658,7 @@ impl TransferManager {
             queue_generation: 0,
             queue_index: std::sync::Mutex::new(QueueIndex::default()),
             revisions: std::sync::Mutex::new(TransferRevisions::new()),
+            restored: false,
         }
     }
 
@@ -1829,7 +1837,40 @@ impl TransferManager {
         Vec::new()
     }
 
+    /// An active row that stopped holding a download slot (Paused,
+    /// Insufficient) and would run past the cap if resumed in place: pausing
+    /// it already promoted another row into its slot. It waits at the head of
+    /// the queue, where Stop leaves a row, for the next free slot.
+    fn requires_slot_to_resume(transfer: &Transfer) -> bool {
+        transfer.direction == TransferDirection::Download
+            && matches!(
+                transfer.status,
+                TransferStatus::Paused | TransferStatus::Insufficient
+            )
+    }
+
+    fn park_resumed_in_queue(&mut self, id: &str) {
+        let Some(mut transfer) = self.active.remove(id) else {
+            return;
+        };
+        transfer.status = Self::queued_wait_status(&transfer);
+        transfer.speed = 0;
+        Self::clear_failure_context(&mut transfer);
+        Self::clear_runtime_health(&mut transfer);
+        self.queue.push_front(transfer);
+        self.queue_changed();
+        if let Some(control) = self.controls.get(id) {
+            control.resume();
+        }
+    }
+
     pub fn resume(&mut self, id: &str) -> Vec<Transfer> {
+        let park = self.active.get(id).is_some_and(Self::requires_slot_to_resume)
+            && self.active_download_count() >= self.max_concurrent as usize;
+        if park {
+            self.park_resumed_in_queue(id);
+            return Vec::new();
+        }
         if let Some(transfer) = self.active.get_mut(id) {
             if transfer.status == TransferStatus::Paused {
                 // Match Insufficient: do not jump straight to Active before a
@@ -1910,20 +1951,35 @@ impl TransferManager {
         let max_downloads = self.max_concurrent as usize;
         let mut active_downloads = self.active_download_count();
         let mut promote_idx: HashSet<usize> = HashSet::new();
+        // Parked after the loop: moving a row into the queue now would shift
+        // the indices in `queue_index`.
+        let mut park: Vec<String> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::with_capacity(wanted.len());
         for id in ids.iter().map(String::as_str) {
             if !seen.insert(id) {
                 continue;
             }
             if register_missing_controls && !self.controls.contains_key(id) {
-                let ord = self
+                // Only for a row this can resume; see `resume_transfer`.
+                if let Some(ord) = self
                     .active
                     .get(id)
                     .or_else(|| queue_index.get(id).map(|&idx| &self.queue[idx]))
-                    .map(|t| Self::priority_ordinal(&t.priority));
-                self.install_control(id, TransferControl::new(), ord);
+                    .map(|t| Self::priority_ordinal(&t.priority))
+                {
+                    self.install_control(id, TransferControl::new(), Some(ord));
+                }
             }
             if let Some(transfer) = self.active.get(id) {
+                if Self::requires_slot_to_resume(transfer) && active_downloads >= max_downloads {
+                    // The status `park_resumed_in_queue` will give it,
+                    // recorded here to keep request order.
+                    outcome
+                        .statuses
+                        .push((id.to_string(), Self::queued_wait_status(transfer)));
+                    park.push(id.to_string());
+                    continue;
+                }
                 let resumable = matches!(
                     transfer.status,
                     TransferStatus::Paused | TransferStatus::Insufficient
@@ -1977,6 +2033,9 @@ impl TransferManager {
                 }
             }
             self.queue_changed();
+        }
+        for id in park.iter().rev() {
+            self.park_resumed_in_queue(id);
         }
         outcome
     }
@@ -2286,6 +2345,7 @@ impl TransferManager {
                 revisions.removed_since(since)
             },
             transfers,
+            restored: self.restored,
         }
     }
 
@@ -3190,6 +3250,49 @@ mod tests {
         ids.iter().map(|id| id.to_string()).collect()
     }
 
+    #[test]
+    fn resuming_an_unknown_id_registers_no_control() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(download("a"));
+        manager.resume_many(&owned(&["missing", "a"]), true);
+        assert!(manager.get_control("missing").is_none());
+        assert!(manager.get_control("a").is_some());
+    }
+
+    #[test]
+    fn resuming_a_download_whose_slot_was_given_away_waits_in_the_queue() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(download("a"));
+        manager.enqueue(download("b"));
+        // Pausing `a` frees its slot, so `b` is promoted into it.
+        assert_eq!(ids(&manager.pause_and_promote("a")), ["b"]);
+
+        assert!(manager.resume("a").is_empty());
+        assert_eq!(manager.active_download_count(), 1, "the cap still holds");
+        assert!(!manager.active.contains_key("a"));
+        assert_eq!(manager.queue.front().map(|t| t.id.as_str()), Some("a"));
+        assert_eq!(status_of(&manager, "a"), TransferStatus::Searching);
+
+        // The batch form parks the same way, and reports the new status.
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(download("a"));
+        manager.enqueue(download("b"));
+        manager.enqueue(download("c"));
+        manager.pause_and_promote("a");
+        let outcome = manager.resume_many(&owned(&["a"]), false);
+        assert!(outcome.restart_ids.is_empty() && outcome.promoted.is_empty());
+        assert_eq!(manager.active_download_count(), 1);
+        assert_eq!(ids(&Vec::from(manager.queue.clone())), ["a", "c"]);
+        assert!(outcome.statuses.iter().any(|(id, _)| id == "a"));
+
+        // With a slot free it resumes in place, as before.
+        let mut manager = TransferManager::new(2);
+        manager.enqueue(download("a"));
+        manager.pause_and_promote("a");
+        manager.resume("a");
+        assert!(manager.active.contains_key("a"));
+    }
+
     fn status_of(manager: &TransferManager, id: &str) -> TransferStatus {
         manager.get_transfer(id).expect("row present").status.clone()
     }
@@ -3231,8 +3334,9 @@ mod tests {
     }
 
     /// Same end state as resuming each id in turn: request order decides who
-    /// gets the free slot, an in-place `active` resume takes a slot too, and
-    /// rows left waiting keep their queue position.
+    /// gets the free slot, an in-place `active` resume needs one too and
+    /// otherwise waits at the head of the queue, and rows left waiting keep
+    /// their queue position.
     #[test]
     fn resume_many_matches_resuming_each_id_in_turn() {
         let build = || {
@@ -3256,7 +3360,11 @@ mod tests {
 
         assert_eq!(ids(&outcome.promoted), ids(&sequential_promoted));
         assert_eq!(ids(&outcome.promoted), ["c"]);
-        assert_eq!(outcome.restart_ids, ["a"], "a paused active row needs a restart");
+        assert!(
+            outcome.restart_ids.is_empty(),
+            "`c` took the only slot, so the paused active row `a` waits instead"
+        );
+        assert_eq!(batched.queue.front().map(|t| t.id.as_str()), Some("a"));
         for id in ["a", "b", "c", "d"] {
             assert_eq!(status_of(&batched, id), status_of(&sequential, id), "{id}");
         }
@@ -3509,6 +3617,19 @@ mod tests {
         let behind = manager.get_transfers_since(Some(base.epoch), base.revision);
         assert_eq!(delta_ids(&behind), ["b"]);
         assert_eq!(behind.removed, ["c"]);
+    }
+
+    #[test]
+    fn a_delta_says_whether_the_last_sessions_downloads_are_back() {
+        let mut manager = TransferManager::new(1);
+        let early = manager.get_transfers_since(None, 0);
+        assert!(!early.restored);
+
+        manager.enqueue(sourced("a", 1));
+        manager.restored = true;
+        let restored = manager.get_transfers_since(Some(early.epoch), early.revision);
+        assert!(restored.restored);
+        assert_eq!(delta_ids(&restored), ["a"]);
     }
 
     #[test]

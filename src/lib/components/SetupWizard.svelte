@@ -26,7 +26,7 @@
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { inertBackground, trapTabKey } from '$lib/a11y';
-  import { formatSpeed } from '$lib/utils';
+  import { clampInputUtf8Bytes, formatSpeed, NICKNAME_MAX_BYTES } from '$lib/utils';
 
   function fmtSpeedShort(bytesPerSec: number): string {
     return bytesPerSec > 0 ? formatSpeed(bytesPerSec) : m.wizard_summary_unlimited();
@@ -189,10 +189,9 @@
     return Math.min(max, Math.max(min, Math.trunc(n)));
   }
 
-  // The backend caps a nickname at 128 bytes, not characters; `maxlength` on
-  // the input counts UTF-16 units, so multi-byte text can pass it and still be
-  // refused on the final save.
-  let nicknameTooLong = $derived(new TextEncoder().encode(nickname.trim()).length > 128);
+  // The input stops at the byte cap as you type; this guards a value that did
+  // not arrive by typing, such as a prefill.
+  let nicknameTooLong = $derived(new TextEncoder().encode(nickname.trim()).length > NICKNAME_MAX_BYTES);
 
   /** Whether the current step's required fields pass validation. */
   let canAdvance = $derived.by(() => {
@@ -570,7 +569,16 @@
           <p class="step-desc">{m.wizard_nickname_desc()}</p>
           <div class="field">
             <label for="nickname">{m.wizard_nickname_label()}</label>
-            <input id="nickname" type="text" bind:value={nickname} maxlength="128" class="text-input" placeholder={m.wizard_nickname_placeholder()} />
+            <input
+              id="nickname"
+              type="text"
+              value={nickname}
+              maxlength="128"
+              oninput={(e) => (nickname = clampInputUtf8Bytes(e, NICKNAME_MAX_BYTES, nickname))}
+              oncompositionend={(e) => (nickname = clampInputUtf8Bytes(e, NICKNAME_MAX_BYTES, nickname))}
+              class="text-input"
+              placeholder={m.wizard_nickname_placeholder()}
+            />
           </div>
           {#if nicknameFromEmule}
             <p class="step-hint from-emule">{m.wizard_from_emule()}</p>

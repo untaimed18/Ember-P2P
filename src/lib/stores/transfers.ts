@@ -288,6 +288,11 @@ interface TransferEventPayload extends StatusEventPayload {
 
 export const transfers = writable<Transfer[]>([]);
 
+/** Whether `transfers` holds the backend's whole list: not only rows events
+ *  delivered ahead of the first sync, and not a list the backend answered
+ *  before it had restored the last session's unfinished downloads. */
+export const transfersLoaded = writable(false);
+
 /** The upload cap in force (`RuntimeStatus.effective_upload_speed`, bytes/s,
  *  0 = unlimited), or `null` until the backend has published one. Differs from
  *  `AppSettings.max_upload_speed` while a schedule rule or USS is in charge. */
@@ -361,6 +366,16 @@ const reversibleStateEnteredAt = new Map<string, number>();
  */
 const reversibleStateLeftAt = new Map<string, number>();
 const sourceCountsUpdatedAt = new Map<string, number>();
+/** When the page last set each download's category. The backend sends no
+ *  event for it, so a poll already in flight then still carries the old one. */
+const categorySetAt = new Map<string, number>();
+
+/** Show the category the backend has just accepted for these downloads. */
+export function setLocalCategory(ids: ReadonlySet<string>, category: string) {
+  const now = Date.now();
+  for (const id of ids) categorySetAt.set(id, now);
+  transfers.update((list) => list.map((t) => (ids.has(t.id) ? { ...t, category } : t)));
+}
 
 function eventContext(now: number): RowEventContext {
   return { now, reversibleStateEnteredAt, reversibleStateLeftAt, sourceCountsUpdatedAt };
@@ -558,7 +573,14 @@ function applyProgress(existing: Transfer, p: ProgressPayload): Transfer {
     ...(p.upload_time != null ? { upload_time: p.upload_time } : {}),
     ...(p.up_part_status != null ? { up_part_status: p.up_part_status } : {}),
     ...(p.up_part_count != null ? { up_part_count: p.up_part_count } : {}),
-    ...(p.up_peer_part_status != null ? { up_peer_part_status: p.up_peer_part_status } : {}),
+    // Mirrored, absent included: the backend sets the row's bitmap from each
+    // upload progress event and clears it when the peer's file no longer
+    // matches, and a cleared value is left out of the payload.
+    ...(isUpload
+      ? { up_peer_part_status: p.up_peer_part_status ?? undefined }
+      : p.up_peer_part_status != null
+        ? { up_peer_part_status: p.up_peer_part_status }
+        : {}),
   };
 }
 
@@ -1000,6 +1022,7 @@ async function runSync(pollStartedAt: number): Promise<void> {
     if (!sticky.has(row.id)) reconciledRows.add(row);
   }
   commitTransfers(next);
+  if (delta.restored) transfersLoaded.set(true);
 }
 
 /**
@@ -1050,8 +1073,12 @@ function mergePolledRow(
   } else if (!preserveFreshEventCounts) {
     sourceCountsUpdatedAt.delete(apiItem.id);
   }
+  const categorySet = categorySetAt.get(apiItem.id);
+  const snapshotPredatesCategory = categorySet != null && categorySet > pollStartedAt;
+  if (categorySet != null && !snapshotPredatesCategory) categorySetAt.delete(apiItem.id);
   const row = snapCompletedDownload({
     ...apiItem,
+    category: snapshotPredatesCategory ? eventItem.category : apiItem.category,
     status,
     ...mergeProgressCounters(apiItem, eventItem),
     speed: mergeSpeed(status, apiItem.speed),
@@ -1077,7 +1104,10 @@ function mergePolledRow(
   return {
     row,
     sticky:
-      snapshotPredatesReversibleEntry || snapshotPredatesReversibleLeave || preserveFreshEventCounts,
+      snapshotPredatesReversibleEntry ||
+      snapshotPredatesReversibleLeave ||
+      preserveFreshEventCounts ||
+      snapshotPredatesCategory,
   };
 }
 
@@ -1127,6 +1157,7 @@ export function forgetTransfer(id: string) {
   reversibleStateEnteredAt.delete(id);
   reversibleStateLeftAt.delete(id);
   sourceCountsUpdatedAt.delete(id);
+  categorySetAt.delete(id);
   missingFromApiSince.delete(id);
   lastApiCompleted.delete(id);
   progressRewindHold.delete(id);
@@ -1155,6 +1186,7 @@ export function cleanupTransferStore() {
   reversibleStateEnteredAt.clear();
   reversibleStateLeftAt.clear();
   sourceCountsUpdatedAt.clear();
+  categorySetAt.clear();
   lastApiCompleted.clear();
   progressRewindHold.clear();
   announcedTerminal.clear();
@@ -1169,6 +1201,7 @@ export function cleanupTransferStore() {
   syncInFlight = null;
   initialized = false;
   transfers.set([]);
+  transfersLoaded.set(false);
 }
 
 let pollPumpOnNextVisible = false;

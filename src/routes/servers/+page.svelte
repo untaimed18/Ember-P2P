@@ -33,6 +33,7 @@
   import { toastError } from '$lib/stores/toast';
   import { serverLog, appendServerLog, clearServerLog } from '$lib/stores/serverLog';
   import IconX from '$lib/components/IconX.svelte';
+  import { TableWindow } from '$lib/tableWindow.svelte';
 
   let servers: ServerInfo[] = $state([]);
   let connectedServer: ServerInfo | null = $state(null);
@@ -646,6 +647,12 @@
       // keyboard user would have to Tab through everything to reach it.
       ctxReturnFocus = row;
       void tick().then(() => ctxMenuEl?.querySelector<HTMLButtonElement>('.ctx-item')?.focus());
+    } else {
+      const index = serverIndexByKey.get(serverKey(server));
+      const target = index === undefined ? null : rowNavTarget(index, e.key);
+      if (target === null) return;
+      e.preventDefault();
+      void focusServerRow(target);
     }
   }
 
@@ -809,6 +816,105 @@
       return target.includes(query);
     });
   });
+
+  // A server.met from one of the big lists runs to thousands of entries, each a
+  // row of a dozen cells; only the ones near the viewport are mounted. Lists
+  // this short or shorter render whole and keep their row animations.
+  const serverWindow = new TableWindow(() => filteredServers.length, {
+    minRows: 150,
+    rowHeight: 30,
+    rowSelector: 'tr.server-row',
+  });
+  let windowedServers = $derived(serverWindow.slice(filteredServers));
+  let serverIndexByKey = $derived(new Map(filteredServers.map((s, i) => [serverKey(s), i])));
+
+  // Roving tabindex: only the mounted rows exist to tab through, so the table
+  // is a single tab stop and the arrow keys walk the whole list instead.
+  let focusedKey: string | null = $state(null);
+
+  function isMountedIndex(index: number | undefined): boolean {
+    return index !== undefined && index >= serverWindow.start && index < serverWindow.end;
+  }
+
+  let tabStopKey = $derived.by(() => {
+    const preferred = [focusedKey, selectedServer && serverKey(selectedServer)].find(
+      (key): key is string => !!key && isMountedIndex(serverIndexByKey.get(key)),
+    );
+    return preferred ?? (windowedServers[0] ? serverKey(windowedServers[0]) : null);
+  });
+
+  const ROW_PAGE = 10;
+
+  function rowNavTarget(from: number, key: string): number | null {
+    const last = filteredServers.length - 1;
+    switch (key) {
+      case 'ArrowDown': return Math.min(last, from + 1);
+      case 'ArrowUp': return Math.max(0, from - 1);
+      case 'PageDown': return Math.min(last, from + ROW_PAGE);
+      case 'PageUp': return Math.max(0, from - ROW_PAGE);
+      case 'Home': return 0;
+      case 'End': return last;
+      default: return null;
+    }
+  }
+
+  function mountedServerRow(index: number): HTMLElement | undefined {
+    if (!isMountedIndex(index)) return undefined;
+    return serverWindow.body?.querySelectorAll<HTMLElement>('tr.server-row')[index - serverWindow.start];
+  }
+
+  async function focusServerRow(index: number) {
+    const server = filteredServers[index];
+    if (!server) return;
+    focusedKey = serverKey(server);
+    const headerHeight = serverWindow.body?.closest('table')?.tHead?.getBoundingClientRect().height ?? 0;
+    serverWindow.reveal(index, headerHeight);
+    await tick();
+    mountedServerRow(index)?.focus({ preventScroll: serverWindow.active });
+  }
+
+  // Scrolling the focused row out of the window unmounts it, which would drop
+  // focus to the document. Hold focus on the scroller until it is back.
+  let parkedKey: string | null = null;
+
+  $effect.pre(() => {
+    const start = serverWindow.start;
+    const end = serverWindow.end;
+    const indexByKey = serverIndexByKey;
+    untrack(() => {
+      const active = document.activeElement;
+      const row = active instanceof HTMLElement ? active.closest('tr.server-row') : null;
+      if (!row || !serverWindow.body?.contains(row) || !focusedKey) return;
+      const index = indexByKey.get(focusedKey);
+      if (index !== undefined && index >= start && index < end) return;
+      parkedKey = focusedKey;
+      serverWindow.scroller?.focus({ preventScroll: true });
+    });
+  });
+
+  $effect(() => {
+    void serverWindow.start;
+    void serverWindow.end;
+    void serverIndexByKey;
+    untrack(() => {
+      if (!parkedKey || document.activeElement !== serverWindow.scroller) return;
+      const index = serverIndexByKey.get(parkedKey);
+      const row = index === undefined ? undefined : mountedServerRow(index);
+      if (!row) return;
+      parkedKey = null;
+      row.focus({ preventScroll: true });
+    });
+  });
+
+  function handleTableWrapKeydown(e: KeyboardEvent) {
+    if (e.target !== e.currentTarget || !parkedKey) return;
+    // A parked server that a filter or refresh has since removed has no index;
+    // walk from just above the list rather than leave the keys dead.
+    const target = rowNavTarget(serverIndexByKey.get(parkedKey) ?? -1, e.key);
+    if (target === null || target < 0) return;
+    e.preventDefault();
+    void focusServerRow(target);
+  }
 
   function formatCount(n: number): string {
     if (n === 0) return '\u2014';
@@ -984,7 +1090,16 @@
         </div>
       </div>
 
-      <div class="server-table-wrap">
+      <!-- Focusable only to hold focus for a row scrolled out of the window;
+           the keydown takes the arrow keys back to that row. -->
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="server-table-wrap"
+        bind:this={serverWindow.scroller}
+        tabindex="-1"
+        onkeydown={handleTableWrapKeydown}
+        onblur={() => (parkedKey = null)}
+      >
         {#if loading && servers.length === 0}
           <div class="empty-state compact">
             <div class="spinner lg"></div>
@@ -1055,20 +1170,27 @@
                 <th>{m.servers_col_actions()}</th>
               </tr>
             </thead>
-            <tbody>
-              {#each filteredServers as server (`${server.ip}:${server.port}`)}
+            <tbody bind:this={serverWindow.body}>
+              {#if serverWindow.topPad > 0}
+                <tr class="row-spacer" aria-hidden="true" style="height: {serverWindow.topPad}px;"><td colspan="11"></td></tr>
+              {/if}
+              {#each windowedServers as server, i (`${server.ip}:${server.port}`)}
+                {@const rowKey = serverKey(server)}
                 <tr
+                  class="server-row"
+                  class:row-alt={((serverWindow.start + i) & 1) === 1}
                   class:connected={isConnected(server)}
                   class:selected={isSelected(server)}
                   class:failed-server={server.fail_count >= 3}
-                  tabindex="0"
+                  tabindex={rowKey === tabStopKey ? 0 : -1}
                   aria-selected={isSelected(server)}
+                  onfocus={() => (focusedKey = rowKey)}
                   onclick={(e: MouseEvent) => selectServer(server, e)}
                   ondblclick={() => handleDoubleClick(server)}
                   oncontextmenu={(e: MouseEvent) => handleContextMenu(e, server)}
                   onkeydown={(e) => handleRowKeydown(e, server)}
-                  in:fade={{ duration: 150 }}
-                  animate:flip={{ duration: 180 }}
+                  in:fade={{ duration: serverWindow.active ? 0 : 150 }}
+                  animate:flip={{ duration: serverWindow.active ? 0 : 180 }}
                 >
                   <td class="name-cell" title={server.name || m.servers_unnamed()}>
                     <span class="server-icon" class:connected-icon={isConnected(server)}>S</span>
@@ -1096,10 +1218,13 @@
                        else. -->
                   <td>{server.is_static ? m.common_yes() : m.common_no()}</td>
                   <td>
-                    <button type="button" class="server-remove" onclick={(e: MouseEvent) => { e.stopPropagation(); handleRemoveServer(server); }} title={m.common_remove()} aria-label={m.servers_remove_aria({ name: server.name || `${server.ip}:${server.port}` })}><IconX size={12} /></button>
+                    <button type="button" class="server-remove" tabindex={rowKey === tabStopKey ? 0 : -1} onclick={(e: MouseEvent) => { e.stopPropagation(); handleRemoveServer(server); }} title={m.common_remove()} aria-label={m.servers_remove_aria({ name: server.name || `${server.ip}:${server.port}` })}><IconX size={12} /></button>
                   </td>
                 </tr>
               {/each}
+              {#if serverWindow.bottomPad > 0}
+                <tr class="row-spacer" aria-hidden="true" style="height: {serverWindow.bottomPad}px;"><td colspan="11"></td></tr>
+              {/if}
             </tbody>
           </table>
         {/if}
@@ -1470,10 +1595,18 @@
     background: var(--danger);
   }
 
+  /* The table is windowed behind spacer rows; scroll anchoring would answer
+     each spacer resize by moving scrollTop, and so the window, again (see
+     `.results-scroll` on the search page). */
   .server-table-wrap {
     flex: 1;
     overflow: auto;
     min-height: 0;
+    overflow-anchor: none;
+  }
+
+  .server-table-wrap:focus {
+    outline: none;
   }
 
   .server-table {
@@ -1524,8 +1657,20 @@
     background: var(--bg-hover);
   }
 
-  .server-table tbody tr:nth-child(even):not(.selected):not(.connected) {
+  /* From the list index, not `nth-child`: windowed rows change which child
+     they are as the table scrolls. */
+  .server-table tbody tr.row-alt:not(.selected):not(.connected) {
     background: var(--table-row-alt);
+  }
+
+  .server-table tbody tr.row-spacer,
+  .server-table tbody tr.row-spacer:hover {
+    background: transparent;
+  }
+
+  .server-table tbody tr.row-spacer td {
+    padding: 0;
+    border: 0;
   }
 
   .server-table tbody tr.selected {

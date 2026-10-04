@@ -648,13 +648,22 @@ impl AICHRecoveryHashSet {
             entries.push((id, hash));
         }
 
+        // One width for the whole answer, as eMule writes it: 32-bit for a
+        // large file, 16-bit otherwise. Its reader takes a non-zero 16-bit
+        // count as every hash of the part and refuses the answer when it is
+        // not, so sorting each id by its own size (siblings 16-bit, deep
+        // leaves 32-bit past ~512 parts) cost eMule and aMule downloaders the
+        // repair and a whole-part re-download instead. The id test only backs
+        // up the size test, which always covers it.
+        let use_32 = self.file_size > super::messages::OLD_MAX_EMULE_FILE_SIZE
+            || entries.iter().any(|&(id, _)| id > u16::MAX as u64);
         let mut entries_16 = Vec::new();
         let mut entries_32 = Vec::new();
         for &(id, hash) in &entries {
-            if id <= u16::MAX as u64 {
-                entries_16.push((id as u16, hash));
-            } else {
+            if use_32 {
                 entries_32.push((id as u32, hash));
+            } else {
+                entries_16.push((id as u16, hash));
             }
         }
 
@@ -1337,6 +1346,48 @@ mod tests {
     fn leaf_ids_matches_emule_documented_example() {
         assert_eq!(leaf_ids(2, 1, true), vec![3, 2]);
         assert_eq!(leaf_ids(4, 1, true), vec![7, 6, 5, 4]);
+    }
+
+    /// eMule reads a non-zero 16-bit count as the whole part's hash list, so
+    /// one answer may not split its hashes between the two sections.
+    #[test]
+    fn a_recovery_answer_uses_one_identifier_width() {
+        fn section_counts(data: &[u8]) -> (usize, usize) {
+            let count_16 = u16::from_le_bytes([data[0], data[1]]) as usize;
+            let at = 2 + count_16 * 22;
+            let count_32 = u16::from_le_bytes([data[at], data[at + 1]]) as usize;
+            assert_eq!(data.len(), at + 2 + count_32 * 24, "no trailing bytes");
+            (count_16, count_32)
+        }
+        let synthetic = |num_parts: usize| {
+            let leaves = num_parts * BLOCKS_PER_FULL_PART;
+            AICHRecoveryHashSet {
+                root_hash: [0u8; 20],
+                leaf_hashes: (0..leaves)
+                    .map(|i| {
+                        let mut h = [0u8; 20];
+                        h[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                        h
+                    })
+                    .collect(),
+                file_size: (num_parts * PARTSIZE) as u64,
+            }
+        };
+
+        // 662 parts (~6 GB): past 512 parts some leaves sit at depth 16, with
+        // ids of 65536 and up, beside audit-path siblings well under 1024.
+        let large = synthetic(662);
+        assert!(large.file_size > crate::network::ed2k::messages::OLD_MAX_EMULE_FILE_SIZE);
+        for part in [0, 300, 661] {
+            let (c16, c32) = section_counts(&large.create_part_recovery_data(part, PARTSIZE));
+            assert_eq!(c16, 0, "part {part}: a large file answers in 32-bit ids only");
+            assert!(c32 > BLOCKS_PER_FULL_PART, "part {part}: leaves plus audit path");
+        }
+
+        let small = synthetic(3);
+        let (c16, c32) = section_counts(&small.create_part_recovery_data(1, PARTSIZE));
+        assert_eq!(c32, 0, "a small file answers in 16-bit ids only");
+        assert!(c16 > BLOCKS_PER_FULL_PART);
     }
 
     #[test]

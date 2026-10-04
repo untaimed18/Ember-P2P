@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 /// Per-file cap on retained A4AF candidates.
 const MAX_A4AF_ENTRIES_PER_FILE: usize = 500;
@@ -26,9 +27,11 @@ const STARVED_SWAP_STOP_SECS: i64 = 2 * 60;
 pub struct A4AFEntry {
     pub peer_addr: SocketAddr,
     pub assigned_file_hash: [u8; 16],
-    pub added_time: i64,
+    /// Monotonic, as are the swap times: on the wall clock a step back held
+    /// every swap cooldown for the length of the step.
+    pub added_time: Instant,
     /// Last time this source was swapped (eMule suspension timing)
-    pub last_swap_time: i64,
+    pub last_swap_time: Option<Instant>,
     /// Queue rank on the assigned file (0 = unknown)
     pub queue_rank: u16,
     /// Whether we have needed parts from the assigned file (NNP = No Needed Parts)
@@ -97,8 +100,8 @@ impl A4AFManager {
             slot.insert(A4AFEntry {
                 peer_addr,
                 assigned_file_hash,
-                added_time: chrono::Utc::now().timestamp(),
-                last_swap_time: 0,
+                added_time: Instant::now(),
+                last_swap_time: None,
                 queue_rank: 0,
                 has_needed_parts: has_needed_parts_on_assigned,
                 credit_ratio: 1.0,
@@ -129,7 +132,7 @@ impl A4AFManager {
         if targets.is_empty() || dry_sources.is_empty() {
             return;
         }
-        let now = chrono::Utc::now().timestamp();
+        let now = Instant::now();
         for target in targets {
             let entries = self.a4af_sources.entry(*target).or_default();
             if entries.len() >= MAX_A4AF_ENTRIES_PER_FILE {
@@ -146,7 +149,7 @@ impl A4AFManager {
                     peer_addr: *peer_addr,
                     assigned_file_hash: *assigned_file_hash,
                     added_time: now,
-                    last_swap_time: 0,
+                    last_swap_time: None,
                     queue_rank: 0,
                     // This sweep selects on `NoneNeededParts`, so by
                     // construction the peer has nothing left for the file it
@@ -221,7 +224,7 @@ impl A4AFManager {
     /// - Source count: prefer files with fewer active sources
     pub fn process_swaps(&self, file_info: &HashMap<[u8; 16], FileSwapInfo>) -> Vec<SwapAction> {
         let mut swaps = Vec::new();
-        let now = chrono::Utc::now().timestamp();
+        let now = Instant::now();
 
         for (target_hash, entries) in &self.a4af_sources {
             let target = match file_info.get(target_hash) {
@@ -240,7 +243,11 @@ impl A4AFManager {
                 } else {
                     PURGE_SOURCE_SWAP_STOP_SECS
                 };
-                if entry.last_swap_time > 0 && now - entry.last_swap_time < cooldown_secs {
+                let cooldown = Duration::from_secs(cooldown_secs as u64);
+                if entry
+                    .last_swap_time
+                    .is_some_and(|at| now.saturating_duration_since(at) < cooldown)
+                {
                     continue;
                 }
 
@@ -272,10 +279,10 @@ impl A4AFManager {
 
     /// Mark a source as recently swapped (resets suspension timer).
     pub fn mark_swapped(&mut self, peer_addr: SocketAddr) {
-        let now = chrono::Utc::now().timestamp();
+        let now = Instant::now();
         for entries in self.a4af_sources.values_mut() {
             if let Some(entry) = entries.get_mut(&peer_addr) {
-                entry.last_swap_time = now;
+                entry.last_swap_time = Some(now);
             }
         }
     }
@@ -298,9 +305,9 @@ impl A4AFManager {
     }
 
     pub fn cleanup_stale(&mut self, max_age_secs: i64) {
-        let cutoff = chrono::Utc::now().timestamp() - max_age_secs;
+        let max_age = Duration::from_secs(max_age_secs.max(0) as u64);
         for entries in self.a4af_sources.values_mut() {
-            entries.retain(|_, e| e.added_time > cutoff);
+            entries.retain(|_, e| e.added_time.elapsed() < max_age);
         }
         self.a4af_sources.retain(|_, v| !v.is_empty());
     }

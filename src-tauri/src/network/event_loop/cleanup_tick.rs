@@ -392,10 +392,10 @@ pub(in crate::network) async fn on_cleanup_tick(
     // instead of letting it grow one entry per (server, file_hash) for
     // the entire session.
     {
-        let now = chrono::Utc::now().timestamp();
+        let horizon = std::time::Duration::from_secs(SERVER_UDP_SOURCE_REASK_SECS as u64);
         state
             .server_udp_source_reask_at
-            .retain(|_, last| now.saturating_sub(*last) < SERVER_UDP_SOURCE_REASK_SECS);
+            .retain(|_, last| last.elapsed() < horizon);
     }
 
     // Bound `pending_udp_reasks`. Entries are removed when the matching
@@ -414,11 +414,10 @@ pub(in crate::network) async fn on_cleanup_tick(
             // than one about to. Evicting by age instead of
             // clearing the whole table preserves correlation for
             // every reask sent in roughly the last reask cycle.
-            const MAX_PENDING_UDP_REASK_AGE_SECS: i64 = 30;
-            let now = chrono::Utc::now().timestamp();
-            state
-                .pending_udp_reasks
-                .retain(|_, (_, sent_at)| now.saturating_sub(*sent_at) < MAX_PENDING_UDP_REASK_AGE_SECS);
+            let now = std::time::Instant::now();
+            state.pending_udp_reasks.retain(|_, (_, sent_at)| {
+                !crate::network::state::udp_reask_unanswered(*sent_at, now)
+            });
             // Pathological fallback: if a flood of reasks was sent
             // inside the same age window and age-based eviction
             // couldn't bring the table back under budget, fall

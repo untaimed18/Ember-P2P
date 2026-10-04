@@ -1310,19 +1310,27 @@ pub fn build_search_expression_with_node(
 /// (int64 meta) leaf. Used to skip UDP servers lacking `SRV_UDPFLG_LARGEFILES`,
 /// matching eMule's `m_b64BitSearchPacket` gate.
 pub fn search_expression_uses_64bit(expr: &[u8]) -> bool {
-    /// Deepest boolean nesting the walk will follow. The `0x00` arm consumes
-    /// two bytes and recurses twice, so an N-byte run of `0x00` nests N/2 deep
-    /// — a stack overflow, which aborts the process and cannot be contained by
-    /// `panic = "unwind"`. Over-deep input is reported as unparseable, exactly
-    /// like every other malformed shape here. Nothing legitimate comes close:
-    /// `build_search_expression` emits a right-leaning AND chain over at most
-    /// a keyword tree plus four constraint leaves.
-    const MAX_EXPR_DEPTH: u32 = 32;
-
-    fn walk(data: &[u8], mut pos: usize, depth: u32) -> Option<(bool, usize)> {
-        if depth >= MAX_EXPR_DEPTH {
-            return None;
+    /// The tree is prefix-encoded, so a flat scan counting the operands still
+    /// owed reads it without recursion. A recursive walk needed a depth cap
+    /// against hostile nesting, and that cap fell short of real queries: a
+    /// plain N-word search is an N-deep left-leaning AND chain, so 32 words
+    /// read as unparseable — "no 64-bit sizes" — and a size limit past 4 GiB
+    /// went to servers that cannot decode it.
+    fn scan(data: &[u8]) -> Option<bool> {
+        let mut pos = 0usize;
+        let mut owed = 1usize;
+        let mut uses_64bit = false;
+        while owed > 0 {
+            owed -= 1;
+            let (is_64bit, next) = leaf_or_operator(data, pos, &mut owed)?;
+            uses_64bit |= is_64bit;
+            pos = next;
         }
+        Some(uses_64bit)
+    }
+
+    /// One node at `pos`: an operator adds its two operands to `owed`.
+    fn leaf_or_operator(data: &[u8], mut pos: usize, owed: &mut usize) -> Option<(bool, usize)> {
         if pos >= data.len() {
             return None;
         }
@@ -1330,14 +1338,12 @@ pub fn search_expression_uses_64bit(expr: &[u8]) -> bool {
         pos += 1;
         match kind {
             0x00 => {
-                // Boolean: op byte + left + right
+                // Boolean: op byte, then left and right
                 if pos >= data.len() {
                     return None;
                 }
-                pos += 1; // AND/OR/NOT
-                let (left_64, pos) = walk(data, pos, depth + 1)?;
-                let (right_64, pos) = walk(data, pos, depth + 1)?;
-                Some((left_64 || right_64, pos))
+                *owed += 2;
+                Some((false, pos + 1))
             }
             0x01 => {
                 // String term
@@ -1398,7 +1404,7 @@ pub fn search_expression_uses_64bit(expr: &[u8]) -> bool {
             _ => None,
         }
     }
-    walk(expr, 0, 0).map(|(uses, _)| uses).unwrap_or(false)
+    scan(expr).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1525,17 +1531,15 @@ mod search_expr_tests {
 
     #[test]
     fn deeply_nested_expression_is_rejected_instead_of_overflowing_the_stack() {
-        // Every two `0x00` bytes are one more level of boolean nesting, so this
-        // would recurse ~2000 deep without the depth cap. Must come back as
+        // Every two `0x00` bytes are one more level of boolean nesting, ~2000
+        // here with no leaf to close any of them. Must come back as
         // "unparseable" (false) rather than abort the process.
         let deep = vec![0x00u8; 4096];
         assert!(!search_expression_uses_64bit(&deep));
     }
 
     #[test]
-    fn nesting_within_the_depth_limit_still_reaches_the_last_leaf() {
-        // Sixteen AND joints — far deeper than `build_search_expression` ever
-        // emits, still inside the budget, so the trailing int64 leaf is found.
+    fn deep_right_leaning_nesting_still_reaches_the_last_leaf() {
         let mut expr = Vec::new();
         for _ in 0..16 {
             expr.push(0x00);
@@ -1544,6 +1548,26 @@ mod search_expr_tests {
         }
         expr.extend(u64_size_leaf());
         assert!(search_expression_uses_64bit(&expr));
+    }
+
+    /// A plain 40-word query is a 40-deep left-leaning AND chain; the old
+    /// recursive walk gave up at 32 and reported no 64-bit leaf.
+    #[test]
+    fn a_long_plain_query_still_reports_its_64bit_size_leaf() {
+        let words = 40;
+        let mut expr = vec![0x00, 0x00];
+        for _ in 1..words {
+            expr.extend([0x00, 0x00]);
+        }
+        for _ in 0..words {
+            expr.extend(string_leaf("word"));
+        }
+        // `words - 1` joints over `words` leaves, then one more joining the
+        // size leaf.
+        expr.extend(u64_size_leaf());
+        assert!(search_expression_uses_64bit(&expr));
+        // A truncated tree is still unparseable.
+        assert!(!search_expression_uses_64bit(&expr[..expr.len() - 3]));
     }
 
     #[test]

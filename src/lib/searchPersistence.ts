@@ -40,11 +40,12 @@ export const PERSIST_RETRY_LIMITS = [PERSIST_MAX_RESULTS, 100, 25];
  * The `requestId` a restored tab carries instead of the one it had.
  *
  * This matters more than it looks. `requestId` is a frontend counter
- * (`newSearchNonce`) that restarts at 1 on every page load, while tabs restored
- * from storage still held ids from before the reload — so the first search
- * after a restore would be handed an id a restored tab already had, and
+ * (`newSearchNonce`) that used to restart at 1 on every page load, while tabs
+ * restored from storage still held ids from before the reload — so the first
+ * search after a restore was handed an id a restored tab already had, and
  * `updateTabByRequestId` matches on exactly that. The new search's results
- * would have streamed into the old tab while the new one sat empty.
+ * streamed into the old tab while the new one sat empty. The counter now
+ * starts from the clock, but a restored tab still has no live request.
  *
  * Zero is unmatchable rather than merely unlikely: `newSearchNonce` only ever
  * returns positive integers, and `validRequestId` rejects anything `<= 0`
@@ -92,21 +93,33 @@ function usableRow(row: unknown): row is SearchResult {
  * replaced was.
  *
  * `filter` has already copied, so the in-place shed cannot touch the live tab.
+ * `shed` is how many usable rows the limit left out.
  */
-function rowsWorthStoring(raw: unknown, limit: number): SearchResult[] {
+function rowsWorthStoring(raw: unknown, limit: number): { rows: SearchResult[]; shed: number } {
   const rows = (Array.isArray(raw) ? raw : []).filter(usableRow);
-  if (rows.length > limit) shedWeakestRows(rows, limit);
-  return rows;
+  const usable = rows.length;
+  if (usable > limit) shedWeakestRows(rows, limit);
+  return { rows, shed: usable - rows.length };
+}
+
+/** A stored tab's `shed`, which nothing else checks before it is added to. */
+function storedShed(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 
 /** Strip a tab to what is worth storing, and to what survives being stored. */
 export function forPersist(tab: SearchTab, limit = PERSIST_MAX_RESULTS): SearchTab {
+  const { rows, shed } = rowsWorthStoring(tab.results, limit);
   return {
     ...tab,
-    results: rowsWorthStoring(tab.results, limit),
+    results: rows,
+    // Rows storage leaves out are as gone after a restore as those the cap shed.
+    shed: storedShed(tab.shed) + shed,
     // A `Map` does not survive JSON, and `mergeIntoTab` rebuilds it from its
     // length check whenever it is missing.
     resultIndex: undefined,
+    // Nor does a `Set`; and a restored tab has no stream left to tell repeats in.
+    shedKeys: undefined,
     // The request this tab was streaming is unreachable now: its id belonged to
     // a listener that no longer exists, so no further event will ever arrive
     // for it. Restoring it as still-searching would leave a spinner running
@@ -155,7 +168,7 @@ export function trimPersistPayload(payload: PersistedSearch, limit: number): Per
       // this came from, and the attempt that failed may not be the last one.
       const results = tab.results.slice();
       shedWeakestRows(results, limit);
-      return { ...tab, results };
+      return { ...tab, results, shed: storedShed(tab.shed) + tab.results.length - results.length };
     }),
   };
 }

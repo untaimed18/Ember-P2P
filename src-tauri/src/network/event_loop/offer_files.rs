@@ -3,11 +3,98 @@
 //! `CSharedFileList::Process` does.
 
 use super::*;
+use crate::network::command::{part_presence, spawn_part_presence_probe, take_part_presence_grew};
 
 /// How long a chunk the server link refused (writer queue full, or the session
 /// breaking) waits before the next try, rather than being retried on every
 /// turn of the loop.
 const OFFER_RETRY_AFTER_REFUSAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The downloads worth offering to a server as partial files: those allowed
+/// to advertise, not already in the offer, and with a `.part` on disk.
+///
+/// Whether the `.part` exists is a file-system call per download, and on a
+/// Temp folder on a slow or network drive that adds up, so nothing here waits
+/// for it: the answer is the last presence probe's, and a new probe starts on
+/// the blocking pool. A `.part` that probe finds for the first time requests
+/// another offer drain ([`take_part_presence_grew`]), which offers it then;
+/// `offered_ed2k_hashes` keeps a file already sent from going out again.
+///
+/// [`take_part_presence_grew`]: crate::network::command::take_part_presence_grew
+pub(in crate::network) async fn partial_download_offers(
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    settings: &AppSettings,
+    known_files: &KnownFileList,
+    restricted: &HashSet<String>,
+    seen_offer_hashes: &mut HashSet<String>,
+) -> Vec<ed2k::server::OfferFile> {
+    let download_folders = settings.download_folders();
+    let candidates: Vec<(String, Vec<PathBuf>, ed2k::server::OfferFile)> = {
+        let mgr = transfer_manager.read().await;
+        let mut candidates = Vec::new();
+        for transfer in mgr.active.values().chain(mgr.queue.iter()) {
+            if transfer.direction != TransferDirection::Download {
+                continue;
+            }
+            if matches!(
+                transfer.status,
+                TransferStatus::Completed | TransferStatus::Failed
+            ) {
+                continue;
+            }
+            if !transfer_may_advertise_partial(known_files, restricted, transfer) {
+                continue;
+            }
+            if transfer.file_hash.is_empty()
+                || !seen_offer_hashes.insert(transfer.file_hash.clone())
+            {
+                continue;
+            }
+            let hash_bytes = match hex::decode(&transfer.file_hash) {
+                Ok(bytes) if bytes.len() >= 16 => bytes,
+                _ => continue,
+            };
+            let mut h = [0u8; 16];
+            h.copy_from_slice(&hash_bytes[..16]);
+            candidates.push((
+                transfer.id.clone(),
+                download_folders.part_paths(&transfer.id),
+                ed2k::server::OfferFile {
+                    hash: h,
+                    name: transfer.file_name.clone(),
+                    size: transfer.total_size,
+                    is_complete: false,
+                    file_type: ed2k::server::offer_file_type(&transfer.file_name),
+                },
+            ));
+        }
+        candidates
+    };
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let (probe, offers) = with_known_parts(candidates, &part_presence().lock().present);
+    spawn_part_presence_probe(probe);
+    offers
+}
+
+/// Split partial-offer candidates into the probe to run next and the offers
+/// whose `.part` the last probe found. A candidate lists where its `.part`
+/// may be in every download folder; finding it in any one is enough.
+fn with_known_parts(
+    candidates: Vec<(String, Vec<PathBuf>, ed2k::server::OfferFile)>,
+    present: &HashSet<String>,
+) -> (Vec<(String, PathBuf)>, Vec<ed2k::server::OfferFile>) {
+    let mut probe = Vec::with_capacity(candidates.len());
+    let mut offers = Vec::new();
+    for (id, paths, offer) in candidates {
+        if present.contains(&id) {
+            offers.push(offer);
+        }
+        probe.extend(paths.into_iter().map(|path| (id.clone(), path)));
+    }
+    (probe, offers)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn drain_offer_files(
@@ -20,6 +107,10 @@ pub(in crate::network) async fn drain_offer_files(
     pending_offer_files: &mut Option<Vec<ed2k::server::OfferFile>>,
     pending_offer_signature: &mut Option<(usize, u64)>,
 ) {
+    // A `.part` found for the first time may be one the last list left out.
+    if take_part_presence_grew() {
+        state.request_offer_files = true;
+    }
     // Drain at most one OP_OFFERFILES chunk per `ED2K_OFFER_PACKET_INTERVAL`,
     // as eMule's `CSharedFileList::Process` does; the first packet after
     // login goes out at once.
@@ -64,46 +155,16 @@ pub(in crate::network) async fn drain_offer_files(
                     .collect();
                 (offer_files, restricted)
             };
-            let temp_dir = PathBuf::from(&settings.download_folder).join("Temp");
-            {
-                let mgr = transfer_manager.read().await;
-                for transfer in mgr.active.values().chain(mgr.queue.iter()) {
-                    if transfer.direction != TransferDirection::Download {
-                        continue;
-                    }
-                    if matches!(
-                        transfer.status,
-                        TransferStatus::Completed | TransferStatus::Failed
-                    ) {
-                        continue;
-                    }
-                    if !transfer_may_advertise_partial(known_files, &restricted, transfer) {
-                        continue;
-                    }
-                    if transfer.file_hash.is_empty()
-                        || !seen_offer_hashes.insert(transfer.file_hash.clone())
-                    {
-                        continue;
-                    }
-                    let hash_bytes = match hex::decode(&transfer.file_hash) {
-                        Ok(bytes) if bytes.len() >= 16 => bytes,
-                        _ => continue,
-                    };
-                    let part_path = temp_dir.join(format!("{}.part", transfer.id));
-                    if !part_path.exists() {
-                        continue;
-                    }
-                    let mut h = [0u8; 16];
-                    h.copy_from_slice(&hash_bytes[..16]);
-                    offer_files.push(ed2k::server::OfferFile {
-                        hash: h,
-                        name: transfer.file_name.clone(),
-                        size: transfer.total_size,
-                        is_complete: false,
-                        file_type: ed2k::server::offer_file_type(&transfer.file_name),
-                    });
-                }
-            }
+            offer_files.extend(
+                partial_download_offers(
+                    transfer_manager,
+                    settings,
+                    known_files,
+                    &restricted,
+                    &mut seen_offer_hashes,
+                )
+                .await,
+            );
             let signature = offer_files_signature(&offer_files);
             // Files that left the list are not unpublished, because eD2K has
             // no message for it: an empty OP_OFFERFILES is eMule's keep-alive
@@ -232,4 +293,49 @@ async fn still_offerable(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(id: &str, hash: u8) -> (String, Vec<PathBuf>, ed2k::server::OfferFile) {
+        let name = format!("{id}.bin");
+        (
+            id.to_string(),
+            vec![PathBuf::from(format!("{id}.part"))],
+            ed2k::server::OfferFile {
+                hash: [hash; 16],
+                file_type: ed2k::server::offer_file_type(&name),
+                name,
+                size: 1_000,
+                is_complete: false,
+            },
+        )
+    }
+
+    #[test]
+    fn only_parts_the_last_probe_found_are_offered_and_all_are_probed_again() {
+        let present = HashSet::from(["found".to_string()]);
+        let (probe, offers) =
+            with_known_parts(vec![candidate("found", 1), candidate("not-yet", 2)], &present);
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].hash, [1; 16]);
+        let probed: Vec<&str> = probe.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(probed, ["found", "not-yet"]);
+    }
+
+    #[test]
+    fn a_part_left_in_an_earlier_download_folder_is_probed_there_too() {
+        let folders = crate::storage::part_folders::DownloadFolders::new(
+            "/downloads/new",
+            &["/downloads/old".to_string()],
+        );
+        let (id, _, offer) = candidate("moved", 3);
+        let paths = folders.part_paths(&id);
+        let (probe, _) = with_known_parts(vec![(id, paths.clone(), offer)], &HashSet::new());
+        let probed: Vec<&PathBuf> = probe.iter().map(|(_, path)| path).collect();
+        assert_eq!(probed, paths.iter().collect::<Vec<_>>());
+        assert!(probed[1].starts_with("/downloads/old"));
+    }
 }

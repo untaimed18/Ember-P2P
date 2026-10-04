@@ -22,14 +22,13 @@ pub(super) async fn reverify_complete_part_file(
     file_size: u64,
     expected_aich: Option<&str>,
     expected_ember: Option<&str>,
+    part_dir: &std::path::Path,
     download_dir: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let part_path = download_dir
-        .join("Temp")
-        .join(format!("{transfer_id}.part"));
+    let part_path = part_dir.join("Temp").join(format!("{transfer_id}.part"));
     let expected = file_hash.to_string();
     let verify_path = part_path.clone();
-    let verify_root = download_dir.to_path_buf();
+    let verify_root = part_dir.to_path_buf();
     let expected_aich_owned = expected_aich.map(str::to_string);
     let ember_wanted = expected_ember.is_some();
     let (computed_hash, verified_identity, computed_aich, computed_ember) =
@@ -85,25 +84,18 @@ pub(super) async fn reverify_complete_part_file(
     }
 
     let safe_name = crate::security::sanitize_filename(file_name);
-    let prepare_root = download_dir.to_path_buf();
-    let allowed = vec![download_dir.to_string_lossy().into_owned()];
-    let completed_dir = tokio::task::spawn_blocking(move || {
-        crate::security::filesystem::prepare_approved_subdir(&prepare_root, "Downloads", &allowed)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("Failed to create Downloads dir: {e}"))??;
-    let final_target = completed_dir.join(&safe_name);
     let pp = part_path.clone();
+    let pp_root = part_dir.to_path_buf();
     let root = download_dir.to_path_buf();
     let actual_final = tokio::task::spawn_blocking(move || {
-        ed2k::transfer::move_part_to_final_approved(&pp, &final_target, &root, &verified_identity)
+        ed2k::transfer::move_part_to_downloads(&pp, &pp_root, &root, &safe_name, &verified_identity)
     })
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
 
     // Clean up .part.met
     let met_path = part_path.with_extension("part.met");
-    let cleanup_root = download_dir.to_string_lossy().into_owned();
+    let cleanup_root = part_dir.to_string_lossy().into_owned();
     let _ = tokio::task::spawn_blocking(move || {
         crate::security::filesystem::remove_approved_file(&met_path, &[cleanup_root])
     })
@@ -125,7 +117,7 @@ pub(super) async fn handle_download_event(
     stats_manager: &mut StatsManager,
     remove_finished: bool,
     a4af: &Arc<RwLock<ed2k::a4af::A4AFManager>>,
-    download_folder: &str,
+    download_roots: &[String],
     db_progress_last_persist: &mut HashMap<String, std::time::Instant>,
     db_progress_persist_interval: std::time::Duration,
     // Pending-since tracking for KAD callback placeholder rows. When
@@ -133,7 +125,7 @@ pub(super) async fn handle_download_event(
     // drop their timestamp entries so the periodic timeout sweep in
     // `source_retry_timer` doesn't keep checking keys that no longer
     // refer to live rows.
-    callback_row_pending_since: &mut HashMap<(String, String, u16), i64>,
+    callback_row_pending_since: &mut HashMap<(String, String, u16), std::time::Instant>,
     status_writes: &Arc<TransferStatusWriteClock>,
 ) {
     match event {
@@ -186,6 +178,8 @@ pub(super) async fn handle_download_event(
             if should_persist_db {
                 let db_for_progress = db.clone();
                 let transfer_id_for_progress = transfer_id.clone();
+                let part_folder = crate::storage::part_folders::located_folder(&transfer_id)
+                    .map(|folder| folder.to_string_lossy().into_owned());
                 tokio::task::spawn_blocking(move || {
                     // Guarded: this write is unsequenced and can be executed
                     // after the completion write it was queued before, which
@@ -196,6 +190,7 @@ pub(super) async fn handle_download_event(
                         capped_downloaded,
                         progress,
                         speed,
+                        part_folder.as_deref(),
                     ) {
                         warn!(
                             "DB update_transfer_progress failed for {transfer_id_for_progress}: {e}"
@@ -662,21 +657,25 @@ pub(super) async fn handle_download_event(
 
             // Defensive cleanup: remove any leftover .part / .part.met files
             // that should have been moved/deleted during the completion flow.
-            let temp_dir = PathBuf::from(download_folder).join("Temp");
-            let part_path = temp_dir.join(format!("{transfer_id}.part"));
-            let met_path = temp_dir.join(format!("{transfer_id}.part.met"));
-            if tokio::fs::try_exists(&part_path).await.unwrap_or(false) {
-                if let Err(e) = tokio::fs::remove_file(&part_path).await {
-                    warn!(
-                        "Failed to clean up leftover .part after completion: {} — {e}",
-                        part_path.display()
-                    );
-                } else {
-                    info!("Cleaned up leftover .part file for completed download {transfer_id}");
+            for root in download_roots {
+                let temp_dir = PathBuf::from(root).join("Temp");
+                let part_path = temp_dir.join(format!("{transfer_id}.part"));
+                let met_path = temp_dir.join(format!("{transfer_id}.part.met"));
+                if tokio::fs::try_exists(&part_path).await.unwrap_or(false) {
+                    if let Err(e) = tokio::fs::remove_file(&part_path).await {
+                        warn!(
+                            "Failed to clean up leftover .part after completion: {} — {e}",
+                            part_path.display()
+                        );
+                    } else {
+                        info!(
+                            "Cleaned up leftover .part file for completed download {transfer_id}"
+                        );
+                    }
                 }
-            }
-            if tokio::fs::try_exists(&met_path).await.unwrap_or(false) {
-                let _ = tokio::fs::remove_file(&met_path).await;
+                if tokio::fs::try_exists(&met_path).await.unwrap_or(false) {
+                    let _ = tokio::fs::remove_file(&met_path).await;
+                }
             }
 
             if remove_finished {

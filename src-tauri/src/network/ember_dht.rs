@@ -10,6 +10,46 @@ pub(super) fn ember_highwater_path(data_dir: &std::path::Path) -> std::path::Pat
     data_dir.join("ember_dht_highwater.json")
 }
 
+/// Whether two unsolicited senders are far enough apart to corroborate that our
+/// UDP port is open: different /16s for IPv4, different /48s for IPv6.
+///
+/// Two addresses anyone holds, a pair of VPS in one provider block, would
+/// otherwise make a firewalled node drop its firewalled flag and its buddy
+/// fan-out.
+pub(super) fn ember_reach_witnesses_independent(a: IpAddr, b: IpAddr) -> bool {
+    match (a, b) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => a.octets()[..2] != b.octets()[..2],
+        (IpAddr::V6(a), IpAddr::V6(b)) => a.octets()[..6] != b.octets()[..6],
+        _ => true,
+    }
+}
+
+/// What a newly confirmed observed address does to `external_ip`.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ObservedIpAction {
+    Adopt,
+    Reprobe,
+    Keep,
+}
+
+/// The votes fill an empty `external_ip` unless STUN disagrees, but never move
+/// one we hold: STUN decides that, so a confirmed address that differs asks for
+/// a re-probe. Without one an idle node, which nothing else re-probes for, kept
+/// advertising its old address after an IP change. Not while a live HighID
+/// holds it, since STUN does not move that either.
+pub(super) fn observed_ip_action(
+    current: Option<Ipv4Addr>,
+    voted: Ipv4Addr,
+    stun: Option<Ipv4Addr>,
+    highid: Option<Ipv4Addr>,
+) -> ObservedIpAction {
+    match current {
+        None if stun.is_none_or(|stun| stun == voted) => ObservedIpAction::Adopt,
+        Some(current) if current != voted && highid != Some(current) => ObservedIpAction::Reprobe,
+        _ => ObservedIpAction::Keep,
+    }
+}
+
 pub(super) fn load_ember_verified_highwater(path: &std::path::Path) -> EmberVerifiedHighwater {
     crate::security::recover_interrupted_replace(path);
     let Ok(bytes) = std::fs::read(path) else {
@@ -117,7 +157,9 @@ pub(super) fn fail_ember_record_pending(
         return false;
     };
     unplaced.remove(&reference.key);
-    if !unplaced.is_empty() {
+    let round_open = !unplaced.is_empty();
+    schedule.partial.insert(slot);
+    if round_open {
         return false;
     }
     if schedule.finish_round(slot, now) {
@@ -489,6 +531,12 @@ pub(super) struct EmberKeywordSearch {
     /// is about to see. Re-deriving it per tick instead would mean verifying
     /// every gathered signature again once a second.
     pub(super) streamed_files: HashSet<String>,
+    /// `(file hash, publisher key)` of every record a streamed slice has
+    /// counted. A republished record is a new blob, so the blob dedup keeps
+    /// both versions and they can land in different slices; slice counts are
+    /// added up, and counting that publisher twice would stick, since the UI
+    /// merges counts by max. Bounded by the search's result-blob cap.
+    pub(super) streamed_publishers: HashSet<([u8; 16], [u8; 32])>,
 }
 
 /// A batch of Ember DHT keyword results ready to emit (slice 10).
@@ -926,6 +974,11 @@ pub(super) const EMBER_DISCONNECT_SECS: i64 = 20 * 60;
 /// far shorter than [`EMBER_DISCONNECT_SECS`].
 pub(super) const EMBER_EMPTY_REARM_SECS: i64 = 300;
 
+/// How long a remembered peer that was offered and did not stick waits before
+/// a thin table offers it again. Long against a dead address's three missed
+/// pings, short against a laptop coming back online.
+pub(super) const EMBER_REOFFER_AFTER_SECS: i64 = 30 * 60;
+
 /// How long a verified contact may go unheard before it is purged outright,
 /// matching KAD's two hours. Well beyond the liveness-ping interval, so this
 /// only catches contacts the ping budget never got around to probing — which
@@ -1047,6 +1100,12 @@ pub(super) async fn probe_bucket_oldest(
             .values()
             .any(|p| p.node_id == *oldest_id)
         {
+            continue;
+        }
+        // Not sent to, and faulted like any contact we cannot reach, which is
+        // what hands the waiting newcomer its slot.
+        if ember_addr_banned(state, *oldest_addr) {
+            fault_ember_contact(state, oldest_id, "banned");
             continue;
         }
         let (wire_req_id, frame) = state.ember_dht.build_ping();
@@ -1314,6 +1373,16 @@ pub(super) async fn run_ember_maintenance(
         if contacts > 0 || rearmed {
             state.ember_last_overlay_contacts = contacts;
         }
+        // Short of an empty table, re-offer the book on a slow clock while the
+        // table is still thin; see `BootstrapCache::rearm_stale_offers`.
+        if state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
+            let reoffered = state
+                .ember_bootstrap_cache
+                .rearm_stale_offers(now_secs, EMBER_REOFFER_AFTER_SECS);
+            if reoffered > 0 {
+                debug!("Ember DHT: {reoffered} remembered peer(s) may be offered to the table again");
+            }
+        }
     }
 
     // 0a) KAD-bridge bootstrap (slice 13). See `run_ember_kad_bridge`.
@@ -1497,9 +1566,13 @@ pub(super) async fn run_ember_maintenance(
         && outstanding < EMBER_SEED_BATCH
     {
         let local_id = state.ember_dht.local_id();
-        let batch = state
-            .ember_bootstrap_cache
-            .seed_batch(&local_id, &held, EMBER_SEED_BATCH);
+        // Only what the outstanding seeds leave of one batch, or 31 unproven
+        // seeds earned 32 more and the two shared one batch's ping budget.
+        let batch = state.ember_bootstrap_cache.seed_batch(
+            &local_id,
+            &held,
+            EMBER_SEED_BATCH - outstanding,
+        );
         if !batch.is_empty() {
             let offered_count = batch.len();
             // One at a time through the admission gate, not `load_contacts`:
@@ -1604,7 +1677,7 @@ pub(super) async fn run_ember_maintenance(
     }
 
     // 1b) Publish-target lookups — resolve the nodes genuinely closest to keys
-    //     we publish under, a couple per cycle, so republishes stop relying on
+    //     we publish under, a few per cycle, so republishes stop relying on
     //     our own table's answer for a distant key. Same shape as a bucket
     //     refresh: the search has no waiter, and `maybe_finish_ember_search`
     //     files the result under the key it was resolving.
@@ -1614,7 +1687,8 @@ pub(super) async fn run_ember_maintenance(
     //     FIND_NODEs are two more unanswered queries on the same handshake
     //     that the liveness ping is already waiting on.
     if state.ember_dht.routing().verified_len() > 0 {
-        for _ in 0..EMBER_MAINT_MAX_TARGET_LOOKUPS {
+        let lookups = ember_target_lookups_this_cycle(state.ember_publish_target_queue.len());
+        for _ in 0..lookups {
             let Some(key) = state.ember_publish_target_queue.pop_front() else {
                 break;
             };
@@ -1655,6 +1729,10 @@ pub(super) async fn run_ember_maintenance(
             .values()
             .any(|p| p.node_id == contact.node_id)
         {
+            continue;
+        }
+        if ember_addr_banned(state, contact.addr) {
+            fault_ember_contact(state, &contact.node_id, "banned");
             continue;
         }
         let (wire_req_id, frame) = state.ember_dht.build_ping();
@@ -2124,6 +2202,15 @@ pub(super) async fn handle_ember_dht_message(
         &session_extras,
     );
 
+    // Read now, before the handlers below consume the pending query a
+    // FOUND_NODE answers.
+    let leads_asked_for = ember_leads_were_asked_for(state, &inbound, from, now);
+    if ember_reply_was_solicited(state, &inbound, from) {
+        if let Some(id) = inbound.sender_id {
+            state.ember_dht.note_answered(id, std::time::Instant::now());
+        }
+    }
+
     // A STORE that did not authenticate cost nothing the budget exists to
     // ration, so give the charge back. `sender_id` is set for every frame that
     // decoded, so its absence here is precisely "the version, the signature, the
@@ -2204,7 +2291,9 @@ pub(super) async fn handle_ember_dht_message(
     // path from exactly the peers who need it.
     //
     // Two sources answer it, and neither is complete on its own. The transport
-    // records every address Ember dialled, which covers searches and both bridges.
+    // records every address Ember dialled, which covers searches and both bridges,
+    // and every address QUIC sent to while it shares this socket (relays, sources,
+    // friend punches, attachments, room streams).
     // But Ember rides the KAD socket, so a KAD query to the same host opens the very
     // mapping in question — `has_recent_ip` is KAD's own record of that, written
     // only for outbound requests.
@@ -2222,7 +2311,7 @@ pub(super) async fn handle_ember_dht_message(
     // the relay path from exactly the peer that needed it.
     let unsolicited = inbound.ping_received
         && was_stranger
-        && !state.ember_transport.recently_dialled(from.ip())
+        && !state.ember_transport.may_have_dialled(from.ip())
         && !state.flood_protection.has_recent_ip(from.ip())
         && !crate::security::is_private_ip(from.ip());
     if unsolicited {
@@ -2236,7 +2325,7 @@ pub(super) async fn handle_ember_dht_message(
             .ember_reach_witness
             .filter(|(_, at)| now.saturating_sub(*at) < EMBER_UDP_REACHABLE_TTL_SECS);
         match witness {
-            Some((first, _)) if first != from.ip() => {
+            Some((first, _)) if ember_reach_witnesses_independent(first, from.ip()) => {
                 if state.ember_udp_reachable_at.is_none() {
                     info!(
                         "Ember DHT: strangers at {first} and {} both reached us unsolicited, \
@@ -2507,7 +2596,15 @@ pub(super) async fn handle_ember_dht_message(
             }
         }
     }
-    probe_ember_gossip_leads(socket, state, &inbound.gossip_leads, inbound.sender_id).await;
+    // Probed only when the frame carrying them answers something we asked this
+    // peer, or cost a lookup token to send (ANNOUNCE_PEER). An unsolicited
+    // FOUND_NODE or PEER_LIST is charged to nothing, so one peer sending them
+    // as fast as the frame gate allows used up the shared probe budget with
+    // leads it chose and starved the probes of real ones. Their contacts are
+    // still merged into the table, unverified.
+    if leads_asked_for {
+        probe_ember_gossip_leads(socket, state, &inbound.gossip_leads, inbound.sender_id).await;
+    }
 
     if inbound.pong_received {
         state.ember_diagnostics.ember_dht_pongs_received = state
@@ -2536,23 +2633,23 @@ pub(super) async fn handle_ember_dht_message(
                     .saturating_add(1);
                 if let Some(confirmed) = state.ember_observed_votes.record_vote(observed, from.ip())
                 {
-                    // Prefer STUN corroboration. If STUN has not produced an
-                    // address yet (Ember-only / STUN failure), accept the
-                    // correlated vote majority. If STUN disagrees, ignore.
                     let stun_ip = state.nat_info.external_addr.and_then(|a| match a.ip() {
                         std::net::IpAddr::V4(v4) => Some(v4),
                         std::net::IpAddr::V6(_) => None,
                     });
-                    if state.external_ip.is_none() {
-                        if let std::net::IpAddr::V4(v4) = confirmed.ip() {
-                            let adopt = match stun_ip {
-                                Some(stun) => stun == v4,
-                                None => true,
-                            };
-                            if adopt {
+                    if let std::net::IpAddr::V4(v4) = confirmed.ip() {
+                        match observed_ip_action(
+                            state.external_ip,
+                            v4,
+                            stun_ip,
+                            live_highid_external_ip(state),
+                        ) {
+                            ObservedIpAction::Adopt => {
                                 set_external_ip(state, Some(v4));
                                 state.stats.external_ip = v4.to_string();
                             }
+                            ObservedIpAction::Reprobe => state.ember_observed_ip_moved = true,
+                            ObservedIpAction::Keep => {}
                         }
                     }
                 }

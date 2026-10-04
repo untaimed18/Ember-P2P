@@ -58,12 +58,11 @@ fn next_requeue_search_count(
 /// `last_search_at` for a re-queued download. The first re-queue after
 /// progress retries at once, as before; later ones wait out the interval
 /// their count earned instead of retrying on the next tick.
-fn requeue_last_search_at(search_count: u32, now: i64) -> i64 {
-    if search_count <= 1 {
-        0
-    } else {
-        now
-    }
+fn requeue_last_search_at(
+    search_count: u32,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    (search_count > 1).then_some(now)
 }
 
 fn note_requeue(transfer_id: &str, prev_pending: Option<u32>, completed_now: u64) -> u32 {
@@ -82,6 +81,31 @@ fn forget_requeue_history(transfer_id: &str) {
     }
 }
 
+/// Failed moves of a verified download into `Downloads` before it is left
+/// Failed instead of re-queued.
+const COMPLETION_MOVE_ATTEMPTS: u32 = 2;
+
+fn completion_move_failures() -> &'static std::sync::Mutex<HashMap<String, u32>> {
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u32>>> =
+        std::sync::OnceLock::new();
+    FAILURES.get_or_init(Default::default)
+}
+
+fn note_completion_move_failure(transfer_id: &str) -> u32 {
+    let Ok(mut failures) = completion_move_failures().lock() else {
+        return COMPLETION_MOVE_ATTEMPTS;
+    };
+    let count = failures.entry(transfer_id.to_string()).or_insert(0);
+    *count = count.saturating_add(1);
+    *count
+}
+
+fn forget_completion_move_failures(transfer_id: &str) {
+    if let Ok(mut failures) = completion_move_failures().lock() {
+        failures.remove(transfer_id);
+    }
+}
+
 /// Scope of a finished download's known.met record. An existing record is the
 /// user's own decision about this content and wins either way: re-downloading
 /// something they restricted must not republish it, and a friend's restriction
@@ -92,6 +116,27 @@ fn completed_download_friends_only(
     existing_record: Option<bool>,
 ) -> bool {
     existing_record.unwrap_or(from_restricting_friend)
+}
+
+/// Give a restored download whose finished copy was not its file back the
+/// paused or stopped `status` it had, where a normal restore puts such a row,
+/// unless the user changed it while the copy was checked. `true` when it was.
+fn restore_status_after_copy_check(
+    mgr: &mut TransferManager,
+    transfer_id: &str,
+    status: TransferStatus,
+) -> bool {
+    let checking = mgr
+        .active
+        .get(transfer_id)
+        .is_some_and(|row| row.status == TransferStatus::Verifying);
+    let Some(mut row) = checking.then(|| mgr.active.remove(transfer_id)).flatten() else {
+        return false;
+    };
+    row.status = status;
+    row.speed = 0;
+    mgr.enqueue(row);
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -203,6 +248,7 @@ pub(in crate::network) async fn on_download_event(
         state.per_file_sources.remove(transfer_id);
         state.download_handles.remove(transfer_id);
         forget_requeue_history(transfer_id);
+        forget_completion_move_failures(transfer_id);
         {
             let mgr_snap = transfer_manager.read().await;
             if let Some(t) = mgr_snap.get_transfer(transfer_id) {
@@ -283,6 +329,26 @@ pub(in crate::network) async fn on_download_event(
                 .filter(|name| !name.is_empty())
                 .unwrap_or(sanitized_name);
             let now = chrono::Utc::now().timestamp();
+            // The file's own modification time, read as discovery reads it.
+            // `Completed` arrives after a full-file verification and the move,
+            // so the clock is ahead of the file by however long those took;
+            // recorded as `now`, neither the path lookup nor the name fallback
+            // matched it, and every completed download in a shared folder was
+            // read again in full at the next scan.
+            let completed_mtime = {
+                let path = completed_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    std::fs::symlink_metadata(&path)
+                        .ok()
+                        .and_then(|meta| meta.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                })
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(now)
+            };
 
             if let Ok(hash_bytes) = hex::decode(&file_hash) {
                 if hash_bytes.len() == 16 {
@@ -391,7 +457,7 @@ pub(in crate::network) async fn on_download_event(
                             }
                             ember_hex
                         },
-                        modified_at: now,
+                        modified_at: completed_mtime,
                         // The dropped `_transferred` field on the
                         // completed-download snapshot is this
                         // transfer's *downloaded* byte count, not
@@ -469,6 +535,17 @@ pub(in crate::network) async fn on_download_event(
                     known_files.add_or_update(record.clone());
                     if completed_friends_only {
                         sync_shared_friends_only_hashes(shared_friends_only_hashes, known_files);
+                        // Saved now, as `SetFilesFriendsOnly` does, rather than
+                        // by the 120s writer: until then nothing else holds the
+                        // restriction, and a crash in between had the file,
+                        // already in a shared folder, rehashed as public and
+                        // published on the next start.
+                        //
+                        // Started by the loop right after this event, through
+                        // the periodic writer's own path, or the moment a save
+                        // already running reports back. Waiting for the lock
+                        // here stalled every network event behind that save.
+                        state.known_met_save_soon = true;
                     }
 
                     // Auto-share completed download (eMule: CPartFile::PerformFileCompleteEnd)
@@ -487,7 +564,7 @@ pub(in crate::network) async fn on_download_event(
                         aich_hash: record.aich_hash.clone(),
                         ember_file_hash: record.ember_file_hash.clone(),
                         extension: ext,
-                        modified_at: now,
+                        modified_at: completed_mtime,
                         priority: existing
                             .as_ref()
                             .map(|record| {
@@ -708,20 +785,31 @@ pub(in crate::network) async fn on_download_event(
         // Our own folder refused the write; no peer was involved, so none is
         // blamed or penalized. The row still re-queues below and recovers by
         // itself once the folder is fixed, which is what eMule does too.
-        let is_folder_error =
-            failure_code == ed2k::transfer::TransferFailureCode::DownloadFolderUnavailable;
+        // An earlier download folder that is offline holds the download back
+        // the same way, until the drive with its progress is connected again;
+        // the row says so, and the download folder itself is fine.
+        let is_folder_error = matches!(
+            failure_code,
+            ed2k::transfer::TransferFailureCode::DownloadFolderUnavailable
+                | ed2k::transfer::TransferFailureCode::PartFolderOffline
+        );
         if is_folder_error {
             warn!("Download {transfer_id} cannot use its download folder: {error}");
+        }
+        if failure_code == ed2k::transfer::TransferFailureCode::DownloadFolderUnavailable {
             emit_download_folder_unavailable(app_handle);
         }
-        // The finished `.part` could not be read back. Also local: no source
-        // is blamed, the same as a folder error.
+        // The finished `.part` could not be read back, or moved once
+        // verified. Also local: no source is blamed, the same as a folder
+        // error.
         let is_local_read_error = matches!(
             failure_code,
             ed2k::transfer::TransferFailureCode::FinalVerifyInconclusive
                 | ed2k::transfer::TransferFailureCode::LocalReadFailed
+                | ed2k::transfer::TransferFailureCode::CompletionMoveFailed
         );
-        let blames_source = !is_folder_error && !is_local_read_error;
+        let copy_check = super::resume_downloads::take_copy_check(transfer_id);
+        let blames_source = !is_folder_error && !is_local_read_error && copy_check.is_none();
 
         // Prefer is_user_cancel_error for source-failure classification;
         // also honour an already-cancelled control (cancel race).
@@ -811,6 +899,28 @@ pub(in crate::network) async fn on_download_event(
             }
         }
 
+        // A restored download whose finished copy was not its file resumes
+        // as it was left, and one the user had paused or stopped stays so.
+        if let Some(status @ (TransferStatus::Paused | TransferStatus::Stopped)) = copy_check {
+            let restored = restore_status_after_copy_check(
+                &mut *transfer_manager.write().await,
+                transfer_id,
+                status.clone(),
+            );
+            if restored {
+                let key = if status == TransferStatus::Paused { "paused" } else { "stopped" };
+                spawn_transfer_status_write(
+                    transfer_status_writes,
+                    db.clone(),
+                    transfer_id.clone(),
+                    key,
+                );
+                crate::commands::transfers::emit_transfer_status(app_handle, transfer_id, &status);
+            }
+            info!("Restored download {transfer_id} keeps its {status:?} state: {error}");
+            return;
+        }
+
         // eMule-style: downloads never auto-fail. Re-queue for source
         // retry unless the user explicitly cancelled — or the local
         // disk is full (Insufficient), which is transfer-level —
@@ -873,6 +983,19 @@ pub(in crate::network) async fn on_download_event(
             state.pending_downloads.remove(transfer_id);
             forget_requeue_history(transfer_id);
             warn!("Download {transfer_id} cannot be read back from disk — not re-queuing");
+        } else if failure_code == ed2k::transfer::TransferFailureCode::CompletionMoveFailed
+            && !is_user_cancel
+            && note_completion_move_failure(transfer_id) >= COMPLETION_MOVE_ATTEMPTS
+        {
+            // Each attempt re-reads the whole file to verify it first, and the
+            // same move failed again. Falls through to Failed with the `.part`
+            // kept, like the read failure above.
+            state.pending_downloads.remove(transfer_id);
+            forget_requeue_history(transfer_id);
+            forget_completion_move_failures(transfer_id);
+            warn!(
+                "Download {transfer_id} could not be moved into Downloads again — not re-queuing"
+            );
         } else if is_disk_full && !is_user_cancel {
             let file_name = {
                 let mgr = transfer_manager.read().await;
@@ -1053,7 +1176,7 @@ pub(in crate::network) async fn on_download_event(
                     expected_aich: t.expected_aich.clone(),
                     control,
                     search_count,
-                    last_search_at: requeue_last_search_at(search_count, chrono::Utc::now().timestamp()),
+                    last_search_at: requeue_last_search_at(search_count, std::time::Instant::now()),
                     priority: priority_str_to_u32(&t.priority),
                 });
                 info!("Re-queued failed download {} for source retry: {}", transfer_id, error);
@@ -1128,7 +1251,7 @@ pub(in crate::network) async fn on_download_event(
     // Inject Ember Peer Exchange sources into matching active downloads
     if let DownloadEvent::EmberSources { ref transfer_id, ref entries, ref aich_roots, ref ember_peers, ref relay_attestations, from_ember_hash } = event {
         let we_are_unreachable = state.firewalled || state.low_id;
-        handle_epx_sources(state, transfer_manager, source_manager, local_index, entries, aich_roots, ember_peers, relay_attestations, from_ember_hash, &format!("download {transfer_id}"), false, we_are_unreachable).await;
+        handle_epx_sources(state, transfer_manager, source_manager, local_index, entries, aich_roots, ember_peers, relay_attestations, from_ember_hash, &format!("download {transfer_id}"), false, we_are_unreachable, &HashMap::new()).await;
     }
 
     if let DownloadEvent::EmberPeerDiscovered { ip, tcp_port, udp_port } = event {
@@ -1666,7 +1789,7 @@ pub(in crate::network) async fn on_download_event(
     // event can't unwind the whole network loop (→ outer catch →
     // shutdown). Mirrors the handle_command_inner/handle_udp_packet_inner
     // catch_unwind pattern.
-    if let Err(p) = std::panic::AssertUnwindSafe(handle_download_event(event, app_handle, transfer_manager, source_manager, db, &mut promoted, stats_manager, settings.remove_finished_downloads, a4af_shared, &settings.download_folder, db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL, &mut state.callback_row_pending_since, transfer_status_writes)).catch_unwind().await {
+    if let Err(p) = std::panic::AssertUnwindSafe(handle_download_event(event, app_handle, transfer_manager, source_manager, db, &mut promoted, stats_manager, settings.remove_finished_downloads, a4af_shared, &settings.download_roots(), db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL, &mut state.callback_row_pending_since, transfer_status_writes)).catch_unwind().await {
         error!("handle_download_event panicked, dropping event: {}", describe_panic(&*p));
     }
 
@@ -1774,8 +1897,9 @@ mod requeue_tests {
         let second = next_requeue_search_count(None, Some((first, 500)), 500);
         let third = next_requeue_search_count(None, Some((second, 500)), 500);
         assert_eq!((second, third), (2, 3));
-        assert_eq!(requeue_last_search_at(first, 1_000), 0, "first retry is immediate");
-        assert_eq!(requeue_last_search_at(third, 1_000), 1_000, "later ones wait");
+        let now = std::time::Instant::now();
+        assert_eq!(requeue_last_search_at(first, now), None, "first retry is immediate");
+        assert_eq!(requeue_last_search_at(third, now), Some(now), "later ones wait");
     }
 
     #[test]
@@ -1800,5 +1924,68 @@ mod requeue_tests {
         forget_requeue_history(id);
         assert_eq!(note_requeue(id, None, 10), 1);
         forget_requeue_history(id);
+    }
+
+    /// A move into `Downloads` that fails again after a full re-verification
+    /// will keep failing; the second one leaves the download Failed.
+    #[test]
+    fn a_repeated_completion_move_failure_stops_the_retries() {
+        let id = "requeue-tests-completion-move";
+        forget_completion_move_failures(id);
+        assert!(note_completion_move_failure(id) < COMPLETION_MOVE_ATTEMPTS);
+        assert!(note_completion_move_failure(id) >= COMPLETION_MOVE_ATTEMPTS);
+        forget_completion_move_failures(id);
+        assert!(
+            note_completion_move_failure(id) < COMPLETION_MOVE_ATTEMPTS,
+            "a resume after the download was left Failed starts afresh"
+        );
+        forget_completion_move_failures(id);
+        assert_eq!(
+            ed2k::transfer::classify_failure(
+                "stage:completion_move: Access is denied. (os error 5)",
+                &ed2k::transfer::SourceFailureKind::Permanent,
+            ),
+            ed2k::transfer::TransferFailureCode::CompletionMoveFailed
+        );
+    }
+
+    fn checking(id: &str) -> Transfer {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "file_name": "movie.bin",
+            "file_hash": "00".repeat(16),
+            "peer_id": "203.0.113.7:4662",
+            "peer_name": "",
+            "direction": "download",
+            "status": "verifying",
+            "progress": 0.0,
+            "speed": 0,
+            "total_size": 100,
+            "transferred": 0,
+            "started_at": 0,
+        }))
+        .unwrap()
+    }
+
+    /// A paused download whose leftover finished copy fails its check stays
+    /// paused, as a normal restore leaves it, instead of starting to download.
+    #[test]
+    fn a_paused_download_whose_copy_fails_its_check_stays_paused() {
+        let mut mgr = TransferManager::new(3);
+        mgr.active.insert("paused".into(), checking("paused"));
+        assert!(restore_status_after_copy_check(&mut mgr, "paused", TransferStatus::Paused));
+        let row = mgr.get_transfer("paused").unwrap();
+        assert_eq!(row.status, TransferStatus::Paused);
+        assert!(!mgr.active.contains_key("paused"), "queued like any restored paused row");
+
+        let mut resumed = checking("resumed");
+        resumed.status = TransferStatus::Searching;
+        mgr.active.insert("resumed".into(), resumed);
+        assert!(
+            !restore_status_after_copy_check(&mut mgr, "resumed", TransferStatus::Stopped),
+            "a row the user changed while it was checked is left as they set it"
+        );
+        assert_eq!(mgr.get_transfer("resumed").unwrap().status, TransferStatus::Searching);
+        assert!(!restore_status_after_copy_check(&mut mgr, "gone", TransferStatus::Paused));
     }
 }

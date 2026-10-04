@@ -202,9 +202,41 @@ fn record_ttl(data: &[u8]) -> Duration {
         _ => KEYWORD_RECORD_TTL,
     }
 }
+
+fn is_presence_departure(data: &[u8]) -> bool {
+    channel_kind_from_data(data) == Some(CHANNEL_KIND_PRESENCE)
+        && channel_flags_from_data(data).is_some_and(|f| f & CHANNEL_FLAG_DEPARTED != 0)
+}
+
 /// How far a record's signed creation timestamp may sit in the future before
 /// we treat it as bogus (clock-skew tolerance between peers).
 const CLOCK_SKEW_TOLERANCE_SECS: i64 = 3600;
+
+/// The skew tolerance for a record that lives `ttl_secs`.
+///
+/// An hour is a fraction of a keyword's day but more than a presence record's
+/// whole 45-minute life, so a flat hour let a future-dated presence outlive
+/// its TTL and beat the tombstone that should have replaced it.
+fn skew_tolerance_secs(ttl_secs: i64) -> i64 {
+    CLOCK_SKEW_TOLERANCE_SECS.min(ttl_secs / 2)
+}
+
+/// Whether a record body a search was offered is within its life: the rule a
+/// storer admits it under, with the skew tolerance granted once more in each
+/// direction for the searcher's own clock. The storer's bounds alone stacked
+/// that clock's error on the publisher's, so a searcher half an hour slow
+/// refused most presence records and one over an hour slow refused fresh
+/// records of every type. Unsigned fields only, so check the signature
+/// separately. `false` for a body too short to carry a timestamp.
+pub(crate) fn record_is_current(data: &[u8], now_unix: i64) -> bool {
+    let Some(created_at) = data.get(105..113).and_then(|b| b.try_into().ok()).map(i64::from_le_bytes)
+    else {
+        return false;
+    };
+    let ttl_secs = record_ttl(data).as_secs() as i64;
+    let skew = skew_tolerance_secs(ttl_secs);
+    created_at <= now_unix + 2 * skew && now_unix.saturating_sub(created_at) < ttl_secs + skew
+}
 
 /// One record on its way to or from disk.
 ///
@@ -293,6 +325,8 @@ pub struct DhtRecord {
     /// Wall clock, not [`Instant`], because this is not a local schedule: it is
     /// `created_at + `[`record_ttl`], both read from the publisher's signed body,
     /// so it is the same death time every other holder of these bytes computes.
+    /// A body dated ahead of our clock is the exception, aged from our clock
+    /// instead, so tolerated skew cannot lengthen its life.
     /// The neighbouring `last_republished` and `stored_at` are the opposite case
     /// — purely local intervals — and stay monotonic.
     ///
@@ -903,6 +937,19 @@ impl DhtStore {
         signature: [u8; 64],
         attributed_ip: Option<std::net::Ipv4Addr>,
     ) -> bool {
+        self.store_record(key, data, signature, attributed_ip, false)
+    }
+
+    /// [`Self::store_attributed`], skipping the signature check only when
+    /// `signature_checked` — which only [`VerifiedRecords`] can vouch for.
+    fn store_record(
+        &mut self,
+        key: [u8; 16],
+        data: Vec<u8>,
+        signature: [u8; 64],
+        attributed_ip: Option<std::net::Ipv4Addr>,
+        signature_checked: bool,
+    ) -> bool {
         // A body that cannot pack into a FOUND_VALUE even as the only blob
         // would store-but-hide: live under the key, skipped by the packer,
         // and if every live record is oversized the peer answers FOUND_NODE
@@ -980,7 +1027,7 @@ impl DhtStore {
         if !self.admit_created_at(&key, created_at, ttl_secs, now_unix) {
             return false;
         }
-        if !verify_record_signature(&data, &signature, &publisher_key) {
+        if !signature_checked && !verify_record_signature(&data, &signature, &publisher_key) {
             self.signature_rejections = self.signature_rejections.saturating_add(1);
             debug!(
                 "DHT store: signature verification failed for key {} from publisher {}",
@@ -1001,17 +1048,34 @@ impl DhtStore {
                 return false;
             }
             // A new key can sit further out than the cached bound, and the
-            // bound is only safe while it over-estimates. Clearing it costs one
-            // scan later; during a flood at capacity nothing is inserted, so it
-            // survives exactly when it is doing work.
-            self.furthest_key_distance = None;
+            // bound is only safe while it over-estimates, so it rises to cover
+            // the newcomer. It used to be cleared, and at the key cap every
+            // admitted key then cost the next arrival two full scans.
+            let incoming = self.local_id.map(|local| xor_distance(&local.0, &key));
+            self.furthest_key_distance = match (self.furthest_key_distance, incoming) {
+                (Some(bound), Some(distance)) => Some(bound.max(distance)),
+                _ => None,
+            };
         }
 
         let now = Instant::now();
         // From the signed body rather than from "now plus what is left", which
         // are the same instant only until a clock moves. `age < ttl_secs` was
-        // checked above, so this is still in the future.
-        let expires_at_unix = created_at.saturating_add(ttl_secs);
+        // checked above, so this is still in the future. A body dated ahead of
+        // our clock is aged from now instead, so the skew we tolerate cannot
+        // also lengthen its life past the TTL.
+        //
+        // Except a leave tombstone, which must outlive every live copy dated
+        // before it (see `CHANNEL_PRESENCE_DEPARTED_TTL`). Those are admitted
+        // until their own date plus the TTL, so from a fast clock a tombstone
+        // aged from now lapsed first and a harvested live copy could be stored
+        // again in its place.
+        let aged_from = if is_presence_departure(&data) {
+            created_at
+        } else {
+            created_at.min(now_unix)
+        };
+        let expires_at_unix = aged_from.saturating_add(ttl_secs);
         let incoming_ember = ember_digest_from_record_data(&data);
         let incoming_file = file_hash_from_record_data(&data);
         let record = DhtRecord {
@@ -1045,12 +1109,15 @@ impl DhtStore {
             // FOUND_VALUE — so without this an attacker could keep re-storing
             // the oldest copy they had seen and pin a publisher's record to
             // that copy's (earlier) expiry, or roll back its metadata.
+            // Not ACKed: the sender would otherwise count as placed a copy
+            // this key does not hold.
             if !resident_gives_way(&records[pos], created_at, &signature) {
+                self.timestamp_rejections = self.timestamp_rejections.saturating_add(1);
                 debug!(
-                    "Key {} already holds a newer record from this publisher, ignoring replay",
+                    "Key {} already holds a newer record from this publisher, refusing the older copy",
                     hex::encode(key)
                 );
-                return true;
+                return false;
             }
 
             let existing_ember = ember_digest_from_record_data(&records[pos].data);
@@ -1062,9 +1129,14 @@ impl DhtStore {
             // servable until the publisher's next republish, up to an hour
             // away. The reclaim pass that would have dropped it runs later, so
             // it cannot help here.
+            // And only while it outlives the next republish (half a TTL is at
+            // least one for every record type that carries a digest). Past
+            // that, keeping it meant the following bare republish was dropped
+            // too if it landed just before the resident lapsed, and the key
+            // held nothing for a whole interval.
             if existing_ember != [0u8; 32]
                 && incoming_ember == [0u8; 32]
-                && records[pos].expires_at_unix > now_unix
+                && records[pos].expires_at_unix > now_unix + ttl_secs / 2
             {
                 // Keep the richer digest, but still treat this as the
                 // republish it is: the publisher is alive and re-announcing,
@@ -1085,6 +1157,27 @@ impl DhtStore {
                 // this record on the very next tick.
                 records[pos].last_republished = now;
                 return true;
+            }
+            // A replacement that moves the record to another address takes a
+            // slot of that address's per-IP quota, the same as an insert would.
+            // Without this, storing from one address and replacing from another
+            // freed the first address's slot each time, so two hosts could fill
+            // every source slot of a key with one of them.
+            let record_ip = |r: &DhtRecord| r.attributed_ip.or_else(|| source_ip_from_record_data(&r.data));
+            if let Some(ip) = record_ip(&record).filter(|ip| record_ip(&records[pos]) != Some(*ip)) {
+                let same_ip = records
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, r)| *i != pos && r.expires_at_unix > now_unix && record_ip(r) == Some(ip))
+                    .count();
+                if same_ip >= self.scale.max_sources_per_ip() {
+                    self.source_ip_cap_rejections = self.source_ip_cap_rejections.saturating_add(1);
+                    debug!(
+                        "Key {} already has {same_ip} source record(s) attributed to {ip}, rejecting a replacement",
+                        hex::encode(key)
+                    );
+                    return false;
+                }
             }
             let old_len = record_cost(records[pos].data.len());
             let new_len = record_cost(record.data.len());
@@ -1235,7 +1328,7 @@ impl DhtStore {
     }
 
     fn admit_created_at(&mut self, key: &[u8; 16], created_at: i64, ttl_secs: i64, now_unix: i64) -> bool {
-        if created_at > now_unix + CLOCK_SKEW_TOLERANCE_SECS {
+        if created_at > now_unix + skew_tolerance_secs(ttl_secs) {
             self.timestamp_rejections = self.timestamp_rejections.saturating_add(1);
             debug!(
                 "DHT store: rejecting record for key {} dated {}s in the future",
@@ -1558,9 +1651,12 @@ impl DhtStore {
     /// the answer, and at restore time no eviction pressure exists to abuse anyway,
     /// since it runs against an empty store with far fewer records than the key
     /// budget.
-    pub fn restore(&mut self, records: Vec<PersistedRecord>) -> usize {
+    ///
+    /// The signatures were checked by [`VerifiedRecords::verify`], off the
+    /// runtime, and are not checked again.
+    pub fn restore_verified(&mut self, records: VerifiedRecords) -> usize {
         let mut accepted = 0usize;
-        for record in records {
+        for record in records.0 {
             if record.data.first() == Some(&RECORD_TYPE_SOURCE) {
                 continue;
             }
@@ -1623,11 +1719,17 @@ impl DhtStore {
                     continue;
                 }
             }
-            if self.store_attributed(key, record.data, record.signature, None) {
+            if self.store_record(key, record.data, record.signature, None, true) {
                 accepted += 1;
             }
         }
         accepted
+    }
+
+    /// [`Self::restore_verified`], verifying on the spot.
+    #[cfg(test)]
+    pub fn restore(&mut self, records: Vec<PersistedRecord>) -> usize {
+        self.restore_verified(VerifiedRecords::verify(records))
     }
 
     /// How many records are waiting to be replicated onward — those a
@@ -1882,6 +1984,39 @@ fn signed_identity_from_record_data(data: &[u8]) -> Option<([u8; 16], [u8; 32], 
 /// Returns false on any failure (malformed key, malformed sig, or
 /// signature mismatch). Uses the same strict verify as frame / record
 /// parse paths so weak-key forgeries cannot sneak in via `store` alone.
+/// Persisted records whose signatures have been checked, under the author their
+/// own body names.
+///
+/// Built only by [`Self::verify`], which is the point: a restore of up to
+/// twenty thousand records used to spend an Ed25519 check per record on the
+/// async runtime, and this lets the check run where the file is read while the
+/// store still cannot be handed an unchecked record by mistake.
+pub struct VerifiedRecords(Vec<PersistedRecord>);
+
+impl VerifiedRecords {
+    /// Keep the records with a valid signature. Blocking: one verification
+    /// each, so call it off the runtime.
+    pub fn verify(records: Vec<PersistedRecord>) -> Self {
+        let now_unix = chrono::Utc::now().timestamp();
+        Self(
+            records
+                .into_iter()
+                // What `restore_verified` drops anyway is not worth a check.
+                .filter(|record| record.data.first() != Some(&RECORD_TYPE_SOURCE))
+                .filter(|record| {
+                    signed_identity_from_record_data(&record.data).is_some_and(
+                        |(_, author, created_at)| {
+                            let ttl_secs = record_ttl(&record.data).as_secs() as i64;
+                            now_unix.saturating_sub(created_at) < ttl_secs
+                                && verify_record_signature(&record.data, &record.signature, &author)
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
 fn verify_record_signature(data: &[u8], signature: &[u8; 64], publisher_key: &[u8; 32]) -> bool {
     let Some(vk) = crypto::verifying_key_from_bytes(publisher_key) else {
         return false;
@@ -2436,10 +2571,11 @@ mod tests {
     }
 
     /// Inserting a new key can put one further out than the cached bound, so
-    /// the bound must be dropped rather than left too small — a bound that
-    /// under-estimates refuses keys the store should have taken.
+    /// the bound must rise to cover it rather than be left too small — a bound
+    /// that under-estimates refuses keys the store should have taken — and
+    /// kept rather than dropped, which cost a rescan per admitted key.
     #[test]
-    fn a_new_key_clears_the_cached_bound() {
+    fn a_new_key_raises_the_cached_bound() {
         let mut store = store_at_key_cap(0x01, 8);
 
         // Provoke a refusal so the bound is populated.
@@ -2454,11 +2590,11 @@ mod tests {
         let fresh = [0x02u8; 16];
         let (sk2, _) = keypair();
         let (d2, d2_sig) = signed_body(fresh, &[2], &sk2);
+        let before = store.furthest_key_distance.expect("cached");
         assert!(store.store(fresh, d2, d2_sig));
-        assert!(
-            store.furthest_key_distance.is_none(),
-            "a new key invalidates the bound"
-        );
+        let local = store.local_id.expect("store has a local id");
+        let after = store.furthest_key_distance.expect("the bound survives an insert");
+        assert!(after >= before && after >= xor_distance(&local.0, &fresh));
     }
 
     #[test]
@@ -2779,6 +2915,44 @@ mod tests {
         );
     }
 
+    /// Store from one address, then replace from another: the replacement
+    /// takes a slot of the new address's quota, so the old address's slot is
+    /// not freed for the next identity to reuse.
+    #[test]
+    fn a_replacement_cannot_move_a_source_past_the_per_ip_cap() {
+        use super::super::publish::{SignedRecord, SourceContact};
+        use std::net::Ipv4Addr;
+
+        let mut store = DhtStore::new();
+        store.set_scale(scale::NetworkScale::Established);
+        let cap = scale::NetworkScale::Established.max_sources_per_ip();
+        let file_hash = [0x78u8; 16];
+        let key = super::super::publish::source_key(&file_hash);
+        let target = Ipv4Addr::new(198, 51, 4, 1);
+        let contact = |ip, i: u8| SourceContact {
+            ip,
+            tcp_port: 4662,
+            udp_port: 4672,
+            flags: 0,
+            noise_pub: [i; 32],
+            ..Default::default()
+        };
+        let now = now_ts();
+
+        let mut moved = 0;
+        for i in 0..(cap as u8 + 3) {
+            let sk = SigningKey::from_bytes(&[i.wrapping_add(40); 32]);
+            let staging = Ipv4Addr::new(198, 51, 3, i + 1);
+            let first = SignedRecord::source_at(file_hash, "big.iso", contact(staging, i), &sk, now - 10);
+            assert!(store.store(key, first.data.clone(), first.signature));
+            let second = SignedRecord::source_at(file_hash, "big.iso", contact(target, i), &sk, now);
+            if store.store(key, second.data.clone(), second.signature) {
+                moved += 1;
+            }
+        }
+        assert_eq!(moved, cap, "replacements count against the address they move to");
+    }
+
     /// Records are public, so anyone can harvest one from a FOUND_VALUE and
     /// re-store it. An older copy must not displace a newer one, or a
     /// publisher's record can be pinned to the older copy's earlier expiry.
@@ -2797,8 +2971,8 @@ mod tests {
 
         let key = old.keyword_hash;
         assert!(store.store(key, newer_data, newer_sig));
-        // Replaying the older copy must not take effect.
-        assert!(store.store(key, old.data.clone(), old.signature));
+        // Replaying the older copy must not take effect, nor be ACKed as held.
+        assert!(!store.store(key, old.data.clone(), old.signature));
 
         let held = store.get(&key).expect("record present");
         assert_eq!(held.len(), 1);
@@ -3599,8 +3773,13 @@ mod tests {
         let winner = if a.signature > b.signature { &a } else { &b };
         for order in [[&a, &b], [&b, &a]] {
             let mut store = DhtStore::new();
-            for record in order {
-                assert!(store.store(record.keyword_hash, record.data.clone(), record.signature));
+            for (i, record) in order.into_iter().enumerate() {
+                let taken = store.store(record.keyword_hash, record.data.clone(), record.signature);
+                assert_eq!(
+                    taken,
+                    i == 0 || record.signature == winner.signature,
+                    "only the copy the key now holds is ACKed"
+                );
             }
             let held = store.get_live(&a.keyword_hash);
             assert_eq!(held.len(), 1);
@@ -3739,11 +3918,84 @@ mod tests {
         );
         good[33..65].fill(0xAB);
         assert!(store.store(key, good.clone(), sign(&sk, &good)));
-        let (zero_ember, zero_sig) =
-            signed_body(key, &[super::super::publish::RECORD_TYPE_KEYWORD], &sk);
-        assert!(store.store(key, zero_ember, zero_sig));
+        let zero_ember = stamped(
+            padded_for(key, &[super::super::publish::RECORD_TYPE_KEYWORD]),
+            sk.verifying_key().to_bytes(),
+            now_ts() + 1,
+        );
+        let zero_sig = sign(&sk, &zero_ember);
+        assert!(store.store(key, zero_ember.clone(), zero_sig));
         let kept = &store.get(&key).unwrap()[0].data;
         assert_eq!(&kept[33..65], &good[33..65]);
+
+        // Once the rich body has less than a republish interval left, the bare
+        // republish replaces it rather than leave the key to lapse.
+        store.entries.get_mut(&key).unwrap()[0].expires_at_unix = now_ts() + 60;
+        let later = stamped(
+            padded_for(key, &[super::super::publish::RECORD_TYPE_KEYWORD]),
+            sk.verifying_key().to_bytes(),
+            now_ts() + 2,
+        );
+        assert!(store.store(key, later.clone(), sign(&sk, &later)));
+        assert_eq!(store.get(&key).unwrap()[0].data, later);
+    }
+
+    /// A future-dated record is aged from our clock, so the skew it is allowed
+    /// cannot stretch its life, and a short-lived type gets proportionally less
+    /// skew: an hour is longer than a presence record's whole life.
+    #[test]
+    fn future_dated_records_do_not_outlive_their_ttl() {
+        let mut store = DhtStore::new();
+        let (sk, _) = keypair();
+        let key = [8u8; 16];
+        let ahead = stamped(
+            padded_for(key, &[super::super::publish::RECORD_TYPE_KEYWORD]),
+            sk.verifying_key().to_bytes(),
+            now_ts() + 1800,
+        );
+        assert!(store.store(key, ahead.clone(), sign(&sk, &ahead)));
+        let held = &store.get(&key).unwrap()[0];
+        assert!(held.expires_at_unix <= now_ts() + KEYWORD_RECORD_TTL.as_secs() as i64 + 1);
+
+        let presence_ttl = CHANNEL_PRESENCE_TTL.as_secs() as i64;
+        assert_eq!(skew_tolerance_secs(presence_ttl), presence_ttl / 2);
+        assert_eq!(
+            skew_tolerance_secs(KEYWORD_RECORD_TTL.as_secs() as i64),
+            CLOCK_SKEW_TOLERANCE_SECS
+        );
+    }
+
+    /// Ageing a fast clock's tombstone from our clock let it lapse while the
+    /// live record it replaced, admitted until its own date plus the TTL,
+    /// could still be stored again and served as present.
+    #[test]
+    fn a_fast_clocks_tombstone_outlives_the_live_record_it_replaced() {
+        let mut store = DhtStore::new();
+        let (sk, pk) = keypair();
+        let key = [9u8; 16];
+        let presence = |flags: u8, created_at: i64| {
+            let mut data = padded_for(key, &[RECORD_TYPE_CHANNEL, 1]);
+            data[65] = CHANNEL_KIND_PRESENCE;
+            data[66] = flags;
+            stamped(data, pk, created_at)
+        };
+        let ttl = CHANNEL_PRESENCE_TTL.as_secs() as i64;
+        let fast = now_ts() + 20 * 60;
+        let live = presence(0, fast - 5 * 60);
+        assert!(store.store(key, live.clone(), sign(&sk, &live)));
+        assert!(
+            store.get(&key).unwrap()[0].expires_at_unix <= now_ts() + ttl + 1,
+            "a live copy is still aged from our clock"
+        );
+
+        let departed = presence(CHANNEL_FLAG_DEPARTED, fast);
+        assert!(store.store(key, departed.clone(), sign(&sk, &departed)));
+        let held = &store.get(&key).unwrap()[0];
+        assert_eq!(held.data, departed);
+        assert!(
+            held.expires_at_unix >= fast - 5 * 60 + ttl,
+            "the tombstone has to be held for as long as the live copy is admissible"
+        );
     }
 
     /// The whole point of `foreign_stats` is telling "storing for others"

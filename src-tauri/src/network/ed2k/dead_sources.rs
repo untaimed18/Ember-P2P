@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use tracing::debug;
 
@@ -79,12 +80,21 @@ struct PerFileDeadKey {
     port: u16,
 }
 
+/// Expiries are monotonic, as eMule's `::GetTickCount()` ones are. On the wall
+/// clock a step back (NTP correcting a fast clock, or Windows re-reading an RTC
+/// a dual-booted Linux left in UTC) kept every source blocked in the last
+/// 15 to 45 minutes blocked for the length of the step as well. Nothing here is
+/// persisted, so nothing needs a wall time.
 pub struct DeadSourceList {
     /// Global dead source list (eMule: theApp.clientlist->m_globDeadSourceList)
-    sources: HashMap<DeadSourceKey, i64>,
+    sources: HashMap<DeadSourceKey, Instant>,
     /// Per-file dead source list (eMule: CPartFile::m_DeadSourceList)
-    per_file: HashMap<PerFileDeadKey, i64>,
-    last_cleanup: i64,
+    per_file: HashMap<PerFileDeadKey, Instant>,
+    last_cleanup: Option<Instant>,
+}
+
+fn secs(s: i64) -> Duration {
+    Duration::from_secs(s.max(0) as u64)
 }
 
 impl DeadSourceList {
@@ -92,8 +102,13 @@ impl DeadSourceList {
         Self {
             sources: HashMap::new(),
             per_file: HashMap::new(),
-            last_cleanup: 0,
+            last_cleanup: None,
         }
+    }
+
+    fn cleanup_due(&self, now: Instant) -> bool {
+        self.last_cleanup
+            .is_none_or(|at| now.duration_since(at) > secs(CLEANUP_INTERVAL_SECS))
     }
 
     /// Drop the soonest-to-expire entries until `map` is back under
@@ -105,17 +120,20 @@ impl DeadSourceList {
     /// batch instead (the oldest ~10% of the cap, and never fewer than the
     /// current overflow) amortizes that scan over the thousands of inserts that
     /// follow while still guaranteeing the documented maximum is never exceeded.
-    fn evict_overflow<K: Eq + std::hash::Hash>(map: &mut HashMap<K, i64>, max_entries: usize) {
+    fn evict_overflow<K: Eq + std::hash::Hash, V: Ord + Copy>(
+        map: &mut HashMap<K, V>,
+        max_entries: usize,
+    ) {
         if map.len() <= max_entries {
             return;
         }
         let overflow = map.len() - max_entries;
         let batch = overflow.max(max_entries / 10);
-        let mut expiries: Vec<i64> = map.values().copied().collect();
+        let mut expiries: Vec<V> = map.values().copied().collect();
         // `batch` is at least 1 (overflow > 0) and at most `map.len()`, so the
-        // index is in range. Everything below the cutoff goes; expiries are
-        // second-granularity, so ties at the cutoff are common and only as many
-        // of them as needed are dropped.
+        // index is in range. Everything below the cutoff goes; of the entries
+        // tied at the cutoff (rare for instants, common for the second-granular
+        // values the test uses) only as many as needed are dropped.
         let cutoff = *expiries.select_nth_unstable(batch - 1).1;
         let below_cutoff = expiries.iter().filter(|&&expiry| expiry < cutoff).count();
         let mut ties_to_drop = batch.saturating_sub(below_cutoff);
@@ -156,13 +174,13 @@ impl DeadSourceList {
         port: u16,
         source_is_firewalled: bool,
     ) {
-        let now = chrono::Utc::now().timestamp();
+        let now = Instant::now();
         let block_time = if source_is_firewalled {
             BLOCKTIMEFW_SECS
         } else {
             BLOCKTIME_SECS
         };
-        let expiry = now + block_time;
+        let expiry = now + secs(block_time);
 
         let key = DeadSourceKey {
             client_id,
@@ -173,7 +191,7 @@ impl DeadSourceList {
         };
         self.sources.insert(key, expiry);
 
-        if now - self.last_cleanup > CLEANUP_INTERVAL_SECS {
+        if self.cleanup_due(now) {
             self.cleanup();
         }
         self.evict_global_overflow();
@@ -181,8 +199,8 @@ impl DeadSourceList {
 
     /// Add a source to the per-file dead list (longer timeout, file-specific failure).
     pub fn add_dead_source_for_file(&mut self, file_hash: [u8; 16], ip: u32, port: u16) {
-        let now = chrono::Utc::now().timestamp();
-        let expiry = now + BLOCKTIME_PER_FILE_SECS;
+        let now = Instant::now();
+        let expiry = now + secs(BLOCKTIME_PER_FILE_SECS);
 
         let key = PerFileDeadKey {
             file_hash,
@@ -191,7 +209,7 @@ impl DeadSourceList {
         };
         self.per_file.insert(key, expiry);
 
-        if now - self.last_cleanup > CLEANUP_INTERVAL_SECS {
+        if self.cleanup_due(now) {
             self.cleanup();
         }
         self.evict_per_file_overflow();
@@ -201,19 +219,18 @@ impl DeadSourceList {
     /// transient failures (connection timeout, EOF, etc.). The source will
     /// be eligible for retry sooner than a permanent failure.
     pub fn add_transient_dead_source_for_file(&mut self, file_hash: [u8; 16], ip: u32, port: u16) {
-        let now = chrono::Utc::now().timestamp();
+        let now = Instant::now();
         let key = PerFileDeadKey {
             file_hash,
             ip,
             port,
         };
-        let existing = self.per_file.get(&key).copied().unwrap_or(0);
-        let expiry = now + BLOCKTIME_TRANSIENT_SECS;
-        if expiry > existing {
+        let expiry = now + secs(BLOCKTIME_TRANSIENT_SECS);
+        if self.per_file.get(&key).is_none_or(|&existing| expiry > existing) {
             self.per_file.insert(key, expiry);
         }
 
-        if now - self.last_cleanup > CLEANUP_INTERVAL_SECS {
+        if self.cleanup_due(now) {
             self.cleanup();
         }
         self.evict_per_file_overflow();
@@ -221,8 +238,8 @@ impl DeadSourceList {
 
     /// Check if a source is dead globally (any file).
     pub fn is_dead_source(&mut self, client_id: u32, ip: u32, port: u16) -> bool {
-        let now = chrono::Utc::now().timestamp();
-        if now - self.last_cleanup > CLEANUP_INTERVAL_SECS {
+        let now = Instant::now();
+        if self.cleanup_due(now) {
             self.cleanup();
         }
         let key = DeadSourceKey {
@@ -249,7 +266,7 @@ impl DeadSourceList {
         if ip != 0 && self.is_dead_source(ip, ip, port) {
             return true;
         }
-        let now = chrono::Utc::now().timestamp();
+        let now = Instant::now();
         let key = PerFileDeadKey {
             file_hash: *file_hash,
             ip,
@@ -263,7 +280,7 @@ impl DeadSourceList {
     }
 
     pub fn cleanup(&mut self) {
-        let now = chrono::Utc::now().timestamp();
+        let now = Instant::now();
         let before_global = self.sources.len();
         let before_file = self.per_file.len();
         self.sources.retain(|_, expiry| *expiry > now);
@@ -275,7 +292,7 @@ impl DeadSourceList {
                 self.sources.len(), self.per_file.len()
             );
         }
-        self.last_cleanup = now;
+        self.last_cleanup = Some(now);
     }
 
     pub fn len(&self) -> usize {

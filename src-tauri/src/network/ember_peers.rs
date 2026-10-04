@@ -664,11 +664,39 @@ pub(super) fn ember_session_introduced_among(
         || known.has_host(ip)
 }
 
+/// Whether a peer that sent us a signed frame may join the session-contact map.
+///
+/// Stricter than [`ember_session_introduced_among`], which also lets in any
+/// address we recently sent to so the IP filter passes replies from peers a
+/// search dialled. That includes the reply to a stranger's own ping, so used
+/// here it let any public host that pinged twice be pinned onto every lookup
+/// and offered as a publish target, outside the routing table's /24 limits.
+/// A dial vouches only for a LAN or CGNAT host, the peers the map exists for.
+pub(super) fn ember_session_contact_admitted_among(
+    keyless: &HostPortMap<std::time::Instant>,
+    session: &HostPortMap<ember::dht::EmberContact>,
+    known: &HostPortMap<std::time::Instant>,
+    recently_dialled: impl FnOnce() -> bool,
+    ip: Ipv4Addr,
+    udp_port: u16,
+) -> bool {
+    ember_session_introduced_among(keyless, session, known, || false, ip, udp_port)
+        || (crate::security::is_lan_or_cgnat_v4(ip) && recently_dialled())
+}
+
 pub(super) fn remember_ember_session_dht_contact(state: &mut NetworkState, contact: ember::dht::EmberContact) {
     let IpAddr::V4(ip) = contact.addr.ip() else {
         return;
     };
-    if !ember_session_introduced(state, ip, contact.addr.port()) {
+    let admitted = ember_session_contact_admitted_among(
+        &state.ember_keyless_peers,
+        &state.ember_session_dht_contacts,
+        &state.known_ember_peers,
+        || state.ember_transport.recently_dialled(IpAddr::V4(ip)),
+        ip,
+        contact.addr.port(),
+    );
+    if !admitted {
         return;
     }
     record_ember_session_dht_contact(&mut state.ember_session_dht_contacts, contact);
@@ -738,6 +766,21 @@ pub(super) fn ember_peer_ip_verdict(state: &NetworkState, ip: Ipv4Addr, udp_port
     ember_ip_verdict(&state.ip_filter, &state.banned_ips, ip, || {
         ember_session_introduced(state, ip, udp_port)
     })
+}
+
+/// Whether the ban list holds `addr`'s IPv4 address.
+///
+/// For the dial paths that check the routing table's filter gate instead of
+/// [`ember_addr_ip_verdict`]: the table knows the user's filter but not the ban
+/// list, so without this a banned address kept being queried, pinged and
+/// re-learned from gossip after it faulted out.
+pub(super) fn ember_addr_banned(state: &NetworkState, addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(v4) => state.banned_ips.contains(&v4),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .is_some_and(|v4| state.banned_ips.contains(&v4)),
+    }
 }
 
 /// [`ember_peer_ip_verdict`] for a socket address. A genuinely IPv6 peer is
@@ -978,6 +1021,111 @@ pub(super) fn ember_announce_due(
     }
 }
 
+/// Whether the gossip leads in `inbound` arrived in a frame we asked for, or
+/// one that cost its sender a lookup token: an `ANNOUNCE_PEER`, a `PEER_LIST`
+/// from a peer we announced to within the last two maintenance cycles, or a
+/// `FOUND_NODE` answering a query outstanding to its sender. Only those have
+/// their leads probed; see `handle_ember_dht_message`.
+pub(super) fn ember_leads_were_asked_for(
+    state: &NetworkState,
+    inbound: &ember::dht::engine::DhtInbound,
+    from: SocketAddr,
+    now: i64,
+) -> bool {
+    if inbound.announce_peer_received {
+        return true;
+    }
+    let Some(sender) = inbound.sender_id else {
+        return false;
+    };
+    if inbound.peer_list.is_some() {
+        let window = 2 * EMBER_MAINT_INTERVAL.as_secs() as i64;
+        return state
+            .ember_announced_at
+            .get(&sender)
+            .is_some_and(|at| now.saturating_sub(*at) <= window);
+    }
+    if let Some((rid, _)) = &inbound.found_node {
+        if state
+            .ember_dht_pending_finds
+            .get(rid)
+            .is_some_and(|(_, dest, _)| *dest == from)
+        {
+            return true;
+        }
+        return state
+            .ember_dht_search_requests
+            .get(rid)
+            .and_then(|req| {
+                state
+                    .ember_search
+                    .get(req.search_id)
+                    .and_then(|search| search.pending_query(req.per_search_req_id))
+            })
+            .is_some_and(|(node, _)| node == sender);
+    }
+    true
+}
+
+/// Whether `inbound` is a reply to a request we sent its sender and still hold
+/// open, bound the way each reply's own handler binds it. Request ids come from
+/// counters, so an id alone proves nothing; the reply also has to come from the
+/// node or address the request went to. Read before the handlers consume the
+/// pending entries.
+pub(super) fn ember_reply_was_solicited(
+    state: &NetworkState,
+    inbound: &ember::dht::engine::DhtInbound,
+    from: SocketAddr,
+) -> bool {
+    let Some(sender) = inbound.sender_id else {
+        return false;
+    };
+    let search_query_to_sender = |rid: u32| {
+        state
+            .ember_dht_search_requests
+            .get(&rid)
+            .and_then(|req| {
+                state
+                    .ember_search
+                    .get(req.search_id)
+                    .and_then(|search| search.pending_query(req.per_search_req_id))
+            })
+            .is_some_and(|(node, _)| node == sender)
+    };
+    if let Some(rid) = inbound.pong_request_id {
+        return state
+            .ember_dht_pending_pings
+            .get(&rid)
+            .is_some_and(|(_, dest, _)| *dest == from)
+            || state
+                .ember_dht_maint_pings
+                .get(&rid)
+                .is_some_and(|ping| ping.node_id == sender);
+    }
+    if let Some((rid, _)) = &inbound.found_node {
+        return state
+            .ember_dht_pending_finds
+            .get(rid)
+            .is_some_and(|(_, dest, _)| *dest == from)
+            || search_query_to_sender(*rid);
+    }
+    if let Some(page) = &inbound.found_value {
+        return search_query_to_sender(page.request_id);
+    }
+    if let Some(rid) = inbound.store_ack_request_id {
+        return state
+            .ember_dht_publish_requests
+            .get(&rid)
+            .is_some_and(|req| req.node_id == sender);
+    }
+    if let Some((rid, _)) = inbound.store_batch_ack {
+        return state.ember_batch_publish.awaits_ack(rid, sender);
+    }
+    // The engine reports a PROXY_STORE_ACK only when it echoes an ask we sent
+    // this buddy.
+    inbound.proxy_store_ack.is_some()
+}
+
 /// Public-table contacts plus firsthand session peers, least-recently-announced
 /// first. `ANNOUNCE_PEER` used to walk only the public table, so a friend the
 /// IP policy kept in the session map (LAN / CGNAT with `block_private_ips`)
@@ -1140,7 +1288,7 @@ pub(super) fn ember_overlay_publish_targets(
 
 /// Target-lookup queue slots a buddy's `PROXY_STORE` forwards may occupy.
 ///
-/// The queue drains [`EMBER_MAINT_MAX_TARGET_LOOKUPS`] keys a cycle and is
+/// The queue drains at most [`EMBER_MAINT_MAX_TARGET_LOOKUPS`] keys a cycle and is
 /// first come, first served, so every key queued on someone else's behalf
 /// delays one of ours. A forwarded key is as distant as any of ours, so it
 /// still gets a share — just not one that can crowd our own keys out.
@@ -1314,7 +1462,7 @@ pub(super) fn sign_local_relay_attestation(
         relay_ip,
         relay_port,
         now_unix + ember::RELAY_ATTESTATION_MAX_TTL_SECS,
-        ember::RELAY_ATTESTATION_CAP_RELAY_V1,
+        ember::RELAY_ATTESTATION_CAP_RELAY_V1 | ember::RELAY_ATTESTATION_CAP_PINNED_TARGET,
     ))
 }
 
@@ -1964,7 +2112,9 @@ pub(super) async fn probe_ember_gossip_leads(
         // A gossiped address is one the sender named, so the user's own filter
         // has to apply before we dial it — `is_bogus_v4` alone let `ipfilter.dat`
         // be bypassed for every address learned this way.
-        if !state.ember_dht.routing().admits_addr(&contact.addr) {
+        if !state.ember_dht.routing().admits_addr(&contact.addr)
+            || ember_addr_banned(state, contact.addr)
+        {
             continue;
         }
         if state

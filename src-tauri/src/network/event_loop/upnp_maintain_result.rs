@@ -19,7 +19,7 @@ pub(in crate::network) async fn on_upnp_maintain_result(
     *upnp_maintain_handle = None;
     if result.revision == upnp_mappings.revision() {
         let was_mapped = state.upnp_mapped;
-        *upnp_mappings = result.mappings;
+        upnp_mappings.adopt(result.mappings);
         let mapped = result.mapped;
         state.upnp_mapped = mapped;
         state.stats.upnp_mapped = mapped;

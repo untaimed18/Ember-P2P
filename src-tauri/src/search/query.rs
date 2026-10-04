@@ -29,7 +29,7 @@
 //! boolean path never stripped, so quoting one word changed whether another
 //! was searched at all.
 
-use crate::network::kad::publish::extract_query_keywords;
+use crate::network::kad::publish::{extract_query_keywords, kad_keyword_lowercase};
 
 const MAX_QUERY_BYTES: usize = 16 * 1024;
 const MAX_PARSE_DEPTH: usize = 64;
@@ -103,6 +103,13 @@ impl QueryExpr {
         }
     }
 
+    /// [`Self::matches`] against a file name, lowercased the way the terms
+    /// were. `str::to_lowercase` differs on `İ` and word-final `Σ`, so a name
+    /// lowercased with it never contained a term holding either.
+    pub fn matches_name(&self, name: &str) -> bool {
+        self.matches(&kad_keyword_lowercase(name))
+    }
+
     /// Positive (non-negated) terms in first-occurrence order, de-duplicated.
     /// Used to pick the Kad lookup keyword and to seed the spam scorer; negated
     /// terms are intentionally excluded so we never look up / score on a term
@@ -113,6 +120,32 @@ impl QueryExpr {
         let mut seen = std::collections::HashSet::new();
         out.retain(|t| seen.insert(t.clone()));
         out
+    }
+
+    /// Terms every match must contain. A DHT lookup on one of these finds
+    /// every matching file; a lookup on a term from one side of an OR misses
+    /// the files that match through the other side.
+    pub fn required_terms(&self) -> Vec<String> {
+        match self {
+            QueryExpr::Term(s) => vec![s.clone()],
+            QueryExpr::And(l, r) => {
+                let mut out = l.required_terms();
+                for term in r.required_terms() {
+                    if !out.contains(&term) {
+                        out.push(term);
+                    }
+                }
+                out
+            }
+            QueryExpr::Or(l, r) => {
+                let right = r.required_terms();
+                l.required_terms()
+                    .into_iter()
+                    .filter(|term| right.contains(term))
+                    .collect()
+            }
+            QueryExpr::Not(l, _r) => l.required_terms(),
+        }
     }
 
     fn collect_positive(&self, out: &mut Vec<String>) {
@@ -249,7 +282,19 @@ pub fn parse(query: &str) -> Option<QueryExpr> {
 
     let toks = lex(query);
     let mut parser = Parser { toks, pos: 0 };
-    if let Some(expr) = parser.parse_or(0) {
+    // A `)` with no `(` to close ends `parse_or`; skip it and carry on, or
+    // everything after it was dropped (`movie (2019)) 1080p` lost `1080p`).
+    let mut parts = Vec::new();
+    loop {
+        if let Some(expr) = parser.parse_or(0) {
+            parts.push(expr);
+        }
+        if !matches!(parser.peek(), Some(Tok::RParen)) {
+            break;
+        }
+        parser.advance();
+    }
+    if let Some(expr) = fold_and(parts) {
         return Some(expr);
     }
 
@@ -284,12 +329,19 @@ fn has_operators(query: &str) -> bool {
         if raw.starts_with('-') && raw.len() > 1 {
             return true;
         }
-        let upper = raw.to_ascii_uppercase();
-        if upper == "AND" || upper == "OR" || upper == "NOT" {
+        if is_operator_word(raw) {
             return true;
         }
     }
     false
+}
+
+/// `AND`, `OR` and `NOT` as operators: upper-case only, as eMule's scanner
+/// and the search box's syntax hint have them. Matched in any case, ordinary
+/// title words became operators: `eminem not afraid` excluded "Not Afraid",
+/// and a related search for the title `truth or dare` became an OR.
+fn is_operator_word(raw: &str) -> bool {
+    matches!(raw, "AND" | "OR" | "NOT")
 }
 
 /// Fold a list of operands into a left-leaning AND chain
@@ -475,8 +527,13 @@ fn lex(query: &str) -> Vec<Tok> {
             }
             '-' => {
                 // A '-' at a token boundary is negation; consume just the dash
-                // so the following run becomes the negated primary.
-                toks.push(Tok::Not);
+                // so the following run becomes the negated primary. A dash
+                // standing alone, as in `Pink Floyd - The Wall (1979)`, is a
+                // separator: `has_operators` already reads it so, and taken as
+                // NOT it excluded the very file being searched for.
+                if chars.get(i + 1).is_some_and(|next| !next.is_whitespace()) {
+                    toks.push(Tok::Not);
+                }
                 i += 1;
             }
             _ => {
@@ -490,7 +547,8 @@ fn lex(query: &str) -> Vec<Tok> {
                     i += 1;
                 }
                 let raw: String = chars[start..i].iter().collect();
-                match raw.to_ascii_uppercase().as_str() {
+                // Case-sensitive; see `is_operator_word`.
+                match raw.as_str() {
                     "AND" => toks.push(Tok::And),
                     "OR" => toks.push(Tok::Or),
                     "NOT" => toks.push(Tok::Not),
@@ -820,6 +878,48 @@ mod tests {
         let dash = parse("movie -cam").unwrap();
         let word = parse("movie NOT cam").unwrap();
         assert_eq!(dash, word);
+    }
+
+    #[test]
+    fn required_terms_are_those_every_match_contains() {
+        let req = |q: &str| parse(q).unwrap().required_terms();
+        assert_eq!(req("matrix reloaded"), vec!["matrix", "reloaded"]);
+        assert_eq!(req("ubuntu (desktop OR server)"), vec!["ubuntu"]);
+        assert_eq!(req("(ubuntu iso) OR (debian iso)"), vec!["iso"]);
+        assert!(req("matrix OR reloaded").is_empty());
+        assert_eq!(req("movie -cam"), vec!["movie"]);
+    }
+
+    /// Operators are upper-case only, as in eMule and the syntax hint: words
+    /// in a title are words.
+    #[test]
+    fn lower_case_operator_words_are_ordinary_words() {
+        let expr = parse("eminem not afraid").unwrap();
+        assert!(!expr.contains_not());
+        assert!(expr.matches("eminem - not afraid.mp3"));
+        assert!(!parse("truth or dare").unwrap().contains_or());
+        assert!(parse("truth OR dare").unwrap().contains_or());
+    }
+
+    /// A dash with space on both sides separates; it does not negate.
+    #[test]
+    fn a_standalone_dash_does_not_negate_the_next_word() {
+        let expr = parse("Pink Floyd - The Wall (1979)").unwrap();
+        assert!(!expr.contains_not());
+        assert!(expr.matches("pink floyd - the wall (1979).mp3"));
+        // Attached to the word it still negates.
+        assert!(parse("pink floyd -live (wall)").unwrap().contains_not());
+    }
+
+    /// A `)` with nothing to close used to end the parse there.
+    #[test]
+    fn a_stray_closing_paren_keeps_the_rest_of_the_query() {
+        let expr = parse("movie (2019)) 1080p").unwrap();
+        assert!(expr.matches("movie 2019 1080p"));
+        assert!(!expr.matches("movie 2019 720p"), "1080p must still be required");
+        let expr = parse("alpha) beta").unwrap();
+        assert!(!expr.matches("alpha only"));
+        assert!(expr.matches("alpha beta"));
     }
 
     #[test]

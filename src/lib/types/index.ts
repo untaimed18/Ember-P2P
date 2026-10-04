@@ -311,6 +311,8 @@ export interface NetworkStats {
   ember_peers: number;
   epx_sources_received: number;
   server_status?: string;
+  /** While on an eD2K server: whether it gave us a LowID; null otherwise. */
+  ed2k_low_id?: boolean | null;
   stun_keepalive_active?: boolean;
   public_udp_port?: number;
   public_tcp_port?: number;
@@ -875,6 +877,9 @@ export interface AppSettings {
    *  discarded. Change shared folders through the sharing commands. */
   readonly shared_folders: string[];
   download_folder: string;
+  /** Earlier download folders that still hold unfinished downloads, which
+   *  finish where they started. Backend-owned, like `shared_folders`. */
+  readonly previous_download_folders?: string[];
   max_upload_speed: number;
   max_download_speed: number;
   max_concurrent_downloads: number;
@@ -897,6 +902,8 @@ export interface AppSettings {
    *  menu, with the file's facts substituted into a URL template. Empty by
    *  default — opening one tells a third party which file you are after. */
   web_services: WebService[];
+  /** Download categories the user made, offered beside the built-in ones. */
+  download_categories?: string[];
   block_private_ips: boolean;
   filter_servers_by_ip: boolean;
   add_servers_from_server: boolean;
@@ -949,8 +956,6 @@ export interface AppSettings {
   readonly default_shared_folder_seeded: boolean;
   /** Monotonic optimistic-concurrency token for settings saves. */
   settings_revision: number;
-  /** Retained for config.json; unsolicited requests always queue, reciprocal accepts auto-confirm. */
-  friend_require_approval: boolean;
   /** Disable incoming chat messages from friends */
   friend_chat_disabled: boolean;
   /** Send and display friend-chat read receipts. Off both ways. */
@@ -992,6 +997,9 @@ export interface AppSettings {
    *  the built-in default rather than "relay nothing" — that is
    *  `relay_for_peers`. */
   max_relay_sessions: number;
+  /** Whether QUIC shares the KAD / Ember UDP port. `config.json` only, owned
+   *  by the backend (`BACKEND_OWNED_SETTINGS_FIELDS`). */
+  readonly quic_shares_udp_port: boolean;
   /** What to do when the user closes the main window via the title-bar X.
    *
    *  - `'ask'` (default): show a dialog letting the user pick.
@@ -1009,7 +1017,11 @@ export interface AppSettings {
    *  true (Ember's original always-check-on-launch behavior). */
   auto_check_updates: boolean;
   /** How often the automatic background update check may run. */
-  update_check_frequency: 'daily' | 'weekly' | 'monthly';
+  update_check_frequency: 'hourly' | 'daily' | 'weekly' | 'monthly';
+  /** Install updates without asking, once nothing is transferring and the user
+   *  is away, after a one-minute warning. Only on together with
+   *  `auto_check_updates`. */
+  silent_update_enabled: boolean;
 
   /** Master switch for desktop notifications. Off silences every category
    *  below, and the backend re-checks it so a stale renderer cannot notify

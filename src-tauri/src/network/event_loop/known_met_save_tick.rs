@@ -2,6 +2,65 @@
 
 use super::*;
 
+/// Start a background save of a dirty catalog, unless one is running or the
+/// lock is held. Also run as soon as a save finishes when
+/// `known_met_save_soon` asks for it.
+pub(in crate::network) fn start_known_met_save(
+    state: &mut NetworkState,
+    known_files: &mut KnownFileList,
+    known_met_save_in_flight: &mut bool,
+    known_met_save_result_tx: &mpsc::UnboundedSender<KnownMetSaveResult>,
+    known_met_save_started_at: &mut Option<tokio::time::Instant>,
+) {
+    // `is_authoritative` gates the attempt because the periodic interval's
+    // first tick fires immediately, roughly half a second before the
+    // deferred known.met load lands. Without it every launch spent a
+    // blocking task and the save lock on a write `save` then refused,
+    // and reported the refusal back as `Ok(false)` — indistinguishable
+    // from a genuine known_paths.dat durability failure, so the result arm
+    // logged "save completed but companion was not durable" immediately
+    // after `save` had logged that it skipped. Nothing was lost either way
+    // (the catalog stays dirty and the next tick, by which time the load
+    // has landed, writes it), but the pair of contradictory warnings
+    // described a failure that never happened. The `|| !exists` arm
+    // mirrors `save`'s own condition, which refuses only when *both* hold.
+    // Gating on `is_authoritative` alone would also block a genuine first
+    // run — where there is no catalog on disk to protect and `save` would
+    // have written happily — and because `authoritative` is only ever set
+    // by the deferred load's absorb, a panic in that task would then skip
+    // every periodic save for the rest of the session.
+    if !known_files.is_dirty()
+        || !(known_files.is_authoritative() || !state.data_dir.join("known.met").exists())
+        || *known_met_save_in_flight
+    {
+        return;
+    }
+    // Other writers hold this across their fsync. The catalog stays dirty, so
+    // a skipped tick is just a save two minutes later, where waiting here
+    // stalled the whole event loop behind someone else's disk.
+    let Ok(ownership) = state.known_met_save_lock.clone().try_lock_owned() else {
+        debug!("known.met save lock busy; deferring the save");
+        return;
+    };
+    state.known_met_save_soon = false;
+    let known_path = state.data_dir.join("known.met");
+    let generation = known_files.dirty_generation();
+    let mut snapshot = known_files.snapshot();
+    let tx = known_met_save_result_tx.clone();
+    *known_met_save_in_flight = true;
+    *known_met_save_started_at = Some(tokio::time::Instant::now());
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let _ownership = ownership;
+            snapshot.save(&known_path).map(|_| !snapshot.is_dirty())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("known.met save task failed: {e}"))
+        .and_then(|r| r);
+        let _ = tx.send(KnownMetSaveResult { generation, result });
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_known_met_save_tick(
     state: &mut NetworkState,
@@ -28,56 +87,13 @@ pub(in crate::network) async fn on_known_met_save_tick(
         &state.ember_keyword_publish_unix,
         known_files,
     );
-    // `is_authoritative` gates the attempt because this interval's
-    // first tick fires immediately, roughly half a second before the
-    // deferred known.met load lands. Without it every launch spent a
-    // blocking task and the save lock on a write `save` then refused,
-    // and reported the refusal back as `Ok(false)` — indistinguishable
-    // from a genuine known_paths.dat durability failure, so the arm
-    // below logged "save completed but companion was not durable"
-    // immediately after `save` had logged that it skipped. Nothing was
-    // lost either way (the catalog stays dirty and the next tick, by
-    // which time the load has landed, writes it), but the pair of
-    // contradictory warnings described a failure that never happened.
-    // The `|| !exists` arm mirrors `save`'s own condition, which
-    // refuses only when *both* hold. Gating on `is_authoritative`
-    // alone would also block a genuine first run — where there is no
-    // catalog on disk to protect and `save` would have written
-    // happily — and because `authoritative` is only ever set by the
-    // deferred load's absorb, a panic in that task would then skip
-    // every periodic save for the rest of the session.
-    if known_files.is_dirty()
-        && (known_files.is_authoritative()
-            || !state.data_dir.join("known.met").exists())
-        && !*known_met_save_in_flight
-    {
-        // Other writers hold this across their fsync. The catalog stays
-        // dirty, so a skipped tick is just a save two minutes later, where
-        // waiting here stalled the whole event loop behind someone else's disk.
-        match state.known_met_save_lock.clone().try_lock_owned() {
-            Ok(ownership) => {
-                let known_path = state.data_dir.join("known.met");
-                let generation = known_files.dirty_generation();
-                let mut snapshot = known_files.snapshot();
-                let tx = known_met_save_result_tx.clone();
-                *known_met_save_in_flight = true;
-                *known_met_save_started_at = Some(tokio::time::Instant::now());
-                tokio::spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        let _ownership = ownership;
-                        snapshot.save(&known_path).map(|_| !snapshot.is_dirty())
-                    })
-                    .await
-                    .map_err(|e| anyhow::anyhow!("known.met save task failed: {e}"))
-                    .and_then(|r| r);
-                    let _ = tx.send(KnownMetSaveResult { generation, result });
-                });
-            }
-            Err(_) => {
-                debug!("known.met save lock busy; deferring the periodic save to the next tick");
-            }
-        }
-    }
+    start_known_met_save(
+        state,
+        known_files,
+        known_met_save_in_flight,
+        known_met_save_result_tx,
+        known_met_save_started_at,
+    );
     while let Ok(hs) = aich_set_rx.try_recv() {
         // Only the not-yet-appended queue is bounded; the file is not. A
         // queue this deep means appends keep failing, and refusing (rather

@@ -12,12 +12,16 @@ pub(super) fn name_spam_penalty(name: &str) -> usize {
 }
 
 pub(super) fn kad_tag_file_rating(tag: &kad::types::KadTag) -> Option<u8> {
-    let raw = tag
-        .uint32_value()
-        .map(|v| v as u64)
-        .or_else(|| tag.uint16_value().map(|v| v as u64))
-        .or_else(|| tag.uint8_value().map(|v| v as u64))?;
-    crate::network::ed2k::comments::unpack_file_rating(raw)
+    let raw = kad_tag_uint::<u32>(tag)?;
+    crate::network::ed2k::comments::unpack_file_rating(raw.into())
+}
+
+/// A KAD integer tag at whatever width it arrived in, if it fits `T`. eMule
+/// writes each one at the smallest width that holds the value, so a sources
+/// count of 5 comes as a UINT8 and a 40 KB file size as a UINT16; reading one
+/// fixed width saw neither.
+fn kad_tag_uint<T: TryFrom<u64>>(tag: &kad::types::KadTag) -> Option<T> {
+    tag.as_uint().and_then(|v| T::try_from(v).ok())
 }
 
 pub(super) fn convert_search_results(
@@ -46,11 +50,8 @@ pub(super) fn convert_search_results(
     // arrives as a string (e.g. an ED2K-bridged "h:mm:ss"/"mm:ss"/"ss" form),
     // parse it the same way eMule's ConvertED2KTag does.
     fn parse_media_length(tag: &KadTag) -> Option<u32> {
-        if let Some(v) = tag.uint32_value() {
-            return Some(v);
-        }
-        if let Some(v) = tag.uint16_value() {
-            return Some(v as u32);
+        if tag.as_uint().is_some() {
+            return kad_tag_uint(tag);
         }
         let s = tag.string_value()?;
         let parts: Vec<u32> = s
@@ -118,13 +119,9 @@ pub(super) fn convert_search_results(
                         }
                     }
                     TagName::Id(TAG_MEDIA_BITRATE) => {
-                        if let Some(v) = tag.uint32_value() {
+                        if let Some(v) = kad_tag_uint::<u32>(tag) {
                             if v > 0 {
                                 media.bitrate = Some(v);
-                            }
-                        } else if let Some(v) = tag.uint16_value() {
-                            if v > 0 {
-                                media.bitrate = Some(v as u32);
                             }
                         }
                     }
@@ -165,7 +162,7 @@ pub(super) fn convert_search_results(
                         }
                     }
                     TagName::Str(s) if s.eq_ignore_ascii_case("bitrate") => {
-                        if let Some(v) = tag.uint32_value() {
+                        if let Some(v) = kad_tag_uint::<u32>(tag) {
                             if v > 0 {
                                 media.bitrate = Some(v);
                             }
@@ -184,10 +181,8 @@ pub(super) fn convert_search_results(
                         }
                     }
                     TagName::Id(TAG_FILESIZE) => {
-                        if let Some(v) = tag.uint64_value() {
+                        if let Some(v) = tag.as_uint() {
                             size = v;
-                        } else if let Some(v) = tag.uint32_value() {
-                            size = v as u64;
                         }
                     }
                     TagName::Id(TAG_FILETYPE) => {
@@ -196,26 +191,22 @@ pub(super) fn convert_search_results(
                         }
                     }
                     TagName::Id(TAG_SOURCES) => {
-                        if let Some(v) = tag.uint32_value() {
-                            sources_tag = v.min(MAX_KAD_AVAILABILITY);
-                        } else if let TagValue::Uint16(v) = &tag.value {
-                            sources_tag = (*v as u32).min(MAX_KAD_AVAILABILITY);
+                        if let Some(v) = tag.as_uint() {
+                            sources_tag = v.min(MAX_KAD_AVAILABILITY.into()) as u32;
                         }
                     }
                     TagName::Id(TAG_COMPLETE_SOURCES) => {
-                        if let Some(v) = tag.uint32_value() {
-                            complete_sources_tag = v.min(MAX_KAD_AVAILABILITY);
-                        } else if let Some(v) = tag.uint16_value() {
-                            complete_sources_tag = (v as u32).min(MAX_KAD_AVAILABILITY);
+                        if let Some(v) = tag.as_uint() {
+                            complete_sources_tag = v.min(MAX_KAD_AVAILABILITY.into()) as u32;
                         }
                     }
                     TagName::Id(TAG_SOURCEIP) => {
-                        if let Some(v) = tag.uint32_value() {
+                        if let Some(v) = kad_tag_uint(tag) {
                             source_ip = v;
                         }
                     }
                     TagName::Id(TAG_SOURCEPORT) => {
-                        if let Some(v) = tag.uint16_value() {
+                        if let Some(v) = kad_tag_uint(tag) {
                             source_port = v;
                         }
                     }
@@ -462,6 +453,9 @@ pub(super) fn convert_note_search_results(
     file_hash: &KadId,
 ) -> Vec<SearchResult> {
     let forced_hash = hex::encode(kad_id_to_md4_bytes(file_hash));
+    // Every node storing a publisher's note returns it; eMule's `AddNote`
+    // keeps the first per source id, and so does this.
+    let mut seen_publishers = HashSet::new();
 
     entries
         .iter()
@@ -479,10 +473,8 @@ pub(super) fn convert_note_search_results(
                         }
                     }
                     TagName::Id(TAG_FILESIZE) => {
-                        if let Some(v) = tag.uint64_value() {
+                        if let Some(v) = tag.as_uint() {
                             size = v;
-                        } else if let Some(v) = tag.uint32_value() {
-                            size = v as u64;
                         }
                     }
                     TagName::Id(TAG_FILERATING) => {
@@ -506,6 +498,9 @@ pub(super) fn convert_note_search_results(
             }
 
             if rating.is_none() && comment.as_ref().is_none_or(|c| c.is_empty()) {
+                return None;
+            }
+            if !seen_publishers.insert(entry.id) {
                 return None;
             }
 
@@ -773,37 +768,37 @@ pub(super) fn extract_kad_sources(entries: &[kad::messages::SearchResultEntry]) 
         for tag in &entry.tags {
             match &tag.name {
                 TagName::Id(TAG_SOURCEIP) => {
-                    if let Some(v) = tag.uint32_value() {
+                    if let Some(v) = kad_tag_uint(tag) {
                         ip = v;
                     }
                 }
                 TagName::Id(TAG_SOURCEPORT) => {
-                    if let Some(v) = tag.uint16_value() {
+                    if let Some(v) = kad_tag_uint(tag) {
                         port = v;
                     }
                 }
                 TagName::Id(TAG_SOURCEUPORT) => {
-                    if let Some(v) = tag.uint16_value() {
+                    if let Some(v) = kad_tag_uint(tag) {
                         udp_port = v;
                     }
                 }
                 TagName::Id(TAG_SOURCETYPE) => {
-                    if let Some(v) = tag.uint8_value() {
+                    if let Some(v) = kad_tag_uint(tag) {
                         source_type = v;
                     }
                 }
                 TagName::Id(TAG_ENCRYPTION) => {
-                    if let Some(v) = tag.uint8_value() {
+                    if let Some(v) = kad_tag_uint(tag) {
                         connect_options = v;
                     }
                 }
                 TagName::Id(TAG_SERVERIP) => {
-                    if let Some(v) = tag.uint32_value() {
+                    if let Some(v) = kad_tag_uint(tag) {
                         server_ip = v;
                     }
                 }
                 TagName::Id(TAG_SERVERPORT) => {
-                    if let Some(v) = tag.uint16_value() {
+                    if let Some(v) = kad_tag_uint(tag) {
                         server_port = v;
                     }
                 }
@@ -1258,8 +1253,8 @@ pub(super) fn matches_search_expr_for_tags(expr: &KadSearchExpr, tags: &[KadTag]
         .iter()
         .find(|tag| matches!(&tag.name, TagName::Id(TAG_FILENAME)))
         .and_then(|tag| tag.string_value())
-        .unwrap_or_default()
-        .to_lowercase();
+        .map(kad::publish::kad_keyword_lowercase)
+        .unwrap_or_default();
     let file_size = tags.iter().find_map(search_entry_tag_u64).unwrap_or(0);
     matches_search_expr_impl(expr, &file_name, file_size, Some(tags))
 }
@@ -1293,16 +1288,29 @@ pub(super) fn matches_search_expr_impl(
             matches_search_expr_impl(left, lower_name, file_size, tags)
                 && !matches_search_expr_impl(right, lower_name, file_size, tags)
         }
-        KadSearchExpr::String(value) => lower_name.contains(&value.to_lowercase()),
+        KadSearchExpr::String(value) => {
+            // eMule tokenizes a string term on the keyword separators and
+            // requires every word (`SSearchTerm::Evaluate`), so a quoted
+            // `"pink floyd"` matches `Pink_Floyd-The_Wall`. A term with no
+            // word in it matches nothing, as there.
+            let value = kad::publish::kad_keyword_lowercase(value);
+            let mut words = value
+                .split(kad::publish::is_kad_keyword_separator)
+                .filter(|word| !word.is_empty())
+                .peekable();
+            words.peek().is_some() && words.all(|word| lower_name.contains(word))
+        }
         KadSearchExpr::MetaString { tag, value } => {
-            let value = value.to_lowercase();
+            let value = kad::publish::kad_keyword_lowercase(value);
             if tag_matches_filename(tag) {
                 lower_name.contains(&value)
             } else if let Some(tags) = tags {
                 tags.iter()
                     .find(|entry_tag| tag_name_matches(tag, &entry_tag.name))
                     .and_then(|entry_tag| entry_tag.string_value())
-                    .map(|entry_value| entry_value.to_lowercase().contains(&value))
+                    .map(|entry_value| {
+                        kad::publish::kad_keyword_lowercase(entry_value).contains(&value)
+                    })
                     .unwrap_or(false)
             } else {
                 false

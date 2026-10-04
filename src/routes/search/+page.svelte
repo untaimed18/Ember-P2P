@@ -50,7 +50,7 @@
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { passiveScroll } from '$lib/actions/passiveScroll';
-  import { computeRowWindow } from '$lib/rowWindow';
+  import { adoptRowHeight, computeRowWindow } from '$lib/rowWindow';
   import { openWebService } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
   import IconX from '$lib/components/IconX.svelte';
@@ -65,6 +65,7 @@
     transferFailureReasonText,
   } from '$lib/i18n';
   import { plural } from '$lib/plural';
+  import { isShortcutLetter } from '$lib/shortcutKey';
 
   const searchTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
   /** Request ids whose invoke has settled (success or error). Prevents a late
@@ -1694,6 +1695,10 @@
     8 + MEDIA_COLUMNS.reduce((n, c) => n + (columnVis[c.key] ? 1 : 0), 0),
   );
 
+  /** True once an empty window has scheduled a follow-up measure. Stops that
+   *  follow-up from rescheduling itself if the rows are not in the DOM yet. */
+  let rowMeasurePending = false;
+
   function updateRowWindow() {
     const scroller = resultsScrollEl;
     const body = resultsBodyEl;
@@ -1701,10 +1706,23 @@
     if (!scroller || !body || total === 0) {
       rowWindowStart = 0;
       rowWindowEnd = 0;
+      rowMeasurePending = false;
       return;
     }
     // This side owns the measuring, because only this side can read the DOM;
-    // `computeRowWindow` owns the rule and is tested against it.
+    // `computeRowWindow` and `adoptRowHeight` own the rules and are tested
+    // against them. The average, not the first row: one wrapped origin chip
+    // or spam badge is taller than its neighbours, and a scrollbar drag jumps
+    // straight onto it. Measuring that single row and feeding the height back
+    // into the window swapped two slices forever and never returned to the
+    // event loop — the reload dialog. The wheel moves a row or two, stays on
+    // the same height, and never started the swap.
+    const rows = body.querySelectorAll<HTMLElement>('tr.result-row');
+    if (rows.length > 0) {
+      rowMeasurePending = false;
+      const span = rows[rows.length - 1].getBoundingClientRect().bottom - rows[0].getBoundingClientRect().top;
+      rowHeight = adoptRowHeight(rowHeight, span / rows.length);
+    }
     const { start, end } = computeRowWindow({
       total,
       bodyTop: body.getBoundingClientRect().top - scroller.getBoundingClientRect().top,
@@ -1713,6 +1731,14 @@
     });
     rowWindowStart = start;
     rowWindowEnd = end;
+    // The first pass often runs before any result row is mounted, so it can
+    // only guess the height. One follow-up frame measures the rows it just
+    // asked for. Not on every window after that: measuring the slice a new
+    // height selects is the loop above.
+    if (rows.length === 0 && end > start && !rowMeasurePending) {
+      rowMeasurePending = true;
+      scheduleRowWindowUpdate();
+    }
   }
 
   function scheduleRowWindowUpdate() {
@@ -1731,10 +1757,13 @@
   let rowsBelowWindow = $derived(Math.max(0, filteredResults.length - rowWindowEnd));
 
   $effect(() => {
-    // The list, its height or the elements changed; the scrollport did not, so
-    // this is the one path that does not go through the scroll handler.
+    // The list or the elements changed; the scrollport did not, so this is the
+    // one path that does not go through the scroll handler. `rowHeight` is
+    // not read here. `updateRowWindow` writes it, and subscribing would run
+    // this again on that write — a new height selects different rows, which
+    // measure differently, and a scrollbar jump between those two heights
+    // never returns.
     void filteredResults;
-    void rowHeight;
     void resultsScrollEl;
     void resultsBodyEl;
     untrack(() => updateRowWindow());
@@ -1753,20 +1782,6 @@
     const ro = new ResizeObserver(() => scheduleRowWindowUpdate());
     ro.observe(el);
     return () => ro.disconnect();
-  });
-
-  // Row height comes from the rows themselves, so a different font size, a
-  // longer locale or browser zoom cannot desync the spacers from the content.
-  // Safe to read now that nothing is `content-visibility: auto`: every
-  // rendered row has real layout, including the overscan.
-  $effect(() => {
-    void windowedResults;
-    untrack(() => {
-      const row = resultsBodyEl?.querySelector<HTMLTableRowElement>('tr.result-row');
-      if (!row) return;
-      const measured = row.getBoundingClientRect().height;
-      if (measured > 0 && Math.abs(measured - rowHeight) >= 0.5) rowHeight = measured;
-    });
   });
 
   // O(1) instead of two more full scans of `filteredResults`. The effect below
@@ -2287,7 +2302,11 @@
       searchInvokeSettled.add(requestId);
       clearSearchTimeoutForRequest(requestId);
       flushPendingSearchResults(requestId);
+      // Stop, Clear and a newer search all rotate the tab's id and then cancel,
+      // which is what resolves this invoke — after they pruned the id, so the
+      // `add` above put it back for good.
       if (!get(searchTabs).some((t) => t.requestId === requestId)) {
+        forgetSettledRequest(requestId);
         return;
       }
       if (results && results.length > 0) {
@@ -2298,7 +2317,10 @@
       searchInvokeSettled.add(requestId);
       clearSearchTimeoutForRequest(requestId);
       flushPendingSearchResults(requestId);
-      if (!get(searchTabs).some((t) => t.requestId === requestId)) return;
+      if (!get(searchTabs).some((t) => t.requestId === requestId)) {
+        forgetSettledRequest(requestId);
+        return;
+      }
       const msg = translateError(e, m.search_failed());
       console.error('Search failed:', e);
       patchSearchTabByRequestId(requestId, (tab) => ({
@@ -2993,6 +3015,8 @@
               ...t,
               requestId: freshId,
               results: [],
+              shed: undefined,
+              shedKeys: undefined,
               error: null,
               isSearching: false,
               progress: null,
@@ -3000,6 +3024,7 @@
           : t,
       ),
     );
+    if (discardedId != null) forgetSettledRequest(discardedId);
     selectedResultKey = null;
     notes = [];
     spamExplainLoading = false;
@@ -3391,7 +3416,7 @@
   // Ctrl+C copies the ticked results' links, or the whole filtered list when
   // nothing is ticked. Skipped while text is selected or focus is in a field,
   // so the normal copy still works in the query box.
-  if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C')) {
+  if ((e.ctrlKey || e.metaKey) && isShortcutLetter(e, 'c')) {
     const target = e.target as HTMLElement | null;
     if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
     if (confirmOpen || networkAlertOpen || selectedResult || !(window.getSelection()?.isCollapsed ?? true)) return;
@@ -3700,7 +3725,7 @@
   <p class="filter-help">{m.search_filter_help_prefix()} <code>-</code> {m.search_filter_help_suffix()}</p>
 </div>
 
-<div class="page-content" bind:this={resultsScrollEl} use:passiveScroll={scheduleRowWindowUpdate}>
+<div class="page-content results-scroll" bind:this={resultsScrollEl} use:passiveScroll={scheduleRowWindowUpdate}>
   {#if emberDrivesThisSearch && emberReadinessUnknown}
     <div class="search-readiness-hint" role="status">
       {m.search_network_ember_diagnostics_hint()}
@@ -3816,6 +3841,12 @@
         </span>
         {#if extensionOnlyHintExt}
           <p class="results-extension-hint">{m.search_extension_keyword_hint({ ext: extensionOnlyHintExt })}</p>
+        {/if}
+        {#if (activeTab?.shed ?? 0) > 0}
+          <!-- A tab keeps a bounded number of rows and drops the least
+               available first. Without saying so, a broad search looked as
+               if it had lost hits. -->
+          <p class="results-extension-hint">{m.search_results_shed({ count: formatNumber(activeTab?.shed ?? 0) })}</p>
         {/if}
       </div>
       <div class="results-info-actions">
@@ -5313,6 +5344,20 @@
 
   .search-results-table tbody tr {
     height: 30px;
+  }
+
+  /*
+   * The spacer above the viewport changes height as the window moves. Scroll
+   * anchoring treats that as the page shifting and nudges scrollTop to hold
+   * the rows still, which moves the window, which resizes the spacer. Dragging
+   * the scrollbar keeps feeding new positions into that loop; past the first
+   * screen the top spacer exists and the exchange runs until the page stops
+   * responding. A wheel notch lands inside the overscan, so the spacer usually
+   * does not change. Nothing is inserted above the rows while the user
+   * scrolls, so anchoring has nothing to preserve.
+   */
+  .results-scroll {
+    overflow-anchor: none;
   }
 
   /*

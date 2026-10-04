@@ -457,6 +457,22 @@ pub struct SearchResultRecord {
     /// A second node that returned the identical blob, if any. A record held
     /// by two responders is not one responder's word.
     pub confirmed_by: Option<EmberNodeId>,
+    /// The /24 (IPv6 /48) `from_node` answered from; `None` for our own store
+    /// or a node whose address the search no longer holds.
+    ///
+    /// A node id is a keypair, so counting responders by id let one host
+    /// answering under three keys vouch for a claim three times. Consumers that
+    /// count independent responders count these instead where they are known.
+    pub from_subnet: Option<u64>,
+    /// The /24 `confirmed_by` answered from, likewise.
+    pub confirmed_subnet: Option<u64>,
+    /// Seeded from our own store rather than returned by a remote node.
+    ///
+    /// Our store admits a HighID source record only when the STORE came from
+    /// the address it names, so such a record is not one responder's say-so
+    /// about where to dial. Its publishers and digest still count as one
+    /// responder's word.
+    pub from_local_store: bool,
 }
 
 /// An active iterative search.
@@ -805,6 +821,9 @@ impl IterativeSearch {
                 data,
                 from_node: node,
                 confirmed_by: None,
+                from_subnet: self.node_subnet(&node),
+                confirmed_subnet: None,
+                from_local_store: seeded,
             });
         }
     }
@@ -994,6 +1013,11 @@ impl IterativeSearch {
     /// been asked yet, and page follow-ups to nodes that already answered with
     /// more records than their datagram could carry.
     pub fn next_to_query(&mut self) -> Vec<QueryTarget> {
+        // The response handlers drive a search once more before it is removed,
+        // and anything sent then is answered to nobody.
+        if self.complete {
+            return Vec::new();
+        }
         let in_flight = self
             .shortlist
             .iter()
@@ -1307,11 +1331,17 @@ impl IterativeSearch {
         // marked above, and nothing here queries anyone).
         let offer_allowance = self.per_node_result_allowance(from_id);
         let from_subnet = self.node_subnet(from_id);
+        let now_unix = chrono::Utc::now().timestamp();
         if let Some(subnet) = from_subnet.filter(|_| value_answer_expected) {
             self.responder_subnets.insert(*from_id, subnet);
         }
         let mut cut_short = false;
         let mut delivered_now = 0usize;
+        // Records this reply carried for our key, taken or not. A page with
+        // none earns no follow-up: otherwise an empty answer bought another
+        // query, up to the per-node page allowance, and a cheap identity could
+        // hold half the search's slots answering nothing.
+        let mut carried = 0usize;
         for data in value_records {
             if self.search_type == SearchType::FindValue {
                 if data.len() < 17 + 64 {
@@ -1327,6 +1357,7 @@ impl IterativeSearch {
                     continue;
                 }
             }
+            carried += 1;
             // No single peer gets to fill the budget. See
             // [`MAX_RESULTS_PER_NODE`]: the walk ends when the budget is full,
             // so without this the node that answers first also decides how far
@@ -1359,6 +1390,7 @@ impl IterativeSearch {
                     let held = &mut self.results[slot];
                     if independent && held.from_node != *from_id && held.confirmed_by.is_none() {
                         held.confirmed_by = Some(*from_id);
+                        held.confirmed_subnet = from_subnet;
                     }
                     self.note_contributor(*from_id);
                 }
@@ -1394,6 +1426,10 @@ impl IterativeSearch {
                     .is_some_and(|&n| n >= MAX_PUBLISHERS_PER_FILE_PER_NODE)
             });
             *offered += 1;
+            if !SignedRecord::value_blob_is_current(&data, now_unix) {
+                debug!("Search {}: dropping an expired or future-dated FOUND_VALUE blob", self.id);
+                continue;
+            }
             if over_share {
                 // Charged like any other offer, or a node could be paged to its
                 // ceiling handing over records none of which are taken.
@@ -1428,7 +1464,8 @@ impl IterativeSearch {
                         .entry((*from_id, file, digest))
                         .or_insert(0) += 1;
                 }
-                let (from_node, confirmed_by) = match first_offered_by {
+                let prior_subnet = self.turned_away.get(&blob_digest).and_then(|(_, subnet)| *subnet);
+                let (from_node, confirmed_by, from_node_subnet, confirmed_subnet) = match first_offered_by {
                     Some(first) => {
                         self.turned_away.remove(&blob_digest);
                         if let Some((file, digest)) = publisher_share(&data) {
@@ -1437,11 +1474,11 @@ impl IterativeSearch {
                                 .entry((*from_id, file, digest))
                                 .or_insert(0) += 1;
                         }
-                        (first, Some(*from_id))
+                        (first, Some(*from_id), prior_subnet, from_subnet)
                     }
                     None => {
                         self.turned_away.remove(&blob_digest);
-                        (*from_id, prior_offerer)
+                        (*from_id, prior_offerer, from_subnet, prior_offerer.and(prior_subnet))
                     }
                 };
                 self.result_slots.insert(blob_digest, self.results.len());
@@ -1449,11 +1486,14 @@ impl IterativeSearch {
                     data,
                     from_node,
                     confirmed_by,
+                    from_subnet: from_node_subnet,
+                    confirmed_subnet,
+                    from_local_store: self.local_node == Some(from_node),
                 });
             }
         }
 
-        if let Some(page) = page {
+        if let Some(page) = page.filter(|_| carried > 0) {
             self.queue_next_page(from_id, asked_start, page, cut_short, delivered_now > 0);
         }
 
@@ -2178,6 +2218,9 @@ impl SearchManager {
                 data,
                 from_node: local_id,
                 confirmed_by: None,
+                from_subnet: None,
+                confirmed_subnet: None,
+                from_local_store: true,
             });
             search.seeded_count = search.seeded_count.saturating_add(1);
             added += 1;
@@ -4200,6 +4243,11 @@ mod tests {
         assert_eq!(
             search.results.len(),
             MAX_LOCAL_SEED_RESULTS + 2 * MAX_RESULTS_PER_NODE
+        );
+        assert_eq!(
+            search.results.iter().filter(|r| r.from_local_store).count(),
+            MAX_LOCAL_SEED_RESULTS,
+            "only the seed is marked as our own store's"
         );
         assert!(
             !search.complete,

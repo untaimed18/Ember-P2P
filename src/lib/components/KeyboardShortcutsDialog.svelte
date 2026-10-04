@@ -148,6 +148,7 @@
       title: () => m.shortcuts_section_transfers(),
       shortcuts: [
         { keys: ['↑ / ↓'], label: () => m.shortcuts_transfers_navigate() },
+        { keys: [modifierKey, 'V'], label: () => m.shortcuts_transfers_paste_links() },
         { keys: ['F2'], label: () => m.shortcuts_transfers_rename() },
         { keys: ['Delete'], label: () => m.shortcuts_transfers_delete() },
       ],

@@ -5,7 +5,62 @@ Ordered by priority within each section.
 
 ## Room transfers (Ember Transfer)
 
-### 1. Send encrypted offers
+### 1. Send encrypted offers — done in 1.7.1, with a fallback the sender approves
+
+**Done in 1.7.1:** Senders send the sealed offer and hold the plain one back.
+The recipient answers a sealed offer at once with an "offer seen" frame
+(`XFER_SEEN_PLAIN_VERSION` 28). Anything the recipient says about the transfer
+cancels the plain offer. With nothing heard in `XFER_PLAIN_OFFER_FALLBACK_SECS`
+(10 s) the plain offer is **not** sent on its own: the sender's transfer card
+says there is no reply yet, that the recipient may be on an older Ember, and
+that a standard offer lets the members relaying it see the file's name and size,
+with a **Send standard offer** button (`send_channel_transfer_standard_offer`).
+That sends the held offer once, and only while the transfer is still waiting
+and unread. A 1.7.0 recipient ignores it as a repeat; a 1.6 recipient prompts
+on it. A forwarder that drops "seen" can bring the question up but cannot make
+the offer go out. Like an incoming offer, the question opens the members pane
+and the transfer drawer, counts on the members button, and shows a toast when
+the room is not on screen.
+
+Sending the standard offer starts the sender's unanswered-offer window again
+(`XFER_OFFER_TTL_SECS` plus 30 s): a 1.6 prompt only starts when the offer
+lands, and the stall cancel the sender sends when it gives up takes that prompt
+down. The standard offer travels through room members only: other transfer
+frames fall back to up to three non-member contacts when no member is
+reachable. In a public room those could read the offer, and since a hand-off
+to them counts as not sent, every retry would have handed it to more of them.
+No plain offer is held for a file over 100 MiB (`V1_6_XFER_MAX_BYTES`), since
+1.6 drops that offer unread: the sender is not asked, and the offer expires
+with the message that members on 1.6 or earlier cannot receive files over
+100 MB.
+
+A 1.7.0 recipient keeps no record of a decline, so a standard offer clicked
+while that recipient's decline is still on its way brings up a second prompt
+there. 1.7.1 remembers declines.
+
+Members proven to read sealed offers are remembered in the database
+(`sealed_offer_readers`, created on first use so the schema stays at 62 and
+1.7.0 can still open it after a downgrade) for 180 days
+(`SEALED_OFFER_READER_KEEP_SECS`). No plain offer is held for them, so they are
+never asked about. The proof is a frame 1.6.x never sends whose authentication
+names the member: a "seen", sealed offer or sealed stream frame (pairwise
+transfer key), a typing signal or a room friend request (the member's
+signature). Only members on the room's roster are recorded. A public room's
+roster takes new identities for free, so only the 4,096 most recently proven
+members are kept (`SEALED_OFFER_READERS_MAX`); one that drops off is asked
+about again. A proof dated more than a day ahead
+(`SEALED_OFFER_READER_MAX_FUTURE_SECS`) was written while the clock was wrong:
+it counts for nothing, and the next proof replaces it. A 1.7.0 recipient
+never sends "seen", so its sender is asked until that member has typed, sent a
+sealed offer or stream frame, or asked for a friendship in a shared room.
+
+The sealed offer pads the name with NULs to `XFER_NAME_MAX` (160 bytes), so
+every sealed offer is the same length. 1.7.0's decoder takes the padding as
+part of the name (valid UTF-8, within the limit), and `sanitize_filename` strips
+NULs before the name is used, so its prompt reads the same.
+
+What remains is the second option below: stop holding the plain offer once 1.6
+members are rare.
 
 **Why:** An offer carries the file name and size. It is encrypted only with the
 room's content key, so when it travels through other members (no direct session
@@ -47,6 +102,14 @@ of the other end's own frames are contained by the state machines (first offer
 wins, accept once, peer checks), not by cryptography. Consider binding frames to
 a per-transfer counter or phase.
 
+Offers are the visible case. A member an offer was forwarded through can wrap
+it in a fresh gossip envelope once the recipient no longer remembers the
+transfer (`XFER_FINISHED_REMEMBER`, 180 s after it ended or was declined, and
+at once after its prompt expired) and put the prompt up again for a transfer
+the sender has dropped; accepting it only stalls. A replayed sealed offer also
+renews its sender's entry in `sealed_offer_readers`. An offer timestamp under
+the pairwise tag would let the recipient refuse one older than the offer window.
+
 ### 4. Tighter use of claimed public addresses (low)
 
 A member can make us attempt one connection per transfer to a public address it
@@ -56,7 +119,30 @@ past session has seen for that member.
 
 ## Networking
 
-### 5. Share the open UDP port with QUIC
+### 5. Share the open UDP port with QUIC — done in 1.7.1
+
+**Done in 1.7.1:** as designed below, in `network/ember/udp_mux.rs`. QUIC runs
+on the KAD / Ember socket, a listen-only endpoint stays on the TCP port number
+for peers that guess it, and `quic_shares_udp_port: false` in `config.json`
+restores the separate socket. The guessers are not only 1.7.0: a relay asked to
+reach a source known only from KAD dials the source's TCP port number, because
+a KAD record has nowhere to carry a QUIC port, and 1.7.1 requesters still ask
+for that. The legacy listener keeps the old socket's UPnP mapping, Windows
+Firewall rule and mapping keep-alive, since those relays dial it from outside
+the NAT: without UPnP, the keep-alive's datagram from that port is what holds a
+mapping open for them, as it did for the 1.7.0 socket. One cost the
+design did not name: the shared socket cannot set don't-fragment, because Ember
+frames up to 4 KiB rely on fragmentation, so quinn skips path-MTU discovery and
+stays at 1200-byte packets. Another: it neither reads a datagram's local
+address nor sets a reply's, as quinn's own socket does, so a reply leaves from
+whatever address the OS routes it from. A peer that dialled one of our other
+addresses drops it, since a QUIC client accepts packets only from the address it
+dialled. Advertised addresses are learned from our own outbound traffic, so
+this takes an asymmetric multi-homed setup, such as a port forward to a second
+network adapter, and KAD and Ember on that socket have always behaved this way.
+`quic_shares_udp_port: false` is the workaround. What remains: the legacy
+listener can go only once nothing dials the TCP port for QUIC, which needs a
+relay target for KAD-only sources first.
 
 **Why:** QUIC listens on its own UDP port. Setups that forward a single port (a
 VPN such as ProtonVPN, many routers) leave it unreachable. 1.7.0 covers this
@@ -67,6 +153,112 @@ blocked entirely.
 the one forwarded port carries everything. Deferred because it changes how every
 inbound UDP packet is read (KAD, Ember DHT, room chat, presence); it needs
 careful packet classification and broad testing.
+
+It also settles which port a relay should dial. Today QUIC binds its own socket
+on the TCP port number (or +1 to +4, or an OS-chosen port) and STUNs it
+separately, so a peer's QUIC port has to be advertised on its own. 1.7.1 added
+it to firewalled source records (contact flag bit 7) for that reason. Once QUIC
+shares the socket, that field and every other advertised QUIC port are simply
+the public UDP port.
+
+#### Design
+
+**Today.** The main loop owns `recv_from` on the KAD socket and routes each
+datagram in order: STUN replies (`route_stun_binding_packet`), Ember frames
+(magic `0xEB 0x3E`), then everything else to `handle_udp_packet` (KAD, eD2K
+UDP, and their eMule-obfuscated forms). QUIC has a separate `quinn::Endpoint`
+on its own socket (`build_server_client_endpoint`).
+
+**One reader, four destinations.** A dedicated task owns `recv_from` on the
+shared socket and classifies each datagram before anything else sees it:
+
+1. STUN: unchanged.
+2. Ember: the magic bytes, unchanged.
+3. QUIC: sent straight to quinn over a channel.
+4. Everything else: to the main loop over a bounded channel, which replaces its
+   `udp_socket.recv_from` arm.
+
+QUIC must not go through the main loop. Relayed transfers, attachments and room
+streams all ride QUIC, and the main loop awaits inside its handlers, so its
+latency would become their throughput. The channels drop on full, as UDP does,
+and count the drops.
+
+**Classifying QUIC.** Plain KAD and eD2K begin with `0xE3`, `0xE4`, `0xE5`,
+`0xC5` or `0xD4`, and `0xE4` / `0xE5` are also valid QUIC long-header first
+bytes. Obfuscated eMule packets begin with random bytes. So the first byte alone
+decides nothing:
+
+- **Long header** (first two bits `11`): QUIC only when bytes 1 to 4 are a
+  version we speak (`0x00000001`, or `0` for version negotiation) and the
+  connection-ID lengths that follow fit the datagram. A KAD packet would need
+  opcode `0x00` followed by `00 00 01`. A random obfuscated packet matches about
+  one time in 2^34.
+- **Short header** (first two bits `01`): QUIC only when the destination
+  connection ID is one we issued. Plain KAD and eD2K never start in `0x40` to
+  `0x7F`, so only obfuscated packets can land here. Two quinn settings make the
+  test sound:
+  - A custom `ConnectionIdGenerator` issues 16-byte IDs: 8 random bytes plus an
+    8-byte keyed BLAKE3 tag. The classifier and `validate` both check the tag,
+    so a random packet passes about one time in 2^64. quinn's own
+    `HashedConnectionIdGenerator` is too thin for this, with a 5-byte FxHash tag
+    and a 3-byte nonce.
+  - `EndpointConfig::grease_quic_bit(false)`, so every QUIC packet we are sent
+    keeps the fixed bit set.
+
+A packet sent the wrong way costs only that packet. QUIC routed to
+`handle_udp_packet` fails deobfuscation and is dropped. Obfuscated KAD routed to
+quinn fails CID validation, so quinn neither answers it nor sends a stateless
+reset. One known loss: a stateless reset sent to us looks random, reaches
+`handle_udp_packet`, and is dropped, so such a connection ends by idle timeout
+instead of at once.
+
+**The quinn side.** `Endpoint::new_with_abstract_socket` with an
+`AsyncUdpSocket` whose:
+
+- `poll_recv` drains the QUIC channel;
+- `try_send` calls `try_send_to` on the shared tokio socket;
+- segment counts are 1.
+
+This gives up GSO, GRO and ECN, which quinn-udp would otherwise enable. They
+matter little at our rates. Do not create a `quinn_udp::UdpSocketState` on the
+shared socket: on Linux it turns on GRO, which coalesces datagrams and breaks
+the KAD reader.
+
+**What changes around it:**
+
+- `state.quic_port` becomes `udp_port`, and `advertised_quic_port` becomes
+  `advertised_udp_port`: one socket, one NAT mapping, one STUN reading, one
+  keep-alive. The separate QUIC STUN probe and its mapping keep-alive go away.
+- UPnP already skips the QUIC mapping when `quic_port == udp_port`
+  (`upnp.rs` `map_all`), and the Windows firewall already skips the dedicated
+  QUIC rule (`dedicated_quic_udp_port`). The firewall call site passes
+  `tcp_port` as the QUIC port and must pass the real one.
+- Everything that advertises our QUIC port reads `advertised_quic_port`, so it
+  follows with no wire change. That covers rendezvous registration, friend
+  presence, punch records, relay attestations, attachment offers and the source
+  record field.
+- KAD's per-IP rate limiter and overhead statistics must count only what reaches
+  `handle_udp_packet`, not QUIC bulk data. QUIC keeps its own admission limits
+  (`QUIC_PENDING_PER_IP` and the rest) in the accept loop.
+
+**Compatibility.** Peers dial whatever port we advertise, so 1.7.x peers reach a
+shared-port node without change, and it reaches them the same way. The one gap
+is a peer that guesses instead of reading an advertisement: an old relay dialling
+a KAD-sourced target on its TCP port number. To cover it, keep a second endpoint
+on the old port for one release. It uses the same server config and accept loop,
+and opens no new firewall or UPnP mapping. Keep a hidden config switch that goes
+back to the separate socket in case classification misbehaves in the field.
+
+**Tests before shipping:**
+
+- The classifier never calls obfuscated KAD or eD2K traffic (real captures plus
+  fuzz) QUIC, and always recognises packets carrying our own CIDs.
+- Loopback: two nodes on shared sockets carry KAD pings, Ember DHT traffic and a
+  QUIC bulk stream at the same time, with no loss on the KAD side and QUIC
+  throughput within reach of the separate-socket build.
+- Interop with a 1.7.1 node in both directions: relay, punch and attachments.
+- The motivating case: a single forwarded UDP port (a VPN such as ProtonVPN)
+  reaching QUIC with no TCP fallback.
 
 ## Ember DHT
 
@@ -91,13 +283,15 @@ how long each responder has been a verified contact.
 
 ## Friend chat attachments
 
-### 7. Refuse non-friend dials earlier (low)
+### 7. Refuse non-friend dials earlier (low) — done in 1.7.1
 
-Any Ember user can complete the QUIC or Noise handshake and open a chat
-attachment stream (type `0x07`) before being refused. They get nothing, but the
-handshake costs CPU. Close the connection as soon as the proven identity is not
-a friend, before reading the stream. Room transfer streams (`0x08`) cannot use
-this check, since room members are not friends; their grant check stays as is.
+A chat attachment stream (type `0x07`) from a non-friend is now refused as soon
+as its type is known: the QUIC accept path closes the connection after the
+7-byte header, using the friend check the handshake already made, and the TCP
+fallback refuses on the first byte. The handshake itself still has to complete,
+since that is what proves who the peer is. Room transfer streams (`0x08`)
+cannot use this check, since room members are not friends; their grant check
+stays as is.
 
 ### 8. Shorter re-fetch window after delivery (info)
 
@@ -116,21 +310,48 @@ the attachment's friend, so this is for symmetry only.
 
 ## Sharing and library
 
-### Prune deletes on paged reloads of very large shares
+### Prune deletes on paged reloads of very large shares — done in 1.7.1
 
 A share root over 100,000 files is walked in pages (`MAX_DISCOVERED_FILES` in
-`sharing/indexer.rs`); every page after the first is `partial`, so a full reload
-never reconciles deletions for such a root. File-system events cover the usual
-case, but a file deleted while hashing is paused (events deferred, then a paged
-full reload) stays in the index and offerable until "Remove missing". Fix: track
-the paths seen across one complete cursor cycle and reconcile once the last page
-lands.
+`sharing/indexer.rs`), and no page after the first may reconcile deletions.
+`sharing/paged_cycle.rs` now follows each such root through one cursor cycle,
+collecting what every page saw, and the page that finishes the folder removes
+the rows indexed when the cycle began that no page found. Rows indexed during
+the cycle are kept, paths found by filesystem-event rescans count as seen, and
+a cycle that skips a stretch (a page out of sequence, a trimmed frontier) is
+abandoned rather than trusted.
 
-### "Share without subfolders" still walks the whole tree
+### "Share without subfolders" still walks the whole tree — done in 1.7.1
 
-The allowlist keeps nested files off the wire (`shared = false`), but discovery
-is still recursive, so they are hashed and indexed locally. Walk only the
-allowlisted entries (depth 1 for a files-only allowlist).
+Discovery of a folder with an allowlist now walks only the allowlisted files
+and folders and the folders that lead to them (`DiscoveryScope` in
+`sharing/indexer.rs`), in every scan: startup, add, full reload and
+filesystem events. Files never picked are not hashed or indexed, so they do not
+show in the Library. A file unshared from a partial share goes onto the
+folder's withheld list (`withheld_folder_files`), which discovery walks too, so
+the index keeps it as an unshared file just as in a folder shared whole: it
+leaves the Library list, which shows only offered files, and the Library
+explorer lists it as not shared. Sharing a copy of the same content elsewhere
+does not share it; sharing it again from the explorer puts it back on the
+allowlist. Widening a partial share, from the explorer, the folder picker or a
+drop, queues a scan of what it newly offers.
+
+### Unshare a folder inside a listed folder entry
+
+"Unshare folder" on `F:\Music\Live` while a partial share of `F:\` lists
+`F:\Music` unshares the files there now, but the list still offers `Live`, so
+files added to it later are offered and the explorer shows it as shared. A fix
+needs either a per-folder exclusion that discovery, `allowlist_permits` and the
+withheld tidy-up all honour, or the `F:\Music` entry expanded into its contents
+minus `Live`, which changes what new files in `F:\Music` get.
+
+### Withheld lists after unsharing a large partial share
+
+Unsharing a whole partly shared folder withholds every indexed path in it, and
+the list lives in `settings.json`: it is rewritten and fsynced on every
+settings, cursor and intent save, sent to the webview and back, and rescanned
+by `tidy_withheld` on every list edit. Fine for hundreds of files; for a drive
+of them, keep the withheld lists in a store of their own.
 
 ### eMule import: offer eMule's one-folder sharing
 
@@ -139,6 +360,22 @@ listed. The import says so per folder ("{count} folders eMule did not share will
 be shared") and each folder can be unticked, but there is no way to import a
 folder the eMule way. Offer "without subfolders" per imported folder, reusing the
 allowlist.
+
+## Upload queue
+
+### Give up on a waiter whose slot dial fails
+
+A disconnected HighID waiter at the top of the queue is dialled for its slot
+(`try_add_up_next_client` in `ed2k/upload.rs`: three dials at once, 15 seconds
+to connect). A failed dial keeps the row with a 30-second backoff for the rest
+of its hour in the queue, so a peer that went offline is dialled about every 45
+seconds, and nine or more such rows above a reachable waiter keep all three
+dials busy. Rows restored after a restart make this likelier. eMule drops a
+waiter whose slot connection fails. A fix needs `connect_and_serve` to report a
+failed connect apart from a soft end (a slot lost to a connected waiter, a
+refusal), then drop the row or back off longer after each failure. Push-grant
+sessions are plain eD2K, so a waiter for a friends-only file is dropped when
+dialled; leaving such rows to the peer's own re-ask would keep its place.
 
 ## App-wide
 

@@ -35,9 +35,11 @@ pub(in crate::network) async fn on_uss_ping_tick(
         state.uss_missed_pongs = state.uss_missed_pongs.saturating_add(1);
     }
 
-    // Rotate host every 5 minutes or after 3 consecutive timed-out pings
-    let should_rotate = state.uss_host.is_some()
-        && (state.uss_missed_pongs >= 3 || now_ts.saturating_sub(state.uss_host_selected_at) > 300);
+    // Rotate only after 3 consecutive timed-out pings. Each host has its own
+    // RTT baseline, which takes about two and a half minutes of pings to
+    // measure, so swapping a healthy host every 5 minutes left USS without a
+    // baseline half the time.
+    let should_rotate = state.uss_host.is_some() && state.uss_missed_pongs >= 3;
     if should_rotate {
         debug!(
             "USS: rotating ping host (missed={}, age={}s)",

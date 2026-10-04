@@ -180,6 +180,32 @@ fn relay_ticket_next_round_delay(
         .saturating_duration_since(completed_at)
 }
 
+/// Whose the completion copy carrying `.part` stem `stem` is, given the
+/// downloads `unfinished` at startup (`None`: unknown, so any download may
+/// be). Chat and room transfers have no hash on record to check a copy by.
+fn completion_copy_owner(
+    db: &Database,
+    unfinished: Option<&HashSet<String>>,
+    stem: &str,
+) -> ed2k::transfer::CopyOwner {
+    if uuid::Uuid::parse_str(stem).is_err() {
+        return ed2k::transfer::CopyOwner::Unknown;
+    }
+    if unfinished.is_none_or(|unfinished| unfinished.contains(stem)) {
+        return ed2k::transfer::CopyOwner::Unfinished;
+    }
+    match db.finished_download_identity(stem) {
+        Some((name, ed2k_hash, size)) => {
+            ed2k::transfer::CopyOwner::Finished(ed2k::transfer::ExpectedFinishedFile {
+                name,
+                ed2k_hash,
+                size,
+            })
+        }
+        None => ed2k::transfer::CopyOwner::Unknown,
+    }
+}
+
 /// This mirrors the rendezvous server's accepted-ticket cap. Keeping the
 /// responder's active join/session work bounded prevents a hostile or slow
 /// relay endpoint from accumulating background tasks across poll cycles.
@@ -188,6 +214,8 @@ const MAX_FRIEND_RELAY_TICKET_SESSIONS: usize = 8;
 const PERIODIC_SAVE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(300);
 const SHORT_IO_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
 const NAT_PROBE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(20);
+/// Least time between a NAT probe and one asked for by the observed-address votes.
+const OBSERVED_IP_REPROBE_FLOOR: std::time::Duration = std::time::Duration::from_secs(60);
 /// Realistic worst-case STUN/TCP-hold cycle is 79s: 3×(5+8) + 4×(5+5)
 /// (DNS+connect timeouts on three TCP-hold targets then four TCP STUN
 /// servers). The QUIC keep-alive is a parallel DNS lookup (≤5s) plus an
@@ -301,11 +329,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     } = deps;
     // Do not bind KAD/eD2K/Ember sockets or start the upload listener while a
     // recovered/reset policy database is awaiting explicit acknowledgement.
+    // The startup scan's one-shot signal is kept rather than dropped: restored
+    // upload waiters would otherwise wait out the fallback.
+    let mut library_indexed_during_gate = false;
     while !security_policy.is_loaded() {
         tokio::select! {
             command = cmd_rx.recv() => {
                 match command {
                     Some(NetworkCommand::Shutdown { .. }) | None => return Ok(()),
+                    Some(NetworkCommand::StartupLibraryIndexed) => library_indexed_during_gate = true,
                     Some(_) => {
                         warn!("Dropping network command while security policy reset is unacknowledged");
                     }
@@ -361,13 +393,20 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let _ = app_handle.emit(
                     "network-error",
                     serde_json::json!({
-                        "message": format!("Failed to create UDP socket: {e}"),
+                        "message": crate::commands::errors::coded_ctx(
+                            "network_udp_socket_failed",
+                            format!("Failed to create UDP socket: {e}"),
+                            &e,
+                        ),
                     }),
                 );
                 anyhow::bail!("Failed to create UDP socket: {e}");
             }
         };
-        let _ = sock2.set_recv_buffer_size(1024 * 1024);
+        // Sized for QUIC bulk transfer, which shares this socket: what the
+        // separate QUIC socket used to ask for.
+        let _ = sock2.set_recv_buffer_size(8 * 1024 * 1024);
+        let _ = sock2.set_send_buffer_size(2 * 1024 * 1024);
         sock2.set_nonblocking(true)?;
         let addr: SocketAddr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), candidate);
         if let Err(e) = sock2.bind(&socket2::SockAddr::from(addr)) {
@@ -393,7 +432,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 udp_port.saturating_add(4),
             );
             error!("{msg}");
-            let _ = app_handle.emit("network-error", serde_json::json!({ "message": msg }));
+            let _ = app_handle.emit(
+                "network-error",
+                serde_json::json!({
+                    "message": crate::commands::errors::coded_ctx("network_udp_bind_failed", msg.clone(), udp_port),
+                }),
+            );
             anyhow::bail!("{msg}");
         }
     };
@@ -405,15 +449,28 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             settings.udp_port, udp_port
         );
         let _ = app_handle.emit("network-warning", serde_json::json!({
+            "code": "udp_port_fallback",
+            "configured": settings.udp_port,
+            "bound": udp_port,
             "message": format!("UDP port {} was in use. Using port {} instead.", settings.udp_port, udp_port),
         }));
     }
     info!("UDP socket bound on port {udp_port}");
 
-    // The connection broker binds a *second* UDP socket for QUIC on the
-    // configured `tcp_port`, so `tcp_port == udp_port` means QUIC loses that
-    // port to the Kad UDP socket bound above and
-    // `build_server_client_endpoint` takes the next free neighbour.
+    // One task reads this socket from here on and splits QUIC from the rest;
+    // the loop below takes everything else from `udp_rx`. With the switch off
+    // it passes every datagram through and QUIC binds a socket of its own.
+    let quic_cid_key = settings
+        .quic_shares_udp_port
+        .then(ember::udp_mux::CidKey::random);
+    let ember_dial_log = ember::transport::DialLog::default();
+    let (mut udp_rx, quic_shared_socket) =
+        ember::udp_mux::start(udp_socket.clone(), quic_cid_key.clone(), ember_dial_log.clone());
+
+    // With QUIC on its own socket it binds the configured `tcp_port`, so
+    // `tcp_port == udp_port` means it loses that port to the Kad UDP socket
+    // bound above and `build_server_client_endpoint` takes the next free
+    // neighbour.
     //
     // Noted rather than warned about, and no advice offered. Setting both
     // fields to one number is what a VPN forwarding a single port requires,
@@ -425,7 +482,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // local port QUIC ended up on. The one thing worth having in a log is
     // that port, because the Windows Firewall rule is added for the port QUIC
     // actually bound rather than the one configured here.
-    if settings.tcp_port == settings.udp_port {
+    if !settings.quic_shares_udp_port && settings.tcp_port == settings.udp_port {
         info!(
             "tcp_port and udp_port are both {} — a single-port setup. Kad UDP \
              holds that port, so QUIC will bind a neighbour and advertise its \
@@ -697,6 +754,23 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!(error))?
     };
 
+    // Up to sixteen megabytes read and parsed, so off the async task too.
+    let restored_upload_queue = {
+        let dir = data_dir.clone();
+        match tokio::task::spawn_blocking(move || ed2k::upload_queue_store::restore(&dir)).await {
+            Ok(pending) => pending.map(|mut pending| {
+                if library_indexed_during_gate {
+                    pending.make_due();
+                }
+                pending
+            }),
+            Err(e) => {
+                warn!("Upload queue restore task failed: {e}");
+                None
+            }
+        }
+    };
+
     // Verified channel transfers, hashed off the event loop. Created here
     // rather than with the other result channels below because the sender
     // lives in `NetworkState`, which is built next.
@@ -736,6 +810,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         pending_downloads: HashMap::new(),
         data_dir: data_dir.clone(),
         known_met_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+        known_met_save_soon: false,
         server_met_save_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         server_met_save_lock: Arc::new(std::sync::Mutex::new(())),
         nodes_save_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -786,6 +861,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         udp_port,
         quic_port: None,
         quic_public_port: None,
+        quic_shares_udp: false,
+        quic_shared_socket,
+        quic_cid_key,
+        quic_legacy_endpoint: None,
         upnp_mapped: upnp_success,
         ip_filter,
         banned_ips,
@@ -813,16 +892,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         request_offer_files: false,
         offered_ed2k_hashes: HashSet::new(),
         server_tcp_getsources_cursor: 0,
-        server_tcp_srcreq_next_at: 0,
+        server_tcp_srcreq_next_at: None,
         server_tcp_srcreq_file_at: HashMap::new(),
+        server_logged_in_at: None,
         server_tcp_srcreq_asks: VecDeque::new(),
-        server_connected_at: 0,
         starved_server_reask_at: std::collections::HashMap::new(),
         kad_source_search_cursor: 0,
         dead_sources: DeadSourceList::new(),
         corruption_blackbox: CorruptionBlackBox::new(),
         aich_recovery_pending: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
         per_file_sources: HashMap::new(),
+        max_sources_per_file: ed2k::sources::max_sources_per_file(settings.max_sources_per_file),
         active_kad_search_state: HashMap::new(),
         udp_discovery_sent: 0,
         udp_discovery_send_errs: 0,
@@ -846,6 +926,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         server_login_tcp_port: None,
         last_tcp_remap_reconnect_at: None,
         pending_server_connect: None,
+        restored_upload_queue,
         pending_buddy_hashes: pending_buddy_hashes.clone(),
         shared_buddy_info: shared_buddy_info.clone(),
         shared_ip_filter: shared_ip_filter.clone(),
@@ -878,6 +959,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         skip_compress_video_shared: Arc::new(std::sync::atomic::AtomicBool::new(
             settings.skip_compress_video,
         )),
+        download_folders: settings.download_folders().shared(),
         filter_incoming_shared: Arc::new(std::sync::atomic::AtomicBool::new(
             settings.filter_incoming_connections,
         )),
@@ -901,6 +983,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_announced_at: HashMap::new(),
         ember_publish_unplaced: HashMap::new(),
         ember_publish_placed: HashSet::new(),
+        ember_publish_partial: HashSet::new(),
+        ember_keyword_retries_spent: HashSet::new(),
         ember_publish_attempts: HashMap::new(),
         ember_publish_pass: EmberPublishPassStats::default(),
         ember_batch_publish: EmberBatchPublisher::default(),
@@ -996,14 +1080,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         friend_relay_offer_sent: HashMap::new(),
         friend_relay_offer_seen: HashMap::new(),
         friend_file_offer_seen: HashMap::new(),
-        ember_transport: ember::transport::EmberTransport::new(
+        ember_transport: ember::transport::EmberTransport::with_dial_log(
             identity.noise_private_key,
             identity.noise_public_key,
+            ember_dial_log,
         ),
         ember_pending_pings: HashMap::new(),
         ember_dht,
         ember_dht_protection: ember::dht::protection::DhtProtection::new(),
         ember_observed_votes: ember::dht::observed::EmberObservedIpVotes::new(),
+        ember_observed_ip_moved: false,
         ember_content_hashes: HashMap::new(),
         ember_dht_pending_pings: HashMap::new(),
         ember_dht_pending_finds: HashMap::new(),
@@ -1016,6 +1102,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_dht_pending_publishes: HashMap::new(),
         ember_dht_maint_pings: HashMap::new(),
         ember_source_publish_at: HashMap::new(),
+        ember_named_source_buddy: None,
         ember_source_publish_unix: HashMap::new(),
         ember_keyword_publish_at: HashMap::new(),
         ember_keyword_publish_unix: HashMap::new(),
@@ -1053,6 +1140,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_channel_presence_searches: HashMap::new(),
         ember_channel_presence_buffer: HashMap::new(),
         ember_pending_channel_presence: Vec::new(),
+        ember_channel_ingest: None,
         channel_presence_fetch_at: HashMap::new(),
         channel_focused: None,
         channel_beacon_beat_at: HashMap::new(),
@@ -1080,6 +1168,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_handoff_fetch_at: HashMap::new(),
         local_ed25519_seed: ed25519_secret_key,
         xfer_send: HashMap::new(),
+        sealed_offer_readers: Default::default(),
         xfer_recv: HashMap::new(),
         xfer_finish_tx,
         xfer_finish_in_flight: 0,
@@ -1112,8 +1201,49 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // so the transcript never shows a transfer that will not move again.
     {
         let db = db.clone();
-        let folder = settings.download_folder.clone();
-        let _ = tokio::task::spawn_blocking(move || chat_attach::sweep_interrupted(&db, &folder)).await;
+        let folders = settings.download_roots();
+        let _ = tokio::task::spawn_blocking(move || chat_attach::sweep_interrupted(&db, &folders)).await;
+    }
+    // In the background, one folder each, so an offline one holds up nothing;
+    // only copies older than this run are touched, never one a completion
+    // starting meanwhile is writing. An unfinished download's copies are
+    // settled by its resume instead, before it can start.
+    {
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(5))
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let unfinished = match db.incomplete_downloads_owning_partials() {
+            Ok(unfinished) => Some(Arc::new(unfinished)),
+            Err(e) => {
+                warn!("Leaving completion copies of downloads alone: downloads unreadable ({e})");
+                None
+            }
+        };
+        let roots = settings.download_roots();
+        for root in roots.clone() {
+            let (roots, db, unfinished) = (roots.clone(), db.clone(), unfinished.clone());
+            tokio::task::spawn_blocking(move || {
+                ed2k::transfer::settle_stale_completion_copies(&root, &roots, cutoff, &|stem| {
+                    completion_copy_owner(&db, unfinished.as_deref(), stem)
+                })
+            });
+        }
+    }
+    // Files a completion or a Cancel could not remove, retried for as long
+    // as the app runs: a scanner lets go, a drive comes back.
+    crate::storage::deferred_removals::install(&db);
+    {
+        let (db, folders) = (db.clone(), state.download_folders.clone());
+        tokio::spawn(async move {
+            loop {
+                let (db, folders) = (db.clone(), folders.read().clone());
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::storage::deferred_removals::retry(&db, &folders)
+                })
+                .await;
+                tokio::time::sleep(crate::storage::deferred_removals::RETRY_INTERVAL).await;
+            }
+        });
     }
 
     // Seed the Ember DHT routing table from the last session's persisted
@@ -1194,9 +1324,24 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         .ember_dht
         .set_ip_filter(state.shared_ip_filter.clone());
 
-    state.ember_verified_highwater =
-        load_ember_verified_highwater(&ember_highwater_path(&data_dir));
-    state.ember_source_address = load_ember_source_address(&ember_source_address_path(&data_dir));
+    {
+        let highwater_path = ember_highwater_path(&data_dir);
+        let source_address_path = ember_source_address_path(&data_dir);
+        match tokio::task::spawn_blocking(move || {
+            (
+                load_ember_verified_highwater(&highwater_path),
+                load_ember_source_address(&source_address_path),
+            )
+        })
+        .await
+        {
+            Ok((highwater, source_address)) => {
+                state.ember_verified_highwater = highwater;
+                state.ember_source_address = source_address;
+            }
+            Err(e) => warn!("Ember startup state load task failed: {e}"),
+        }
+    }
 
     // Carry the record store across the restart too. Every record is re-verified
     // and re-dated on the way in, so anything that expired while we were closed
@@ -1209,14 +1354,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     crate::security::recover_interrupted_replace(&store_ember_path);
     if store_ember_path.exists() {
         // Same reasoning as `nodes_ember.dat` above: synchronous file read and
-        // record validation, so it belongs on the blocking pool.
+        // record validation, so it belongs on the blocking pool — the
+        // signature checks included, one per record for up to twenty thousand.
         let loaded = tokio::task::spawn_blocking(move || {
-            ember::dht::bootstrap::load_store(&store_ember_path)
+            ember::dht::bootstrap::load_store(&store_ember_path).map(|records| {
+                let offered = records.len();
+                (offered, ember::dht::store::VerifiedRecords::verify(records))
+            })
         })
         .await;
         match loaded {
-            Ok(Ok(records)) => {
-                let offered = records.len();
+            Ok(Ok((offered, records))) => {
                 let accepted = state.ember_dht.restore_records(records);
                 // Recorded so the shutdown save can tell "this store is genuinely
                 // empty" from "we never got to read the file" — see `save_store`.
@@ -1585,7 +1733,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // until server.met bootstrap finishes). Starting the TCP login before the
     // upload listener / command loop are up made splash IPC wait and raced
     // the server's HighID port-test against a not-yet-listening socket.
-    let mut pending_auto_connect_server = settings.auto_connect_server;
+    // A restart for an update goes back to the server the user was on, whether
+    // or not auto-connect is set: they were connected a minute ago.
+    let mut resume_server = crate::auto_update::resume::take_resume_server();
+    let mut pending_auto_connect_server = settings.auto_connect_server || resume_server.is_some();
     // After a successful login, OP_OFFERFILES is queued into pending_offer_files
     // (declared with other deferred startup state) and drained one chunk/turn.
 
@@ -1597,7 +1748,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // Upload queue shared between the upload listener (owner/writer) and
     // the UDP reask-ack handler (reader that needs to answer the real queue
     // rank for a peer pinging us over UDP). Holding the shared handle here
-    // avoids a placeholder 0 rank reply.
+    // avoids a placeholder 0 rank reply. Whoever was still waiting when the
+    // last session shut down rejoins it once the library has loaded
+    // (`state.restored_upload_queue`).
     let upload_queue_handle: ed2k::upload::UploadQueueRef =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
@@ -1642,7 +1795,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let ul_filter_incoming = state.filter_incoming_shared.clone();
         let ul_share_browsing = state.share_browsing_shared.clone();
         let ul_obfuscation = state.obfuscation_enabled_shared.clone();
-        let ul_download_folder = settings.download_folder.clone();
+        let ul_download_folders = state.download_folders.clone();
         let ul_fw_probes = firewall_probe_ips.clone();
         let ul_fw_shared = state.firewalled_shared.clone();
         let ul_tcp_connect_back = state.tcp_connect_back_shared.clone();
@@ -1683,7 +1836,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 udp_port,
                 ul_adv_udp,
                 ul_folders,
-                PathBuf::from(&ul_download_folder),
+                ul_download_folders,
                 ul_index,
                 ul_transfers,
                 ul_bw,
@@ -1736,13 +1889,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             {
                 error!("Upload listener error: {e}");
                 let _ = ul_app.emit("network-error", serde_json::json!({
-                    "message": format!("TCP port {tcp_port} is already in use. Uploads will not work. Change the port in Settings or close the other application."),
+                    "message": crate::commands::errors::coded_ctx(
+                        "network_tcp_port_in_use",
+                        format!("TCP port {tcp_port} is already in use. Uploads will not work. Change the port in Settings or close the other application."),
+                        tcp_port,
+                    ),
                 }));
             }
         });
     }
 
-    let mut udp_buf = vec![0u8; 65535];
     let mut server_udp_ping_idx: usize = 0;
 
     // Use MissedTickBehavior::Skip on ALL timers so that slow loop iterations
@@ -2129,11 +2285,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     };
     if pending_incomplete_downloads.is_none() {
         startup_download_admission.take();
+        transfer_manager.write().await.restored = true;
     }
-    let mut part_progress_task: Option<
-        tokio::task::JoinHandle<std::collections::HashMap<String, (u64, bool, bool)>>,
-    > = None;
-    let mut part_progress_map: Option<std::collections::HashMap<String, (u64, bool, bool)>> = None;
+    let mut part_progress_task: Option<tokio::task::JoinHandle<event_loop::RestoredParts>> = None;
+    let mut part_progress_map: Option<event_loop::RestoredParts> = None;
     let mut pending_startup_cleanup = true;
     let mut known_met_ready = false;
     let mut pending_upnp_setup = upnp_enabled;
@@ -2298,7 +2453,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         &udp_socket,
                         &mut state,
                         &mut settings,
-                        new_settings,
+                        *new_settings,
                         &db,
                         &identity,
                         &app_handle,
@@ -2412,6 +2567,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             &mut part_progress_task,
             &mut pending_incomplete_downloads,
             &mut startup_download_admission,
+            &upload_queue_handle,
         )
         .await;
 
@@ -2434,12 +2590,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         .chain(state.xfer_finishing.keys())
                         .map(|id| format!("ember-xfer-{}", hex::encode(id))),
                 );
-                crate::commands::transfers::sweep_orphan_part_files(
-                    &settings.download_folder,
-                    &known_ids,
-                    &db,
-                )
-                .await;
+                // A coarse filesystem clock can date a file written just
+                // after the snapshot a little before it.
+                let cutoff = std::time::SystemTime::now()
+                    .checked_sub(std::time::Duration::from_secs(5))
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                let (roots, db) = (settings.download_roots(), db.clone());
+                tokio::spawn(async move {
+                    crate::commands::transfers::sweep_orphan_part_files(
+                        &roots, &known_ids, &db, cutoff,
+                    )
+                    .await;
+                });
             }
 
             #[cfg(target_os = "windows")]
@@ -2511,7 +2673,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         // run it now. The tick either spends the frame or drops every ask it
         // could not use, so this cannot fire twice for the same line.
         if !state.server_tcp_srcreq_asks.is_empty()
-            && server_tcp_srcreq_frame_open(&state, chrono::Utc::now().timestamp())
+            && server_tcp_srcreq_frame_open(&state, std::time::Instant::now())
         {
             server_tcp_source_timer.reset_immediately();
         }
@@ -2536,26 +2698,48 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             && state.server_connection.is_none()
         {
             pending_auto_connect_server = false;
-            match ed2k::server_list::ServerList::resolve_auto_connect_target(
-                &state.data_dir,
-                &state.server_list,
-            ) {
-                Some((server_ip, server_port)) => {
-                    initiate_server_connect(
-                        &mut state,
-                        &settings,
-                        &app_handle,
-                        &shared_server_addr,
-                        server_ip,
-                        server_port,
+            // Only a server still in the user's own list: the resume file is
+            // untrusted, and this is the one value in it that makes Ember dial.
+            let resuming = resume_server.is_some();
+            let resumed = resume_server.take().filter(|(ip, port)| {
+                state
+                    .server_list
+                    .servers()
+                    .iter()
+                    .any(|s| &s.ip == ip && s.port == *port)
+            });
+            // Without it, fall back to the ordinary auto-connect target only
+            // for a user who has auto-connect on: a resume goes back to the
+            // server the user chose, not to one they never asked for.
+            let target = resumed.or_else(|| {
+                settings.auto_connect_server.then(|| {
+                    ed2k::server_list::ServerList::resolve_auto_connect_target(
+                        &state.data_dir,
+                        &state.server_list,
                     )
-                    .await;
-                }
-                None => {
-                    emit_server_auto_connect_failed(
-                        &app_handle,
-                        "no last server and eMule Sunrise not in list",
-                    );
+                })?
+            });
+            if target.is_none() && resuming && !settings.auto_connect_server {
+                info!("Not reconnecting after the update: that server is no longer in the list");
+            } else {
+                match target {
+                    Some((server_ip, server_port)) => {
+                        initiate_server_connect(
+                            &mut state,
+                            &settings,
+                            &app_handle,
+                            &shared_server_addr,
+                            server_ip,
+                            server_port,
+                        )
+                        .await;
+                    }
+                    None => {
+                        emit_server_auto_connect_failed(
+                            &app_handle,
+                            "no last server and eMule Sunrise not in list",
+                        );
+                    }
                 }
             }
         }
@@ -2642,6 +2826,32 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 reason,
             ));
         }
+        // Not gated on activity: an idle node is exactly the one nothing else
+        // re-probes for, and the votes only ask on a change of confirmation.
+        if state.ember_observed_ip_moved
+            && !nat_probe_in_flight
+            && state.nat_info.last_probed.elapsed() >= OBSERVED_IP_REPROBE_FLOOR
+        {
+            state.ember_observed_ip_moved = false;
+            let current = state.external_ip.map(IpAddr::V4);
+            let voted = state
+                .ember_observed_votes
+                .confirmed()
+                .map(|addr| addr.ip())
+                .filter(|ip| Some(*ip) != current);
+            if let Some(voted) = voted {
+                info!("NAT probe: Ember peers confirm {voted}, not our {current:?} — re-probing");
+                nat_probe_in_flight = true;
+                nat_probe_started_at = Some(tokio::time::Instant::now());
+                state.nat_probe_generation = state.nat_probe_generation.saturating_add(1);
+                nat_probe_packet_tx = Some(spawn_nat_probe(
+                    udp_socket.clone(),
+                    nat_probe_result_tx.clone(),
+                    state.nat_probe_generation,
+                    "observed address moved",
+                ));
+            }
+        }
 
         tokio::select! {
             // Background first-launch server.met download (must not block splash).
@@ -2705,140 +2915,80 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 }
             }
 
-            // Incoming UDP packets: batch up to 20 per iteration so we re-check
-            // commands and timers between batches
-            result = udp_socket.recv_from(&mut udp_buf) => {
-                match result {
-                    Ok((len, from)) => {
-                        if route_stun_binding_packet(
-                            &mut nat_probe_packet_tx,
-                            &mut udp_map_ka_packet_tx,
-                            &udp_buf[..len],
-                            from,
-                        ) {
-                            // STUN replies are consumed by the background NAT
-                            // probe; keep the main loop as the only UDP
-                            // receiver so normal KAD/Ember packets cannot be
-                            // stolen by a concurrent recv task.
-                        } else if settings.ember_native_enabled
-                            && ember::transport::EmberTransport::is_ember_packet(&udp_buf[..len])
-                        {
-                            // Ember rides the KAD socket but skips
-                            // `handle_udp_packet`, so the shared
-                            // IP-filter/ban/rate-limit gate must run here.
-                            if ember_udp_recv_allowed(&mut state, from) {
-                                handle_ember_native_udp(
-                                    &udp_socket,
-                                    &udp_buf[..len],
-                                    from,
-                                    &mut state,
-                                    &transfer_manager,
-                                    &source_manager,
-                                    &local_index,
-                                    &db,
-                                    &app_handle,
-                                    &bandwidth_limiter,
-                                ).await;
-                            }
-                        } else {
-                            // Always dispatch: this handler owns eD2K peer UDP as
-                            // well as KAD, and it gates the KAD half on connection
-                            // state itself. Only the KAD accounting is conditional.
-                            if state.stats.status != NetworkStatus::Disconnected {
-                                last_kad_activity_at = chrono::Utc::now().timestamp();
-                                stats_manager.add_overhead(
-                                    crate::storage::statistics::OverheadCategory::Kad,
-                                    crate::storage::statistics::OverheadDirection::Download,
-                                    len as u64,
-                                );
-                            }
-                            handle_udp_packet(
+            // Incoming UDP datagrams, from the reader that owns the socket (see
+            // `ember::udp_mux`; QUIC never comes this way). Up to 20 per
+            // iteration so commands and timers are re-checked between batches.
+            Some(first) = udp_rx.recv() => {
+                let mut next = Some(first);
+                let mut handled = 0usize;
+                while let Some(datagram) = next {
+                    let (data, from) = (&datagram.data, datagram.from);
+                    let len = data.len();
+                    if route_stun_binding_packet(
+                        &mut nat_probe_packet_tx,
+                        &mut udp_map_ka_packet_tx,
+                        data,
+                        from,
+                    ) {
+                        // STUN replies are consumed by the background NAT
+                        // probe; the loop is still the only consumer of this
+                        // socket's non-QUIC traffic, so normal KAD/Ember
+                        // packets cannot be stolen by a concurrent reader.
+                    } else if settings.ember_native_enabled
+                        && ember::transport::EmberTransport::is_ember_packet(data)
+                    {
+                        // Ember rides the KAD socket but skips
+                        // `handle_udp_packet`, so the shared
+                        // IP-filter/ban/rate-limit gate must run here.
+                        if ember_udp_recv_allowed(&mut state, from) {
+                            handle_ember_native_udp(
                                 &udp_socket,
-                                &udp_buf[..len],
+                                data,
                                 from,
                                 &mut state,
-                                &app_handle,
-                                &local_index,
-                                &settings,
-                                &db,
-                                &active_port_tests,
-                                &upload_queue_handle,
-                                &credit_manager,
                                 &transfer_manager,
                                 &source_manager,
-                                &known_files,
+                                &local_index,
+                                &db,
+                                &app_handle,
                                 &bandwidth_limiter,
                             ).await;
                         }
-                    }
-                    Err(e) => {
-                        debug!("UDP recv error: {e}");
-                    }
-                }
-                // Process up to 19 more queued packets without re-entering select
-                for _ in 0..19 {
-                    match udp_socket.try_recv_from(&mut udp_buf) {
-                        Ok((len, from)) => {
-                            if route_stun_binding_packet(
-                                &mut nat_probe_packet_tx,
-                                &mut udp_map_ka_packet_tx,
-                                &udp_buf[..len],
-                                from,
-                            ) {
-                                // Routed to the active NAT probe.
-                            } else if settings.ember_native_enabled
-                                && ember::transport::EmberTransport::is_ember_packet(&udp_buf[..len])
-                            {
-                                // See the gate rationale on the first
-                                // recv branch above — same fast-path
-                                // bypass of `handle_udp_packet`.
-                                if ember_udp_recv_allowed(&mut state, from) {
-                                    handle_ember_native_udp(
-                                        &udp_socket,
-                                        &udp_buf[..len],
-                                        from,
-                                        &mut state,
-                                        &transfer_manager,
-                                        &source_manager,
-                                        &local_index,
-                                        &db,
-                                        &app_handle,
-                                        &bandwidth_limiter,
-                                    ).await;
-                                }
-                            } else {
-                                // See the first recv branch: dispatch regardless so
-                                // eD2K peer UDP is served with KAD down, and gate
-                                // only the KAD accounting.
-                                if state.stats.status != NetworkStatus::Disconnected {
-                                    last_kad_activity_at = chrono::Utc::now().timestamp();
-                                    stats_manager.add_overhead(
-                                        crate::storage::statistics::OverheadCategory::Kad,
-                                        crate::storage::statistics::OverheadDirection::Download,
-                                        len as u64,
-                                    );
-                                }
-                                handle_udp_packet(
-                                    &udp_socket,
-                                    &udp_buf[..len],
-                                    from,
-                                    &mut state,
-                                    &app_handle,
-                                    &local_index,
-                                    &settings,
-                                    &db,
-                                    &active_port_tests,
-                                    &upload_queue_handle,
-                                    &credit_manager,
-                                    &transfer_manager,
-                                    &source_manager,
-                                    &known_files,
-                                    &bandwidth_limiter,
-                                ).await;
-                            }
+                    } else {
+                        // Always dispatch: this handler owns eD2K peer UDP as
+                        // well as KAD, and it gates the KAD half on connection
+                        // state itself. Only the KAD accounting is conditional.
+                        if state.stats.status != NetworkStatus::Disconnected {
+                            last_kad_activity_at = chrono::Utc::now().timestamp();
+                            stats_manager.add_overhead(
+                                crate::storage::statistics::OverheadCategory::Kad,
+                                crate::storage::statistics::OverheadDirection::Download,
+                                len as u64,
+                            );
                         }
-                        Err(_) => break,
+                        handle_udp_packet(
+                            &udp_socket,
+                            data,
+                            from,
+                            &mut state,
+                            &app_handle,
+                            &local_index,
+                            &settings,
+                            &db,
+                            &active_port_tests,
+                            &upload_queue_handle,
+                            &credit_manager,
+                            &transfer_manager,
+                            &source_manager,
+                            &known_files,
+                            &bandwidth_limiter,
+                        ).await;
                     }
+                    handled += 1;
+                    if handled >= 20 {
+                        break;
+                    }
+                    next = udp_rx.try_recv().ok();
                 }
             }
 
@@ -2875,7 +3025,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &udp_socket,
                             &mut state,
                             &mut settings,
-                            new_settings,
+                            *new_settings,
                             &db,
                             &identity,
                             &app_handle,
@@ -2969,6 +3119,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &upload_queue_handle,
                 )
                 .await;
+                if state.known_met_save_soon {
+                    start_known_met_save(
+                        &mut state,
+                        &mut known_files,
+                        &mut known_met_save_in_flight,
+                        &known_met_save_result_tx,
+                        &mut known_met_save_started_at,
+                    );
+                }
             }
 
             // Upload events from the peer-to-peer upload listener
@@ -3087,7 +3246,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &mut upnp_maintain_in_flight,
                     &upnp_maintain_result_tx,
                     &mut upnp_maintain_started_at,
-                    &upnp_mappings,
+                    &mut upnp_mappings,
                 ))
                 .catch_unwind()
                 .await;
@@ -3322,6 +3481,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'cleanup_timer' panicked: {}", describe_panic(&*__p));
                 }
+                // A node with no shared folders never runs the startup
+                // reconcile that merges last session's upload waiters.
+                ed2k::upload_queue_store::merge_when_ready(
+                    &mut state.restored_upload_queue,
+                    &upload_queue_handle,
+                    &local_index,
+                    &transfer_manager,
+                )
+                .await;
             }
 
             // Broker tick + event drain. Used to live inside the
@@ -4122,6 +4290,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         error!("Failed to save known.met: {e}");
                     }
                 }
+                if state.known_met_save_soon {
+                    start_known_met_save(
+                        &mut state,
+                        &mut known_files,
+                        &mut known_met_save_in_flight,
+                        &known_met_save_result_tx,
+                        &mut known_met_save_started_at,
+                    );
+                }
                 }).catch_unwind().await;
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'known_met_save_result_rx' panicked: {}", describe_panic(&*__p));
@@ -4532,7 +4709,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &bandwidth_limiter,
                     &db,
                     &app_handle,
-                    &stats_manager,
                     &known_files,
                     &mut cache_write_handle,
                     &mut last_cache_refresh_started_at,
@@ -4544,7 +4720,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &shared_searches,
                     &shared_servers,
                     &shared_stats,
-                    &shared_transfer_stats,
                 ))
                 .catch_unwind()
                 .await;
@@ -4616,6 +4791,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         upnp_enabled,
         &mut upnp_mappings,
         &mut xfer_finish_rx,
+        &upload_queue_handle,
     )
     .await;
 

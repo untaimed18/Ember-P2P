@@ -395,13 +395,14 @@ pub(in crate::network) async fn on_search_poll_tick(
                 // Re-apply the full boolean query locally: a Kad
                 // lookup only matches a single keyword hash, so
                 // OR/NOT branches the responding node doesn't store
-                // can slip through. Skipped for a single bare
-                // keyword (already exact). `pending_keywords` still
-                // seeds the spam scorer in the enrich call below.
+                // can slip through. A single bare keyword too: a
+                // keyword is published from the words of the name,
+                // so a row whose name lacks it is a node answering
+                // with something it was never given under that key.
+                // `pending_keywords` still seeds the spam scorer in
+                // the enrich call below.
                 let pending_expr = pending.query_expr.clone();
-                if !pending_expr.is_trivial() {
-                    batch.retain(|r| pending_expr.matches(&r.file.name.to_lowercase()));
-                }
+                batch.retain(|r| pending_expr.matches_name(&r.file.name));
                 let resights = dedup_streamed_batch(
                     &mut state.active_search_request,
                     pending_request_id,
@@ -761,20 +762,14 @@ pub(in crate::network) async fn on_search_poll_tick(
                 let all_results = convert_search_results(&search.results, |ip| {
                     is_search_source_safe(state, ip)
                 });
-                if !query_expr.is_trivial() {
-                    let before = all_results.len();
-                    let filtered: Vec<SearchResult> = all_results
-                        .into_iter()
-                        .filter(|r| query_expr.matches(&r.file.name.to_lowercase()))
-                        .collect();
-                    info!(
-                        "Keyword filter: {before} -> {} results (boolean query)",
-                        filtered.len()
-                    );
-                    filtered
-                } else {
-                    all_results
-                }
+                // Same filter as the streamed batches above.
+                let before = all_results.len();
+                let filtered: Vec<SearchResult> = all_results
+                    .into_iter()
+                    .filter(|r| query_expr.matches_name(&r.file.name))
+                    .collect();
+                info!("Keyword filter: {before} -> {} results", filtered.len());
+                filtered
             } else {
                 Vec::new()
             };
@@ -1127,7 +1122,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                         {
                             let pfs = state.per_file_sources
                                 .entry(transfer_id.clone())
-                                .or_insert_with(|| ed2k::sources::PerFileSourceList::new(fh));
+                                .or_insert_with(|| ed2k::sources::PerFileSourceList::new(fh, state.max_sources_per_file));
                             let is_new = pfs.add_source_with_identity(
                                 cb_src.ip,
                                 cb_src.tcp_port,
@@ -1163,6 +1158,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                                     });
                                     broker.attempt_low_to_low(
                                         &transfer_id, fh, cb_src.ip, cb_src.tcp_port,
+                                        ember::broker::RelayTarget::default(),
                                         state.nat_info.nat_type, ext,
                                     ).await
                                 } else {
@@ -1399,7 +1395,6 @@ pub(in crate::network) async fn on_search_poll_tick(
                         // `Connecting`, producing duplicate
                         // rows for peers that are already
                         // queued or transferring.
-                        let now_ts = chrono::Utc::now().timestamp();
                         for cb_src in &callback_sources {
                             let ip_s = upload_server::kad_callback_display_key(
                                 cb_src.ip,
@@ -1442,7 +1437,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             // map yet.
                             state.callback_row_pending_since.insert(
                                 (transfer_id.clone(), ip_s, cb_src.tcp_port),
-                                now_ts,
+                                std::time::Instant::now(),
                             );
                         }
                         for dc_src in &direct_callback_sources {
@@ -1471,7 +1466,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             );
                             state.callback_row_pending_since.insert(
                                 (transfer_id.clone(), ip_s, dc_src.tcp_port),
-                                now_ts,
+                                std::time::Instant::now(),
                             );
                         }
                         for ls in &lowid_sources {
@@ -1504,7 +1499,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                                 );
                                 state.callback_row_pending_since.insert(
                                     (transfer_id.clone(), ip_str, ls.ed2k_server_port),
-                                    now_ts,
+                                    std::time::Instant::now(),
                                 );
                             }
                         }
@@ -1622,7 +1617,6 @@ pub(in crate::network) async fn on_search_poll_tick(
                         // match the listed listening port,
                         // so a refreshed placeholder would
                         // duplicate-row the same peer.
-                        let now_ts = chrono::Utc::now().timestamp();
                         for cb_src in &callback_sources {
                             let ip_s = upload_server::kad_callback_display_key(
                                 cb_src.ip,
@@ -1661,7 +1655,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             // map yet.
                             state.callback_row_pending_since.insert(
                                 (transfer_id.clone(), ip_s, cb_src.tcp_port),
-                                now_ts,
+                                std::time::Instant::now(),
                             );
                         }
                         for dc_src in &direct_callback_sources {
@@ -1693,7 +1687,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             );
                             state.callback_row_pending_since.insert(
                                 (transfer_id.clone(), ip_s, dc_src.tcp_port),
-                                now_ts,
+                                std::time::Instant::now(),
                             );
                         }
                         // Parity with the indirect-only branch:
@@ -1740,7 +1734,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             );
                             state.callback_row_pending_since.insert(
                                 (transfer_id.clone(), ip_str, ls.ed2k_server_port),
-                                now_ts,
+                                std::time::Instant::now(),
                             );
                         }
                     }
@@ -1761,7 +1755,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                     {
                         let pfs = state.per_file_sources
                             .entry(transfer_id.clone())
-                            .or_insert_with(|| ed2k::sources::PerFileSourceList::new(hash_bytes));
+                            .or_insert_with(|| ed2k::sources::PerFileSourceList::new(hash_bytes, state.max_sources_per_file));
                         for (ip_s, port) in &sources {
                             if let Ok(v4) = ip_s.parse::<Ipv4Addr>() {
                                 let udp_port = {
@@ -1868,7 +1862,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             file_name: pending.file_name,
                             file_size: pending.file_size,
                             sources: download_sources,
-                            download_dir: PathBuf::from(&settings.download_folder),
+                            download_folders: state.download_folders.clone(),
                             user_hash: state.user_hash,
                             nickname: settings.nickname.clone(),
                             tcp_port: advertised_tcp_port(state),
@@ -2006,7 +2000,6 @@ pub(in crate::network) async fn on_search_poll_tick(
                         // prevention — see parallel blocks
                         // in the pending / pending→active
                         // branches above).
-                        let now_ts = chrono::Utc::now().timestamp();
                         for cb_src in &callback_sources {
                             let ip_s = upload_server::kad_callback_display_key(
                                 cb_src.ip,
@@ -2045,7 +2038,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             // map yet.
                             state.callback_row_pending_since.insert(
                                 (transfer_id.clone(), ip_s, cb_src.tcp_port),
-                                now_ts,
+                                std::time::Instant::now(),
                             );
                         }
                         for dc_src in &direct_callback_sources {
@@ -2077,7 +2070,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             );
                             state.callback_row_pending_since.insert(
                                 (transfer_id.clone(), ip_s, dc_src.tcp_port),
-                                now_ts,
+                                std::time::Instant::now(),
                             );
                         }
                     }

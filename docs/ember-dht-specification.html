@@ -895,8 +895,20 @@ footer.doc-end {
 <p>
   Inbound XX handshakes may briefly queue outbound traffic for that peer
   (honest simultaneous-open). After a 3-second grace the node dials the
-  identity itself; once an IK initiator is pending, further inbound msg1s from
-  that address are refused so a forged handshake cannot be renewed.
+  identity itself; once an initiator handshake of ours is pending, further
+  inbound XX msg1s from that address are refused so a forged handshake cannot
+  be renewed.
+</p>
+<p>
+  Two nodes that dial each other with IK at the same moment are settled by
+  Noise static key rather than both refusing and waiting out the 30-second
+  handshake timeout. The node with the lower static key stays initiator and
+  refuses the inbound <code>IK_INIT</code>. The node with the higher key answers
+  it as responder, and when that handshake is from the identity it was dialling,
+  it drops its own initiator and re-sends that initiator's first message and
+  queued payloads over the resulting session. Each side decides from its own key
+  and the key it dialled, so both reach the same answer. A pending XX initiator
+  still refuses an inbound <code>IK_INIT</code>.
 </p>
 
 <h3>4.3 Session lifecycle</h3>
@@ -1456,15 +1468,30 @@ footer.doc-end {
     <tr><td>ip</td><td>4</td><td>IPv4, the address downloaders should dial</td></tr>
     <tr><td>tcp_port</td><td>2 LE</td><td>eD2K client-to-client</td></tr>
     <tr><td>udp_port</td><td>2 LE</td><td>Ember / KAD UDP</td></tr>
-    <tr><td>flags</td><td>1</td><td>bit 0 firewalled, bit 1 obfuscation, bit 2 relay-capable</td></tr>
+    <tr><td>flags</td><td>1</td><td>bit 0 firewalled, bit 1 obfuscation, bit 2 relay-capable, bit 7 QUIC port present</td></tr>
     <tr><td>noise_pub</td><td>32</td><td>Stashed for future native (Noise) dialing</td></tr>
     <tr><td>user_hash</td><td>16</td><td>Optional trailer: publisher's eD2K user hash, present with the buddy block</td></tr>
     <tr><td>buddy_ip</td><td>4</td><td>Optional trailer: HighID buddy the searcher should <code>CALLBACK_REQ</code></td></tr>
     <tr><td>buddy_udp</td><td>2 LE</td><td>Optional trailer</td></tr>
     <tr><td>buddy_noise_pub</td><td>32</td><td>Optional trailer: buddy's Noise static key</td></tr>
     <tr><td>callback_token</td><td>16</td><td>Optional trailer: publisher-derived token copied into <code>CALLBACK_REQ</code> / <code>CALLBACK</code></td></tr>
+    <tr><td>buddy endorsement</td><td>104</td><td>Optional trailer: buddy Ed25519 key (32), expiry (8 LE), signature (64)</td></tr>
+    <tr><td>quic_port</td><td>2 LE</td><td>Only when flags bit 7 is set, and always the record's last two bytes: the publisher's advertised QUIC port, which a relay dials</td></tr>
   </tbody>
 </table>
+<p>
+  Firewalled records set bit 7 and end with the publisher's advertised QUIC
+  port. The relay dials that port, not <code>tcp_port</code>. From 1.7.1 QUIC
+  shares the UDP socket, so the value is the public UDP port. A 1.7.0 publisher's
+  QUIC endpoint sits on the TCP port number unless it could not bind it, in which
+  case it is on a neighbouring port, and a NAT may remap either.
+  Older parsers read these records unchanged. They infer the callback trailer
+  from the residual length being at least its size and ignore any bytes after
+  it, and two bytes alone fall short of that size. The decoder clears bit 7
+  before exposing <code>flags</code>, so it never reaches the EPX source flags
+  that share the byte.
+  <span class="badge">additive</span>
+</p>
 <p>
   A downloader uses <code>ip + tcp_port</code> over the existing eD2K path
   when the source is not firewalled. Firewalled records append a 70-byte
@@ -1516,9 +1543,34 @@ footer.doc-end {
   a 24-hour source TTL would.
 </p>
 <p>
-  Clock skew tolerance on the signed timestamp is <strong>1 hour</strong> into
-  the future; older than TTL is expired. A replayed older copy cannot replace
-  a newer one: <code>created_at</code> is kept and compared.
+  A record's signed timestamp may sit at most
+  <strong>min(1 hour, TTL / 2)</strong> in the future: an hour for keyword,
+  source and room-index records, 22.5 minutes for a 45-minute presence record.
+  A flat hour was longer than a presence record's whole life. A record dated
+  ahead of the storer's clock is aged from the storer's clock, not from its
+  timestamp, so the tolerated skew cannot extend its life past the TTL. A record
+  older than its TTL is expired.
+</p>
+<p>
+  A presence leave tombstone is the exception: it is aged from its own
+  timestamp. It has to outlive every live copy dated before it, and a storer
+  admits those until their timestamp plus the TTL, so a tombstone from a fast
+  clock aged from the storer's clock lapsed first, and a harvested live copy
+  could be stored again and served as present.
+</p>
+<p>
+  From 1.7.1 a storer refuses a presence record from a publisher whose clock
+  runs 22.5 to 60 minutes fast; 1.7.0 accepted it. Such a node's room presence
+  does not reach 1.7.1 storers until its clock is corrected.
+</p>
+<p>
+  A replayed older copy cannot replace a newer one: <code>created_at</code> is
+  kept and compared. The store does not acknowledge the refused copy
+  (<code>STORE_ACK</code> is withheld and its <code>STORE_BATCH_ACK</code> bit is
+  clear), so its sender does not count it as placed. One exception remains: a
+  byte-identical copy whose signature the storer saw within
+  <code>STORE_SIG_REPLAY_TTL</code> (§12.4) is still answered as a replay after
+  a newer copy superseded it.
 </p>
 
 <h3>7.5 Store capacity</h3>
@@ -1572,6 +1624,15 @@ footer.doc-end {
   drops junk. The per-node result budget is charged on blobs <em>offered</em>,
   not only those accepted, so a peer that sends nothing but junk still hits
   its own limit.
+</p>
+<p>
+  A responder need not have applied the storer's clock rule (§7.4), so the
+  searcher drops a blob outside its life before it takes a result slot. Its own
+  clock gets the skew tolerance again in each direction: a blob may be dated up
+  to twice <strong>min(1 hour, TTL / 2)</strong> ahead, and be up to its TTL
+  plus that tolerance old. Without the second allowance the searcher's clock
+  error stacked on the publisher's, and a searcher half an hour slow refused
+  most presence records.
 </p>
 
 <!-- ══════════════════════════════════════════════ 8 ══════════════════════════════════════════════ -->
@@ -1720,6 +1781,15 @@ footer.doc-end {
   library is not slammed in one tick after a restart.
 </p>
 <p>
+  A keyword round that placed some of a file’s keys but lost one on every
+  replica counts as published and comes back after 30 minutes, up to three
+  times. After that the file waits out the 12-hour cycle, and gets no further
+  short retries until a round places every key: a key storers refuse for as
+  long as the file is shared, such as a word past the per-publisher cap
+  (§7.5), would otherwise bring the file’s whole keyword set back three times
+  every cycle.
+</p>
+<p>
   The last successful source-publish and keyword-publish are written to
   <code>known.met</code> (<code>0xE4</code> / <code>0xE5</code>). On start, a
   stamp still inside its interval (2 hours for sources, 12 hours for keywords)
@@ -1814,6 +1884,27 @@ footer.doc-end {
   process lifetime, so a stale address stayed qualified indefinitely and a
   genuine address change could not displace it.
 </p>
+<p>
+  A rival address displaces a confirmed one only with strictly more distinct
+  nets. When the confirmed address lapses because its votes aged out, then for
+  one vote lifetime a rival must beat the most nets that ever backed it at once,
+  or else have a quorum of its own nets among those that voted for the lapsed
+  address. The first rule stops three quiet /24s from taking the address the
+  moment honest votes age out. The second admits a genuine address change: the
+  same peers now seeing us somewhere else. On a network with no more nets than
+  the old peak, the change could not otherwise confirm until the lapse aged out.
+  The backers remembered for that test are the 256 nets that voted most
+  recently, so on a long uptime they are still the peers talking to us when the
+  address moves.
+</p>
+<p>
+  A confirmed address becomes the node’s external address only when it has
+  none, and only if STUN has no reading or agrees. Votes never replace an
+  address already held: a confirmation that differs from it triggers a STUN
+  re-probe, no sooner than a minute after the last one, even on an idle node
+  that would otherwise not probe, and the STUN result decides. A live HighID is
+  left as it is.
+</p>
 
 <h3>11.2 Firewalled publishing and consume</h3>
 <p>
@@ -1858,6 +1949,92 @@ footer.doc-end {
   the same path: the buddy table is populated when a <code>PROXY_STORE_ACK</code>
   matches a request we sent, so a network that is already forwarding publishes can bounce
   callbacks without a second handshake.
+</p>
+
+<h3>11.3 Relay requests</h3>
+<p>
+  When neither side can accept a connection, the broker asks a relay admitted
+  from an ERAT attestation to bridge a QUIC stream. The request is
+  <code>RELAY_REQUEST</code> (relay message type <code>0x01</code>), framed as
+  <code>type (1) | session_id (4 LE) | payload_len (2 LE) | payload</code>.
+  Version 2 has a 183-byte payload. Version 3 appends the target's Ember node id
+  (16 bytes) before the signature, for a 199-byte payload. The relay then
+  refuses to bridge to any endpoint whose QUIC certificate does not prove that
+  node id.
+</p>
+<table class="data">
+  <thead><tr><th>Bytes</th><th>Field</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>version</td><td><code>2</code> or <code>3</code></td></tr>
+    <tr><td>1..5</td><td>target_ip</td><td>IPv4 the relay dials</td></tr>
+    <tr><td>5..7</td><td>target_port</td><td>LE; the port the relay dials over QUIC (for Ember DHT sources, the record's <code>quic_port</code>)</td></tr>
+    <tr><td>7..23</td><td>file_hash</td><td>eD2K file hash</td></tr>
+    <tr><td>23..55</td><td>attestation_hash</td><td>The relay's ERAT attestation hash</td></tr>
+    <tr><td>55..87</td><td>requester_pubkey</td><td>Requester's Ed25519 key</td></tr>
+    <tr><td>87..103</td><td>requester_ember_hash</td><td>Must bind to <code>requester_pubkey</code></td></tr>
+    <tr><td>103..119</td><td>nonce</td><td>Fresh random; replays within 10 minutes are refused</td></tr>
+    <tr><td>119..135</td><td>target_node_id</td><td>Version 3 only</td></tr>
+    <tr><td>135..199</td><td>signature</td><td>Version 3; at 119..183 in version 2</td></tr>
+  </tbody>
+</table>
+<p>
+  The signature is Ed25519 by <code>requester_pubkey</code> over
+  <code>domain | session_id (4 LE) | attestation_hash | target_ip | target_port (2 LE) | file_hash | requester_pubkey | requester_ember_hash | nonce</code>,
+  followed by <code>target_node_id</code> in version 3. The domain is
+  <code>"ember-relay-request-v3\0"</code> for version 3 and
+  <code>"ember-relay-request-v2\0"</code> for version 2, so a version 2
+  signature cannot be replayed with a node id attached. The signed order is not
+  the payload order: the attestation hash comes before the target.
+</p>
+<p>
+  A relay advertises version 3 support with ERAT capability bit
+  <code>0x02</code> (<code>RELAY_ATTESTATION_CAP_PINNED_TARGET</code>) beside
+  the required relay bit <code>0x01</code>. Verifiers require only
+  <code>0x01</code>, so older peers accept attestations carrying the new bit. A
+  requester sends version 3 only to a relay with bit <code>0x02</code>, because a
+  1.7.0 relay accepts no payload length but version 2's.
+  <span class="badge">additive</span>
+</p>
+<p>
+  The relay answers on the same stream, echoing <code>session_id</code>, and
+  only once it has reached the target: it opens a QUIC stream to the target,
+  sends <code>RELAY_CONNECT</code> (type <code>0x03</code>, payload the 16-byte
+  file hash), and then answers <code>RELAY_ACCEPT</code> (type <code>0x02</code>,
+  empty payload), after which the stream carries eD2K bytes in both directions.
+  Any refusal is <code>RELAY_REJECT</code> (type <code>0x06</code>) with a
+  one-byte reason, so a requester never takes an unreachable target for a
+  working relay. Type <code>0x05</code> was <code>RELAY_CLOSE</code>, which a
+  1.7.0 relay sends after ACCEPT when the target cannot be reached; it is
+  retired, not free.
+</p>
+<table class="data">
+  <thead><tr><th>Reason</th><th>Meaning</th><th>Requester</th></tr></thead>
+  <tbody>
+    <tr><td>0x01</td><td>No session free, overall or for this requester, or relaying is turned off</td><td>Skips the relay for 60 s</td></tr>
+    <tr><td>0x02</td><td>Target refused: port 0, non-public, the requester's own address, or filtered or banned</td><td>Attempt fails</td></tr>
+    <tr><td>0x03</td><td>Payload length of no accepted version, a requester that is not a friend or not the connection's identity, or an unknown or expired attestation hash</td><td>Skips the relay for an hour; a friend's relay only while that attestation is still the one held</td></tr>
+    <tr><td>0x04</td><td>Unsupported version or length mismatch, a key that does not bind to the Ember hash, a bad signature, or a replayed nonce</td><td>Attempt fails</td></tr>
+    <tr><td>0x05</td><td>Target unreachable, without an Ember identity, not the pinned node id, or the requester itself</td><td>Attempt fails</td></tr>
+  </tbody>
+</table>
+<p>
+  No REJECT counts against the relay: each is a working relay answering. A
+  relay with no room for the connection itself turns it away before any request
+  is read, by refusing the handshake (<code>CONNECTION_REFUSED</code>) or by
+  closing it with reason <code>no session capacity</code>,
+  <code>active principal session cap reached</code> or
+  <code>friend reserve requires pinned identity</code>. The requester skips such
+  a relay for 60 s. A close is not held against the relay, since the handshake
+  proved who sent it; a refused handshake is, since anyone at the address could
+  send one. A requester has at most two requests in flight to one relay, the
+  sessions a relay holds per requester, and keeps the attestation with the
+  latest expiry when an older copy arrives again.
+</p>
+<p>
+  A bridge passes each direction's end of stream on as soon as that direction
+  ends, closes after 120 s in which neither direction moves a byte, and when it
+  ends waits up to 10 s for each side to acknowledge what is still on its way
+  before the connections close.
 </p>
 
 <!-- ══════════════════════════════════════════════ 12 ══════════════════════════════════════════════ -->
@@ -1938,10 +2115,13 @@ footer.doc-end {
 <p>
   Identical STORE frames (same publisher signature) collapse for 60 seconds
   so a retransmit storm cannot re-verify the same blob forever. A replay only
-  counts if the store still holds that signature: the cache is never cleared
-  by eviction, and treating a displaced record as a replay made
+  counts if the store still holds that record byte for byte, or a newer copy
+  of it from the same publisher that superseded it (§7.4): the cache is never
+  cleared by eviction, and treating an evicted record as a replay made
   <code>STORE_BATCH</code> set the accepted bit for a replica that was gone,
-  after which the publisher retired the file.
+  after which the publisher retired the file. A superseded copy is still
+  answered as a replay, since the key holds that publisher's newer record for
+  the file; it is not stored again and does not re-arm the cache.
 </p>
 <p>
   Cache size 50,000; swept at most once per TTL. An unconditional size check
@@ -2197,7 +2377,7 @@ footer.doc-end {
     <tr><td>EMBER_SOURCE_PUBLISH_MIN/MAX_PER_TICK</td><td>5 / 256 files</td><td>network/mod.rs</td></tr>
     <tr><td>KEYWORD_RECORD_TTL</td><td>24 h</td><td>dht/store.rs</td></tr>
     <tr><td>SOURCE_RECORD_TTL</td><td>6 h</td><td>dht/store.rs</td></tr>
-    <tr><td>CLOCK_SKEW_TOLERANCE_SECS</td><td>1 h</td><td>dht/store.rs</td></tr>
+    <tr><td>CLOCK_SKEW_TOLERANCE_SECS</td><td>1 h, capped at TTL / 2 per record</td><td>dht/store.rs</td></tr>
     <tr><td>EMBER_RENDEZVOUS_REPUBLISH_SECS</td><td>5 h</td><td>network/mod.rs</td></tr>
     <tr><td>EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS</td><td>10 min</td><td>network/mod.rs</td></tr>
     <tr><td>EMBER_SEARCH_QUEUED_QUERY_TIMEOUT</td><td>12 s</td><td>network/mod.rs</td></tr>

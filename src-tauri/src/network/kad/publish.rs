@@ -930,7 +930,7 @@ const INV_KAD_KEYWORD_CHARS: &[char] = &[
     '"',
 ];
 
-fn is_kad_keyword_separator(c: char) -> bool {
+pub(crate) fn is_kad_keyword_separator(c: char) -> bool {
     INV_KAD_KEYWORD_CHARS.contains(&c)
 }
 
@@ -947,7 +947,7 @@ fn is_kad_keyword_separator(c: char) -> bool {
 /// different key. Mapping char by char and keeping any char whose lowercase is
 /// not a single char gives a 1:1 result and, incidentally, drops the final-sigma
 /// context rule, because that rule lives in `str::to_lowercase` alone.
-fn kad_keyword_lowercase(s: &str) -> String {
+pub(crate) fn kad_keyword_lowercase(s: &str) -> String {
     s.chars()
         .map(|c| {
             let mut lower = c.to_lowercase();

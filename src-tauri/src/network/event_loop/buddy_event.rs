@@ -131,7 +131,12 @@ pub(in crate::network) async fn on_buddy_event(
                         let pfs = state
                             .per_file_sources
                             .entry(pd.transfer_id.clone())
-                            .or_insert_with(|| ed2k::sources::PerFileSourceList::new(file_hash));
+                            .or_insert_with(|| {
+                                ed2k::sources::PerFileSourceList::new(
+                                    file_hash,
+                                    state.max_sources_per_file,
+                                )
+                            });
                         if pfs.add_source_full(dest_ip, dest_port, 0) {
                             state.ember_payload_dirty = true;
                         }
@@ -176,7 +181,7 @@ pub(in crate::network) async fn on_buddy_event(
                         file_name: pd.file_name,
                         file_size: pd.file_size,
                         sources: download_sources,
-                        download_dir: PathBuf::from(&settings.download_folder),
+                        download_folders: state.download_folders.clone(),
                         user_hash: state.user_hash,
                         nickname: settings.nickname.clone(),
                         tcp_port: advertised_tcp_port(state),
@@ -337,11 +342,21 @@ pub(in crate::network) async fn on_buddy_event(
             pkt.extend_from_slice(&reask_payload);
             // Register like the source-timer senders do: an answer to
             // a reask that is not in this map is dropped as
-            // unsolicited by both reply branches.
-            state.pending_udp_reasks.insert(
+            // unsolicited by both reply branches. Not sent while the
+            // peer still owes an answer about another file; see
+            // `udp_reask_awaits_other_file`.
+            let now_ts = std::time::Instant::now();
+            if crate::network::state::udp_reask_awaits_other_file(
+                &state.pending_udp_reasks,
                 (dest_ip, dest_port),
-                (file_hash, chrono::Utc::now().timestamp()),
-            );
+                &file_hash,
+                now_ts,
+            ) {
+                return;
+            }
+            state
+                .pending_udp_reasks
+                .insert((dest_ip, dest_port), (file_hash, now_ts));
             let _ = udp_socket.send_to(&pkt, addr).await;
             debug!("Sent UDP reask to {}:{} via buddy relay for file {}", dest_ip, dest_port, hash_hex);
         }

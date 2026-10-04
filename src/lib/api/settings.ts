@@ -128,6 +128,22 @@ export async function takePendingRestoreFailedNotice(): Promise<boolean> {
   return invoke('take_pending_restore_failed_notice');
 }
 
+/**
+ * Consume the one-shot notice that startup discarded a staged restore because
+ * it had waited too long to be applied. Nothing on disk records it afterwards.
+ */
+export async function takePendingRestoreExpiredNotice(): Promise<boolean> {
+  return invoke('take_pending_restore_expired_notice');
+}
+
+/**
+ * Consume the notice that known.met could not be read this session (`reset`:
+ * the catalog was lost and sharing reset to fail-closed), or null.
+ */
+export async function takePendingKnownMetNotice(): Promise<{ reset: boolean } | null> {
+  return invoke('take_pending_known_met_notice');
+}
+
 /** Open the official Ember website in the default browser. */
 export async function openEmberWebsite(): Promise<void> {
   return invoke('open_ember_website');

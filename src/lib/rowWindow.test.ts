@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { computeRowWindow } from './rowWindow';
+import { adoptRowHeight, computeRowWindow } from './rowWindow';
 
 /** The search table's real numbers: 34px rows in a 680px scrollport. */
 const base = { total: 15_000, bodyTop: 0, viewportHeight: 680, rowHeight: 34, overscan: 8 };
@@ -65,6 +65,27 @@ describe('computeRowWindow', () => {
     const window = computeRowWindow({ ...base, viewportHeight: 0 });
 
     expect(window.end).toBeGreaterThan(0);
+  });
+
+  it('keeps the spacer height when a window is only a fraction of a pixel off', () => {
+    // Two slices a scrollbar drag can land on: one a little over 34, one a
+    // little under. Chasing either of them is the freeze.
+    let height = 34;
+    for (let n = 0; n < 8; n++) height = adoptRowHeight(height, n % 2 === 0 ? 34.4 : 33.7);
+    expect(height).toBe(34);
+  });
+
+  it('follows a row height that actually changed', () => {
+    // Zoom, or the first real measure after the 34px guess.
+    expect(adoptRowHeight(34, 36)).toBe(36);
+    expect(adoptRowHeight(34, 33)).toBe(33);
+  });
+
+  it('ignores a measurement the DOM should not have produced', () => {
+    expect(adoptRowHeight(34, 0)).toBe(34);
+    expect(adoptRowHeight(34, Number.NaN)).toBe(34);
+    expect(adoptRowHeight(Number.NaN, 36)).toBe(36);
+    expect(adoptRowHeight(Number.NaN, Number.NaN)).toBe(1);
   });
 
   it('survives measurements the DOM should never produce', () => {

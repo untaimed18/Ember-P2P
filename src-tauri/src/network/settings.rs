@@ -121,6 +121,7 @@ pub(super) fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_channel_presence_searches.clear();
     state.ember_channel_presence_buffer.clear();
     state.ember_pending_channel_presence.clear();
+    state.ember_channel_ingest = None;
     state.channel_presence_fetch_at.clear();
     state.channel_focused = None;
     state.channel_beacon_beat_at.clear();
@@ -200,6 +201,8 @@ pub(super) fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_announced_at.clear();
     state.ember_publish_unplaced.clear();
     state.ember_publish_placed.clear();
+    state.ember_publish_partial.clear();
+    state.ember_keyword_retries_spent.clear();
     state.ember_publish_attempts.clear();
     state.ember_publish_pass = EmberPublishPassStats::default();
 
@@ -292,6 +295,7 @@ pub(super) fn apply_network_settings(
         new_settings.skip_compress_video,
         std::sync::atomic::Ordering::Relaxed,
     );
+    *state.download_folders.write() = new_settings.download_folders();
     state.filter_incoming_shared.store(
         new_settings.filter_incoming_connections,
         std::sync::atomic::Ordering::Relaxed,
@@ -318,6 +322,10 @@ pub(super) fn apply_network_settings(
     );
     ed2k::multi_source::set_global_conn_limit(new_settings.max_connections as usize);
     crate::sharing::manager::set_global_preview_priority(new_settings.preview_priority_all);
+    state.max_sources_per_file = ed2k::sources::max_sources_per_file(new_settings.max_sources_per_file);
+    for pfs in state.per_file_sources.values_mut() {
+        pfs.set_max_sources(state.max_sources_per_file);
+    }
     if !new_settings.uss_enabled {
         if let Some((addr, _)) = state.uss_host.take() {
             state.uss_prev_host = Some(addr);

@@ -23,17 +23,19 @@ describe('fileTypeKey', () => {
     expect(fileTypeKey('jpg')).toBe('Image');
     expect(fileTypeKey('7z')).toBe('Archive');
     expect(fileTypeKey('pdf')).toBe('Document');
+    expect(fileTypeKey('EXE')).toBe('Program');
     expect(fileTypeKey('iso')).toBe('CD/DVD');
+    expect(fileTypeKey('emulecollection')).toBe('Collection');
   });
 
   it('leaves unknown extensions uncategorised', () => {
-    expect(fileTypeKey('exe')).toBe('');
+    expect(fileTypeKey('dat')).toBe('');
     expect(fileTypeKey('')).toBe('');
   });
 
   it('only ever returns a real filter option', () => {
     const options = new Set<string>(FILE_TYPE_FILTERS);
-    for (const ext of ['mp3', 'mp4', 'png', 'zip', 'txt', 'bin']) {
+    for (const ext of ['mp3', 'mp4', 'png', 'zip', 'txt', 'exe', 'bin', 'emulecollection']) {
       expect(options.has(fileTypeKey(ext))).toBe(true);
     }
   });

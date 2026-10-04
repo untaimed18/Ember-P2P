@@ -25,6 +25,8 @@ import {
   toggleChannelFavourite,
   totalChannelUnread,
   unreadBadgeTone,
+  xferNeedsConsent,
+  xferStartsAsking,
 } from './channels';
 import { listChannels, type ChannelInfo, type ChannelTransferInfo } from '$lib/api/channels';
 
@@ -387,6 +389,37 @@ describe('awaitingChannelOffers', () => {
     expect(get(awaitingChannelOffers)).toBe(1);
     ignoredMembers.set([{ pubkey: PEER, name: '' }]);
     expect(get(awaitingChannelOffers)).toBe(0);
+  });
+});
+
+describe('xferNeedsConsent', () => {
+  const sent = (extra: Partial<ChannelTransferInfo> = {}) =>
+    ({
+      xfer_id: 'x1',
+      channel_id: A,
+      peer_pubkey: 'ee'.repeat(32),
+      direction: 'send',
+      name: 'f.txt',
+      size: 1,
+      transferred: 0,
+      status: 'offered',
+      ...extra,
+    }) as ChannelTransferInfo;
+
+  it('asks only about an unanswered offer this user sent', () => {
+    expect(xferNeedsConsent(sent({ awaiting_consent: true }))).toBe(true);
+    expect(xferNeedsConsent(sent())).toBe(false);
+    expect(xferNeedsConsent(sent({ awaiting_consent: false }))).toBe(false);
+    expect(xferNeedsConsent(sent({ awaiting_consent: true, status: 'active' }))).toBe(false);
+    expect(xferNeedsConsent(sent({ awaiting_consent: true, direction: 'receive' }))).toBe(false);
+  });
+
+  it('puts the question up once, however often it is repeated', () => {
+    const asking = sent({ awaiting_consent: true });
+    expect(xferStartsAsking(undefined, asking)).toBe(true);
+    expect(xferStartsAsking(sent(), asking)).toBe(true);
+    expect(xferStartsAsking(asking, asking)).toBe(false);
+    expect(xferStartsAsking(asking, sent())).toBe(false);
   });
 });
 

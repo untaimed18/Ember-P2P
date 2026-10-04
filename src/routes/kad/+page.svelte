@@ -1,7 +1,6 @@
 <script lang="ts">
   import {
     kadConnect,
-    kadDisconnect,
     kadRecheckFirewall,
     kadBootstrapIp,
     kadBootstrapUrl,
@@ -79,12 +78,9 @@
     return inertBackground(bootstrapOverlay);
   });
 
-  // K25: debounce Connect/Disconnect so a user who double-clicks the
-  // button doesn't queue two conflicting commands.
-  // Which way the in-flight click is going: the status alone can't say,
-  // since both a fresh connect and a Cancel spend time in 'connecting'.
-  let pendingAction: 'connect' | 'disconnect' | null = $state(null);
-  let connectPending = $derived(pendingAction !== null);
+  // K25: debounce Connect so a user who double-clicks the button doesn't
+  // queue two connects.
+  let connectPending = $state(false);
 
   onMount(() => {
     mounted = true;
@@ -216,26 +212,21 @@
     return translateError(e, fallback);
   }
 
+  // Connect only. There is deliberately no Disconnect: Ember depends on KAD
+  // staying connected, so it is not something a user can switch off here.
   async function handleConnect() {
-    // K25: ignore re-entrant clicks while a connect/disconnect is in
-    // flight. Without this an eager user who double-clicks flips the
-    // state twice and can end up with the backend in an unexpected mode.
-    if (connectPending) return;
+    // K25: ignore re-entrant clicks while a connect is in flight.
+    if (connectPending || $networkStats.status !== 'disconnected') return;
     kadError = null;
     try {
-      if ($networkStats.status === 'connected' || $networkStats.status === 'connecting') {
-        pendingAction = 'disconnect';
-        await kadDisconnect();
-      } else {
-        pendingAction = 'connect';
-        loading = true;
-        await kadConnect();
-      }
+      connectPending = true;
+      loading = true;
+      await kadConnect();
     } catch (e: unknown) {
       kadError = toErrMsg(e, m.kad_connection_failed());
       loading = false;
     } finally {
-      pendingAction = null;
+      connectPending = false;
     }
   }
 
@@ -380,11 +371,7 @@
   }
 
   function getConnectButtonLabel(): string {
-    if (pendingAction === 'connect') return m.kad_connecting();
-    if (pendingAction === 'disconnect') return m.kad_disconnecting();
-    if ($networkStats.status === 'connected') return m.servers_disconnect();
-    if ($networkStats.status === 'connecting') return m.common_cancel();
-    return m.servers_connect();
+    return connectPending ? m.kad_connecting() : m.servers_connect();
   }
 
   const bootstrapModes = ['ip', 'url', 'clients'] as const;
@@ -810,8 +797,8 @@
 
   let isConnected = $derived($networkStats.status === 'connected');
 
-  /** Sitting out KAD is a supported runtime choice, but with no eD2K server
-   *  either there is no network left that can answer "who has this file" —
+  /** KAD can still end up disconnected — a start that failed — and with no
+   *  eD2K server either there is no network left that can answer "who has this file" —
    *  `network_ready_for_sources` in the backend is KAD *or* server. Say so
    *  here rather than letting it surface as searches that quietly return
    *  nothing.
@@ -877,19 +864,20 @@
     <h2>{m.nav_kad_network()}</h2>
     <p class="page-subtitle">{m.kad_page_subtitle()}</p>
   </div>
-  <div class="header-actions">
-    <button
-      class={$networkStats.status === 'connected' ? 'danger' : ''}
-      onclick={handleConnect}
-      disabled={connectPending}
-      aria-busy={connectPending}
-    >
-      {#if connectPending}
-        <span class="spinner xs current" aria-hidden="true"></span>
-      {/if}
-      {getConnectButtonLabel()}
-    </button>
-  </div>
+  {#if $networkStats.status === 'disconnected' || connectPending}
+    <div class="header-actions">
+      <button
+        onclick={handleConnect}
+        disabled={connectPending}
+        aria-busy={connectPending}
+      >
+        {#if connectPending}
+          <span class="spinner xs current" aria-hidden="true"></span>
+        {/if}
+        {getConnectButtonLabel()}
+      </button>
+    </div>
+  {/if}
 </div>
 
 {#if kadError}

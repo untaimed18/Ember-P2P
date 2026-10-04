@@ -152,7 +152,7 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
                 }
             }
             ServerUdpResponse::FoundSources { addr, files } => {
-                let now = chrono::Utc::now().timestamp();
+                let now = std::time::Instant::now();
                 let files: Vec<_> = files
                     .into_iter()
                     .filter(|(file_hash, _)| {
@@ -445,7 +445,7 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
                     }
                     for pd in state.pending_downloads.values_mut() {
                         if pd.file_hash == hash_hex {
-                            pd.last_search_at = 0;
+                            pd.last_search_at = None;
                             debug!("Marked pending download {} for immediate retry (UDP sources)", pd.transfer_id);
                         }
                     }

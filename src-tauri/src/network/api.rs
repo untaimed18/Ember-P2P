@@ -343,13 +343,29 @@ pub enum NetworkCommand {
     GetConnectedServerSnapshot {
         tx: oneshot::Sender<Option<ServerInfo>>,
     },
+    /// The eD2K server the user means to be on: connected, connecting, or
+    /// waiting out an auto-reconnect backoff. `None` once they disconnected or
+    /// were never connected. What an update restart reconnects to.
+    GetEd2kServerIntent {
+        tx: oneshot::Sender<Option<(String, u16)>>,
+    },
+    /// How many Ember Transfers (room and friend file hand-offs) are sending,
+    /// receiving or verifying right now — work a silent update must not cut off.
+    GetEmberTransferActivity {
+        tx: oneshot::Sender<usize>,
+    },
+    /// The startup scan has put the library into the index (or there is no
+    /// library to scan), so last session's upload waiters can rejoin the queue.
+    StartupLibraryIndexed,
     UpdateSettings {
-        settings: AppSettings,
+        settings: Box<AppSettings>,
     },
     SetFileComment {
         file_hash: String,
         rating: u8,
         comment: String,
+        /// Answered once the comment is in the database.
+        tx: oneshot::Sender<Result<(), String>>,
     },
     /// Atomically validates and applies a batch of share-state changes to the
     /// in-memory known.met catalog, then acknowledges central processing.
@@ -360,7 +376,20 @@ pub enum NetworkCommand {
     /// Persist the friends-only scope for a batch of content hashes.
     SetFilesFriendsOnly {
         updates: Vec<(String, bool)>,
-        tx: oneshot::Sender<Result<usize, String>>,
+        /// The hashes this did not save: known.met had no record for them, or
+        /// declined the write.
+        tx: oneshot::Sender<Result<Vec<String>, String>>,
+    },
+    /// Files confirmed gone from these paths (deleted, or found missing from
+    /// a folder that is there): known.met forgets the paths.
+    ForgetKnownPaths {
+        paths: Vec<String>,
+    },
+    /// A folder taken out of the library: known.met forgets the paths under
+    /// `root` that none of `keep_roots` still shares.
+    ForgetKnownPathsUnder {
+        root: String,
+        keep_roots: Vec<String>,
     },
     /// Offer one of our shared files to a friend over their live session.
     OfferFileToFriend {
@@ -611,7 +640,7 @@ pub enum NetworkCommand {
     },
     /// Publish an already-signed Ember DHT record (channel index/presence/moderation).
     PublishEmberRecord {
-        record: crate::network::ember::dht::publish::SignedRecord,
+        record: Box<crate::network::ember::dht::publish::SignedRecord>,
         tx: oneshot::Sender<Result<EmberPublishPending, String>>,
     },
     /// Iterative FIND_VALUE for raw 16-byte DHT keys (channel Gather).
@@ -689,6 +718,12 @@ pub enum NetworkCommand {
         xfer_id: [u8; 16],
         tx: oneshot::Sender<Result<(), String>>,
     },
+    /// Send the plain offer for one of our offers the user was asked about.
+    /// Does nothing once the recipient has shown it read the sealed one.
+    SendChannelTransferPlainOffer {
+        xfer_id: [u8; 16],
+        tx: oneshot::Sender<Result<(), String>>,
+    },
     /// Everything in flight, for the Channels page to draw.
     ListChannelTransfers {
         tx: oneshot::Sender<Vec<ChannelTransferSnapshot>>,
@@ -755,6 +790,9 @@ pub struct ChannelTransferSnapshot {
     /// The name is a program, shortcut or script, or one dressed up as a
     /// document (`report.pdf.exe`); see `security::is_dangerous_extension`.
     pub risky: bool,
+    /// A send whose recipient has not shown it read the sealed offer, and
+    /// whose user is being asked whether to send the plain one.
+    pub awaiting_consent: bool,
 }
 
 /// One Ember DHT routing-table contact, flattened to strings for IPC.

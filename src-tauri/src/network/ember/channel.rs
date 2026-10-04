@@ -989,8 +989,9 @@ pub fn open_with_content_keys<T>(
 }
 
 /// Presence timestamps more than this far ahead of wall clock are dropped.
-/// Same bound DHT store uses for `created_at` (`CLOCK_SKEW_TOLERANCE_SECS`
-/// = 3600): a record that sat in the store can still carry a lying
+/// The DHT store's general `CLOCK_SKEW_TOLERANCE_SECS` (3600), looser than
+/// the 1350 seconds (half the 45-minute TTL) a storer admits a presence
+/// record under: a record that sat in the store can still carry a lying
 /// `last_seen`, and that is what roster eviction sorts on.
 pub const PRESENCE_MAX_FUTURE_SKEW_SECS: i64 = 3600;
 
@@ -1456,9 +1457,9 @@ const TYPING_PLAIN_VERSION: u8 = 23;
 /// one: v1.6.x drops it without scoring the hop, keeps using the block
 /// protocol, and never dials.
 const XFER_STREAM_SEALED_VERSION: u8 = 25;
-/// An offer encrypted to the recipient alone. See [`encode_xfer_offer_sealed`]
-/// for why 1.7.0 reads it and does not yet send it. v1.6.x drops the number
-/// like the two above, which is why senders keep the plain offer for now.
+/// An offer encrypted to the recipient alone. v1.6.x drops the number like the
+/// two above, so a sender that hears nothing back asks its user whether to send
+/// the plain offer too; see [`XFER_SEEN_PLAIN_VERSION`].
 const XFER_OFFER_SEALED_VERSION: u8 = 26;
 /// A friend request from one member to another, for a recipient the friend
 /// rendezvous cannot find: a current build publishes presence only to its
@@ -1469,6 +1470,21 @@ const XFER_OFFER_SEALED_VERSION: u8 = 26;
 /// reason typing has one: v1.6.x drops it without scoring the hop, and never
 /// relays it.
 const ROOM_FRIEND_REQUEST_PLAIN_VERSION: u8 = 27;
+/// "Your sealed offer arrived and I can read it", sent the moment one does —
+/// apart from Accept and Deny, which wait on a person. A sender that has not
+/// heard it (or anything else about the transfer) within
+/// [`XFER_PLAIN_OFFER_FALLBACK_SECS`] asks its user whether to send the plain
+/// offer, which is all v1.6.x reads and which every member it is forwarded
+/// through can read too; the first offer under a transfer id wins, so a
+/// recipient that read both sees one prompt. v1.6.x and 1.7.0 drop the number.
+///
+/// A forwarder can drop this frame but cannot make one, so it can bring the
+/// question up and nothing more. See [`xfer_frame_proves_sealed_reader`] for
+/// the members no question is asked about.
+const XFER_SEEN_PLAIN_VERSION: u8 = 28;
+/// How long a sender waits to hear that its sealed offer was read before it
+/// asks whether to send the plain one as well.
+pub const XFER_PLAIN_OFFER_FALLBACK_SECS: u64 = 10;
 const TYPING_SIG_DOMAIN: &[u8] = b"ember-channel-typing-author-v1\0";
 const PRESENCE_BEACON_SIG_DOMAIN: &[u8] = b"ember-channel-presence-beacon-v1\0";
 const MOD_ACTION_BAN: u8 = 1;
@@ -3218,6 +3234,7 @@ pub fn xfer_frame_peek(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16])> {
             | XFER_DONE_PLAIN_VERSION
             | XFER_STREAM_SEALED_VERSION
             | XFER_OFFER_SEALED_VERSION
+            | XFER_SEEN_PLAIN_VERSION
     ) {
         return None;
     }
@@ -3228,6 +3245,17 @@ pub fn xfer_frame_peek(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16])> {
     let mut xfer_id = [0u8; 16];
     xfer_id.copy_from_slice(&bytes[65..81]);
     Some((sender, target, xfer_id))
+}
+
+/// Whether a transfer frame that [`xfer_verify`] accepted shows its sender
+/// reads sealed offers: only 1.7.0 and later send these numbers, and the
+/// pairwise authenticator names the sender, so nobody forwarding it can have
+/// made it.
+pub fn xfer_frame_proves_sealed_reader(bytes: &[u8]) -> bool {
+    matches!(
+        bytes.first(),
+        Some(&(XFER_STREAM_SEALED_VERSION | XFER_OFFER_SEALED_VERSION | XFER_SEEN_PLAIN_VERSION))
+    )
 }
 
 /// Check the authenticator and hand back the frame body without it.
@@ -3306,21 +3334,21 @@ pub fn decode_xfer_offer(bytes: &[u8]) -> Option<XferOffer> {
     parse_xfer_offer_body(sender, target, xfer_id, bytes.get(XFER_HEADER_LEN..)?)
 }
 
-/// `hdr || nonce(12) || sealed(size(8) || root(32) || name) || tag(16)`.
+/// `hdr || nonce(12) || sealed(size(8) || root(32) || name || NUL padding) || tag(16)`.
 ///
 /// The plain offer's body, encrypted to the recipient alone, so a member the
 /// offer is forwarded through learns neither the file's name nor its size.
-/// 1.7.0 reads these and still sends the plain offer, because v1.6.x reads only
-/// that one and a sender cannot tell which build a relayed member runs; once
-/// the members who cannot read this have updated, senders can switch.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "not sent until senders switch; see docs/post-1.7.0.md")
-)]
+/// Sent first; the plain offer follows only for a recipient that has not
+/// answered it with [`encode_xfer_seen`], and only if the user agrees.
+///
+/// The name is padded with NULs to [`XFER_NAME_MAX`] so every sealed offer is
+/// the same length and a forwarder cannot tell how long the name is. 1.7.0
+/// reads the padding as part of the name and strips it with the rest of what
+/// `sanitize_filename` removes, so its prompt shows the same name.
 pub fn encode_xfer_offer_sealed(key: &[u8; 32], offer: &XferOffer) -> Vec<u8> {
     let name = truncate_utf8_owned(&offer.name, XFER_NAME_MAX);
     let mut out = Vec::with_capacity(
-        XFER_HEADER_LEN + XFER_SEAL_NONCE_LEN + 8 + 32 + name.len() + XFER_MAC_LEN,
+        XFER_HEADER_LEN + XFER_SEAL_NONCE_LEN + 8 + 32 + XFER_NAME_MAX + XFER_MAC_LEN,
     );
     put_xfer_header(
         &mut out,
@@ -3336,6 +3364,7 @@ pub fn encode_xfer_offer_sealed(key: &[u8; 32], offer: &XferOffer) -> Vec<u8> {
     out.extend_from_slice(&offer.size.to_le_bytes());
     out.extend_from_slice(&offer.root);
     out.extend_from_slice(name.as_bytes());
+    out.resize(body + 8 + 32 + XFER_NAME_MAX, 0);
     xfer_seal_xor(key, XFER_OFFER_SEAL_DOMAIN, &offer.xfer_id, &nonce, &mut out[body..]);
     append_xfer_tag(key, &mut out);
     out
@@ -3352,6 +3381,11 @@ pub fn decode_xfer_offer_sealed(key: &[u8; 32], bytes: &[u8]) -> Option<XferOffe
     let (nonce, body) = sealed.split_at(XFER_SEAL_NONCE_LEN);
     let mut rest = body.to_vec();
     xfer_seal_xor(key, XFER_OFFER_SEAL_DOMAIN, &xfer_id, nonce, &mut rest);
+    // The padding, and only from the name: size and root may end in zeros.
+    if rest.len() > 8 + 32 {
+        let name_end = rest[8 + 32..].iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        rest.truncate(8 + 32 + name_end);
+    }
     parse_xfer_offer_body(sender, target, xfer_id, &rest)
 }
 
@@ -3383,6 +3417,24 @@ fn parse_xfer_offer_body(
         root,
         name,
     })
+}
+
+/// `hdr || tag(16)`: the recipient read a sealed offer.
+pub fn encode_xfer_seen(
+    key: &[u8; 32],
+    sender: &[u8; 32],
+    target: &[u8; 32],
+    xfer_id: &[u8; 16],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(XFER_HEADER_LEN + XFER_MAC_LEN);
+    put_xfer_header(&mut out, XFER_SEEN_PLAIN_VERSION, sender, target, xfer_id);
+    append_xfer_tag(key, &mut out);
+    out
+}
+
+pub fn decode_xfer_seen(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16])> {
+    let header = take_xfer_header(bytes, XFER_SEEN_PLAIN_VERSION)?;
+    (bytes.len() == XFER_HEADER_LEN).then_some(header)
 }
 
 /// `hdr || status(1) || tag(16)`.
@@ -6553,6 +6605,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_offer_seen_frame_round_trips_and_is_nothing_else() {
+        let offer = sample_offer();
+        let frame = encode_xfer_seen(&K, &offer.target, &offer.sender, &offer.xfer_id);
+        assert_eq!(xfer_frame_peek(&frame), Some((offer.target, offer.sender, offer.xfer_id)));
+        assert!(xfer_verify(&[0x99u8; 32], &frame).is_none());
+        let body = xfer_verify(&K, &frame).expect("authenticated");
+        assert_eq!(decode_xfer_seen(body), Some((offer.target, offer.sender, offer.xfer_id)));
+        assert!(decode_xfer_reply(body).is_none());
+        assert!(decode_xfer_done(body).is_none());
+        assert!(decode_xfer_offer(body).is_none());
+        let reply = encode_xfer_reply(&K, &offer.target, &offer.sender, &offer.xfer_id, XferReply::Accept);
+        assert!(decode_xfer_seen(xfer_verify(&K, &reply).unwrap()).is_none());
+    }
+
     /// A sealed offer reads back as the same offer, passes the same bounds,
     /// hides the name and size from anyone without the pairwise key, and is
     /// never mistaken for a plain one or the reverse.
@@ -6577,6 +6644,80 @@ mod tests {
         assert!(decode_xfer_offer_sealed(&K, &opened(&encode_xfer_offer_sealed(&K, &too_big))).is_none());
         let empty = XferOffer { name: String::new(), ..sample_offer() };
         assert!(decode_xfer_offer_sealed(&K, &opened(&encode_xfer_offer_sealed(&K, &empty))).is_none());
+    }
+
+    /// 1.7.0's sealed-offer decoder, which knows nothing of the padding.
+    fn v1_7_0_decode_xfer_offer_sealed(key: &[u8; 32], bytes: &[u8]) -> Option<XferOffer> {
+        let (sender, target, xfer_id) = take_xfer_header(bytes, XFER_OFFER_SEALED_VERSION)?;
+        let sealed = bytes.get(XFER_HEADER_LEN..)?;
+        if sealed.len() < XFER_SEAL_NONCE_LEN {
+            return None;
+        }
+        let (nonce, body) = sealed.split_at(XFER_SEAL_NONCE_LEN);
+        let mut rest = body.to_vec();
+        xfer_seal_xor(key, XFER_OFFER_SEAL_DOMAIN, &xfer_id, nonce, &mut rest);
+        parse_xfer_offer_body(sender, target, xfer_id, &rest)
+    }
+
+    /// Every sealed offer is the same length whatever its name, so the members
+    /// it is forwarded through cannot tell how long the name is; the padding
+    /// comes off again here, and 1.7.0 shows the same name once it sanitizes.
+    #[test]
+    fn a_sealed_offer_hides_the_length_of_its_name() {
+        let mut root = [0x11u8; 32];
+        root[31] = 0;
+        let names = ["a".to_string(), "holiday-photos.zip".to_string(), "é".repeat(XFER_NAME_MAX)];
+        let lengths: Vec<usize> = names
+            .iter()
+            .map(|name| {
+                let offer = XferOffer { name: name.clone(), root, ..sample_offer() };
+                let frame = encode_xfer_offer_sealed(&K, &offer);
+                let decoded = decode_xfer_offer_sealed(&K, &opened(&frame)).expect("reads back");
+                assert!(offer.name.starts_with(&decoded.name) && !decoded.name.is_empty());
+                assert!(!decoded.name.contains('\0'));
+                assert_eq!(decoded.root, root, "a root ending in zero is not padding");
+
+                let old = v1_7_0_decode_xfer_offer_sealed(&K, &opened(&frame)).expect("1.7.0 accepts it");
+                assert_eq!(
+                    crate::security::sanitize_filename(&old.name),
+                    crate::security::sanitize_filename(&decoded.name)
+                );
+                assert_eq!((old.size, old.root), (decoded.size, decoded.root));
+                frame.len()
+            })
+            .collect();
+        assert!(lengths.windows(2).all(|pair| pair[0] == pair[1]), "{lengths:?}");
+        assert_eq!(
+            lengths[0],
+            XFER_HEADER_LEN + XFER_SEAL_NONCE_LEN + 8 + 32 + XFER_NAME_MAX + XFER_MAC_LEN
+        );
+    }
+
+    /// Only frames 1.6.x never sends mark a member as reading sealed offers.
+    #[test]
+    fn only_frames_newer_than_v1_6_mark_a_sealed_offer_reader() {
+        let offer = sample_offer();
+        let (s, t, id) = (offer.sender, offer.target, offer.xfer_id);
+        let proving = [
+            encode_xfer_offer_sealed(&K, &offer),
+            encode_xfer_seen(&K, &s, &t, &id),
+            encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, quic_only(4662)),
+        ];
+        for frame in &proving {
+            assert!(xfer_frame_proves_sealed_reader(frame), "version {}", frame[0]);
+        }
+        let older = [
+            encode_xfer_offer(&K, &offer),
+            encode_xfer_reply(&K, &s, &t, &id, XferReply::Accept),
+            encode_xfer_block_request(&K, &s, &t, &id, 0, 1),
+            encode_xfer_block_data(&K, &s, &t, &id, 0, b"x").expect("one byte fits"),
+            encode_xfer_cancel(&K, &s, &t, &id, XferCancel::User),
+            encode_xfer_done(&K, &s, &t, &id),
+        ];
+        for frame in &older {
+            assert!(!xfer_frame_proves_sealed_reader(frame), "version {}", frame[0]);
+        }
+        assert!(!xfer_frame_proves_sealed_reader(&[]));
     }
 
     #[test]
@@ -7651,6 +7792,7 @@ mod tests {
         // protocol.
         assert!(!V167_ASSIGNED_OR_RETIRED.contains(&XFER_STREAM_SEALED_VERSION));
         assert!(!V167_ASSIGNED_OR_RETIRED.contains(&XFER_OFFER_SEALED_VERSION));
+        assert!(!V167_ASSIGNED_OR_RETIRED.contains(&XFER_SEEN_PLAIN_VERSION));
         // A room friend request too: v1.6.7 neither reads nor relays it.
         assert!(!V167_ASSIGNED_OR_RETIRED.contains(&ROOM_FRIEND_REQUEST_PLAIN_VERSION));
         assert_eq!(

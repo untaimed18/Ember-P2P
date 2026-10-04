@@ -62,7 +62,15 @@
     type PendingRestoreStatus,
     type RestoreSummary,
   } from '$lib/api/backup';
-  import { formatDateTime, formatSize, formatSpeed, shortPubkey } from '$lib/utils';
+  import { collectBackupPrefs } from '$lib/backupPrefs';
+  import {
+    clampInputUtf8Bytes,
+    formatDateTime,
+    formatSize,
+    formatSpeed,
+    NICKNAME_MAX_BYTES,
+    shortPubkey,
+  } from '$lib/utils';
   import { getRuntimeStatus } from '$lib/api/system';
   import {
     MAX_RULE_LABEL_CHARS,
@@ -70,6 +78,7 @@
     endTimeValueToMinutes,
     hasDay,
     isOvernight,
+    MAX_CONFIGURED_SPEED_BPS,
     minutesToTimeValue,
     newScheduleRule,
     ruleProblem,
@@ -112,10 +121,76 @@
     restartToUpdate,
     runStagedInstaller,
   } from '$lib/stores/updater';
+  import { silentUpdate, silentUpdateResume } from '$lib/stores/silentUpdate';
+  import { toastError } from '$lib/stores/toast';
   import { networkStats } from '$lib/stores/network';
+  import { isShortcutLetter } from '$lib/shortcutKey';
 
   const appVersion = import.meta.env.VITE_APP_VERSION;
   const appLicense = import.meta.env.VITE_APP_LICENSE;
+
+  // Silent updates. `supported` is the backend's answer for this install;
+  // the status line describes what the saved setting is doing right now.
+  const silentSupported = $derived($silentUpdate?.supported ?? false);
+  const silentUnsupportedHint = $derived.by(() => {
+    switch ($silentUpdate?.unsupportedReason) {
+      case 'deb':
+        return m.settings_silent_update_unsupported_deb();
+      case 'msi':
+        return m.settings_silent_update_unsupported_msi();
+      default:
+        return m.settings_silent_update_unsupported_other();
+    }
+  });
+  const silentStatusText = $derived.by(() => {
+    const s = $silentUpdate;
+    if (!s || !s.supported) return '';
+    const version = s.version ?? '';
+    const lastSuccess = s.lastSuccess
+      ? m.silent_update_status_last_success({
+          version: s.lastSuccess.to,
+          date: formatDateTime(Math.floor(s.lastSuccess.at / 1000), {
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+          }),
+        })
+      : '';
+    if (!s.enabled) return lastSuccess;
+    switch (s.phase) {
+      case 'preparing':
+        return s.prepareFailed
+          ? m.silent_update_status_prepare_failed({ version })
+          : m.silent_update_status_preparing({ version });
+      case 'waiting':
+        return m.silent_update_status_waiting({ version });
+      case 'postponed':
+        return m.silent_update_status_postponed({
+          version,
+          time: formatDateTime(Math.floor((s.postponedUntil ?? 0) / 1000), {
+            weekday: 'short',
+            hour: 'numeric',
+            minute: '2-digit',
+          }),
+        });
+      case 'held':
+        return m.silent_update_status_held({ version });
+      case 'countdown':
+        return m.silent_update_status_countdown({ version });
+      case 'installing':
+        return m.silent_update_status_installing({ version });
+      default:
+        return lastSuccess;
+    }
+  });
+
+  async function resumeSilentUpdate() {
+    try {
+      await silentUpdateResume();
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    }
+  }
 
   function updateSettingsOutcomeMessage(result: UpdateSettingsResult): string {
     switch (result.outcome) {
@@ -343,7 +418,12 @@
     backupBusy = true;
     showBackupMsg(m.settings_backup_exporting(), 'progress');
     try {
-      const summary = await exportBackup(backupPassphrase);
+      const summary = await exportBackup(
+        backupPassphrase,
+        collectBackupPrefs(typeof localStorage === 'undefined' ? null : localStorage, {
+          searchHistory: $appSettings?.save_search_history,
+        }),
+      );
       if (!summary) {
         backupMessage = null;
         return;
@@ -1017,7 +1097,7 @@
       if (hasUnsavedChanges) e.preventDefault();
     };
     const handleKeyboardSave = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+      if ((e.ctrlKey || e.metaKey) && isShortcutLetter(e, 's')) {
         e.preventDefault();
         if (hasUnsavedChanges) handleSave();
       }
@@ -1071,6 +1151,10 @@
     return Math.min(max, Math.max(0, Math.trunc(n)));
   }
 
+  function clampNicknameInput(event: Event) {
+    if (settings) settings.nickname = clampInputUtf8Bytes(event, NICKNAME_MAX_BYTES, settings.nickname);
+  }
+
   /** Validate and clamp numeric fields to the ranges documented in AppSettings.
    *  Returns an error message on hard failure (mutates nothing in that case).
    *  Otherwise mutates `s` in place and reports whether any numeric field was
@@ -1081,11 +1165,9 @@
     if (!s.nickname.trim()) {
       return { error: m.settings_validation_nickname_empty(), adjusted: false };
     }
-    // Mirror the backend's 128-byte cap (commands/settings.rs) so an oversized
-    // nickname is rejected here with a clear message instead of only failing on
-    // save. `maxlength` on the input is a coarse char guard; this is the
-    // authoritative byte check (multi-byte UTF-8 can exceed it).
-    if (new TextEncoder().encode(s.nickname).length > 128) {
+    // Mirror the backend's 128-byte cap (commands/settings.rs). The input
+    // already stops at it; this catches a value that arrived another way.
+    if (new TextEncoder().encode(s.nickname).length > NICKNAME_MAX_BYTES) {
       return { error: m.error_settings_nickname_too_long(), adjusted: false };
     }
     if (s.channel_username.trim() && !isValidChannelUsername(s.channel_username)) {
@@ -1162,21 +1244,24 @@
     // (eMule has always allowed this too). This matters for users on a
     // VPN that only forwards a single port for both protocols. The only
     // thing we still require is that the port is in the 1-65535 range.
-    s.max_upload_speed = cn(s.max_upload_speed, 2_147_483_647, 0);
-    s.max_download_speed = cn(s.max_download_speed, 2_147_483_647, 0);
-    s.max_concurrent_downloads = ci(s.max_concurrent_downloads, 1, 50, 3);
-    s.max_concurrent_uploads = ci(s.max_concurrent_uploads, 1, 50, 4);
-    s.max_sources_per_file = ci(s.max_sources_per_file, 1, 2000, 1000);
+    s.max_upload_speed = cn(s.max_upload_speed, MAX_CONFIGURED_SPEED_BPS, 0);
+    // The clearing effect waits for the cap field to lose focus, and a save
+    // can arrive before it does.
+    if (s.max_upload_speed === 0) s.uss_enabled = false;
+    s.max_download_speed = cn(s.max_download_speed, MAX_CONFIGURED_SPEED_BPS, 0);
+    s.max_concurrent_downloads = ci(s.max_concurrent_downloads, 1, 50, 5);
+    s.max_concurrent_uploads = ci(s.max_concurrent_uploads, 1, 50, 5);
+    s.max_sources_per_file = ci(s.max_sources_per_file, 50, 2000, 400);
     s.max_connections = ci(s.max_connections, 1, 2000, 500);
     // Lower bound 0: that is the documented "no burst gate" value, not an
     // empty box — `numericFields` above already rejects those.
     s.max_connections_per_five_secs = ci(s.max_connections_per_five_secs, 0, 500, 20);
-    s.download_queue_wait_secs = ci(s.download_queue_wait_secs, 60, 14400, 600);
+    s.download_queue_wait_secs = ci(s.download_queue_wait_secs, 60, 14400, 1800);
     s.multisource_retry_rounds = ci(s.multisource_retry_rounds, 1, 20, 3);
     s.download_part_retry_rounds = ci(s.download_part_retry_rounds, 1, 20, 3);
     s.max_download_file_size_gib = ci(s.max_download_file_size_gib, 1, 593, 593);
     s.search_timeout_secs = ci(s.search_timeout_secs, 30, 600, 120);
-    s.max_friends = ci(s.max_friends, 1, 500, 100);
+    s.max_friends = ci(s.max_friends, 1, 500, 200);
     // 0 is "always ask", not an empty box; the ceiling is the attachment cap.
     s.chat_attachment_auto_accept_mb = cn(s.chat_attachment_auto_accept_mb, 2048, 25);
     return { error: null, adjusted };
@@ -1247,7 +1332,6 @@
     if (cached) {
       setAppSettings({
         ...cached,
-        friend_require_approval: settings.friend_require_approval,
         friend_chat_disabled: settings.friend_chat_disabled,
         friend_chat_read_receipts: settings.friend_chat_read_receipts,
         friend_browse_disabled: settings.friend_browse_disabled,
@@ -1269,7 +1353,6 @@
           const latest = await getSettings();
           const candidate = {
             ...latest,
-            friend_require_approval: settings.friend_require_approval,
             friend_chat_disabled: settings.friend_chat_disabled,
             friend_chat_read_receipts: settings.friend_chat_read_receipts,
             friend_browse_disabled: settings.friend_browse_disabled,
@@ -1282,7 +1365,6 @@
             settings.settings_revision = result.settings.settings_revision;
             if (originalSettings) {
               const baseline = JSON.parse(originalSettings) as AppSettings;
-              baseline.friend_require_approval = result.settings.friend_require_approval;
               baseline.friend_chat_disabled = result.settings.friend_chat_disabled;
               baseline.friend_chat_read_receipts = result.settings.friend_chat_read_receipts;
               baseline.friend_browse_disabled = result.settings.friend_browse_disabled;
@@ -1312,7 +1394,6 @@
       if (persisted) {
         setAppSettings(persisted);
         if (settings) {
-          settings.friend_require_approval = persisted.friend_require_approval;
           settings.friend_chat_disabled = persisted.friend_chat_disabled;
           settings.friend_chat_read_receipts = persisted.friend_chat_read_receipts;
           settings.friend_browse_disabled = persisted.friend_browse_disabled;
@@ -1325,7 +1406,6 @@
         // Save with nothing edited and popping the leave guard on every exit.
         if (originalSettings) {
           const baseline = JSON.parse(originalSettings) as AppSettings;
-          baseline.friend_require_approval = persisted.friend_require_approval;
           baseline.friend_chat_disabled = persisted.friend_chat_disabled;
           baseline.friend_chat_read_receipts = persisted.friend_chat_read_receipts;
           baseline.friend_browse_disabled = persisted.friend_browse_disabled;
@@ -1758,8 +1838,8 @@
     const trimmedName = name.trim();
     const trimmedUrl = url.trim();
     if (!trimmedName || !looksLikeWebServiceUrl(trimmedUrl)) return 'invalid';
-    if (current.web_services.length >= MAX_WEB_SERVICES) return 'full';
     if (current.web_services.some((s) => s.url === trimmedUrl)) return 'duplicate';
+    if (current.web_services.length >= MAX_WEB_SERVICES) return 'full';
     current.web_services = [...current.web_services, { name: trimmedName, url: trimmedUrl }];
     return 'added';
   }
@@ -1811,23 +1891,22 @@
       // Null is a dismissed picker, which is not a failure and not worth a
       // message.
       if (imported === null) return;
-      let added = 0;
-      for (const service of imported) {
-        if (addWebServiceEntry(service.name, service.url) === 'added') added += 1;
-      }
+      const outcomes = imported.map((service) => addWebServiceEntry(service.name, service.url));
+      const added = outcomes.filter((o) => o === 'added').length;
+      const full = outcomes.includes('full') ? m.webservices_full({ max: MAX_WEB_SERVICES }) : null;
       if (added === 0) {
         webServiceMessage = {
           kind: 'err',
-          text: imported.length === 0 ? m.webservices_import_none() : m.webservices_import_duplicate(),
+          text:
+            full ??
+            (outcomes.includes('duplicate') ? m.webservices_import_duplicate() : m.webservices_import_none()),
         };
       } else {
-        webServiceMessage = {
-          kind: 'ok',
-          text: plural(added, {
-            one: m.webservices_imported_one,
-            other: () => m.webservices_imported_other({ count: added }),
-          }),
-        };
+        const addedText = plural(added, {
+          one: m.webservices_imported_one,
+          other: () => m.webservices_imported_other({ count: added }),
+        });
+        webServiceMessage = { kind: 'ok', text: full ? `${addedText} ${full}` : addedText };
       }
     } catch (e: unknown) {
       webServiceMessage = { kind: 'err', text: translateError(e) };
@@ -2196,10 +2275,20 @@
     });
   });
 
+  // Focus is inside the upload cap field. Emptying it to retype a value, or
+  // typing the "0" of "0.5", reads as 0 for a keystroke.
+  let uploadCapEditing = $state(false);
+
   // USS needs a non-zero upload cap. Clear the flag when the user switches
-  // to Unlimited so save can't persist an inert/invalid combo.
+  // to Unlimited so save can't persist an inert/invalid combo. Not while the
+  // cap is being typed: the passing 0 would turn USS off for good.
   $effect(() => {
-    if (settings && settings.max_upload_speed === 0 && settings.uss_enabled) {
+    if (
+      settings &&
+      settings.max_upload_speed === 0 &&
+      settings.uss_enabled &&
+      !uploadCapEditing
+    ) {
       settings.uss_enabled = false;
       // A config that already violated the invariant on disk makes this clear
       // ours, not an edit: `onMount` snapshots `originalSettings` before
@@ -2543,7 +2632,15 @@
           <div class="divider"></div>
           <div class="field">
             <label for="nickname">{m.settings_nickname_label()}</label>
-            <input id="nickname" bind:value={settings.nickname} maxlength="128" placeholder={m.settings_nickname_placeholder()} />
+            <input
+              id="nickname"
+              value={settings.nickname}
+              maxlength="128"
+              oninput={clampNicknameInput}
+              oncompositionend={clampNicknameInput}
+              placeholder={m.settings_nickname_placeholder()}
+            />
+            <span class="hint">{m.settings_nickname_hint()}</span>
           </div>
           <div class="divider"></div>
           <div class="field toggle-row">
@@ -2864,19 +2961,29 @@
               </div>
             </div>
 
-            <div class="field">
-              <label for="max-dl-gib">{m.settings_max_file_size_label()}</label>
-              <input id="max-dl-gib" class="compact-number" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} />
-              <span class="hint">{m.settings_max_file_size_hint()}</span>
+            <!-- eMule's `MaxSourcesPerFile` is a knob its users tune for rare
+                 files, so it sits here beside the other limits. Applied live
+                 on save to every download's source list and the source
+                 cache; the backend floor is 50. -->
+            <div class="field-row">
+              <div class="field half">
+                <label for="max-sources">{m.settings_max_sources_label()}</label>
+                <input id="max-sources" type="number" min="50" max="2000" bind:value={settings.max_sources_per_file} />
+                <span class="hint">{m.settings_max_sources_hint()}</span>
+              </div>
+              <div class="field half">
+                <label for="max-dl-gib">{m.settings_max_file_size_label()}</label>
+                <input id="max-dl-gib" class="compact-number" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} />
+                <span class="hint">{m.settings_max_file_size_hint()}</span>
+              </div>
             </div>
           </div>
 
-          <!-- The remaining protocol budget / retry knobs (max_sources,
-               queue wait, retry rounds) stay in AppSettings for config.json
-               and backend clamps, but are intentionally not exposed here.
-               `max_connections` used to be in that list; it is above now,
-               because it governs upload-queue capacity and eMule has always
-               exposed it. -->
+          <!-- The remaining protocol budget / retry knobs (queue wait, retry
+               rounds) stay in AppSettings for config.json and backend clamps,
+               but are intentionally not exposed here. `max_connections` and
+               `max_sources_per_file` used to be in that list; they are above
+               now, because eMule has always exposed both. -->
 
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_behavior()}</h4>
@@ -3209,8 +3316,13 @@
               </span>
             </div>
           {/if}
-          <div class="field">
+          <div
+            class="field"
+            onfocusin={() => (uploadCapEditing = true)}
+            onfocusout={() => (uploadCapEditing = false)}
+          >
             <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} />
+            <span class="hint">{m.settings_max_upload_speed_hint()}</span>
           </div>
           <div class="field">
             <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} />
@@ -3481,12 +3593,10 @@
           <div class="divider"></div>
 
           <!--
-            KAD bootstraps on startup and there is no switch for it, so this
-            row states the behavior rather than pretending to offer a choice —
-            same shape as the Ember row above. Sitting out KAD for a session is
-            a runtime action and still lives on the KAD Network page; what it
-            is not is a preference that survives a restart, because a client
-            that cannot find peers is a client that looks broken.
+            KAD bootstraps on startup and there is no switch for it, nor a
+            Disconnect on the KAD Network page: Ember depends on it staying
+            connected. So this row states the behavior rather than pretending
+            to offer a choice — same shape as the Ember row above.
           -->
           <div class="field toggle-row">
             <div class="toggle-info">
@@ -3520,11 +3630,13 @@
           </div>
 
           <!--
-            eD2K server-list discovery. These mirror the three eMule
-            options under Options -> Servers. New-server admission from
-            server/client lists is read live after Save; purging already-
-            listed servers when "filter servers by IP" turns on also runs
-            on Save (and at startup / IP-filter reload).
+            eD2K server-list discovery, after eMule's Options -> Servers.
+            New-server admission from server lists is read live after Save;
+            purging already-listed servers when "filter servers by IP" turns
+            on also runs on Save (and at startup / IP-filter reload). eMule's
+            third option, servers learned from clients, has no switch here:
+            nothing in the backend adds servers from clients, so a toggle for
+            it would only claim to do something.
           -->
           <div class="field toggle-row">
             <div class="toggle-info">
@@ -3532,14 +3644,6 @@
               <span class="hint">{m.settings_update_servers_hint()}</span>
             </div>
             <ToggleSwitch bind:checked={settings.add_servers_from_server} ariaLabel={m.settings_update_servers_aria()} />
-          </div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_update_servers_clients_label()}</span>
-              <span class="hint">{m.settings_update_servers_clients_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.add_servers_from_clients} ariaLabel={m.settings_update_servers_clients_label()} />
           </div>
 
           <div class="field toggle-row">
@@ -3833,10 +3937,6 @@
           </div>
         </div>
         <div class="card-body">
-          {#if $appSettings?.ember_native_enabled === false}
-            <p class="channels-notice" role="status">{m.settings_channels_ember_off()}</p>
-          {/if}
-
           <div class="field">
             <label for="channel_username">{m.settings_channel_username_label()}</label>
             <input
@@ -4061,6 +4161,13 @@
                   when: formatDateTime(pendingRestore.staged_at),
                 })}
               </span>
+              {#if pendingRestore.expires_at > 0}
+                <span class="hint">
+                  {m.settings_backup_pending_expires({
+                    when: formatDateTime(pendingRestore.expires_at),
+                  })}
+                </span>
+              {/if}
               <div class="action-row">
                 <button class="action-btn" onclick={performRestart} disabled={backupBusy}>
                   {m.settings_restart_now()}
@@ -4283,7 +4390,14 @@
               <span class="toggle-title">{m.settings_auto_check_updates_label()}</span>
               <span class="hint">{m.settings_auto_check_updates_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.auto_check_updates} ariaLabel={m.settings_auto_check_updates_label()} />
+            <ToggleSwitch
+              bind:checked={settings.auto_check_updates}
+              ariaLabel={m.settings_auto_check_updates_label()}
+              onchange={(on) => {
+                // Silent updates install what these checks find.
+                if (!on && settings) settings.silent_update_enabled = false;
+              }}
+            />
           </div>
           <div class="field" class:about-frequency-disabled={!settings.auto_check_updates}>
             <label for="update-check-frequency">{m.settings_update_check_frequency_label()}</label>
@@ -4293,10 +4407,37 @@
               bind:value={settings.update_check_frequency}
               disabled={!settings.auto_check_updates}
             >
+              <option value="hourly">{m.settings_update_frequency_hourly()}</option>
               <option value="daily">{m.settings_update_frequency_daily()}</option>
               <option value="weekly">{m.settings_update_frequency_weekly()}</option>
               <option value="monthly">{m.settings_update_frequency_monthly()}</option>
             </select>
+          </div>
+          <div class="field toggle-row" class:about-frequency-disabled={!silentSupported}>
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_silent_update_label()}</span>
+              <span class="hint">
+                {silentSupported ? m.settings_silent_update_hint() : silentUnsupportedHint}
+              </span>
+              {#if silentSupported && silentStatusText}
+                <span class="hint silent-update-status">
+                  {silentStatusText}
+                  {#if $silentUpdate?.enabled && $silentUpdate.phase === 'postponed'}
+                    <button type="button" class="silent-update-resume" onclick={() => void resumeSilentUpdate()}>
+                      {m.silent_update_resume_btn()}
+                    </button>
+                  {/if}
+                </span>
+              {/if}
+            </div>
+            <ToggleSwitch
+              bind:checked={settings.silent_update_enabled}
+              disabled={!silentSupported}
+              ariaLabel={m.settings_silent_update_label()}
+              onchange={(on) => {
+                if (on && settings) settings.auto_check_updates = true;
+              }}
+            />
           </div>
 
           <div class="divider"></div>
@@ -5121,17 +5262,6 @@
     color: var(--text-muted);
   }
 
-  .channels-notice {
-    margin: 0 0 4px;
-    padding: 9px 12px;
-    border: 1px solid color-mix(in srgb, var(--warning) 30%, var(--border));
-    border-radius: var(--radius-md);
-    background: color-mix(in srgb, var(--warning) 9%, transparent);
-    color: var(--text-secondary);
-    font-size: var(--font-size-sm);
-    line-height: 1.45;
-  }
-
   .channels-pref-action {
     display: inline-flex;
     align-items: center;
@@ -5272,6 +5402,27 @@
 
   .about-frequency-disabled {
     opacity: 0.55;
+  }
+
+  .silent-update-status {
+    display: block;
+    margin-top: 4px;
+    color: var(--text-primary);
+  }
+
+  .silent-update-resume {
+    border: none;
+    background: transparent;
+    padding: 0;
+    margin-left: 6px;
+    color: var(--accent);
+    font-size: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .silent-update-resume:hover {
+    text-decoration: underline;
   }
 
   .about-update-panel {

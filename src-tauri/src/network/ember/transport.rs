@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -247,6 +247,9 @@ const XX_UNVALIDATED_MSG2_BURST: u32 = 64;
 /// covers the one legitimate spike there is: coming online and being dialled
 /// by everyone who already held our contact.
 ///
+/// XX message 1 draws on the same bucket once it reaches the Noise responder,
+/// cookie or no cookie: it is the same work.
+///
 /// Unlike the XX budget, a token is spent on every initiation we look at,
 /// including one that turns out to be malformed. That is deliberate but it is
 /// not free: the work being rationed *is* the read that decides whether the
@@ -325,7 +328,14 @@ struct NoiseSession {
     /// Bitmap of accepted nonces in `[recv_high - 63, recv_high]`; bit `i`
     /// represents `recv_high - i`.
     recv_window: u64,
+    /// Which handshake produced this session. Unique for the life of the
+    /// process, so a payload held back by one handshake is released only by a
+    /// frame read under that handshake's keys; see [`DeferredIkPayload`].
+    generation: u64,
 }
+
+/// Source of [`NoiseSession::generation`].
+static NEXT_SESSION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl NoiseSession {
     fn new(
@@ -335,6 +345,7 @@ impl NoiseSession {
     ) -> Self {
         let now = Instant::now();
         Self {
+            generation: NEXT_SESSION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             transport,
             remote_noise_pub,
             last_activity: now,
@@ -477,6 +488,10 @@ enum PendingHandshake {
     /// Noise_IK: we sent message 1, waiting for message 2.
     IkInitiator {
         state: snow::HandshakeState,
+        /// The payload message 1 carried. Kept because a crossed dial we lose
+        /// the tie on is refused by the peer, message and all, so it has to go
+        /// again over the session the peer's handshake produces.
+        first_message: Vec<u8>,
         queued: Vec<QueuedPayload>,
         created: Instant,
         /// Static key this handshake was started for. `pending` is keyed by
@@ -533,6 +548,8 @@ pub enum IncomingResult {
         from: SocketAddr,
         remote_noise_pub: [u8; 32],
         payload: Vec<u8>,
+        /// [`NoiseSession::generation`] of the session that read it.
+        generation: u64,
     },
     /// Handshake progressed; one or more response packets need to be sent.
     ///
@@ -704,16 +721,125 @@ impl EmberControlMessage {
     }
 }
 
+/// Sessions by `(address, static key)`. Ordered so that one address's slots
+/// are a range: the per-packet lookups run for junk from unknown addresses
+/// too, and a scan made each one cost the whole table.
+type SessionMap = BTreeMap<(SocketAddr, [u8; 32]), NoiseSession>;
+
+/// Every slot at `addr`.
+fn slots_at(
+    map: &SessionMap,
+    addr: SocketAddr,
+) -> impl Iterator<Item = (&(SocketAddr, [u8; 32]), &NoiseSession)> {
+    map.range((addr, [0u8; 32])..=(addr, [0xFFu8; 32]))
+}
+
+/// Addresses we have sent to from the KAD/Ember socket, and when: how the caller
+/// tells a peer that reached us unsolicited from one answering through a NAT
+/// mapping we opened ourselves. Keyed on address only: a peer's source port
+/// rotates, and the mapping question is about the host.
+///
+/// Shared, because the transport is not the only thing sending from that socket:
+/// QUIC rides it too when it shares the port, and every QUIC dial opens the same
+/// mapping a Noise packet would. The QUIC half writes from quinn's driver tasks
+/// once per datagram, so the lock is held only for a map update.
+#[derive(Clone, Default)]
+pub struct DialLog(std::sync::Arc<parking_lot::Mutex<DialLogInner>>);
+
+#[derive(Default)]
+struct DialLogInner {
+    at: HashMap<IpAddr, Instant>,
+    /// Insertion order for `at`, for the same reason as
+    /// `EmberTransport::recent_handshake_order`: capped eviction without an
+    /// O(n) scan of the map. Pushed only when an address is newly inserted —
+    /// refreshing an existing dial updates the map in place — so the queue
+    /// holds each resident address at most once and cannot outgrow it.
+    order: VecDeque<IpAddr>,
+    /// Until when a dial the cap pushed out would still have been inside
+    /// [`DIAL_MEMORY`]. The QUIC half also logs replies to unvalidated
+    /// sources, so spoofed Initials can fill the log. Read only by
+    /// [`EmberTransport::may_have_dialled`]: every other caller treats
+    /// "dialled" as permission, which a flood must not be able to grant.
+    saturated_until: Option<Instant>,
+}
+
+impl DialLog {
+    pub fn note(&self, ip: IpAddr) {
+        // Canonicalised on the way in as well as the way out. The socket is IPv4
+        // today so the two forms cannot both occur, but storing `::ffff:a.b.c.d`
+        // under one key and querying `a.b.c.d` under another would silently never
+        // match, and nothing about that failure would be visible.
+        let ip = ip.to_canonical();
+        let now = Instant::now();
+        let mut inner = self.0.lock();
+        if let Some(at) = inner.at.get_mut(&ip) {
+            // Already resident: refresh in place and leave its position in the
+            // order queue alone, so re-dialling a known address neither grows
+            // the queue nor costs an eviction.
+            *at = now;
+            return;
+        }
+        while inner.at.len() >= MAX_DIALLED_ADDRS {
+            let Some(oldest) = inner.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted_at) = inner.at.remove(&oldest) {
+                let forgotten_until = evicted_at + DIAL_MEMORY;
+                if forgotten_until > now {
+                    inner.saturated_until = Some(
+                        inner
+                            .saturated_until
+                            .map_or(forgotten_until, |until| until.max(forgotten_until)),
+                    );
+                }
+                break;
+            }
+        }
+        inner.at.insert(ip, now);
+        inner.order.push_back(ip);
+    }
+
+    /// Compared on the canonical address so an IPv4-mapped IPv6 source matches the
+    /// v4 entry it belongs to, rather than silently missing.
+    pub fn recent(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        self.0
+            .lock()
+            .at
+            .get(&ip)
+            .is_some_and(|at| at.elapsed() < DIAL_MEMORY)
+    }
+
+    /// Whether the cap has pushed out a dial still inside [`DIAL_MEMORY`], so
+    /// an address [`Self::recent`] says nothing about may have been dialled.
+    fn forgot_a_live_dial(&self) -> bool {
+        self.0
+            .lock()
+            .saturated_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn prune(&self, now: Instant) {
+        let mut inner = self.0.lock();
+        inner.at.retain(|_, at| now.duration_since(*at) < DIAL_MEMORY);
+        if inner.saturated_until.is_some_and(|until| now >= until) {
+            inner.saturated_until = None;
+        }
+        let DialLogInner { at, order, .. } = &mut *inner;
+        order.retain(|ip| at.contains_key(ip));
+    }
+}
+
 pub struct EmberTransport {
     local_noise_key: [u8; 32],
     local_noise_pub: [u8; 32],
-    sessions: HashMap<(SocketAddr, [u8; 32]), NoiseSession>,
+    sessions: SessionMap,
     /// Completed handshakes waiting to replace a slot that already holds a
     /// *proven* session. Consulted only after every live session at the address
     /// has failed AEAD, and promoted the moment one of these decrypts a frame.
     /// See [`EmberTransport::install_session`] for why a proven session is
     /// never displaced on the strength of a handshake alone.
-    staged_sessions: HashMap<(SocketAddr, [u8; 32]), NoiseSession>,
+    staged_sessions: SessionMap,
     pending: HashMap<SocketAddr, PendingHandshake>,
     /// BLAKE3 digests of recently-processed handshake-initiation packets
     /// (`IK_INIT`, `XX_MSG1`) with the time we first saw them. An attacker can
@@ -748,17 +874,9 @@ pub struct EmberTransport {
     /// cannot be aimed by an attacker choosing its source addresses.
     trim_salt: [u8; 32],
     /// Addresses we have sent to, and when. Written by [`Self::note_dialled`] and
-    /// read by [`Self::recently_dialled`], which is how the caller tells a peer
-    /// that reached us unsolicited from one answering through a NAT mapping we
-    /// opened ourselves. Keyed on address only: a peer's source port rotates, and
-    /// the mapping question is about the host.
-    dialled: HashMap<IpAddr, Instant>,
-    /// Insertion order for `dialled`, for the same reason as
-    /// `recent_handshake_order`: capped eviction without an O(n) scan of the
-    /// map. Pushed only when an address is newly inserted — refreshing an
-    /// existing dial updates the map in place — so the queue holds each
-    /// resident address at most once and cannot outgrow it.
-    dialled_order: VecDeque<IpAddr>,
+    /// by the QUIC half of the shared socket, and read by
+    /// [`Self::recently_dialled`]. See [`DialLog`].
+    dialled: DialLog,
     /// Secret keying the XX retry cookie, and the one it replaced. Two, not
     /// one, so a cookie minted a moment before a rotation is still honoured
     /// a moment after it. This is the *only* state an unvalidated XX msg1
@@ -796,6 +914,17 @@ struct DeferredIkPayload {
     /// forged initiation borrow a genuine peer's identity binding.
     remote_noise_pub: [u8; 32],
     stored: Instant,
+    /// The session the carrying handshake produced. Only a frame read under
+    /// its keys releases the payload.
+    ///
+    /// Any frame from this address and key used to, on whichever session read
+    /// it. Past the replay window a captured `IK_INIT` is processed again: the
+    /// session it builds is only staged beside the live one, but it re-armed
+    /// the payload, and the peer's next ordinary frame released it a second
+    /// time — every thirty seconds, for as long as the attacker kept replaying
+    /// one packet. The staged session's keys come from our fresh ephemeral, so
+    /// a replayer never produces the frame that would release its payload.
+    generation: u64,
 }
 
 /// A handshake initiation we have already processed.
@@ -837,19 +966,25 @@ impl Drop for EmberTransport {
 }
 
 impl EmberTransport {
+    #[cfg(test)]
     pub fn new(local_noise_key: [u8; 32], local_noise_pub: [u8; 32]) -> Self {
+        Self::with_dial_log(local_noise_key, local_noise_pub, DialLog::default())
+    }
+
+    /// A transport whose dial record is shared with `dialled`'s other writers,
+    /// so [`Self::recently_dialled`] answers for their sends too.
+    pub fn with_dial_log(local_noise_key: [u8; 32], local_noise_pub: [u8; 32], dialled: DialLog) -> Self {
         Self {
             local_noise_key,
             local_noise_pub,
-            sessions: HashMap::new(),
-            staged_sessions: HashMap::new(),
+            sessions: BTreeMap::new(),
+            staged_sessions: BTreeMap::new(),
             pending: HashMap::new(),
             recent_handshakes: HashMap::new(),
             recent_handshake_order: VecDeque::new(),
             deferred_ik: HashMap::new(),
             trim_salt: fresh_cookie_secret(),
-            dialled: HashMap::new(),
-            dialled_order: VecDeque::new(),
+            dialled,
             cookie_secret: fresh_cookie_secret(),
             prev_cookie_secret: fresh_cookie_secret(),
             cookie_rotated_at: Instant::now(),
@@ -860,13 +995,13 @@ impl EmberTransport {
         }
     }
 
-    /// Whether we may run the Noise responder for one fresh IK initiation,
-    /// charging it if so.
+    /// Whether we may run the Noise responder for one fresh IK initiation or
+    /// XX message 1, charging it if so. See [`IK_HANDSHAKE_PER_SEC`].
     ///
     /// Charged on take, unlike [`Self::xx_msg2_budget_available`] and its
     /// separate spend: there the token pays for a packet that may still not be
     /// sent, here it pays for the crypto we are about to do either way.
-    fn take_ik_handshake_token(&mut self) -> bool {
+    fn take_handshake_token(&mut self) -> bool {
         let now = Instant::now();
         let elapsed = now.duration_since(self.ik_refilled_at);
         let earned = (elapsed.as_millis() as u64 * u64::from(IK_HANDSHAKE_PER_SEC)) / 1000;
@@ -1119,49 +1254,27 @@ impl EmberTransport {
     /// including gossip contacts the routing table refused, and so is the *common*
     /// way to open a mapping to a peer we have no contact for.
     fn note_dialled(&mut self, ip: IpAddr) {
-        // Canonicalised on the way in as well as the way out. The socket is IPv4
-        // today so the two forms cannot both occur, but storing `::ffff:a.b.c.d`
-        // under one key and querying `a.b.c.d` under another would silently never
-        // match, and nothing about that failure would be visible.
-        let ip = ip.to_canonical();
-        let now = Instant::now();
-        if let Some(at) = self.dialled.get_mut(&ip) {
-            // Already resident: refresh in place and leave its position in the
-            // order queue alone, so re-dialling a known address neither grows
-            // the queue nor costs an eviction.
-            *at = now;
-            return;
-        }
-        while self.dialled.len() >= MAX_DIALLED_ADDRS {
-            let Some(oldest) = self.dialled_order.pop_front() else {
-                break;
-            };
-            if self.dialled.remove(&oldest).is_some() {
-                break;
-            }
-        }
-        self.dialled.insert(ip, now);
-        self.dialled_order.push_back(ip);
+        self.dialled.note(ip);
     }
 
     /// Whether we have sent anything to this address recently enough that a NAT
     /// mapping we opened could still be carrying its reply.
-    ///
-    /// Compared on the canonical address so an IPv4-mapped IPv6 source matches the
-    /// v4 entry it belongs to, rather than silently missing.
     pub fn recently_dialled(&self, ip: IpAddr) -> bool {
-        let ip = ip.to_canonical();
-        self.dialled
-            .get(&ip)
-            .is_some_and(|at| at.elapsed() < DIAL_MEMORY)
+        self.dialled.recent(ip)
+    }
+
+    /// [`Self::recently_dialled`], or unknown because the log had to forget a
+    /// dial that was still live. For the one question where a wrong "no" is
+    /// the dangerous answer: whether a ping could be a reply through our own
+    /// mapping rather than proof our port is open.
+    pub fn may_have_dialled(&self, ip: IpAddr) -> bool {
+        self.dialled.forgot_a_live_dial() || self.dialled.recent(ip)
     }
 
     /// Check if we have an established session with a peer.
     #[allow(dead_code)]
     pub fn has_session(&self, addr: &SocketAddr) -> bool {
-        self.sessions
-            .keys()
-            .any(|(session_addr, _)| session_addr == addr)
+        slots_at(&self.sessions, *addr).next().is_some()
     }
 
     /// Whether a completed Noise session exists for this identity at `addr`.
@@ -1244,6 +1357,10 @@ impl EmberTransport {
         remote_noise_pub: Option<&[u8; 32]>,
         message: &[u8],
     ) -> OutgoingResult {
+        if message.is_empty() {
+            // What `encode_message` returns for a frame it refused to build.
+            return OutgoingResult::Error("empty message".to_string());
+        }
         self.note_dialled(peer.ip());
 
         // Fast path: an established session for the identity we were asked to
@@ -1405,10 +1522,7 @@ impl EmberTransport {
         let mut unique: Option<(SocketAddr, [u8; 32])> = None;
         let mut best: Option<((SocketAddr, [u8; 32]), bool, Instant)> = None;
         let mut count = 0usize;
-        for (slot, session) in &self.sessions {
-            if slot.0 != peer {
-                continue;
-            }
+        for (slot, session) in slots_at(&self.sessions, peer) {
             count += 1;
             unique = Some(*slot);
             let rank = (session.addr_validated, session.last_activity);
@@ -1504,23 +1618,13 @@ impl EmberTransport {
     /// she is the arrival, so the oldest spoof stays and a newer one is dropped
     /// instead of her.
     fn trim_sessions_at(&mut self, addr: SocketAddr, arriving: [u8; 32]) {
-        while self
-            .sessions
-            .keys()
-            .filter(|(session_addr, _)| *session_addr == addr)
-            .count()
-            > MAX_SESSIONS_PER_ADDR
-        {
+        while slots_at(&self.sessions, addr).count() > MAX_SESSIONS_PER_ADDR {
             let arriving_validated = self
                 .sessions
                 .get(&(addr, arriving))
                 .is_some_and(|session| session.addr_validated);
-            let newest_unvalidated = self
-                .sessions
-                .iter()
-                .filter(|((session_addr, key), session)| {
-                    *session_addr == addr && *key != arriving && !session.addr_validated
-                })
+            let newest_unvalidated = slots_at(&self.sessions, addr)
+                .filter(|((_, key), session)| *key != arriving && !session.addr_validated)
                 .max_by_key(|(_, session)| session.established)
                 .map(|(slot, _)| *slot);
             if let Some(victim) = newest_unvalidated {
@@ -1532,10 +1636,8 @@ impl EmberTransport {
                 self.sessions.remove(&(addr, arriving));
                 break;
             }
-            let lru = self
-                .sessions
-                .iter()
-                .filter(|((session_addr, key), _)| *session_addr == addr && *key != arriving)
+            let lru = slots_at(&self.sessions, addr)
+                .filter(|((_, key), _)| *key != arriving)
                 .min_by_key(|(_, session)| session.last_activity)
                 .map(|(slot, _)| *slot);
             if let Some(victim) = lru {
@@ -1591,17 +1693,14 @@ impl EmberTransport {
             .retain(|_, e| now.duration_since(e.seen_at) < HANDSHAKE_REPLAY_TTL);
         self.deferred_ik
             .retain(|_, d| now.duration_since(d.stored) < DEFERRED_IK_PAYLOAD_TTL);
-        self.dialled
-            .retain(|_, at| now.duration_since(*at) < DIAL_MEMORY);
-        // Both order queues are swept alongside the maps they index. Stale rows
-        // are harmless at pop time but would otherwise accumulate for the life
-        // of the process, since eviction is the only other thing that drains
-        // them and it only runs at the cap.
+        self.dialled.prune(now);
+        // Swept alongside the map it indexes. Stale rows are harmless at pop
+        // time but would otherwise accumulate for the life of the process, since
+        // eviction is the only other thing that drains them and it only runs at
+        // the cap.
         let live_handshakes = &self.recent_handshakes;
         self.recent_handshake_order
             .retain(|(k, at)| live_handshakes.get(k).is_some_and(|e| e.seen_at == *at));
-        let live_dialled = &self.dialled;
-        self.dialled_order.retain(|ip| live_dialled.contains_key(ip));
     }
 
     /// Drop the session, staged re-handshake and deferred payload held for one
@@ -1718,8 +1817,10 @@ impl EmberTransport {
         // deferral only as a payload that arrives one round trip late.
         let released = match &result {
             IncomingResult::Message {
-                remote_noise_pub, ..
-            } => self.take_deferred_ik(from, remote_noise_pub),
+                remote_noise_pub,
+                generation,
+                ..
+            } => self.take_deferred_ik(from, remote_noise_pub, *generation),
             _ => None,
         };
 
@@ -1767,8 +1868,9 @@ impl EmberTransport {
         // request embedded in IK_INIT, which a search retries once and a
         // one-shot `STORE_RECORD` or `ExchangeRequest` never recovers.
         // Releasing on a non-probe frame weakens nothing: `take_deferred_ik`
-        // only fires on a frame that authenticated under keys derived from
-        // our IK_RESP, which is the same proof the `Pong` carried.
+        // only fires on a frame read by the session this handshake produced,
+        // under keys derived from our IK_RESP, which is the same proof the
+        // `Pong` carried.
         //
         // The probe answer itself is ours to swallow — surfacing it would
         // look like an unsolicited reply to the caller's pending-ping
@@ -1887,6 +1989,7 @@ impl EmberTransport {
                     peer,
                     PendingHandshake::IkInitiator {
                         state: initiator,
+                        first_message: first_message.to_vec(),
                         queued,
                         created: Instant::now(),
                         remote_noise_pub: *remote_pub,
@@ -1913,10 +2016,20 @@ impl EmberTransport {
         // `prepare_outgoing` keeps refreshing `last_activity` so the idle
         // timeout never fires, and the collision itself marked the contact
         // fresh enough to skip liveness pings for ten minutes.
-        if matches!(
-            self.pending.get(&from),
-            Some(PendingHandshake::IkInitiator { .. } | PendingHandshake::XxInitiatorMsg1 { .. })
-        ) {
+        //
+        // Refusing on both sides left each first message to wait out the 30 s
+        // timeout instead, so a crossed IK dial is settled by static key: the
+        // lower key stays initiator, and the higher one answers as responder
+        // and hands what it had queued to the session that produces. Each side
+        // decides from its own key and the one it dialled, so they agree.
+        let initiator_in_flight = match self.pending.get(&from) {
+            Some(PendingHandshake::IkInitiator { remote_noise_pub, .. }) => {
+                *self.local_noise_public_key() < *remote_noise_pub
+            }
+            Some(PendingHandshake::XxInitiatorMsg1 { .. }) => true,
+            _ => false,
+        };
+        if initiator_in_flight {
             debug!("Ignoring IK init from {from}: an initiator handshake is in flight");
             return IncomingResult::Rejected;
         }
@@ -1948,7 +2061,7 @@ impl EmberTransport {
         // why this one sits so far above honest traffic. A retransmit was
         // already answered from the replay cache without reaching here, so a
         // drop costs a peer one attempt, not a handshake.
-        if !self.take_ik_handshake_token() {
+        if !self.take_handshake_token() {
             trace!("Dropping IK init from {from}: over the handshake budget");
             self.forget_handshake(&handshake_digest);
             return IncomingResult::Rejected;
@@ -2037,18 +2150,42 @@ impl EmberTransport {
         // problem — an unauthenticated forged `XX_MSG1` would then block real IK
         // handshakes, which is the worse trade, since msg1 proves nothing at all
         // while a completed IK is authenticated.
-        let hold_inbound_xx = matches!(
-            self.pending.get(&from),
-            Some(PendingHandshake::XxResponderMsg2 { created, .. })
-                if created.elapsed() < XX_RESPONDER_QUEUE_GRACE
-        );
-        if !hold_inbound_xx {
-            self.pending.remove(&from);
-        }
+        //
+        // Our own IK initiator is only still here when we lost the tie above.
+        // It is ours to give up only if this handshake reached the identity it
+        // was dialling; another identity at the address leaves it running.
+        let crossed_initiator = match self.pending.get(&from) {
+            Some(PendingHandshake::IkInitiator { remote_noise_pub: target, .. }) => {
+                Some(*target == remote_noise_pub)
+            }
+            _ => None,
+        };
+        let keep_pending = crossed_initiator == Some(false)
+            || matches!(
+                self.pending.get(&from),
+                Some(PendingHandshake::XxResponderMsg2 { created, .. })
+                    if created.elapsed() < XX_RESPONDER_QUEUE_GRACE
+            );
         trace!("IK handshake completed (responder) with {from}");
 
         self.remember_handshake_response(handshake_digest, resp_buf.clone());
         let mut packets_to_send = vec![resp_buf];
+        if crossed_initiator == Some(true) {
+            if let Some(PendingHandshake::IkInitiator { first_message, queued, .. }) =
+                self.pending.get(&from)
+            {
+                let first = (!first_message.is_empty()).then_some(first_message.as_slice());
+                let rest = queued
+                    .iter()
+                    .filter(|q| q.addressed_to(&remote_noise_pub))
+                    .map(|q| q.bytes.as_slice());
+                for msg in first.into_iter().chain(rest) {
+                    if let Some(packet) = session.seal(msg) {
+                        packets_to_send.push(packet);
+                    }
+                }
+            }
+        }
 
         // Nothing in message 1 proves the sender can *receive* where it says
         // it is. IK is 1-RTT and every node's static key is published in
@@ -2080,6 +2217,7 @@ impl EmberTransport {
                     payload: payload_buf[..payload_len].to_vec(),
                     remote_noise_pub,
                     stored: Instant::now(),
+                    generation: session.generation,
                 },
             );
             let probe = EmberControlMessage::Ping { nonce: probe_nonce }.encode();
@@ -2129,6 +2267,9 @@ impl EmberTransport {
             debug!("IK responder: per-address session cap refused {from}; not answering");
             return IncomingResult::Rejected;
         }
+        if !keep_pending {
+            self.pending.remove(&from);
+        }
 
         IncomingResult::HandshakeComplete {
             peer: from,
@@ -2144,15 +2285,24 @@ impl EmberTransport {
         &mut self,
         from: SocketAddr,
         remote_noise_pub: &[u8; 32],
+        generation: u64,
     ) -> Option<DeferredIkPayload> {
         // Logged rather than silently returning `None`: a dropped deferral means
         // a peer's first-contact request is gone, and for a one-shot publish or
         // exchange there is no retry to make it look like anything but a peer
         // that never asked.
-        let Some(entry) = self.deferred_ik.remove(&(from, *remote_noise_pub)) else {
+        let slot = (from, *remote_noise_pub);
+        let Some(held) = self.deferred_ik.get(&slot) else {
             trace!("No deferred IK payload for {from}: evicted, expired, or never held one");
             return None;
         };
+        // Held for another session at this address and key: the one its
+        // handshake staged, which only its own frames can promote. Left in
+        // place for that, or for the TTL sweep.
+        if held.generation != generation {
+            return None;
+        }
+        let entry = self.deferred_ik.remove(&slot)?;
         // The key already pins the claimant, so this only drops one that has sat
         // here past its TTL. The static-key comparison stays as a belt-and-braces
         // check against a future caller keying it differently.
@@ -2567,6 +2717,16 @@ impl EmberTransport {
                 };
             }
         };
+        // The cookie waives the reflection limit above, not this one: a proven
+        // address still costs a keypair and two X25519 per msg1, and the cookie
+        // is reusable for its whole lifetime, so without this a host at its
+        // own address could stream fresh ephemerals at the network task
+        // unmetered. Same bucket as IK, since it is the same CPU.
+        if !self.take_handshake_token() {
+            trace!("Dropping XX msg1 from {from}: over the handshake budget");
+            self.forget_handshake(&handshake_digest);
+            return IncomingResult::Rejected;
+        }
         let params = match NOISE_PATTERN_XX.parse::<snow::params::NoiseParams>() {
             Ok(p) => p,
             Err(_) => return IncomingResult::Rejected,
@@ -2917,17 +3077,11 @@ impl EmberTransport {
 
         // Try every session at this address until AEAD succeeds. A squatter's
         // replay window or decrypt failure must not hide the real peer's frame.
-        let candidates: Vec<[u8; 32]> = self
-            .sessions
-            .keys()
-            .filter(|(addr, _)| *addr == from)
-            .map(|(_, key)| *key)
+        let candidates: Vec<[u8; 32]> = slots_at(&self.sessions, from)
+            .map(|((_, key), _)| *key)
             .collect();
-        let staged: Vec<[u8; 32]> = self
-            .staged_sessions
-            .keys()
-            .filter(|(addr, _)| *addr == from)
-            .map(|(_, key)| *key)
+        let staged: Vec<[u8; 32]> = slots_at(&self.staged_sessions, from)
+            .map(|((_, key), _)| *key)
             .collect();
         if candidates.is_empty() && staged.is_empty() {
             debug!("Ember transport packet from {from} with no session");
@@ -2955,6 +3109,7 @@ impl EmberTransport {
                         from,
                         remote_noise_pub: session.remote_noise_pub,
                         payload: payload_buf[..len].to_vec(),
+                        generation: session.generation,
                     };
                 }
                 Err(_) => continue,
@@ -2989,6 +3144,7 @@ impl EmberTransport {
                     promoted.last_inbound = now;
                     promoted.addr_validated = true;
                     let remote_noise_pub = promoted.remote_noise_pub;
+                    let generation = promoted.generation;
                     debug!(
                         "Ember transport: promoting re-handshaked session for {from} after it decrypted a frame"
                     );
@@ -3001,6 +3157,7 @@ impl EmberTransport {
                         from,
                         remote_noise_pub,
                         payload: payload_buf[..len].to_vec(),
+                        generation,
                     };
                 }
                 Err(_) => continue,
@@ -3018,16 +3175,26 @@ impl EmberTransport {
     /// when nothing unproven remains. Ties break on a per-process salted hash
     /// of the address, so the order cannot be aimed by choosing source addresses.
     fn evict_one_session(&mut self) {
-        let victim = self
+        // The salted rank is a hash, so it is only computed to break a tie.
+        let this = &*self;
+        let by = |time: fn(&NoiseSession) -> Instant| {
+            move |a: &(&(SocketAddr, [u8; 32]), &NoiseSession),
+                  b: &(&(SocketAddr, [u8; 32]), &NoiseSession)| {
+                time(a.1).cmp(&time(b.1)).then_with(|| {
+                    this.salted_addr_rank(&a.0 .0).cmp(&this.salted_addr_rank(&b.0 .0))
+                })
+            }
+        };
+        let victim = this
             .sessions
             .iter()
             .filter(|(_, s)| !s.addr_validated)
-            .max_by_key(|(slot, s)| (s.established, self.salted_addr_rank(&slot.0)))
+            .max_by(by(|s| s.established))
             .map(|(k, _)| *k)
             .or_else(|| {
-                self.sessions
+                this.sessions
                     .iter()
-                    .min_by_key(|(slot, s)| (s.last_activity, self.salted_addr_rank(&slot.0)))
+                    .min_by(by(|s| s.last_activity))
                     .map(|(k, _)| *k)
             });
         if let Some(victim) = victim {
@@ -3157,6 +3324,35 @@ mod tests {
 
     use super::*;
 
+    /// The QUIC half logs replies to sources nobody validated, so a flood of
+    /// spoofed Initials can push real dials out of the log. A real dial it can
+    /// no longer vouch for must not turn into an unsolicited witness.
+    #[test]
+    fn a_dial_log_that_had_to_forget_a_live_dial_treats_everyone_as_dialled() {
+        let log = DialLog::default();
+        let real: IpAddr = "203.0.113.7".parse().unwrap();
+        let stranger: IpAddr = "198.51.100.9".parse().unwrap();
+        log.note(real);
+        assert!(!log.recent(stranger));
+
+        for n in 0..MAX_DIALLED_ADDRS as u32 {
+            log.note(IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000 + n)));
+        }
+        assert!(!log.0.lock().at.contains_key(&real), "the cap pushed the real dial out");
+        let transport = EmberTransport::with_dial_log([1; 32], [2; 32], log.clone());
+        assert!(transport.may_have_dialled(real), "a forgotten live dial may still have been one");
+        assert!(transport.may_have_dialled(stranger), "and so may any address until it would have lapsed");
+        assert!(
+            !transport.recently_dialled(stranger),
+            "the filter and rate exemptions keyed on a real dial are not granted by a flood"
+        );
+
+        log.0.lock().saturated_until = Some(Instant::now() - Duration::from_secs(1));
+        log.prune(Instant::now());
+        assert!(log.0.lock().saturated_until.is_none());
+        assert!(!transport.may_have_dialled(stranger));
+    }
+
     fn make_keypair() -> ([u8; 32], [u8; 32]) {
         let params: snow::params::NoiseParams = NOISE_PATTERN_XX.parse().unwrap();
         let kp = snow::Builder::new(params).generate_keypair().unwrap();
@@ -3229,18 +3425,76 @@ mod tests {
             OutgoingResult::Ready { packet } => packet,
             other => panic!("expected Ready, got {}", variant_name(&other)),
         };
-        // Delivered, therefore the incumbent session survived. Asserting on the
-        // exact payload list would be wrong: the replayed init re-armed its own
-        // embedded payload as a deferred one, and any authenticated frame
-        // releases that, so Alice's original first message rides along a second
-        // time. Duplicate delivery of an already-authenticated payload is
-        // harmless here (the DHT's own replay collapse covers it) and is not
-        // what this test is about.
+        // Delivered, therefore the incumbent session survived — and delivered
+        // alone. The replayed init re-armed its embedded payload, but for the
+        // session it staged, which only the genuine peer's new keys could
+        // promote; a frame on the live session does not release it. It used
+        // to, so one captured init re-delivered Alice's first message every
+        // time the replay window lapsed, and nothing above the transport
+        // collapses a repeated CHANNEL_MSG, CALLBACK_REQ or EPX frame.
         let delivered = bob.dispatch_incoming(&after, alice_addr).app_payloads;
-        assert!(
-            delivered.contains(&b"after".to_vec()),
-            "a replayed init must not wedge the live session; got {delivered:?}"
+        assert_eq!(
+            delivered,
+            vec![b"after".to_vec()],
+            "a replayed init must neither wedge the live session nor re-deliver its payload"
         );
+    }
+
+    /// Two peers that IK-dial each other at once settle on one handshake at
+    /// once, and both first messages arrive, instead of each refusing the
+    /// other and waiting out the pending timeout.
+    #[test]
+    fn a_crossed_ik_dial_is_settled_by_static_key() {
+        let (a_priv, a_pub) = make_keypair();
+        let (b_priv, b_pub) = make_keypair();
+        let ((low_priv, low_pub), (high_priv, high_pub)) = if a_pub < b_pub {
+            ((a_priv, a_pub), (b_priv, b_pub))
+        } else {
+            ((b_priv, b_pub), (a_priv, a_pub))
+        };
+        let mut low = EmberTransport::new(low_priv, low_pub);
+        let mut high = EmberTransport::new(high_priv, high_pub);
+        let low_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let high_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let start = |t: &mut EmberTransport, to: SocketAddr, key: &[u8; 32], msg: &[u8]| {
+            match t.prepare_outgoing(to, Some(key), msg) {
+                OutgoingResult::HandshakeStarted { packet } => packet,
+                other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+            }
+        };
+        let low_init = start(&mut low, high_addr, &high_pub, b"from low");
+        let high_init = start(&mut high, low_addr, &low_pub, b"from high");
+        match high.prepare_outgoing(low_addr, Some(&low_pub), b"high, queued") {
+            OutgoingResult::Queued => {}
+            other => panic!("expected Queued, got {}", variant_name(&other)),
+        }
+
+        assert!(
+            matches!(low.process_incoming(&high_init, high_addr), IncomingResult::Rejected),
+            "the lower key keeps its own dial"
+        );
+        let answer = match high.process_incoming(&low_init, low_addr) {
+            IncomingResult::HandshakeComplete { packets_to_send, .. } => packets_to_send,
+            _ => panic!("the higher key answers"),
+        };
+        assert!(!high.pending.contains_key(&low_addr), "and gives up its own dial");
+        // IK_RESP, high's two messages, then the routability probe.
+        assert_eq!(answer.len(), 4);
+
+        let _ = low.process_incoming(&answer[0], high_addr);
+        let mut heard = Vec::new();
+        for packet in &answer[1..3] {
+            match low.process_incoming(packet, high_addr) {
+                IncomingResult::Message { payload, .. } => heard.push(payload),
+                _ => panic!("expected Message"),
+            }
+        }
+        assert_eq!(heard, vec![b"from high".to_vec(), b"high, queued".to_vec()]);
+
+        let probe_answer = low.dispatch_incoming(&answer[3], high_addr);
+        let released = high.dispatch_incoming(&probe_answer.responses[0], low_addr);
+        assert_eq!(released.app_payloads, vec![b"from low".to_vec()]);
     }
 
     #[test]
@@ -3961,7 +4215,7 @@ mod tests {
         // initiations: that loop takes long enough to earn tokens back while
         // it runs, so where it landed would be a matter of how fast the
         // machine is.
-        while bob.take_ik_handshake_token() {}
+        while bob.take_handshake_token() {}
 
         assert!(
             matches!(
@@ -4348,6 +4602,17 @@ mod tests {
                 incoming_variant_name(&other)
             ),
         };
+        // A cookie waives the reflection budget, not the CPU one: with the
+        // handshake bucket empty, even a proven msg1 is refused.
+        let (tokens, refilled) = (bob.ik_tokens, bob.ik_refilled_at);
+        bob.ik_tokens = 0;
+        bob.ik_refilled_at = Instant::now();
+        assert!(matches!(
+            bob.process_incoming(&proven, alice_addr),
+            IncomingResult::Rejected
+        ));
+        bob.ik_tokens = tokens.max(1);
+        bob.ik_refilled_at = refilled;
         let msg2 = match bob.process_incoming(&proven, alice_addr) {
             IncomingResult::HandshakeResponse { packets, .. } => {
                 let packet = packets.into_iter().next().expect("msg2");

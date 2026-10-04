@@ -680,6 +680,11 @@ pub struct NetworkStats {
     /// Current eD2K server connection status: "connected", "connecting", or "disconnected"
     #[serde(default)]
     pub server_status: String,
+    /// While connected to an eD2K server: whether it gave us a LowID. `None`
+    /// when not connected. Tracks the server's own ID changes (a port test that
+    /// promotes us to HighID mid-session).
+    #[serde(default)]
+    pub ed2k_low_id: Option<bool>,
     /// STUN/NATMAP-style keep-alive is actively refreshing mappings this session.
     #[serde(default)]
     pub stun_keepalive_active: bool,
@@ -1346,6 +1351,7 @@ impl Default for NetworkStats {
             ember_peers: 0,
             epx_sources_received: 0,
             server_status: String::from("disconnected"),
+            ed2k_low_id: None,
             stun_keepalive_active: false,
             public_udp_port: 0,
             public_tcp_port: 0,
@@ -1380,6 +1386,13 @@ pub struct AppSettings {
     pub channel_username: String,
     pub shared_folders: Vec<String>,
     pub download_folder: String,
+    /// Earlier download folders whose `Temp` still holds unfinished downloads.
+    /// A download keeps its `.part` in the folder it started in (see
+    /// `storage::part_folders`), so each of these stays an approved root
+    /// until nothing is left in it. Backend-owned (see
+    /// `BACKEND_OWNED_SETTINGS_FIELDS`): an entry here grants file access.
+    #[serde(default)]
+    pub previous_download_folders: Vec<String>,
     pub max_upload_speed: u64,
     pub max_download_speed: u64,
     pub max_concurrent_downloads: u32,
@@ -1435,6 +1448,11 @@ pub struct AppSettings {
     /// a download is stuck, and it has to be there at that moment.
     #[serde(default = "default_web_services")]
     pub web_services: Vec<crate::webservices::WebService>,
+    /// Download categories the user made, offered beside the built-in ones
+    /// (Audio, Video, …) in the Transfers category menu and filter. Only the
+    /// names live here; each download stores its own category string.
+    #[serde(default)]
+    pub download_categories: Vec<String>,
     /// Block private/LAN/CGNAT IPs across KAD contact admission, outbound
     /// dials, UDP ingest, and (when filter-incoming is on) inbound TCP.
     /// Bogus/unroutable space is always rejected regardless of this toggle.
@@ -1651,6 +1669,12 @@ pub struct AppSettings {
     /// rather than "relay nothing", which [`Self::relay_for_peers`] expresses.
     #[serde(default = "default_max_relay_sessions")]
     pub max_relay_sessions: u32,
+    /// Whether QUIC shares the KAD / Ember UDP socket, so one forwarded UDP
+    /// port carries everything. `config.json` only: the way back to a separate
+    /// QUIC socket should packet classification misbehave somewhere in the
+    /// field. Read at startup.
+    #[serde(default = "default_true")]
+    pub quic_shares_udp_port: bool,
     /// What to do when the user closes the main window via the title-bar X.
     ///
     /// - `"ask"` (default): emit a dialog asking the user to choose.
@@ -1694,33 +1718,52 @@ pub struct AppSettings {
     /// separately from folder defaults because an explicit action must win.
     #[serde(default)]
     pub pending_file_priorities: std::collections::HashMap<String, String>,
+    /// Files restricted to friends while they were still hashing. Normalized
+    /// paths. Until the hash lands nothing else holds the restriction, so a
+    /// restart in between brought the file up public; applied like the two
+    /// above, and dropped once `known.met` has the record.
+    #[serde(default)]
+    pub pending_friends_only: std::collections::HashSet<String>,
     /// Folders shared by dropping specific files: later newly-seen files in
     /// that folder stay unshared until chosen. Keys are normalized folder
     /// paths; values are the normalized file paths that should be shared.
     /// Backend-owned (see `BACKEND_OWNED_SETTINGS_FIELDS`).
     #[serde(default)]
     pub pending_folder_allowlists: std::collections::HashMap<String, Vec<String>>,
+    /// Files of a partly shared folder that the user unshared, keyed like
+    /// `pending_folder_allowlists`. Discovery walks only what a folder's
+    /// allowlist names, so these are walked too and stay in the Library as
+    /// unshared files instead of disappearing, while the allowlist no longer
+    /// offers them. Backend-owned (see `BACKEND_OWNED_SETTINGS_FIELDS`).
+    #[serde(default)]
+    pub withheld_folder_files: std::collections::HashMap<String, Vec<String>>,
     /// Resume keys for bounded shared-folder discovery pages. Each normalized
     /// folder path advances only after its page has been committed, so folders
     /// larger than the in-memory scan budget are eventually indexed in full.
     #[serde(default)]
     pub shared_folder_scan_cursors: std::collections::HashMap<String, String>,
-    /// Automatically check for Ember updates in the background shortly
-    /// after launch (subject to `update_check_frequency`). This only gates
-    /// the *silent* startup check — the "Check for Updates" button in
+    /// Automatically check for Ember updates in the background, at launch and
+    /// while Ember keeps running (subject to `update_check_frequency`). This
+    /// only gates the *automatic* check — the "Check for Updates" button in
     /// Settings → About always works regardless of this setting. Defaults
     /// to `true` to preserve Ember's original always-check-on-launch
     /// behavior for existing users upgrading into this setting.
     #[serde(default = "default_true")]
     pub auto_check_updates: bool,
     /// How often the automatic background check gated by `auto_check_updates`
-    /// may run: `"daily"`, `"weekly"`, or `"monthly"`. This is only the
-    /// user's preference — the actual "was it long enough ago?" bookkeeping
-    /// (last-checked timestamp) is tracked on the frontend
-    /// (`src/lib/stores/updater.ts`), since the whole update-check flow
-    /// already lives there with no backend involvement.
+    /// may run: `"hourly"`, `"daily"`, `"weekly"`, or `"monthly"`. This is only the
+    /// user's preference — the "was it long enough ago?" bookkeeping lives in
+    /// `silent-update-state.json` (`auto_update::record`), where the backend
+    /// scheduler reads it.
     #[serde(default = "default_update_check_frequency")]
     pub update_check_frequency: String,
+    /// Install updates without asking: wait until nothing is transferring and
+    /// the user is away, warn for a minute, then update and reopen the way the
+    /// session was left (`auto_update::silent`). Off by default, and only ever
+    /// on together with `auto_check_updates`, since it acts on what those checks
+    /// find.
+    #[serde(default)]
+    pub silent_update_enabled: bool,
 
     /// Master switch for desktop notifications. Off means Ember never asks the
     /// OS to show anything, whatever the per-event switches below say.
@@ -1770,7 +1813,7 @@ pub struct AppSettings {
     /// an overnight download is not cut off by the OS idle timer. The display
     /// is left alone — only sleep is deferred, and only while there is work.
     ///
-    /// Honored on Windows; see [`crate::power::supported`]. The Settings
+    /// Honored on Windows and Linux; see [`crate::power::supported`]. The Settings
     /// toggle is disabled where no inhibitor exists rather than offering a
     /// switch that does nothing.
     #[serde(default = "default_true")]
@@ -1834,6 +1877,26 @@ impl AppSettings {
             part_retry_rounds: self.download_part_retry_rounds.clamp(1, 20),
             max_download_bytes,
         }
+    }
+
+    pub fn download_folders(&self) -> crate::storage::part_folders::DownloadFolders {
+        crate::storage::part_folders::DownloadFolders::new(
+            &self.download_folder,
+            &self.previous_download_folders,
+        )
+    }
+
+    /// Every download folder a `.part` may be in, current first.
+    pub fn download_roots(&self) -> Vec<String> {
+        self.download_folders().roots()
+    }
+
+    /// The roots the approved-root registry has to keep: the shared folders
+    /// and every download folder that still holds downloads.
+    pub fn configured_roots(&self) -> Vec<String> {
+        let mut roots = self.shared_folders.clone();
+        roots.extend(self.download_roots());
+        roots
     }
 }
 
@@ -2259,6 +2322,7 @@ impl Default for AppSettings {
             channel_username: String::new(),
             shared_folders: vec![completed_dir],
             download_folder: download_dir,
+            previous_download_folders: Vec::new(),
             max_upload_speed: 0,
             max_download_speed: 0,
             max_concurrent_downloads: 5,
@@ -2268,7 +2332,9 @@ impl Default for AppSettings {
             folder_priorities: std::collections::HashMap::new(),
             pending_share_states: std::collections::HashMap::new(),
             pending_file_priorities: std::collections::HashMap::new(),
+            pending_friends_only: std::collections::HashSet::new(),
             pending_folder_allowlists: std::collections::HashMap::new(),
+            withheld_folder_files: std::collections::HashMap::new(),
             shared_folder_scan_cursors: std::collections::HashMap::new(),
             nodes_dat_path: String::new(),
             upnp_enabled: false,
@@ -2278,6 +2344,7 @@ impl Default for AppSettings {
             filter_incoming_connections: false,
             allow_shared_files_browse: false,
             web_services: default_web_services(),
+            download_categories: Vec::new(),
             block_private_ips: true,
             filter_servers_by_ip: true,
             add_servers_from_server: true,
@@ -2328,10 +2395,12 @@ impl Default for AppSettings {
             ember_default_on_migrated: true,
             relay_for_peers: default_relay_for_peers(),
             max_relay_sessions: default_max_relay_sessions(),
+            quic_shares_udp_port: true,
             close_to_tray_behavior: default_close_to_tray_behavior(),
             launch_maximized: false,
             auto_check_updates: true,
             update_check_frequency: default_update_check_frequency(),
+            silent_update_enabled: false,
             notifications_enabled: true,
             notifications_only_when_unfocused: true,
             notify_download_complete: true,

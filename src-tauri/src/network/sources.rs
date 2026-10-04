@@ -23,6 +23,9 @@ pub(super) async fn handle_epx_sources(
     label: &str,
     include_pending_downloads: bool,
     we_are_unreachable: bool,
+    // What a relay needs to reach a firewalled source, by `(ip, tcp_port)`.
+    // Only our own DHT lookups know it; a peer's exchange carries neither.
+    relay_targets: &HashMap<(Ipv4Addr, u16), ember::broker::RelayTarget>,
 ) -> usize {
     state.ember_diagnostics.epx_events_received = state
         .ember_diagnostics
@@ -135,12 +138,18 @@ pub(super) async fn handle_epx_sources(
                         *file_hash,
                         ip,
                         port,
+                        relay_targets.get(&(ip, port)).copied().unwrap_or_default(),
                     )
                     .await;
                     let pfs = state
                         .per_file_sources
                         .entry(transfer_id.clone())
-                        .or_insert_with(|| ed2k::sources::PerFileSourceList::new(*file_hash));
+                        .or_insert_with(|| {
+                            ed2k::sources::PerFileSourceList::new(
+                                *file_hash,
+                                state.max_sources_per_file,
+                            )
+                        });
                     if pfs.add_source_full(ip, port, udp_port) {
                         stored_new = true;
                     }
@@ -518,7 +527,7 @@ const _: () = assert!(STARVED_SERVER_REASK_SECS < SERVER_TCP_SRCREQ_INTERVAL_SEC
 /// counting for up to `SOURCE_EXPIRY_SECS`. That matters twice over: it
 /// overstates the swarm in the Sources column by however many peers we are
 /// simultaneously refusing to contact, and the same figure gates every further
-/// lookup against `MAX_SOURCES_FOR_UDP` — so a file whose sources have all died
+/// lookup against `max_sources_for_udp` — so a file whose sources have all died
 /// reads as fully sourced and stops looking for more, which is exactly when it
 /// needs to.
 pub(super) async fn retire_dead_source_from_registry(
@@ -533,14 +542,24 @@ pub(super) async fn retire_dead_source_from_registry(
         .remove_source(file_hash, &ip, port);
 }
 
+fn secs(s: i64) -> std::time::Duration {
+    std::time::Duration::from_secs(s.max(0) as u64)
+}
+
 /// Whether another TCP source-request frame may go out now.
 ///
 /// Also enforces the post-login settle window, so callers do not have to repeat
 /// both checks.
-pub(super) fn server_tcp_srcreq_frame_open(state: &NetworkState, now: i64) -> bool {
+///
+/// The server source-request clocks here are monotonic, as eMule's
+/// `::GetTickCount()` ones are: on the wall clock a step back closed the frame,
+/// and held every file's re-ask floor, for the length of the step.
+pub(super) fn server_tcp_srcreq_frame_open(state: &NetworkState, now: std::time::Instant) -> bool {
     state.server_connected
-        && now.saturating_sub(state.server_connected_at) >= SERVER_SOURCE_SETTLE_SECS
-        && now >= state.server_tcp_srcreq_next_at
+        && state
+            .server_logged_in_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= secs(SERVER_SOURCE_SETTLE_SECS))
+        && state.server_tcp_srcreq_next_at.is_none_or(|at| now >= at)
 }
 
 /// Close the frame after sending, mirroring eMule's
@@ -548,8 +567,8 @@ pub(super) fn server_tcp_srcreq_frame_open(state: &NetworkState, now: i64) -> bo
 ///
 /// Charged once per frame regardless of how many of the 15 slots were used, as
 /// eMule does — the credit is spent on the frame, not the hash.
-pub(super) fn close_server_tcp_srcreq_frame(state: &mut NetworkState, now: i64) {
-    state.server_tcp_srcreq_next_at = now + SERVER_TCP_SRCREQ_INTERVAL_SECS;
+pub(super) fn close_server_tcp_srcreq_frame(state: &mut NetworkState, now: std::time::Instant) {
+    state.server_tcp_srcreq_next_at = Some(now + secs(SERVER_TCP_SRCREQ_INTERVAL_SECS));
 }
 
 /// eMule's `SERVERREASKTIME` (`Opcodes.h:65`): the least time between two TCP
@@ -563,25 +582,27 @@ pub(super) const SERVER_TCP_SRCREQ_FILE_REASK_SECS: i64 = 15 * 60;
 
 /// Whether `file_hash` may go out in another TCP `OP_GETSOURCES` at `now`.
 pub(super) fn server_tcp_srcreq_file_due(
-    asked_at: &HashMap<[u8; 16], i64>,
+    asked_at: &HashMap<[u8; 16], std::time::Instant>,
     file_hash: &[u8; 16],
-    now: i64,
+    now: std::time::Instant,
 ) -> bool {
-    asked_at
-        .get(file_hash)
-        .is_none_or(|at| now.saturating_sub(*at) >= SERVER_TCP_SRCREQ_FILE_REASK_SECS)
+    asked_at.get(file_hash).is_none_or(|at| {
+        now.saturating_duration_since(*at) >= secs(SERVER_TCP_SRCREQ_FILE_REASK_SECS)
+    })
 }
 
 /// Stamp `file_hash` as asked at `now`. Entries past the re-ask floor decide
 /// nothing, so they are dropped whenever the map grows.
 pub(super) fn note_server_tcp_srcreq_file(
-    asked_at: &mut HashMap<[u8; 16], i64>,
+    asked_at: &mut HashMap<[u8; 16], std::time::Instant>,
     file_hash: [u8; 16],
-    now: i64,
+    now: std::time::Instant,
 ) {
     const PRUNE_ABOVE: usize = 1024;
     if asked_at.len() >= PRUNE_ABOVE {
-        asked_at.retain(|_, at| now.saturating_sub(*at) < SERVER_TCP_SRCREQ_FILE_REASK_SECS);
+        asked_at.retain(|_, at| {
+            now.saturating_duration_since(*at) < secs(SERVER_TCP_SRCREQ_FILE_REASK_SECS)
+        });
     }
     asked_at.insert(file_hash, now);
 }
@@ -603,7 +624,7 @@ pub(super) fn queue_server_source_ask(
     transfer_id: &str,
     file_hash: [u8; 16],
     file_size: u64,
-    now: i64,
+    now: std::time::Instant,
 ) -> bool {
     let Some(conn) = state.server_connection.as_ref().filter(|_| state.server_connected) else {
         return false;
@@ -625,11 +646,11 @@ pub(super) fn queue_server_source_ask(
 /// per file, none for a file inside its re-ask floor, and a bounded line.
 pub(super) fn push_server_source_ask(
     asks: &mut VecDeque<(String, [u8; 16], u64)>,
-    asked_at: &HashMap<[u8; 16], i64>,
+    asked_at: &HashMap<[u8; 16], std::time::Instant>,
     transfer_id: &str,
     file_hash: [u8; 16],
     file_size: u64,
-    now: i64,
+    now: std::time::Instant,
 ) -> bool {
     if !server_tcp_srcreq_file_due(asked_at, &file_hash, now) {
         return false;
@@ -675,7 +696,7 @@ pub(super) fn send_server_get_sources(
     state: &mut NetworkState,
     file_hash: &[u8; 16],
     file_size: u64,
-    now: i64,
+    now: std::time::Instant,
 ) -> anyhow::Result<u64> {
     if !server_tcp_srcreq_file_due(&state.server_tcp_srcreq_file_at, file_hash, now) {
         return Ok(0);
@@ -855,18 +876,6 @@ pub(super) async fn send_kad_callback_req(
     }
 }
 
-// Keep eDonkey UDP source lookups protocol-compatible while adapting fanout
-// to runtime conditions so we stay fast without looking like a flooder.
-// eMule: GetMaxSourcePerFileUDP() — keep discovering (server UDP + active KAD
-// re-search) until a file knows this many sources, then stop asking. Raised
-// from 50 to feed the Path B "queue on many sources" model: a popular file is
-// queued on hundreds of peers (connectionless, UDP-reask maintained), so the
-// known-source pool must be allowed to grow well past the old held-connection
-// count. Still well under MAX_SOURCES_PER_FILE (500) / the user's
-// max_sources_per_file (default 400), and the per-channel reask INTERVALS
-// (KAD backoff, 30-min server UDP) remain the politeness gate — not this count.
-pub(super) const MAX_SOURCES_FOR_UDP: usize = 300;
-
 pub(super) const MAX_FAIL_COUNT_FOR_UDP: u32 = 3;
 
 /// Maximum number of UDP source-discovery queries we'll send to a
@@ -928,7 +937,7 @@ pub(super) fn build_all_getsources_packets(
     }
 
     let mut packets = Vec::with_capacity(servers.len());
-    let now = chrono::Utc::now().timestamp();
+    let now = std::time::Instant::now();
     // Only build (and stamp a 30-min reask time for) as many packets as will
     // actually fit in the send queue. We record `server_udp_source_reask_at`
     // the moment a packet is built, but the caller drops any packets past the
@@ -948,11 +957,9 @@ pub(super) fn build_all_getsources_packets(
             continue;
         }
         let key = (server.ip.clone(), server.port, *file_hash);
-        if state
-            .server_udp_source_reask_at
-            .get(&key)
-            .is_some_and(|last| now.saturating_sub(*last) < SERVER_UDP_SOURCE_REASK_SECS)
-        {
+        if state.server_udp_source_reask_at.get(&key).is_some_and(|last| {
+            now.saturating_duration_since(*last) < secs(SERVER_UDP_SOURCE_REASK_SECS)
+        }) {
             continue;
         }
         if let Some(packet) =
@@ -967,10 +974,10 @@ pub(super) fn build_all_getsources_packets(
 
 pub(super) fn is_recent_configured_server_source_reply(
     server_list: &ServerList,
-    queries: &HashMap<(String, u16, [u8; 16]), i64>,
+    queries: &HashMap<(String, u16, [u8; 16]), std::time::Instant>,
     addr: SocketAddr,
     file_hash: &[u8; 16],
-    now: i64,
+    now: std::time::Instant,
 ) -> bool {
     let tcp_port = addr.port().saturating_sub(4);
     let ip = addr.ip().to_string();
@@ -981,7 +988,9 @@ pub(super) fn is_recent_configured_server_source_reply(
     configured
         && queries
             .get(&(ip, tcp_port, *file_hash))
-            .is_some_and(|sent_at| now.saturating_sub(*sent_at) <= SERVER_UDP_SOURCE_REPLY_TTL_SECS)
+            .is_some_and(|sent_at| {
+                now.saturating_duration_since(*sent_at) <= secs(SERVER_UDP_SOURCE_REPLY_TTL_SECS)
+            })
 }
 
 /// Build UDP GETSOURCES packets for ALL eligible servers, packing multiple
@@ -997,7 +1006,7 @@ pub(super) fn build_all_getsources_packets_multi(
     }
 
     let mut packets = Vec::with_capacity(servers.len());
-    let now = chrono::Utc::now().timestamp();
+    let now = std::time::Instant::now();
     // See `build_all_getsources_packets`: cap the number of packets at the
     // send queue's remaining room so we never stamp a reask time for a packet
     // the caller would drop (which would suppress those files on that server
@@ -1014,11 +1023,9 @@ pub(super) fn build_all_getsources_packets_multi(
             .iter()
             .filter(|(fh, _)| {
                 let key = (server.ip.clone(), server.port, *fh);
-                state
-                    .server_udp_source_reask_at
-                    .get(&key)
-                    .map(|last| now.saturating_sub(*last) >= SERVER_UDP_SOURCE_REASK_SECS)
-                    .unwrap_or(true)
+                state.server_udp_source_reask_at.get(&key).is_none_or(|last| {
+                    now.saturating_duration_since(*last) >= secs(SERVER_UDP_SOURCE_REASK_SECS)
+                })
             })
             .copied()
             .collect();
@@ -1085,7 +1092,9 @@ pub(super) fn inject_source_into_active_transfers(
             let pfs = state
                 .per_file_sources
                 .entry(transfer_id.clone())
-                .or_insert_with(|| ed2k::sources::PerFileSourceList::new(file_hash));
+                .or_insert_with(|| {
+                    ed2k::sources::PerFileSourceList::new(file_hash, state.max_sources_per_file)
+                });
             let already_known = pfs.has_source(v4, source.peer_port);
             if already_known {
                 // Worker may have soft-dropped this peer (no free parts).
@@ -1265,7 +1274,7 @@ pub(super) async fn ask_networks_for_sources(
     // which reports `server_query` for this transfer when it goes out.
     // `server` stays false when the file was asked within the last
     // `SERVER_TCP_SRCREQ_FILE_REASK_SECS`, the same as with no session.
-    let now = chrono::Utc::now().timestamp();
+    let now = std::time::Instant::now();
     outcome.server = queue_server_source_ask(state, transfer_id, file_hash, file_size, now);
     outcome.server_recent = !outcome.server
         && state.server_connected
@@ -1298,26 +1307,33 @@ pub(super) async fn ask_networks_for_sources(
 mod server_tcp_srcreq_file_floor_tests {
     use super::*;
 
+    /// `t0` plus `s` seconds: every test time is after the first, so none has
+    /// to subtract from a clock that may be young.
+    fn at(t0: std::time::Instant, s: i64) -> std::time::Instant {
+        t0 + secs(s)
+    }
+
     #[test]
     fn a_file_is_not_asked_again_inside_serverreasktime() {
+        let t0 = std::time::Instant::now();
         let mut asked = HashMap::new();
         let file = [0x11; 16];
-        assert!(server_tcp_srcreq_file_due(&asked, &file, 1_000), "never asked");
+        assert!(server_tcp_srcreq_file_due(&asked, &file, at(t0, 0)), "never asked");
 
-        note_server_tcp_srcreq_file(&mut asked, file, 1_000);
-        assert!(!server_tcp_srcreq_file_due(&asked, &file, 1_001));
+        note_server_tcp_srcreq_file(&mut asked, file, at(t0, 0));
+        assert!(!server_tcp_srcreq_file_due(&asked, &file, at(t0, 1)));
         assert!(!server_tcp_srcreq_file_due(
             &asked,
             &file,
-            1_000 + SERVER_TCP_SRCREQ_FILE_REASK_SECS - 1
+            at(t0, SERVER_TCP_SRCREQ_FILE_REASK_SECS - 1)
         ));
         assert!(server_tcp_srcreq_file_due(
             &asked,
             &file,
-            1_000 + SERVER_TCP_SRCREQ_FILE_REASK_SECS
+            at(t0, SERVER_TCP_SRCREQ_FILE_REASK_SECS)
         ));
         assert!(
-            server_tcp_srcreq_file_due(&asked, &[0x22; 16], 1_001),
+            server_tcp_srcreq_file_due(&asked, &[0x22; 16], at(t0, 1)),
             "the floor is per file"
         );
     }
@@ -1333,8 +1349,9 @@ mod server_tcp_srcreq_file_floor_tests {
             hash[..4].copy_from_slice(&n.to_le_bytes());
             hash
         };
+        let now = std::time::Instant::now();
         for n in 0..200 {
-            assert!(push_server_source_ask(&mut asks, &asked, &format!("t{n}"), file(n), 1_000, 0));
+            assert!(push_server_source_ask(&mut asks, &asked, &format!("t{n}"), file(n), 1_000, now));
         }
 
         let first = take_frame_source_asks(&mut asks, SERVER_TCP_SRCREQ_MAX_PER_FRAME, |_, _| true);
@@ -1346,13 +1363,14 @@ mod server_tcp_srcreq_file_floor_tests {
 
     #[test]
     fn an_ask_is_refused_inside_the_floor_and_queued_once() {
+        let t0 = std::time::Instant::now();
         let mut asks = VecDeque::new();
         let mut asked = HashMap::new();
-        note_server_tcp_srcreq_file(&mut asked, [1; 16], 1_000);
+        note_server_tcp_srcreq_file(&mut asked, [1; 16], at(t0, 0));
 
-        assert!(!push_server_source_ask(&mut asks, &asked, "recent", [1; 16], 10, 1_060));
-        assert!(push_server_source_ask(&mut asks, &asked, "a", [2; 16], 10, 1_060));
-        assert!(push_server_source_ask(&mut asks, &asked, "b", [2; 16], 10, 1_061));
+        assert!(!push_server_source_ask(&mut asks, &asked, "recent", [1; 16], 10, at(t0, 60)));
+        assert!(push_server_source_ask(&mut asks, &asked, "a", [2; 16], 10, at(t0, 60)));
+        assert!(push_server_source_ask(&mut asks, &asked, "b", [2; 16], 10, at(t0, 61)));
         assert_eq!(asks.len(), 1, "one place in line per file");
     }
 
@@ -1375,20 +1393,22 @@ mod server_tcp_srcreq_file_floor_tests {
 
     #[test]
     fn stale_stamps_are_pruned_and_live_ones_kept() {
+        let t0 = std::time::Instant::now();
         let mut asked = HashMap::new();
         for n in 0..1024u32 {
             let mut file = [0u8; 16];
             file[..4].copy_from_slice(&n.to_le_bytes());
             // Half stale, half still inside the floor at t = 10_000.
-            let at = if n % 2 == 0 { 0 } else { 10_000 - 60 };
-            asked.insert(file, at);
+            let stamp = if n % 2 == 0 { at(t0, 0) } else { at(t0, 10_000 - 60) };
+            asked.insert(file, stamp);
         }
-        note_server_tcp_srcreq_file(&mut asked, [0xFF; 16], 10_000);
+        let now = at(t0, 10_000);
+        note_server_tcp_srcreq_file(&mut asked, [0xFF; 16], now);
 
         assert_eq!(asked.len(), 513);
         assert!(asked
             .values()
-            .all(|at| 10_000 - at < SERVER_TCP_SRCREQ_FILE_REASK_SECS));
+            .all(|stamp| now.duration_since(*stamp) < secs(SERVER_TCP_SRCREQ_FILE_REASK_SECS)));
     }
 }
 
@@ -1402,33 +1422,35 @@ mod server_udp_source_admission_tests {
         servers.add(ServerEntry::new("198.51.100.10".to_string(), 4661));
         let addr: SocketAddr = "198.51.100.10:4665".parse().unwrap();
         let hash = [0x44; 16];
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + std::time::Duration::from_secs(s);
         let mut queries = HashMap::new();
-        queries.insert(("198.51.100.10".to_string(), 4661, hash), 1_000);
+        queries.insert(("198.51.100.10".to_string(), 4661, hash), at(0));
 
         assert!(is_recent_configured_server_source_reply(
-            &servers, &queries, addr, &hash, 1_100
+            &servers, &queries, addr, &hash, at(100)
         ));
         // Correlation is non-destructive: duplicate replies remain valid in
         // the same response window.
         assert!(is_recent_configured_server_source_reply(
-            &servers, &queries, addr, &hash, 1_100
+            &servers, &queries, addr, &hash, at(100)
         ));
         assert!(!is_recent_configured_server_source_reply(
-            &servers, &queries, addr, &hash, 1_121
+            &servers, &queries, addr, &hash, at(121)
         ));
         assert!(!is_recent_configured_server_source_reply(
             &servers,
             &queries,
             "198.51.100.11:4665".parse().unwrap(),
             &hash,
-            1_100
+            at(100)
         ));
         assert!(!is_recent_configured_server_source_reply(
             &servers,
             &queries,
             addr,
             &[0x45; 16],
-            1_100
+            at(100)
         ));
     }
 }

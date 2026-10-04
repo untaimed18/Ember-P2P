@@ -138,6 +138,15 @@ pub(super) fn capture_advertised_tcp_port_then_reset_low_id(
 
 /// UDP counterpart of `advertised_tcp_port` — the KAD-peer-voted or
 /// STUN-confirmed public UDP port when known, otherwise the raw bind port.
+///
+/// The one answer for the KAD / Ember socket's public port, which QUIC shares:
+/// rendezvous, relay attestations, source records, attachment offers and punch
+/// registrations (through `FriendNatContext::advertised_udp_port`) all read it.
+/// `external_udp_port` outranks the NAT probe's `nat_info.external_addr`
+/// because it is the better-confirmed value: either two consecutive keep-alive
+/// readings, which KAD votes may not overwrite while the keep-alive holds it,
+/// or the port KAD peers saw our firewall checks come from. The probe is one
+/// sample, taken at startup or on a probe trigger, and not re-read after.
 pub(super) fn advertised_udp_port(state: &NetworkState) -> u16 {
     state
         .external_udp_port
@@ -145,16 +154,21 @@ pub(super) fn advertised_udp_port(state: &NetworkState) -> u16 {
         .unwrap_or(state.udp_port)
 }
 
-/// The QUIC port a *peer* should dial: the public port STUN found for the QUIC
-/// socket at bind time, falling back to the bound port.
+/// The QUIC port a *peer* should dial.
 ///
-/// The two differ only on a NAT that re-maps ports (CGNAT), and only the public
-/// one is reachable there. This is deliberately not `advertised_udp_port`: that
-/// tracks the KAD socket, and NAT mappings are per-socket, so its public port
-/// says nothing about where QUIC can be reached. `None` means no QUIC endpoint
-/// is bound yet. Mapping keep-alive transmits from this socket to hold the
-/// mapping open; it does not re-sample the public port.
+/// When QUIC shares the KAD socket that is simply `advertised_udp_port`: one
+/// socket, one NAT mapping. Otherwise it is the public port STUN found for the
+/// QUIC socket at bind time, falling back to the bound port. The two differ
+/// only on a NAT that re-maps ports (CGNAT), and only the public one is
+/// reachable there; the KAD socket's public port says nothing about a separate
+/// socket's, since NAT mappings are per-socket. `None` means no QUIC endpoint
+/// is bound yet. Mapping keep-alive transmits from a separate socket to hold
+/// its mapping open; it does not re-sample the public port.
 pub(super) fn advertised_quic_port(state: &NetworkState) -> Option<u16> {
+    // On the shared socket QUIC is reached wherever KAD is.
+    if state.quic_shares_udp && state.quic_port.is_some() {
+        return Some(advertised_udp_port(state)).filter(|p| *p != 0);
+    }
     state
         .quic_public_port
         .filter(|p| *p != 0)

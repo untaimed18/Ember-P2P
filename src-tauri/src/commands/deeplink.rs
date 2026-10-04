@@ -160,6 +160,12 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
         });
     }
     if !lower.starts_with("ed2k://") && lower.ends_with(".emulecollection") {
+        if is_network_path(&payload) {
+            return Err(coded(
+                "deeplink_terminal_invalid",
+                "Collections on a network share cannot be opened from a link",
+            ));
+        }
         let name = std::path::Path::new(&payload)
             .file_name()
             .map(|name| crate::security::sanitize_remote_text(&name.to_string_lossy(), 1024))
@@ -265,14 +271,50 @@ pub fn load_pending_queue(app: &AppHandle) -> Vec<PendingDeepLink> {
         })
 }
 
+/// True for a UNC share (`\\server\share`, `//server/share`, `\\?\UNC\…`) or
+/// any other `\\` namespace path that does not name a local drive letter.
+///
+/// Merely resolving such a path makes Windows connect to the server over SMB
+/// and offer the user's NTLM credentials, so a link must never get Ember to
+/// touch one.
+fn is_network_path(path: &str) -> bool {
+    let normalized = path.trim().replace('/', "\\");
+    let Some(rest) = normalized.strip_prefix(r"\\") else {
+        return false;
+    };
+    // Windows collapses `..` in a `\\.\` path before resolving it, so
+    // `\\.\C:\..\UNC\server\share` climbs off the drive onto a share.
+    if rest.split('\\').any(|component| component.trim() == "..") {
+        return true;
+    }
+    let names_local_drive = |device: &str| {
+        let bytes = device.as_bytes();
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    };
+    match rest
+        .strip_prefix(r"?\")
+        .or_else(|| rest.strip_prefix(r".\"))
+    {
+        Some(device) => !names_local_drive(device),
+        None => true,
+    }
+}
+
 /// True if `arg` looks like a deep link we should act on: an `ed2k:` URI
-/// (including browser-encoded `ed2k://%7Cfile%7C…` forms), a path ending
-/// in `.emulecollection`, or an in-app Ember invite / friend code.
+/// (including browser-encoded `ed2k://%7Cfile%7C…` forms), an absolute local
+/// path ending in `.emulecollection`, or an in-app Ember invite / friend code.
+///
+/// A relative path is not one the OS hands over for a double-clicked file. It
+/// would be opened against the running Ember's working directory, not the
+/// launcher's, and it is what is left of a path with spaces after the NSIS
+/// installer's relaunch has split it.
 pub fn is_deep_link_payload(arg: &str) -> bool {
     let trimmed = arg.trim();
     let lower = trimmed.to_ascii_lowercase();
     crate::network::ed2k::hash::looks_like_ed2k_uri(trimmed)
-        || lower.ends_with(".emulecollection")
+        || (lower.ends_with(".emulecollection")
+            && Path::new(trimmed).is_absolute()
+            && !is_network_path(trimmed))
         || lower.starts_with("ember3:")
         || lower.starts_with("ember2:")
         || lower.starts_with("ember-channel:")
@@ -299,6 +341,111 @@ pub fn extract_deep_link_payloads(args: &[String]) -> Vec<String> {
         })
         .filter(|a| !a.is_empty() && a.len() <= MAX_PAYLOAD_LEN)
         .collect()
+}
+
+/// A second launch's argv as that launch had it, from what the Windows
+/// single-instance plugin delivers: it joins the arguments with `|` and splits
+/// them on `|` again, so a raw `ed2k://|file|…|/` arrives as `ed2k://`,
+/// `file`, …. A link left unfinished takes back the pieces after it, up to the
+/// next `ed2k:` link. Other platforms deliver argv whole, where no link is
+/// unfinished and nothing changes.
+///
+/// After an `ed2k:` link only another `ed2k:` link may split off: the pieces
+/// may be the link's own fields, which whoever wrote the link controls, so a
+/// field that reads as a collection path or an invite must not become a
+/// payload of its own. That holds after a link that already looks finished
+/// too — a browser-encoded `ed2k://%7Cfile%7C…%7C/` can be followed by raw
+/// `|` pieces of the same URL. A launch the OS makes for a clicked link or a
+/// double-clicked collection carries one payload, so nothing real follows one.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn rejoin_forwarded_args(args: Vec<String>) -> Vec<String> {
+    use crate::network::ed2k::hash::looks_like_ed2k_uri;
+    let mut rejoined: Vec<String> = Vec::with_capacity(args.len());
+    let mut open_link = false;
+    let mut after_link = false;
+    for (index, piece) in args.into_iter().enumerate() {
+        let is_payload = index > 0
+            && if after_link {
+                looks_like_ed2k_uri(&piece)
+            } else {
+                is_deep_link_payload(&piece)
+            };
+        if after_link && !is_payload {
+            if open_link {
+                if let Some(link) = rejoined.last_mut() {
+                    link.push('|');
+                    link.push_str(&piece);
+                }
+            }
+            continue;
+        }
+        after_link = after_link || (is_payload && looks_like_ed2k_uri(&piece));
+        open_link = is_payload && ed2k_link_unfinished(&piece);
+        rejoined.push(piece);
+    }
+    rejoined
+}
+
+/// Every complete `ed2k:` link ends in `|/`, however its pipes arrived.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ed2k_link_unfinished(piece: &str) -> bool {
+    use crate::network::ed2k::hash::{looks_like_ed2k_uri, normalize_ed2k_uri};
+    looks_like_ed2k_uri(piece) && !normalize_ed2k_uri(piece).ends_with("|/")
+}
+
+/// Whether a Linux launch should make itself the `ed2k://` handler, given the
+/// desktop entry `xdg-mime` reports for the scheme now.
+///
+/// Only when nothing handles it, or when the handler is one of Ember's own
+/// entries: the one the plugin writes, rewritten so it follows an AppImage
+/// that has moved, or the `.deb`'s, whose `Exec` carries no `%u` for the link.
+/// The plugin's `register` runs `xdg-mime default`, so claiming on every launch
+/// took the scheme back from whichever client the user had chosen since.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn should_claim_scheme(current_default: &str, own_entries: &[&str]) -> bool {
+    let current = current_default.trim();
+    current.is_empty() || own_entries.contains(&current)
+}
+
+/// Register `ed2k://` with the desktop unless another handler already has it.
+///
+/// Linux has no installer step to do this, unlike NSIS/MSI on Windows.
+#[cfg(target_os = "linux")]
+pub fn register_scheme_unless_taken(app: &AppHandle) {
+    use tauri_plugin_deep_link::DeepLinkExt;
+    // The plugin names its entry after the executable, in the same way; the
+    // bundler names the package's after the product.
+    let bundle_entry = format!(
+        "{}.desktop",
+        app.config().product_name.as_deref().unwrap_or("Ember")
+    );
+    let own_handler = match tauri::utils::platform::current_exe() {
+        Ok(exe) => match exe.file_name() {
+            Some(name) => format!("{}-handler.desktop", name.to_string_lossy()),
+            None => return,
+        },
+        Err(e) => {
+            tracing::warn!("Not registering ed2k:// links: no executable path ({e})");
+            return;
+        }
+    };
+    // An `xdg-mime` that cannot run reads as "no handler"; `register_all`
+    // needs it too, and reports that failure itself.
+    let current = std::process::Command::new("xdg-mime")
+        .args(["query", "default", "x-scheme-handler/ed2k"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    if !should_claim_scheme(&current, &[own_handler.as_str(), bundle_entry.as_str()]) {
+        tracing::info!(
+            "Leaving ed2k:// links with {}, the handler already chosen",
+            current.trim()
+        );
+        return;
+    }
+    if let Err(e) = app.deep_link().register_all() {
+        tracing::warn!("Failed to register ed2k:// deep link scheme: {e}");
+    }
 }
 
 /// Buffer `payloads` for the frontend and emit a wake signal.
@@ -504,6 +651,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linux_claims_ed2k_only_when_unowned_or_already_ours() {
+        let ours = ["ember-handler.desktop", "Ember.desktop"];
+        assert!(should_claim_scheme("", &ours), "no handler yet");
+        assert!(should_claim_scheme("\n", &ours), "xdg-mime prints a bare newline for none");
+        assert!(
+            should_claim_scheme("ember-handler.desktop\n", &ours),
+            "our own entry is refreshed so a moved AppImage still opens"
+        );
+        assert!(
+            should_claim_scheme("Ember.desktop\n", &ours),
+            "the .deb's entry is Ember's too, and its Exec has no %u for the link"
+        );
+        assert!(
+            !should_claim_scheme("amule.desktop\n", &ours),
+            "a client the user chose keeps the scheme"
+        );
+        assert!(
+            !should_claim_scheme("ember-handler.desktop.bak\n", &ours),
+            "only an exact entry name counts as ours"
+        );
+    }
+
+    #[test]
     fn previews_sanitize_and_classify_confirmation_details() {
         let file = preview_deep_link_payload(
             "ed2k://|file|report\u{202E}fdp.exe|42|0123456789abcdef0123456789abcdef|/",
@@ -595,6 +765,115 @@ mod tests {
             payloads,
             vec!["ed2k://|file|movie.avi|1234|0123456789abcdef0123456789abcdef|/".to_string()]
         );
+    }
+
+    /// What the Windows single-instance plugin does to a second launch's argv.
+    fn forwarded(args: &[&str]) -> Vec<String> {
+        args.join("|").split('|').map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_link_the_single_instance_plugin_split_at_its_pipes_is_rejoined() {
+        let raw = "ed2k://|file|a b.iso|1024|0123456789ABCDEF0123456789ABCDEF|/";
+        let with_sources = "ed2k://|file|c.iso|2048|FEDCBA9876543210FEDCBA9876543210|/|sources,198.51.100.7:4662|/";
+        let encoded = "ed2k://%7Cfile%7Cd.iso%7C4096%7C00112233445566778899AABBCCDDEEFF%7C/";
+        let mixed = "ed2k://%7Cfile%7Ce#1.iso|8192|00112233445566778899AABBCCDDEEFF|/";
+        let cases: [&[&str]; 5] = [
+            &["ember.exe", raw],
+            &["ember.exe", with_sources],
+            &["ember.exe", raw, with_sources],
+            &["ember.exe", encoded],
+            &["ember.exe", mixed],
+        ];
+        for args in cases {
+            let owned: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            assert_eq!(rejoin_forwarded_args(forwarded(args)), owned, "{args:?}");
+            assert_eq!(
+                extract_deep_link_payloads(&rejoin_forwarded_args(forwarded(args))),
+                extract_deep_link_payloads(&owned),
+            );
+        }
+        let plain = vec!["ember.exe".to_string()];
+        assert_eq!(rejoin_forwarded_args(plain.clone()), plain);
+    }
+
+    #[test]
+    fn a_field_inside_a_forwarded_link_never_becomes_its_own_payload() {
+        let local = std::env::temp_dir()
+            .join("set.emulecollection")
+            .to_string_lossy()
+            .into_owned();
+        let hash = "0123456789ABCDEF0123456789ABCDEF";
+        let links = [
+            format!(r"ed2k://|file|\\attacker.example\s\list.emulecollection|1|{hash}|/"),
+            format!("ed2k://|file|{local}|1|{hash}|/"),
+            format!("ed2k://|file|ember-channel:abc|1|{hash}|/"),
+            format!("ed2k://|file|ember3:abc|1|{hash}|/"),
+            format!("ed2k://|file|x.iso|1|{hash}|/|{local}"),
+            format!("ed2k://%7Cfile%7Cx.iso%7C1%7C{hash}%7C/|ember-channel:abc"),
+            format!("ed2k://%7Cfile%7Cx.iso%7C1%7C{hash}%7C/|ember3:abc"),
+            format!("ed2k://%7Cfile%7Cx.iso%7C1%7C{hash}%7C/|{local}"),
+        ];
+        for link in &links {
+            let payloads =
+                extract_deep_link_payloads(&rejoin_forwarded_args(forwarded(&["ember.exe", link])));
+            assert_eq!(payloads.len(), 1, "{link}");
+            assert!(payloads[0].starts_with("ed2k://|file|"), "{link}");
+        }
+    }
+
+    #[test]
+    fn collections_on_a_network_share_are_refused() {
+        let remote = [
+            r"\\attacker.example\s\list.emulecollection",
+            "//attacker.example/s/list.emulecollection",
+            r"\\?\UNC\attacker.example\s\list.emulecollection",
+            r"\\.\UNC\attacker.example\s\list.emulecollection",
+            r"\\?\GLOBALROOT\Device\Mup\attacker.example\s\list.emulecollection",
+            r"\\.\C:\..\UNC\attacker.example\s\list.emulecollection",
+            r"\\.\C:\Users\..\..\UNC\attacker.example\s\list.emulecollection",
+        ];
+        for path in remote {
+            assert!(is_network_path(path), "{path}");
+            assert!(!is_deep_link_payload(path), "{path}");
+            assert!(preview_deep_link_payload(path).is_err(), "{path}");
+            let pending = vec![PendingDeepLink {
+                id: "remote".to_string(),
+                payload: path.to_string(),
+            }];
+            assert!(
+                collection_path_from_pending(&pending, "remote").is_err(),
+                "{path}"
+            );
+        }
+        for local in [
+            r"C:\Users\Ember\set.emulecollection",
+            r"\\?\C:\Users\Ember\set.emulecollection",
+            "/home/ember/set.emulecollection",
+        ] {
+            assert!(!is_network_path(local), "{local}");
+            assert_eq!(preview_deep_link_payload(local).unwrap().kind, "collection");
+        }
+    }
+
+    #[test]
+    fn only_an_absolute_collection_path_is_a_deep_link() {
+        let absolute = std::env::temp_dir()
+            .join("John Smith")
+            .join("set.emulecollection")
+            .to_string_lossy()
+            .into_owned();
+        let split: Vec<String> = std::iter::once("ember.exe")
+            .chain(absolute.split(' '))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            extract_deep_link_payloads(&["ember.exe".to_string(), absolute.clone()]),
+            vec![absolute]
+        );
+        assert!(extract_deep_link_payloads(&split).is_empty());
+        assert!(!is_deep_link_payload("set.emulecollection"));
+        assert!(!is_deep_link_payload(r"Smith\Downloads\set.emulecollection"));
     }
 
     #[test]

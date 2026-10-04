@@ -194,6 +194,11 @@ pub(crate) const LEAD_PING_RESERVE_DIVISOR: usize = 4;
 /// the low side is forgetting a range that one ping relearns.
 const MAX_TRACKED_PEER_VERSIONS: usize = 1024;
 
+/// How long one answer keeps a contact ahead in `FOUND_NODE` replies. A peer
+/// whose NAT mapping closed, or that moved behind one, stops answering but may
+/// keep pinging us, and should fall back among the unproven once it does.
+const ANSWERED_TTL: Duration = Duration::from_secs(3600);
+
 /// What the engine produced from one inbound DHT frame.
 #[derive(Default)]
 pub struct DhtInbound {
@@ -287,10 +292,9 @@ pub struct DhtInbound {
     /// separately from a malformed payload.
     pub version_mismatch: Option<u8>,
     /// A STORE record repeated a publisher signature we accepted inside the
-    /// replay window (slice 14), and we still hold that record or its
-    /// publisher's newer copy. Not a refusal: it is acknowledged like a fresh
-    /// store, because it is already placed; this marks only that no new work
-    /// was done.
+    /// replay window (slice 14), and we still hold that record. Not a refusal:
+    /// it is acknowledged like a fresh store, because it is already placed;
+    /// this marks only that no new work was done.
     pub store_replay_rejected: bool,
     /// A verified `PROXY_STORE` the caller should fan out via the normal
     /// publish driver (buddy-assisted firewalled source publish).
@@ -484,6 +488,17 @@ pub struct EmberDht {
     /// session it was proved on. Relearned in one maintenance ping if we forget
     /// it, which is also why nothing here needs to survive a restart.
     peer_versions: HashMap<EmberNodeId, VersionRange>,
+    /// Contacts that have answered a request of ours, with when they last did.
+    ///
+    /// A contact's `last_seen` moves on any signed frame, so a peer behind a
+    /// NAT that only ever pings us looks exactly as alive as one that can be
+    /// reached, and we used to hand it to third parties who cannot reach it.
+    /// An answer is the nearest thing to KAD's correlated response, which is
+    /// why only the network loop, holding the requests, may record one: a
+    /// reply-shaped frame nobody asked for costs its sender nothing. Bounded
+    /// and pruned the same way as [`Self::peer_versions`], and read as lapsed
+    /// after [`ANSWERED_TTL`].
+    answered: HashMap<EmberNodeId, Instant>,
     /// Noise static we currently advertise. A `PROXY_STORE` trailer must
     /// name this key, otherwise a firewalled publisher can steer every
     /// searcher's `CALLBACK_REQ` at someone else.
@@ -599,6 +614,7 @@ impl EmberDht {
             #[cfg(test)]
             inbound_record_verifications: 0,
             peer_versions: HashMap::new(),
+            answered: HashMap::new(),
             local_noise_pub: noise_public_key,
             local_contact_ip: Ipv4Addr::UNSPECIFIED,
             local_contact_udp: 0,
@@ -1056,14 +1072,40 @@ impl EmberDht {
     /// one to the other is what keeps this from being a second, unbounded
     /// notion of "peers we know about".
     pub fn prune_peer_versions(&mut self) -> usize {
+        let routing = &self.routing;
+        let now = Instant::now();
+        self.answered.retain(|id, at| {
+            routing.get_contact(id).is_some() && now.saturating_duration_since(*at) < ANSWERED_TTL
+        });
         if self.peer_versions.is_empty() {
             return 0;
         }
         let before = self.peer_versions.len();
-        let routing = &self.routing;
         self.peer_versions
             .retain(|id, _| routing.get_contact(id).is_some());
         before - self.peer_versions.len()
+    }
+
+    /// Record that `id` answered a request we sent it and still held open.
+    pub fn note_answered(&mut self, id: EmberNodeId, now: Instant) {
+        if self.routing.get_contact(&id).is_none() {
+            return;
+        }
+        if self.answered.len() >= MAX_TRACKED_PEER_VERSIONS && !self.answered.contains_key(&id) {
+            self.answered
+                .retain(|_, at| now.saturating_duration_since(*at) < ANSWERED_TTL);
+            if self.answered.len() >= MAX_TRACKED_PEER_VERSIONS {
+                return;
+            }
+        }
+        self.answered.insert(id, now);
+    }
+
+    /// Whether `id` has answered one of our requests within [`ANSWERED_TTL`].
+    fn has_answered(&self, id: &EmberNodeId, now: Instant) -> bool {
+        self.answered
+            .get(id)
+            .is_some_and(|at| now.saturating_duration_since(*at) < ANSWERED_TTL)
     }
 
     /// Whether `peer` said it can decode `version`.
@@ -1260,10 +1302,11 @@ impl EmberDht {
 
         // The other way a seen signature stops being held is the publisher
         // superseding it with a republish. That is not an eviction to make
-        // good: `DhtStore::store` finds the newer copy, keeps it, and
-        // reports success — so every replay of the retired copy was
-        // reported as a fresh store, re-armed this cache entry, and paid a
-        // second Ed25519 verification for the privilege.
+        // good: `DhtStore::store` finds the newer copy and keeps it, so a
+        // replay of the retired copy must not be treated as a fresh store,
+        // re-arm this cache entry, or pay a second Ed25519 verification. Nor
+        // is it ACKed, any more than `DhtStore::store` ACKs it once the cache
+        // entry has lapsed: the key does not hold that copy.
         //
         // Only past the verification, because what decides it — file hash and
         // creation date — is read from the body, and those are the fields a
@@ -1275,7 +1318,7 @@ impl EmberDht {
                     && h.created_at > parsed.timestamp
             })
         {
-            return StoreOutcome::Replay;
+            return StoreOutcome::Rejected;
         }
 
         // A firewalled source's declared address is exempt from the bind
@@ -2013,8 +2056,13 @@ impl EmberDht {
         session_contacts: &[EmberContact],
     ) -> Vec<EmberContact> {
         let budget = messages::MAX_CONTACTS_PER_DATAGRAM;
-        let mut closest = self.routing.find_closest(target, budget + 1);
+        let mut closest = self.routing.find_closest(target, 2 * budget + 1);
         closest.retain(|c| c.node_id != asker);
+        // Contacts that have answered us first, nearest first within each
+        // group: one that has only ever pinged us may be behind a NAT the asker
+        // cannot cross. It still fills a reply the answered ones cannot.
+        let now = Instant::now();
+        closest.sort_by_key(|c| !self.has_answered(&c.node_id, now));
         closest.truncate(budget);
         // LAN/CGNAT session peers live beside the public table when
         // `block_private_ips` is on. A neighbour on that island already
@@ -2581,8 +2629,8 @@ impl EmberDht {
 
     /// Load persisted records back into the store, returning how many were
     /// accepted (see [`DhtStore::restore`]).
-    pub fn restore_records(&mut self, records: Vec<super::store::PersistedRecord>) -> usize {
-        self.store.restore(records)
+    pub fn restore_records(&mut self, records: super::store::VerifiedRecords) -> usize {
+        self.store.restore_verified(records)
     }
 
     /// Records waiting to be replicated onward (see
@@ -2677,7 +2725,6 @@ impl EmberDht {
                 AddResult::Rejected => {}
             }
         }
-
         match msg.payload {
             DhtPayload::Ping { versions } => {
                 out.ping_received = true;
@@ -3750,6 +3797,53 @@ mod tests {
         let held = local.contact_for(&alice.local_id()).unwrap();
         assert_eq!(held.failed_queries, 0);
         assert!(held.last_seen > 1000);
+    }
+
+    /// A contact that has only ever pinged us may sit behind a NAT the asker
+    /// cannot cross, so one that has answered us goes first in a `FOUND_NODE`,
+    /// even from further away.
+    #[test]
+    fn contacts_that_answered_us_lead_a_found_node_reply() {
+        let mut d = dht(40);
+        let local = d.local_id();
+        let asker = EmberNodeId([0xEE; 16]);
+        let budget = messages::MAX_CONTACTS_PER_DATAGRAM;
+        for bucket in 0..budget + 4 {
+            assert!(d.add_contact(contact_in_bucket(local, bucket, 1_000)));
+        }
+        let far = contact_in_bucket(local, 120, 1_000);
+        assert!(d.add_contact(far.clone()));
+
+        let reply = d.closest_excluding(&local, asker, &[]);
+        assert!(!reply.iter().any(|c| c.node_id == far.node_id));
+
+        d.note_answered(far.node_id, Instant::now());
+        let reply = d.closest_excluding(&local, asker, &[]);
+        assert_eq!(reply.len(), budget);
+        assert_eq!(reply[0].node_id, far.node_id);
+    }
+
+    /// A reply-shaped frame is not an answer on its own: the engine cannot see
+    /// which requests are open, so a PONG it decodes marks nobody, and a mark
+    /// the network loop does record lapses unless it is renewed.
+    #[test]
+    fn only_a_recorded_answer_leads_and_it_lapses() {
+        let mut local = dht(43);
+        let mut peer = dht(44);
+        let peer_addr = addr(44, 4672);
+        let (_rid, ping) = local.build_ping();
+        let on_peer = peer.handle_message(&ping, addr(43, 4672), local.local_noise_pub, 1000);
+        let on_local =
+            local.handle_message(&on_peer.responses[0], peer_addr, peer.local_noise_pub, 1001);
+        assert!(on_local.pong_received);
+        assert!(local.contact_for(&peer.local_id()).is_some());
+
+        let t0 = Instant::now();
+        assert!(!local.has_answered(&peer.local_id(), t0));
+
+        local.note_answered(peer.local_id(), t0);
+        assert!(local.has_answered(&peer.local_id(), t0 + ANSWERED_TTL - Duration::from_secs(1)));
+        assert!(!local.has_answered(&peer.local_id(), t0 + ANSWERED_TTL));
     }
 
     #[test]
@@ -5693,7 +5787,8 @@ mod tests {
     /// still holds the entry but the store no longer holds the record, so the
     /// replay reached `store`, hit the newer-copy guard, and was reported as a
     /// fresh store — an ACK for a record we did not take, a re-armed cache
-    /// entry, and two Ed25519 verifications, on demand.
+    /// entry, and two Ed25519 verifications, on demand. It is refused exactly
+    /// as `store` refuses it once the cache entry has lapsed.
     #[test]
     fn a_replay_of_a_record_its_publisher_superseded_is_not_a_fresh_store() {
         let mut a = dht(20);
@@ -5707,7 +5802,7 @@ mod tests {
         let (old_data, old_sig) = redated(&sk, &base, base.timestamp - 300);
         let (new_data, new_sig) = redated(&sk, &base, base.timestamp);
 
-        let (_rid, old_frame) = a.build_store(key, old_data, old_sig);
+        let (_rid, old_frame) = a.build_store(key, old_data.clone(), old_sig);
         assert!(
             b.handle_message(&old_frame, a_addr, a_noise, 1000)
                 .stored_record
@@ -5725,15 +5820,27 @@ mod tests {
             "a superseded copy must not be reported as stored"
         );
         assert!(
-            replay.store_replay_rejected,
-            "a signature we have already seen whose record is gone for good is a replay"
+            !replay.store_replay_rejected,
+            "a copy we no longer hold is not a replay of one we do"
         );
-        assert_eq!(
-            replay.responses.len(),
-            1,
-            "the sender still needs its STORE_ACK"
-        );
+        assert!(replay.responses.is_empty(), "and is not ACKed: the key does not hold it");
         assert_eq!(b.store_stats(), (1, 1), "and the live store is untouched");
+
+        let entry = messages::BatchedRecord {
+            key,
+            record: old_data,
+            record_signature: old_sig,
+        };
+        let (_rid, batch, _taken) = a.build_store_batch(&[entry]).expect("a batch");
+        let on_b = b.handle_message(&batch, a_addr, a_noise, 1003);
+        assert!(!on_b.store_replay_rejected);
+        let on_a = a.handle_message(&on_b.responses[0], addr(21, 4672), b.local_noise_pub, 1004);
+        assert_eq!(
+            on_a.store_batch_ack.map(|(_, accepted)| accepted),
+            Some(0),
+            "nor does it set its accepted bit in a batch"
+        );
+        assert_eq!(b.store_stats(), (1, 1));
     }
 
     /// At capacity the cache used to choose its victim with a `min_by_key` over

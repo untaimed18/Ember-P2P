@@ -1490,26 +1490,47 @@ fn kad_row(hash: &str, availability: u32) -> SearchResult {
     }
 }
 
-/// Both DHT legs hand over only the records they have not converted before,
-/// so the count on a row is that slice's. The row has to carry what the
-/// slices add up to, or the UI's max-merge keeps the biggest single slice.
+fn ember_row(hash: &str, availability: u32) -> SearchResult {
+    SearchResult {
+        result_origin: crate::search::merge::ORIGIN_EMBER.to_string(),
+        availability,
+        ..sample_search_result(hash)
+    }
+}
+
+/// Ember slices count publishers the earlier slices had not, so the row has
+/// to carry what they add up to, or the UI's max-merge keeps the biggest one.
 #[test]
-fn kad_slices_add_up_to_a_running_total_as_they_arrive() {
+fn ember_slices_add_up_to_a_running_total_as_they_arrive() {
     let mut active = sample_active_search_request(1);
-    let mut first = vec![kad_row("hash1", 3)];
+    let mut first = vec![ember_row("hash1", 3)];
     note_dht_availability(&mut active, &mut first, DhtBatchKind::Incremental);
     assert_eq!(first[0].availability, 3);
 
-    let mut second = vec![kad_row("hash1", 5)];
+    let mut second = vec![ember_row("hash1", 5)];
     note_dht_availability(&mut active, &mut second, DhtBatchKind::Incremental);
     assert_eq!(
         second[0].availability, 8,
-        "a file eight KAD nodes published must not read as five"
+        "a file eight Ember publishers named must not read as five"
     );
 
-    let mut third = vec![kad_row("hash1", 2)];
+    let mut third = vec![ember_row("hash1", 2)];
     note_dht_availability(&mut active, &mut third, DhtBatchKind::Incremental);
     assert_eq!(third[0].availability, 10);
+}
+
+/// A KAD slice's count is a swarm estimate, and the same publishers come back
+/// from every node storing their entry, so slices raise the total to the
+/// larger rather than adding: the UI's max-merge would keep an overshoot for
+/// good, even after the closing rebuild.
+#[test]
+fn kad_slices_keep_the_largest_estimate_rather_than_adding() {
+    let mut active = sample_active_search_request(1);
+    for (slice, shown) in [(3, 3), (5, 5), (2, 5)] {
+        let mut batch = vec![kad_row("hash1", slice)];
+        note_dht_availability(&mut active, &mut batch, DhtBatchKind::Incremental);
+        assert_eq!(batch[0].availability, shown);
+    }
 }
 
 /// The closing batch of either leg is a rebuild over every record gathered,
@@ -1519,11 +1540,11 @@ fn kad_slices_add_up_to_a_running_total_as_they_arrive() {
 fn the_closing_rebuild_replaces_the_total_rather_than_doubling_it() {
     let mut active = sample_active_search_request(1);
     for slice in [3, 5, 2] {
-        let mut batch = vec![kad_row("hash1", slice)];
+        let mut batch = vec![ember_row("hash1", slice)];
         note_dht_availability(&mut active, &mut batch, DhtBatchKind::Incremental);
     }
 
-    let mut closing = vec![kad_row("hash1", 10)];
+    let mut closing = vec![ember_row("hash1", 10)];
     note_dht_availability(&mut active, &mut closing, DhtBatchKind::Cumulative);
     assert_eq!(closing[0].availability, 10);
 }
@@ -1717,6 +1738,9 @@ fn held_records(blobs: &[Vec<u8>]) -> Vec<ember::dht::search::SearchResultRecord
             data: data.clone(),
             from_node: ember::dht::EmberNodeId([i as u8 + 1; 16]),
             confirmed_by: None,
+            from_subnet: None,
+            confirmed_subnet: None,
+            from_local_store: false,
         })
         .collect()
 }
@@ -2106,6 +2130,8 @@ fn a_queued_batch_uses_the_handshake_extended_deadline() {
 struct TestSchedule {
     unplaced: HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
     placed: HashSet<([u8; 16], EmberPublishKind)>,
+    partial: HashSet<([u8; 16], EmberPublishKind)>,
+    retries_spent: HashSet<[u8; 16]>,
     attempts: HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
     source_at: HashMap<[u8; 16], std::time::Instant>,
     keyword_at: HashMap<[u8; 16], std::time::Instant>,
@@ -2116,6 +2142,8 @@ impl TestSchedule {
         EmberPublishSchedule {
             unplaced: &mut self.unplaced,
             placed: &mut self.placed,
+            partial: &mut self.partial,
+            retries_spent: &mut self.retries_spent,
             attempts: &mut self.attempts,
             source_at: &mut self.source_at,
             keyword_at: &mut self.keyword_at,
@@ -2308,9 +2336,78 @@ fn a_file_awaiting_placement_is_not_selected_again() {
     );
 }
 
+/// A record names a buddy only while its endorsement outlives the next
+/// republish, and the endorsement is renewed before it gets that short, so
+/// there is no stretch in which records name an endorsement searchers refuse.
+#[test]
+fn a_buddy_endorsement_is_renewed_before_records_stop_naming_it() {
+    let now = 1_800_000_000i64;
+    let republish = EMBER_SOURCE_REPUBLISH.as_secs() as i64;
+    let fresh = now + 6 * 3600;
+    assert!(ember_buddy_endorsement_outlives_republish(fresh, now));
+    assert!(!ember_buddy_endorsement_renew_due(fresh, now));
+
+    let ageing = now + republish + 45 * 60;
+    assert!(ember_buddy_endorsement_outlives_republish(ageing, now), "still named");
+    assert!(ember_buddy_endorsement_renew_due(ageing, now), "and already being renewed");
+
+    let dying = now + republish + 10 * 60;
+    assert!(
+        !ember_buddy_endorsement_outlives_republish(dying, now),
+        "it would lapse before the record's next republish"
+    );
+}
+
+/// One timeout dropped the named buddy from the candidates, so the next
+/// endorsed contact was named and the whole library's firewalled source
+/// records fell due again over a single lost datagram.
+#[test]
+fn the_named_buddy_survives_a_missed_query() {
+    let local = ember::dht::EmberNodeId([0; 16]);
+    let contact = |id: u8, failed_queries: u8| ember::dht::EmberContact {
+        node_id: ember::dht::EmberNodeId([id; 16]),
+        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, id)), 4672),
+        noise_pub: [id; 32],
+        ed25519_pub: [id; 32],
+        last_seen: 1_800_000_000,
+        failed_queries,
+    };
+    let named = Some(ember::dht::EmberNodeId([1; 16]));
+
+    assert!(ember_buddy_candidate(&contact(1, 0), local, named));
+    assert!(ember_buddy_candidate(&contact(1, ember::dht::MAX_FAILED_QUERIES - 1), local, named));
+    assert!(
+        !ember_buddy_candidate(&contact(1, ember::dht::MAX_FAILED_QUERIES), local, named),
+        "not once it would be evicted"
+    );
+    assert!(ember_buddy_candidate(&contact(2, 0), local, named));
+    assert!(
+        !ember_buddy_candidate(&contact(2, 1), local, named),
+        "a contact we have not named still needs a clean record"
+    );
+    let mut unverified = contact(2, 0);
+    unverified.last_seen = 0;
+    assert!(!ember_buddy_candidate(&unverified, local, named));
+    assert!(!ember_buddy_candidate(&contact(0, 0), local, None), "never ourselves");
+}
+
+/// Target lookups keep pace with the queue instead of a fixed two a minute.
+#[test]
+fn target_lookups_scale_with_the_queue() {
+    assert_eq!(ember_target_lookups_this_cycle(0), EMBER_MAINT_MIN_TARGET_LOOKUPS);
+    assert_eq!(ember_target_lookups_this_cycle(100), EMBER_MAINT_MIN_TARGET_LOOKUPS);
+    assert_eq!(ember_target_lookups_this_cycle(300), 5);
+    assert_eq!(
+        ember_target_lookups_this_cycle(EMBER_PUBLISH_TARGET_QUEUE_MAX),
+        EMBER_MAINT_MAX_TARGET_LOOKUPS
+    );
+}
+
 /// Which of a file's keys resolves last is timing, not outcome: a timeout
 /// always lands after the acks. A round in which one keyword landed and
-/// another was refused everywhere is published, not a failed round.
+/// another was refused everywhere is published, not a failed round — but it
+/// comes back soon for the keyword that did not land, rather than leaving that
+/// word unsearchable for the twelve-hour interval.
 #[test]
 fn a_round_that_placed_one_key_is_published_when_its_last_key_fails() {
     let mut sched = TestSchedule::default();
@@ -2331,18 +2428,68 @@ fn a_round_that_placed_one_key_is_published_when_its_last_key_fails() {
     );
     assert!(!sched.unplaced.contains_key(&slot));
     assert!(!sched.placed.contains(&slot));
-    assert_eq!(sched.rounds_failed(landed), 0, "and nothing is charged");
-    assert_eq!(
+    assert!(!sched.partial.contains(&slot));
+    assert_eq!(sched.rounds_failed(landed), 1, "the lost keyword counts against the file");
+    let staleness_at = |at| {
         ember_publish_staleness(
             &sched.unplaced,
             &sched.keyword_at,
             landed.file_hash,
             landed.kind,
             EMBER_KEYWORD_REPUBLISH,
-            now,
-        ),
-        None,
-        "the file waits out its interval like any confirmed one"
+            at,
+        )
+    };
+    assert_eq!(staleness_at(now), None, "not straight away");
+    assert!(
+        staleness_at(now + EMBER_KEYWORD_PARTIAL_RETRY + std::time::Duration::from_secs(1)).is_some(),
+        "but after the short retry, not the full interval"
+    );
+}
+
+/// A key storers refuse for as long as the file is shared — a word past the
+/// 150-per-publisher cap because most of the library carries it — used to get
+/// its three short retries back every interval, each republishing the file's
+/// whole keyword set. Once spent they stay spent until every key lands.
+#[test]
+fn a_key_that_never_lands_spends_its_retries_once() {
+    let mut sched = TestSchedule::default();
+    let landed = record_ref(6, 60);
+    let refused = record_ref(6, 61);
+    let file = landed.file_hash;
+    let mut at = std::time::Instant::now();
+    let round = |sched: &mut TestSchedule, at: std::time::Instant, place_both: bool| {
+        track_ember_record_pending(sched.borrow(), landed);
+        track_ember_record_pending(sched.borrow(), refused);
+        assert!(!place_ember_record_pending(sched.borrow(), landed, at));
+        if place_both {
+            assert!(place_ember_record_pending(sched.borrow(), refused, at));
+        } else {
+            assert!(fail_ember_record_pending(sched.borrow(), refused, at));
+        }
+        sched.keyword_at[&file].duration_since(at)
+    };
+
+    for _ in 0..EMBER_PUBLISH_MAX_ATTEMPTS {
+        assert_eq!(round(&mut sched, at, false), EMBER_KEYWORD_PARTIAL_RETRY);
+        at += EMBER_KEYWORD_PARTIAL_RETRY;
+    }
+    assert_eq!(round(&mut sched, at, false), EMBER_KEYWORD_REPUBLISH, "spent");
+
+    at += EMBER_KEYWORD_REPUBLISH;
+    assert_eq!(
+        round(&mut sched, at, false),
+        EMBER_KEYWORD_REPUBLISH,
+        "the next interval does not get them back"
+    );
+
+    at += EMBER_KEYWORD_REPUBLISH;
+    assert_eq!(round(&mut sched, at, true), EMBER_KEYWORD_REPUBLISH);
+    at += EMBER_KEYWORD_REPUBLISH;
+    assert_eq!(
+        round(&mut sched, at, false),
+        EMBER_KEYWORD_PARTIAL_RETRY,
+        "a round that placed every key earns them again"
     );
 }
 
@@ -3021,6 +3168,9 @@ fn one_responder_minting_publishers_cannot_decide_a_files_digest() {
         data,
         from_node: ember::dht::EmberNodeId([node; 16]),
         confirmed_by: None,
+        from_subnet: None,
+        confirmed_subnet: None,
+        from_local_store: false,
     };
     let minted: Vec<_> = (0..40u8)
         .map(|i| {
@@ -3067,7 +3217,11 @@ fn one_responder_minting_publishers_cannot_decide_a_files_digest() {
         &HashSet::new(),
         &mut content_hashes,
     );
-    assert_eq!(sources.len(), 40, "every contact stays connectable");
+    assert_eq!(
+        sources.len(),
+        MAX_UNCONFIRMED_SOURCES_PER_RESPONDER,
+        "one responder's unconfirmed addresses are capped, not all dialled"
+    );
     assert!(
         content_hashes.is_empty(),
         "but no digest is pinned on one responder's word"
@@ -3582,6 +3736,53 @@ fn ember_keyword_results_honor_boolean_queries() {
     assert_eq!(not_results[0].file.hash, hex::encode(hash_a));
 }
 
+/// The streaming path records these pairs to skip in later slices, so a record
+/// the build refused must not appear: it would hide that publisher's valid one.
+#[test]
+fn ember_build_reports_only_the_publishers_its_counts_include() {
+    let counted = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+    let other_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let off_query = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
+    let file = [0x59u8; 16];
+    let blobs = vec![
+        ember_kw_blob(&counted, "ubuntu", file, 1, "ubuntu.iso"),
+        ember_kw_blob(&other_key, "debian", file, 1, "ubuntu.iso"),
+        ember_kw_blob(&off_query, "ubuntu", file, 1, "ubuntu desktop.iso"),
+    ];
+    let expr = crate::search::query::parse("ubuntu -desktop").expect("parses");
+    let built = build_ember_keyword_built(
+        &held_records(&blobs),
+        &["ubuntu".to_string()],
+        Some(&expr),
+    );
+    assert_eq!(
+        built.counted_publishers,
+        vec![(file, counted.verifying_key().to_bytes())]
+    );
+    assert_eq!(built.results.len(), 1);
+    assert_eq!(built.results[0].availability, 1);
+}
+
+/// With an OR beside a shared term, the walk goes to the shared term — the
+/// longer OR-side words would see only part of the answer — and the result
+/// build must expect records under that same key, or it drops every hit.
+#[test]
+fn ember_or_query_walks_and_keeps_the_term_every_match_contains() {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let hash_a = [0x57u8; 16];
+    let hash_b = [0x58u8; 16];
+    let expr = crate::search::query::parse("ubuntu (desktop OR serverx)").expect("parses");
+    let keywords = expr.positive_terms();
+    assert_eq!(ember_walk_query(&keywords, Some(&expr)), "ubuntu");
+
+    let blobs = vec![
+        ember_kw_blob(&sk, "ubuntu", hash_a, 1, "ubuntu desktop.iso"),
+        ember_kw_blob(&sk, "ubuntu", hash_b, 1, "ubuntu serverx.iso"),
+    ];
+    let results = build_ember_keyword_built(&held_records(&blobs), &keywords, Some(&expr)).results;
+    assert_eq!(results.len(), 2, "both OR sides found under the shared key");
+}
+
 #[test]
 fn ember_keyword_results_ignore_source_and_garbage_blobs() {
     let sk = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]);
@@ -3718,6 +3919,7 @@ fn firewalled_source_records_preserve_callback_buddy() {
             user_hash: Some([0xCCu8; 16]),
             buddy: Some(buddy),
             callback_token: Some([0xDDu8; 16]),
+            quic_port: None,
         },
     );
     let mut diag = crate::types::EmberDiagnostics::default();
@@ -4237,6 +4439,17 @@ fn mirrored_ember_counters_pin_at_the_ceiling_instead_of_wrapping() {
     assert_eq!(saturating_u32(u64::from(u32::MAX) + 5), u32::MAX);
 }
 
+/// Two strangers in one provider block are one party as far as proof of an
+/// open port goes.
+#[test]
+fn udp_open_witnesses_must_come_from_different_networks() {
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    assert!(!ember_reach_witnesses_independent(ip("203.0.113.5"), ip("203.0.200.9")));
+    assert!(ember_reach_witnesses_independent(ip("203.0.113.5"), ip("198.51.100.9")));
+    assert!(!ember_reach_witnesses_independent(ip("2001:db8:1::1"), ip("2001:db8:1:ff::2")));
+    assert!(ember_reach_witnesses_independent(ip("2001:db8:1::1"), ip("2001:db8:2::1")));
+}
+
 #[test]
 fn the_rendezvous_advert_follows_udp_reachability_not_tcp() {
     // KAD proved the port open: advertise, whatever TCP says.
@@ -4281,6 +4494,34 @@ fn stun_may_replace_a_kad_vote_but_not_a_live_highid() {
     assert!(
         should_adopt_stun_external_ip(Some(kad), stun, Some(highid)),
         "HighID that has not yet been applied must not block STUN from replacing KAD"
+    );
+}
+
+/// The votes used to be read only while `external_ip` was empty, so an idle
+/// Ember-only node that changed address kept advertising the old one: nothing
+/// re-probed STUN for it, and its source records named an address storers
+/// refuse under anti-reflection.
+#[test]
+fn a_vote_confirmed_change_of_address_asks_stun_rather_than_moving_it() {
+    let old = Ipv4Addr::new(8, 8, 8, 8);
+    let new = Ipv4Addr::new(9, 9, 9, 9);
+    assert_eq!(observed_ip_action(None, new, None, None), ObservedIpAction::Adopt);
+    assert_eq!(observed_ip_action(None, new, Some(new), None), ObservedIpAction::Adopt);
+    assert_eq!(
+        observed_ip_action(None, new, Some(old), None),
+        ObservedIpAction::Keep,
+        "STUN disagreeing still wins an empty slot"
+    );
+    assert_eq!(
+        observed_ip_action(Some(old), new, Some(old), None),
+        ObservedIpAction::Reprobe,
+        "peers never move an address we hold, but STUN is asked again"
+    );
+    assert_eq!(observed_ip_action(Some(new), new, None, None), ObservedIpAction::Keep);
+    assert_eq!(
+        observed_ip_action(Some(old), new, None, Some(old)),
+        ObservedIpAction::Keep,
+        "a live HighID is not something STUN would move"
     );
 }
 
@@ -4872,6 +5113,33 @@ fn session_introduced_matches_the_key_scans_it_replaced() {
             }
         }
     }
+}
+
+/// Answering a public stranger's ping marks it dialled, which must not be
+/// enough to pin it as a session contact. A LAN host we dialled still is, and
+/// so is anything an eD2K session vouches for.
+#[test]
+fn a_public_peer_we_only_answered_is_not_a_session_contact() {
+    let now = std::time::Instant::now();
+    let keyless = HostPortMap::new();
+    let session = HostPortMap::new();
+    let mut known = HostPortMap::new();
+    let stranger = Ipv4Addr::new(80, 1, 2, 3);
+    let lan = Ipv4Addr::new(192, 168, 1, 7);
+    let introduced = Ipv4Addr::new(80, 9, 9, 9);
+    known.insert((introduced, 4662), now);
+
+    let admitted = |ip, dialled| {
+        ember_session_contact_admitted_among(&keyless, &session, &known, || dialled, ip, 4672)
+    };
+    assert!(!admitted(stranger, true), "a reply to its ping vouches for nothing");
+    assert!(
+        ember_session_introduced_among(&keyless, &session, &known, || true, stranger, 4672),
+        "the IP filter still lets the reply's answer through"
+    );
+    assert!(admitted(lan, true));
+    assert!(!admitted(lan, false));
+    assert!(admitted(introduced, false));
 }
 
 /// `handle_ember_dht_message` copies the session map only when the frame's
@@ -5688,6 +5956,29 @@ fn note_results_keep_requested_file_hash() {
     assert_eq!(results[0].rating, Some(5));
 }
 
+/// Each node storing a note returns it, so one publisher's note arrives once
+/// per responder; it is still one note. An empty entry must not take the
+/// publisher's slot ahead of the real one.
+#[test]
+fn note_results_keep_one_note_per_publisher() {
+    let note = |publisher: u8, comment: &str| SearchResultEntry {
+        id: KadId([publisher; 16]),
+        tags: vec![KadTag {
+            name: TagName::Id(TAG_DESCRIPTION),
+            value: TagValue::String(comment.to_string()),
+        }],
+    };
+    let entries = vec![
+        note(0x22, ""),
+        note(0x22, "Looks good"),
+        note(0x22, "Looks good"),
+        note(0x33, "Fake"),
+    ];
+    let results = convert_note_search_results(&entries, &KadId([0x11; 16]));
+    let comments: Vec<_> = results.iter().map(|r| r.comment.as_deref()).collect();
+    assert_eq!(comments, [Some("Looks good"), Some("Fake")]);
+}
+
 #[test]
 fn search_results_extract_kad_media_tags() {
     let entries = vec![SearchResultEntry {
@@ -5757,6 +6048,48 @@ fn search_results_without_media_leave_field_none() {
     let results = convert_search_results(&entries, |_| true);
     assert_eq!(results.len(), 1);
     assert!(results[0].media.is_none());
+}
+
+/// eMule writes every Kad integer tag at the smallest width that holds it, so
+/// small counts, sizes and media figures arrive as UINT8/UINT16.
+#[test]
+fn kad_results_read_integer_tags_at_any_width() {
+    use crate::network::kad::types::{TAG_COMPLETE_SOURCES, TAG_FILESIZE, TAG_SOURCES};
+    let tag = |id: u8, value: TagValue| KadTag {
+        name: TagName::Id(id),
+        value,
+    };
+    let entries = vec![SearchResultEntry {
+        id: KadId([0x56; 16]),
+        tags: vec![
+            tag(TAG_FILENAME, TagValue::String("song.mp3".to_string())),
+            tag(TAG_FILESIZE, TagValue::Uint16(40_000)),
+            tag(TAG_SOURCES, TagValue::Uint8(5)),
+            tag(TAG_COMPLETE_SOURCES, TagValue::Uint8(3)),
+            tag(TAG_MEDIA_BITRATE, TagValue::Uint8(128)),
+            tag(TAG_MEDIA_LENGTH, TagValue::Uint8(200)),
+        ],
+    }];
+    let results = convert_search_results(&entries, |_| true);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].file.size, 40_000);
+    assert_eq!(results[0].availability, 5);
+    assert_eq!(results[0].file.complete_sources, 3);
+    let media = results[0].media.as_ref().expect("media present");
+    assert_eq!(media.bitrate, Some(128));
+    assert_eq!(media.duration, Some(200));
+}
+
+/// eMule splits an inbound string term on the keyword separators and wants
+/// every word (`SSearchTerm::Evaluate`), not the term as one substring.
+#[test]
+fn inbound_kad_string_term_requires_each_word() {
+    let name = "pink_floyd-the_wall.mp3";
+    let term = |s: &str| KadSearchExpr::String(s.to_string());
+    assert!(matches_search_expr_impl(&term("Pink Floyd"), name, 0, None));
+    assert!(matches_search_expr_impl(&term("wall pink"), name, 0, None));
+    assert!(!matches_search_expr_impl(&term("pink money"), name, 0, None));
+    assert!(!matches_search_expr_impl(&term(" - "), name, 0, None), "no word, no match");
 }
 
 /// Both Kad counts are estimates of one swarm, so neither accumulates with

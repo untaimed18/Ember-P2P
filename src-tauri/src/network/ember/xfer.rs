@@ -214,6 +214,55 @@ pub struct SendState {
     /// When the stall timer fired on a transfer that had sent everything, and
     /// the recipient was asked how it ended. See [`SendState::stall_verdict`].
     asked_at: Option<Instant>,
+    /// The plain offer, held back until the recipient has had time to say it
+    /// read the sealed one; see `channel::XFER_SEEN_PLAIN_VERSION`.
+    plain_offer: Option<PlainOffer>,
+}
+
+/// A plain offer that has not gone out. Every member it is forwarded through
+/// can read its file name and size, so it is only ever sent on the user's say.
+enum PlainOffer {
+    /// Waiting until the time given for the recipient to say it read the
+    /// sealed offer.
+    Held { due: Instant, frame: Vec<u8> },
+    /// Nothing was heard in time, and the user has been asked.
+    AwaitingConsent(Vec<u8>),
+}
+
+/// How long a member proven to read sealed offers is believed to still do so.
+/// Past it they are treated as unknown again, since a member can go back to an
+/// older build.
+pub const SEALED_OFFER_READER_KEEP_SECS: i64 = 180 * 24 * 3600;
+
+/// A proof dated further ahead than this was written while our clock was
+/// wrong. Believed, it would last until that date plus the keep time.
+pub const SEALED_OFFER_READER_MAX_FUTURE_SECS: i64 = 24 * 3600;
+
+/// Members kept proven at once, newest proof first. In a public room an
+/// identity costs nothing, so without a bound the table grows by one row per
+/// identity that typed there in the last [`SEALED_OFFER_READER_KEEP_SECS`].
+/// A member who falls off is only asked about again.
+pub const SEALED_OFFER_READERS_MAX: usize = 4096;
+
+/// Whether a member last proven to read sealed offers at `last_seen` (Unix
+/// seconds) still counts as one at `now`. Such a member is never sent a plain
+/// offer, and no plain offer is held for them.
+pub fn sealed_offer_reader_current(last_seen: Option<i64>, now: i64) -> bool {
+    last_seen.is_some_and(|at| {
+        at <= now.saturating_add(SEALED_OFFER_READER_MAX_FUTURE_SECS)
+            && now.saturating_sub(at) <= SEALED_OFFER_READER_KEEP_SECS
+    })
+}
+
+/// The largest offer v1.6.x reads. It drops a larger one without answering.
+pub const V1_6_XFER_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Whether to hold the plain offer for a `size`-byte file. Never for a member
+/// known to read sealed offers, and never for a file v1.6.x would drop: there
+/// the plain offer could only show its name and size to the members relaying
+/// it.
+pub fn holds_plain_offer(size: u64, reads_sealed: bool) -> bool {
+    !reads_sealed && size <= V1_6_XFER_MAX_BYTES
 }
 
 /// How long a sender that has sent everything waits, once its stall timer
@@ -259,7 +308,73 @@ impl SendState {
             streamed: 0,
             reporter: ProgressReporter::default(),
             asked_at: None,
+            plain_offer: None,
         }
+    }
+
+    /// Keep `frame` until `due`, and then ask the user about it, unless the
+    /// recipient shows first that it read the sealed offer.
+    pub fn hold_plain_offer(&mut self, frame: Vec<u8>, due: Instant) {
+        self.plain_offer = Some(PlainOffer::Held { due, frame });
+    }
+
+    /// The recipient answered something about this transfer, so it has the
+    /// sealed offer and the plain one would only be a duplicate. True when
+    /// that takes down a question the user was being asked.
+    pub fn offer_was_read(&mut self) -> bool {
+        matches!(self.plain_offer.take(), Some(PlainOffer::AwaitingConsent(_)))
+    }
+
+    /// A verified frame about this transfer arrived from `sender`. Only the
+    /// recipient's own counts as having read the offer. True when that takes
+    /// down a question the user was being asked.
+    pub fn heard_from(&mut self, sender: &[u8; 32]) -> bool {
+        self.peer == *sender && self.offer_was_read()
+    }
+
+    /// True once, when the held plain offer comes due: the user is to be asked
+    /// whether to send it.
+    pub fn plain_offer_came_due(&mut self, now: Instant) -> bool {
+        match self.plain_offer.take() {
+            Some(PlainOffer::Held { due, frame }) if now >= due => {
+                self.plain_offer = Some(PlainOffer::AwaitingConsent(frame));
+                true
+            }
+            other => {
+                self.plain_offer = other;
+                false
+            }
+        }
+    }
+
+    /// Whether the user is being asked to send the plain offer.
+    pub fn awaiting_consent(&self) -> bool {
+        matches!(self.plain_offer, Some(PlainOffer::AwaitingConsent(_)))
+    }
+
+    /// The plain offer the user has just agreed to send. Handed out once, and
+    /// only while the user was being asked.
+    pub fn take_consented_plain_offer(&mut self) -> Option<Vec<u8>> {
+        match self.plain_offer.take() {
+            Some(PlainOffer::AwaitingConsent(frame)) => Some(frame),
+            other => {
+                self.plain_offer = other;
+                None
+            }
+        }
+    }
+
+    /// Put back a consented plain offer that could not be sent, so the user can
+    /// try again.
+    pub fn ask_again(&mut self, frame: Vec<u8>) {
+        self.plain_offer = Some(PlainOffer::AwaitingConsent(frame));
+    }
+
+    /// The consented plain offer went out. A v1.6.x recipient's prompt only
+    /// starts now, so the offer window starts again with it; see
+    /// [`Self::is_stalled`].
+    pub fn plain_offer_sent(&mut self, now: Instant) {
+        self.updated_at = now;
     }
 
     /// What to do now that [`Self::is_stalled`] holds.
@@ -284,15 +399,20 @@ impl SendState {
     /// recipient accepted, so it also counts as the accept. Only movement
     /// feeds the stall timer: this is called every tick while a stream is
     /// open, and one whose recipient vanished must still time out.
-    pub fn note_streamed(&mut self, position: u64) {
+    ///
+    /// True when that takes down a question the user was being asked.
+    pub fn note_streamed(&mut self, position: u64) -> bool {
+        let mut question_down = false;
         if !self.accepted {
             self.accepted = true;
             self.updated_at = Instant::now();
+            question_down = self.offer_was_read();
         }
         if position > self.streamed {
             self.streamed = position.min(self.size);
             self.updated_at = Instant::now();
         }
+        question_down
     }
 
     /// Read one block, opening the file on first use and keeping the handle.
@@ -392,6 +512,8 @@ impl SendState {
     /// [`XFER_OFFER_TTL_SECS`], but the recipient's clock starts when the
     /// offer lands rather than when it was sent, so without it an accept at
     /// the very edge of the window could still race the sender's cleanup.
+    /// For the same reason the window starts again when the plain offer goes
+    /// out, which is when a v1.6.x recipient's prompt appears.
     pub fn is_stalled(&self, now: Instant) -> bool {
         let window = if self.accepted {
             Duration::from_secs(XFER_STALL_SECS)
@@ -819,6 +941,16 @@ impl FinishedXfers {
         Some((entry.channel_id, entry.verdict.clone()))
     }
 
+    /// Whether `xfer_id` from `peer` is a transfer remembered here, answered
+    /// or not: a frame about it, even inside the answer gap, is never a new
+    /// offer.
+    pub fn remembers(&self, xfer_id: &[u8; 16], peer: &[u8; 32], now: Instant) -> bool {
+        self.entries.get(xfer_id).is_some_and(|entry| {
+            entry.peer == *peer
+                && now.saturating_duration_since(entry.finished_at) <= XFER_FINISHED_REMEMBER
+        })
+    }
+
     /// Verdicts due to be sent again unasked, as `(channel_id, peer, frame)`.
     pub fn due(&mut self, now: Instant) -> Vec<([u8; 16], [u8; 32], Vec<u8>)> {
         self.prune(now);
@@ -890,6 +1022,146 @@ mod tests {
         (state, TempDir(dir))
     }
 
+    fn plain_send() -> SendState {
+        SendState::new([1u8; 16], [2u8; 32], [3u8; 32], "x.bin".into(), 5, PathBuf::from("x.bin"))
+    }
+
+    /// A due plain offer is not sent: the user is asked, once, and it goes out
+    /// only when they agree — also once.
+    #[test]
+    fn a_due_plain_offer_waits_for_consent_and_goes_out_once() {
+        let t0 = Instant::now();
+        let due = t0 + Duration::from_secs(10);
+        let mut send = plain_send();
+        assert!(!send.plain_offer_came_due(due), "nothing held");
+        assert!(send.take_consented_plain_offer().is_none());
+
+        send.hold_plain_offer(b"plain".to_vec(), due);
+        assert!(!send.plain_offer_came_due(t0 + Duration::from_secs(9)));
+        assert!(!send.awaiting_consent());
+        assert!(send.take_consented_plain_offer().is_none(), "not before it is due");
+
+        assert!(send.plain_offer_came_due(due));
+        assert!(send.awaiting_consent());
+        assert!(!send.plain_offer_came_due(due + Duration::from_secs(60)), "asked once");
+
+        assert_eq!(send.take_consented_plain_offer().as_deref(), Some(&b"plain"[..]));
+        assert!(!send.awaiting_consent());
+        assert!(send.take_consented_plain_offer().is_none(), "sent once");
+        assert!(!send.plain_offer_came_due(due + Duration::from_secs(120)), "never asked again");
+    }
+
+    /// A plain offer whose send failed is asked about again rather than lost
+    /// or retried behind the user's back.
+    #[test]
+    fn a_consented_plain_offer_that_could_not_be_sent_is_asked_about_again() {
+        let due = Instant::now();
+        let mut send = plain_send();
+        send.hold_plain_offer(b"plain".to_vec(), due);
+        assert!(send.plain_offer_came_due(due));
+        let frame = send.take_consented_plain_offer().expect("consented");
+        send.ask_again(frame);
+        assert!(send.awaiting_consent());
+        assert!(!send.plain_offer_came_due(due + Duration::from_secs(5)), "no second prompt");
+        assert!(send.take_consented_plain_offer().is_some());
+    }
+
+    /// Anything verified from the recipient cancels the held plain offer, and
+    /// takes the question down if it was up. A frame naming anyone else does
+    /// neither.
+    #[test]
+    fn a_frame_from_the_recipient_cancels_the_held_plain_offer() {
+        let t0 = Instant::now();
+        let due = t0 + Duration::from_secs(10);
+        let (recipient, stranger) = ([2u8; 32], [9u8; 32]);
+
+        let mut send = plain_send();
+        send.hold_plain_offer(b"plain".to_vec(), due);
+        assert!(!send.heard_from(&stranger));
+        assert!(!send.heard_from(&recipient), "no question was up yet");
+        assert!(!send.plain_offer_came_due(due), "cancelled before it was due");
+        assert!(send.take_consented_plain_offer().is_none());
+
+        send.hold_plain_offer(b"plain".to_vec(), due);
+        assert!(send.plain_offer_came_due(due));
+        assert!(!send.heard_from(&stranger));
+        assert!(send.awaiting_consent(), "a stranger cannot take the question down");
+        assert!(send.heard_from(&recipient), "the question comes down");
+        assert!(!send.awaiting_consent());
+        assert!(send.take_consented_plain_offer().is_none(), "nothing left to consent to");
+
+        send.hold_plain_offer(b"plain".to_vec(), due);
+        assert!(!send.note_streamed(1), "no question was up yet");
+        assert!(!send.plain_offer_came_due(due), "a stream opening counts too");
+    }
+
+    /// A stream that opens before its first byte still takes the question
+    /// down, and says so, since no progress report will.
+    #[test]
+    fn a_stream_opening_at_zero_bytes_takes_the_question_down() {
+        let due = Instant::now();
+        let mut send = plain_send();
+        send.hold_plain_offer(b"plain".to_vec(), due);
+        assert!(send.plain_offer_came_due(due));
+        assert!(send.note_streamed(0));
+        assert!(!send.awaiting_consent());
+        assert_eq!(send.progress_step(), None, "nothing else would have reported it");
+        assert!(!send.note_streamed(0), "said once");
+    }
+
+    /// A plain offer clicked late gets a whole offer window from when it went
+    /// out: a v1.6.x recipient's prompt starts when it lands, and the stall
+    /// cancel sent on giving up takes that prompt down.
+    #[test]
+    fn a_late_plain_offer_starts_the_offer_window_again() {
+        let mut send = plain_send();
+        let created = send.updated_at;
+        let window = Duration::from_secs(XFER_OFFER_TTL_SECS as u64 + OFFER_GRACE_SECS);
+        let clicked = created + Duration::from_secs(XFER_OFFER_TTL_SECS as u64);
+        send.hold_plain_offer(b"plain".to_vec(), created);
+        assert!(send.plain_offer_came_due(created));
+
+        let frame = send.take_consented_plain_offer().expect("consented");
+        send.ask_again(frame);
+        assert!(
+            send.is_stalled(created + window + Duration::from_secs(1)),
+            "a send that failed gains no time"
+        );
+
+        send.take_consented_plain_offer().expect("consented");
+        send.plain_offer_sent(clicked);
+        assert!(!send.is_stalled(created + window + Duration::from_secs(1)));
+        assert!(!send.is_stalled(clicked + Duration::from_secs(XFER_OFFER_TTL_SECS as u64)));
+        assert!(send.is_stalled(clicked + window + Duration::from_secs(1)));
+    }
+
+    /// v1.6.x drops an offer over 100 MiB unread, so no plain offer is held
+    /// for one; nor for a member known to read sealed offers.
+    #[test]
+    fn a_plain_offer_is_held_only_where_it_can_help() {
+        assert!(holds_plain_offer(1, false));
+        assert!(holds_plain_offer(V1_6_XFER_MAX_BYTES, false));
+        assert!(!holds_plain_offer(V1_6_XFER_MAX_BYTES + 1, false));
+        assert!(!holds_plain_offer(1, true));
+    }
+
+    /// Proof of reading sealed offers lasts half a year from the last time it
+    /// was seen, and no proof is no proof.
+    #[test]
+    fn a_sealed_offer_reader_is_believed_for_half_a_year() {
+        let now = 1_800_000_000;
+        assert!(!sealed_offer_reader_current(None, now));
+        assert!(sealed_offer_reader_current(Some(now), now));
+        assert!(sealed_offer_reader_current(Some(now - SEALED_OFFER_READER_KEEP_SECS), now));
+        assert!(!sealed_offer_reader_current(Some(now - SEALED_OFFER_READER_KEEP_SECS - 1), now));
+        assert!(sealed_offer_reader_current(Some(now + 60), now), "a clock set back is not a downgrade");
+        assert!(sealed_offer_reader_current(Some(now + SEALED_OFFER_READER_MAX_FUTURE_SECS), now));
+        assert!(
+            !sealed_offer_reader_current(Some(now + SEALED_OFFER_READER_MAX_FUTURE_SECS + 1), now),
+            "a proof written under a clock far ahead says nothing"
+        );
+    }
+
     /// A lost "done" is repeated twice unasked, and again when the sender
     /// speaks up about the transfer — to that sender only, never faster than
     /// the answer gap, and not once the transfer is long past.
@@ -914,11 +1186,17 @@ mod tests {
         );
         assert_eq!(finished.answer(&xfer, &sender, later), Some((room, b"done".to_vec())));
         assert!(finished.answer(&xfer, &sender, later + Duration::from_secs(1)).is_none());
+        assert!(
+            finished.remembers(&xfer, &sender, later + Duration::from_secs(1)),
+            "inside the gap it is still no new offer"
+        );
+        assert!(!finished.remembers(&xfer, &stranger, later));
         assert!(finished.answer(&xfer, &sender, later + Duration::from_secs(3)).is_some());
         assert!(finished.answer(&[0u8; 16], &sender, later).is_none());
         assert!(finished
             .answer(&xfer, &sender, t0 + XFER_FINISHED_REMEMBER + Duration::from_secs(1))
             .is_none());
+        assert!(!finished.remembers(&xfer, &sender, t0 + XFER_FINISHED_REMEMBER + Duration::from_secs(1)));
     }
 
     #[test]

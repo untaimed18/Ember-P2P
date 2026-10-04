@@ -412,6 +412,14 @@ impl EmberBatchPublisher {
         outcome
     }
 
+    /// Whether batch `request_id` went to `from` and is still waiting for its
+    /// ack — what [`Self::note_ack`] would honour.
+    pub(crate) fn awaits_ack(&self, request_id: u32, from: ember::dht::EmberNodeId) -> bool {
+        self.in_flight
+            .get(&request_id)
+            .is_some_and(|batch| batch.node_id == from)
+    }
+
     /// Drop batches whose ack never came, returning the records they carried.
     ///
     /// The references are returned rather than merely counted because these are
@@ -1024,6 +1032,28 @@ mod tests {
         assert_eq!(outcome.placed, vec![keyword]);
         assert!(outcome.refused.is_empty());
         assert_eq!(publisher.expire(now + EMBER_BATCH_ACK_TIMEOUT), vec![keyword]);
+    }
+
+    /// Only the node a batch went to answers it, and only while it is open:
+    /// what lets an ack count as that node having answered us.
+    #[test]
+    fn a_batch_awaits_its_ack_from_the_node_it_went_to() {
+        let node = contact(1).node_id;
+        let mut publisher = EmberBatchPublisher::default();
+        publisher.in_flight.insert(
+            7,
+            EmberBatchInFlight {
+                node_id: node,
+                records: vec![reference(0xAA, EmberPublishKind::Keyword, 0x11)],
+                deadline: std::time::Instant::now() + EMBER_BATCH_ACK_TIMEOUT,
+                voided: 0,
+            },
+        );
+        assert!(publisher.awaits_ack(7, node));
+        assert!(!publisher.awaits_ack(7, contact(2).node_id), "another node");
+        assert!(!publisher.awaits_ack(8, node), "another batch");
+        publisher.note_ack(7, 1, node);
+        assert!(!publisher.awaits_ack(7, node), "answered already");
     }
 
     /// A whole tick's burst lost at once — one failed handshake — is one bad

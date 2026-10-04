@@ -26,6 +26,18 @@ export interface TransferStats {
   overhead_file_request: number;
   overhead_epx: number;
   overhead_ember_dht: number;
+  /** Payload rates for the graph; absent from a backend that predates it. */
+  rate_history?: RateHistory;
+}
+
+/** Recent rates, oldest first. Each sample is `[down, up]` in bytes/second. */
+export interface RateHistory {
+  /** Unix seconds of the newest sample in `recent`. */
+  recent_end: number;
+  /** About one sample a second, the last five minutes. */
+  recent: [number, number][];
+  /** One average per completed minute, the last hour. */
+  minutes: [number, number][];
 }
 
 export async function getStatistics(): Promise<TransferStats> {

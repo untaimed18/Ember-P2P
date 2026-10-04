@@ -766,7 +766,8 @@ impl CreditManager {
                     tracing::error!(
                         "cryptkey.dat is protected but could not be decrypted ({e}); \
                          leaving SecIdent disabled this session and NOT regenerating \
-                         (the keypair may be recoverable on the correct account)"
+                         (the keypair may be recoverable on the correct account, or on \
+                         Linux once the login keyring is unlocked)"
                     );
                     let backup = key_path.with_extension("dat.undecryptable");
                     let _ = std::fs::copy(&key_path, &backup);

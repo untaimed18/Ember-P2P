@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -427,10 +426,23 @@ pub(super) fn expire_outstanding_ranges(outstanding: &mut Vec<OutstandingRange>)
 }
 
 pub(super) fn refresh_outstanding_range(outstanding: &mut [OutstandingRange], pkt_start: u64) {
-    if let Some(r) = outstanding
-        .iter_mut()
+    if let Some(start) = outstanding
+        .iter()
         .find(|r| pkt_start >= r.start && pkt_start < r.end)
+        .map(|r| r.start)
     {
+        touch_queued_from(outstanding, start);
+    }
+}
+
+/// Refresh every range from `start` on. Uploaders serve requests in order and
+/// ours ascend through the part, so the ranges after the one being sent are
+/// waiting their turn, not dropped. Timed from the request alone, the second
+/// of two blocks at 4 KB/s expired before its first byte (~45 s in), and each
+/// expiry re-requested more than the peer could ever deliver. Ranges before
+/// `start` the peer has skipped, and keep their own deadline.
+fn touch_queued_from(outstanding: &mut [OutstandingRange], start: u64) {
+    for r in outstanding.iter_mut().filter(|r| r.start >= start) {
         r.touch();
     }
 }
@@ -452,6 +464,7 @@ pub(super) fn take_completed_outstanding_range(
         .position(|r| pkt_start >= r.start && pkt_start < r.end && pkt_end == r.end)
     {
         outstanding.swap_remove(i);
+        touch_queued_from(outstanding, pkt_end);
         true
     } else {
         refresh_outstanding_range(outstanding, pkt_start);
@@ -703,7 +716,7 @@ pub struct Ed2kDownload {
     pub file_name: String,
     pub file_size: u64,
     pub source_addr: SocketAddr,
-    pub download_dir: PathBuf,
+    pub download_folders: crate::storage::part_folders::SharedDownloadFolders,
     pub tcp_port: u16,
     pub udp_port: u16,
     pub bandwidth_limiter: Arc<BandwidthLimiter>,
@@ -941,7 +954,8 @@ pub enum DownloadEvent {
         part_end: u64,
         sender_user_hash: Option<[u8; 16]>,
     },
-    /// A part failed its MD4 hash check.
+    /// A part failed its MD4 hash check, or AICH recovery narrowed one to a
+    /// bad 180 KiB block, which is then the range reported.
     PartCorrupted {
         file_hash: [u8; 16],
         part_start: u64,
@@ -1103,6 +1117,85 @@ pub(crate) async fn prepare_download_dirs(
     .map_err(|e| download_folder_error("preparing Temp and Downloads", download_dir, e))
 }
 
+/// Also tagged [`DOWNLOAD_FOLDER_STAGE`], so the download is re-queued without
+/// blaming a source, and starts again once the folder is back.
+pub(crate) const PART_FOLDER_OFFLINE_STAGE: &str = "stage:part_folder_offline";
+
+fn part_folder_offline_error(folder: &std::path::Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{DOWNLOAD_FOLDER_STAGE}: {PART_FOLDER_OFFLINE_STAGE}: {} holds this download's progress \
+         and cannot be reached",
+        folder.display()
+    )
+}
+
+/// The download folder holding this download's `.part` — the one it started
+/// in — and that folder's `Temp`, prepared. Only the current folder gets a
+/// `Downloads`: finished files never go to an earlier one.
+pub(crate) async fn prepare_part_dir(
+    folders: &crate::storage::part_folders::SharedDownloadFolders,
+    transfer_id: &str,
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let folders = folders.read().clone();
+    let current = folders.current.clone();
+    let id = transfer_id.to_string();
+    let root = tokio::task::spawn_blocking(move || folders.folder_to_resume_in(&id))
+        .await
+        .map_err(|e| anyhow::anyhow!("download folder task failed: {e}"))?
+        .map_err(|offline| part_folder_offline_error(&offline))?;
+    let temp = if root == current {
+        prepare_download_dirs(&root).await?.0
+    } else {
+        let part_root = root.clone();
+        tokio::task::spawn_blocking(move || {
+            let allowed = vec![part_root.to_string_lossy().into_owned()];
+            crate::security::filesystem::prepare_approved_subdir(&part_root, "Temp", &allowed)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("download folder task failed: {e}"))?
+        .map_err(|e| download_folder_error("preparing Temp", &root, e))?
+    };
+    crate::storage::part_folders::note_located(transfer_id, &root);
+    Ok((root, temp))
+}
+
+/// Move a verified `.part` into `<download_root>/Downloads/<file_name>`.
+/// `download_root` is the download folder current at completion, which need
+/// not be the one holding the `.part`. Blocking.
+pub(crate) fn move_part_to_downloads(
+    part_path: &std::path::Path,
+    part_root: &std::path::Path,
+    download_root: &std::path::Path,
+    file_name: &str,
+    expected_source_identity: &crate::security::filesystem::ObjectIdentity,
+) -> anyhow::Result<std::path::PathBuf> {
+    let allowed = vec![download_root.to_string_lossy().into_owned()];
+    let completed_dir =
+        crate::security::filesystem::prepare_approved_subdir(download_root, "Downloads", &allowed)
+            .map_err(|e| download_folder_error("preparing Downloads", download_root, e))?;
+    move_part_between_roots_approved(
+        part_path,
+        part_root,
+        &completed_dir.join(file_name),
+        download_root,
+        expected_source_identity,
+    )
+    .map_err(|e| {
+        let error = format!("{e:#}");
+        if is_disk_full_error(&error) || is_download_folder_error(&error) {
+            e
+        } else {
+            anyhow::anyhow!("{COMPLETION_MOVE_STAGE}: {error}")
+        }
+    })
+}
+
+/// Prefix on a failure to move a verified `.part` into `Downloads`. Every
+/// retry reads the whole file again to verify it, so the event loop retries
+/// such a failure once and then leaves the download Failed, `.part` kept, for
+/// the user to resume.
+pub(crate) const COMPLETION_MOVE_STAGE: &str = "stage:completion_move";
+
 pub(crate) fn failure_kind_name(kind: &SourceFailureKind) -> String {
     match kind {
         SourceFailureKind::Transient => "transient".to_string(),
@@ -1173,6 +1266,8 @@ transfer_failure_codes! {
     NetworkChannelUnavailable => "network_channel_unavailable", "Network channel unavailable";
     DownloadFolderUnavailable => "download_folder_unavailable",
         "The download folder cannot be written; check it in Settings";
+    PartFolderOffline => "part_folder_offline",
+        "The drive holding this download's progress is not connected; Resume starts it over";
     EmberPinCorrupt => "ember_pin_corrupt",
         "Persisted Ember digest was corrupt; cancel and re-add the eh= link";
     AichPinCorrupt => "aich_pin_corrupt",
@@ -1181,6 +1276,8 @@ transfer_failure_codes! {
         "Couldn't read the finished file to verify it";
     LocalReadFailed => "local_read_failed",
         "The finished file can't be read from the drive";
+    CompletionMoveFailed => "completion_move_failed",
+        "The finished file couldn't be moved into the download folder";
 }
 
 /// Reduce a raw error to the canned failure the UI shows.
@@ -1194,8 +1291,14 @@ pub(crate) fn classify_failure(error: &str, kind: &SourceFailureKind) -> Transfe
     if lower.contains("cancelled") {
         return TransferFailureCode::Cancelled;
     }
+    if error.contains(PART_FOLDER_OFFLINE_STAGE) {
+        return TransferFailureCode::PartFolderOffline;
+    }
     if is_download_folder_error(error) {
         return TransferFailureCode::DownloadFolderUnavailable;
+    }
+    if error.contains(COMPLETION_MOVE_STAGE) {
+        return TransferFailureCode::CompletionMoveFailed;
     }
     if error.contains(LOCAL_READ_FAILED_MSG) {
         return TransferFailureCode::LocalReadFailed;
@@ -1411,6 +1514,11 @@ mod tests {
         let cases: &[(&str, SourceFailureKind, TransferFailureCode)] = &[
             ("download cancelled by user", Transient, C::Cancelled),
             ("peer does not have the file", Permanent, C::RemoteMissingFile),
+            (
+                "peer does not have the file any more (FileNotFound during transfer)",
+                Permanent,
+                C::RemoteMissingFile,
+            ),
             ("FileReqAnsNoFil", Permanent, C::RemoteMissingFile),
             (EMBER_BLAKE3_MISMATCH_MSG, Permanent, C::EmberContentHashMismatch),
             (
@@ -1464,8 +1572,18 @@ mod tests {
                 Transient,
                 C::DownloadFolderUnavailable,
             ),
+            (
+                "stage:download_folder: stage:part_folder_offline: /x cannot be reached",
+                Transient,
+                C::PartFolderOffline,
+            ),
             (FINAL_VERIFY_INCONCLUSIVE_MSG, Transient, C::FinalVerifyInconclusive),
             (LOCAL_READ_FAILED_MSG, Transient, C::LocalReadFailed),
+            (
+                "stage:completion_move: file not found (os error 2)",
+                Permanent,
+                C::CompletionMoveFailed,
+            ),
             ("unrecognised", Permanent, C::PermanentFailure),
             ("unrecognised", Transient, C::TransientFailure),
             ("unrecognised", DownloadTimeout, C::DownloadTimedOut),
@@ -1514,6 +1632,7 @@ mod tests {
             "stage:queue_detached queue wait exceeded 1800s (rank Some(42))",
             "stage:queue_wait timed out waiting for upload slot after 1800s",
             "peer has no free upload slots (OutOfPartReqs)",
+            "peer ended our upload slot (OutOfPartReqs)",
             "peer revoked upload slot (QueueFull during transfer)",
             "peer put us back in queue at rank 7 during transfer",
         ] {
@@ -1614,14 +1733,14 @@ mod tests {
     fn hashset2_aich_pins_when_it_matches_the_expected_root() {
         let expected = [0x11u8; 20];
         let mut pinned = None;
-        consider_hashset2_aich_pin(&mut pinned, Some(expected), None, 0, expected);
+        consider_hashset2_aich_pin(&mut pinned, Some(expected), None, "", expected);
         assert_eq!(pinned, Some(expected));
     }
 
     #[test]
     fn hashset2_aich_does_not_first_wins_without_expected_or_votes() {
         let mut pinned = None;
-        consider_hashset2_aich_pin(&mut pinned, None, None, 0, [0xAAu8; 20]);
+        consider_hashset2_aich_pin(&mut pinned, None, None, "", [0xAAu8; 20]);
         assert!(pinned.is_none());
     }
 
@@ -1629,15 +1748,16 @@ mod tests {
     fn hashset2_aich_requires_two_sources_when_expected_is_unknown() {
         let root = [0xBBu8; 20];
         let mut pinned = None;
-        let mut votes: HashMap<[u8; 20], HashSet<usize>> = HashMap::new();
-        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), 0, root);
+        let mut votes: HashMap<[u8; 20], HashSet<String>> = HashMap::new();
+        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), "203.0.113.5", root);
         assert!(pinned.is_none());
-        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), 0, root);
+        // A reconnect gets a new worker index but is still the same peer.
+        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), "203.0.113.5", root);
         assert!(
             pinned.is_none(),
             "the same source repeating a root is still one vote"
         );
-        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), 1, root);
+        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), "198.51.100.9", root);
         assert_eq!(pinned, Some(root));
     }
 
@@ -1645,19 +1765,19 @@ mod tests {
     fn hashset2_aich_ignores_a_conflicting_root_when_expected_is_known() {
         let expected = [0x11u8; 20];
         let mut pinned = None;
-        let mut votes: HashMap<[u8; 20], HashSet<usize>> = HashMap::new();
+        let mut votes: HashMap<[u8; 20], HashSet<String>> = HashMap::new();
         consider_hashset2_aich_pin(
             &mut pinned,
             Some(expected),
             Some(&mut votes),
-            0,
+            "203.0.113.5",
             [0xFFu8; 20],
         );
         consider_hashset2_aich_pin(
             &mut pinned,
             Some(expected),
             Some(&mut votes),
-            1,
+            "198.51.100.9",
             [0xFFu8; 20],
         );
         assert!(pinned.is_none());
@@ -1917,6 +2037,54 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicate_of_a_full_length_name_still_fits() {
+        let dir = std::path::Path::new("Downloads");
+        // `sanitize_filename` clamps to 255 bytes; the duplicate must not
+        // grow past that.
+        let ascii = format!("{}.mkv", "a".repeat(251));
+        assert_eq!(ascii.len(), 255);
+        let wide = format!("{}.mkv", "é".repeat(125));
+        for name in [ascii, wide] {
+            for suffix in [1, 42, 10_000] {
+                let candidate = dedup_candidate(&dir.join(&name), suffix);
+                let file_name = candidate.file_name().unwrap().to_str().unwrap();
+                assert!(file_name.len() <= 255, "{} bytes", file_name.len());
+                assert!(file_name.ends_with(&format!(" ({suffix}).mkv")));
+            }
+        }
+        // Short names are untouched.
+        assert_eq!(
+            dedup_candidate(&dir.join("movie.mkv"), 2),
+            dir.join("movie (2).mkv")
+        );
+    }
+
+    #[test]
+    fn a_block_queued_behind_the_one_arriving_does_not_expire() {
+        let mut outstanding = Vec::new();
+        push_outstanding_batch(&mut outstanding, &[(0, 100), (100, 200), (200, 300)]);
+        for r in &mut outstanding {
+            r.expires_at = std::time::Instant::now();
+        }
+        // Data for the middle block: it and the one queued after it are
+        // live; the one before it the peer skipped keeps its deadline.
+        refresh_outstanding_range(&mut outstanding, 150);
+        let now = std::time::Instant::now();
+        let live = |start: u64| outstanding.iter().find(|r| r.start == start).unwrap().expires_at > now;
+        assert!(!live(0));
+        assert!(live(100));
+        assert!(live(200));
+
+        // Completing a block refreshes the ones behind it as well.
+        for r in &mut outstanding {
+            r.expires_at = std::time::Instant::now();
+        }
+        assert!(take_completed_outstanding_range(&mut outstanding, 100, 200));
+        let now = std::time::Instant::now();
+        assert!(outstanding.iter().find(|r| r.start == 200).unwrap().expires_at > now);
+    }
+
+    #[test]
     fn concurrent_completed_files_claim_distinct_names() {
         let dir = std::env::temp_dir().join(format!(
             "ember-final-name-race-{}-{}",
@@ -2005,6 +2173,66 @@ mod tests {
     }
 
     #[test]
+    fn a_part_left_in_an_earlier_download_folder_completes_into_the_current_one() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-completion-across-folders-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let old = base.join("old");
+        let new = base.join("new");
+        let data = base.join("data");
+        for dir in [old.join("Temp"), new.clone(), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let part = old.join("Temp").join("started-before.part");
+        std::fs::write(&part, b"verified bytes").unwrap();
+        let old_string = old.to_string_lossy().into_owned();
+        let roots = [old_string.clone(), new.to_string_lossy().into_owned()];
+        crate::security::filesystem::initialize_approved_roots(&data, &roots).unwrap();
+        let (_, opened) = crate::security::filesystem::open_existing_approved(
+            &part,
+            std::slice::from_ref(&old_string),
+            false,
+        )
+        .unwrap();
+        let identity = crate::security::filesystem::opened_file_identity(&opened).unwrap();
+        drop(opened);
+
+        let final_path =
+            move_part_to_downloads(&part, &old, &new, "finished.bin", &identity).unwrap();
+        assert_eq!(
+            final_path,
+            new.canonicalize().unwrap().join("Downloads").join("finished.bin")
+        );
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"verified bytes");
+        assert!(!part.exists());
+
+        let stray = old.join("Temp").join("stray.part");
+        std::fs::write(&stray, b"x").unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(
+            move_part_to_downloads(&stray, &new, &new, "x.bin", &identity).is_err(),
+            "the part must be inside the root it is said to be in"
+        );
+        assert!(
+            move_part_to_downloads(&stray, &old, &outside, "x.bin", &identity).is_err(),
+            "and the target inside an approved one"
+        );
+        let changed = move_part_to_downloads(&stray, &old, &new, "x.bin", &identity)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            classify_failure(&changed, &SourceFailureKind::Transient),
+            TransferFailureCode::CompletionMoveFailed,
+            "{changed}"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn approved_completion_copy_fallback_preserves_identity_checks() {
         let _registry_guard = crate::security::filesystem::test_registry_lock();
         let base = std::env::temp_dir().join(format!(
@@ -2050,6 +2278,505 @@ mod tests {
         );
         assert!(!part.exists());
         assert_eq!(std::fs::read(&final_path).unwrap(), b"fallback bytes");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn completion_copies_in(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with(COMPLETION_COPY_PREFIX))
+            .collect()
+    }
+
+    /// The cross-volume path: copied under a name the library skips, then
+    /// renamed. A kill mid-copy leaves that name, never a truncated file
+    /// under the real one, which the watcher would index and the retried
+    /// completion would step around as "name (1)".
+    #[test]
+    fn a_copied_completion_is_published_by_renaming_a_finished_temporary_copy() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-completion-copy-rename-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let root = base.join("root");
+        let data = base.join("data");
+        let downloads = root.join("Downloads");
+        for dir in [root.join("Temp"), downloads.clone(), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let root_string = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(
+            &data,
+            std::slice::from_ref(&root_string),
+        )
+        .unwrap();
+        let allowed = [root_string];
+        let target = downloads.join("finished.bin");
+        std::fs::write(&target, b"someone else's").unwrap();
+        let part = root.join("Temp").join("source.part");
+        std::fs::write(&part, b"copied bytes").unwrap();
+        let (_, opened) =
+            crate::security::filesystem::open_existing_approved(&part, &allowed, false).unwrap();
+        let identity = crate::security::filesystem::opened_file_identity(&opened).unwrap();
+        drop(opened);
+
+        let final_path =
+            move_part_to_final_with_roots(&part, &target, &allowed, Some(&identity), false)
+                .unwrap();
+        assert_eq!(final_path.file_name().unwrap(), "finished (1).bin");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"copied bytes");
+        assert_eq!(std::fs::read(&target).unwrap(), b"someone else's", "never replaced");
+        assert!(!part.exists());
+        assert!(completion_copies_in(&downloads).is_empty(), "the copy was renamed, not left");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A volume that has neither a rename that refuses to replace nor hard
+    /// links (FUSE, NFS, exFAT, SMB) still completes: the file is copied
+    /// straight to a free name, as before the temporary copy existed.
+    #[test]
+    fn a_volume_without_a_no_replace_rename_or_hard_links_still_completes() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-completion-no-rename-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let (root, data) = (base.join("root"), base.join("data"));
+        let downloads = root.join("Downloads");
+        for dir in [root.join("Temp"), downloads.clone(), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let root_string = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(
+            &data,
+            std::slice::from_ref(&root_string),
+        )
+        .unwrap();
+        let allowed = [root_string];
+        let target = downloads.join("finished.bin");
+        std::fs::write(&target, b"someone else's").unwrap();
+        let part = root.join("Temp").join("source.part");
+        std::fs::write(&part, b"copied bytes").unwrap();
+        let (_, opened) =
+            crate::security::filesystem::open_existing_approved(&part, &allowed, false).unwrap();
+        let identity = crate::security::filesystem::opened_file_identity(&opened).unwrap();
+        drop(opened);
+
+        NO_REPLACE_PUBLISH_UNSUPPORTED.with(|unsupported| unsupported.set(true));
+        let moved = move_part_to_final_with_roots(&part, &target, &allowed, Some(&identity), false);
+        NO_REPLACE_PUBLISH_UNSUPPORTED.with(|unsupported| unsupported.set(false));
+
+        let final_path = moved.unwrap();
+        assert_eq!(final_path.file_name().unwrap(), "finished (1).bin");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"copied bytes");
+        assert_eq!(std::fs::read(&target).unwrap(), b"someone else's", "never replaced");
+        assert!(!part.exists());
+        assert!(completion_copies_in(&downloads).is_empty(), "the temporary copy is removed");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A rename that happened but could not be confirmed (a filesystem
+    /// without stable inode numbers) counts as published, so completion
+    /// neither fails nor publishes the file again as "name (1)".
+    #[test]
+    fn a_rename_that_took_place_counts_as_published() {
+        let base = std::env::temp_dir().join(format!(
+            "ember-renamed-copy-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let published = base.join("finished.bin");
+        std::fs::write(&published, b"copied bytes").unwrap();
+        let copy = |len| CompletionCopy {
+            path: base.join(completion_copy_name(std::path::Path::new("x.part"))),
+            identity: crate::security::filesystem::object_identity(&published).unwrap(),
+            len,
+            source: None,
+        };
+        assert!(copy(12).renamed_to(&published));
+        assert!(!copy(5).renamed_to(&published), "not a file of the copy's length");
+        let still_there = copy(12);
+        std::fs::write(&still_there.path, b"copied bytes").unwrap();
+        assert!(!still_there.renamed_to(&published), "the copy was not renamed");
+
+        let other = base.join("other.bin");
+        std::fs::write(&other, b"other bytes!").unwrap();
+        let vanished = CompletionCopy {
+            identity: crate::security::filesystem::object_identity(&other).unwrap(),
+            ..copy(12)
+        };
+        assert!(
+            !vanished.renamed_to(&published),
+            "a copy that vanished is not published by a different file of its length"
+        );
+        let source = base.join("x.part");
+        std::fs::write(&source, b"copied bytes").unwrap();
+        let unstable_inodes = CompletionCopy {
+            source: Some(source),
+            ..vanished
+        };
+        assert!(
+            unstable_inodes.renamed_to(&published),
+            "where file IDs do not survive a rename, the source's exact bytes do"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A scanner or the indexer holding the fresh copy refuses the rename
+    /// for a moment: it is retried, never answered with a copy in place
+    /// that could leave a truncated file under the real name.
+    #[cfg(windows)]
+    #[test]
+    fn a_completion_copy_held_by_a_scanner_is_retried_and_never_copied_in_place() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        for code in [5, 32, 33] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert!(held_by_another_process(&error));
+            assert!(!no_replace_publish_unavailable(&error), "{code}");
+        }
+        let base = std::env::temp_dir().join(format!(
+            "ember-held-completion-copy-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let (root, data) = (base.join("root"), base.join("data"));
+        let downloads = root.join("Downloads");
+        for dir in [root.join("Temp"), downloads.clone(), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let root_string = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(
+            &data,
+            std::slice::from_ref(&root_string),
+        )
+        .unwrap();
+        let allowed = [root_string];
+        let part = root.join("Temp").join("source.part");
+        let identity = |part: &std::path::Path| {
+            let (_, opened) =
+                crate::security::filesystem::open_existing_approved(part, &allowed, false)
+                    .unwrap();
+            crate::security::filesystem::opened_file_identity(&opened).unwrap()
+        };
+
+        std::fs::write(&part, b"held a moment").unwrap();
+        COMPLETION_COPY_HELD.with(|held| held.set(2));
+        let moved = move_part_to_final_with_roots(
+            &part,
+            &downloads.join("moment.bin"),
+            &allowed,
+            Some(&identity(&part)),
+            false,
+        );
+        let left = COMPLETION_COPY_HELD.with(|held| held.replace(0));
+        assert_eq!(moved.unwrap().file_name().unwrap(), "moment.bin");
+        assert_eq!(left, 0, "both refusals were waited out");
+        assert_eq!(std::fs::read(downloads.join("moment.bin")).unwrap(), b"held a moment");
+        assert!(completion_copies_in(&downloads).is_empty());
+
+        std::fs::write(&part, b"held for good").unwrap();
+        COMPLETION_COPY_HELD.with(|held| held.set(u32::MAX));
+        let moved = move_part_to_final_with_roots(
+            &part,
+            &downloads.join("held.bin"),
+            &allowed,
+            Some(&identity(&part)),
+            false,
+        );
+        COMPLETION_COPY_HELD.with(|held| held.set(0));
+        assert!(moved.is_err(), "the completion fails and is tried again later");
+        assert!(part.exists(), "the .part is kept");
+        assert!(!downloads.join("held.bin").exists(), "nothing under the real name");
+        assert!(completion_copies_in(&downloads).is_empty(), "the copy is not left behind");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Regression for volumes without hard links (exFAT, FAT32, some
+    /// shares), where the scanner's hold cannot be got round by a link: a
+    /// short hold is waited out as everywhere, and a long one ends in the
+    /// file copied straight to a free name, as before the temporary copy
+    /// existed, rather than in a failed completion.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_copy_on_a_volume_without_hard_links_still_completes() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-held-no-links-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let (root, data) = (base.join("root"), base.join("data"));
+        let downloads = root.join("Downloads");
+        for dir in [root.join("Temp"), downloads.clone(), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let root_string = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(
+            &data,
+            std::slice::from_ref(&root_string),
+        )
+        .unwrap();
+        let allowed = [root_string];
+        let part = root.join("Temp").join("source.part");
+        let identity = |part: &std::path::Path| {
+            let (_, opened) =
+                crate::security::filesystem::open_existing_approved(part, &allowed, false)
+                    .unwrap();
+            crate::security::filesystem::opened_file_identity(&opened).unwrap()
+        };
+        let complete = |held: u32, name: &str| {
+            HARD_LINKS_UNSUPPORTED.with(|unsupported| unsupported.set(true));
+            COMPLETION_COPY_HELD.with(|copy_held| copy_held.set(held));
+            let moved = move_part_to_final_with_roots(
+                &part,
+                &downloads.join(name),
+                &allowed,
+                Some(&identity(&part)),
+                false,
+            );
+            COMPLETION_COPY_HELD.with(|copy_held| copy_held.set(0));
+            HARD_LINKS_UNSUPPORTED.with(|unsupported| unsupported.set(false));
+            moved
+        };
+
+        std::fs::write(&part, b"held a moment").unwrap();
+        let moved = complete(2, "moment.bin").unwrap();
+        assert_eq!(moved.file_name().unwrap(), "moment.bin");
+        assert_eq!(std::fs::read(&moved).unwrap(), b"held a moment");
+        assert!(!part.exists());
+
+        std::fs::write(&part, b"held for good").unwrap();
+        std::fs::write(downloads.join("held.bin"), b"someone else's").unwrap();
+        let moved = complete(u32::MAX, "held.bin").unwrap();
+        assert_eq!(moved.file_name().unwrap(), "held (1).bin", "a free name, never a replace");
+        assert_eq!(std::fs::read(&moved).unwrap(), b"held for good");
+        assert_eq!(std::fs::read(downloads.join("held.bin")).unwrap(), b"someone else's");
+        assert!(!part.exists());
+        assert!(completion_copies_in(&downloads).is_empty(), "the held copy is removed");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_completion_copy_is_named_so_the_library_never_shares_it() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let attachment = format!("ember-attach-{}", "ab".repeat(16));
+        for stem in [id.as_str(), attachment.as_str()] {
+            let part = std::path::Path::new("Temp").join(format!("{stem}.part"));
+            let name = completion_copy_name(&part);
+            assert_eq!(parse_completion_copy_name(&name), Some(stem));
+            let copy_of_copy = completion_copy_name(std::path::Path::new(&name));
+            assert_eq!(
+                parse_completion_copy_name(&copy_of_copy),
+                Some(stem),
+                "a recovered copy published across volumes keeps naming its download"
+            );
+            assert!(crate::sharing::indexer::is_excluded_share_file_name(
+                std::path::Path::new(&name)
+            ));
+        }
+        for other in [
+            ".ember-copy-.tmp",
+            ".ember-copy-0123456789abcdef.tmp",
+            ".ember-copy-0123456789abcdeg.x.tmp",
+            ".ember-copy-0123456789abcdef.a.b.tmp",
+            "movie.tmp",
+        ] {
+            assert_eq!(parse_completion_copy_name(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn stale_completion_copies_are_settled_by_whose_they_are() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-stale-completion-copies-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let (old, new, data) = (base.join("old"), base.join("new"), base.join("data"));
+        for root in [&old, &new] {
+            for dir in ["Temp"].into_iter().chain(finished_file_dirs()) {
+                std::fs::create_dir_all(root.join(dir)).unwrap();
+            }
+        }
+        std::fs::create_dir_all(&data).unwrap();
+        let roots = [
+            new.to_string_lossy().into_owned(),
+            old.to_string_lossy().into_owned(),
+        ];
+        crate::security::filesystem::initialize_approved_roots(&data, &roots).unwrap();
+        let downloads = new.join("Downloads");
+        let copy_of = |root: &std::path::Path, dir: &str, stem: &str, bytes: &[u8]| {
+            let path = root
+                .join(dir)
+                .join(completion_copy_name(std::path::Path::new(&format!("{stem}.part"))));
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let uuid = || uuid::Uuid::new_v4().to_string();
+        let (redo, unfinished, recovered, partial, duplicate, linked, newer) =
+            (uuid(), uuid(), uuid(), uuid(), uuid(), uuid(), uuid());
+        let attachment = format!("ember-attach-{}", "cd".repeat(16));
+        let room = format!("ember-xfer-{}", "ef".repeat(16));
+        std::fs::write(old.join("Temp").join(format!("{redo}.part")), b"x").unwrap();
+        std::fs::write(new.join("Temp").join(format!("{attachment}.part")), b"x").unwrap();
+
+        let redone = copy_of(&new, "Downloads", &redo, b"half");
+        let chat = copy_of(&old, crate::network::chat_attach::CHAT_FILES_DIR, &attachment, b"half");
+        let resumed = copy_of(&new, "Downloads", &unfinished, b"finished bytes");
+        let only_copy = copy_of(&new, "Downloads", &recovered, b"finished bytes");
+        let cut_short = copy_of(&new, "Downloads", &partial, b"fini");
+        let leftover = copy_of(&new, "Downloads", &duplicate, b"song bytes");
+        std::fs::write(downloads.join("song.bin"), b"song bytes").unwrap();
+        let linked_copy = copy_of(&new, "Downloads", &linked, b"clip bytes");
+        std::fs::write(downloads.join("clip.bin"), b"another clip").unwrap();
+        std::fs::hard_link(&linked_copy, downloads.join("clip (1).bin")).unwrap();
+        let restarted = copy_of(&new, "Downloads", &newer, b"finished bytes");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(new.join("Temp").join(format!("{newer}.part")), b"x").unwrap();
+        let unknown = copy_of(&new, crate::network::ember::xfer::CHANNEL_FILES_DIR, &room, b"?");
+        let taken = downloads.join("movie.bin");
+        std::fs::write(&taken, b"someone else's").unwrap();
+        let unrelated = downloads.join(".ember-copy-mine.tmp");
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        let hash_of = |bytes: &[u8]| {
+            let path = base.join("hashed");
+            std::fs::write(&path, bytes).unwrap();
+            super::super::hash::ed2k_hash_open_file(&mut std::fs::File::open(&path).unwrap())
+                .unwrap()
+        };
+        let finished_file = |name: &str, bytes: &[u8]| ExpectedFinishedFile {
+            name: name.into(),
+            ed2k_hash: hash_of(bytes),
+            size: bytes.len() as u64,
+        };
+        let owner = |stem: &str| {
+            if stem == unfinished {
+                CopyOwner::Unfinished
+            } else if stem == recovered || stem == partial {
+                CopyOwner::Finished(finished_file("movie.bin", b"finished bytes"))
+            } else if stem == duplicate {
+                CopyOwner::Finished(finished_file("song.bin", b"song bytes"))
+            } else if stem == linked {
+                CopyOwner::Finished(finished_file("clip.bin", b"clip bytes"))
+            } else {
+                CopyOwner::Unknown
+            }
+        };
+        let settle = |cutoff| {
+            for root in &roots {
+                settle_stale_completion_copies(root, &roots, cutoff, &owner);
+            }
+        };
+
+        settle(std::time::UNIX_EPOCH);
+        for path in [&redone, &chat, &only_copy, &cut_short, &unknown, &leftover] {
+            assert!(path.exists(), "a copy from this run is never touched");
+        }
+
+        settle(std::time::SystemTime::now() + std::time::Duration::from_secs(60));
+        assert!(!redone.exists(), "its .part, in another folder, completes again");
+        assert!(!chat.exists(), "chat copies are settled the same way");
+        assert!(resumed.exists(), "an unfinished download's copy is left to its resume");
+        assert!(!only_copy.exists());
+        assert_eq!(
+            std::fs::read(downloads.join("movie (1).bin")).unwrap(),
+            b"finished bytes",
+            "a finished download's only complete copy is published under a free name"
+        );
+        assert_eq!(std::fs::read(&taken).unwrap(), b"someone else's");
+        assert!(!cut_short.exists(), "a copy that is not the finished file is removed");
+        assert!(!leftover.exists(), "the finished file is there: its copy goes");
+        assert!(!downloads.join("song (1).bin").exists(), "and is not published again");
+        assert!(!linked_copy.exists(), "a copy linked as the finished file goes");
+        assert_eq!(
+            std::fs::read(downloads.join("clip (1).bin")).unwrap(),
+            b"clip bytes",
+            "the name it was published as, the plain one being taken"
+        );
+        assert!(!downloads.join("clip (2).bin").exists(), "and it is not published again");
+        assert!(restarted.exists(), "a .part newer than the copy never costs the copy");
+        assert!(unknown.exists(), "a copy nothing can check is kept");
+        assert!(unrelated.exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_destination_without_room_fails_before_copying_and_keeps_the_part() {
+        let dir = std::path::Path::new("downloads");
+        let buffer = crate::network::downloads::DISK_SPACE_BUFFER;
+        let error = room_for_completion_copy(100, Some(99), dir).unwrap_err().to_string();
+        assert!(is_disk_full_error(&error), "{error}");
+        assert_eq!(
+            classify_failure(&error, &SourceFailureKind::Transient),
+            TransferFailureCode::InsufficientDisk
+        );
+        assert!(
+            room_for_completion_copy(100, Some(100 + buffer - 1), dir).is_err(),
+            "the same margin the download keeps"
+        );
+        assert!(room_for_completion_copy(100, Some(100 + buffer), dir).is_ok());
+        assert!(
+            room_for_completion_copy(100, None, dir).is_ok(),
+            "a volume that will not say lets the copy try"
+        );
+    }
+
+    // Held across the awaits for the reason given above
+    // `a_download_folder_that_is_not_an_approved_root_is_tagged`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_worker_holds_a_download_whose_progress_is_on_an_offline_folder() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-offline-part-folder-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let (new, data) = (base.join("new"), base.join("data"));
+        let volume = base.join("unplugged");
+        let offline = volume.join("old");
+        for dir in [new.clone(), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let folders = crate::storage::part_folders::DownloadFolders::new(
+            &new.to_string_lossy(),
+            &[offline.to_string_lossy().into_owned()],
+        );
+        let roots = folders.roots();
+        let shared = folders.shared();
+        let id = uuid::Uuid::new_v4().to_string();
+        crate::storage::part_folders::note_located(&id, &offline);
+        crate::storage::part_folders::simulate_unplugged(&volume, true);
+
+        let error = prepare_part_dir(&shared, &id).await.unwrap_err().to_string();
+        crate::storage::part_folders::simulate_unplugged(&volume, false);
+        assert_eq!(
+            classify_failure(&error, &SourceFailureKind::Transient),
+            TransferFailureCode::PartFolderOffline
+        );
+        assert!(
+            !new.join("Temp").join(format!("{id}.part")).exists(),
+            "no second `.part` started from zero"
+        );
+
+        std::fs::create_dir_all(offline.join("Temp")).unwrap();
+        std::fs::write(offline.join("Temp").join(format!("{id}.part")), b"progress").unwrap();
+        crate::security::filesystem::initialize_approved_roots(&data, &roots).unwrap();
+        let (root, temp) = prepare_part_dir(&shared, &id).await.unwrap();
+        assert_eq!(root, offline, "resumed where the progress is once the drive is back");
+        assert_eq!(temp.file_name().unwrap(), "Temp");
+        assert!(
+            !offline.join("Downloads").exists(),
+            "an earlier folder never gets a Downloads"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 }
@@ -2119,11 +2846,12 @@ impl Ed2kDownload {
             .control
             .seal_pending_rename()
             .unwrap_or_else(|| self.file_name.clone());
+        let download_dir = self.download_folders.read().current.clone();
         let final_path = finalize_zero_ed2k_file(
             &self.transfer_id,
             &zero_name,
             self.file_hash,
-            &self.download_dir,
+            &download_dir,
         )
         .await?;
         self.emit_source_detail(event_tx, "completed", None, 0, 0, "", "")
@@ -2318,50 +3046,21 @@ impl Ed2kDownload {
             }
         }
 
-        let mut completed_path_out: Option<String> = None;
-        let mut verified_part_hashes: Vec<[u8; 16]> = Vec::new();
-        match self
-            .download_from_streams(
-                &mut *reader,
-                &mut *writer,
-                peer_user_hash,
-                // Same as multi-source EstablishedStream: format file requests
-                // from the peer's Hello caps, not PeerCapabilities::default()
-                // (ext_ver=0), or modern peers short-read and FIN.
-                peer_caps,
-                &event_tx,
-                emule_info_done,
-                &mut completed_path_out,
-                &mut verified_part_hashes,
-            )
-            .await
-        {
-            Ok(_) => {
-                let _ = event_tx
-                    .send(DownloadEvent::Completed {
-                        transfer_id: self.transfer_id.clone(),
-                        final_path: completed_path_out,
-                        // Computed by the final verification, which had to read
-                        // the file anyway. This path never gets a peer-supplied
-                        // hashset, so without these the completion handler read
-                        // the whole file again to recompute them.
-                        part_hashes: verified_part_hashes,
-                        // `download_from_streams` only reaches `Ok` after its
-                        // internal Ember BLAKE3 check passed (or there was
-                        // none to run) — reflect the latter case here from
-                        // whether we had a hash to check in the first place.
-                        ember_verified: self.ember_file_hash != [0u8; 32],
-                    })
-                    .await;
-                Ok(())
-            }
-            Err(e) => {
-                // Propagate Err so the spawn site emits Failed once. Emitting
-                // here and returning Ok made Result look successful while the
-                // transfer had already failed on the event channel.
-                Err(e)
-            }
-        }
+        // `Completed` is sent by `download_from_streams` itself, from a task an
+        // abort cannot drop. An `Err` propagates so the spawn site emits Failed
+        // once.
+        self.download_from_streams(
+            &mut *reader,
+            &mut *writer,
+            peer_user_hash,
+            // Same as multi-source EstablishedStream: format file requests
+            // from the peer's Hello caps, not PeerCapabilities::default()
+            // (ext_ver=0), or modern peers short-read and FIN.
+            peer_caps,
+            &event_tx,
+            emule_info_done,
+        )
+        .await
     }
 
     async fn download_from_streams(
@@ -2372,15 +3071,6 @@ impl Ed2kDownload {
         initial_caps: PeerCapabilities,
         event_tx: &mpsc::Sender<DownloadEvent>,
         skip_emule_info: bool,
-        // Set to the real on-disk destination once the `.part` is moved to
-        // its final location, so the caller's `Completed` event can carry
-        // the deduplicated path instead of letting Open/Reveal reconstruct
-        // (and mis-resolve) it from the file name.
-        completed_path_out: &mut Option<String>,
-        // Set to the part hashes the final verification computed, so the
-        // completion handler can record them in known.met without reading the
-        // whole file again to derive what this pass already produced.
-        part_hashes_out: &mut Vec<[u8; 16]>,
     ) -> anyhow::Result<()> {
         let mut peer_supports_large_files = initial_caps.supports_large_files;
         let mut peer_supports_multipacket = initial_caps.supports_multi_packet;
@@ -3999,7 +4689,7 @@ impl Ed2kDownload {
         // Apply an AICH root harvested from the MultiPacket answer. Same voting
         // rule as the HashSet2 root, so an unverified single source cannot pin.
         if let Some(root) = mp_aich_root {
-            consider_hashset2_aich_pin(&mut aich_master_hash, self.expected_aich_master, None, 0, root);
+            consider_hashset2_aich_pin(&mut aich_master_hash, self.expected_aich_master, None, "", root);
         }
         if aich_master_hash.is_some() {
             debug!(
@@ -4069,7 +4759,7 @@ impl Ed2kDownload {
                                                 &mut aich_master_hash,
                                                 self.expected_aich_master,
                                                 None,
-                                                0,
+                                                "",
                                                 root,
                                             );
                                             if aich_master_hash == Some(root) {
@@ -4586,11 +5276,11 @@ impl Ed2kDownload {
             );
         }
 
-        // Ensure download directories exist:
-        //   <download_dir>/Temp/     -- .part files during download
-        //   <download_dir>/Downloads/ -- completed files
-        let allowed_roots = vec![self.download_dir.to_string_lossy().into_owned()];
-        let (temp_dir, completed_dir) = prepare_download_dirs(&self.download_dir).await?;
+        // `.part` files live in `<part_root>/Temp`, completed files go to the
+        // `Downloads` of whichever download folder is current at completion.
+        let (part_root, temp_dir) =
+            prepare_part_dir(&self.download_folders, &self.transfer_id).await?;
+        let allowed_roots = vec![part_root.to_string_lossy().into_owned()];
 
         let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
 
@@ -4715,7 +5405,7 @@ impl Ed2kDownload {
                 Some(self.control.discarding_flag()),
             )
             .await
-            .map_err(|e| download_folder_error("opening the part file", &self.download_dir, e))?
+            .map_err(|e| download_folder_error("opening the part file", &part_root, e))?
         };
 
         let mut downloaded: u64 = tracker.completed_bytes();
@@ -4725,7 +5415,6 @@ impl Ed2kDownload {
         // simultaneously based on connection speed, keeping the peer's upload pipe full.
         const MAX_BLOCKS_PER_REQUEST: usize = 3;
         let max_part_rounds = self.ed2k_limits.part_retry_rounds;
-        let mut peer_out_of_parts = false;
         let mut measured_speed: u64 = 0;
         let mut speed_measure_start = std::time::Instant::now();
         let mut speed_measure_bytes: u64 = 0;
@@ -4783,9 +5472,6 @@ impl Ed2kDownload {
             }
 
             for part_idx in needed {
-                if peer_out_of_parts {
-                    break;
-                }
                 self.check_control().await?;
                 let mut aich_recovery_data: Option<([u8; 20], Vec<u8>)> = None;
 
@@ -4881,9 +5567,6 @@ impl Ed2kDownload {
 
                 // Receive loop: process blocks and refill pipeline as requests complete
                 while total_received < total_sent_bytes {
-                    if peer_out_of_parts {
-                        break;
-                    }
                     self.check_control().await?;
 
                     // Periodic EPX re-send: if payload has been rebuilt and 5min elapsed
@@ -5399,9 +6082,27 @@ impl Ed2kDownload {
                             }
                         }
                         (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
-                            info!("Peer session limit reached (OutOfPartReqs), will re-queue");
-                            peer_out_of_parts = true;
-                            break;
+                            // The uploader rotated us out and took the slot
+                            // back. This path has no in-session re-queue, and
+                            // carrying on sent the next round's requests into
+                            // a slot we no longer held: every retry round went
+                            // in milliseconds and the source was failed with a
+                            // penalty. End as the queue state it is, like
+                            // OP_QUEUEFULL above.
+                            info!("Peer session limit reached (OutOfPartReqs), ending the session to re-queue");
+                            self.emit_source_detail_parts(
+                                event_tx,
+                                "queued",
+                                None,
+                                0,
+                                0,
+                                &client_software_label,
+                                &peer_name_label,
+                                src_avail_parts,
+                                src_total_parts,
+                            )
+                            .await;
+                            anyhow::bail!("peer ended our upload slot (OutOfPartReqs)");
                         }
                         (OP_EMULEPROT, OP_QUEUEFULL) if payload.is_empty() => {
                             self.file_req_overhead.record_download(6u64);
@@ -5463,7 +6164,7 @@ impl Ed2kDownload {
                         }
                         (OP_EDONKEYHEADER, OP_FILEREQANSNOFIL) => {
                             anyhow::bail!(
-                                "peer no longer has the file (FileNotFound during transfer)"
+                                "peer does not have the file any more (FileNotFound during transfer)"
                             );
                         }
                         (OP_EMULEPROT, OP_PUBLICKEY) if !payload.is_empty() => {
@@ -5870,10 +6571,6 @@ impl Ed2kDownload {
                     }
                 }
 
-                if peer_out_of_parts {
-                    continue;
-                }
-
                 // Guard against duplicate/overlapping blocks that satisfied the
                 // byte budget without actually closing all gaps in this part.
                 {
@@ -6176,9 +6873,6 @@ impl Ed2kDownload {
                 // download loop on fsync.
                 super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
             }
-
-            // If peer ended the session, reset flag for next retry round
-            peer_out_of_parts = false;
         }
 
         // Signal the uploader that we're done downloading from them. eMule
@@ -6251,7 +6945,7 @@ impl Ed2kDownload {
         // Temp-file write.
         let expected_hash = hex::encode(self.file_hash);
         let verify_path = part_path.clone();
-        let verify_root = self.download_dir.clone();
+        let verify_root = part_root.clone();
         let expected_aich = self.expected_aich_master;
         let ember_expected = self.ember_file_hash;
         let mut ember_pin_failed = false;
@@ -6274,6 +6968,7 @@ impl Ed2kDownload {
             })
         });
         let job_cancel = verify_cancel.clone();
+        let expected_ed2k = expected_hash.clone();
         let verified_result = match tokio::task::spawn_blocking(move || {
             let allowed = vec![verify_root.to_string_lossy().into_owned()];
             // Tell the library scheduler this drive is busy. It rations reads
@@ -6298,7 +6993,8 @@ impl Ed2kDownload {
                 },
                 job_cancel.as_ref(),
             )?;
-            if let Some(got) = digests.ember {
+            // Only once the ed2k hash matched; see the multi-source worker.
+            if let Some(got) = digests.ember.filter(|_| digests.ed2k == expected_ed2k) {
                 if got != ember_expected {
                     anyhow::bail!(
                         "ember blake3 mismatch: expected={} got={}",
@@ -6448,30 +7144,56 @@ impl Ed2kDownload {
         // reset for multi-part files).
         tracker.mark_file_hash_verified();
         seal_control_rename(&self.control, &mut tracker);
-        let final_path = completed_dir.join(completed_download_name(
-            tracker.file_name(),
-            &self.file_name,
-        ));
-        {
-            let pp = part_path.clone();
-            let fp = final_path.clone();
-            let root = self.download_dir.clone();
+        // As in the multi-source worker: stopped after verification, the
+        // verified `.part` stays put and the next run completes it.
+        if self.control.is_cancelled() {
+            anyhow::bail!("cancelled by user");
+        }
+        let final_name = completed_download_name(tracker.file_name(), &self.file_name);
+        let pp = part_path.clone();
+        let pp_root = part_root.clone();
+        let download_root = self.download_folders.read().current.clone();
+        let met_roots = allowed_roots.clone();
+        let finish_tx = event_tx.clone();
+        let finish_id = self.transfer_id.clone();
+        // `download_from_streams` only gets here after its Ember BLAKE3 check
+        // passed (or there was none to run).
+        let ember_verified = self.ember_file_hash != [0u8; 32];
+        // Spawned so that an abort (Pause, Stop) landing during the move, which
+        // `abort` cannot stop, does not drop the sidecar delete and `Completed`
+        // after it. See the multi-source worker.
+        let finish = tokio::spawn(async move {
             let actual_final = tokio::task::spawn_blocking(move || {
-                move_part_to_final_approved(&pp, &fp, &root, &verified_identity)
+                move_part_to_downloads(
+                    &pp,
+                    &pp_root,
+                    &download_root,
+                    &final_name,
+                    &verified_identity,
+                )
             })
             .await
             .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
-            *completed_path_out = Some(actual_final.to_string_lossy().into_owned());
-        }
-        // The verification above computed these as a by-product of the pass it
-        // had to make anyway. Without handing them over, the completion handler
-        // read the whole file a second time to recompute exactly these values
-        // for known.met — every time, because this path never obtains a
-        // peer-supplied hashset.
-        *part_hashes_out = verified_part_hashes;
-        tracker.delete_met(&[self.download_dir.to_string_lossy().into_owned()]);
-
-        Ok(())
+            tracker.delete_met(&met_roots);
+            let _ = finish_tx
+                .send(DownloadEvent::Completed {
+                    transfer_id: finish_id,
+                    // The real on-disk destination, deduplicated by the move,
+                    // so Open/Reveal need not reconstruct it from the name.
+                    final_path: Some(actual_final.to_string_lossy().into_owned()),
+                    // Computed by the final verification, which had to read
+                    // the file anyway. This path never gets a peer-supplied
+                    // hashset, so without these the completion handler read
+                    // the whole file again to recompute them.
+                    part_hashes: verified_part_hashes,
+                    ember_verified,
+                })
+                .await;
+            Ok::<(), anyhow::Error>(())
+        });
+        finish
+            .await
+            .map_err(|e| anyhow::anyhow!("completion task: {e}"))?
     }
 
     async fn acquire_download_bandwidth(&self, bytes: u64) -> anyhow::Result<()> {
@@ -6593,6 +7315,7 @@ pub(super) async fn finalize_zero_ed2k_file(
     }
     let allowed = vec![download_dir.to_string_lossy().into_owned()];
     let (temp_dir, completed_dir) = prepare_download_dirs(download_dir).await?;
+    crate::storage::part_folders::note_located(transfer_id, download_dir);
     let safe_name = crate::security::sanitize_filename(file_name);
     let part_path = temp_dir.join(format!("{transfer_id}.part"));
     let final_path = completed_dir.join(&safe_name);
@@ -6668,11 +7391,39 @@ fn move_part_to_final_with_roots(
     // Windows the loser fails despite having a complete .part; on Unix,
     // rename can replace the winner. Hard-linking claims an absent destination
     // atomically without replacement and remains O(1) on the common same-volume
-    // path. Filesystems without hard-link support fall back to an exclusive
-    // create+copy, which is also collision-safe.
-    for suffix in 0..=10_000u32 {
+    // path. Across volumes, or on filesystems without hard links, the file is
+    // copied under a temporary name first and then renamed into a free name
+    // without replacement, which is also collision-safe. Where that rename
+    // is unavailable too, the file is copied straight to a free name with an
+    // exclusive create, as before the temporary copy existed.
+    let mut staged: Option<CompletionCopy> = None;
+    let mut copy_in_place = false;
+    let mut suffix = 0u32;
+    while suffix <= 10_000 {
         let final_path = dedup_candidate(target, suffix);
-        if allow_hard_link {
+        suffix += 1;
+        if copy_in_place {
+            let copied =
+                copy_exclusive(part_path, &final_path, allowed_roots, expected_source_identity);
+            match copied {
+                Ok(_) => {
+                    sync_published(&final_path, allowed_roots);
+                    remove_completed_part_best_effort(
+                        part_path,
+                        &final_path,
+                        "copied",
+                        allowed_roots,
+                        expected_source_identity,
+                    );
+                    return Ok(final_path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || final_path.exists() => {
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if allow_hard_link && staged.is_none() {
             let link_result = if allowed_roots.is_empty() {
                 std::fs::hard_link(part_path, &final_path).map(|()| final_path.clone())
             } else if let Some(expected) = expected_source_identity {
@@ -6706,32 +7457,761 @@ fn move_part_to_final_with_roots(
                 Err(e) => return Err(e.into()),
             }
         }
-        match copy_exclusive(
-            part_path,
-            &final_path,
-            allowed_roots,
-            expected_source_identity,
-        ) {
-            Ok(()) => {
+        let copy = match &staged {
+            Some(copy) => copy,
+            None => staged.insert(stage_completion_copy(
+                part_path,
+                target,
+                allowed_roots,
+                expected_source_identity,
+            )?),
+        };
+        match copy.publish(&final_path, allowed_roots) {
+            Ok(published) => {
+                sync_published(&published, allowed_roots);
                 remove_completed_part_best_effort(
                     part_path,
-                    &final_path,
+                    &published,
                     "copied",
                     allowed_roots,
                     expected_source_identity,
                 );
-                return Ok(final_path);
+                return Ok(published);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || final_path.exists() => {
                 continue;
             }
-            Err(e) => return Err(e.into()),
+            Err(e) if no_replace_publish_unavailable(&e) => {
+                tracing::info!(
+                    "{} cannot take a rename that refuses to replace ({e}); copying the \
+                     finished file straight to its name instead",
+                    final_path.parent().unwrap_or(&final_path).display()
+                );
+                copy.discard(allowed_roots);
+                staged = None;
+                copy_in_place = true;
+                suffix -= 1;
+            }
+            Err(e) => {
+                copy.discard(allowed_roots);
+                return Err(e.into());
+            }
         }
+    }
+    if let Some(copy) = staged {
+        copy.discard(allowed_roots);
     }
     anyhow::bail!(
         "Could not allocate a unique completed filename for {}",
         target.display()
     )
+}
+
+/// Prefix and suffix of the name a finished file is copied under before it is
+/// published: `.ember-copy-<16 hex>.<part stem>.tmp`. The `.tmp` keeps the
+/// indexer and the folder watcher off it
+/// (`sharing::indexer::is_excluded_share_file_name`), the part stem names the
+/// `.part` it was copied from, and the startup cleanup
+/// ([`settle_stale_completion_copies`]) only ever touches names of this shape.
+const COMPLETION_COPY_PREFIX: &str = ".ember-copy-";
+const COMPLETION_COPY_SUFFIX: &str = ".tmp";
+
+/// A `.part` stem a completion copy's name can carry: a download's UUID, or a
+/// chat or room transfer's `ember-attach-<hex>` / `ember-xfer-<hex>`.
+fn is_copy_name_stem(stem: &str) -> bool {
+    (1..=64).contains(&stem.len())
+        && stem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn completion_copy_name(part_path: &std::path::Path) -> String {
+    let stem = part_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".part").or_else(|| parse_completion_copy_name(name)))
+        .filter(|stem| is_copy_name_stem(stem))
+        .unwrap_or("unknown");
+    format!(
+        "{COMPLETION_COPY_PREFIX}{:016x}.{stem}{COMPLETION_COPY_SUFFIX}",
+        rand::random::<u64>()
+    )
+}
+
+/// The `.part` stem a completion copy's name carries, or `None` for any
+/// other name.
+fn parse_completion_copy_name(name: &str) -> Option<&str> {
+    let (hex, stem) = name
+        .strip_prefix(COMPLETION_COPY_PREFIX)?
+        .strip_suffix(COMPLETION_COPY_SUFFIX)?
+        .split_once('.')?;
+    (hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()) && is_copy_name_stem(stem))
+        .then_some(stem)
+}
+
+/// What a finished download's file has to be: its name, ed2k hash (hex)
+/// and size. Startup recovers a completion copy only when it matches.
+pub(crate) struct ExpectedFinishedFile {
+    pub name: String,
+    pub ed2k_hash: String,
+    pub size: u64,
+}
+
+/// Whether a failed no-replace publication is the filesystem or platform not
+/// offering one (FUSE, NFS, exFAT and SMB volumes, other Unixes), rather than
+/// something an exclusive create would also run into. A scanner or indexer
+/// holding the fresh copy ([`held_by_another_process`]) is not: copying the
+/// file in place under its real name could leave it truncated there.
+fn no_replace_publish_unavailable(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::Unsupported
+            | std::io::ErrorKind::CrossesDevices
+            | std::io::ErrorKind::InvalidInput
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        return error.raw_os_error().is_some_and(|code| {
+            [
+                libc::EINVAL,
+                libc::ENOTSUP,
+                libc::EOPNOTSUPP,
+                libc::ENOSYS,
+                libc::EXDEV,
+                libc::EPERM,
+            ]
+            .contains(&code)
+        });
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_INVALID_FUNCTION, ERROR_NOT_SAME_DEVICE, ERROR_NOT_SUPPORTED,
+        // ERROR_INVALID_PARAMETER.
+        return matches!(
+            error.raw_os_error(),
+            Some(1) | Some(17) | Some(50) | Some(87)
+        );
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Whether a rename failed because another process has the file open: on
+/// Windows a virus scanner or the indexer opening a fresh file without
+/// delete sharing, which lets go within moments.
+fn held_by_another_process(error: &std::io::Error) -> bool {
+    // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION.
+    cfg!(windows) && matches!(error.raw_os_error(), Some(5) | Some(32) | Some(33))
+}
+
+/// The waits between renames refused by [`held_by_another_process`].
+const HELD_RENAME_BACKOFF_MS: [u64; 5] = [50, 100, 200, 400, 800];
+
+/// Completion copies this run created, by file name. The startup cleanup
+/// leaves them to the completion making them, whatever their dates say.
+fn copies_of_this_run() -> &'static parking_lot::Mutex<std::collections::HashSet<String>> {
+    static COPIES: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    COPIES.get_or_init(Default::default)
+}
+
+/// Make a published name durable before the `.part` it was copied from, on
+/// another volume, is removed: a power cut must not keep the removal and
+/// lose the name. Unix syncs the directory; on Windows flushing the file
+/// commits its metadata.
+fn sync_published(path: &std::path::Path, allowed_roots: &[String]) {
+    #[cfg(unix)]
+    let synced = {
+        let _ = allowed_roots;
+        path.parent().map_or(Ok(()), |parent| {
+            std::fs::File::open(parent).and_then(|dir| dir.sync_all())
+        })
+    };
+    #[cfg(not(unix))]
+    let synced = if allowed_roots.is_empty() {
+        Ok(())
+    } else {
+        crate::security::filesystem::open_existing_approved(path, allowed_roots, true)
+            .and_then(|(_, file)| file.sync_all())
+    };
+    if let Err(e) = synced {
+        tracing::debug!("Could not sync the publication of {}: {e}", path.display());
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`CompletionCopy::publish`] fail as a volume without either.
+    static NO_REPLACE_PUBLISH_UNSUPPORTED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Makes this many renames in [`CompletionCopy::publish`] fail as a
+    /// scanner holding the copy would; `u32::MAX` holds it for good, against
+    /// the hard link too.
+    static COMPLETION_COPY_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Makes [`CompletionCopy::publish`]'s hard link fail as on a volume
+    /// without hard links.
+    static HARD_LINKS_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A finished file copied in full, flushed and synced under a temporary name
+/// next to where it is published.
+struct CompletionCopy {
+    path: std::path::PathBuf,
+    identity: crate::security::filesystem::ObjectIdentity,
+    len: u64,
+    /// The `.part` it was copied from, while that is still there.
+    source: Option<std::path::PathBuf>,
+}
+
+impl CompletionCopy {
+    /// Rename the copy to `final_path`, which must not exist yet. A rename
+    /// refused because another process holds the copy is tried again for a
+    /// moment, then by hard link, and otherwise fails, keeping the copy's
+    /// source.
+    fn publish(
+        &self,
+        final_path: &std::path::Path,
+        allowed_roots: &[String],
+    ) -> std::io::Result<std::path::PathBuf> {
+        if allowed_roots.is_empty() {
+            std::fs::hard_link(&self.path, final_path)?;
+            let _ = std::fs::remove_file(&self.path);
+            return Ok(final_path.to_path_buf());
+        }
+        #[cfg(test)]
+        if NO_REPLACE_PUBLISH_UNSUPPORTED.with(std::cell::Cell::get) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no rename that refuses to replace, and no hard links",
+            ));
+        }
+        let mut backoff = HELD_RENAME_BACKOFF_MS.iter();
+        let error = loop {
+            match self.rename_no_replace(final_path, allowed_roots) {
+                Err(e) if held_by_another_process(&e) => match backoff.next() {
+                    Some(ms) => std::thread::sleep(std::time::Duration::from_millis(*ms)),
+                    None => break e,
+                },
+                Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => break e,
+                published => return published,
+            }
+        };
+        if self.renamed_to(final_path) {
+            tracing::warn!(
+                "Published {} although the rename could not be confirmed: {error}",
+                final_path.display()
+            );
+            return Ok(final_path.to_path_buf());
+        }
+        if final_path.exists() {
+            return Err(error);
+        }
+        // A scanner holding the fresh copy open without delete sharing
+        // blocks a rename on Windows, but not a hard link. A volume without
+        // hard links (exFAT, FAT32, some shares) is answered like one without
+        // a no-replace rename: the caller copies the file straight to a free
+        // name, as before the temporary copy existed.
+        match self.hard_link_to(final_path, allowed_roots) {
+            Ok(linked) => {
+                self.discard(allowed_roots);
+                Ok(linked)
+            }
+            Err(link_error)
+                if hard_link_fallback_allowed(&link_error)
+                    && !held_by_another_process(&link_error) =>
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!("{error}; no hard links here either ({link_error})"),
+                ))
+            }
+            Err(_) => Err(error),
+        }
+    }
+
+    fn hard_link_to(
+        &self,
+        final_path: &std::path::Path,
+        allowed_roots: &[String],
+    ) -> std::io::Result<std::path::PathBuf> {
+        #[cfg(test)]
+        if HARD_LINKS_UNSUPPORTED.with(std::cell::Cell::get) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        }
+        #[cfg(test)]
+        if COMPLETION_COPY_HELD.with(std::cell::Cell::get) == u32::MAX {
+            return Err(std::io::Error::from_raw_os_error(32));
+        }
+        crate::security::filesystem::hard_link_approved(
+            &self.path,
+            final_path,
+            allowed_roots,
+            &self.identity,
+        )
+    }
+
+    fn rename_no_replace(
+        &self,
+        final_path: &std::path::Path,
+        allowed_roots: &[String],
+    ) -> std::io::Result<std::path::PathBuf> {
+        #[cfg(test)]
+        if COMPLETION_COPY_HELD.with(|held| {
+            let left = held.get();
+            if left > 0 && left != u32::MAX {
+                held.set(left - 1);
+            }
+            left > 0
+        }) {
+            return Err(std::io::Error::from_raw_os_error(32));
+        }
+        crate::security::filesystem::rename_approved_no_replace(
+            &self.path,
+            final_path,
+            allowed_roots,
+            &self.identity,
+        )
+    }
+
+    /// Whether a rename that reported failure took place anyway: the copy's
+    /// name is gone and `final_path` is the same file — its volume and file
+    /// ID, or device and inode — or, on a filesystem without stable inode
+    /// numbers, has exactly the source's bytes.
+    fn renamed_to(&self, final_path: &std::path::Path) -> bool {
+        let copy_gone = matches!(
+            std::fs::symlink_metadata(&self.path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        );
+        if !copy_gone
+            || !std::fs::symlink_metadata(final_path)
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == self.len)
+        {
+            return false;
+        }
+        crate::security::filesystem::object_identity(final_path)
+            .is_ok_and(|identity| identity == self.identity)
+            || self
+                .source
+                .as_deref()
+                .is_some_and(|source| same_contents(source, final_path))
+    }
+
+    /// Remove the copy, or have it removed once whatever holds it lets go.
+    fn discard(&self, allowed_roots: &[String]) {
+        let removed = if allowed_roots.is_empty() {
+            std::fs::remove_file(&self.path)
+        } else {
+            crate::security::filesystem::remove_approved_file_if_identity(
+                &self.path,
+                allowed_roots,
+                &self.identity,
+            )
+        };
+        match removed {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Could not remove the completion copy {}: {e}. Removing it later.",
+                    self.path.display()
+                );
+                crate::storage::deferred_removals::defer(&self.path, allowed_roots);
+            }
+        }
+    }
+}
+
+/// Whether two files have the same bytes. Blocking.
+fn same_contents(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::io::Read;
+    let (Ok(mut a), Ok(mut b)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return false;
+    };
+    let (mut left, mut right) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
+    loop {
+        let Ok(read) = a.read(&mut left) else {
+            return false;
+        };
+        if read == 0 {
+            return b.read(&mut right).is_ok_and(|more| more == 0);
+        }
+        if b.read_exact(&mut right[..read]).is_err() || left[..read] != right[..read] {
+            return false;
+        }
+    }
+}
+
+/// Fail before copying when the volume `target` is on has no room for the
+/// whole file, with the error that marks the download Insufficient and keeps
+/// its `.part`. A failed query lets the copy try: running out of space while
+/// writing fails the same way.
+fn ensure_room_for_completion_copy(
+    part_path: &std::path::Path,
+    target_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let Ok(needed) = std::fs::metadata(part_path).map(|metadata| metadata.len()) else {
+        return Ok(());
+    };
+    room_for_completion_copy(needed, fs2::available_space(target_dir).ok(), target_dir)
+}
+
+fn room_for_completion_copy(
+    needed: u64,
+    available: Option<u64>,
+    target_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let wanted = needed.saturating_add(crate::network::downloads::DISK_SPACE_BUFFER);
+    match available {
+        Some(available) if available < wanted => anyhow::bail!(
+            "stage:insufficient_disk: the finished file needs {needed} bytes and {} has {available} free",
+            target_dir.display()
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn stage_completion_copy(
+    part_path: &std::path::Path,
+    target: &std::path::Path,
+    allowed_roots: &[String],
+    expected_source_identity: Option<&crate::security::filesystem::ObjectIdentity>,
+) -> anyhow::Result<CompletionCopy> {
+    let target_dir = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("completed file target has no folder"))?;
+    ensure_room_for_completion_copy(part_path, target_dir)?;
+    let name = completion_copy_name(part_path);
+    copies_of_this_run().lock().insert(name.clone());
+    let path = target_dir.join(name);
+    let (identity, len) =
+        copy_exclusive(part_path, &path, allowed_roots, expected_source_identity)?;
+    Ok(CompletionCopy {
+        path,
+        identity,
+        len,
+        source: Some(part_path.to_path_buf()),
+    })
+}
+
+/// The folders of a download folder that finished files are published into:
+/// eD2K downloads, chat attachments and room transfers.
+fn finished_file_dirs() -> [&'static str; 3] {
+    [
+        "Downloads",
+        crate::network::chat_attach::CHAT_FILES_DIR,
+        crate::network::ember::xfer::CHANNEL_FILES_DIR,
+    ]
+}
+
+/// Whose a completion copy is, by the `.part` stem its name carries.
+pub(crate) enum CopyOwner {
+    /// An unfinished download. Resuming it settles its copies first
+    /// (`network::event_loop::resume_downloads`), before it can start.
+    Unfinished,
+    /// A finished download, and what its file is.
+    Finished(ExpectedFinishedFile),
+    /// A chat or room transfer, or a download no longer listed.
+    Unknown,
+}
+
+/// `<stem>.part` in some download folder's `Temp`: `Ok(None)` when none
+/// holds it, `Err(())` when a folder that cannot be looked at might.
+fn completion_source(
+    download_roots: &[String],
+    stem: &str,
+) -> Result<Option<std::fs::Metadata>, ()> {
+    let mut unknown = false;
+    for root in download_roots {
+        let part = std::path::Path::new(root)
+            .join("Temp")
+            .join(format!("{stem}.part"));
+        match std::fs::symlink_metadata(part) {
+            Ok(metadata) => return Ok(Some(metadata)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => unknown = true,
+        }
+    }
+    if unknown {
+        Err(())
+    } else {
+        Ok(None)
+    }
+}
+
+/// Whether `part` was there before `copy` was written: created — or, where
+/// that is not known, last written — no later than the copy's last write.
+/// Dates that cannot be read say it was not.
+pub(crate) fn made_before(part: &std::fs::Metadata, copy: &std::fs::Metadata) -> bool {
+    match (part.created().or_else(|_| part.modified()), copy.modified()) {
+        (Ok(part), Ok(copy)) => part <= copy,
+        _ => false,
+    }
+}
+
+/// Settle the completion copies a crash, a kill or a power cut left, in an
+/// earlier run, where finished files are published ([`finished_file_dirs`])
+/// in the download folder `root`, one of `download_roots`. `owner` says
+/// whose each is:
+///
+/// - an unfinished download's is left to resuming it;
+/// - a finished download's is removed when the file it was published as is
+///   there — that very file, or one with its hash — and otherwise, being
+///   the only copy, published once when it is the file and removed when it
+///   is not;
+/// - any other is removed while a `.part` it was made from remains, and
+///   kept when none does, since it can be the only complete copy.
+///
+/// A copy this run made, or modified at or after `cutoff`, may belong to a
+/// completion running now and is left alone. Blocking.
+pub(crate) fn settle_stale_completion_copies(
+    root: &str,
+    download_roots: &[String],
+    cutoff: std::time::SystemTime,
+    owner: &dyn Fn(&str) -> CopyOwner,
+) {
+    let allowed = [root.to_string()];
+    for dir in finished_file_dirs() {
+        let dir = std::path::Path::new(root).join(dir);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(stem) = parse_completion_copy_name(name) else {
+                continue;
+            };
+            if copies_of_this_run().lock().contains(name) {
+                continue;
+            }
+            let Ok(copy) = entry.metadata() else {
+                continue;
+            };
+            if !copy.modified().is_ok_and(|modified| modified < cutoff) {
+                continue;
+            }
+            let path = entry.path();
+            match owner(stem) {
+                CopyOwner::Unfinished => {}
+                CopyOwner::Finished(expected) => settle_finished_copy(
+                    &path,
+                    root,
+                    download_roots.first().map_or(root, String::as_str),
+                    &expected,
+                ),
+                CopyOwner::Unknown => match completion_source(download_roots, stem) {
+                    Ok(Some(part)) if made_before(&part, &copy) => {
+                        remove_interrupted_copy(&path, &allowed)
+                    }
+                    Ok(Some(_)) => tracing::warn!(
+                        "Keeping completion copy {}: the .part it names is newer than it",
+                        path.display()
+                    ),
+                    Ok(None) => tracing::warn!(
+                        "Keeping completion copy {}: its source is gone and what it should be \
+                         is unknown",
+                        path.display()
+                    ),
+                    Err(()) => {}
+                },
+            }
+        }
+    }
+}
+
+fn remove_interrupted_copy(path: &std::path::Path, allowed: &[String]) {
+    match crate::security::filesystem::remove_approved_file(path, allowed) {
+        Ok(()) => tracing::info!("Removed interrupted completion copy {}", path.display()),
+        Err(e) => tracing::warn!(
+            "Could not remove interrupted completion copy {}: {e}",
+            path.display()
+        ),
+    }
+}
+
+fn settle_finished_copy(
+    path: &std::path::Path,
+    root: &str,
+    download_root: &str,
+    expected: &ExpectedFinishedFile,
+) {
+    let is_the_file = |file: &mut std::fs::File| -> anyhow::Result<bool> {
+        Ok(super::hash::ed2k_hash_open_file(file)?.eq_ignore_ascii_case(&expected.ed2k_hash))
+    };
+    match recover_completion_copy(
+        path,
+        root,
+        download_root,
+        &expected.name,
+        expected.size,
+        &is_the_file,
+    ) {
+        Ok(CopyRecovery::Published(published)) => tracing::warn!(
+            "Recovered a finished file whose publication was interrupted as {}",
+            published.display()
+        ),
+        Ok(CopyRecovery::AlreadyPublished(_)) => tracing::info!(
+            "Removed interrupted completion copy {}: the finished file is there",
+            path.display()
+        ),
+        Ok(CopyRecovery::NotTheFile) => tracing::info!(
+            "Removed completion copy {}, which is not the finished file",
+            path.display()
+        ),
+        Err(e) => tracing::warn!("Keeping completion copy {}: {e}", path.display()),
+    }
+}
+
+/// What [`recover_completion_copy`] did with a copy.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CopyRecovery {
+    Published(std::path::PathBuf),
+    /// The file was published before, as this name: the copy is removed.
+    AlreadyPublished(std::path::PathBuf),
+    NotTheFile,
+}
+
+/// `name` in `dir` and every name completion gives it there when that one
+/// is taken (`name (1)`, `name (2)`, …), lowest first. Blocking.
+fn published_names(dir: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
+    let base = dir.join(name);
+    let mut variants: Vec<(u32, std::path::PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let text = file_name.to_str()?;
+            let open = text.rfind(" (")?;
+            let rest = &text[open + 2..];
+            let suffix: u32 = rest[..rest.find(')')?].parse().ok()?;
+            (suffix > 0
+                && dedup_candidate(&base, suffix).file_name() == Some(file_name.as_os_str()))
+            .then(|| (suffix, entry.path()))
+        })
+        .collect();
+    variants.sort();
+    std::iter::once(base)
+        .chain(variants.into_iter().map(|(_, path)| path))
+        .collect()
+}
+
+/// Whether `published`, in the download folder `root`, is the finished file:
+/// the copy itself (`identity`), or `size` bytes `is_the_file` accepts.
+/// Blocking.
+fn is_published_copy(
+    published: &std::path::Path,
+    root: &str,
+    identity: &crate::security::filesystem::ObjectIdentity,
+    size: u64,
+    is_the_file: &dyn Fn(&mut std::fs::File) -> anyhow::Result<bool>,
+) -> bool {
+    let Ok((_, mut file)) = crate::security::filesystem::open_existing_approved(
+        published,
+        &[root.to_string()],
+        false,
+    ) else {
+        return false;
+    };
+    crate::security::filesystem::opened_file_identity(&file).is_ok_and(|id| id == *identity)
+        || (file.metadata().is_ok_and(|metadata| metadata.len() == size)
+            && is_the_file(&mut file).unwrap_or(false))
+}
+
+/// The completion copies an earlier run left in `dir`, each with the
+/// `.part` stem its name carries. Blocking.
+pub(crate) fn earlier_completion_copies(
+    dir: &std::path::Path,
+) -> Vec<(String, std::path::PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let this_run = copies_of_this_run().lock().clone();
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let stem = parse_completion_copy_name(&name)?.to_string();
+            (!this_run.contains(&name)).then(|| (stem, entry.path()))
+        })
+        .collect()
+}
+
+/// Publish the completion copy at `path`, in the download folder `root`,
+/// when it is `size` bytes that `is_the_file` accepts, and remove it when it
+/// is not. It is published in `download_root`, the current download folder,
+/// under the first free name from `file_name` in its `Downloads`, the way a
+/// completion publishes; but when the file was published already — the copy
+/// is linked as, or `is_the_file` accepts, `file_name` or a `name (N)` of
+/// it beside the copy or there — the copy is only removed. An error keeps
+/// it. Blocking.
+pub(crate) fn recover_completion_copy(
+    path: &std::path::Path,
+    root: &str,
+    download_root: &str,
+    file_name: &str,
+    size: u64,
+    is_the_file: &dyn Fn(&mut std::fs::File) -> anyhow::Result<bool>,
+) -> anyhow::Result<CopyRecovery> {
+    let allowed = [root.to_string()];
+    let (_, mut file) = crate::security::filesystem::open_existing_approved(path, &allowed, false)?;
+    let identity = crate::security::filesystem::opened_file_identity(&file)?;
+    let len = file.metadata()?.len();
+    let matches = len == size && is_the_file(&mut file)?;
+    drop(file);
+    let copy = CompletionCopy {
+        path: path.to_path_buf(),
+        identity,
+        len,
+        source: None,
+    };
+    if !matches {
+        copy.discard(&allowed);
+        return Ok(CopyRecovery::NotTheFile);
+    }
+    let name = crate::security::sanitize_filename(file_name);
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("completion copy has no folder"))?;
+    let elsewhere = !crate::storage::part_folders::same_folder(root, download_root);
+    let places = std::iter::once((dir.to_path_buf(), root)).chain(
+        elsewhere.then(|| (std::path::Path::new(download_root).join("Downloads"), download_root)),
+    );
+    for (dir, dir_root) in places {
+        for published in published_names(&dir, &name) {
+            if is_published_copy(&published, dir_root, &copy.identity, size, is_the_file) {
+                copy.discard(&allowed);
+                return Ok(CopyRecovery::AlreadyPublished(published));
+            }
+        }
+    }
+    if elsewhere {
+        let published = move_part_to_downloads(
+            path,
+            std::path::Path::new(root),
+            std::path::Path::new(download_root),
+            &name,
+            &copy.identity,
+        )?;
+        return Ok(CopyRecovery::Published(published));
+    }
+    let target = dir.join(&name);
+    for suffix in 0..=10_000u32 {
+        let final_path = dedup_candidate(&target, suffix);
+        match copy.publish(&final_path, &allowed) {
+            Ok(published) => {
+                sync_published(&published, &allowed);
+                return Ok(CopyRecovery::Published(published));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || final_path.exists() => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    anyhow::bail!("no free name for {}", target.display())
 }
 
 /// Approved-root wrapper used by production completion/recovery paths. The
@@ -6744,9 +8224,35 @@ pub(crate) fn move_part_to_final_approved(
     download_root: &std::path::Path,
     expected_source_identity: &crate::security::filesystem::ObjectIdentity,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let allowed = vec![download_root.to_string_lossy().into_owned()];
-    let verified_part = crate::security::filesystem::verify_existing_path(part_path, &allowed)?;
-    let verified_target = crate::security::filesystem::verify_output_path(target, &allowed)?;
+    move_part_between_roots_approved(
+        part_path,
+        download_root,
+        target,
+        download_root,
+        expected_source_identity,
+    )
+}
+
+/// [`move_part_to_final_approved`] for a `.part` left in an earlier download
+/// folder: each end is pinned to its own root, and the move is a copy when
+/// the two are on different volumes.
+pub(crate) fn move_part_between_roots_approved(
+    part_path: &std::path::Path,
+    part_root: &std::path::Path,
+    target: &std::path::Path,
+    target_root: &std::path::Path,
+    expected_source_identity: &crate::security::filesystem::ObjectIdentity,
+) -> anyhow::Result<std::path::PathBuf> {
+    let part_allowed = vec![part_root.to_string_lossy().into_owned()];
+    let target_allowed = vec![target_root.to_string_lossy().into_owned()];
+    let verified_part =
+        crate::security::filesystem::verify_existing_path(part_path, &part_allowed)?;
+    let verified_target =
+        crate::security::filesystem::verify_output_path(target, &target_allowed)?;
+    let mut allowed = part_allowed;
+    if target_allowed != allowed {
+        allowed.extend(target_allowed);
+    }
     move_part_to_final_with_roots(
         &verified_part,
         &verified_target,
@@ -6796,19 +8302,34 @@ fn dedup_candidate(base: &std::path::Path, suffix: u32) -> std::path::PathBuf {
     let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = base.extension().and_then(|s| s.to_str());
     let parent = base.parent().unwrap_or(base);
-    if let Some(ext) = ext {
-        parent.join(format!("{stem} ({suffix}).{ext}"))
-    } else {
-        parent.join(format!("{stem} ({suffix})"))
+    let tail = match ext {
+        Some(ext) => format!(" ({suffix}).{ext}"),
+        None => format!(" ({suffix})"),
+    };
+    // `sanitize_filename` lets a name reach the 255-byte limit, so the
+    // suffix has to come out of the stem: past it the link fails with an
+    // error that is not `AlreadyExists`, and completion failed and re-verified
+    // the whole file on every retry. 255 UTF-8 bytes is never more than
+    // NTFS's 255 UTF-16 units.
+    const MAX_NAME_BYTES: usize = 255;
+    let mut end = stem.len().min(MAX_NAME_BYTES.saturating_sub(tail.len()));
+    while end > 0 && !stem.is_char_boundary(end) {
+        end -= 1;
     }
+    // Windows drops trailing dots and spaces, as `sanitize_filename` notes.
+    let stem = stem[..end].trim_end_matches(['.', ' ']);
+    let stem = if stem.is_empty() { "file" } else { stem };
+    parent.join(format!("{stem}{tail}"))
 }
 
+/// Copy `source_path` to the new file `destination_path`, synced and the same
+/// length as the source, returning the copy's identity and length.
 fn copy_exclusive(
     source_path: &std::path::Path,
     destination_path: &std::path::Path,
     allowed_roots: &[String],
     expected_source_identity: Option<&crate::security::filesystem::ObjectIdentity>,
-) -> std::io::Result<()> {
+) -> std::io::Result<(crate::security::filesystem::ObjectIdentity, u64)> {
     use std::io::Write;
 
     let mut source = if allowed_roots.is_empty() {
@@ -6834,7 +8355,17 @@ fn copy_exclusive(
         file
     };
     let destination_identity = crate::security::filesystem::opened_file_identity(&destination)?;
+    let source_len = source.metadata()?.len();
     if let Err(e) = std::io::copy(&mut source, &mut destination)
+        .and_then(|copied| {
+            if copied == source_len {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "completion copy wrote {copied} of {source_len} bytes"
+                )))
+            }
+        })
         .and_then(|_| destination.flush())
         .and_then(|_| destination.sync_all())
     {
@@ -6872,7 +8403,7 @@ fn copy_exclusive(
             ));
         }
     }
-    Ok(())
+    Ok((destination_identity, source_len))
 }
 
 fn remove_completed_part_best_effort(
@@ -6974,14 +8505,16 @@ pub(crate) fn verify_hashset(
 /// Whole-file ed2k still gates completion, but a first-wins pin poisons
 /// recovery: later AICH answers are ignored if they disagree with the pin.
 /// Catalog `expected` is enough on its own. Otherwise a single source is
-/// not: two distinct `src_idx` values must advertise the same root. When
-/// `expected` is already known, a conflicting HashSet2 root is ignored even
-/// if several sources repeat it.
+/// not: two distinct peer addresses must advertise the same root. Keyed on
+/// the address rather than the worker's index, which is new each time a peer
+/// is re-injected or calls back, so one client voted twice by reconnecting
+/// and pinned a root nothing could replace. When `expected` is already known,
+/// a conflicting HashSet2 root is ignored even if several sources repeat it.
 pub(super) fn consider_hashset2_aich_pin(
     pinned: &mut Option<[u8; 20]>,
     expected: Option<[u8; 20]>,
-    votes: Option<&mut HashMap<[u8; 20], HashSet<usize>>>,
-    src_idx: usize,
+    votes: Option<&mut HashMap<[u8; 20], HashSet<String>>>,
+    voter: &str,
     root: [u8; 20],
 ) {
     if pinned.is_some() {
@@ -6997,7 +8530,7 @@ pub(super) fn consider_hashset2_aich_pin(
     let Some(votes) = votes else {
         return;
     };
-    votes.entry(root).or_default().insert(src_idx);
+    votes.entry(root).or_default().insert(voter.to_string());
     if votes.get(&root).map(|s| s.len()).unwrap_or(0) >= 2 {
         *pinned = Some(root);
     }

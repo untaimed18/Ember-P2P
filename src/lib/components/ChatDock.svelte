@@ -34,6 +34,7 @@
   import { plural } from '$lib/plural';
   import IconX from '$lib/components/IconX.svelte';
   import { shortcutModAria } from '$lib/platform';
+  import { isShortcutLetter } from '$lib/shortcutKey';
   import {
     clampDockWidth,
     maxDockWidth,
@@ -461,7 +462,7 @@
       cycleTab(e.shiftKey ? -1 : 1);
       return;
     }
-    if (e.key === 'k' || e.key === 'K') {
+    if (isShortcutLetter(e, 'k')) {
       // The find-anything gesture, and the reason the list can be long: with
       // fifty conversations allowed, typing a name has to beat scrolling to it.
       //
@@ -474,7 +475,7 @@
       else openSwitcher();
       return;
     }
-    if ((e.key === 'w' || e.key === 'W') && !isTypingTarget(e.target)) {
+    if (isShortcutLetter(e, 'w') && !isTypingTarget(e.target)) {
       // Ctrl+W is "close window" in the OS, but here it's "close
       // conversation" — the dock isn't a real window so we can safely
       // repurpose it. Disabled while typing so a user mid-message doesn't lose
