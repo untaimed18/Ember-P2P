@@ -378,7 +378,7 @@ If you are stuck on a Low ID: confirm 4662/TCP and 4672/UDP are forwarded, check
 #### Prerequisites
 
 - [Rust](https://rustup.rs/) (1.94+, matching `rust-version` in [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml))
-- [Node.js](https://nodejs.org/) (20.19+, 22.12+ or 24+, matching `engines` in [`package.json`](package.json); CI builds on 24)
+- [Node.js](https://nodejs.org/) (22.12+ or 24+, matching `engines` in [`package.json`](package.json); CI builds on 24)
 - **Windows**: Visual Studio Build Tools with C++ workload
 - **Linux**: WebKitGTK 4.1 and GTK 3 development packages. On Debian/Ubuntu:
 

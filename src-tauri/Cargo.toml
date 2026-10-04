@@ -107,7 +107,7 @@ arboard = { version = "3", default-features = false, features = ["wayland-data-c
 tauri-plugin-updater = "2"
 rsa = "0.9"
 num-bigint-dig = "0.8"
-opener = "0.8"
+opener = "0.9"
 crc32fast = "1"
 zeroize = { version = "1", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
@@ -130,7 +130,7 @@ x509-cert = { version = "0.3", default-features = false }
 strsim = "0.11"
 zip = "8"
 fs2 = "0.4"
-maxminddb = "0.29"
+maxminddb = "0.32"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 parking_lot = "0.12"
 # Direct `notify` rather than `notify-debouncer-mini`: the mini crate drops
