@@ -340,7 +340,7 @@ pub(super) fn convert_search_results(
             existing.file.complete_sources = *cs;
 
             if name_spam_penalty(&p.name) < name_spam_penalty(&existing.file.name) {
-                existing.file.name = p.name;
+                crate::search::merge::rename_result(existing, p.name);
             }
             if existing.file_type.is_empty() && !p.file_type.is_empty() {
                 existing.file_type = p.file_type;
@@ -1430,5 +1430,39 @@ mod fileformat_tests {
         assert!(!matches_search_expr_for_tags(&ext("avi"), &tags));
         assert!(!matches_search_expr_for_tags(&ext("mkv"), &named("no_extension")));
         assert!(!matches_search_expr_for_tags(&ext(""), &tags));
+    }
+}
+
+#[cfg(test)]
+mod convert_tests {
+    use super::*;
+
+    fn entry(name: &str) -> kad::messages::SearchResultEntry {
+        kad::messages::SearchResultEntry {
+            id: KadId([0x42; 16]),
+            tags: vec![
+                KadTag {
+                    name: TagName::Id(TAG_FILENAME),
+                    value: TagValue::String(name.to_string()),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_FILESIZE),
+                    value: TagValue::Uint32(4096),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn a_better_name_from_a_later_node_brings_its_extension_and_type() {
+        let padded = "[promo] [promo] Holiday Clip.avi";
+        let clean = "Holiday Clip.zip";
+        assert!(name_spam_penalty(clean) < name_spam_penalty(padded));
+
+        let results = convert_search_results(&[entry(padded), entry(clean)], |_| true);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file.name, clean);
+        assert_eq!(results[0].file.extension, "zip");
+        assert_eq!(results[0].file_type, "Arc");
     }
 }

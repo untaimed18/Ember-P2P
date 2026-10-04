@@ -4,6 +4,7 @@
 //! way `command.rs` does.
 
 use super::*;
+use super::kad::search::SEARCH_RESULT_PAGE_SIZE;
 
 /// Serveable-parts bitmaps for downloads answering UDP reasks without a live
 /// tracker (paused or queued), keyed by transfer id. Filled from the live
@@ -1270,7 +1271,11 @@ pub(super) async fn handle_udp_packet_inner(
             // handshake / UDP-key (or legacy challenge) path can promote
             // them. Remaining contacts wait to be verified lazily.
             let mut hello_addrs: Vec<(SocketAddr, KadId, u8)> = Vec::new();
-            for (i, c) in contacts.into_iter().enumerate() {
+            for (i, c) in contacts
+                .into_iter()
+                .filter(|c| c.udp_port != 0)
+                .enumerate()
+            {
                 let addr = SocketAddr::new(c.ip.into(), c.udp_port);
                 let id = c.id;
                 let ver = c.version;
@@ -1411,6 +1416,8 @@ pub(super) async fn handle_udp_packet_inner(
                 .iter()
                 .find(|t| matches!(&t.name, TagName::Id(TAG_SOURCEUPORT)))
                 .and_then(|t| t.uint16_value())
+                // eMule ignores a zero tag and keeps the datagram's port.
+                .filter(|&port| port != 0)
                 .unwrap_or(from.port());
 
             let now = chrono::Utc::now().timestamp();
@@ -1558,6 +1565,8 @@ pub(super) async fn handle_udp_packet_inner(
                 .iter()
                 .find(|t| matches!(&t.name, TagName::Id(TAG_SOURCEUPORT)))
                 .and_then(|t| t.uint16_value())
+                // eMule ignores a zero tag and keeps the datagram's port.
+                .filter(|&port| port != 0)
                 .unwrap_or(from.port());
             if !peer_udp_firewalled {
                 state.routing_table.insert(KadContact {
@@ -1901,6 +1910,10 @@ pub(super) async fn handle_udp_packet_inner(
                         .filter(|c| {
                             // eMule: reject Kad1 contacts (version <= 1)
                             if !c.is_kad2() {
+                                return false;
+                            }
+                            // eMule `IsGoodIPPort`: nothing listens on port 0.
+                            if c.udp_port == 0 {
                                 return false;
                             }
                             // eMule: reject DNS port 53 for old versions
@@ -2508,7 +2521,7 @@ pub(super) async fn handle_udp_packet_inner(
             let start = (start_position & 0x7FFF) as usize;
             let page = state
                 .dht_store
-                .search_keywords_page(&target, start, 200, |_, tags| {
+                .search_keywords_page(&target, start, SEARCH_RESULT_PAGE_SIZE, |_, tags| {
                     search_expr
                         .as_ref()
                         .is_none_or(|expr| matches_search_expr_for_tags(expr, tags))
@@ -2537,7 +2550,7 @@ pub(super) async fn handle_udp_packet_inner(
             let start = (start_position & 0x7FFF) as usize;
             let page = state
                 .dht_store
-                .search_sources_page(&target, start, 200, |_, tags| {
+                .search_sources_page(&target, start, SEARCH_RESULT_PAGE_SIZE, |_, tags| {
                     matches_requested_file_size_tags(tags, file_size)
                 });
 

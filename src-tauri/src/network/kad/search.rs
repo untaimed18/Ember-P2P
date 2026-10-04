@@ -41,6 +41,12 @@ const NOTES_SEARCH_STOP_THRESHOLD: usize = 50;
 /// past it are dropped, and a silent drop is indistinguishable from the
 /// network having nothing more to give.
 const MAX_SEARCH_RESULT_ENTRIES: usize = 5000;
+/// eMule `Indexed.cpp` `iMaxResults`: one keyword or source answer holds up to
+/// 300 entries counted from the request's `start_position`. Requester and
+/// responder have to agree on it: a smaller step re-requests the tail of an
+/// answer that is still arriving, and the duplicates use up
+/// `MAX_SEARCH_RESULT_ENTRIES` and the per-peer page budget.
+pub const SEARCH_RESULT_PAGE_SIZE: usize = 300;
 /// eMule caps a FindBuddy search at `SEARCHFINDBUDDY` (10) distinct
 /// contacts queried. Both the stop-querying check and the reservation
 /// cap below must use this same value — a previous `+ 1` fudge factor
@@ -185,11 +191,12 @@ pub struct SearchState {
     /// one nothing would ever release.
     pub new_in_use_ids: Vec<KadId>,
     /// Next start_position for pagination: re-fetch contacts that returned a
-    /// full page (200 results) with an incremented offset to get more.
+    /// full page (`SEARCH_RESULT_PAGE_SIZE` results) with an incremented offset
+    /// to get more.
     fetch_page_offset: HashMap<KadId, u16>,
     /// Entries a contact has delivered for its *current* page, accumulated across
     /// datagrams. A responder splits one page over many `SearchRes` packets —
-    /// batched to `UDP_KAD_MAXFRAGMENT`, so ~20 entries each against a 200-result
+    /// batched to `UDP_KAD_MAXFRAGMENT`, so ~20 entries each against a 300-result
     /// page — which is why a single packet's count can never reach the page size
     /// and pagination has to be driven by the running total. Reset when the offset
     /// advances.
@@ -821,7 +828,6 @@ impl SearchState {
             );
         }
 
-        const FETCH_PAGE_SIZE: usize = 200;
         const MAX_PAGES_PER_PEER: u16 = 3;
         // Against the *running* total for this peer's current page, not this one
         // datagram's count: the responder fragments a page to fit
@@ -831,7 +837,7 @@ impl SearchState {
         // first page however much more it held.
         let page_received = self.fetch_page_received.entry(*from).or_insert(0);
         *page_received = page_received.saturating_add(count);
-        let page_complete = *page_received >= FETCH_PAGE_SIZE;
+        let page_complete = *page_received >= SEARCH_RESULT_PAGE_SIZE;
         if page_complete
             && !self.stop_querying
             && self.results.len() < MAX_SEARCH_RESULT_ENTRIES
@@ -841,8 +847,8 @@ impl SearchState {
             )
         {
             let current_offset = self.fetch_page_offset.get(from).copied().unwrap_or(0);
-            let next_offset = current_offset.saturating_add(FETCH_PAGE_SIZE as u16);
-            if current_offset / FETCH_PAGE_SIZE as u16 + 1 < MAX_PAGES_PER_PEER {
+            let next_offset = current_offset.saturating_add(SEARCH_RESULT_PAGE_SIZE as u16);
+            if current_offset / SEARCH_RESULT_PAGE_SIZE as u16 + 1 < MAX_PAGES_PER_PEER {
                 self.fetch_page_offset.insert(*from, next_offset);
                 self.fetch_page_received.insert(*from, 0);
                 self.fetched.remove(from);
@@ -1755,6 +1761,47 @@ mod tests {
             last_type_set: chrono::Utc::now().timestamp(),
             received_hello: false,
         }
+    }
+
+    fn requested_start_position(state: &SearchState, peer: &KadContact) -> u16 {
+        match state.build_fetch_message_for(peer) {
+            KadMessage::SearchKeyReq { start_position, .. } => start_position,
+            other => panic!("expected a SearchKeyReq, got {other:?}"),
+        }
+    }
+
+    /// eMule answers with up to 300 entries from `start_position`, fragmented
+    /// into datagrams of about 20, so the next page starts where a whole
+    /// answer ends rather than partway through one still arriving.
+    #[test]
+    fn keyword_paging_advances_by_a_whole_emule_answer() {
+        let mut state = SearchState::new(SearchId(1), kad_id(1), SearchType::FindKeyword);
+        let peer = contact(kad_id(2), 2);
+        let batch = |n: u8| {
+            (0..20)
+                .map(|i| SearchResultEntry {
+                    id: KadId([n.wrapping_mul(20).wrapping_add(i); KAD_ID_SIZE]),
+                    tags: Vec::new(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for n in 0..10 {
+            state.handle_search_results(&peer.id, batch(n));
+        }
+        assert_eq!(
+            requested_start_position(&state, &peer),
+            0,
+            "200 entries in, the first answer is still arriving"
+        );
+
+        for n in 10..15 {
+            state.handle_search_results(&peer.id, batch(n));
+        }
+        assert_eq!(
+            requested_start_position(&state, &peer),
+            SEARCH_RESULT_PAGE_SIZE as u16
+        );
     }
 
     #[test]

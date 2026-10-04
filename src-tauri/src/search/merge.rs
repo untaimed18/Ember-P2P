@@ -221,6 +221,26 @@ fn vote_name(votes: &mut NameVotes, name: &str) {
     entry.0 = entry.0.saturating_add(1);
 }
 
+/// Give a row a new display name, carrying its extension and file type over to
+/// it. The type column and the type filter both read these, so a row renamed
+/// from `clip.avi` to `album.zip` must not go on being a video.
+pub(crate) fn rename_result(result: &mut SearchResult, name: String) {
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_string())
+        .unwrap_or_default();
+    let inferred = crate::search::index::infer_file_type(&extension);
+    if !inferred.is_empty() {
+        result.file_type = inferred;
+    } else if !crate::search::index::infer_file_type(&result.file.extension).is_empty() {
+        // That type was read off the old name's extension rather than
+        // published, so it says nothing about the new name.
+        result.file_type.clear();
+    }
+    result.file.extension = extension;
+    result.file.name = name;
+}
+
 /// Most advertised name, with the first-seen name breaking a tie.
 fn elected_name(votes: &NameVotes) -> Option<&str> {
     votes
@@ -442,7 +462,7 @@ pub fn merge_search_vecs(
     for (key, result) in map.iter_mut() {
         if let Some(elected) = name_votes.get(key).and_then(elected_name) {
             if result.file.name != elected {
-                result.file.name = elected.to_string();
+                rename_result(result, elected.to_string());
             }
         }
     }
@@ -944,6 +964,45 @@ mod tests {
             "ab".repeat(32),
             "known.met beats a publisher plurality"
         );
+    }
+
+    fn typed(hash: &str, name: &str, origin: &str) -> SearchResult {
+        let mut r = sample(hash, 1, origin);
+        r.file.name = name.into();
+        r.file.extension = name.rsplit_once('.').map(|(_, e)| e.into()).unwrap_or_default();
+        r.file_type = crate::search::index::infer_file_type(&r.file.extension);
+        r
+    }
+
+    /// The vote can rename a row after its first source set the extension and
+    /// type, and both the type column and the type filter read those.
+    #[test]
+    fn an_elected_name_brings_its_extension_and_type_with_it() {
+        let merged = merge_search_vecs(
+            vec![typed("aa", "clip.avi", ORIGIN_KAD)],
+            vec![
+                typed("aa", "album.zip", ORIGIN_SERVER_TCP),
+                typed("aa", "album.zip", ORIGIN_LOCAL),
+            ],
+        );
+        assert_eq!(merged[0].file.name, "album.zip");
+        assert_eq!(merged[0].file.extension, "zip");
+        assert_eq!(merged[0].file_type, "Arc");
+    }
+
+    /// A type inferred from the old extension described the old name; one a
+    /// publisher sent for a name with no recognisable extension still stands.
+    #[test]
+    fn renaming_to_an_unknown_extension_drops_only_an_inferred_type() {
+        let mut inferred = typed("aa", "clip.avi", ORIGIN_KAD);
+        rename_result(&mut inferred, "clip.xyz".into());
+        assert_eq!(inferred.file.extension, "xyz");
+        assert_eq!(inferred.file_type, "");
+
+        let mut published = typed("bb", "readme", ORIGIN_KAD);
+        published.file_type = "Doc".into();
+        rename_result(&mut published, "readme.xyz".into());
+        assert_eq!(published.file_type, "Doc");
     }
 
     /// The rule that decides which spam explanation a merged row shows. The

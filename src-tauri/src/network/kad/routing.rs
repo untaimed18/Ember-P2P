@@ -17,8 +17,6 @@ const KAD_DISCONNECT_DELAY_SECS: i64 = 20 * 60;
 const BIG_TIMER_DISCONNECT_BYPASS_SECS: i64 = KAD_DISCONNECT_DELAY_SECS - 5 * 60;
 /// eMule MIN2S(1): per-zone small timer fires every minute for liveness probing.
 const SMALL_TIMER_INTERVAL_SECS: i64 = 60;
-/// Default contact time-to-live (eMule: 2 hours).
-const CONTACT_DEFAULT_TTL_SECS: i64 = 7200;
 
 pub fn kad_version_name(version: u8) -> &'static str {
     match version {
@@ -726,7 +724,7 @@ impl RoutingZone {
                 return false;
             }
             if c.expires_at == 0 {
-                c.expires_at = now + CONTACT_DEFAULT_TTL_SECS;
+                c.expires_at = now;
             }
             true
         });
@@ -1168,6 +1166,11 @@ impl RoutingTable {
                 return false;
             }
         }
+        // eMule `IsGoodIPPort` in `CRoutingZone::Add`.
+        if contact.udp_port == 0 {
+            tracing::debug!("RT reject {}: UDP port 0", contact.id);
+            return false;
+        }
         if contact.udp_port == 53 && contact.version <= KADEMLIA_VERSION5_48A {
             tracing::debug!(
                 "Rejecting DNS port contact ({}) version {}",
@@ -1254,8 +1257,11 @@ impl RoutingTable {
         if contact.created_at == 0 {
             contact.created_at = now;
         }
+        // eMule gives a new contact no expiry and the small timer then stamps
+        // it `tNow`, so the next pass over its zone probes it; a dead contact
+        // must not wait out a full TTL before its first HELLO.
         if contact.expires_at == 0 {
-            contact.expires_at = now + CONTACT_DEFAULT_TTL_SECS;
+            contact.expires_at = now;
         }
 
         let contact_ip = contact.ip;
@@ -1895,6 +1901,42 @@ mod find_closest_tests {
         assert_eq!(kept.contact_type, CONTACT_TYPE_DEAD, "not revived");
 
         assert!(rt.insert_if_new(contact(0x02, 2)), "a new one is still added");
+    }
+
+    /// eMule `CRoutingZone::Add` refuses these through `IsGoodIPPort`: a
+    /// contact we can never send to only takes a bin slot and an IP slot.
+    #[test]
+    fn a_contact_on_udp_port_zero_is_never_admitted() {
+        let mut rt = RoutingTable::new(KadId([0xFF; 16]), false);
+        let mut portless = contact(0x01, 1);
+        portless.udp_port = 0;
+        assert!(!rt.insert(portless.clone()));
+        assert!(!rt.insert_if_new(portless));
+        assert!(rt.is_empty());
+        assert!(!rt.has_contact_ip(Ipv4Addr::new(1, 2, 3, 1)));
+    }
+
+    /// eMule stamps a new contact's expiry with the time of the first small
+    /// timer pass that sees it, so the pass after that sends it a HELLO
+    /// rather than leaving a dead contact unprobed for a whole TTL.
+    #[test]
+    fn a_new_contact_is_probed_on_the_next_small_timer_pass() {
+        let mut rt = RoutingTable::new(KadId([0xFF; 16]), false);
+        let mut fresh = contact(0x01, 1);
+        fresh.verified = false;
+        fresh.contact_type = CONTACT_TYPE_NEW;
+        assert!(rt.insert(fresh.clone()));
+
+        let next_pass = chrono::Utc::now().timestamp() + SMALL_TIMER_INTERVAL_SECS;
+        let mut to_probe = Vec::new();
+        let mut removed = Vec::new();
+        rt.root
+            .on_small_timer(next_pass, &mut to_probe, &mut removed, &HashMap::new());
+        assert_eq!(
+            to_probe.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![fresh.id]
+        );
+        assert!(removed.is_empty());
     }
 
     /// Regression guard: `find_closest` seeds fresh FindNode/self-lookup
