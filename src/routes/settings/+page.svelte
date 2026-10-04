@@ -1885,7 +1885,14 @@
     if (/[\s\u0000-\u001f]/.test(trimmed)) return false;
     try {
       const parsed = new URL(trimmed);
-      return Boolean(parsed.host) && !parsed.username && !parsed.password;
+      if (!parsed.host || parsed.username || parsed.password) return false;
+      // Mirrors the backend's save check: a placeholder straight after the
+      // address (`https://x.test#name`) fills into the host, so the backend
+      // drops the entry on save and the form must not look as if it took it.
+      const filled = new URL(
+        trimmed.replace(/#(cleanfilename|cleanname|filename|filesize|hashid|name)/g, 'a1'),
+      );
+      return filled.protocol === parsed.protocol && filled.host === parsed.host;
     } catch {
       return false;
     }
