@@ -966,11 +966,12 @@ pub(super) async fn handle_inbound_channel_gossip(
         .await;
         return;
     }
-    // Handoff frames are not gated on `opened`, for acting on or for relaying.
-    // Each carries its own authority — the room's signature on an offer, and on
-    // a ready the signature of the member that offer named — so the key that
-    // sealed it adds nothing, and a nominee who has not fetched the newest
-    // epoch yet must still be able to answer.
+    // Handoff frames are not gated on `opened` for relaying. Each carries its
+    // own authority — the room's signature on an offer, and on a ready the
+    // signature of the member that offer named — so the key that sealed it
+    // adds nothing to whether it is genuine. What it does say is whether the
+    // nominee had caught up with the room when it answered, which the owner
+    // asks before committing; see `apply_channel_handoff_ready`.
     let channel_pk = hex::decode(&ch.pubkey)
         .ok()
         .and_then(|b| <[u8; 32]>::try_from(b).ok());
@@ -992,9 +993,13 @@ pub(super) async fn handle_inbound_channel_gossip(
         .await;
         return;
     }
-    if let Some((sender_pk, successor_pk, version)) =
-        ember::channel::decode_channel_handoff_ready(&plain, &gossip.channel_id)
-    {
+    let ready = ember::channel::decode_channel_handoff_ready_proven(&plain, &gossip.channel_id)
+        .map(|ready| (ready, true))
+        .or_else(|| {
+            ember::channel::decode_channel_handoff_ready(&plain, &gossip.channel_id)
+                .map(|ready| (ready, false))
+        });
+    if let Some(((sender_pk, successor_pk, version), proven)) = ready {
         apply_channel_handoff_ready(
             socket,
             state,
@@ -1003,9 +1008,11 @@ pub(super) async fn handle_inbound_channel_gossip(
             &ch,
             &gossip,
             from_id,
+            opened,
             sender_pk,
             successor_pk,
             version,
+            proven,
         )
         .await;
         return;
@@ -1459,7 +1466,20 @@ pub(super) async fn apply_channel_handoff_offer(
     handoff_offers_seen()
         .lock()
         .note(gossip.channel_id, target_pk, version, now);
-    if target_pk == state.local_ed25519_pubkey {
+    // Behind the room's newest key, we are behind the snapshot that announced
+    // it too — the one carrying the ban that rotated it. The successor starts
+    // from our copy of the ban list, so answering now could carry into it the
+    // very member the owner just removed. The epoch fetch catches us up within
+    // a minute or so, and the owner may offer again.
+    let behind = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE
+        && ch.key_epoch < ch.key_epoch_wanted;
+    if behind && target_pk == state.local_ed25519_pubkey {
+        debug!(
+            "Ember channel handoff: not answering the offer for {} until epoch {} is fetched",
+            ch.channel_id, ch.key_epoch_wanted
+        );
+    }
+    if target_pk == state.local_ed25519_pubkey && !behind {
         // Never answer with a successor key that is not on disk: the owner
         // publishes whatever pubkey the ready names, and a seed held only in
         // memory is a room nobody can ever sign for again.
@@ -1496,22 +1516,34 @@ pub(super) async fn apply_channel_handoff_offer(
         };
         if let (Some(ident), Some(key)) = (ident, channel_content_key(db, ch)) {
             let signing = ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed);
-            let plain = ember::channel::encode_channel_handoff_ready(
+            // Proven first, then the legacy frame owners on older builds read.
+            // An owner that reads both commits on whichever lands first; the
+            // two name the same key, so the second finds it already held.
+            let proven = ember::channel::encode_channel_handoff_ready_proven(
+                &signing,
+                &ident.signing_key,
+                &gossip.channel_id,
+                &state.local_ed25519_pubkey,
+                version,
+            );
+            let legacy = ember::channel::encode_channel_handoff_ready(
                 &signing,
                 &gossip.channel_id,
                 &state.local_ed25519_pubkey,
                 &ident.pubkey,
                 version,
             );
-            let reply = ember::channel::ChannelGossip::new_plaintext(
-                gossip.channel_id,
-                &key,
-                version,
-                &plain,
-                ember::channel::CHANNEL_MSG_TTL_DEFAULT,
-            );
-            let _ = remember_channel_gossip(state, reply.msg_id);
-            fanout_channel_gossip_body(socket, state, db, reply.encode(), None).await;
+            for plain in [proven, legacy] {
+                let reply = ember::channel::ChannelGossip::new_plaintext(
+                    gossip.channel_id,
+                    &key,
+                    version,
+                    &plain,
+                    ember::channel::CHANNEL_MSG_TTL_DEFAULT,
+                );
+                let _ = remember_channel_gossip(state, reply.msg_id);
+                fanout_channel_gossip_body(socket, state, db, reply.encode(), None).await;
+            }
             let _ = app_handle.emit(
                 "ember:channel-handoff",
                 serde_json::json!({
@@ -1629,9 +1661,11 @@ pub(super) async fn apply_channel_handoff_ready(
     ch: &crate::storage::database::StoredChannel,
     gossip: &ember::channel::ChannelGossip,
     from_id: ember::dht::EmberNodeId,
+    opened: ember::channel::OpenedUnder,
     sender_pk: [u8; 32],
     successor_pk: [u8; 32],
     version: u64,
+    proven: bool,
 ) {
     let mut offer_known = handoff_offers_seen()
         .lock()
@@ -1645,11 +1679,29 @@ pub(super) async fn apply_channel_handoff_ready(
             // outlive both the offer's window and the target's standing in the
             // room. Completing on either would hand the room to someone the
             // owner no longer meant it for.
+            //
+            // A ready sealed under a key we have since rotated past comes from
+            // a nominee who had not seen the snapshot announcing it, nor the
+            // ban in it, and the successor inherits their ban list. And the key
+            // a ready names has to be one a room could have: a real point, and
+            // not this room's own. A proven ready has also shown the nominee
+            // holds it; a legacy one, which nominees on older builds send
+            // alone, cannot.
             let acceptable = answers_ours
                 && ember::channel::handoff_offer_live(version, chrono::Utc::now().timestamp())
                 && !db
                     .channel_member_is_banned(&ch.channel_id, &sender_hex)
-                    .unwrap_or(true);
+                    .unwrap_or(true)
+                && !(ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE
+                    && opened == ember::channel::OpenedUnder::Retired)
+                && ember::channel::handoff_successor_fits(&gossip.channel_id, &successor_pk);
+            if answers_ours && !acceptable {
+                debug!(
+                    "Ember channel handoff: not committing {} to the ready for v{version} \
+                     (lapsed, banned, behind the room's key, or an unfit successor; proven: {proven})",
+                    ch.channel_id
+                );
+            }
             if acceptable {
                 // Committed before anything is published: from the first
                 // publish on, the record may be stored without our hearing so,
@@ -1706,6 +1758,13 @@ pub(super) async fn apply_channel_handoff_ready(
                         );
                     }
                     Ok(ChannelHandoffCommitOutcome::NotPending) => {}
+                    Ok(ChannelHandoffCommitOutcome::Unfit) => {
+                        debug!(
+                            "Ember channel handoff: refused v{version} of {}: the successor it \
+                             names is a room this device already holds",
+                            ch.channel_id
+                        );
+                    }
                     Err(e) => {
                         debug!(
                             "Ember channel handoff: could not commit {} to its successor: {e}",
@@ -1909,7 +1968,7 @@ async fn complete_owned_channel_handoff(
             .get_channel_lite(&prepare_hex)
             .ok()
             .flatten()
-            .filter(|row| row.is_owner && row.successor_id.is_empty())?;
+            .filter(|row| row.is_owner && !row.deleted && row.successor_id.is_empty())?;
         let seed = prepare_db.load_channel_owner_seed(&prepare_hex).ok().flatten()?;
         Some((commit, seed))
     })
@@ -1990,7 +2049,7 @@ pub(super) async fn maybe_drive_channel_handoffs(
             let _ = db.drop_channel_handoff_commit(&channel_hex);
             continue;
         };
-        if !ch.is_owner || !ch.successor_id.is_empty() {
+        if !ch.is_owner || ch.deleted || !ch.successor_id.is_empty() {
             let _ = db.drop_channel_handoff_commit(&channel_hex);
             continue;
         }
@@ -2007,6 +2066,23 @@ pub(super) async fn maybe_drive_channel_handoffs(
             .get(&channel_id)
             .map(|(_, at)| *at)
             .unwrap_or(0);
+        // Following our nominee's claim: there is no offer to lapse, and
+        // nothing to give up on, since the members are already leaving.
+        if commit.nominee.is_empty() {
+            if ember::channel::schedule_due(last, now, ember::channel::HANDOFF_CLAIMED_REPUBLISH_SECS) {
+                publish_committed_channel_handoff(
+                    socket,
+                    state,
+                    db,
+                    &app_handle,
+                    &ch,
+                    channel_id,
+                    &commit,
+                )
+                .await;
+            }
+            continue;
+        }
         match ember::channel::handoff_republish_due(commit.version, commit.committed_at, last, now) {
             ember::channel::HandoffRepublish::Publish => {
                 state.channel_handoff_failure_noted.remove(&channel_id);
@@ -2039,6 +2115,85 @@ pub(super) async fn maybe_drive_channel_handoffs(
     }
     state.channel_handoff_publishes.retain(|id, _| live.contains(id));
     state.channel_handoff_failure_noted.retain(|id| live.contains(id));
+}
+
+/// Republish the records of moves this device signed, for the members who were
+/// away when they happened.
+///
+/// Each is signed afresh, because a storer dates a record's life from its
+/// signed creation time and storers on older builds keep this kind only a day.
+/// The old room's seed, set aside when the handoff was applied, signs nothing
+/// else; a claim is signed with our user key, as it was the first time.
+pub(super) async fn maybe_republish_retired_channel_handoffs(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+) {
+    static CHECKED_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let now = chrono::Utc::now().timestamp();
+    let checked_at = CHECKED_AT.load(std::sync::atomic::Ordering::Relaxed);
+    if !ember::channel::schedule_due(checked_at, now, ember::channel::HANDOFF_FETCH_SECS) {
+        return;
+    }
+    CHECKED_AT.store(now, std::sync::atomic::Ordering::Relaxed);
+    let Ok(retired) = db.retired_channel_handoffs(now) else {
+        return;
+    };
+    for row in retired {
+        if !ember::channel::schedule_due(
+            row.published_at,
+            now,
+            ember::channel::HANDOFF_RETIRED_REPUBLISH_SECS,
+        ) {
+            continue;
+        }
+        let channel_id = hex::decode(&row.channel_id)
+            .ok()
+            .and_then(|b| <[u8; 16]>::try_from(b).ok());
+        let channel_pk = hex::decode(&row.channel_pubkey)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok());
+        let successor_pk = hex::decode(&row.successor_pubkey)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok());
+        let (Some(channel_id), Some(channel_pk), Some(successor_pk)) =
+            (channel_id, channel_pk, successor_pk)
+        else {
+            continue;
+        };
+        let record = match row.owner_seed {
+            Some(seed) => {
+                let ident = ember::channel::ChannelIdentity::from_seed(&seed);
+                if ident.channel_id != channel_id {
+                    continue;
+                }
+                ember::dht::publish::SignedRecord::channel_handoff(
+                    row.version,
+                    successor_pk,
+                    channel_id,
+                    ident.pubkey,
+                    row.private,
+                    &ident.signing_key,
+                )
+            }
+            None => ember::dht::publish::SignedRecord::channel_succession_claim(
+                channel_id,
+                channel_pk,
+                &successor_pk,
+                i64::try_from(row.version).unwrap_or(i64::MAX),
+                row.private,
+                &ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed),
+            ),
+        };
+        let Some(publish_id) = state
+            .ember_publish
+            .start_publish(record, state.ember_dht.routing())
+        else {
+            continue;
+        };
+        drive_ember_publish(socket, state, publish_id).await;
+        let _ = db.note_retired_channel_handoff_published(&row.channel_id, now);
+    }
 }
 
 /// Move the room's registry name to the successor, signing with the old seed.

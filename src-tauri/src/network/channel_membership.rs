@@ -2264,6 +2264,18 @@ pub(super) async fn maybe_publish_owned_channel_records(
         if !ember::channel::schedule_due(last, now, ember::channel::MODERATION_REPUBLISH_SECS) {
             continue;
         }
+        // A commitment with no nominee is one this device did not offer: a
+        // record it found stored, or its nominee's claim it is following. The
+        // members are leaving for that successor, and a fresh snapshot from us
+        // is exactly what makes the ones still deciding refuse the claim.
+        if db
+            .channel_handoff_commit(&ch.channel_id)
+            .ok()
+            .flatten()
+            .is_some_and(|commit| commit.nominee.is_empty())
+        {
+            continue;
+        }
         let Ok(Some(seed)) = db.load_channel_owner_seed(&ch.channel_id) else {
             continue;
         };
@@ -2822,6 +2834,7 @@ pub(super) async fn maybe_refresh_channel_handoff(
     // handoffs are republished here, and finished once this fetch or a
     // publish acknowledgement confirms one is stored.
     maybe_drive_channel_handoffs(socket, state, db).await;
+    maybe_republish_retired_channel_handoffs(socket, state, db).await;
     let now = chrono::Utc::now().timestamp();
     let Some(channels) = channels_lite_cached(state, db) else {
         return;
@@ -2876,13 +2889,24 @@ pub(super) async fn maybe_refresh_channel_handoff(
 
         // A succession claim lives under its own key, because it is signed by
         // the nominee rather than the room. Only worth asking for once the
-        // owner has actually been silent long enough to honour one.
-        if ch.successor_nominee.is_empty()
-            || ch.claim_after_days <= 0
-            || ch.moderation_updated_at <= 0
-            || now.saturating_sub(ch.moderation_updated_at)
-                < ch.claim_after_days.saturating_mul(86_400)
-        {
+        // owner has actually been silent long enough to honour one — and by
+        // the owner, once back from such a silence, for as long as the claimant
+        // keeps a claim made in it published.
+        let claim_due = if ch.is_owner {
+            db.channel_owner_silence(&ch.channel_id)
+                .ok()
+                .flatten()
+                .is_some_and(|silence| {
+                    now.saturating_sub(silence.silent_until) < ember::channel::HANDOFF_RETIRED_KEEP_SECS
+                })
+        } else {
+            !ch.successor_nominee.is_empty()
+                && ch.claim_after_days > 0
+                && ch.moderation_updated_at > 0
+                && now.saturating_sub(ch.moderation_updated_at)
+                    >= ch.claim_after_days.saturating_mul(86_400)
+        };
+        if !claim_due {
             continue;
         }
         if state
@@ -3010,6 +3034,9 @@ pub(super) fn ingest_channel_claim_records(
     let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
         return None;
     };
+    if ch.is_owner {
+        return follow_claim_on_owned_channel(db, &ch, channel_id, records);
+    }
     if !ember::channel::owner_silence_is_confirmed(ch.moderation_checked_at) {
         return None;
     }
@@ -3090,6 +3117,67 @@ pub(super) fn ingest_channel_claim_records(
             tracing::info!(
                 channel_id = %channel_id_hex,
                 "followed a succession claim after {silent_for}s of owner silence"
+            );
+            return Some(successor_id);
+        }
+    }
+    None
+}
+
+/// Follow our nominee's claim on a room we own, made while we were silent.
+///
+/// The members who honoured it are in the successor already, and every
+/// snapshot we publish from here makes the ones who have not yet looked refuse
+/// it — so carrying on as owner splits the room. Instead the room is committed
+/// to the claimed successor like a handoff of our own, which every member
+/// follows however they decided on the claim, and which the handoff loop
+/// publishes and then completes; the owned-room pass stops republishing it
+/// meanwhile.
+///
+/// Judged against the silence we recorded on coming back, not our current
+/// snapshot, which is newer than anything the claimant could have cited.
+fn follow_claim_on_owned_channel(
+    db: &Database,
+    ch: &crate::storage::database::StoredChannel,
+    channel_id: [u8; 16],
+    records: &[Vec<u8>],
+) -> Option<[u8; 16]> {
+    if ch.deleted || !ch.successor_id.is_empty() {
+        return None;
+    }
+    let silence = db.channel_owner_silence(&ch.channel_id).ok().flatten()?;
+    let mut candidates: Vec<([u8; 32], [u8; 32], [u8; 16], i64, bool)> = records
+        .iter()
+        .filter_map(|blob| {
+            ember::dht::publish::SignedRecord::parse_channel_succession_claim(blob, &channel_id)
+        })
+        .filter(|(claimant, ..)| silence.nominee.eq_ignore_ascii_case(&hex::encode(claimant)))
+        .filter(|(_, _, _, witnessed_ts, _)| {
+            ember::channel::claim_fits_owner_silence(
+                *witnessed_ts,
+                silence.silent_from,
+                silence.silent_until,
+                silence.claim_after_days,
+            )
+        })
+        .collect();
+    // The members' own order, so we follow the claim they did.
+    candidates.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.2.cmp(&b.2)));
+    for (claimant, successor_pk, successor_id, _, _) in candidates {
+        if db
+            .channel_member_is_banned(&ch.channel_id, &hex::encode(claimant))
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let now = chrono::Utc::now().timestamp();
+        if db
+            .commit_claimed_channel_handoff(&ch.channel_id, &hex::encode(successor_pk), now)
+            .unwrap_or(false)
+        {
+            tracing::info!(
+                channel_id = %ch.channel_id,
+                "our nominee claimed this room while we were away; following it"
             );
             return Some(successor_id);
         }

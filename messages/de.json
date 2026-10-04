@@ -3687,6 +3687,7 @@
   "error_channels_ban_self": "Sie können sich nicht selbst sperren",
   "error_channels_ban_owner": "Sie können den Raumbesitzer nicht sperren",
   "error_channels_ban_owner_offline": "Jemanden aus einem privaten Raum zu entfernen erfordert, dass der Raumbesitzer online ist: nur er kann den Raumschlüssel wechseln, und ohne das würde die Person alles Weitere weiterhin mitlesen.",
+  "error_channels_ban_transfer_nominee": "Dieses Mitglied übernimmt den Raum bereits und kann daher nicht mehr daraus gesperrt werden.",
   "error_channels_key_behind": "Neue Nachrichten sind gesperrt, bis dieses Gerät den aktuellen Raumschlüssel hat",
   "error_channels_ban_list_full": "Sperrliste ist voll (max. {detail})",
   "error_channels_member_invalid": "Ungültiger Mitgliedsschlüssel",

@@ -3663,6 +3663,7 @@
   "error_channels_ban_self": "你不能封鎖自己",
   "error_channels_ban_owner": "你不能封鎖房主",
   "error_channels_ban_owner_offline": "將成員移出私密房間需要房主在線：只有房主能更換房間金鑰，否則該成員仍能讀取之後傳送的全部內容。",
+  "error_channels_ban_transfer_nominee": "該成員已在接管此房間，因此無法再將其封鎖。",
   "error_channels_key_behind": "在此裝置取得目前房間金鑰之前，新訊息將保持鎖定",
   "error_channels_ban_list_full": "封鎖名單已滿（最多 {detail} 人）",
   "error_channels_member_invalid": "成員金鑰無效",

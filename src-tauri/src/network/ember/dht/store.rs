@@ -6,8 +6,9 @@ use tracing::debug;
 use crate::network::ember::crypto;
 
 use super::publish::{
-    channel_flags_from_data, channel_kind_from_data, CHANNEL_FLAG_DEPARTED, CHANNEL_KIND_INDEX,
-    CHANNEL_KIND_PRESENCE, RECORD_TYPE_CHANNEL, RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
+    channel_flags_from_data, channel_kind_from_data, CHANNEL_FLAG_DEPARTED, CHANNEL_KIND_CLAIM,
+    CHANNEL_KIND_HANDOFF, CHANNEL_KIND_INDEX, CHANNEL_KIND_PRESENCE, RECORD_TYPE_CHANNEL,
+    RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
 };
 use super::{scale, EmberNodeId};
 
@@ -182,6 +183,25 @@ const _: () = assert!(
     "a room listing must outlive the generic keyword TTL"
 );
 
+/// A room's "this room has moved" record: an owner's handoff, or a nominee's
+/// succession claim.
+///
+/// A member who was away when the room moved finds it here and nowhere else,
+/// and the old room's owner gives its seed up once the handoff lands, so for a
+/// day-long life the member who came back on day two was left in a room with
+/// nobody in it. Its signer republishes it on a long, bounded cadence (see
+/// `ember::channel::HANDOFF_RETIRED_REPUBLISH_SECS`), which is what keeps it on
+/// storers running older builds that still drop it after a day.
+const CHANNEL_HANDOFF_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
+
+// Same reasoning as the assertion above: equal to the keyword default, the
+// constant would compile and quietly put stranded members back.
+const _: () = assert!(
+    CHANNEL_HANDOFF_TTL.as_secs() >= CHANNEL_INDEX_TTL.as_secs()
+        && CHANNEL_HANDOFF_TTL.as_secs() > KEYWORD_RECORD_TTL.as_secs(),
+    "a handoff must outlive a room listing and the generic keyword TTL"
+);
+
 /// How long a record of this type lives, from its leading type byte.
 fn record_ttl(data: &[u8]) -> Duration {
     match data.first() {
@@ -197,6 +217,7 @@ fn record_ttl(data: &[u8]) -> Duration {
                 }
             }
             Some(CHANNEL_KIND_INDEX) => CHANNEL_INDEX_TTL,
+            Some(CHANNEL_KIND_HANDOFF | CHANNEL_KIND_CLAIM) => CHANNEL_HANDOFF_TTL,
             _ => KEYWORD_RECORD_TTL,
         },
         _ => KEYWORD_RECORD_TTL,
@@ -3741,6 +3762,48 @@ mod tests {
         )
         .expect("the fixture fits one record");
         assert_eq!(record_ttl(&moderation.data), KEYWORD_RECORD_TTL);
+    }
+
+    /// A member who missed the move has only these two records to find the
+    /// successor by, so both outlive the day a moderation snapshot gets.
+    #[test]
+    fn handoff_and_claim_records_outlive_a_members_absence() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let old = ChannelIdentity::generate();
+        let successor = ChannelIdentity::generate();
+        let handoff = SignedRecord::channel_handoff(
+            7,
+            successor.pubkey,
+            old.channel_id,
+            old.pubkey,
+            true,
+            &old.signing_key,
+        );
+        assert_eq!(record_ttl(&handoff.data), CHANNEL_HANDOFF_TTL);
+
+        let nominee = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let claim = SignedRecord::channel_succession_claim(
+            old.channel_id,
+            old.pubkey,
+            &successor.pubkey,
+            1_700_000_000,
+            true,
+            &nominee,
+        );
+        assert_eq!(record_ttl(&claim.data), CHANNEL_HANDOFF_TTL);
+
+        let now = chrono::Utc::now().timestamp();
+        let week_old = {
+            let mut data = handoff.data.clone();
+            data[105..113].copy_from_slice(&(now - 7 * 86_400).to_le_bytes());
+            data
+        };
+        assert!(
+            record_is_current(&week_old, now),
+            "a week-old handoff is still one a returning member can follow"
+        );
     }
 
     /// Two snapshots an owner signed in the same second: every storer ends up

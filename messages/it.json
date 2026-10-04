@@ -3663,6 +3663,7 @@
   "error_channels_ban_self": "Non puoi bandire te stesso",
   "error_channels_ban_owner": "Non puoi bandire il proprietario della stanza",
   "error_channels_ban_owner_offline": "Rimuovere qualcuno da una stanza privata richiede che il proprietario della stanza sia online: solo lui può cambiare la chiave della stanza, e senza questo la persona continuerebbe a leggere tutto ciò che viene inviato in seguito.",
+  "error_channels_ban_transfer_nominee": "Questo membro sta già prendendo in carico la stanza, quindi non può più esserne bandito.",
   "error_channels_key_behind": "I nuovi messaggi sono bloccati finché questo dispositivo non avrà la chiave attuale della stanza",
   "error_channels_ban_list_full": "L'elenco dei bandi è pieno (max {detail})",
   "error_channels_member_invalid": "Chiave del membro non valida",

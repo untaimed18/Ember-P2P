@@ -4148,6 +4148,24 @@ pub async fn ban_channel_member(
         ));
     }
     if is_owner {
+        // Once a handoff record naming them is known to be stored, the members
+        // are following it to the room they now own, and nothing this device
+        // signs can call it back. Banning them here would only ban them from a
+        // room nobody is left in.
+        let db = state.db.clone();
+        let id = channel_id.clone();
+        let commit = tokio::task::spawn_blocking(move || db.channel_handoff_commit(&id))
+            .await
+            .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+            .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load channel", e))?;
+        if commit.is_some_and(|commit| {
+            commit.confirmed && commit.nominee.eq_ignore_ascii_case(&hex::encode(pk))
+        }) {
+            return Err(coded(
+                "channels_ban_transfer_nominee",
+                "This member is already taking over the room and can no longer be banned from it",
+            ));
+        }
         let owned = load_owned_channel(&state, &channel_id).await?;
         let mut bans = load_banned_pubkeys(&state, &channel_id).await?;
         let mut mods = load_moderator_pubkeys(&state, &channel_id).await?;
@@ -4665,6 +4683,32 @@ pub async fn claim_channel_ownership(
             "claimed a room locally but could not publish the claim yet"
         );
     }
+    // Kept for republishing, which is also what covers a publish that failed
+    // just now: a member away for the day the claim lived on older storers, and
+    // the silent owner when they come back, have no other way to find it.
+    {
+        let db = state.db.clone();
+        let old = channel_id.clone();
+        let old_pubkey_hex = row.pubkey.clone();
+        let successor_pk_hex = hex::encode(successor.pubkey);
+        let witnessed = row.moderation_updated_at;
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            db.retire_channel_claim(
+                &old,
+                &old_pubkey_hex,
+                witnessed,
+                &successor_pk_hex,
+                private,
+                chrono::Utc::now().timestamp(),
+            )
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r)
+        {
+            tracing::warn!(channel_id = %channel_id, error = %e, "could not keep the claim for republishing");
+        }
+    }
 
     // Take the name with us. Signed with our *user* key: the owner registered
     // us as their nominee, and the registry checks their claim has been stale
@@ -4728,7 +4772,7 @@ pub async fn claim_channel_ownership(
                     None
                 }
             };
-            if let Err(e) = commit_channel_moderation(
+            match commit_channel_moderation(
                 &state,
                 &owned,
                 &owned.row.topic,
@@ -4738,8 +4782,18 @@ pub async fn claim_channel_ownership(
             )
             .await
             {
-                tracing::warn!(channel_id = %successor_id_hex, error = %e, "could not publish the claimed room's first record");
-                undo_rotation(&state, &owned, rotated).await;
+                // The handoff left the room owing a rotation; this was it. One
+                // that failed stays owed, and the owned-room pass retries it.
+                Ok(_) if rotated.is_some() => {
+                    let db = state.db.clone();
+                    let id = successor_id_hex.clone();
+                    let _ = tokio::task::spawn_blocking(move || db.clear_channel_rotate_pending(&id)).await;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(channel_id = %successor_id_hex, error = %e, "could not publish the claimed room's first record");
+                    undo_rotation(&state, &owned, rotated).await;
+                }
             }
         }
         Err(e) => {

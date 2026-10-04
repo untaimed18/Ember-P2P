@@ -540,6 +540,37 @@ pub fn handoff_republish_due(
     }
     HandoffRepublish::Publish
 }
+
+/// How often the signer of a finished move republishes its record. A quarter
+/// of the day older storers keep it for, as the owner does for moderation.
+pub const HANDOFF_RETIRED_REPUBLISH_SECS: i64 = 6 * 3600;
+/// How long after a move its signer keeps republishing. A member away longer
+/// than this, plus the record's own life on storers that keep it a month,
+/// finds the old room silent.
+pub const HANDOFF_RETIRED_KEEP_SECS: i64 = 90 * 86_400;
+/// Least gap between publishes of a handoff an owner committed to on finding
+/// its nominee's claim. Not bounded by an offer's window, because there was
+/// no offer: the members are already following the claim, and the record is
+/// what brings the rest of them along.
+pub const HANDOFF_CLAIMED_REPUBLISH_SECS: i64 = 5 * 60;
+
+/// Whether a succession claim citing `witnessed_ts` is one the members could
+/// rightly have honoured while we, the owner, were silent from `silent_from`
+/// (our last stamp before going quiet) until `silent_until` (the first after).
+///
+/// It has to cite that last stamp or something newer — the members it was
+/// shown to held at least that — and its window has to have run out before we
+/// came back, or the claimant raced our return rather than our absence.
+pub fn claim_fits_owner_silence(
+    witnessed_ts: i64,
+    silent_from: i64,
+    silent_until: i64,
+    claim_after_days: i64,
+) -> bool {
+    claim_after_days > 0
+        && witnessed_ts >= silent_from
+        && witnessed_ts.saturating_add(claim_after_days.saturating_mul(86_400)) <= silent_until
+}
 // --- Ember Transfer -------------------------------------------------------
 //
 // One member hands a file to one other member. Nothing is broadcast: the
@@ -1410,6 +1441,12 @@ const HANDOFF_OFFER_PLAIN_VERSION: u8 = 6;
 // was not, so any content-key holder who saw the flooded offer could race the
 // nominee and point the DHT handoff at a successor they own.
 const HANDOFF_READY_PLAIN_VERSION: u8 = 17;
+/// A ready that also carries the successor key's signature over the same
+/// preimage, proving the nominee holds the key it names. A new number rather
+/// than a longer 17, because every build so far decodes 17 at exactly 137
+/// bytes and would drop a longer one; nominees send this beside the legacy
+/// frame, which is what owners on those builds still act on.
+const HANDOFF_READY_PROVEN_PLAIN_VERSION: u8 = 29;
 const MOD_SIG_DOMAIN: &[u8] = b"ember-channel-mod-author-v1\0";
 const SYNC_SIG_DOMAIN: &[u8] = b"ember-channel-sync-author-v1\0";
 const HANDOFF_READY_DOMAIN: &[u8] = b"ember-channel-handoff-ready-v1\0";
@@ -3920,6 +3957,66 @@ pub fn decode_channel_handoff_ready(
     Some((sender, successor, version))
 }
 
+/// [`encode_channel_handoff_ready`] with the successor key's own signature
+/// over the same preimage appended.
+pub fn encode_channel_handoff_ready_proven(
+    signing_key: &SigningKey,
+    successor_signing_key: &SigningKey,
+    channel_id: &[u8; 16],
+    sender_pubkey: &[u8; 32],
+    version: u64,
+) -> Vec<u8> {
+    let successor_pubkey = successor_signing_key.verifying_key().to_bytes();
+    let mut out = encode_channel_handoff_ready(
+        signing_key,
+        channel_id,
+        sender_pubkey,
+        &successor_pubkey,
+        version,
+    );
+    out[0] = HANDOFF_READY_PROVEN_PLAIN_VERSION;
+    let proof = crypto::sign(
+        successor_signing_key,
+        &handoff_ready_preimage(channel_id, sender_pubkey, &successor_pubkey, version),
+    );
+    out.extend_from_slice(&proof);
+    out
+}
+
+/// Decode a ready that proves its successor key. Both signatures must verify:
+/// a frame claiming the proof and failing it is refused outright rather than
+/// read as the legacy ready it starts with.
+pub fn decode_channel_handoff_ready_proven(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+) -> Option<([u8; 32], [u8; 32], u64)> {
+    if bytes.len() != 137 + 64 || bytes[0] != HANDOFF_READY_PROVEN_PLAIN_VERSION {
+        return None;
+    }
+    let mut legacy = bytes[..137].to_vec();
+    legacy[0] = HANDOFF_READY_PLAIN_VERSION;
+    let (sender, successor, version) = decode_channel_handoff_ready(&legacy, channel_id)?;
+    let proof: [u8; 64] = bytes[137..].try_into().ok()?;
+    let vk = crypto::verifying_key_from_bytes(&successor)?;
+    if !crypto::verify(
+        &vk,
+        &handoff_ready_preimage(channel_id, &sender, &successor, version),
+        &proof,
+    ) {
+        return None;
+    }
+    Some((sender, successor, version))
+}
+
+/// Whether a successor key named for `channel_id` could be a room at all: a
+/// real Ed25519 point, and not the room it is meant to replace. Checked on
+/// every ready, proven or not, because an owner still has to act on legacy
+/// readies and those prove nothing about the key.
+pub fn handoff_successor_fits(channel_id: &[u8; 16], successor_pubkey: &[u8; 32]) -> bool {
+    crypto::verifying_key_from_bytes(successor_pubkey).is_some()
+        && channel_id_from_pubkey(successor_pubkey) != *channel_id
+}
+
 /// Extra blob for a DHT handoff record: version, successor pubkey/id, flags.
 pub fn encode_handoff_extra(
     version: u64,
@@ -6418,6 +6515,93 @@ mod tests {
             decode_channel_handoff_ready(&legacy, &room).is_none(),
             "unsigned Ready frames are refused"
         );
+    }
+
+    /// The proof has to be made by the key the ready names, and the frame has
+    /// to stay invisible to the legacy decoder so owners on older builds act
+    /// only on the legacy ready sent beside it.
+    #[test]
+    fn a_proven_handoff_ready_requires_the_successor_key_and_hides_from_legacy_decoders() {
+        let nominee = SigningKey::generate(&mut OsRng);
+        let nominee_pk = nominee.verifying_key().to_bytes();
+        let successor = ChannelIdentity::generate();
+        let room = [0x22u8; 16];
+        let proven = encode_channel_handoff_ready_proven(
+            &nominee,
+            &successor.signing_key,
+            &room,
+            &nominee_pk,
+            11,
+        );
+        assert_eq!(
+            decode_channel_handoff_ready_proven(&proven, &room),
+            Some((nominee_pk, successor.pubkey, 11))
+        );
+        assert!(
+            decode_channel_handoff_ready(&proven, &room).is_none(),
+            "a build that knows only the legacy ready must not read this one"
+        );
+        assert!(decode_channel_handoff_ready_proven(&proven, &[0u8; 16]).is_none());
+
+        let legacy = encode_channel_handoff_ready(&nominee, &room, &nominee_pk, &successor.pubkey, 11);
+        assert!(
+            decode_channel_handoff_ready_proven(&legacy, &room).is_none(),
+            "a legacy ready proves nothing about the successor key"
+        );
+
+        // The nominee naming a key someone else holds, with a proof made by a
+        // key the ready does not name.
+        let stranger = ChannelIdentity::generate();
+        let mut borrowed = legacy.clone();
+        borrowed[0] = HANDOFF_READY_PROVEN_PLAIN_VERSION;
+        borrowed.extend_from_slice(&crypto::sign(
+            &stranger.signing_key,
+            &handoff_ready_preimage(&room, &nominee_pk, &successor.pubkey, 11),
+        ));
+        assert!(
+            decode_channel_handoff_ready_proven(&borrowed, &room).is_none(),
+            "the proof must come from the successor key the ready names"
+        );
+    }
+
+    #[test]
+    fn a_successor_key_that_is_the_room_itself_does_not_fit() {
+        let room = ChannelIdentity::generate();
+        let successor = ChannelIdentity::generate();
+        assert!(handoff_successor_fits(&room.channel_id, &successor.pubkey));
+        assert!(
+            !handoff_successor_fits(&room.channel_id, &room.pubkey),
+            "a handoff naming the room it moves loops the room into itself"
+        );
+        let not_a_point = (0u8..=255)
+            .map(|b| [b; 32])
+            .find(|pk| crypto::verifying_key_from_bytes(pk).is_none())
+            .expect("some constant fill is not a curve point");
+        assert!(
+            !handoff_successor_fits(&room.channel_id, &not_a_point),
+            "a key that is not a point cannot be a room"
+        );
+    }
+
+    #[test]
+    fn an_owner_honours_only_a_claim_its_own_silence_allowed() {
+        let day = 86_400;
+        let from = 1_000 * day;
+        let until = from + 20 * day;
+        assert!(claim_fits_owner_silence(from, from, until, 14));
+        assert!(
+            claim_fits_owner_silence(from + day, from, until, 14),
+            "a claim citing a later stamp than ours still ran out before we came back"
+        );
+        assert!(
+            !claim_fits_owner_silence(from - day, from, until, 14),
+            "members held our last stamp, so a claim citing an older one was refused"
+        );
+        assert!(
+            !claim_fits_owner_silence(from + 7 * day, from, until, 14),
+            "its window had not run out when we came back"
+        );
+        assert!(!claim_fits_owner_silence(from, from, until, 0), "no window, no succession");
     }
 
     #[test]

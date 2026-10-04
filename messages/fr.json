@@ -3663,6 +3663,7 @@
   "error_channels_ban_self": "Vous ne pouvez pas vous bannir vous-même",
   "error_channels_ban_owner": "Vous ne pouvez pas bannir le propriétaire du salon",
   "error_channels_ban_owner_offline": "Retirer quelqu'un d'un salon privé exige que le propriétaire du salon soit en ligne : lui seul peut changer la clé du salon, et sans cela la personne continuerait à lire tout ce qui est envoyé ensuite.",
+  "error_channels_ban_transfer_nominee": "Ce membre est déjà en train de reprendre le salon : il ne peut plus en être banni.",
   "error_channels_key_behind": "Les nouveaux messages sont verrouillés tant que cet appareil n’a pas la clé actuelle du salon",
   "error_channels_ban_list_full": "La liste de bannissement est pleine (max. {detail})",
   "error_channels_member_invalid": "Clé de membre invalide",

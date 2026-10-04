@@ -3663,6 +3663,7 @@
   "error_channels_ban_self": "No puedes bloquearte a ti mismo",
   "error_channels_ban_owner": "No puedes bloquear al propietario de la sala",
   "error_channels_ban_owner_offline": "Expulsar a alguien de una sala privada requiere que el propietario de la sala esté conectado: solo él puede cambiar la clave de la sala y, sin eso, esa persona seguiría leyendo todo lo que se envíe después.",
+  "error_channels_ban_transfer_nominee": "Este miembro ya está asumiendo la propiedad de la sala, así que ya no se le puede bloquear en ella.",
   "error_channels_key_behind": "Los mensajes nuevos están bloqueados hasta que este dispositivo tenga la clave actual de la sala",
   "error_channels_ban_list_full": "La lista de bloqueos está llena (máx. {detail})",
   "error_channels_member_invalid": "Clave de miembro no válida",

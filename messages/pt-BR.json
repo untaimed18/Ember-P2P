@@ -3663,6 +3663,7 @@
   "error_channels_ban_self": "Você não pode banir a si mesmo",
   "error_channels_ban_owner": "Você não pode banir o dono da sala",
   "error_channels_ban_owner_offline": "Remover alguém de uma sala privada exige que o dono da sala esteja online: só ele pode trocar a chave da sala e, sem isso, a pessoa continuaria lendo tudo o que for enviado depois.",
+  "error_channels_ban_transfer_nominee": "Este membro já está assumindo a sala, então não pode mais ser banido dela.",
   "error_channels_key_behind": "As novas mensagens ficam bloqueadas até este dispositivo ter a chave atual da sala",
   "error_channels_ban_list_full": "A lista de banidos está cheia (máx. {detail})",
   "error_channels_member_invalid": "Chave de membro inválida",

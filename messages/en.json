@@ -3687,6 +3687,7 @@
   "error_channels_ban_self": "You cannot ban yourself",
   "error_channels_ban_owner": "You cannot ban the room's owner",
   "error_channels_ban_owner_offline": "Removing someone from a private room needs the room's owner online: only they can change the room key, and without that the person would keep reading everything sent afterwards.",
+  "error_channels_ban_transfer_nominee": "This member is already taking over the room, so they can no longer be banned from it.",
   "error_channels_key_behind": "New messages are locked until this device has the current room key",
   "error_channels_ban_list_full": "Ban list is full (max {detail})",
   "error_channels_member_invalid": "Invalid member key",
