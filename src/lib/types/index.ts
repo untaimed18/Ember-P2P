@@ -1069,6 +1069,10 @@ export interface AppSettings {
   launch_at_login: boolean;
   /** A launch at sign-in comes up in the tray rather than on the desktop. */
   start_hidden_at_login: boolean;
+  /** Offer to add eD2K links found on the clipboard when the window gains focus. */
+  watch_clipboard_links: boolean;
+  /** Free space, in MB, under which the download drive is reported low; 0 off. */
+  low_disk_warning_mb: number;
 }
 
 /** One window of the bandwidth timetable.

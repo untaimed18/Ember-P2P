@@ -15,6 +15,9 @@
   import FinishActionCountdown from '$lib/components/FinishActionCountdown.svelte';
   import { initFinishAction } from '$lib/stores/finishAction';
   import { startUserActivityReporting } from '$lib/userActivity';
+  import { startClipboardWatch } from '$lib/clipboardWatch';
+  import { notify } from '$lib/notifications';
+  import { formatBytes } from '$lib/utils';
 
   import { initNetworkStore, cleanupNetworkStore, startStatsPoll } from '$lib/stores/network';
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
@@ -314,6 +317,8 @@
     let unlistenDropPending: UnlistenFn | null = null;
     let unlistenDropRejected: UnlistenFn | null = null;
     let unlistenDownloadFolder: UnlistenFn | null = null;
+    let unlistenDiskSpace: UnlistenFn | null = null;
+    const stopClipboardWatch = startClipboardWatch();
     let stopChatPopout: (() => void) | null = null;
 
     void initChatPopoutMain().then((stop) => {
@@ -515,6 +520,8 @@
       pauseAll: m.tray_pause_all(),
       resumeAll: m.tray_resume_all(),
       altSpeed: m.tray_alt_speed(),
+      cancelExit: m.tray_cancel_exit(),
+      cancelSleep: m.tray_cancel_sleep(),
     }).catch((e) => console.error('Failed to set the tray labels:', e));
 
     // The tray and the status bar save speed limits without the Settings page.
@@ -548,6 +555,16 @@
     })
       .then((fn) => { if (mounted) unlistenDownloadFolder = fn; else fn(); })
       .catch((e) => console.error('Failed to register download-folder-unavailable listener:', e));
+
+    listen<{ path?: string; freeBytes?: number }>('disk-space-low', (event) => {
+      if (!mounted) return;
+      const free = formatBytes(event.payload?.freeBytes ?? 0);
+      const message = m.layout_disk_space_low({ free });
+      toastWarning(message);
+      void notify('disk_space', m.layout_disk_space_low_title(), message);
+    })
+      .then((fn) => { if (mounted) unlistenDiskSpace = fn; else fn(); })
+      .catch((e) => console.error('Failed to register disk-space-low listener:', e));
 
     listen<{ token?: number; folders?: string[]; reason?: string }>(
       'shared-folder-drop-pending',
@@ -765,6 +782,8 @@
       if (unlistenDropPending) unlistenDropPending();
       if (unlistenDropRejected) unlistenDropRejected();
       if (unlistenDownloadFolder) unlistenDownloadFolder();
+      if (unlistenDiskSpace) unlistenDiskSpace();
+      stopClipboardWatch();
       stopChatPopout?.();
     };
   });

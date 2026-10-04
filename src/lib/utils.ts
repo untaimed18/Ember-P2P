@@ -1,4 +1,5 @@
 import { getLocale } from '$lib/i18n';
+import { noteOwnClipboardText } from '$lib/clipboardOwn';
 
 /**
  * Format a byte count as a human-readable string (e.g. "1.5 MB", "1,5 Mo").
@@ -417,6 +418,7 @@ export { TimeoutError, withTimeout } from './timeout';
  * without the backend command.
  */
 export async function copyToClipboard(text: string): Promise<boolean> {
+  noteOwnClipboardText(text);
   try {
     const { writeClipboardText } = await import('$lib/api/system');
     await writeClipboardText(text);

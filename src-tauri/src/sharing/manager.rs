@@ -2349,6 +2349,27 @@ impl TransferManager {
         }
     }
 
+    /// Move the queued downloads among `ids` to the front of the queue, or to
+    /// the back, keeping their order among themselves. Priority still decides
+    /// first; this orders rows within one. Returns how many moved: a row that
+    /// is already running is not in the queue.
+    pub fn move_queued(&mut self, ids: &[String], to_front: bool) -> usize {
+        let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let (moved, rest): (VecDeque<Transfer>, VecDeque<Transfer>) = std::mem::take(&mut self.queue)
+            .into_iter()
+            .partition(|t| wanted.contains(t.id.as_str()));
+        let count = moved.len();
+        self.queue = if to_front {
+            moved.into_iter().chain(rest).collect()
+        } else {
+            rest.into_iter().chain(moved).collect()
+        };
+        if count > 0 {
+            self.queue_changed();
+        }
+        count
+    }
+
     /// Update the concurrent-download cap and promote any queued downloads
     /// that the new cap now permits. Returns the newly promoted transfers so
     /// the caller can start them (empty when the cap was lowered or no queued
@@ -3714,5 +3735,29 @@ mod tests {
         let queued = manager.queue.len();
         manager.enqueue(sourced("q3", 1));
         assert_eq!(manager.queue.len(), queued, "still queued, so not enqueued twice");
+    }
+
+    #[test]
+    fn moving_in_the_queue_keeps_the_moved_rows_in_their_order() {
+        let mut manager = TransferManager::new(1);
+        let mut running = sourced("run", 1);
+        running.status = TransferStatus::Active;
+        manager.enqueue(running);
+        for id in ["a", "b", "c", "d"] {
+            manager.enqueue(sourced(id, 1));
+        }
+        let order = |m: &TransferManager| m.queue.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
+        let ids = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(manager.move_queued(&ids(&["d", "run", "b"]), true), 2, "the running row is not queued");
+        assert_eq!(order(&manager), ["b", "d", "a", "c"]);
+        assert_eq!(manager.get_transfer("a").unwrap().id, "a", "the lookup index follows");
+
+        assert_eq!(manager.move_queued(&ids(&["b"]), false), 1);
+        assert_eq!(order(&manager), ["d", "a", "c", "b"]);
+        assert_eq!(manager.move_queued(&ids(&["gone"]), true), 0);
+
+        let promoted = manager.stop("run");
+        assert_eq!(promoted.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["d"], "the front starts next");
     }
 }

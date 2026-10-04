@@ -46,7 +46,8 @@ export type NotifyCategory =
   | 'shares_browsed'
   | 'channel_message'
   | 'silent_update'
-  | 'finish_action';
+  | 'finish_action'
+  | 'disk_space';
 
 const CATEGORY_SETTING: Record<NotifyCategory, keyof AppSettings> = {
   download_complete: 'notify_download_complete',
@@ -65,6 +66,8 @@ const CATEGORY_SETTING: Record<NotifyCategory, keyof AppSettings> = {
   silent_update: 'notifications_enabled',
   // Likewise the warning before "when downloads finish" exits or sleeps.
   finish_action: 'notifications_enabled',
+  // Downloads stop when the drive fills, so it goes with their failures.
+  disk_space: 'notify_download_failed',
 };
 
 /** Identical notifications inside this window collapse into one. */

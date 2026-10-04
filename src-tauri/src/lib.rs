@@ -166,7 +166,8 @@ fn raise_open_file_limit() {
 
 /// The tray icon's menu, in the language the frontend last sent (`tray`).
 /// `cancel` is the silent-update countdown's "Cancel update" entry, shown above
-/// the others while the countdown runs.
+/// the others while the countdown runs. The "When downloads finish" countdown
+/// gets its own entry there too while it runs.
 pub(crate) fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(
     manager: &M,
     cancel: Option<&MenuItem<R>>,
@@ -197,15 +198,35 @@ pub(crate) fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(
         &quit_separator,
         &quit_item,
     ];
-    match cancel {
-        Some(cancel) => {
-            let separator = PredefinedMenuItem::separator(manager)?;
-            let mut items: Vec<&dyn IsMenuItem<R>> = vec![cancel, &separator];
-            items.extend(ordinary);
-            Menu::with_items(manager, &items)
+    let finish_cancel = match finish_action::countdown_remaining_secs() {
+        Some((action, _)) => {
+            let label = match action {
+                finish_action::FinishAction::Sleep => &labels.cancel_sleep,
+                _ => &labels.cancel_exit,
+            };
+            Some(MenuItem::with_id(
+                manager,
+                finish_action::TRAY_CANCEL_ID,
+                label,
+                true,
+                None::<&str>,
+            )?)
         }
-        None => Menu::with_items(manager, &ordinary),
+        None => None,
+    };
+    let separator = PredefinedMenuItem::separator(manager)?;
+    let mut items: Vec<&dyn IsMenuItem<R>> = Vec::new();
+    if let Some(cancel) = cancel {
+        items.push(cancel);
     }
+    if let Some(item) = finish_cancel.as_ref() {
+        items.push(item);
+    }
+    if !items.is_empty() {
+        items.push(&separator);
+    }
+    items.extend(ordinary);
+    Menu::with_items(manager, &items)
 }
 
 async fn reconcile_shared_files(network_tx: &mpsc::Sender<network::NetworkCommand>) -> bool {
@@ -1174,6 +1195,9 @@ pub fn run() {
                         }
                     }
                     auto_update::silent::TRAY_CANCEL_ID => auto_update::silent::postpone(),
+                    finish_action::TRAY_CANCEL_ID => {
+                        finish_action::cancel_finish_action(app.clone());
+                    }
                     "tray_pause_all" | "tray_resume_all" => {
                         let pause = event.id.as_ref() == "tray_pause_all";
                         let app = app.clone();
@@ -2292,6 +2316,7 @@ pub fn run() {
             commands::transfers::clear_completed,
             commands::transfers::get_transfer_sources,
             commands::transfers::set_transfer_priority,
+            commands::transfers::move_transfers_in_queue,
             commands::transfers::set_transfer_category,
             commands::transfers::rename_transfer,
             commands::transfers::set_preview_priority,
@@ -2605,6 +2630,7 @@ pub fn run() {
 
             if let tauri::WindowEvent::Focused(true) = event {
                 auto_update::resume::on_main_window_focused(window);
+                background::note_main_window_focused();
                 return;
             }
 

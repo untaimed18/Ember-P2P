@@ -317,6 +317,8 @@
   }
 
   let settings: AppSettings | null = $state(null);
+  /** "Warn when free space is below", besides off. The backend caps it at 100 GB. */
+  const LOW_DISK_CHOICES_MB = [512, 1024, 2048, 5120, 10240];
   let pageContentEl: HTMLDivElement | null = $state(null);
   let originalSettings: string = $state('');
   let saving = $state(false);
@@ -3007,6 +3009,19 @@
               </div>
               <span class="hint">{folderLayoutHint(settings.download_folder)}</span>
             </div>
+            <div class="field">
+              <label for="low-disk-warning">{m.settings_low_disk_label()}</label>
+              <span class="hint">{m.settings_low_disk_hint()}</span>
+              <select id="low-disk-warning" bind:value={settings.low_disk_warning_mb}>
+                <option value={0}>{m.settings_low_disk_off()}</option>
+                {#each LOW_DISK_CHOICES_MB as mb (mb)}
+                  <option value={mb}>{formatSize(mb * 1024 * 1024)}</option>
+                {/each}
+                {#if settings.low_disk_warning_mb !== 0 && !LOW_DISK_CHOICES_MB.includes(settings.low_disk_warning_mb)}
+                  <option value={settings.low_disk_warning_mb}>{formatSize(settings.low_disk_warning_mb * 1024 * 1024)}</option>
+                {/if}
+              </select>
+            </div>
           </div>
 
           <div class="settings-group">
@@ -3085,6 +3100,13 @@
                 <span class="hint">{m.settings_auto_remove_hint()}</span>
               </div>
               <ToggleSwitch bind:checked={settings.remove_finished_downloads} ariaLabel={m.settings_auto_remove()} />
+            </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_watch_clipboard_label()}</span>
+                <span class="hint">{m.settings_watch_clipboard_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.watch_clipboard_links} ariaLabel={m.settings_watch_clipboard_label()} />
             </div>
             <!-- Grouped with the other transfer behaviour rather than with
                  Preview, where it briefly sat: this governs what we send when

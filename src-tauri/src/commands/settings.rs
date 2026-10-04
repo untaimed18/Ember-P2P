@@ -876,6 +876,7 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     changed |= clamp_assign(&mut settings.max_download_file_size_gib, 1, 593);
     changed |= clamp_assign(&mut settings.search_timeout_secs, 30, 600);
     changed |= clamp_assign(&mut settings.max_friends, 1, 500);
+    changed |= clamp_assign(&mut settings.low_disk_warning_mb, 0, 100 * 1024);
 
     // Friend session encryption is not a user-facing toggle; keep it on even
     // if an older config.json or hand edit turned it off.

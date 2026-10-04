@@ -1848,6 +1848,20 @@ pub struct AppSettings {
     /// A launch at sign-in comes up in the tray rather than on the desktop.
     #[serde(default = "default_true")]
     pub start_hidden_at_login: bool,
+
+    /// When the window gains focus with eD2K links on the clipboard, offer to
+    /// add them. Off unless asked for: it reads the clipboard without a
+    /// click, and only at that moment.
+    #[serde(default)]
+    pub watch_clipboard_links: bool,
+    /// Warn once the download folder's drive has less than this much free
+    /// space while downloads are running. 0 turns the warning off.
+    #[serde(default = "default_low_disk_warning_mb")]
+    pub low_disk_warning_mb: u32,
+}
+
+fn default_low_disk_warning_mb() -> u32 {
+    1024
 }
 
 fn default_alt_max_upload_speed() -> u64 {
@@ -2449,6 +2463,8 @@ impl Default for AppSettings {
             alt_max_download_speed: default_alt_max_download_speed(),
             launch_at_login: false,
             start_hidden_at_login: true,
+            watch_clipboard_links: false,
+            low_disk_warning_mb: default_low_disk_warning_mb(),
         }
     }
 }

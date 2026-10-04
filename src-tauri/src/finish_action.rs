@@ -17,12 +17,18 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::app_state::AppState;
 use crate::commands::errors::coded;
 use crate::sharing::manager::TransferManager;
-use crate::types::{TransferDirection, TransferStatus};
+use crate::types::{Transfer, TransferDirection, TransferStatus};
 
 /// How long the user has to change their mind once the last download is done.
 const COUNTDOWN: Duration = Duration::from_secs(60);
 
 const STATUS_EVENT: &str = "ember:finish-action";
+
+/// The tray's "Cancel exit" / "Cancel sleep" entry, shown while the countdown runs.
+pub const TRAY_CANCEL_ID: &str = "tray_finish_action_cancel";
+
+/// Whether the tray menu was last built with the countdown's entry.
+static TRAY_SHOWS_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +145,11 @@ pub const fn sleep_supported() -> bool {
 /// the action back — otherwise one forgotten paused file would keep the
 /// machine awake all night.
 pub fn pending_downloads(manager: &TransferManager) -> usize {
+    pending_download_rows(manager).count()
+}
+
+/// The rows [`pending_downloads`] counts.
+pub fn pending_download_rows(manager: &TransferManager) -> impl Iterator<Item = &Transfer> {
     manager
         .active
         .values()
@@ -154,7 +165,6 @@ pub fn pending_downloads(manager: &TransferManager) -> usize {
                     | TransferStatus::Failed
             )
         })
-        .count()
 }
 
 /// Seconds left on the countdown, for the tray tooltip.
@@ -168,6 +178,10 @@ pub fn countdown_remaining_secs() -> Option<(FinishAction, u64)> {
 fn publish(app: &AppHandle, status: &FinishActionStatus) {
     if let Err(error) = app.emit(STATUS_EVENT, status) {
         tracing::debug!("Could not emit the finish action status: {error}");
+    }
+    let counting = status.countdown_ends_at.is_some();
+    if TRAY_SHOWS_CANCEL.swap(counting, std::sync::atomic::Ordering::AcqRel) != counting {
+        crate::auto_update::silent::rebuild_tray_menu(app);
     }
 }
 

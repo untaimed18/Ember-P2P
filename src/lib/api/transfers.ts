@@ -178,8 +178,32 @@ export async function getKnownClientCounts(): Promise<KnownClientCounts> {
   );
 }
 
-export async function clearCompleted(): Promise<number> {
-  return invoke('clear_completed');
+/** Clear finished downloads from the list: all of them, or only `transferIds`.
+ *  Returns how many went. */
+export async function clearCompleted(transferIds?: string[]): Promise<number> {
+  if (!transferIds) return invoke('clear_completed');
+  let cleared = 0;
+  for (let i = 0; i < transferIds.length; i += MAX_BATCH_TRANSFER_IDS) {
+    cleared += await invoke<number>('clear_completed', {
+      transferIds: transferIds.slice(i, i + MAX_BATCH_TRANSFER_IDS),
+    });
+  }
+  return cleared;
+}
+
+/** Move queued downloads to the front or back of the download queue.
+ *  Returns how many were waiting there; a running one is not. */
+export async function moveTransfersInQueue(transferIds: string[], toFront: boolean): Promise<number> {
+  let moved = 0;
+  // To the front last chunk first, so earlier chunks end up ahead of later ones.
+  const chunks: string[][] = [];
+  for (let i = 0; i < transferIds.length; i += MAX_BATCH_TRANSFER_IDS) {
+    chunks.push(transferIds.slice(i, i + MAX_BATCH_TRANSFER_IDS));
+  }
+  for (const chunk of toFront ? chunks.reverse() : chunks) {
+    moved += await invoke<number>('move_transfers_in_queue', { transferIds: chunk, toFront });
+  }
+  return moved;
 }
 
 export async function setTransferPriority(transferId: string, priority: 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto'): Promise<void> {

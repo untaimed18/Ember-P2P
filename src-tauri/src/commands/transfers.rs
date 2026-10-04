@@ -2320,6 +2320,23 @@ pub async fn set_transfer_priority(
     Ok(())
 }
 
+/// Move queued downloads to the front or the back of the download queue.
+/// Returns how many were waiting there to be moved.
+#[tauri::command]
+pub async fn move_transfers_in_queue(
+    state: tauri::State<'_, AppState>,
+    transfer_ids: Vec<String>,
+    to_front: bool,
+) -> Result<u32, String> {
+    check_batch_size(&transfer_ids)?;
+    let moved = state
+        .transfer_manager
+        .write()
+        .await
+        .move_queued(&transfer_ids, to_front);
+    Ok(u32::try_from(moved).unwrap_or(u32::MAX))
+}
+
 #[tauri::command]
 pub async fn set_transfer_category(
     state: tauri::State<'_, AppState>,
@@ -2645,8 +2662,20 @@ pub async fn get_transfer_sources(
     Ok(manager.get_source_details(&transfer_id))
 }
 
+/// Clear completed rows: every one, or only those in `transfer_ids`. A listed
+/// row that is not completed (any more) is left alone.
 #[tauri::command]
-pub async fn clear_completed(state: tauri::State<'_, AppState>) -> Result<u32, String> {
+pub async fn clear_completed(
+    state: tauri::State<'_, AppState>,
+    transfer_ids: Option<Vec<String>>,
+) -> Result<u32, String> {
+    let only = match transfer_ids {
+        Some(ids) => {
+            check_batch_size(&ids)?;
+            Some(ids.into_iter().collect::<std::collections::HashSet<String>>())
+        }
+        None => None,
+    };
     // L1: completed rows have no live network state (their upload/download
     // tasks already returned), so there's nothing for CancelDownload to
     // clean up. Just drop from the manager's completed bucket and delete
@@ -2655,7 +2684,7 @@ pub async fn clear_completed(state: tauri::State<'_, AppState>) -> Result<u32, S
     let mut manager = state.transfer_manager.write().await;
     let mut ids: Vec<String> = Vec::new();
     manager.completed.retain(|t| {
-        if t.status == TransferStatus::Completed {
+        if t.status == TransferStatus::Completed && only.as_ref().is_none_or(|only| only.contains(&t.id)) {
             ids.push(t.id.clone());
             false
         } else {

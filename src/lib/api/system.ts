@@ -56,6 +56,8 @@ export async function setTrayLabels(labels: {
   pauseAll: string;
   resumeAll: string;
   altSpeed: string;
+  cancelExit: string;
+  cancelSleep: string;
 }): Promise<void> {
   return invoke('set_tray_labels', {
     labels: {
@@ -65,6 +67,8 @@ export async function setTrayLabels(labels: {
       pause_all: labels.pauseAll,
       resume_all: labels.resumeAll,
       alt_speed: labels.altSpeed,
+      cancel_exit: labels.cancelExit,
+      cancel_sleep: labels.cancelSleep,
     },
   });
 }

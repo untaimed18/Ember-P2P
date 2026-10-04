@@ -3,6 +3,7 @@
   import PartsBar from '$lib/components/PartsBar.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import AddLinksDialog from '$lib/components/AddLinksDialog.svelte';
+  import { addLinksRequested } from '$lib/clipboardWatch';
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
   import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
   import { addActionToast, toastError } from '$lib/stores/toast';
@@ -10,7 +11,7 @@
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, removeTransfer,
-    clearCompleted, setTransferPriority, setTransferCategory, renameTransfer, setPreviewPriority,
+    clearCompleted, moveTransfersInQueue, setTransferPriority, setTransferCategory, renameTransfer, setPreviewPriority,
     pauseTransfersBatch, resumeTransfersBatch, stopTransfersBatch, cancelTransfersBatch, getTransfers,
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
     getUploadQueue, getKnownClients, getKnownClientCounts, getDownloadFileDetails,
@@ -558,7 +559,6 @@
     userHash: '',
     name: '',
   });
-  let confirmClearCompleted = $state({ open: false, filter: '', count: 0 });
   // D27: confirmation + in-flight tracker for archive recovery, which
   // can take noticeable time for large partials and isn't reversible.
   let confirmRecover: { open: boolean; id: string; name: string } = $state({ open: false, id: '', name: '' });
@@ -2730,6 +2730,13 @@
     return isPausedState(t) || isHeldForDrive(t);
   }
 
+  /** Rows that may be waiting in the download queue. The backend has the last
+   *  word: a searching row can be running instead. */
+  function canMoveInQueue(t: Transfer): boolean {
+    return t.direction === 'download'
+      && (t.status === 'queued' || t.status === 'searching' || t.status === 'paused' || t.status === 'stopped');
+  }
+
   // Not while the file is being hashed or moved: completion has already read
   // the name it will write, so a rename accepted there would leave the row
   // and the file on disk disagreeing. The backend refuses the same window.
@@ -3241,6 +3248,14 @@
         case 'open_location': await openTransferFileLocation(t.id); break;
         case 'rename': openRename(t); return;
         case 'priority': if (extra && PRIORITIES.includes(extra as Priority)) await setPriorityFor(targets, extra as Priority); break;
+        case 'queue_front':
+        case 'queue_back': {
+          const front = action === 'queue_front';
+          const moved = await moveTransfersInQueue(targets.filter(canMoveInQueue).map((x) => x.id), front);
+          if (moved === 0) showInfo(m.transfers_queue_none_waiting());
+          else showInfo(front ? m.transfers_queue_moved_front() : m.transfers_queue_moved_back());
+          break;
+        }
         case 'find_sources': {
           try {
             await runFindSourcesWithStatus(t);
@@ -3270,7 +3285,7 @@
           confirmRecover = { open: true, id: t.id, name: t.file_name };
           return;
         }
-        case 'clear_completed': openClearCompletedConfirm(); return;
+        case 'clear_completed': clearCompletedWithUndo(); return;
         case 'copy_link': {
           if (multi) { await copyDownloadLinks(targets); break; }
           const link = await formatEd2kLink(t.file_name, t.total_size, t.file_hash, t.ember_file_hash);
@@ -3505,6 +3520,12 @@
   /** The Add eD2K Links dialog: the header button opens it; Ctrl+V and the
    *  pane and row menus still paste straight from the clipboard. */
   let addLinksOpen = $state(false);
+  // The clipboard offer's "Add…", from whichever page the toast was on.
+  $effect(() => {
+    if (!$addLinksRequested) return;
+    addLinksRequested.set(false);
+    addLinksOpen = true;
+  });
 
   async function queueLinksFromDialog(text: string) {
     if (pasteLinkBusy) return;
@@ -3720,8 +3741,11 @@
    * keep using bandwidth) after the user has given up on it, and Undo resumes
    * exactly the ones this paused. Ember closing inside the window leaves them
    * paused, which loses nothing.
+   *
+   * `clear` sends `removeIds`, all completed rows, through Clear completed:
+   * one request for the lot rather than one per row.
    */
-  function discardWithUndo(cancelIds: string[], removeIds: string[]) {
+  function discardWithUndo(cancelIds: string[], removeIds: string[], clear = false) {
     const all = new Set([...cancelIds, ...removeIds]);
     if (all.size === 0) return;
     let snapshots: Transfer[] = [];
@@ -3776,7 +3800,7 @@
           }).catch((e: unknown) => toastError(toErrorMsg(e)));
         },
       },
-      () => void commitDiscard(cancelIds, removeIds, paused, restore),
+      () => void commitDiscard(cancelIds, removeIds, paused, restore, clear),
     );
   }
 
@@ -3785,6 +3809,7 @@
     removeIds: string[],
     paused: Promise<string[]>,
     restore: (ids: ReadonlySet<string>) => void,
+    clear: boolean,
   ) {
     // The pause has to land before the cancel goes out behind it.
     await paused;
@@ -3824,7 +3849,17 @@
         toastError(toErrorMsg(e));
       }
     }
-    if (remove.length > 0) await removeTransfersBatch(remove, false);
+    if (remove.length === 0) return;
+    if (!clear) {
+      await removeTransfersBatch(remove, false);
+      return;
+    }
+    try {
+      await clearCompleted(remove);
+    } catch (e: unknown) {
+      restore(new Set(remove));
+      toastError(toErrorMsg(e));
+    }
   }
 
   type Priority = 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto';
@@ -3910,13 +3945,10 @@
     return pool.filter((t) => t.status === 'completed');
   }
 
-  function openClearCompletedConfirm() {
-    const targets = clearCompletedTargets();
-    confirmClearCompleted = {
-      open: true,
-      filter: narrowLabel,
-      count: targets.length,
-    };
+  /** No confirmation: the rows can be had back from the Undo toast, and
+   *  clearing only takes them off the list. */
+  function clearCompletedWithUndo() {
+    discardWithUndo([], clearCompletedTargets().map((t) => t.id), true);
   }
 
   async function handleStopAll() {
@@ -3971,14 +4003,6 @@
       one: m.transfers_confirm_batch_cancel_one,
       few: () => m.transfers_confirm_batch_cancel_few({ count }),
       other: () => m.transfers_confirm_batch_cancel_other({ count }),
-    });
-  }
-
-  function clearCompletedFilteredMessage(count: number, filter: string): string {
-    return plural(count, {
-      one: () => m.transfers_confirm_clear_completed_filtered_one({ filter }),
-      few: () => m.transfers_confirm_clear_completed_filtered_few({ count, filter }),
-      other: () => m.transfers_confirm_clear_completed_filtered_other({ count, filter }),
     });
   }
 
@@ -4899,7 +4923,7 @@
   // filter box or confirm dialogs.
   const target = e.target as HTMLElement | null;
   const inEditable = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable);
-  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || columnMenu || uploadsPaneCtxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted.open || confirmBatchCancel.open || confirmRecover.open || renameDialog.open) return;
+  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || columnMenu || uploadsPaneCtxMenu || confirmCancel.open || confirmBan.open || confirmBatchCancel.open || confirmRecover.open || renameDialog.open) return;
   // A dialog owned elsewhere (the shortcut sheet, a settings modal) or the
   // chat dock has the keyboard; File Details is this page's own and keeps F2.
   if (target?.closest('.chat-dock')) return;
@@ -5124,7 +5148,7 @@
               <button type="button" role="menuitem" class="menu-danger" onclick={(e) => { handleCancelAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_cancel_all()}</button>
             {/if}
             {#if clearCompletedTargets().length > 0}
-              <button type="button" role="menuitem" onclick={(e) => { openClearCompletedConfirm(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_clear_completed()}</button>
+              <button type="button" role="menuitem" onclick={(e) => { clearCompletedWithUndo(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_clear_completed()}</button>
             {/if}
           </div>
         </details>
@@ -6518,7 +6542,7 @@
     <button class="ctx-item" role="menuitem" disabled={pasteLinkBusy} onclick={() => { closePaneCtx(); void pasteLinksFromClipboard(); }}>{m.transfers_ctx_paste_link()}</button>
     <button class="ctx-item" role="menuitem" onclick={() => { closePaneCtx(); void handleOpenDownloadsFolder(); }}>{m.transfers_open_downloads_folder()}</button>
     <div class="ctx-sep" role="separator"></div>
-    <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => { closePaneCtx(); openClearCompletedConfirm(); }}>{m.transfers_clear_completed()}</button>
+    <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => { closePaneCtx(); clearCompletedWithUndo(); }}>{m.transfers_clear_completed()}</button>
     <button class="ctx-item ctx-danger" role="menuitem" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); handleCancelAll(); }}>{m.transfers_cancel_all()}</button>
   </div>
 {/if}
@@ -6581,6 +6605,10 @@
           </div>
         {/if}
       </div>
+      {#if ctxTargets.some(canMoveInQueue)}
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('queue_front')}>{m.transfers_ctx_queue_front()}</button>
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('queue_back')}>{m.transfers_ctx_queue_back()}</button>
+      {/if}
       <div class="ctx-submenu-wrap" role="presentation">
         <button
           class="ctx-item ctx-sub"
@@ -6694,6 +6722,10 @@
           </div>
         {/if}
       </div>
+      {#if canMoveInQueue(ctxTransfer)}
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('queue_front')}>{m.transfers_ctx_queue_front()}</button>
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('queue_back')}>{m.transfers_ctx_queue_back()}</button>
+      {/if}
       <div class="ctx-submenu-wrap" role="presentation">
         <button
           class="ctx-item ctx-sub"
@@ -6857,32 +6889,6 @@
       void refreshReputations([confirmBan.userHash], true);
       showInfo(m.transfers_banned_user({ name: confirmBan.name }));
     } catch (e: unknown) {
-      transferError = toErrorMsg(e);
-    }
-  }}
-/>
-
-<ConfirmDialog
-  bind:open={confirmClearCompleted.open}
-  title={m.transfers_clear_completed()}
-  message={confirmClearCompleted.filter
-    ? clearCompletedFilteredMessage(confirmClearCompleted.count, confirmClearCompleted.filter)
-    : m.transfers_confirm_clear_completed_msg()}
-  confirmLabel={m.common_clear()}
-  onconfirm={async () => {
-    let markedIds: string[] = [];
-    try {
-      if (downloadsNarrowed) {
-        await removeTransfersBatch(clearCompletedTargets().map((t) => t.id), false);
-      } else {
-        markedIds = $transfers.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id);
-        for (const id of markedIds) markDownloadRemoved(id);
-        await clearCompleted();
-        markedIds = [];
-        transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) { speedHistory.delete(id); forgetTransfer(id); } return remaining; });
-      }
-    } catch (e: unknown) {
-      for (const id of markedIds) clearDownloadRemoved(id);
       transferError = toErrorMsg(e);
     }
   }}

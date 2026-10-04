@@ -148,6 +148,9 @@ pub struct TrayLabels {
     pub pause_all: String,
     pub resume_all: String,
     pub alt_speed: String,
+    /// The "When downloads finish" countdown's entry, by what it is about to do.
+    pub cancel_exit: String,
+    pub cancel_sleep: String,
 }
 
 impl Default for TrayLabels {
@@ -159,6 +162,8 @@ impl Default for TrayLabels {
             pause_all: "Pause all downloads".to_string(),
             resume_all: "Resume all downloads".to_string(),
             alt_speed: "Alternative speed limits".to_string(),
+            cancel_exit: "Cancel exit".to_string(),
+            cancel_sleep: "Cancel sleep".to_string(),
         }
     }
 }
@@ -226,6 +231,8 @@ fn accept(sent: &SentLabels) -> TrayLabels {
         pause_all: pick(&sent.pause_all, false, english.pause_all, "Pause all"),
         resume_all: pick(&sent.resume_all, false, english.resume_all, "Resume all"),
         alt_speed: pick(&sent.alt_speed, false, english.alt_speed, "Alternative speed"),
+        cancel_exit: pick(&sent.cancel_exit, false, english.cancel_exit, "Cancel exit"),
+        cancel_sleep: pick(&sent.cancel_sleep, false, english.cancel_sleep, "Cancel sleep"),
     }
 }
 
@@ -247,6 +254,8 @@ pub struct SentLabels {
     pub pause_all: String,
     pub resume_all: String,
     pub alt_speed: String,
+    pub cancel_exit: String,
+    pub cancel_sleep: String,
 }
 
 /// The tray menu's labels in the frontend's language. `cancel_update` carries
