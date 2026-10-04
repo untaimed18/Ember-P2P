@@ -314,6 +314,10 @@ pub struct TransferManager {
     /// Rolling speed history per transfer: VecDeque of (cumulative_bytes, Instant)
     speed_history: HashMap<String, VecDeque<(u64, Instant)>>,
     controls: HashMap<String, Arc<TransferControl>>,
+    /// Restored downloads whose re-verification has not reported back yet.
+    /// That check runs on the blocking pool, where Pause and Stop cannot stop
+    /// it, and its result is sent whatever happened to the row meanwhile.
+    restore_verifications: HashSet<String>,
     /// Per-transfer source details (eMule-style per-source tracking)
     source_details: HashMap<String, Vec<crate::types::SourceInfo>>,
     /// Bumped by every structural change to `queue` made here. Nothing
@@ -654,6 +658,7 @@ impl TransferManager {
             max_concurrent,
             speed_history: HashMap::new(),
             controls: HashMap::new(),
+            restore_verifications: HashSet::new(),
             source_details: HashMap::new(),
             queue_generation: 0,
             queue_index: std::sync::Mutex::new(QueueIndex::default()),
@@ -711,6 +716,35 @@ impl TransferManager {
 
     pub fn is_control_cancelled(&self, id: &str) -> bool {
         self.controls.get(id).is_some_and(|c| c.is_cancelled())
+    }
+
+    /// Record that a restored download's re-verification is running, until
+    /// [`Self::finish_restore_verification`] sees its result. Resume is refused
+    /// meanwhile: a worker started beside the check would be torn down by the
+    /// check's own late result.
+    pub fn begin_restore_verification(&mut self, id: &str) {
+        self.restore_verifications.insert(id.to_string());
+    }
+
+    /// `true` when one was running: the result being handled is its own.
+    pub fn finish_restore_verification(&mut self, id: &str) -> bool {
+        self.restore_verifications.remove(id)
+    }
+
+    pub fn is_restore_verification_running(&self, id: &str) -> bool {
+        self.restore_verifications.contains(id)
+    }
+
+    /// Remove a row's control, cancelling it for a download. A worker still
+    /// running on it — a later generation than the one whose result ended the
+    /// row — would otherwise keep writing the `.part` beyond the reach of every
+    /// command. An upload session ends itself before it reports.
+    fn retire_download_control(&mut self, id: &str, direction: &TransferDirection) {
+        if let Some(control) = self.controls.remove(id) {
+            if *direction == TransferDirection::Download {
+                control.cancel();
+            }
+        }
     }
 
     fn get_transfer_mut(&mut self, id: &str) -> Option<&mut Transfer> {
@@ -1159,12 +1193,12 @@ impl TransferManager {
             transfer.speed = 0;
             Self::clear_failure_context(&mut transfer);
             Self::clear_runtime_health(&mut transfer);
+            self.retire_download_control(id, &transfer.direction);
             self.completed.push(transfer);
             if self.completed.len() > 1000 {
                 self.completed.drain(..self.completed.len() - 1000);
             }
             self.speed_history.remove(id);
-            self.controls.remove(id);
             self.source_details.remove(id);
             return Some(self.promote_next());
         }
@@ -1199,12 +1233,12 @@ impl TransferManager {
         transfer.failure_kind = failure_kind;
         transfer.failure_stage = failure_stage;
         Self::clear_runtime_health(&mut transfer);
+        self.retire_download_control(id, &transfer.direction);
         self.completed.push(transfer);
         if self.completed.len() > 1000 {
             self.completed.drain(..self.completed.len() - 1000);
         }
         self.speed_history.remove(id);
-        self.controls.remove(id);
         self.source_details.remove(id);
         Some(self.promote_next())
     }
@@ -1865,6 +1899,10 @@ impl TransferManager {
     }
 
     pub fn resume(&mut self, id: &str) -> Vec<Transfer> {
+        if self.is_restore_verification_running(id) {
+            tracing::info!("Not resuming {id}: its restored copy is still being verified");
+            return Vec::new();
+        }
         let park = self.active.get(id).is_some_and(Self::requires_slot_to_resume)
             && self.active_download_count() >= self.max_concurrent as usize;
         if park {
@@ -1957,6 +1995,10 @@ impl TransferManager {
         let mut seen: HashSet<&str> = HashSet::with_capacity(wanted.len());
         for id in ids.iter().map(String::as_str) {
             if !seen.insert(id) {
+                continue;
+            }
+            if self.is_restore_verification_running(id) {
+                tracing::info!("Not resuming {id}: its restored copy is still being verified");
                 continue;
             }
             if register_missing_controls && !self.controls.contains_key(id) {
@@ -3398,6 +3440,52 @@ mod tests {
             ["c", "a", "b", "d"]
         );
         assert!(batched.get_control("b").is_some(), "a missing control is registered");
+    }
+
+    #[test]
+    fn completing_or_failing_a_download_cancels_the_control_it_removes() {
+        let mut manager = TransferManager::new(2);
+        manager.enqueue(download("done"));
+        manager.enqueue(download("broken"));
+        let done = TransferControl::new();
+        let broken = TransferControl::new();
+        manager.register_control("done", done.clone());
+        manager.register_control("broken", broken.clone());
+
+        assert!(manager.complete("done").is_some());
+        assert!(manager.fail("broken", TransferFailureCode::ConnectionFailed, None, None).is_some());
+
+        assert!(done.is_cancelled(), "a worker still on the completed row must stop");
+        assert!(broken.is_cancelled(), "a worker still on the failed row must stop");
+        assert!(manager.get_control("done").is_none());
+        assert!(manager.get_control("broken").is_none());
+    }
+
+    #[test]
+    fn resume_waits_for_a_running_restore_verification() {
+        let mut manager = TransferManager::new(2);
+        for id in ["single", "batched"] {
+            manager.enqueue(download(id));
+            manager.register_control(id, TransferControl::new());
+            manager.begin_restore_verification(id);
+        }
+        manager.pause_many(&owned(&["single", "batched"]));
+
+        assert!(manager.resume("single").is_empty());
+        let outcome = manager.resume_many(&owned(&["batched"]), true);
+        assert!(outcome.restart_ids.is_empty() && outcome.statuses.is_empty());
+        for id in ["single", "batched"] {
+            assert_eq!(status_of(&manager, id), TransferStatus::Paused, "{id}");
+            assert!(
+                manager.get_control(id).is_some_and(|c| c.is_paused()),
+                "{id}'s control stays paused"
+            );
+        }
+
+        assert!(manager.finish_restore_verification("single"));
+        assert!(!manager.finish_restore_verification("single"));
+        manager.resume("single");
+        assert_ne!(status_of(&manager, "single"), TransferStatus::Paused);
     }
 
     /// A rate measured over a window that has only just opened used to be

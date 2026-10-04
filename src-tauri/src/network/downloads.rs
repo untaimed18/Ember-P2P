@@ -670,6 +670,107 @@ pub(super) async fn try_start_pending_download_from_known_sources(
     file_req_overhead: &crate::storage::statistics::SharedFileReqOverheadCounters,
     epx_overhead: &crate::storage::statistics::SharedSxOverheadCounters,
 ) -> bool {
+    start_pending_download_worker(
+        state,
+        transfer_id,
+        transfer_manager,
+        source_manager,
+        credit_manager,
+        bandwidth_limiter,
+        dl_event_tx,
+        app_handle,
+        settings,
+        shared_ember_payload,
+        ember_payload_generation,
+        shared_banned_ips,
+        geoip,
+        friend_hashes,
+        ember_hash,
+        ed25519_pubkey,
+        ed25519_secret_key,
+        sx_overhead,
+        file_req_overhead,
+        epx_overhead,
+        false,
+    )
+    .await
+}
+
+/// [`try_start_pending_download_from_known_sources`] for a firewalled peer's
+/// connect-back that is already in hand: the worker starts even with no other
+/// source, and the caller hands it the stream through
+/// `active_established_senders`.
+pub(super) async fn start_pending_download_for_callback(
+    state: &mut NetworkState,
+    transfer_id: &str,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    source_manager: &Arc<RwLock<SourceManager>>,
+    credit_manager: &Arc<RwLock<CreditManager>>,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
+    dl_event_tx: &mpsc::Sender<DownloadEvent>,
+    app_handle: &tauri::AppHandle,
+    settings: &AppSettings,
+    shared_ember_payload: &ember::SharedEmberPayload,
+    ember_payload_generation: &ember::EmberPayloadGeneration,
+    shared_banned_ips: &ed2k::upload::SharedBannedIps,
+    geoip: &crate::geoip::GeoIpReader,
+    friend_hashes: &crate::app_state::SharedFriendHashes,
+    ember_hash: [u8; 16],
+    ed25519_pubkey: [u8; 32],
+    ed25519_secret_key: [u8; 32],
+    sx_overhead: &crate::storage::statistics::SharedSxOverheadCounters,
+    file_req_overhead: &crate::storage::statistics::SharedFileReqOverheadCounters,
+    epx_overhead: &crate::storage::statistics::SharedSxOverheadCounters,
+) -> bool {
+    start_pending_download_worker(
+        state,
+        transfer_id,
+        transfer_manager,
+        source_manager,
+        credit_manager,
+        bandwidth_limiter,
+        dl_event_tx,
+        app_handle,
+        settings,
+        shared_ember_payload,
+        ember_payload_generation,
+        shared_banned_ips,
+        geoip,
+        friend_hashes,
+        ember_hash,
+        ed25519_pubkey,
+        ed25519_secret_key,
+        sx_overhead,
+        file_req_overhead,
+        epx_overhead,
+        true,
+    )
+    .await
+}
+
+async fn start_pending_download_worker(
+    state: &mut NetworkState,
+    transfer_id: &str,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    source_manager: &Arc<RwLock<SourceManager>>,
+    credit_manager: &Arc<RwLock<CreditManager>>,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
+    dl_event_tx: &mpsc::Sender<DownloadEvent>,
+    app_handle: &tauri::AppHandle,
+    settings: &AppSettings,
+    shared_ember_payload: &ember::SharedEmberPayload,
+    ember_payload_generation: &ember::EmberPayloadGeneration,
+    shared_banned_ips: &ed2k::upload::SharedBannedIps,
+    geoip: &crate::geoip::GeoIpReader,
+    friend_hashes: &crate::app_state::SharedFriendHashes,
+    ember_hash: [u8; 16],
+    ed25519_pubkey: [u8; 32],
+    ed25519_secret_key: [u8; 32],
+    sx_overhead: &crate::storage::statistics::SharedSxOverheadCounters,
+    file_req_overhead: &crate::storage::statistics::SharedFileReqOverheadCounters,
+    epx_overhead: &crate::storage::statistics::SharedSxOverheadCounters,
+    callback_stream_in_hand: bool,
+) -> bool {
     // The user asked activity to stop. Disconnect re-queues every active
     // download as pending so it resumes on reconnect, but the Ember overlay
     // keeps running and its source lookups call straight back into here — so
@@ -743,7 +844,7 @@ pub(super) async fn try_start_pending_download_from_known_sources(
         .map(|(ip, port)| (ip.to_string(), port))
         .collect();
 
-    if live_sources.is_empty() {
+    if live_sources.is_empty() && !callback_stream_in_hand {
         if !pending_download_has_parked_ember_sources(state, transfer_id) {
             state
                 .pending_downloads
@@ -936,7 +1037,9 @@ pub(super) async fn try_start_pending_download_from_known_sources(
         dl_tid,
         hex::encode(hash_bytes),
         live_sources.len(),
-        if live_sources.is_empty() {
+        if callback_stream_in_hand {
+            " — adopting a firewalled peer's connect-back"
+        } else if live_sources.is_empty() {
             " — parked peers only, worker waits for a firewalled connect-back"
         } else {
             ""

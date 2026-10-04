@@ -800,6 +800,8 @@ mod compressed_part_bounds_tests {
     }
 }
 
+// No longer started: a LowID callback now joins the multi-source worker.
+#[allow(dead_code)]
 pub struct Ed2kDownload {
     pub transfer_id: String,
     pub file_hash: [u8; 16],
@@ -2871,6 +2873,7 @@ mod tests {
     }
 }
 
+#[allow(dead_code)]
 impl Ed2kDownload {
     /// Check if an SX-received source should be rejected (IP filter, banned,
     /// self-source). Returns true if the source should be skipped.

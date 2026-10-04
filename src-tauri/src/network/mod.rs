@@ -77,7 +77,7 @@ use self::ed2k::server::{Ed2kServerConnection, ServerLink};
 use self::ed2k::server_list::{ServerEntry, ServerList};
 use self::ed2k::server_udp::{ServerUdpResponse, ServerUdpSocket};
 use self::ed2k::sources::SourceManager;
-use self::ed2k::transfer::{classify_error, DownloadEvent, Ed2kDownload, SourceFailureKind};
+use self::ed2k::transfer::{classify_error, DownloadEvent, SourceFailureKind};
 use self::ed2k::upload::{self as upload_server, UploadEvent, UploadEventKind};
 use self::kad::bootstrap;
 use self::kad::buddy::{BuddyEvent, BuddyManager, BuddyState, PendingBuddySet};

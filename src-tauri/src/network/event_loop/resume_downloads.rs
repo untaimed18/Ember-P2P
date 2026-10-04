@@ -512,6 +512,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                     let mut mgr = transfer_manager.write().await;
                     mgr.active.insert(tid.clone(), transfer);
                     mgr.register_control(&tid, control);
+                    mgr.begin_restore_verification(&tid);
                 }
                 let handle_id = tid.clone();
                 // The event is sent from the blocking task itself. Pause, Stop
@@ -712,6 +713,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                             let mut mgr = transfer_manager.write().await;
                             mgr.active.insert(tid.clone(), transfer);
                             mgr.register_control(&tid, control);
+                            mgr.begin_restore_verification(&tid);
                         }
 
                         if let Some(old_handle) = state.download_handles.remove(&dl_tid2) {

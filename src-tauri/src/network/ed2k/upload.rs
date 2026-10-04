@@ -7602,7 +7602,7 @@ impl UploadHandler {
         // Check if this is a server callback connection (LowID source connecting
         // back after we sent OP_CALLBACKREQUEST). We match by the TCP port the
         // peer reports in its Hello packet against registered LowID sources for
-        // our currently-connected server.
+        // our currently-connected server that we recently asked to call back.
         if let Some(peer_v4) = diversion_ip {
             let peer_hello_port = if hello_data.len() >= 23 {
                 u16::from_le_bytes([hello_data[21], hello_data[22]])
@@ -7615,7 +7615,7 @@ impl UploadHandler {
                     if let Some(addr) = *server_addr {
                         if let std::net::IpAddr::V4(v4) = addr.ip() {
                             let sm = self.source_manager.read().await;
-                            let matches = sm.find_lowid_files_by_port(
+                            let matches = sm.find_answered_callback_files(
                                 u32::from_le_bytes(v4.octets()),
                                 addr.port(),
                                 peer_hello_port,

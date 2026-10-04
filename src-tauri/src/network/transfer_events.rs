@@ -107,6 +107,80 @@ pub(super) fn reverify_complete_part_file(
     Ok(actual_final)
 }
 
+/// How long the leftover-partial cleanup waits for the finished download's
+/// worker to exit before leaving its files for the orphan sweep.
+const LEFTOVER_PARTIAL_WORKER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Remove a `.part` / `.part.met` that completion should have moved or
+/// deleted, once `worker` has exited and no other worker has been registered
+/// for `transfer_id` since. Either may still hold the files open.
+fn spawn_leftover_partial_cleanup(
+    transfer_manager: Arc<RwLock<TransferManager>>,
+    transfer_id: String,
+    download_roots: Vec<String>,
+    worker: Option<tokio::task::JoinHandle<()>>,
+) {
+    if uuid::Uuid::parse_str(&transfer_id).is_err() {
+        return;
+    }
+    tokio::spawn(async move {
+        if let Some(worker) = worker {
+            if tokio::time::timeout(LEFTOVER_PARTIAL_WORKER_WAIT, worker).await.is_err() {
+                debug!("Worker for completed {transfer_id} still running; leaving its part files");
+                return;
+            }
+        }
+        if transfer_manager.read().await.get_control(&transfer_id).is_some() {
+            return;
+        }
+        let tid = transfer_id.clone();
+        let cleaned = tokio::task::spawn_blocking(move || {
+            let mut cleaned = 0usize;
+            for root in &download_roots {
+                let temp_dir = PathBuf::from(root).join("Temp");
+                for name in [format!("{tid}.part"), format!("{tid}.part.met")] {
+                    let path = temp_dir.join(name);
+                    match remove_leftover_partial(&path, root) {
+                        Ok(true) => cleaned += 1,
+                        Ok(false) => {}
+                        Err(e) => warn!(
+                            "Failed to clean up leftover {} after completion: {e}",
+                            path.display()
+                        ),
+                    }
+                }
+            }
+            cleaned
+        })
+        .await
+        .unwrap_or(0);
+        if cleaned > 0 {
+            info!("Cleaned up {cleaned} leftover part file(s) for completed download {transfer_id}");
+        }
+    });
+}
+
+/// Delete `path` under `root` only if it is still the file it was when
+/// opened here. `Ok(false)` when there was nothing to delete.
+fn remove_leftover_partial(path: &std::path::Path, root: &str) -> std::io::Result<bool> {
+    let allowed = [root.to_string()];
+    let (verified, identity) =
+        match crate::security::filesystem::open_existing_approved(path, &allowed, false) {
+            Ok((verified, file)) => {
+                (verified, crate::security::filesystem::opened_file_identity(&file)?)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+    match crate::security::filesystem::remove_approved_file_if_identity(
+        &verified, &allowed, &identity,
+    ) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 pub(super) async fn handle_download_event(
     event: DownloadEvent,
     app_handle: &tauri::AppHandle,
@@ -127,6 +201,9 @@ pub(super) async fn handle_download_event(
     // refer to live rows.
     callback_row_pending_since: &mut HashMap<(String, String, u16), std::time::Instant>,
     status_writes: &Arc<TransferStatusWriteClock>,
+    // The worker registered for a `Completed` transfer, taken off the
+    // handle map before this runs.
+    completed_worker: Option<tokio::task::JoinHandle<()>>,
 ) {
     match event {
         DownloadEvent::Progress {
@@ -655,28 +732,12 @@ pub(super) async fn handle_download_event(
                 }),
             );
 
-            // Defensive cleanup: remove any leftover .part / .part.met files
-            // that should have been moved/deleted during the completion flow.
-            for root in download_roots {
-                let temp_dir = PathBuf::from(root).join("Temp");
-                let part_path = temp_dir.join(format!("{transfer_id}.part"));
-                let met_path = temp_dir.join(format!("{transfer_id}.part.met"));
-                if tokio::fs::try_exists(&part_path).await.unwrap_or(false) {
-                    if let Err(e) = tokio::fs::remove_file(&part_path).await {
-                        warn!(
-                            "Failed to clean up leftover .part after completion: {} — {e}",
-                            part_path.display()
-                        );
-                    } else {
-                        info!(
-                            "Cleaned up leftover .part file for completed download {transfer_id}"
-                        );
-                    }
-                }
-                if tokio::fs::try_exists(&met_path).await.unwrap_or(false) {
-                    let _ = tokio::fs::remove_file(&met_path).await;
-                }
-            }
+            spawn_leftover_partial_cleanup(
+                transfer_manager.clone(),
+                transfer_id.clone(),
+                download_roots.to_vec(),
+                completed_worker,
+            );
 
             if remove_finished {
                 let mut mgr = transfer_manager.write().await;
