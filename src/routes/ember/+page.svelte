@@ -24,11 +24,13 @@
     EmberDhtStoreEntry,
   } from '$lib/types';
   import { copyToClipboard, formatDurationSecs, formatNumber } from '$lib/utils';
-  import { getLocale } from '$lib/i18n';
+  import { getLocale, translateError } from '$lib/i18n';
   import { EMBER_DIAG_FAILURE_THRESHOLD } from '$lib/emberJoin';
   import { emberJoinTimedOut } from '$lib/stores/emberJoin';
   import { checkForUpdates, installUpdate, restartToUpdate, updater } from '$lib/stores/updater';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import { relaunch } from '@tauri-apps/plugin-process';
   import * as m from '$lib/paraglide/messages';
 
   let diag = $state<EmberDiagnostics | null>(null);
@@ -37,6 +39,9 @@
   let storeEntries = $state<EmberDhtStoreEntry[]>([]);
   let contactFilter = $state('');
   let detailsOpen = $state(false);
+  let showRestartPrompt = $state(false);
+  let restarting = $state(false);
+  let restartError = $state('');
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let unmounted = false;
@@ -133,6 +138,21 @@
 
   let copiedKey = $state<string | null>(null);
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Same relaunch as a port change in Settings: confirm first, paint the
+  // full-screen "Restarting Ember" overlay, then Tauri's relaunch().
+  async function performRestart() {
+    showRestartPrompt = false;
+    restartError = '';
+    restarting = true;
+    try {
+      await new Promise((r) => setTimeout(r, 600));
+      await relaunch();
+    } catch (e) {
+      restarting = false;
+      restartError = m.settings_restart_failed({ error: translateError(e) });
+    }
+  }
 
   async function copyText(value: string, key: string) {
     if (!value) return;
@@ -457,14 +477,27 @@
      with an `h1`, which put the same chrome at two different heading levels
      and two different type sizes depending on where you'd navigated from. -->
 <header class="page-header">
-  <div>
+  <div class="page-heading">
     <h2>{m.nav_ember_network()}</h2>
     <p class="page-subtitle">{m.ember_page_subtitle()}</p>
+  </div>
+  <div class="header-actions">
+    <button
+      type="button"
+      class="secondary"
+      onclick={() => { restartError = ''; showRestartPrompt = true; }}
+      disabled={restarting}
+    >
+      {m.ember_restart_button()}
+    </button>
   </div>
 </header>
 
 <div class="page-content">
   <div class="ember-inner">
+  {#if restartError}
+    <div class="banner banner-error" role="alert">{restartError}</div>
+  {/if}
   <div class="banner banner-info" role="note">{m.ember_network_growing()}</div>
 
   <section class="hero" class:state-off={heroState === 'loading'} class:state-connecting={heroState === 'connecting'} class:state-connected={heroState === 'connected'} class:state-no-peers={heroState === 'no_peers'} aria-live="polite">
@@ -767,6 +800,29 @@
   </div>
 </div>
 
+<!--
+  Confirmed like the port-change prompt in Settings, with the same
+  "Restart now" label and the same relaunch overlay.
+-->
+<ConfirmDialog
+  bind:open={showRestartPrompt}
+  title={m.ember_restart_dialog_title()}
+  message={m.ember_restart_dialog_message()}
+  confirmLabel={m.settings_restart_now()}
+  cancelLabel={m.common_cancel()}
+  onconfirm={performRestart}
+/>
+
+{#if restarting}
+  <div class="restart-overlay" role="status" aria-label={m.settings_restarting_aria()}>
+    <div class="restart-card">
+      <div class="spinner lg"></div>
+      <h2 class="restart-title">{m.settings_restarting_title()}</h2>
+      <p class="restart-sub">{m.ember_restarting_sub()}</p>
+    </div>
+  </div>
+{/if}
+
 <style>
   /*
    * Fixed `.page-header` + scrollable `.page-content` (the app-wide
@@ -780,6 +836,20 @@
     display: flex;
     flex-direction: column;
     gap: 16px;
+  }
+
+  .page-header {
+    gap: 16px;
+  }
+
+  .page-heading {
+    min-width: 0;
+  }
+
+  .header-actions {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
   }
 
   /* Size/weight come from the global `.page-header h2` rule; only the layout
@@ -1334,7 +1404,43 @@
     .stat { transition: none; }
   }
 
+  /* Same overlay as a port-change restart in Settings. */
+  .restart-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 99999;
+    display: grid;
+    place-items: center;
+    background: var(--bg-primary);
+    padding: 20px;
+  }
+
+  .restart-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .restart-title {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--accent);
+    margin: 0;
+  }
+
+  .restart-sub {
+    font-size: var(--font-size-base);
+    color: var(--text-muted);
+    margin: 0;
+  }
+
   @media (max-width: 760px) {
+    .page-header {
+      align-items: flex-start;
+      flex-direction: column;
+    }
+
     .stat-grid {
       grid-template-columns: 1fr 1fr;
     }
