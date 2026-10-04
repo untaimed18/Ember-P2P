@@ -27,6 +27,7 @@ mod background;
 mod bandwidth;
 mod commands;
 mod emule_import;
+mod finish_action;
 mod geoip;
 mod network;
 mod power;
@@ -2532,6 +2533,10 @@ pub fn run() {
             auto_update::silent::silent_update_resume,
             auto_update::silent::note_user_activity,
             auto_update::silent::take_update_outcome,
+            finish_action::get_finish_action,
+            finish_action::set_finish_action,
+            finish_action::cancel_finish_action,
+            finish_action::run_finish_action_now,
             tray::set_tray_labels,
                     ]
                 };
@@ -2610,11 +2615,17 @@ pub fn run() {
             // draws the drop overlay; it just no longer decides what was
             // dropped.
             if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
-                let app_handle = window.app_handle().clone();
-                let paths = paths.clone();
-                tauri::async_runtime::spawn(async move {
-                    commands::sharing::share_dropped_paths(app_handle, paths).await;
-                });
+                let (collections, paths) =
+                    commands::deeplink::take_dropped_collections(paths.clone());
+                if !collections.is_empty() {
+                    commands::deeplink::dispatch_deep_links(window.app_handle(), collections);
+                }
+                if !paths.is_empty() {
+                    let app_handle = window.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        commands::sharing::share_dropped_paths(app_handle, paths).await;
+                    });
+                }
                 return;
             }
 

@@ -320,6 +320,31 @@ pub fn is_deep_link_payload(arg: &str) -> bool {
         || lower.starts_with("ember-channel:")
 }
 
+/// Split an OS drop into the collection files to open and the paths to share.
+///
+/// A dropped `.emulecollection` means what double-clicking it means, so it
+/// takes the same confirmed path a double-click's argv does rather than being
+/// shared as an ordinary file. One the deep-link checks refuse (a network
+/// path, an overlong one) stays with the drop and is shared as before.
+pub fn take_dropped_collections(
+    paths: Vec<std::path::PathBuf>,
+) -> (Vec<String>, Vec<std::path::PathBuf>) {
+    let mut collections = Vec::new();
+    let mut rest = Vec::new();
+    for path in paths {
+        let is_collection = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("emulecollection"));
+        match path.to_str() {
+            Some(s) if is_collection && s.len() <= MAX_PAYLOAD_LEN && is_deep_link_payload(s) => {
+                collections.push(s.to_string());
+            }
+            _ => rest.push(path),
+        }
+    }
+    (collections, rest)
+}
+
 /// Pull the deep-link payloads out of a process/instance argv.
 ///
 /// `argv[0]` (the executable path) is always skipped, as are empty entries and
@@ -649,6 +674,40 @@ pub async fn open_pending_collection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_collections_open_and_everything_else_is_shared() {
+        let root = if cfg!(windows) { "C:\\drop\\" } else { "/drop/" };
+        let collection = format!("{root}set.eMuleCollection");
+        let folder = format!("{root}Movies");
+        let lookalike = format!("{root}notes.emulecollection.txt");
+        let relative = "set.emulecollection".to_string();
+        let (open, share) = take_dropped_collections(vec![
+            collection.clone().into(),
+            folder.clone().into(),
+            lookalike.clone().into(),
+            relative.clone().into(),
+        ]);
+        assert_eq!(open, vec![collection]);
+        assert_eq!(
+            share,
+            vec![
+                std::path::PathBuf::from(folder),
+                lookalike.into(),
+                relative.into(),
+            ],
+            "only an absolute collection path is opened; the rest is shared as before"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_dropped_collection_on_a_network_share_is_not_opened() {
+        let (open, share) =
+            take_dropped_collections(vec![r"\\server\share\set.emulecollection".into()]);
+        assert!(open.is_empty());
+        assert_eq!(share.len(), 1);
+    }
 
     #[test]
     fn linux_claims_ed2k_only_when_unowned_or_already_ours() {

@@ -404,6 +404,15 @@ export function markDownloadRemoved(id: string) {
   recentlyRemovedDownloads.set(id, Date.now() + REMOVED_DOWNLOAD_TTL_MS);
 }
 
+/** Tombstone a download id with no expiry, for a cancel or remove that waits
+ *  behind an Undo. The row is still in the backend the whole time, so a timed
+ *  tombstone would let a poll put it back while the toast is still up. End it
+ *  with `markDownloadRemoved` once the command is sent, or
+ *  `clearDownloadRemoved` on Undo. */
+export function holdDownloadRemoved(id: string) {
+  recentlyRemovedDownloads.set(id, Number.POSITIVE_INFINITY);
+}
+
 /** Drop a download tombstone (e.g. cancel IPC failed) so a later poll can
  *  restore the row from the API snapshot. */
 export function clearDownloadRemoved(id: string) {
@@ -694,6 +703,8 @@ export async function initTransferStore() {
       flushPendingTransfers();
       const list = publishedTransfers;
       if (!list.some((x) => x.id === t.id)) {
+        // A download waiting behind an Undo, or just cancelled, stays gone.
+        if (t.direction !== 'upload' && wasRecentlyRemovedDownload(t.id)) return;
         commitTransfers([...list, t]);
         return;
       }

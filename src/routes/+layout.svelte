@@ -12,6 +12,8 @@
   import UpdateNotice from '$lib/components/UpdateNotice.svelte';
   import SilentUpdateCountdown from '$lib/components/SilentUpdateCountdown.svelte';
   import { initSilentUpdate, reportUpdateOutcome } from '$lib/stores/silentUpdate';
+  import FinishActionCountdown from '$lib/components/FinishActionCountdown.svelte';
+  import { initFinishAction } from '$lib/stores/finishAction';
   import { startUserActivityReporting } from '$lib/userActivity';
 
   import { initNetworkStore, cleanupNetworkStore, startStatsPoll } from '$lib/stores/network';
@@ -299,6 +301,7 @@
     let unlistenUpdateResume: UnlistenFn | null = null;
     let unlistenSettingsChanged: UnlistenFn | null = null;
     let unlistenSilentUpdate: UnlistenFn | null = null;
+    let unlistenFinishAction: UnlistenFn | null = null;
     const stopActivityReporting = startUserActivityReporting();
     let unlistenClose: UnlistenFn | null = null;
     let unlistenConfigCorrupt: UnlistenFn | null = null;
@@ -533,6 +536,10 @@
       .then((fn) => { if (mounted) unlistenSilentUpdate = fn; else fn(); })
       .catch((e) => console.error('Failed to register silent-update listener:', e));
 
+    initFinishAction()
+      .then((fn) => { if (mounted) unlistenFinishAction = fn; else fn(); })
+      .catch((e) => console.error('Failed to register finish-action listener:', e));
+
     // Downloads re-queue on their own once the folder is fixed, so without this
     // the only sign of a folder Ember cannot write is rows that never start.
     listen('download-folder-unavailable', () => {
@@ -735,6 +742,7 @@
       if (unlistenUpdateResume) unlistenUpdateResume();
       if (unlistenSettingsChanged) unlistenSettingsChanged();
       if (unlistenSilentUpdate) unlistenSilentUpdate();
+      if (unlistenFinishAction) unlistenFinishAction();
       stopActivityReporting();
       if (stopPoll) stopPoll();
       if (stopTransferPoll) stopTransferPoll();
@@ -824,6 +832,7 @@
     <!-- Non-blocking auto-update banner, driven by the shared updater store. -->
     <UpdateNotice />
     <SilentUpdateCountdown />
+    <FinishActionCountdown />
     <!-- Headless: routes OS-delivered ed2k:// links and .emulecollection
     files into the app once the shell is ready (settings loaded, no wizard). -->
     <DeepLinkHandler />

@@ -142,12 +142,22 @@
       shortcuts: [
         { keys: ['/'], label: () => m.shortcuts_library_focus_search() },
         { keys: [modifierKey, 'C'], label: () => m.shortcuts_search_copy_links() },
+        { keys: ['↑ / ↓'], label: () => m.shortcuts_search_navigate() },
+        { keys: ['Shift', '↑ / ↓'], label: () => m.shortcuts_search_extend() },
+        { keys: ['Home / End'], label: () => m.shortcuts_search_jump_ends() },
+        { keys: ['PgUp / PgDn'], label: () => m.shortcuts_library_page() },
+        { keys: ['Space'], label: () => m.shortcuts_library_toggle_check() },
+        { keys: ['Enter'], label: () => m.shortcuts_search_download() },
       ],
     },
     {
       title: () => m.shortcuts_section_transfers(),
       shortcuts: [
         { keys: ['↑ / ↓'], label: () => m.shortcuts_transfers_navigate() },
+        { keys: ['Shift', '↑ / ↓'], label: () => m.shortcuts_transfers_extend() },
+        { keys: ['Home / End'], label: () => m.shortcuts_transfers_jump_ends() },
+        { keys: [modifierKey, 'A'], label: () => m.shortcuts_transfers_select_all() },
+        { keys: ['Space'], label: () => m.shortcuts_transfers_pause_resume() },
         { keys: [modifierKey, 'V'], label: () => m.shortcuts_transfers_paste_links() },
         { keys: ['F2'], label: () => m.shortcuts_transfers_rename() },
         { keys: ['Delete'], label: () => m.shortcuts_transfers_delete() },

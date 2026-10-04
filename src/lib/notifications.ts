@@ -45,7 +45,8 @@ export type NotifyCategory =
   | 'friend_request'
   | 'shares_browsed'
   | 'channel_message'
-  | 'silent_update';
+  | 'silent_update'
+  | 'finish_action';
 
 const CATEGORY_SETTING: Record<NotifyCategory, keyof AppSettings> = {
   download_complete: 'notify_download_complete',
@@ -62,6 +63,8 @@ const CATEGORY_SETTING: Record<NotifyCategory, keyof AppSettings> = {
   // the user turned silent updates on, and the warning is how they get to
   // cancel one. Only the master switch silences it.
   silent_update: 'notifications_enabled',
+  // Likewise the warning before "when downloads finish" exits or sleeps.
+  finish_action: 'notifications_enabled',
 };
 
 /** Identical notifications inside this window collapse into one. */
@@ -96,12 +99,13 @@ let deliveryUnavailable = false;
  * notification on *that* put the second-monitor case straight back — the
  * handler returned before this check was ever consulted.
  *
- * The silent-update countdown is drawn in the main window only, so for its
- * warning the chat window having focus is not the user having seen it.
+ * The silent-update and finish-action countdowns are drawn in the main window
+ * only, so for their warnings the chat window having focus is not the user
+ * having seen them.
  */
 function emberIsFocused(category: NotifyCategory): boolean {
   if (typeof document === 'undefined') return false;
-  if (category !== 'silent_update' && chatWindowFocused()) return true;
+  if (category !== 'silent_update' && category !== 'finish_action' && chatWindowFocused()) return true;
   return document.visibilityState === 'visible' && document.hasFocus();
 }
 

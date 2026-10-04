@@ -73,6 +73,10 @@
           {/if}
         </span>
         <span class="toast-msg">{toast.message}</span>
+        {#if toast.action}
+          {@const action = toast.action}
+          <button type="button" class="toast-action" onclick={() => action.run()}>{action.label}</button>
+        {/if}
         <button type="button" class="toast-close" onclick={() => removeToast(toast.id)} title={m.common_dismiss()} aria-label={m.common_dismiss()}>
           <IconX size={13} />
         </button>
@@ -169,6 +173,20 @@
   /* Backend error strings carry hashes and full Windows paths; without
      min-width:0 a flex item won't shrink below its min-content width. */
   .toast-msg { flex: 1; min-width: 0; line-height: 1.35; overflow-wrap: anywhere; }
+  .toast-action {
+    flex-shrink: 0;
+    padding: 3px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .toast-action:hover {
+    background: color-mix(in srgb, var(--text-primary) 10%, var(--bg-primary));
+  }
   .toast-close {
     display: inline-flex;
     align-items: center;

@@ -1,12 +1,21 @@
 import { writable } from 'svelte/store';
 
+export interface ToastAction {
+  label: string;
+  run: () => void;
+}
+
 export interface ToastItem {
   id: number;
   type: 'success' | 'error' | 'warning' | 'info';
   message: string;
+  action?: ToastAction;
 }
 
 let nextId = 0;
+/** Called once when a toast with an action leaves without the action being
+ *  taken — on its timer, on ×, or evicted by the queue cap. */
+const toastExpiry = new Map<number, () => void>();
 const toastTimers = new Map<number, ReturnType<typeof setTimeout>>();
 /** Ids added with `durationMs = 0`. These are notices the user is meant to
  *  acknowledge (consent prompts, fatal failures), so they are never dismissed
@@ -76,12 +85,49 @@ export function resumeToastDismiss() {
   }
 }
 
+function expire(id: number) {
+  const onExpire = toastExpiry.get(id);
+  toastExpiry.delete(id);
+  onExpire?.();
+}
+
+/**
+ * A toast offering one action, such as Undo. Exactly one of `action.run` and
+ * `onExpire` is called: the action if the user takes it, otherwise `onExpire`
+ * once the toast is gone for any reason. The countdown pauses with the others
+ * while the stack is hovered, so reading the toast never costs the chance to
+ * take the action.
+ */
+export function addActionToast(
+  type: ToastItem['type'],
+  message: string,
+  action: ToastAction,
+  onExpire: () => void,
+  durationMs = 8000,
+) {
+  const id = nextId++;
+  const wrapped: ToastAction = {
+    label: action.label,
+    run: () => {
+      if (!toastExpiry.delete(id)) return;
+      removeToast(id);
+      action.run();
+    },
+  };
+  toastExpiry.set(id, onExpire);
+  return pushToast(id, { id, type, message, action: wrapped }, durationMs);
+}
+
 export function addToast(type: ToastItem['type'], message: string, durationMs = 5000) {
   const id = nextId++;
+  return pushToast(id, { id, type, message }, durationMs);
+}
+
+function pushToast(id: number, item: ToastItem, durationMs: number) {
   if (durationMs <= 0) stickyToasts.add(id);
   const evicted: number[] = [];
   toasts.update((t) => {
-    const next = [...t, { id, type, message }];
+    const next = [...t, item];
     while (next.length > MAX_TOASTS) {
       // Drop the oldest dismissable toast. Only when every entry is sticky
       // does the oldest sticky one go, so a burst of warnings can't quietly
@@ -93,7 +139,10 @@ export function addToast(type: ToastItem['type'], message: string, durationMs = 
     }
     return next;
   });
-  for (const evictedId of evicted) clearToastTimer(evictedId);
+  for (const evictedId of evicted) {
+    clearToastTimer(evictedId);
+    expire(evictedId);
+  }
   // No timer for a sticky toast. Both callers that pass 0 depend on it: the
   // Ember-default-on notice comes from a one-shot backend latch that is spent
   // as soon as it resolves, so auto-dismissing it loses the only consent
@@ -118,6 +167,7 @@ export function removeToast(id: number) {
   // toast by clicking its × while hovering would latch the pause on and leave
   // the *next* toast with no timer at all. Nothing is left to hover, so drop it.
   if (remaining === 0) dismissPaused = false;
+  expire(id);
 }
 
 export function clearAllToasts() {
@@ -129,6 +179,8 @@ export function clearAllToasts() {
   // more; leaving this latched would suppress the next toast's timer entirely.
   dismissPaused = false;
   toasts.set([]);
+  const pending = [...toastExpiry.keys()];
+  for (const id of pending) expire(id);
 }
 
 export function toast(message: string) { addToast('info', message); }

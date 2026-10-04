@@ -3072,6 +3072,91 @@
     pendingConfirm = null;
   }
 
+  /** The row the keyboard is on: arrows move it, Space ticks it, Enter
+   *  downloads it. Kept by key, so a re-sort or new results arriving leave
+   *  it on the same file. */
+  let cursorKey = $state<string | null>(null);
+  let cursorIndex = $derived(
+    cursorKey ? filteredResults.findIndex((r) => resultKey(r) === cursorKey) : -1,
+  );
+
+  /** Scroll a row into view. The table is windowed, so the row may not be
+   *  mounted; its position follows from the measured row height. */
+  function revealResultRow(index: number) {
+    const scroller = resultsScrollEl;
+    const body = resultsBodyEl;
+    if (!scroller || !body) return;
+    const scrollerTop = scroller.getBoundingClientRect().top;
+    const bodyTop = body.getBoundingClientRect().top - scrollerTop + scroller.scrollTop;
+    const headerHeight = body.parentElement?.querySelector('thead')?.getBoundingClientRect().height ?? 0;
+    const rowTop = bodyTop + index * rowHeight;
+    const rowBottom = rowTop + rowHeight;
+    if (rowTop - headerHeight < scroller.scrollTop) {
+      scroller.scrollTop = Math.max(0, rowTop - headerHeight);
+    } else if (rowBottom > scroller.scrollTop + scroller.clientHeight) {
+      scroller.scrollTop = rowBottom - scroller.clientHeight;
+    } else {
+      return;
+    }
+    scheduleRowWindowUpdate();
+  }
+
+  function isActivationTarget(el: EventTarget | null): boolean {
+    return (
+      el instanceof HTMLElement &&
+      !!el.closest('button, input, a[href], summary, select, [role="button"], [role="menuitem"], [role="tab"], [role="option"]')
+    );
+  }
+
+  /** Arrow keys, Space and Enter over the results, as on the Library page. */
+  function handleResultsKeydown(e: KeyboardEvent): boolean {
+    if (e.ctrlKey || e.metaKey || e.altKey) return false;
+    const total = filteredResults.length;
+    if (total === 0) return false;
+    const current = cursorIndex;
+    let nextIdx: number | null = null;
+    if (e.key === 'ArrowDown') nextIdx = current < 0 ? 0 : Math.min(total - 1, current + 1);
+    else if (e.key === 'ArrowUp') nextIdx = current <= 0 ? 0 : current - 1;
+    else if (e.key === 'Home') nextIdx = 0;
+    else if (e.key === 'End') nextIdx = total - 1;
+    else if (e.key === 'PageDown') nextIdx = current < 0 ? 0 : Math.min(total - 1, current + 10);
+    else if (e.key === 'PageUp') nextIdx = current <= 0 ? 0 : Math.max(0, current - 10);
+    if (nextIdx !== null) {
+      const next = filteredResults[nextIdx];
+      if (e.shiftKey) {
+        // Tick the rows swept over, never untick: sweeping back over a
+        // ticked row must not drop it.
+        const ticked = new Set(checkedKeys);
+        const from = current < 0 ? nextIdx : current;
+        for (let i = Math.min(from, nextIdx); i <= Math.max(from, nextIdx); i++) {
+          ticked.add(resultKey(filteredResults[i]));
+        }
+        checkedKeys = ticked;
+        lastCheckedKey = resultKey(next);
+      }
+      cursorKey = resultKey(next);
+      revealResultRow(nextIdx);
+      return true;
+    }
+    if (isActivationTarget(e.target)) return false;
+    const cursor = current >= 0 ? filteredResults[current] : null;
+    if (e.key === ' ' && cursor) {
+      toggleCheck(resultKey(cursor), current, e.shiftKey);
+      return true;
+    }
+    if (e.key === 'Enter') {
+      if (checkedCount > 0) {
+        void downloadChecked();
+        return true;
+      }
+      if (cursor && !getBlockingDownloadTransfer(cursor)) {
+        void download(cursor);
+        return true;
+      }
+    }
+    return false;
+  }
+
   function toggleCheck(key: string, index: number, shiftKey: boolean) {
     const next = new Set(checkedKeys);
     const lastIdx = lastCheckedKey
@@ -3447,7 +3532,19 @@
     e.preventDefault();
     if (checkedCount > 0) copyCheckedLinks();
     else requestCopyAllLinks();
+    return;
   }
+  // Already answered by the control that has focus (the tab strip, a sort
+  // header), or meant for a field, a dialog or a menu.
+  if (e.defaultPrevented) return;
+  const target = e.target as HTMLElement | null;
+  const typing = target && (
+    (target.tagName === 'INPUT' && (target as HTMLInputElement).type !== 'checkbox') ||
+    target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable
+  );
+  if (typing || confirmOpen || networkAlertOpen || selectedResult || contextMenu || showColumnMenu) return;
+  if (target?.closest('.chat-dock') || document.querySelector('[aria-modal="true"]')) return;
+  if (handleResultsKeydown(e)) e.preventDefault();
 }} />
 
 <div class="page-header">
@@ -4027,10 +4124,12 @@
             class:row-alt={(idx & 1) === 1}
             class:spam-row={result.is_spam}
             class:row-checked={checkedKeys.has(rKey)}
+            class:row-cursor={cursorKey === rKey}
             class:in-library-row={isInLibraryOnly(result)}
             class:history-completed-row={!isInLibraryOnly(result) && downloadHistoryMap[result.file.hash] === 'completed'}
             class:history-cancelled-row={!isInLibraryOnly(result) && downloadHistoryMap[result.file.hash] === 'cancelled'}
-            oncontextmenu={(e) => showContextMenu(e, result)}
+            oncontextmenu={(e) => { cursorKey = rKey; showContextMenu(e, result); }}
+            onclick={() => (cursorKey = rKey)}
             ondblclick={(e) => {
               if ((e.target as HTMLElement).closest('input, button')) return;
               if (!blockingDl) download(result);
@@ -5202,6 +5301,13 @@
 
   :global(tr.row-checked td) {
     background: var(--table-row-selected) !important;
+  }
+  /* The keyboard cursor: an outline, so it reads on ticked and unticked rows alike. */
+  tr.row-cursor td {
+    box-shadow: inset 0 1px 0 var(--accent), inset 0 -1px 0 var(--accent);
+  }
+  tr.row-cursor td:first-child {
+    box-shadow: inset 2px 0 0 var(--accent), inset 0 1px 0 var(--accent), inset 0 -1px 0 var(--accent);
   }
 
   .col-check {

@@ -138,11 +138,16 @@ async fn run(app: tauri::AppHandle) {
         }
 
         let working = count_working_transfers(&state).await;
+        let pending = crate::finish_action::pending_downloads(&*state.transfer_manager.read().await);
+        crate::finish_action::tick(&app, pending);
         // `sleep_inhibit_supported` is part of the condition rather than only a
         // display flag: on a platform with no implementation `set` is a no-op,
         // so without it `holding_wake_lock` would report an inhibitor that was
         // never taken.
-        let want_awake = sleep_inhibit_supported && prevent_sleep && working > 0;
+        let want_awake = sleep_inhibit_supported
+            && prevent_sleep
+            && working > 0
+            && !crate::finish_action::wake_lock_held_off();
         if want_awake != holding_wake_lock {
             wake_lock.set(want_awake);
             holding_wake_lock = want_awake;
@@ -239,6 +244,16 @@ fn tray_tooltip(state: &AppState, working: usize) -> String {
     if let Some(secs) = crate::auto_update::silent::countdown_remaining_secs() {
         return format!(
             "Ember\n\u{27F3} {}",
+            crate::auto_update::silent::format_countdown(secs)
+        );
+    }
+    if let Some((action, secs)) = crate::finish_action::countdown_remaining_secs() {
+        let symbol = match action {
+            crate::finish_action::FinishAction::Sleep => '\u{263E}',
+            _ => '\u{2715}',
+        };
+        return format!(
+            "Ember\n{symbol} {}",
             crate::auto_update::silent::format_countdown(secs)
         );
     }
