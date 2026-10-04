@@ -830,12 +830,21 @@ async fn preserve_failed_partial(
 /// lets it go — and what stops a finished file's `.part` whose removal failed
 /// after a copy from staying behind in it for good. The folders are swept in
 /// parallel, each for at most [`ORPHAN_SWEEP_FOLDER_BUDGET`].
+///
+/// With [`OrphanDisposal::SetAside`] a download's part files are moved into
+/// one `Temp/orphaned-<timestamp>/` folder per download folder instead of
+/// being removed; room transfers' are removed either way.
+///
+/// Returns whether every folder was swept to the end: not when one could not
+/// be reached or read, was given up on, or held an orphan that could be
+/// neither removed nor set aside.
 pub async fn sweep_orphan_part_files(
     download_roots: &[String],
     known_ids: &std::collections::HashSet<String>,
     db: &Database,
     cutoff: std::time::SystemTime,
-) {
+    disposal: OrphanDisposal,
+) -> bool {
     // Read once, up front, instead of querying per file. This runs inline on
     // the network task's startup gate, so a Temp directory full of stale
     // partials used to mean thousands of blocking queries before the loop
@@ -852,40 +861,147 @@ pub async fn sweep_orphan_part_files(
         }
     };
     let owns_partial = &owns_partial;
-    futures::future::join_all(download_roots.iter().map(|download_folder| async move {
-        let sweep = sweep_orphan_part_files_in(download_folder, known_ids, owns_partial, cutoff);
-        if tokio::time::timeout(ORPHAN_SWEEP_FOLDER_BUDGET, sweep).await.is_err() {
-            tracing::warn!("Orphan sweep: gave up on {download_folder}, which is not answering");
+    let set_aside_in = match disposal {
+        OrphanDisposal::Delete => None,
+        OrphanDisposal::SetAside => Some(format!(
+            "orphaned-{}",
+            chrono::Local::now().format("%Y%m%d-%H%M%S")
+        )),
+    };
+    let set_aside_in = set_aside_in.as_deref();
+    let swept = futures::future::join_all(download_roots.iter().map(|download_folder| async move {
+        let sweep = sweep_orphan_part_files_in(
+            download_folder,
+            known_ids,
+            owns_partial,
+            cutoff,
+            set_aside_in,
+        );
+        match tokio::time::timeout(ORPHAN_SWEEP_FOLDER_BUDGET, sweep).await {
+            Ok(complete) => complete,
+            Err(_) => {
+                tracing::warn!("Orphan sweep: gave up on {download_folder}, which is not answering");
+                false
+            }
         }
     }))
     .await;
+    swept.into_iter().all(|complete| complete)
+}
+
+/// What the startup sweep does with a download's part files that nothing
+/// claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanDisposal {
+    Delete,
+    /// `ember.db` was replaced, by corruption recovery or a restore, so a
+    /// download it does not list may still be one the user wants: only the
+    /// database that knew about it is gone.
+    SetAside,
+}
+
+/// In the data folder from a launch that replaced `ember.db` until a sweep
+/// has set aside every orphan in every download folder. A folder that was
+/// offline or given up on then is still swept that way once it is back,
+/// instead of having its orphans removed by a later, ordinary launch.
+const SET_ASIDE_ORPHANS_MARKER: &str = "set-aside-orphans";
+
+impl OrphanDisposal {
+    /// How this launch's sweep treats orphans. Blocking.
+    pub fn at_startup(data_dir: &Path, db_replaced: bool) -> Self {
+        let marker = data_dir.join(SET_ASIDE_ORPHANS_MARKER);
+        if db_replaced {
+            if let Err(error) = std::fs::write(&marker, b"") {
+                tracing::warn!(
+                    "Could not record that orphans are to be set aside at {}: {error}",
+                    marker.display()
+                );
+            }
+            return Self::SetAside;
+        }
+        if marker.exists() {
+            Self::SetAside
+        } else {
+            Self::Delete
+        }
+    }
+
+    /// Record that a [`Self::SetAside`] sweep reached every orphan. Blocking.
+    pub fn set_aside_finished(data_dir: &Path) {
+        let marker = data_dir.join(SET_ASIDE_ORPHANS_MARKER);
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!("Could not remove {}: {error}", marker.display()),
+        }
+    }
 }
 
 /// An offline network share can hold every call into it for tens of seconds.
 const ORPHAN_SWEEP_FOLDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Move `path`, a part file in `<download_folder>/Temp`, into
+/// `<download_folder>/Temp/<folder>/` under its own name. Blocking.
+fn set_aside_orphan(
+    path: &Path,
+    download_folder: &Path,
+    folder: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let allowed = vec![download_folder.to_string_lossy().into_owned()];
+    let Some((verified, identity)) = pin_cleanup_target(path, &allowed)? else {
+        anyhow::bail!("{} is gone", path.display());
+    };
+    let name = verified
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{} has no file name", verified.display()))?
+        .to_owned();
+    let aside = crate::security::filesystem::prepare_approved_subdir(
+        &download_folder.join("Temp"),
+        folder,
+        &allowed,
+    )?;
+    crate::network::ed2k::transfer::move_part_to_final_approved(
+        &verified,
+        &aside.join(name),
+        download_folder,
+        &identity,
+    )
+}
 
 async fn sweep_orphan_part_files_in(
     download_folder: &str,
     known_ids: &std::collections::HashSet<String>,
     owns_partial: &std::collections::HashSet<String>,
     cutoff: std::time::SystemTime,
-) {
+    set_aside_in: Option<&str>,
+) -> bool {
     let temp_dir = std::path::PathBuf::from(download_folder).join("Temp");
     if !tokio::fs::metadata(&temp_dir).await.is_ok_and(|m| m.is_dir()) {
-        return;
+        // No `Temp` holds no orphans; a folder that is not there may.
+        return tokio::fs::metadata(download_folder).await.is_ok();
     }
     let mut entries = match tokio::fs::read_dir(&temp_dir).await {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!("Orphan sweep: failed to read {}: {e}", temp_dir.display());
-            return;
+            return false;
         }
     };
     let mut swept_part: u32 = 0;
     let mut swept_met: u32 = 0;
+    let mut set_aside: u32 = 0;
     let mut skipped_known: u32 = 0;
     let mut failed: u32 = 0;
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(e) => {
+                failed += 1;
+                tracing::warn!("Orphan sweep: stopped reading {}: {e}", temp_dir.display());
+                break;
+            }
+        };
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -926,6 +1042,39 @@ async fn sweep_orphan_part_files_in(
             skipped_known += 1;
             continue;
         }
+        if let Some(folder) = set_aside_in.filter(|_| !room_xfer) {
+            let moved = tokio::task::spawn_blocking({
+                let (path, root, folder) =
+                    (path.clone(), std::path::PathBuf::from(download_folder), folder.to_string());
+                move || set_aside_orphan(&path, &root, &folder)
+            })
+            .await;
+            match moved {
+                Ok(Ok(aside)) => {
+                    set_aside += 1;
+                    tracing::warn!(
+                        "Orphan sweep: the database was replaced, so {} is kept as {}",
+                        path.display(),
+                        aside.display()
+                    );
+                }
+                Ok(Err(error)) => {
+                    failed += 1;
+                    tracing::warn!(
+                        "Orphan sweep: could not set aside {}, leaving it: {error:#}",
+                        path.display()
+                    );
+                }
+                Err(error) => {
+                    failed += 1;
+                    tracing::warn!(
+                        "Orphan sweep set-aside task failed for {}: {error}",
+                        path.display()
+                    );
+                }
+            }
+            continue;
+        }
         let allowed = vec![download_folder.to_string()];
         let deletion = tokio::task::spawn_blocking({
             let path = path.clone();
@@ -958,12 +1107,13 @@ async fn sweep_orphan_part_files_in(
             }
         }
     }
-    if swept_part > 0 || swept_met > 0 || failed > 0 {
+    if swept_part > 0 || swept_met > 0 || set_aside > 0 || failed > 0 {
         tracing::info!(
-            "Orphan sweep finished: removed {swept_part} .part and {swept_met} .part.met file(s) from {} ({skipped_known} skipped — still in use, {failed} failed to delete)",
+            "Orphan sweep finished: removed {swept_part} .part and {swept_met} .part.met file(s) and set aside {set_aside} from {} ({skipped_known} skipped — still in use, {failed} failed)",
             temp_dir.display()
         );
     }
+    failed == 0
 }
 
 #[tauri::command]
@@ -3116,8 +3266,14 @@ mod ipc_lifecycle_tests {
         std::fs::write(&owned, b"unfinished").unwrap();
         let known: std::collections::HashSet<String> = [live.to_string()].into();
 
-        super::sweep_orphan_part_files(&folders.roots(), &known, &db, std::time::UNIX_EPOCH)
-            .await;
+        super::sweep_orphan_part_files(
+            &folders.roots(),
+            &known,
+            &db,
+            std::time::UNIX_EPOCH,
+            super::OrphanDisposal::Delete,
+        )
+        .await;
         for file in &orphans {
             assert!(
                 file.exists(),
@@ -3127,7 +3283,14 @@ mod ipc_lifecycle_tests {
         }
 
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        super::sweep_orphan_part_files(&folders.roots(), &known, &db, later).await;
+        super::sweep_orphan_part_files(
+            &folders.roots(),
+            &known,
+            &db,
+            later,
+            super::OrphanDisposal::Delete,
+        )
+        .await;
         for file in &orphans {
             assert!(!file.exists(), "{}", file.display());
         }
@@ -3313,9 +3476,141 @@ mod ipc_lifecycle_tests {
         std::fs::write(&room_part, b"fresh").unwrap();
 
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
-        super::sweep_orphan_part_files(&folders.roots(), &Default::default(), &db, later).await;
+        super::sweep_orphan_part_files(
+            &folders.roots(),
+            &Default::default(),
+            &db,
+            later,
+            super::OrphanDisposal::Delete,
+        )
+        .await;
         assert!(part.exists());
         assert!(room_part.exists());
+        drop(db);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// The set-aside folders a sweep made in `temp`.
+    fn set_aside_folders(temp: &Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(temp)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("orphaned-"))
+            })
+            .collect()
+    }
+
+    /// A replaced database lists none of the downloads still in progress, so
+    /// their part files are moved aside, not deleted, and an ordinary sweep
+    /// afterwards leaves them there.
+    #[tokio::test]
+    async fn after_the_database_was_replaced_the_startup_sweep_sets_orphans_aside() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (folders, base) = approved_old_and_new_folders("set-aside");
+        let db = test_db(&base);
+        let new_temp = folders.current.join("Temp");
+        let old_temp = folders.previous[0].join("Temp");
+        let (unlisted, listed) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let unlisted_files = [
+            new_temp.join(format!("{unlisted}.part")),
+            new_temp.join(format!("{unlisted}.part.met")),
+            old_temp.join(format!("{unlisted}.part")),
+        ];
+        for file in &unlisted_files {
+            std::fs::write(file, b"progress").unwrap();
+        }
+        let owned = new_temp.join(format!("{listed}.part"));
+        std::fs::write(&owned, b"unfinished").unwrap();
+        let room_part = new_temp.join(format!("ember-xfer-{}.part", "cd".repeat(16)));
+        std::fs::write(&room_part, b"room").unwrap();
+        let known: std::collections::HashSet<String> = [listed.to_string()].into();
+
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let complete = super::sweep_orphan_part_files(
+            &folders.roots(),
+            &known,
+            &db,
+            later,
+            super::OrphanDisposal::SetAside,
+        )
+        .await;
+
+        assert!(complete);
+        for file in &unlisted_files {
+            assert!(!file.exists(), "{}", file.display());
+            let temp = file.parent().unwrap();
+            let aside = set_aside_folders(temp);
+            assert_eq!(aside.len(), 1, "{aside:?}");
+            let kept = aside[0].join(file.file_name().unwrap());
+            assert_eq!(std::fs::read(&kept).unwrap(), b"progress", "{}", kept.display());
+        }
+        assert!(owned.exists(), "a download still in the list keeps its part where it is");
+        assert!(!room_part.exists(), "a room transfer never outlives the run that started it");
+
+        super::sweep_orphan_part_files(
+            &folders.roots(),
+            &known,
+            &db,
+            later,
+            super::OrphanDisposal::Delete,
+        )
+        .await;
+        let aside = set_aside_folders(&new_temp);
+        assert!(aside[0].join(format!("{unlisted}.part")).exists());
+        assert!(aside[0].join(format!("{unlisted}.part.met")).exists());
+        drop(db);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Orphans are set aside from the launch that replaced the database until
+    /// a sweep has reached every download folder, so one that was not there
+    /// then is not swept by deletion when it comes back.
+    #[tokio::test]
+    async fn orphans_are_set_aside_until_a_sweep_reaches_every_download_folder() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (folders, base) = approved_old_and_new_folders("set-aside-marker");
+        let data = base.join("data");
+        let db = test_db(&base);
+        use super::OrphanDisposal;
+
+        assert_eq!(OrphanDisposal::at_startup(&data, false), OrphanDisposal::Delete);
+        assert_eq!(OrphanDisposal::at_startup(&data, true), OrphanDisposal::SetAside);
+        assert_eq!(
+            OrphanDisposal::at_startup(&data, false),
+            OrphanDisposal::SetAside,
+            "the next launch still sets aside"
+        );
+
+        let mut roots = folders.roots();
+        roots.push(base.join("unplugged").to_string_lossy().into_owned());
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let complete = super::sweep_orphan_part_files(
+            &roots,
+            &Default::default(),
+            &db,
+            later,
+            OrphanDisposal::SetAside,
+        )
+        .await;
+        assert!(!complete, "a download folder that is not there was not swept");
+        let complete = super::sweep_orphan_part_files(
+            &folders.roots(),
+            &Default::default(),
+            &db,
+            later,
+            OrphanDisposal::SetAside,
+        )
+        .await;
+        assert!(complete);
+
+        OrphanDisposal::set_aside_finished(&data);
+        assert_eq!(OrphanDisposal::at_startup(&data, false), OrphanDisposal::Delete);
         drop(db);
         let _ = std::fs::remove_dir_all(base);
     }

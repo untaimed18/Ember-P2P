@@ -425,6 +425,22 @@ pub fn run_update_watchdog_if_requested() -> bool {
     auto_update::watchdog::run_if_requested()
 }
 
+/// Tell the user why Ember is about to exit when that happens before any
+/// window exists. Blocks until the dialog is dismissed. The text is English:
+/// the translations live in the frontend, which never loaded.
+///
+/// `rfd`'s synchronous dialog rather than the dialog plugin's
+/// `blocking_show`, whose dialog is shown through the event loop that
+/// `setup` runs ahead of, so on macOS it would wait on this thread forever.
+fn show_fatal_startup_dialog(message: &str) {
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Ember cannot start")
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Give async tasks a larger worker-thread stack than tokio's 2 MiB default.
@@ -766,7 +782,12 @@ pub fn run() {
 
             let db = Arc::new(
                 Database::new(&app_handle).map_err(|e| {
-                    tracing::error!("Failed to initialize database: {e}");
+                    tracing::error!("Failed to initialize database: {e:#}");
+                    let failure = storage::database::OpenFailure::of(&e);
+                    show_fatal_startup_dialog(&failure.message(
+                        &storage::paths::resolve_data_dir_with_app(&app_handle),
+                        &e,
+                    ));
                     e
                 })?,
             );
@@ -777,6 +798,10 @@ pub fn run() {
             })?;
             let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
             std::fs::create_dir_all(&data_dir)?;
+            let orphan_disposal = commands::transfers::OrphanDisposal::at_startup(
+                &data_dir,
+                restore_applied || db.corrupt_backup.is_some(),
+            );
             // Before the network task starts and before the window is shown:
             // both come back the way an update restart left them.
             auto_update::watchdog::schedule_cleanup(&data_dir);
@@ -815,14 +840,16 @@ pub fn run() {
                 emule_import::apply::pending_root_additions(&data_dir, emule_import.as_ref());
             // The backup deliberately leaves out `approved_roots.json`, whose
             // records bind folders to one machine's file identities, so the
-            // folders a restore just brought back are approved here, as the
-            // ones an eMule import names are. Left out, a restore onto a new
-            // install kept them configured but unapproved: every download
-            // refused its target and every upload its file.
+            // download folders a restore just brought back are approved here,
+            // as the ones an eMule import names are. Left out, a restore onto
+            // a new install kept them configured but unapproved, and every
+            // download refused its target. Its shared folders are not: an
+            // archive is not the user picking a folder to share, so they wait
+            // in the Library for the user to re-approve them.
             if restore_applied {
-                for root in &configured_roots {
-                    if !import_roots.contains(root) {
-                        import_roots.push(root.clone());
+                for root in settings.download_roots() {
+                    if !import_roots.contains(&root) {
+                        import_roots.push(root);
                     }
                 }
             }
@@ -2171,6 +2198,7 @@ pub fn run() {
                         local_index: net_index,
                         fresh_part_hashes: net_fresh_part_hashes,
                         db: net_db,
+                        orphan_disposal,
                         transfer_manager: net_transfers,
                         bandwidth_limiter: net_bw,
                         shared_peers: cached_peers_net,

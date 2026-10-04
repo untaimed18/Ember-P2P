@@ -261,6 +261,8 @@ pub struct NetworkDeps {
     pub fresh_part_hashes: Arc<RwLock<HashMap<[u8; 16], Vec<[u8; 16]>>>>,
     /// Application database (transfers, friends, chat, known files).
     pub db: Arc<Database>,
+    /// What the startup sweep does with part files `db` does not list.
+    pub orphan_disposal: crate::commands::transfers::OrphanDisposal,
 
     // --- Transfers and bandwidth ---
     /// Download/upload bookkeeping shared with the sharing manager.
@@ -309,6 +311,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         local_index,
         fresh_part_hashes,
         db,
+        orphan_disposal,
         transfer_manager,
         bandwidth_limiter,
         shared_peers,
@@ -2595,12 +2598,24 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let cutoff = std::time::SystemTime::now()
                     .checked_sub(std::time::Duration::from_secs(5))
                     .unwrap_or(std::time::UNIX_EPOCH);
-                let (roots, db) = (settings.download_roots(), db.clone());
+                let (roots, db, data_dir) =
+                    (settings.download_roots(), db.clone(), data_dir.clone());
                 tokio::spawn(async move {
-                    crate::commands::transfers::sweep_orphan_part_files(
-                        &roots, &known_ids, &db, cutoff,
+                    use crate::commands::transfers::OrphanDisposal;
+                    let complete = crate::commands::transfers::sweep_orphan_part_files(
+                        &roots,
+                        &known_ids,
+                        &db,
+                        cutoff,
+                        orphan_disposal,
                     )
                     .await;
+                    if complete && orphan_disposal == OrphanDisposal::SetAside {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            OrphanDisposal::set_aside_finished(&data_dir)
+                        })
+                        .await;
+                    }
                 });
             }
 

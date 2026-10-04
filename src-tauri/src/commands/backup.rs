@@ -201,8 +201,8 @@ const BACKUP_FILES: &[BackupFile] = &[
 /// it with no record at all when startup had just created it fresh. Either way
 /// every download failed with "target is outside the approved roots" and,
 /// unlike a shared folder, there was no in-app way to re-approve it. Skipping it
-/// means a restored profile re-runs the migration and approves the configured
-/// roots on *this* machine.
+/// means startup approves a restored profile's download folders on *this*
+/// machine.
 const LEGACY_IGNORED_FILES: &[&str] = &["approved_roots.json"];
 
 /// Zip entry holding the preferences the app window keeps in its own storage
@@ -2612,11 +2612,11 @@ fn mark_restore_applied(staging: &Path) -> bool {
 /// drive, on the very path this feature exists to serve.
 ///
 /// The media player is always cleared. Of the folders, only the download
-/// folder is touched. Shared folders that are missing right
-/// now are left alone on purpose: `initialize_approved_roots` already treats an
-/// absent root as offline and keeps its approval, so dropping them here would
-/// silently delete a user's shares whenever they restored with an external
-/// drive unplugged.
+/// folder is touched, and not when it is on a network share. Shared folders
+/// are left alone, missing or not: a restore does not approve them (see
+/// `run`), so nothing in them is shared until the user re-approves them in the
+/// Library, and dropping the missing ones here would silently delete a user's
+/// shares whenever they restored with an external drive unplugged.
 ///
 /// Edited as raw JSON on purpose: this runs before the config is loaded, and
 /// round-tripping it through AppSettings here would rewrite fields the
@@ -2658,7 +2658,12 @@ fn sanitize_restored_config(data_dir: &Path) {
         .and_then(|v| v.as_str())
         .map(str::to_owned)
     {
-        if !folder.is_empty() && std::fs::create_dir_all(Path::new(&folder)).is_err() {
+        // Creating anything on a share connects to its server and offers it the
+        // user's credentials, which an archive is not to bring about.
+        if !folder.is_empty()
+            && !crate::security::is_network_path(&folder)
+            && std::fs::create_dir_all(Path::new(&folder)).is_err()
+        {
             let fallback = directories::UserDirs::new()
                 .and_then(|dirs| dirs.download_dir().map(|d| d.join("Ember")))
                 .unwrap_or_else(|| data_dir.join("Downloads"));
@@ -3740,6 +3745,24 @@ mod tests {
             "",
             "a restored config must never name a program Ember will run"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restored_download_folder_on_a_network_share_is_not_created() {
+        let dir = scratch("sanitize-share");
+        let share = r"\\192.0.2.1\share\Ember";
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({ "download_folder": share })).unwrap(),
+        )
+        .unwrap();
+
+        sanitize_restored_config(&dir);
+
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+        assert_eq!(repaired["download_folder"].as_str().unwrap(), share);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -600,6 +600,82 @@ impl std::fmt::Display for CorruptDatabase {
 
 impl std::error::Error for CorruptDatabase {}
 
+/// `ember.db` was last written by a newer Ember, whose schema this build must
+/// not touch.
+#[derive(Debug)]
+struct SchemaTooNew(i64);
+
+impl std::fmt::Display for SchemaTooNew {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Database schema version {} is newer than this Ember build supports \
+             (max {MAX_SUPPORTED_SCHEMA_VERSION}). The database was likely written by a \
+             more recent version of Ember. Install that version to access this data; \
+             refusing to start to avoid corruption.",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for SchemaTooNew {}
+
+/// Why [`Database::new`] failed, as far as the person starting Ember can do
+/// something about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenFailure {
+    NewerVersion,
+    DiskFull,
+    Other,
+}
+
+impl OpenFailure {
+    pub fn of(error: &anyhow::Error) -> Self {
+        if error
+            .chain()
+            .any(|cause| cause.downcast_ref::<SchemaTooNew>().is_some())
+        {
+            return Self::NewerVersion;
+        }
+        let disk_full = error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(sqlite, _)) if sqlite.code == ErrorCode::DiskFull
+            ) || cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
+        });
+        if disk_full {
+            Self::DiskFull
+        } else {
+            Self::Other
+        }
+    }
+
+    /// What the dialog shown before Ember exits says.
+    pub fn message(self, data_dir: &std::path::Path, error: &anyhow::Error) -> String {
+        let data_dir = data_dir.display();
+        match self {
+            Self::NewerVersion => format!(
+                "Ember's database was last used by a newer version of Ember, and this \
+                 version cannot open it without risking your data.\n\n\
+                 Install the latest version of Ember to continue. Nothing has been changed.\n\n\
+                 Data folder: {data_dir}"
+            ),
+            Self::DiskFull => format!(
+                "The drive that holds Ember's data is full, so Ember cannot open its \
+                 database.\n\n\
+                 Free up some space on that drive, then start Ember again.\n\n\
+                 Data folder: {data_dir}"
+            ),
+            Self::Other => format!(
+                "Ember could not open its database.\n\n{error:#}\n\n\
+                 The log files in the logs folder of {data_dir} have the details."
+            ),
+        }
+    }
+}
+
 impl Database {
     pub fn new(app_handle: &tauri::AppHandle) -> anyhow::Result<Self> {
         let app_dir = paths::ensure_data_dir_with_app(app_handle)
@@ -1458,23 +1534,18 @@ impl Database {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL DEFAULT 0);",
         )?;
-        let version: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        // Not defaulted on failure: read as 0, a database of any version would
+        // have every migration run over it again.
+        let version: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |r| r.get(0),
+        )?;
 
         // Refuse to run against a database that was last opened by a newer
         // Ember build.
         if version > MAX_SUPPORTED_SCHEMA_VERSION {
-            anyhow::bail!(
-                "Database schema version {version} is newer than this Ember build supports \
-                 (max {MAX_SUPPORTED_SCHEMA_VERSION}). The database was likely written by a \
-                 more recent version of Ember. Install that version to access this data; \
-                 refusing to start to avoid corruption."
-            );
+            return Err(SchemaTooNew(version).into());
         }
 
         let set_version = |tx: &Connection, v: i64| -> anyhow::Result<()> {
@@ -1904,8 +1975,16 @@ impl Database {
                 .unwrap_or(0);
             if auto_vacuum == 0 {
                 // Must set the pragma, then VACUUM, for the file header to change.
-                conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
-                info!("Enabled incremental auto_vacuum on existing database (v21)");
+                // VACUUM rewrites the whole file, so it fails on a disk without
+                // that much room — every launch, were it fatal, for what only
+                // reclaims space.
+                match conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;") {
+                    Ok(()) => info!("Enabled incremental auto_vacuum on existing database (v21)"),
+                    Err(e) => warn!(
+                        "Could not enable incremental auto_vacuum on the existing database \
+                         (v21); continuing without it: {e}"
+                    ),
+                }
             }
             // Only drop a legacy snapshot this database already carried when
             // it was opened.
@@ -13902,6 +13981,81 @@ mod tests {
         );
         drop(after_crash);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn remove_scratch_db(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn a_database_from_a_newer_ember_is_refused_and_reported_as_such() {
+        let (db, path) = scratch_db("newer-schema");
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "UPDATE schema_version SET version = ?1",
+                params![MAX_SUPPORTED_SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        }
+        drop(db);
+
+        let error = Database::open_at(&path).err().expect("a newer schema is refused");
+        assert_eq!(OpenFailure::of(&error), OpenFailure::NewerVersion);
+        assert!(OpenFailure::NewerVersion
+            .message(std::path::Path::new("data"), &error)
+            .contains("newer version of Ember"));
+        remove_scratch_db(&path);
+    }
+
+    /// Read as version 0, it had every migration run over a database of any
+    /// version, a newer one included.
+    #[test]
+    fn a_schema_version_that_cannot_be_read_fails_the_open() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-unreadable-schema-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        remove_scratch_db(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE schema_version (v INTEGER NOT NULL);")
+                .unwrap();
+        }
+
+        let error = Database::open_at(&path).err().expect("the version is unreadable");
+        assert_eq!(OpenFailure::of(&error), OpenFailure::Other);
+        let conn = Connection::open(&path).unwrap();
+        let shared_files: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'shared_files'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared_files, 0, "no migration ran");
+        drop(conn);
+        remove_scratch_db(&path);
+    }
+
+    #[test]
+    fn a_full_disk_is_told_apart_from_other_open_failures() {
+        let sqlite_full = anyhow::Error::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        ));
+        assert_eq!(OpenFailure::of(&sqlite_full), OpenFailure::DiskFull);
+        let storage_full = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            .context("Failed to prepare data dir");
+        assert_eq!(OpenFailure::of(&storage_full), OpenFailure::DiskFull);
+        let denied = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(OpenFailure::of(&denied), OpenFailure::Other);
+        assert!(OpenFailure::Other
+            .message(std::path::Path::new("data"), &denied)
+            .contains("permission denied"));
     }
 
     fn scratch_db(tag: &str) -> (Database, std::path::PathBuf) {
