@@ -91,6 +91,7 @@
     copyToClipboard,
     formatCalendarDate,
     formatClockTime,
+    formatDateTime,
     insertMention,
     isAppVisible,
     mentionTokenAt,
@@ -2514,6 +2515,21 @@
       cancelReply();
       return;
     }
+    if (
+      e.key === 'ArrowUp' &&
+      !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey &&
+      inputText === '' &&
+      editingId === null
+    ) {
+      // Only the newest line we sent, even while it is still on its way: an
+      // older one is never what the key means, and `canEdit` refuses the rest.
+      const lastOwn = messages.findLast((line) => line.direction === 'sent');
+      if (lastOwn && canEdit(lastOwn)) {
+        e.preventDefault();
+        startEdit(lastOwn);
+      }
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -2821,7 +2837,10 @@
 
 {#snippet messageTimestamp(msg: ConvMessage)}
   <div class="bubble-time">
-    {formatClock(msg.timestamp)}
+    <time
+      datetime={msg.timestamp ? new Date(msg.timestamp * 1000).toISOString() : undefined}
+      title={msg.timestamp ? formatDateTime(msg.timestamp, { dateStyle: 'full', timeStyle: 'medium' }) : undefined}
+    >{formatClock(msg.timestamp)}</time>
     {#if (msg.edited_at ?? 0) > 0}
       <span class="bubble-edited" title={m.channels_edited_at({ time: formatTime(msg.edited_at ?? 0) })}>
         {m.channels_edited()}

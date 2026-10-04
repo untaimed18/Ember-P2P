@@ -488,6 +488,23 @@
   let typeFilter: TypeFilter = $state('All');
   let showDuplicatesOnly = $state(false);
   let showMissingOnly = $state(false);
+  type ShareScopeFilter = 'all' | 'friends_only' | 'unpublished' | 'hashing';
+  const VALID_SHARE_SCOPES = new Set<ShareScopeFilter>(['all', 'friends_only', 'unpublished', 'hashing']);
+  let shareScopeFilter = $state<ShareScopeFilter>('all');
+
+  /**
+   * The one sharing state a row is in, if any of the filterable ones.
+   *
+   * A friends-only file is never published by design, so it counts as
+   * friends-only rather than as waiting to be published.
+   */
+  function shareScopeOf(f: FileInfo): Exclude<ShareScopeFilter, 'all'> | null {
+    if (!f.hash) return 'hashing';
+    if (!f.shared) return null;
+    if (f.friends_only) return 'friends_only';
+    if (!f.shared_kad && !f.shared_ed2k && !f.shared_ember) return 'unpublished';
+    return null;
+  }
   let missingPathSet: Set<string> = $state(new Set());
   let missingScanTruncated = $state(false);
   let missingTotalCount = $state(0);
@@ -1367,7 +1384,9 @@
     const hasType = typeFilter !== 'All';
     const dupOnly = showDuplicatesOnly;
     const missOnly = showMissingOnly;
-    if (!hasFolder && !hasQuery && !hasType && !dupOnly && !missOnly) return files;
+    const scope = shareScopeFilter;
+    const hasScope = scope !== 'all';
+    if (!hasFolder && !hasQuery && !hasType && !dupOnly && !missOnly && !hasScope) return files;
     // Normalized once per pass rather than once per row: `isPathInFolder`
     // re-derived it from `folder` on every call.
     const normalizedFolder = hasFolder ? normalizePathForMatch(folder!) : '';
@@ -1377,11 +1396,22 @@
       if (hasType && f.matchType !== typeFilter) return false;
       if (dupOnly && (!f.hash || !duplicateHashes.has(f.hash))) return false;
       if (missOnly && !missingPathSet.has(f.path)) return false;
+      if (hasScope && shareScopeOf(f) !== scope) return false;
       return true;
     });
   });
 
-  let hasActiveLibraryFilters = $derived(!!filterFolder || !!searchQuery.trim() || typeFilter !== 'All' || showDuplicatesOnly || showMissingOnly);
+  /** Counts per sharing state, for the labels in the sharing-state filter. */
+  let shareScopeCounts = $derived.by(() => {
+    const counts: Record<Exclude<ShareScopeFilter, 'all'>, number> = { friends_only: 0, unpublished: 0, hashing: 0 };
+    for (const f of files) {
+      const scope = shareScopeOf(f);
+      if (scope) counts[scope]++;
+    }
+    return counts;
+  });
+
+  let hasActiveLibraryFilters = $derived(!!filterFolder || !!searchQuery.trim() || typeFilter !== 'All' || showDuplicatesOnly || showMissingOnly || shareScopeFilter !== 'all');
   let libraryHashedCount = $derived.by(() => {
     let hashed = 0;
     for (const f of files) if (f.hash) hashed++;
@@ -1399,6 +1429,7 @@
     typeFilter = 'All';
     showDuplicatesOnly = false;
     showMissingOnly = false;
+    shareScopeFilter = 'all';
   }
 
   // --- Multi-select ---
@@ -2721,6 +2752,9 @@
         if (typeof parsed.showDuplicatesOnly === 'boolean') {
           showDuplicatesOnly = parsed.showDuplicatesOnly;
         }
+        if (typeof parsed.shareScopeFilter === 'string' && VALID_SHARE_SCOPES.has(parsed.shareScopeFilter as ShareScopeFilter)) {
+          shareScopeFilter = parsed.shareScopeFilter as ShareScopeFilter;
+        }
         // Restore "missing only" only if the user actually has missing
         // files; otherwise the toggle would re-enable a filter that
         // immediately matches zero rows. The clearing in the onMount
@@ -2767,6 +2801,7 @@
         sortAsc,
         showDuplicatesOnly,
         showMissingOnly,
+        shareScopeFilter,
         topPanelOpen,
         topPanelMetric,
         topPanelScope,
@@ -2778,7 +2813,7 @@
   $effect(() => {
     if (!filtersRestored) return;
     // Track dependencies explicitly so this effect re-runs when any filter/sort changes.
-    void typeFilter; void filterFolder; void searchQuery; void sortField; void sortAsc; void showDuplicatesOnly; void showMissingOnly;
+    void typeFilter; void filterFolder; void searchQuery; void sortField; void sortAsc; void showDuplicatesOnly; void showMissingOnly; void shareScopeFilter;
     void topPanelOpen; void topPanelMetric; void topPanelScope; void expandedFolders;
     persistFilters();
   });
@@ -3230,6 +3265,12 @@
       {#each typeFilterOptions as opt}
         <option value={opt}>{fileTypeFilterLabel(opt)}</option>
       {/each}
+    </select>
+    <select class="filter-type" bind:value={shareScopeFilter} aria-label={m.library_scope_filter_aria()}>
+      <option value="all">{m.library_scope_all()}</option>
+      <option value="friends_only">{m.library_scope_friends_only()} ({formatNumber(shareScopeCounts.friends_only)})</option>
+      <option value="unpublished">{m.library_scope_unpublished()} ({formatNumber(shareScopeCounts.unpublished)})</option>
+      <option value="hashing">{m.library_scope_hashing()} ({formatNumber(shareScopeCounts.hashing)})</option>
     </select>
     <button
       class="dupes-toggle"

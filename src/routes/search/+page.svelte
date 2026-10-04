@@ -502,6 +502,7 @@
   // received (the count arrives on each hit as `file.complete_sources`).
   let filterMinComplete = $state<number | null>(null);
   let hideSpam = $state<boolean>(true);
+  let hideOwned = $state<boolean>(false);
 
   /**
    * Whether a result is effectively "already in the library" with nothing
@@ -962,6 +963,7 @@
         columnVis = next;
       }
       if (typeof p.hideSpam === 'boolean') hideSpam = p.hideSpam;
+      if (typeof p.hideOwned === 'boolean') hideOwned = p.hideOwned;
       if (typeof p.showAdvancedFilters === 'boolean') showAdvancedFilters = p.showAdvancedFilters;
       if (typeof p.sortField === 'string' && VALID_SORT_FIELDS.has(p.sortField as SortField)) {
         sortField = p.sortField as SortField;
@@ -991,6 +993,7 @@
         columnVis,
         columnVisRev: COLUMN_VIS_REV,
         hideSpam,
+        hideOwned,
         showAdvancedFilters,
         sortField,
         sortDir,
@@ -1006,7 +1009,7 @@
     void filterType; void filterColumn; void filterExtension;
     void filterMinSize; void filterMaxSize; void filterMinUnit; void filterMaxUnit;
     void filterMinSources; void filterMinComplete; void columnVis;
-    void hideSpam; void showAdvancedFilters;
+    void hideSpam; void hideOwned; void showAdvancedFilters;
     void sortField; void sortDir;
     persistPrefs();
   });
@@ -1567,12 +1570,18 @@
     const minComplete = Number.isFinite(minCompleteParsed) && minCompleteParsed > 0 ? minCompleteParsed : 0;
     const hasType = !!filterType;
     const spamHidden = hideSpam;
+    const ownedHidden = hideOwned;
 
     const out: SearchResult[] = [];
     let spamCount = 0;
+    let ownedCount = 0;
     for (const r of visibleResults) {
       if (r.is_spam) spamCount++;
       if (spamHidden && r.is_spam) continue;
+      if (ownedHidden && alreadyHave(r)) {
+        ownedCount++;
+        continue;
+      }
       if (hasType && resultType(r) !== filterType) continue;
       if (hasExt && (r.file.extension ?? '').toLowerCase() !== ext) continue;
       if (minBytes > 0 && r.file.size < minBytes) continue;
@@ -1649,11 +1658,20 @@
       return sortDir === 'asc' ? cmp : -cmp;
     });
 
-    return { rows: out, spamCount };
+    return { rows: out, spamCount, ownedCount };
   });
 
   let filteredResults: SearchResult[] = $derived(filterPass.rows);
   let spamHiddenCount = $derived(filterPass.spamCount);
+  let ownedHiddenCount = $derived(filterPass.ownedCount);
+
+  /** In the library, finished before, or already in Transfers. */
+  function alreadyHave(r: SearchResult): boolean {
+    if (r.result_origin?.includes('Local')) return true;
+    if (downloadHistoryMap[r.file.hash] === 'completed') return true;
+    const t = downloadsByHash.get(r.file.hash);
+    return !!t && (t.status === 'completed' || BLOCKING_DOWNLOAD_STATUSES.has(t.status));
+  }
 
   /* --- Row windowing ---------------------------------------------------
    *
@@ -3329,8 +3347,8 @@
   // reason that isn't covered by `hasActiveFilters`: Hide spam. When they
   // differ, the "(filtered from N)" suffix should show even if no explicit
   // filter chip is set, so the user understands why the table isn't showing
-  // the headline number. Library-only hits stay in the table; Hide spam is
-  // the only visibility rule that drops rows on its own.
+  // the headline number. Hide spam and Hide files I already have are the
+  // visibility rules that drop rows on their own.
   // Both sides come from `visibleResults`, not the live store list: mixing a
   // throttled count with an unthrottled one makes "showing X of Y" briefly
   // disagree with the rows actually on screen (and X - Y go negative).
@@ -3339,6 +3357,12 @@
     plural(visibleResults.length, {
       one: m.search_all_hidden_spam_one,
       other: () => m.search_all_hidden_spam_other({ count: formatNumber(visibleResults.length) }),
+    }),
+  );
+  let allHiddenOwnedLabel = $derived(
+    plural(visibleResults.length, {
+      one: m.search_all_hidden_owned_one,
+      other: () => m.search_all_hidden_owned_other({ count: formatNumber(visibleResults.length) }),
     }),
   );
   // `.mp3` / `.mp4` on Ember or KAD walk a key publishers almost never
@@ -3355,7 +3379,8 @@
     (filterMaxSize !== null ? 1 : 0) +
     (filterExtension !== '' ? 1 : 0) +
     (filterMinSources !== null ? 1 : 0) +
-    (filterMinComplete !== null ? 1 : 0)
+    (filterMinComplete !== null ? 1 : 0) +
+    (hideOwned ? 1 : 0)
   );
 
 </script>
@@ -3628,6 +3653,13 @@
               </div>
             {/if}
           </span>
+        </label>
+        <label class="filter-toggle" title={m.search_hide_owned_title()}>
+          <input type="checkbox" bind:checked={hideOwned} />
+          <span>{m.search_hide_owned()}</span>
+          {#if hideOwned && ownedHiddenCount > 0}
+            <span class="filter-count">({ownedHiddenCount})</span>
+          {/if}
         </label>
       </div>
 
@@ -4203,6 +4235,9 @@
           </div>
           <p class="empty-title">{m.search_no_results_filters()}</p>
           <button type="button" class="ghost empty-action" onclick={clearFilters}>{m.common_clear_filters()}</button>
+          {#if hideOwned && ownedHiddenCount > 0}
+            <button type="button" class="ghost empty-action" onclick={() => (hideOwned = false)}>{m.search_show_owned()}</button>
+          {/if}
         {:else}
           <div class="icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -4212,8 +4247,17 @@
               <line x1="1" y1="1" x2="23" y2="23"/>
             </svg>
           </div>
-          <p class="empty-title">{allHiddenSpamLabel}</p>
-          <button type="button" class="ghost empty-action" onclick={() => (hideSpam = false)}>{m.search_show_spam()}</button>
+          {@const spamHides = hideSpam && spamHiddenCount > 0}
+          {@const ownedHides = hideOwned && ownedHiddenCount > 0}
+          <p class="empty-title">
+            {spamHides && ownedHides ? m.search_no_results_filters() : spamHides ? allHiddenSpamLabel : allHiddenOwnedLabel}
+          </p>
+          {#if spamHides}
+            <button type="button" class="ghost empty-action" onclick={() => (hideSpam = false)}>{m.search_show_spam()}</button>
+          {/if}
+          {#if hideOwned && ownedHiddenCount > 0}
+            <button type="button" class="ghost empty-action" onclick={() => (hideOwned = false)}>{m.search_show_owned()}</button>
+          {/if}
         {/if}
       </div>
     {/if}

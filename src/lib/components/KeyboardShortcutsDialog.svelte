@@ -170,6 +170,8 @@
         { keys: [modifierKey, 'K'], label: () => m.shortcuts_channels_search() },
         { keys: ['↑ / ↓'], label: () => m.shortcuts_channels_search_navigate() },
         { keys: ['Enter'], label: () => m.shortcuts_channels_search_open() },
+        { keys: [modifierKey, 'F'], label: () => m.shortcuts_channels_find_messages() },
+        { keys: ['↑'], label: () => m.shortcuts_channels_edit_last() },
       ],
     },
   ]);

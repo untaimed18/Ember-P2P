@@ -26,6 +26,19 @@ function writeStoredTheme(t: Theme): void {
   }
 }
 
+function clearStoredTheme(): void {
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // Following the OS still applies for this session.
+  }
+}
+
+function storedThemeIsExplicit(): boolean {
+  const stored = readStoredTheme();
+  return stored === 'light' || stored === 'dark';
+}
+
 function prefersDark(): boolean {
   try {
     return window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -44,6 +57,9 @@ export function getInitialTheme(): Theme {
 }
 
 export const theme = writable<Theme>(getInitialTheme());
+
+/** True until the user picks Light or Dark; the OS decides meanwhile. */
+export const themeFollowsSystem = writable<boolean>(browser ? !storedThemeIsExplicit() : true);
 
 function applyThemeToDOM(t: Theme) {
   if (!browser) return;
@@ -67,6 +83,16 @@ function applyResolvedTheme(t: Theme) {
 export function applyTheme(t: Theme) {
   applyResolvedTheme(t);
   if (browser) writeStoredTheme(t);
+  themeFollowsSystem.set(false);
+}
+
+/** Drop the explicit choice, so the theme tracks the OS again. */
+export function followSystemTheme() {
+  const t: Theme = browser && prefersDark() ? 'dark' : 'light';
+  if (browser) clearStoredTheme();
+  applyResolvedTheme(t);
+  theme.set(t);
+  themeFollowsSystem.set(true);
 }
 
 let themeCleanup: (() => void) | null = null;
@@ -75,6 +101,7 @@ export function initTheme() {
   const t = getInitialTheme();
   applyResolvedTheme(t);
   theme.set(t);
+  if (browser) themeFollowsSystem.set(!storedThemeIsExplicit());
   // Important: do NOT persist `t` here. The OS-tracking branch in the
   // matchMedia handler below uses "is `STORAGE_KEY` unset?" as the
   // signal for "user has not made an explicit choice yet" — if we
@@ -91,8 +118,7 @@ export function initTheme() {
     if (themeCleanup) themeCleanup();
     const mq = window.matchMedia('(prefers-color-scheme: dark)');
     const handler = (e: MediaQueryListEvent) => {
-      const userChose = readStoredTheme();
-      if (!userChose) {
+      if (!storedThemeIsExplicit()) {
         const next: Theme = e.matches ? 'dark' : 'light';
         applyResolvedTheme(next);
         theme.set(next);

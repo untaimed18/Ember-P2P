@@ -1418,7 +1418,7 @@
   // only those near the viewport are mounted. The whole ledger is reachable;
   // it used to stop at its first 1,000 rows.
   let bottomPaneEl: HTMLDivElement | undefined = $state(undefined);
-  const queueWindow = new TableWindow(() => sortedUploadQueueClients.length, {
+  const queueWindow = new TableWindow(() => filteredUploadQueueClients.length, {
     minRows: 150,
     rowHeight: 28,
     rowSelector: 'tr.queue-row',
@@ -1742,7 +1742,22 @@
     });
     return sorted;
   });
-  let windowedQueueClients = $derived(queueWindow.slice(sortedUploadQueueClients));
+  /** Matches the peer's name, user hash or IP, its client software, the file
+   *  it waits for, or its country code. */
+  let queueFilter = $state('');
+  let filteredUploadQueueClients = $derived.by(() => {
+    const q = queueFilter.trim().toLowerCase();
+    if (!q) return sortedUploadQueueClients;
+    return sortedUploadQueueClients.filter((c) =>
+      c.file_name.toLowerCase().includes(q)
+      || (c.peer_name || '').toLowerCase().includes(q)
+      || (c.user_hash || '').toLowerCase().includes(q)
+      || (c.peer_ip || '').toLowerCase().includes(q)
+      || (c.client_software || '').toLowerCase().includes(q)
+      || (c.country_code || '').toLowerCase().includes(q)
+    );
+  });
+  let windowedQueueClients = $derived(queueWindow.slice(filteredUploadQueueClients));
 
   // --- Sorting ---
   type DlSortField = 'file_name' | 'total_size' | 'transferred' | 'completed_size' | 'speed' | 'progress' | 'sources' | 'priority' | 'status' | 'remaining' | 'last_seen_complete' | 'last_received' | 'category' | 'started_at';
@@ -4688,6 +4703,10 @@
         knownFilter = '';
         e.preventDefault();
         e.stopPropagation();
+      } else if (e.target instanceof HTMLInputElement && e.target.closest('.queue-search') && queueFilter) {
+        queueFilter = '';
+        e.preventDefault();
+        e.stopPropagation();
       }
     }
     return;
@@ -5582,6 +5601,37 @@
              passive (no per-row context-menu actions yet — eMule's queue
              doesn't really have any either, since promotion happens by
              score). -->
+        {#if uploadQueueClients.length > 0}
+          <div class="known-toolbar" role="group" aria-label={m.transfers_queue_filter_aria()}>
+            <label class="pill-search known-search queue-search">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                <circle cx="7" cy="7" r="4.5"/>
+                <line x1="10.5" y1="10.5" x2="14" y2="14"/>
+              </svg>
+              <input
+                type="text"
+                bind:value={queueFilter}
+                placeholder={m.transfers_queue_filter_placeholder()}
+                aria-label={m.transfers_queue_filter_aria()}
+              />
+              {#if queueFilter}
+                <button
+                  type="button"
+                  class="pill-search-clear"
+                  aria-label={m.transfers_known_clear_filter()}
+                  onclick={() => (queueFilter = '')}
+                ><IconX size={13} /></button>
+              {/if}
+            </label>
+            {#if queueFilter.trim() && filteredUploadQueueClients.length !== uploadQueueClients.length}
+              <div class="known-stats" aria-live="polite">
+                <span class="known-stat known-stat-match">
+                  {m.transfers_known_showing_label()} <strong>{filteredUploadQueueClients.length}</strong>
+                </span>
+              </div>
+            {/if}
+          </div>
+        {/if}
         <table
           class="transfer-table queue-table"
           bind:this={queueTableEl}
@@ -5692,6 +5742,17 @@
                     <p class="empty-sub">{m.transfers_loading_short()}</p>
                   </div>
                 {/if}
+              </td></tr>
+            {:else if filteredUploadQueueClients.length === 0}
+              <tr class="empty-row"><td colspan={queueColCount} class="empty-cell">
+                <div class="empty-state compact">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                  </svg>
+                  <p class="empty-title">{m.transfers_queue_no_matches()}</p>
+                  <button class="secondary empty-action" type="button" onclick={() => (queueFilter = '')}>{m.transfers_known_clear_filter()}</button>
+                </div>
               </td></tr>
             {/if}
           </tbody>

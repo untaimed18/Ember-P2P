@@ -95,7 +95,7 @@
   } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import { beforeNavigate } from '$app/navigation';
-  import { theme, applyTheme, type Theme } from '$lib/stores/theme';
+  import { theme, applyTheme, followSystemTheme, themeFollowsSystem, type Theme } from '$lib/stores/theme';
   import {
     locales,
     getLocale,
@@ -2507,13 +2507,39 @@
           <div class="field">
             <span class="field-label">{m.settings_theme_label()}</span>
             <div class="theme-picker">
+              <button
+                type="button"
+                class="theme-swatch"
+                class:selected={$themeFollowsSystem}
+                onclick={followSystemTheme}
+                aria-label={m.settings_theme_system_aria()}
+                aria-pressed={$themeFollowsSystem}
+              >
+                <div class="swatch-preview system-swatch">
+                  <div class="swatch-half light-swatch">
+                    <div class="swatch-sidebar"></div>
+                    <div class="swatch-content">
+                      <div class="swatch-line"></div>
+                      <div class="swatch-line short"></div>
+                    </div>
+                  </div>
+                  <div class="swatch-half dark-swatch">
+                    <div class="swatch-content">
+                      <div class="swatch-line"></div>
+                      <div class="swatch-line short"></div>
+                    </div>
+                  </div>
+                </div>
+                {#if $themeFollowsSystem}<span class="swatch-check">&#10003;</span>{/if}
+                <span class="swatch-label">{m.settings_theme_system()}</span>
+              </button>
             <button
               type="button"
               class="theme-swatch"
-              class:selected={$theme === 'light'}
+              class:selected={!$themeFollowsSystem && $theme === 'light'}
               onclick={() => setTheme('light')}
               aria-label={m.settings_theme_light_aria()}
-              aria-pressed={$theme === 'light'}
+              aria-pressed={!$themeFollowsSystem && $theme === 'light'}
             >
                 <div class="swatch-preview light-swatch">
                   <div class="swatch-sidebar"></div>
@@ -2522,16 +2548,16 @@
                     <div class="swatch-line short"></div>
                   </div>
                 </div>
-                {#if $theme === 'light'}<span class="swatch-check">&#10003;</span>{/if}
+                {#if !$themeFollowsSystem && $theme === 'light'}<span class="swatch-check">&#10003;</span>{/if}
                 <span class="swatch-label">{m.settings_theme_light()}</span>
               </button>
               <button
                 type="button"
                 class="theme-swatch"
-                class:selected={$theme === 'dark'}
+                class:selected={!$themeFollowsSystem && $theme === 'dark'}
                 onclick={() => setTheme('dark')}
                 aria-label={m.settings_theme_dark_aria()}
-                aria-pressed={$theme === 'dark'}
+                aria-pressed={!$themeFollowsSystem && $theme === 'dark'}
               >
                 <div class="swatch-preview dark-swatch">
                   <div class="swatch-sidebar"></div>
@@ -2540,7 +2566,7 @@
                     <div class="swatch-line short"></div>
                   </div>
                 </div>
-                {#if $theme === 'dark'}<span class="swatch-check">&#10003;</span>{/if}
+                {#if !$themeFollowsSystem && $theme === 'dark'}<span class="swatch-check">&#10003;</span>{/if}
                 <span class="swatch-label">{m.settings_theme_dark()}</span>
               </button>
             </div>
@@ -5724,6 +5750,12 @@
 
   .swatch-line.short {
     width: 60%;
+  }
+
+  .system-swatch .swatch-half {
+    flex: 1;
+    display: flex;
+    min-width: 0;
   }
 
   /* Light swatch colors */

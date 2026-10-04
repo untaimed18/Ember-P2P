@@ -292,6 +292,7 @@
   let deepLinkJoin = $state(false);
   /** In-room history search. Local only, so it finds what this device kept. */
   let searchOpen = $state(false);
+  let roomSearchEl: HTMLInputElement | undefined = $state();
   let searchQuery = $state('');
   let searchHits: ChannelMessageInfo[] = $state([]);
   let searching = $state(false);
@@ -711,7 +712,8 @@
   }
 
   /**
-   * Alt+↑/↓ steps through joined rooms; Ctrl/⌘+K searches the room list.
+   * Alt+↑/↓ steps through joined rooms; Ctrl/⌘+K searches the room list and
+   * Ctrl/⌘+F the open room's messages.
    *
    * On `document`, which runs ahead of the dock's `window` listener, and the
    * dock stands down on `defaultPrevented` — so claiming Ctrl+K here is what
@@ -729,8 +731,10 @@
       && (e.key === 'ArrowUp' || e.key === 'ArrowDown');
     const searchKey =
       (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isShortcutLetter(e, 'k');
+    const findKey =
+      (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isShortcutLetter(e, 'f');
     // Everything below costs a DOM query, and this runs on every keypress.
-    if (!menuKey && !roomStep && !searchKey) return;
+    if (!menuKey && !roomStep && !searchKey && !findKey) return;
     if (document.querySelector('[aria-modal="true"]')) return;
     const target = e.target instanceof HTMLElement ? e.target : null;
     if (target?.closest('.chat-dock')) return;
@@ -761,9 +765,23 @@
       if (next && next.channel_id !== selectedId) void selectChannel(next.channel_id);
       return;
     }
+    if (findKey) {
+      if (!selected) return;
+      e.preventDefault();
+      void openRoomSearch();
+      return;
+    }
     if (!listSearchEl) return;
     e.preventDefault();
     void focusListSearch();
+  }
+
+  /** Ctrl/⌘+F: opens the room's message search, or returns to it if open. */
+  async function openRoomSearch() {
+    searchOpen = true;
+    await tick();
+    roomSearchEl?.focus();
+    roomSearchEl?.select();
   }
 
   async function focusListSearch() {
@@ -3055,6 +3073,7 @@
               >
                 <input
                   bind:value={searchQuery}
+                  bind:this={roomSearchEl}
                   placeholder={m.channels_search_placeholder()}
                   aria-label={m.channels_search_room()}
                   use:autoFocus
