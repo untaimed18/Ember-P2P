@@ -2903,6 +2903,7 @@
   "error_peers_failed_load_pending_counts": "Falha ao carregar a contagem de mensagens na fila: {detail}",
   "error_peers_failed_load_messages": "Falha ao carregar mensagens: {detail}",
   "error_peers_failed_mark_messages_read": "Falha ao marcar as mensagens como lidas: {detail}",
+  "error_peers_failed_discard_message": "Não foi possível remover a mensagem que falhou: {detail}",
   "error_peers_failed_queue_message": "Falha ao enfileirar a mensagem: {detail}",
   "error_peers_failed_reject_friend_request": "Falha ao recusar o pedido de amizade: {detail}",
   "error_peers_failed_remove_friend": "Falha ao remover o amigo: {detail}",

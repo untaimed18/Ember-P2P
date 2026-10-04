@@ -2906,6 +2906,7 @@
   "error_peers_failed_load_pending_counts": "Anzahl wartender Nachrichten konnte nicht geladen werden: {detail}",
   "error_peers_failed_load_messages": "Nachrichten konnten nicht geladen werden: {detail}",
   "error_peers_failed_mark_messages_read": "Nachrichten konnten nicht als gelesen markiert werden: {detail}",
+  "error_peers_failed_discard_message": "Die fehlgeschlagene Nachricht konnte nicht entfernt werden: {detail}",
   "error_peers_failed_queue_message": "Nachricht konnte nicht eingereiht werden: {detail}",
   "error_peers_failed_reject_friend_request": "Freundschaftsanfrage konnte nicht abgelehnt werden: {detail}",
   "error_peers_failed_remove_friend": "Freund konnte nicht entfernt werden: {detail}",

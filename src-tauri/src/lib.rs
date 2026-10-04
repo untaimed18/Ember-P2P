@@ -2394,6 +2394,7 @@ pub fn run() {
             commands::peers::get_my_ember_hash,
             commands::peers::reset_friend_code,
             commands::peers::send_chat_message,
+            commands::peers::discard_failed_chat_message,
             commands::peers::get_chat_messages,
             commands::peers::is_chat_locked,
             commands::peers::mark_messages_read,

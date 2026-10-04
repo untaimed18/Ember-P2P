@@ -2903,6 +2903,7 @@
   "error_peers_failed_load_pending_counts": "Error al cargar el número de mensajes en cola: {detail}",
   "error_peers_failed_load_messages": "No se pudieron cargar los mensajes: {detail}",
   "error_peers_failed_mark_messages_read": "No se pudieron marcar los mensajes como leídos: {detail}",
+  "error_peers_failed_discard_message": "No se pudo quitar el mensaje fallido: {detail}",
   "error_peers_failed_queue_message": "Error al poner el mensaje en cola: {detail}",
   "error_peers_failed_reject_friend_request": "No se pudo rechazar la solicitud de amistad: {detail}",
   "error_peers_failed_remove_friend": "No se pudo eliminar al amigo: {detail}",

@@ -2,6 +2,7 @@
   import { onDestroy, tick, untrack } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
+    discardFailedChatMessage,
     getChatMessages,
     sendChatMessage,
     sendChatTyping,
@@ -331,8 +332,10 @@
    * are merged into the transcript only where it is drawn, by time.
    */
   let attachments: ChatAttachment[] = $state([]);
-  /** Picking and hashing a file can take a while for a large one. */
-  let attaching = $state(false);
+  /** Friends a file is being picked and hashed for, which takes a while for a
+   *  large one. Per friend: the hash outlives a switch to another chat. */
+  let attachingFor: string[] = $state([]);
+  let attaching = $derived(friendHash !== '' && attachingFor.includes(friendHash));
   let friendTyping = $state(false);
   let typingHoldTimer: ReturnType<typeof setTimeout> | null = null;
   let lastTypingSentOn = false;
@@ -1959,18 +1962,21 @@
 
   async function sendAttachment() {
     if (attaching || isChannel || !friendHash) return;
-    attaching = true;
+    const friend = friendHash;
+    attachingFor = [...attachingFor, friend];
     try {
-      const sentOne = await pickAndSendChatAttachment(friendHash);
-      if (sentOne) {
+      const sentOne = await pickAndSendChatAttachment(friend);
+      // Another chat may be open by now. Its card loads with that friend's
+      // attachment list when their chat is next opened.
+      if (sentOne && friendHash === friend) {
         upsertAttachment(sentOne);
         scrollToBottom();
       }
     } catch (e) {
       toastError(translateError(e));
     } finally {
-      attaching = false;
-      chatInputEl?.focus();
+      attachingFor = attachingFor.filter((hash) => hash !== friend);
+      if (friendHash === friend) chatInputEl?.focus();
     }
   }
 
@@ -2189,6 +2195,13 @@
     messages = messages.filter((message) => message.id !== msg.id);
     try {
       await deliverToFriend(h, restore.message);
+      // After the send, as on the room path: a delete that failed first
+      // would lose the text outright if the resend failed too.
+      if (msg.id > 0) {
+        await discardFailedChatMessage(h, msg.id).catch((e) =>
+          console.warn('ChatConversation: could not drop the abandoned message', e),
+        );
+      }
     } catch (e: unknown) {
       if (h === friendHash) {
         const next = [...messages];

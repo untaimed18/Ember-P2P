@@ -2903,6 +2903,7 @@
   "error_peers_failed_load_pending_counts": "Не удалось загрузить счётчики сообщений в очереди: {detail}",
   "error_peers_failed_load_messages": "Не удалось загрузить сообщения: {detail}",
   "error_peers_failed_mark_messages_read": "Не удалось отметить сообщения прочитанными: {detail}",
+  "error_peers_failed_discard_message": "Не удалось удалить неотправленное сообщение: {detail}",
   "error_peers_failed_queue_message": "Не удалось поставить сообщение в очередь: {detail}",
   "error_peers_failed_reject_friend_request": "Не удалось отклонить заявку в друзья: {detail}",
   "error_peers_failed_remove_friend": "Не удалось удалить друга: {detail}",

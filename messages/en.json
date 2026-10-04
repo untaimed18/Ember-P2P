@@ -2906,6 +2906,7 @@
   "error_peers_failed_load_pending_counts": "Failed to load queued message counts: {detail}",
   "error_peers_failed_load_messages": "Failed to load messages: {detail}",
   "error_peers_failed_mark_messages_read": "Failed to mark messages read: {detail}",
+  "error_peers_failed_discard_message": "Could not remove the failed message: {detail}",
   "error_peers_failed_queue_message": "Failed to queue message: {detail}",
   "error_peers_failed_reject_friend_request": "Failed to reject friend request: {detail}",
   "error_peers_failed_remove_friend": "Failed to remove friend: {detail}",

@@ -2903,6 +2903,7 @@
   "error_peers_failed_load_pending_counts": "加载排队消息数量失败：{detail}",
   "error_peers_failed_load_messages": "加载消息失败：{detail}",
   "error_peers_failed_mark_messages_read": "标记消息已读失败：{detail}",
+  "error_peers_failed_discard_message": "无法移除发送失败的消息：{detail}",
   "error_peers_failed_queue_message": "消息排队失败：{detail}",
   "error_peers_failed_reject_friend_request": "拒绝好友请求失败：{detail}",
   "error_peers_failed_remove_friend": "移除好友失败：{detail}",

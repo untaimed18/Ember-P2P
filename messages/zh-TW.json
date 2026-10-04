@@ -2903,6 +2903,7 @@
   "error_peers_failed_load_pending_counts": "載入排隊訊息數量失敗：{detail}",
   "error_peers_failed_load_messages": "載入訊息失敗：{detail}",
   "error_peers_failed_mark_messages_read": "標記訊息已讀失敗：{detail}",
+  "error_peers_failed_discard_message": "無法移除傳送失敗的訊息：{detail}",
   "error_peers_failed_queue_message": "訊息排隊失敗：{detail}",
   "error_peers_failed_reject_friend_request": "拒絕好友請求失敗：{detail}",
   "error_peers_failed_remove_friend": "移除好友失敗：{detail}",

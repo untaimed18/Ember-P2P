@@ -897,6 +897,31 @@ pub async fn send_chat_message(
     }
 }
 
+/// Drop a sent message the outbox gave up on, after Resend put its text out as
+/// a new one. Without this the failed copy came back on the next load, next to
+/// the one that was delivered.
+#[tauri::command]
+pub async fn discard_failed_chat_message(
+    state: tauri::State<'_, AppState>,
+    user_hash_hex: String,
+    id: i64,
+) -> Result<(), String> {
+    let canonical = user_hash_hex.to_lowercase();
+    parse_user_hash(&canonical)?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.delete_failed_chat_message(&canonical, id))
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| {
+            coded_ctx(
+                "peers_failed_discard_message",
+                "Failed to remove the failed message",
+                e,
+            )
+        })?;
+    Ok(())
+}
+
 #[derive(serde::Serialize)]
 pub struct ChatSendResult {
     /// `"delivered"` when the message reached a live session, `"queued"` when

@@ -2903,6 +2903,7 @@
   "error_peers_failed_load_pending_counts": "Impossibile caricare i conteggi messaggi in coda: {detail}",
   "error_peers_failed_load_messages": "Impossibile caricare i messaggi: {detail}",
   "error_peers_failed_mark_messages_read": "Impossibile segnare i messaggi come letti: {detail}",
+  "error_peers_failed_discard_message": "Impossibile rimuovere il messaggio non inviato: {detail}",
   "error_peers_failed_queue_message": "Impossibile accodare il messaggio: {detail}",
   "error_peers_failed_reject_friend_request": "Impossibile rifiutare la richiesta di amicizia: {detail}",
   "error_peers_failed_remove_friend": "Impossibile rimuovere l'amico: {detail}",

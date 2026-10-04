@@ -132,6 +132,11 @@ export async function sendChatMessage(
   return invoke('send_chat_message', { userHashHex, message });
 }
 
+/** Drop one of our sent messages the outbox gave up on, after resending it. */
+export async function discardFailedChatMessage(userHashHex: string, id: number): Promise<void> {
+  return invoke('discard_failed_chat_message', { userHashHex, id });
+}
+
 export async function getChatMessages(friendHash: string, limit?: number, beforeId?: number): Promise<ChatMessage[]> {
   return invoke('get_chat_messages', { friendHash, limit: limit ?? 50, beforeId: beforeId ?? null });
 }

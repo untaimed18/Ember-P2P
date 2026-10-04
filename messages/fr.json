@@ -2903,6 +2903,7 @@
   "error_peers_failed_load_pending_counts": "Échec du chargement du nombre de messages en attente : {detail}",
   "error_peers_failed_load_messages": "Échec du chargement des messages : {detail}",
   "error_peers_failed_mark_messages_read": "Échec du marquage des messages comme lus : {detail}",
+  "error_peers_failed_discard_message": "Impossible de retirer le message en échec : {detail}",
   "error_peers_failed_queue_message": "Échec de la mise en file d'attente du message : {detail}",
   "error_peers_failed_reject_friend_request": "Échec du rejet de la demande d'ami : {detail}",
   "error_peers_failed_remove_friend": "Échec de la suppression de l'ami : {detail}",

@@ -6775,6 +6775,18 @@ impl Database {
         Ok(out)
     }
 
+    /// Drop an outbound message the outbox gave up on, once its text has gone
+    /// out again as a new row. Only a failed one of ours: anything else may
+    /// still be delivered, or is the friend's own words.
+    pub fn delete_failed_chat_message(&self, friend_hash: &str, id: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            "DELETE FROM chat_messages
+             WHERE id = ?1 AND friend_hash = ?2 AND direction = 'sent' AND delivery = ?3",
+            params![id, friend_hash, CHAT_FAILED],
+        )? > 0)
+    }
+
     /// Move a stored outbound message between delivery states.
     pub fn set_chat_delivery(&self, id: i64, delivery: i64) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
@@ -13995,6 +14007,30 @@ mod tests {
         assert_eq!(matched, vec![true, true, false]);
         assert!(db.pending_chat_messages(&friend, 10).unwrap().is_empty());
         assert!(db.set_chat_delivery_many(&[], CHAT_DELIVERED).unwrap().is_empty());
+        drop_scratch_db(db, path);
+    }
+
+    /// Resend's cleanup removes only the copy the outbox gave up on: never a
+    /// message still on its way, and never one in another friend's chat.
+    #[test]
+    fn only_a_failed_sent_message_can_be_discarded() {
+        let (db, path) = scratch_db("chat-discard-failed");
+        let friend = "e6".repeat(8);
+        let failed = db.insert_pending_chat_message(&friend, "lost").expect("queue");
+        let queued = db.insert_pending_chat_message(&friend, "waiting").expect("queue");
+        db.set_chat_delivery(failed, CHAT_FAILED).expect("mark");
+
+        assert!(!db.delete_failed_chat_message(&"e7".repeat(8), failed).unwrap());
+        assert!(!db.delete_failed_chat_message(&friend, queued).unwrap());
+        assert!(db.delete_failed_chat_message(&friend, failed).unwrap());
+        assert!(!db.delete_failed_chat_message(&friend, failed).unwrap());
+        let left: Vec<i64> = db
+            .pending_chat_messages(&friend, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(left, vec![queued]);
         drop_scratch_db(db, path);
     }
 
