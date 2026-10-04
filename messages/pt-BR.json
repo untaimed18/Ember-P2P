@@ -774,6 +774,7 @@
   "deeplink_pending_other": "{count} links aguardam revisão.",
   "deeplink_pending_few": "{count} links aguardam revisão.",
   "deeplink_review_pending": "Revisar",
+  "error_transfers_still_verifying": "Este download ainda está sendo verificado após a reinicialização. Retome-o quando a verificação terminar.",
   "error_transfers_invalid_expected_aich": "O hash de integridade AICH deve ter exatamente 40 caracteres hexadecimais.",
   "error_deeplink_terminal_invalid": "Link profundo não suportado ou malformado",
   "library_drop_parent_confirm_title": "Compartilhar os arquivos soltos?",

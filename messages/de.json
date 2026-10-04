@@ -774,6 +774,7 @@
   "deeplink_pending_other": "{count} Links warten auf Überprüfung.",
   "deeplink_pending_few": "{count} Links warten auf Überprüfung.",
   "deeplink_review_pending": "Überprüfen",
+  "error_transfers_still_verifying": "Dieser Download wird nach dem Neustart noch geprüft. Setzen Sie ihn fort, sobald die Prüfung abgeschlossen ist.",
   "error_transfers_invalid_expected_aich": "Der AICH-Integritätshash muss aus genau 40 Hexadezimalzeichen bestehen.",
   "error_deeplink_terminal_invalid": "Nicht unterstützter oder ungültiger Deep Link",
   "library_drop_parent_confirm_title": "Abgelegte Dateien freigeben?",

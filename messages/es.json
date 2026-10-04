@@ -774,6 +774,7 @@
   "deeplink_pending_other": "Hay {count} enlaces pendientes de revisión.",
   "deeplink_pending_few": "Hay {count} enlaces pendientes de revisión.",
   "deeplink_review_pending": "Revisar",
+  "error_transfers_still_verifying": "Esta descarga aún se está comprobando tras el reinicio. Reanúdala cuando termine la comprobación.",
   "error_transfers_invalid_expected_aich": "El hash de integridad AICH debe tener exactamente 40 caracteres hexadecimales.",
   "error_deeplink_terminal_invalid": "Enlace profundo no compatible o con formato incorrecto",
   "library_drop_parent_confirm_title": "¿Compartir los archivos soltados?",

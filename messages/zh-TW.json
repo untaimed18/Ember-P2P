@@ -774,6 +774,7 @@
   "deeplink_pending_other": "有 {count} 個連結等待檢視。",
   "deeplink_pending_few": "有 {count} 個連結等待檢視。",
   "deeplink_review_pending": "檢視",
+  "error_transfers_still_verifying": "此下載在重新啟動後仍在檢查中。請在檢查完成後再繼續。",
   "error_transfers_invalid_expected_aich": "AICH 完整性雜湊必須恰好為 40 個十六進位制字元。",
   "error_deeplink_terminal_invalid": "不支援或格式錯誤的深層連結",
   "library_drop_parent_confirm_title": "共享拖放的檔案？",

@@ -774,6 +774,7 @@
   "deeplink_pending_other": "{count} liens sont en attente de vérification.",
   "deeplink_pending_few": "{count} liens sont en attente de vérification.",
   "deeplink_review_pending": "Examiner",
+  "error_transfers_still_verifying": "Ce téléchargement est encore en cours de vérification après le redémarrage. Reprenez-le une fois la vérification terminée.",
   "error_transfers_invalid_expected_aich": "Le hachage d’intégrité AICH doit comporter exactement 40 caractères hexadécimaux.",
   "error_deeplink_terminal_invalid": "Lien profond non pris en charge ou mal formé",
   "library_drop_parent_confirm_title": "Partager les fichiers déposés ?",

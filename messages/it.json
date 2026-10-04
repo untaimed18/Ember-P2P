@@ -774,6 +774,7 @@
   "deeplink_pending_other": "{count} link sono in attesa di revisione.",
   "deeplink_pending_few": "{count} link sono in attesa di revisione.",
   "deeplink_review_pending": "Rivedi",
+  "error_transfers_still_verifying": "Questo download è ancora in verifica dopo il riavvio. Riprendilo quando la verifica è terminata.",
   "error_transfers_invalid_expected_aich": "L'hash di integrità AICH deve essere di esattamente 40 caratteri esadecimali.",
   "error_deeplink_terminal_invalid": "Deep link non supportato o malformato",
   "library_drop_parent_confirm_title": "Condividere i file rilasciati?",

@@ -774,6 +774,7 @@
   "deeplink_pending_other": "{count} ссылок ожидают проверки.",
   "deeplink_pending_few": "{count} ссылки ожидают проверки.",
   "deeplink_review_pending": "Проверить",
+  "error_transfers_still_verifying": "Эта загрузка ещё проверяется после перезапуска. Возобновите её, когда проверка завершится.",
   "error_transfers_invalid_expected_aich": "Хеш целостности AICH должен содержать ровно 40 шестнадцатеричных символов.",
   "error_deeplink_terminal_invalid": "Неподдерживаемая или некорректная deep link",
   "library_drop_parent_confirm_title": "Открыть доступ к перетащенным файлам?",

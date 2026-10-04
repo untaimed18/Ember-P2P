@@ -2107,6 +2107,18 @@ pub async fn resume_transfer(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
+    // `resume` refuses this too; said here so the click is not silently lost.
+    if state
+        .transfer_manager
+        .read()
+        .await
+        .is_restore_verification_running(&transfer_id)
+    {
+        return Err(coded(
+            "transfers_still_verifying",
+            "This download is still being checked after restart. Resume it when the check finishes.",
+        ));
+    }
     let held_over = !start_held_over(&state, std::slice::from_ref(&transfer_id))
         .await
         .is_empty();
