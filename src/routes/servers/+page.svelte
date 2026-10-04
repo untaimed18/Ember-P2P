@@ -41,6 +41,8 @@
   let error: string | null = $state(null);
   let successMsg: string | null = $state(null);
   let confirmRemoveAll = $state(false);
+  /** Read when the dialog opens: the list empties while it is still fading out. */
+  let removeAllCount = $state(0);
   let confirmRemoveOpen = $state(false);
   let pendingRemoveServers: ServerInfo[] = $state([]);
 
@@ -210,11 +212,16 @@
     };
   });
 
-  async function refresh() {
+  /** Callers whose refresh was queued behind one in flight, settled by the re-run. */
+  let pendingRefreshWaiters: (() => void)[] = [];
+
+  async function refresh(): Promise<void> {
     if (!mounted) return;
     if (refreshInProgress) {
       pendingRefresh = true;
-      return;
+      // Settled by the re-run, not now: the manual Refresh reports success
+      // when this returns, and the pass in flight may predate the click.
+      return new Promise((resolve) => pendingRefreshWaiters.push(resolve));
     }
     refreshInProgress = true;
     pendingRefresh = false;
@@ -248,9 +255,14 @@
     } finally {
       loading = false;
       refreshInProgress = false;
+      const waiters = pendingRefreshWaiters;
+      pendingRefreshWaiters = [];
+      const settle = () => waiters.forEach((resolve) => resolve());
       if (pendingRefresh && mounted) {
         pendingRefresh = false;
-        void refresh();
+        void refresh().finally(settle);
+      } else {
+        settle();
       }
     }
   }
@@ -491,6 +503,7 @@
   }
 
   function handleRemoveAll() {
+    removeAllCount = servers.length;
     confirmRemoveAll = true;
   }
 
@@ -733,9 +746,10 @@
     await refresh();
   }
 
+  // `pendingRemoveServers` is left as it is (the next open replaces it): the
+  // dialog still shows its count while fading out, which read "Remove 0 servers".
   async function confirmPendingRemoval() {
     const pending = pendingRemoveServers;
-    pendingRemoveServers = [];
     if (pending.length === 1) await doRemoveServer(pending[0]);
     else if (pending.length > 1) await doRemoveSelected(pending);
   }
@@ -1449,7 +1463,7 @@
 <ConfirmDialog
   bind:open={confirmRemoveAll}
   title={m.servers_confirm_remove_all_title()}
-  message={m.servers_confirm_remove_all_message({ count: servers.length })}
+  message={m.servers_confirm_remove_all_message({ count: removeAllCount })}
   confirmLabel={m.servers_remove_all()}
   danger={true}
   onconfirm={doRemoveAll}
@@ -1464,7 +1478,6 @@
   confirmLabel={m.common_remove()}
   danger={true}
   onconfirm={confirmPendingRemoval}
-  oncancel={() => (pendingRemoveServers = [])}
 />
 
 <style>

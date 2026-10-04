@@ -332,10 +332,23 @@
   const LOADED_COLLECTION_DISPLAY_LIMIT = 1000;
 
   let collectionSearch = $state('');
+  // Debounced like the Library search: on a large library the filter below
+  // walks every hashed file, which on each keystroke made typing lag.
+  let collectionQuery = $state('');
+  $effect(() => {
+    const q = collectionSearch;
+    if (collectionQuery === '' || q === '') {
+      collectionQuery = q;
+      return;
+    }
+    const timer = setTimeout(() => (collectionQuery = q), 150);
+    return () => clearTimeout(timer);
+  });
+  let collectionNamesLower = $derived(hashedLibraryFiles.map((f) => f.name.toLowerCase()));
   let collectionFilteredFiles = $derived.by(() => {
-    const q = collectionSearch.trim().toLowerCase();
+    const q = collectionQuery.trim().toLowerCase();
     if (!q) return hashedLibraryFiles;
-    return hashedLibraryFiles.filter(f => f.name.toLowerCase().includes(q));
+    return hashedLibraryFiles.filter((_, i) => collectionNamesLower[i].includes(q));
   });
   let displayedCollectionFiles = $derived.by(() =>
     collectionFilteredFiles.slice(0, COLLECTION_PICKER_DISPLAY_LIMIT)
@@ -3563,7 +3576,7 @@
             </div>
           {/if}
           {#if collectionFilteredFiles.length === 0 && hashedLibraryFiles.length > 0}
-            <div class="coll-pick-empty">{m.library_coll_no_matches({ query: collectionSearch })}</div>
+            <div class="coll-pick-empty">{m.library_coll_no_matches({ query: collectionQuery })}</div>
           {:else if hashedLibraryFiles.length === 0}
             <div class="coll-pick-empty">{m.library_coll_no_hashed_files()}</div>
           {/if}

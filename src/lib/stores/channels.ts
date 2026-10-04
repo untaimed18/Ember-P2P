@@ -811,7 +811,16 @@ function carryPrefsToSuccessors(list: ChannelInfo[]): void {
   if (levels !== get(channelNotifyLevels)) channelNotifyLevels.set(levels);
 }
 
-export async function refreshChannels(): Promise<void> {
+let latestRefresh: Promise<void> | null = null;
+
+/** Resolves once the store holds a snapshot at least as new as this call. */
+export function refreshChannels(): Promise<void> {
+  const refresh = refreshChannelsOnce();
+  latestRefresh = refresh;
+  return refresh;
+}
+
+async function refreshChannelsOnce(): Promise<void> {
   const epoch = storeEpoch;
   const startRev = unreadRevision;
   const gen = ++refreshGen;
@@ -820,7 +829,11 @@ export async function refreshChannels(): Promise<void> {
   // snapshot was in flight. Applying it now would undo that newer merge, and
   // if the newer pass had already dropped a dirty flag, a stale unread could
   // land on a room the user just read or a bump that just arrived.
-  if (epoch !== storeEpoch || gen !== refreshGen) return;
+  if (epoch !== storeEpoch) return;
+  // Settled by the newer pass instead: a caller awaiting this one for a room
+  // that only just appeared (the toast that names it) would otherwise read a
+  // list still without that room.
+  if (gen !== refreshGen) return latestRefresh ?? undefined;
   // The database is authoritative for unread, but only as of the moment it was
   // read. A message arriving — or the user opening a room — while this call was
   // in flight moves *that room's* count after the snapshot, and a plain `set`

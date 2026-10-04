@@ -494,4 +494,28 @@ describe('unread counters', () => {
     expect(get(channels)[0].unread).toBe(1);
     expect(get(channels)[0].name).toBe('Fresh');
   });
+
+  it('settles an overtaken refresh only once the newer one has landed', async () => {
+    channels.set([]);
+    let releaseSecond!: (value: ChannelInfo[]) => void;
+    const secondSnap = new Promise<ChannelInfo[]>((resolve) => {
+      releaseSecond = resolve;
+    });
+    vi.mocked(listChannels)
+      .mockResolvedValueOnce([])
+      .mockImplementationOnce(() => secondSnap);
+
+    let firstSettled = false;
+    const first = refreshChannels().then(() => {
+      firstSettled = true;
+    });
+    const second = refreshChannels();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(firstSettled).toBe(false);
+
+    releaseSecond([room({ channel_id: A, name: 'New room' })]);
+    await first;
+    expect(get(channels).map((r) => r.name)).toEqual(['New room']);
+    await second;
+  });
 });

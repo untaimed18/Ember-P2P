@@ -514,8 +514,13 @@
       // Don't overwrite a prior KAD/server "found" summary with a single
       // peer timeout — failures still appear in the expanded source list.
       if (searchFoundIds.has(d.transfer_id)) return;
-      const label = d.kind === 'permanent' ? m.transfers_src_rejected() : d.kind === 'timeout' ? m.transfers_src_timed_out() : m.transfers_src_failed();
-      searchStatus.set(d.transfer_id, `${d.source} ${label}`);
+      const source = d.source;
+      const status = d.kind === 'permanent'
+        ? m.transfers_src_note_rejected({ source })
+        : d.kind === 'timeout'
+          ? m.transfers_src_note_timed_out({ source })
+          : m.transfers_src_note_failed({ source });
+      searchStatus.set(d.transfer_id, status);
       searchStatus = new Map(searchStatus);
     }).then((u) => { if (mounted) searchUnsubs.push(u); else u(); }).catch((e) => { console.error('Failed to subscribe to transfer:source-failed:', e); });
 
