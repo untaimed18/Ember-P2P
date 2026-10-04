@@ -1118,7 +1118,7 @@ pub(in crate::network) async fn on_server_tick(
         && state.server_connection.is_none()
         && state.preferred_ed2k_server.is_some()
     {
-        if state.server_reconnect_failures >= AUTO_CONNECT_MAX_FAILURES {
+        if server_auto_reconnect_gives_up(state.server_reconnect_failures, settings) {
             let (ip, port) = state.preferred_ed2k_server.clone().unwrap_or_default();
             abandon_server_auto_reconnect(
                 state,
@@ -1126,7 +1126,10 @@ pub(in crate::network) async fn on_server_tick(
                 &format!("could not reach preferred server {ip}:{port}"),
             );
         } else {
-        let backoff_secs = server_reconnect_backoff_secs(state.server_reconnect_failures);
+        let backoff_secs = server_reconnect_wait_secs(
+            state.server_reconnect_failures,
+            state.server_reconnect_network_down,
+        );
         let elapsed_ok = state.server_last_connect_attempt
             .map(|t| t.elapsed().as_secs() >= backoff_secs)
             .unwrap_or(true);
@@ -1145,7 +1148,10 @@ pub(in crate::network) async fn on_server_tick(
             let user_hash = state.user_hash;
             let nickname = settings.nickname.clone();
             let tcp_port = advertised_tcp_port(state);
-            let force_plain = state.server_reconnect_failures >= 2;
+            // A slow retry after an outage starts over with obfuscation, so an
+            // obfuscation-only server does not end up reconnected plain.
+            let force_plain =
+                (2..AUTO_CONNECT_MAX_FAILURES).contains(&state.server_reconnect_failures);
             let obfuscation_enabled = state.obfuscation_enabled;
             state.server_last_connect_attempt = Some(std::time::Instant::now());
             // Pre-set server addr so upload handler can detect HighID port test callbacks

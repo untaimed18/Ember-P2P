@@ -1,5 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
@@ -24,23 +25,29 @@ const OP_EMULEINFOANSWER: u8 = 0x02;
 const BUDDY_EVENT_CHANNEL_SIZE: usize = 32;
 const REASK_CALLBACK_BUDGET_PER_SESSION: u32 = 16;
 const MAX_PENDING_BUDDY_HASHES: usize = 512;
-/// Max time to wait for the *next* packet on a buddy TCP connection before
-/// treating it as dead. Both directions send an `OP_BUDDYPING` roughly every
-/// 60s (see `mod.rs`'s `buddy_timer`), so 3x that interval tolerates a
-/// couple of missed/delayed pings from transient network hiccups while
-/// still bounding how long a truly dead peer can sit idle.
+/// Only the firewalled side pings. eMule does so every 10 minutes
+/// (`SetLastBuddyPingPongTime`, `UpdownClient.h`), and answers a ping only
+/// 13 minutes or more after its previous pong, ignoring the rest.
+const BUDDY_PING_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// A buddy that answered our last ping is pinged again on the next 60 s
+/// buddy tick. eMule never answers that soon, so only Ember buddies get this
+/// cadence, and Ember up to 1.7.1 drops a served client after 180 s
+/// without a packet.
+const BUDDY_ANSWERED_PING_INTERVAL: Duration = Duration::from_secs(50);
+/// Max time to wait for the *next* packet from the client we serve before
+/// treating the connection as dead. eMule clients ping every 10 minutes, so
+/// this outlasts one lost ping.
 ///
-/// This matters most for the serving side: `serving_buddy_for` is a single
-/// exclusive slot (`accept_buddy_connection` rejects new requesters while
-/// occupied), and without a read-side timeout a firewalled client that
-/// crashes or black-holes mid-session — without ever sending a TCP
-/// FIN/RST — would occupy that slot forever, since `read_ed2k_packet`
-/// blocks indefinitely and nothing else observes read-side inactivity.
-/// Applied uniformly to the "we are firewalled" reader too for the same
-/// defense-in-depth reason (our own `send_buddy_ping` only detects a dead
-/// buddy on *write* failure, not a connection that accepts writes but never
-/// replies).
-const BUDDY_IDLE_TIMEOUT_SECS: u64 = 180;
+/// Without a read-side timeout a firewalled client that crashes or
+/// black-holes mid-session — without ever sending a TCP FIN/RST — would
+/// occupy the single `serving_buddy_for` slot forever, since
+/// `read_ed2k_packet` blocks indefinitely.
+const BUDDY_SERVING_IDLE_TIMEOUT: Duration = Duration::from_secs(25 * 60);
+/// Same for the connection to our own buddy. At our 10-minute cadence an
+/// eMule buddy answers every other ping, so its pongs arrive about 21
+/// minutes apart. `send_buddy_ping` only notices a dead buddy on a write
+/// failure, not on a connection that accepts writes but never replies.
+const BUDDY_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Packets queued for the dedicated buddy writer task. Keep this small: a
 /// stalled firewalled client must not pin unbounded callback/reask payloads
 /// in memory, and `try_send` failing with Full is the signal to drop the
@@ -176,6 +183,8 @@ pub struct BuddyManager {
 
     buddy_writer: Option<BuddyWriteQueue>,
     buddy_reader_handle: Option<tokio::task::JoinHandle<()>>,
+    last_buddy_ping: Option<Instant>,
+    buddy_ponged_since_ping: bool,
 
     serving_buddy_for: Option<KadId>,
     serving_callback_check: Option<KadId>,
@@ -209,6 +218,8 @@ impl BuddyManager {
             find_attempt_count: 0,
             buddy_writer: None,
             buddy_reader_handle: None,
+            last_buddy_ping: None,
+            buddy_ponged_since_ping: false,
             serving_buddy_for: None,
             serving_callback_check: None,
             serving_callback_budget: 0,
@@ -231,6 +242,8 @@ impl BuddyManager {
         if let Some(w) = self.buddy_writer.take() {
             w.abort();
         }
+        self.last_buddy_ping = None;
+        self.buddy_ponged_since_ping = false;
         if let Some(h) = self.serving_reader_handle.take() {
             h.abort();
         }
@@ -543,6 +556,8 @@ impl BuddyManager {
             Some(conn.disconnect_tx),
         ));
         self.buddy_reader_handle = Some(conn.reader_handle);
+        self.last_buddy_ping = None;
+        self.buddy_ponged_since_ping = false;
         self.state = BuddyState::Connected;
         self.find_attempt_count = 0;
         conn.events
@@ -570,7 +585,7 @@ impl BuddyManager {
             reader,
             event_tx.clone(),
             None,
-            std::time::Duration::from_secs(BUDDY_IDLE_TIMEOUT_SECS),
+            BUDDY_SERVING_IDLE_TIMEOUT,
         ));
 
         self.serving_buddy_for = Some(requester_id);
@@ -600,8 +615,35 @@ impl BuddyManager {
         map.insert(user_hash, (callback_check, now));
     }
 
+    /// Whether our buddy is due an `OP_BUDDYPING` at `now`. The first ping
+    /// goes out on the first tick after connecting.
+    pub fn buddy_ping_due(&self, now: Instant) -> bool {
+        if self.state != BuddyState::Connected {
+            return false;
+        }
+        let Some(sent) = self.last_buddy_ping else {
+            return true;
+        };
+        let interval = if self.buddy_ponged_since_ping {
+            BUDDY_ANSWERED_PING_INTERVAL
+        } else {
+            BUDDY_PING_INTERVAL
+        };
+        now.saturating_duration_since(sent) >= interval
+    }
+
+    fn record_buddy_ping(&mut self, now: Instant) {
+        self.last_buddy_ping = Some(now);
+        self.buddy_ponged_since_ping = false;
+    }
+
+    pub fn note_buddy_pong(&mut self) {
+        self.buddy_ponged_since_ping = true;
+    }
+
     /// Send OP_BUDDYPING to our buddy (we are firewalled).
     pub async fn send_buddy_ping(&mut self) -> bool {
+        self.record_buddy_ping(Instant::now());
         let pkt = build_emule_packet(OP_BUDDYPING, &[]);
         match self.enqueue_buddy(pkt) {
             Enqueue::Queued | Enqueue::Busy => true,
@@ -750,6 +792,8 @@ impl BuddyManager {
         if let Some(w) = self.buddy_writer.take() {
             w.abort();
         }
+        self.last_buddy_ping = None;
+        self.buddy_ponged_since_ping = false;
         self.buddy_id = None;
         self.buddy_addr = None;
         self.buddy_udp_port = None;
@@ -875,7 +919,7 @@ fn event_rx_from_reader(
         reader,
         tx.clone(),
         Some(buddy_id),
-        std::time::Duration::from_secs(BUDDY_IDLE_TIMEOUT_SECS),
+        BUDDY_IDLE_TIMEOUT,
     ));
     (rx, tx, handle)
 }
@@ -883,10 +927,9 @@ fn event_rx_from_reader(
 /// Long-running reader task for a buddy TCP connection.
 /// Reads ed2k packets and sends events back via channel.
 ///
-/// `idle_timeout` is a parameter (rather than always using
-/// `BUDDY_IDLE_TIMEOUT_SECS` directly) purely so tests can exercise the
-/// timeout path in milliseconds instead of real minutes; both production
-/// call sites pass `BUDDY_IDLE_TIMEOUT_SECS`.
+/// `idle_timeout` is a parameter purely so tests can exercise the timeout
+/// path in milliseconds instead of real minutes; production passes
+/// `BUDDY_IDLE_TIMEOUT` or `BUDDY_SERVING_IDLE_TIMEOUT`.
 async fn run_buddy_reader(
     reader: BuddyReadStream,
     event_tx: mpsc::Sender<BuddyEvent>,
@@ -1223,6 +1266,83 @@ mod tests {
 
         drop(client);
         let _ = handle.await;
+    }
+
+    /// Runs the real ping schedule on the 60 s buddy tick for four hours
+    /// against a buddy that answers a ping when `answers(at)` says so.
+    /// Returns the longest gap between packets from the buddy and the
+    /// longest gap between our pings.
+    fn simulate_buddy_link(mut answers: impl FnMut(Duration) -> bool) -> (Duration, Duration) {
+        let mut mgr = test_manager();
+        mgr.state = BuddyState::Connected;
+        let start = Instant::now();
+        let tick = Duration::from_secs(60);
+        let (mut last_in, mut last_out) = (Duration::ZERO, Duration::ZERO);
+        let (mut longest_in, mut longest_out) = (Duration::ZERO, Duration::ZERO);
+        let mut at = tick;
+        while at < Duration::from_secs(4 * 3600) {
+            if mgr.buddy_ping_due(start + at) {
+                mgr.record_buddy_ping(start + at);
+                longest_out = longest_out.max(at - last_out);
+                last_out = at;
+                if answers(at) {
+                    mgr.note_buddy_pong();
+                    longest_in = longest_in.max(at - last_in);
+                    last_in = at;
+                }
+            }
+            at += tick;
+        }
+        (longest_in, longest_out)
+    }
+
+    /// eMule pongs only 13 minutes or more after the client object was made
+    /// or its last pong (`AllowIncomingBuddyPingPong`), and drops the socket
+    /// after 40 s + 15 min without traffic either way.
+    #[test]
+    fn emule_buddy_link_outlives_both_idle_timeouts() {
+        let thirteen_minutes = Duration::from_secs(13 * 60);
+        let mut allowed_from = thirteen_minutes;
+        let (longest_in, longest_out) = simulate_buddy_link(|at| {
+            if at < allowed_from {
+                return false;
+            }
+            allowed_from = at + thirteen_minutes;
+            true
+        });
+        assert!(
+            longest_in + Duration::from_secs(5 * 60) <= BUDDY_IDLE_TIMEOUT,
+            "eMule pongs {longest_in:?} apart against a {BUDDY_IDLE_TIMEOUT:?} timeout"
+        );
+        assert!(longest_out < Duration::from_secs(15 * 60 + 40));
+        assert!(longest_out <= BUDDY_PING_INTERVAL + Duration::from_secs(60));
+        assert!(BUDDY_SERVING_IDLE_TIMEOUT > 2 * BUDDY_PING_INTERVAL);
+    }
+
+    /// Ember up to 1.7.1 answers every ping but drops a served client after
+    /// 180 s without a packet, so it must keep getting pinged every tick.
+    #[test]
+    fn released_ember_buddy_that_answers_every_ping_is_pinged_within_its_timeout() {
+        let (longest_in, longest_out) = simulate_buddy_link(|_| true);
+        assert!(longest_out < Duration::from_secs(180), "pinged {longest_out:?} apart");
+        assert!(longest_in < Duration::from_secs(180));
+    }
+
+    #[test]
+    fn unanswered_buddy_ping_waits_the_emule_interval() {
+        let mut mgr = test_manager();
+        let now = Instant::now();
+        assert!(!mgr.buddy_ping_due(now), "no buddy, nothing to ping");
+        mgr.state = BuddyState::Connected;
+        assert!(mgr.buddy_ping_due(now), "first ping goes out right away");
+
+        mgr.record_buddy_ping(now);
+        assert!(!mgr.buddy_ping_due(now + Duration::from_secs(60)));
+        assert!(!mgr.buddy_ping_due(now + BUDDY_PING_INTERVAL - Duration::from_secs(1)));
+        assert!(mgr.buddy_ping_due(now + BUDDY_PING_INTERVAL));
+
+        mgr.note_buddy_pong();
+        assert!(mgr.buddy_ping_due(now + Duration::from_secs(60)));
     }
 
     /// Serving as a buddy used to `.await` `OP_CALLBACK` on the network

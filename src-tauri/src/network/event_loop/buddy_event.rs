@@ -32,6 +32,7 @@ pub(in crate::network) async fn on_buddy_event(
         }
         Some(BuddyEvent::PongReceived) => {
             debug!("Buddy pong received");
+            state.buddy_manager.note_buddy_pong();
         }
         Some(BuddyEvent::Callback { file_hash, dest_ip, dest_port }) => {
             // `OP_CALLBACK` carries the file id in CUInt128 order,

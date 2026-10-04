@@ -147,6 +147,11 @@ pub struct ServerEntry {
     /// don't index a given hash, so the per-packet `udp_consecutive_failures`
     /// counter otherwise raced past the exclusion threshold under load.)
     pub last_udp_query_at: i64,
+    /// Last time (Unix timestamp, seconds) we sent this server a UDP status
+    /// ping. Runtime-only, like eMule's `CServer::GetLastPingedTime` minus
+    /// the persistence: it is the per-server gate for the 4.5 h status
+    /// cadence, so it has to live as long as the entry does.
+    pub last_udp_ping_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +218,7 @@ impl ServerEntry {
             last_udp_reply_at: 0,
             last_udp_source_reply_at: 0,
             last_udp_query_at: 0,
+            last_udp_ping_at: 0,
         }
     }
 }
@@ -577,6 +583,16 @@ impl ServerList {
                 entry.udp_consecutive_failures = entry.udp_consecutive_failures.saturating_add(1);
                 entry.last_udp_query_at = now;
             }
+        }
+    }
+
+    pub fn record_udp_ping_sent(&mut self, ip: &str, port: u16, at: i64) {
+        if let Some(entry) = self
+            .servers
+            .iter_mut()
+            .find(|s| s.ip == ip && s.port == port)
+        {
+            entry.last_udp_ping_at = at;
         }
     }
 

@@ -2,6 +2,10 @@
 //! replies (status responses, found sources, and global search results).
 
 use super::*;
+use crate::network::ed2k::server_udp::ServerUdpRecv;
+
+/// Datagrams read per 200 ms tick, so a flood cannot hold the network loop.
+const MAX_SERVER_UDP_PACKETS_PER_TICK: usize = 32;
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_server_udp_ping_tick(
@@ -34,8 +38,12 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
         let idx = *server_udp_ping_idx % server_count;
         *server_udp_ping_idx = server_udp_ping_idx.wrapping_add(1);
         let server = state.server_list.servers()[idx].clone();
-        match server_udp.send_status_ping(&server).await {
+        let now = chrono::Utc::now().timestamp();
+        match server_udp.send_status_ping(&server, now).await {
             Ok(bytes) if bytes > 0 => {
+                state
+                    .server_list
+                    .record_udp_ping_sent(&server.ip, server.port, now);
                 stats_manager.add_overhead(
                     crate::storage::statistics::OverheadCategory::Server,
                     crate::storage::statistics::OverheadDirection::Upload,
@@ -51,7 +59,7 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
             }
         }
     }
-    while let Some((recv_len, resp)) = {
+    for _ in 0..MAX_SERVER_UDP_PACKETS_PER_TICK {
         // Snapshot the server list reference so the
         // closure (called possibly multiple times by
         // `try_recv_with`) can do per-server lookups
@@ -65,10 +73,13 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
         // standard UDP port or the server's
         // `obfuscation_port_udp`.
         let server_list = &state.server_list;
-        server_udp.try_recv_with(move |ip, port| {
+        let (recv_len, resp) = match server_udp.try_recv_with(move |ip, port| {
             server_list.lookup_for_udp_addr(ip, port)
-        }).await
-    } {
+        }).await {
+            ServerUdpRecv::Packet(recv_len, resp) => (recv_len, resp),
+            ServerUdpRecv::Skipped => continue,
+            ServerUdpRecv::Drained => break,
+        };
         // Attribute the actual wire bytes to the correct
         // category. Previously every response paid a flat
         // 64-byte "Server" charge AND `FoundSources`

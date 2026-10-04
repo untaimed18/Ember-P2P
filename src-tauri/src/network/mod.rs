@@ -943,6 +943,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         // `initiate_server_connect`, which flips this on for drop recovery.
         server_auto_reconnect: false,
         server_reconnect_failures: 0,
+        server_reconnect_network_down: false,
         preferred_ed2k_server: None,
         server_last_connect_attempt: None,
         pending_uss_pings: HashMap::new(),
@@ -2041,12 +2042,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // a `OP_GLOBGETSOURCES` could sit in the kernel buffer for up
     // to 5 seconds before we noticed — bad latency for source
     // discovery. Pings remain rate-limited *per server* by
-    // `MIN_PING_INTERVAL_SECS` (= 5s) inside `send_status_ping`,
-    // so the higher tick rate doesn't increase ping traffic — it
-    // just makes the recv drain feel like a real event-driven arm.
-    // CPU cost per idle tick is one `try_recv_from` syscall (which
-    // returns `WouldBlock` instantly when nothing's queued) plus a
-    // hashmap lookup for the cooldown — negligible.
+    // `status_ping_due` (eMule's 4.5 h), so the higher tick rate
+    // doesn't increase ping traffic — it just makes the recv drain
+    // feel like a real event-driven arm. CPU cost per idle tick is
+    // one `try_recv_from` syscall (which returns `WouldBlock`
+    // instantly when nothing's queued) — negligible.
     let initial_ping_interval_ms = 200u64;
     let mut server_udp_ping_timer =
         tokio::time::interval(std::time::Duration::from_millis(initial_ping_interval_ms));

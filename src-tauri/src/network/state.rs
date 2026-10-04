@@ -707,8 +707,11 @@ pub(super) struct NetworkState {
     /// or after auto-connect gives up on the preferred server.
     pub(super) server_auto_reconnect: bool,
     /// Consecutive preferred-server connection failures for exponential backoff
-    /// (reset on success). After [`AUTO_CONNECT_MAX_FAILURES`], auto-reconnect stops.
+    /// (reset by a session that lasts). After [`AUTO_CONNECT_MAX_FAILURES`],
+    /// auto-reconnect stops or, with auto-connect on, slows down.
     pub(super) server_reconnect_failures: u32,
+    /// The last connect attempt failed because our own network was down.
+    pub(super) server_reconnect_network_down: bool,
     /// Only server auto-reconnect / auto-connect may dial. Set on connect and
     /// persisted as last successful server on login.
     pub(super) preferred_ed2k_server: Option<(String, u16)>,

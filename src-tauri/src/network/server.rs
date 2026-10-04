@@ -362,10 +362,23 @@ pub(super) async fn apply_server_ip_filter(
     .await;
 }
 
-/// Max preferred-server connect failures before auto-reconnect stops and the
-/// UI is told to connect manually. Covers boot auto-connect and mid-session
-/// drop recovery for the same host only.
+/// Preferred-server connect failures that use up the fast retries. After
+/// them auto-reconnect stops and the UI is told to connect manually, unless
+/// auto-connect is on in Settings, in which case it keeps retrying on the
+/// slow schedule (see [`server_reconnect_backoff_secs`]). Covers boot
+/// auto-connect and mid-session drop recovery for the same host only.
 pub(super) const AUTO_CONNECT_MAX_FAILURES: u32 = 3;
+
+/// First wait once the fast retries are spent, doubling per further failure
+/// up to [`SERVER_SLOW_RECONNECT_MAX_SECS`]. Slow enough that a server which
+/// kicks us right after login is not redialed at a rate it bans for.
+const SERVER_SLOW_RECONNECT_SECS: u64 = 5 * 60;
+const SERVER_SLOW_RECONNECT_MAX_SECS: u64 = 15 * 60;
+
+/// Wait between attempts while our own network is unreachable. Those
+/// attempts never reach the server, so they neither count toward
+/// `AUTO_CONNECT_MAX_FAILURES` nor back off.
+const SERVER_NETWORK_DOWN_RETRY_SECS: u64 = 30;
 
 /// A server session that ends sooner than this after login counts toward
 /// `AUTO_CONNECT_MAX_FAILURES` (see `handle_server_disconnect`).
@@ -390,6 +403,10 @@ fn reconnect_failures_after_session(failures: u32, session_secs: i64) -> u32 {
 /// Wait before auto-reconnecting to the preferred server after `failures`
 /// consecutive failed attempts.
 pub(super) fn server_reconnect_backoff_secs(failures: u32) -> u64 {
+    if let Some(slow_round) = failures.checked_sub(AUTO_CONNECT_MAX_FAILURES) {
+        return (SERVER_SLOW_RECONNECT_SECS << slow_round.min(2))
+            .min(SERVER_SLOW_RECONNECT_MAX_SECS);
+    }
     match failures {
         0 => 0,
         1 => 3,
@@ -398,6 +415,102 @@ pub(super) fn server_reconnect_backoff_secs(failures: u32) -> u64 {
         4 => 20,
         _ => 30,
     }
+}
+
+/// Wait before the next auto-reconnect attempt, given how the last one went.
+pub(super) fn server_reconnect_wait_secs(failures: u32, network_down: bool) -> u64 {
+    if network_down {
+        SERVER_NETWORK_DOWN_RETRY_SECS
+    } else {
+        server_reconnect_backoff_secs(failures)
+    }
+}
+
+/// Whether auto-reconnect stops for good after `failures` failed attempts on
+/// the preferred server.
+pub(super) fn server_auto_reconnect_gives_up(failures: u32, settings: &AppSettings) -> bool {
+    failures >= AUTO_CONNECT_MAX_FAILURES && !settings.auto_connect_server
+}
+
+/// Whether a failed server connect means our own network is down rather than
+/// the server being unreachable: the OS said so (`ENETUNREACH` /
+/// `ENETDOWN`, `WSAENETUNREACH` / `WSAENETDOWN`), e.g. after resuming from
+/// sleep before Wi-Fi is back.
+///
+/// The connect task hands back only the error's text; `io::Error` renders
+/// the raw OS code as `(os error N)`, which decodes the same way on every
+/// platform.
+pub(super) fn server_connect_error_is_network_down(error: &str) -> bool {
+    error
+        .rsplit_once("(os error ")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .and_then(|(code, _)| code.parse::<i32>().ok())
+        .is_some_and(|code| {
+            matches!(
+                std::io::Error::from_raw_os_error(code).kind(),
+                std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::NetworkDown
+            )
+        })
+}
+
+/// Server log line for a failed attempt on the preferred server that will be
+/// retried after `wait_secs`.
+fn server_retry_log_line(error: &str, attempt: u32, wait_secs: u64, network_down: bool) -> String {
+    if network_down {
+        format!("Connection failed ({error}); network unreachable, retrying in {wait_secs}s...")
+    } else if attempt < AUTO_CONNECT_MAX_FAILURES {
+        format!(
+            "Connection failed ({error}); retrying preferred server ({attempt}/{AUTO_CONNECT_MAX_FAILURES})..."
+        )
+    } else {
+        format!(
+            "Connection failed ({error}); retrying preferred server in {} min...",
+            wait_secs.div_ceil(60)
+        )
+    }
+}
+
+/// Book a failed server connect: count it unless our own network was down,
+/// log what happens next, and stop auto-reconnect if
+/// [`server_auto_reconnect_gives_up`]. Returns whether the network was down.
+pub(super) fn record_server_connect_failure(
+    state: &mut NetworkState,
+    settings: &AppSettings,
+    app_handle: &tauri::AppHandle,
+    ip: &str,
+    port: u16,
+    error: &str,
+) -> bool {
+    let network_down = server_connect_error_is_network_down(error);
+    let attempt = if network_down {
+        state.server_reconnect_failures
+    } else {
+        state.server_reconnect_failures.saturating_add(1)
+    };
+    state.server_reconnect_failures = attempt;
+    state.server_reconnect_network_down = network_down;
+    let is_preferred = state
+        .preferred_ed2k_server
+        .as_ref()
+        .is_some_and(|(pip, pport)| pip == ip && *pport == port);
+    let gives_up = server_auto_reconnect_gives_up(attempt, settings);
+    if state.server_auto_reconnect && is_preferred && !gives_up {
+        let wait_secs = server_reconnect_wait_secs(attempt, network_down);
+        emit_server_log(
+            app_handle,
+            &server_retry_log_line(error, attempt, wait_secs, network_down),
+        );
+    } else {
+        emit_server_log(app_handle, &format!("Connection failed ({error})."));
+    }
+    if state.server_auto_reconnect && gives_up {
+        abandon_server_auto_reconnect(
+            state,
+            app_handle,
+            &format!("could not reach preferred server {ip}:{port}"),
+        );
+    }
+    network_down
 }
 
 pub(super) fn emit_server_auto_connect_failed(app_handle: &tauri::AppHandle, detail: &str) {
@@ -456,6 +569,7 @@ pub(super) async fn initiate_server_connect(
 ) {
     state.server_auto_reconnect = true;
     state.server_reconnect_failures = 0;
+    state.server_reconnect_network_down = false;
     state.preferred_ed2k_server = Some((ip.clone(), port));
     // Joining a server is a deliberate "come back online", so it lifts the
     // outbound stop the same way `KadConnect` does. The upload listener needs
@@ -655,5 +769,56 @@ mod reconnect_backoff_tests {
             3
         );
         assert_eq!(reconnect_failures_after_session(2, SHORT_SERVER_SESSION_SECS), 0);
+    }
+
+    /// A router reboot outlasts the fast retries. With auto-connect on, the
+    /// preferred server keeps being retried every few minutes instead of
+    /// being given up on for the rest of the session.
+    #[test]
+    fn spent_fast_retries_fall_back_to_a_capped_slow_schedule_while_auto_connect_is_on() {
+        let fast = server_reconnect_backoff_secs(AUTO_CONNECT_MAX_FAILURES - 1);
+        let slow: Vec<u64> = (0..6)
+            .map(|round| server_reconnect_backoff_secs(AUTO_CONNECT_MAX_FAILURES + round))
+            .collect();
+        assert_eq!(slow, [300, 600, 900, 900, 900, 900]);
+        assert!(slow[0] > fast);
+        assert_eq!(server_reconnect_backoff_secs(u32::MAX), SERVER_SLOW_RECONNECT_MAX_SECS);
+
+        let on = AppSettings {
+            auto_connect_server: true,
+            ..AppSettings::default()
+        };
+        let off = AppSettings {
+            auto_connect_server: false,
+            ..AppSettings::default()
+        };
+        assert!(!server_auto_reconnect_gives_up(AUTO_CONNECT_MAX_FAILURES + 50, &on));
+        assert!(!server_auto_reconnect_gives_up(AUTO_CONNECT_MAX_FAILURES - 1, &off));
+        assert!(server_auto_reconnect_gives_up(AUTO_CONNECT_MAX_FAILURES, &off));
+    }
+
+    fn os_error_text(kind: std::io::ErrorKind) -> String {
+        let code = (1..20_000)
+            .find(|code| std::io::Error::from_raw_os_error(*code).kind() == kind)
+            .expect("no raw OS error maps to this kind here");
+        format!("Connect failed: {}", std::io::Error::from_raw_os_error(code))
+    }
+
+    #[test]
+    fn only_our_own_network_being_down_is_not_a_server_failure() {
+        use std::io::ErrorKind;
+        assert!(server_connect_error_is_network_down(&os_error_text(
+            ErrorKind::NetworkUnreachable
+        )));
+        assert!(server_connect_error_is_network_down(&os_error_text(ErrorKind::NetworkDown)));
+        assert!(!server_connect_error_is_network_down(&os_error_text(
+            ErrorKind::ConnectionRefused
+        )));
+        assert!(!server_connect_error_is_network_down("Connect failed: deadline has elapsed"));
+        assert!(!server_connect_error_is_network_down("Login failed: server rejected login (client_id=0)"));
+        assert_eq!(
+            server_reconnect_wait_secs(AUTO_CONNECT_MAX_FAILURES + 2, true),
+            SERVER_NETWORK_DOWN_RETRY_SECS
+        );
     }
 }
