@@ -11,6 +11,7 @@
     pickPreviewPlayer as pickPreviewPlayerDialog,
     importWebServicesFile,
     getExampleWebService,
+    SETTINGS_CHANGED_EVENT,
     type UpdateSettingsResult,
     type NodesDatDownloadResult,
     type IpFilterDownloadResult,
@@ -1072,6 +1073,16 @@
       })
       .catch((e) => console.error('Failed to register runtime-status listener:', e));
 
+    let unlistenSettingsChanged: UnlistenFn | null = null;
+    listen<AppSettings>(SETTINGS_CHANGED_EVENT, (event) => {
+      if (!unmounted) foldQuickLimits(event.payload);
+    })
+      .then((fn) => {
+        if (unmounted) fn();
+        else unlistenSettingsChanged = fn;
+      })
+      .catch((e) => console.error('Failed to register settings-changed listener:', e));
+
     refreshSpamStats();
     refreshHistoryStats();
     getSettings()
@@ -1109,6 +1120,7 @@
       unlistenIpFilterReload?.();
       unlistenNodesBootstrap?.();
       unlistenRuntimeStatus?.();
+      unlistenSettingsChanged?.();
       window.removeEventListener('beforeunload', handleBeforeUnload);
       window.removeEventListener('keydown', handleKeyboardSave);
       for (const id of activeTimers) clearTimeout(id);
@@ -1301,6 +1313,37 @@
     }
     merged.settings_revision = latest.settings_revision;
     return merged;
+  }
+
+  const QUICK_LIMIT_KEYS = [
+    'alt_speed_enabled',
+    'max_upload_speed',
+    'max_download_speed',
+    'alt_max_upload_speed',
+    'alt_max_download_speed',
+  ] as const;
+
+  /** The tray or the status bar saved speed limits while this page was open.
+   *  Show them, except in a field already edited here, which stays a change
+   *  to save. */
+  function foldQuickLimits(saved: AppSettings): void {
+    if (!settings || !originalSettings) return;
+    let baseline: AppSettings;
+    try {
+      baseline = JSON.parse(originalSettings) as AppSettings;
+    } catch {
+      return;
+    }
+    const current = settings as unknown as Record<string, unknown>;
+    const base = baseline as unknown as Record<string, unknown>;
+    const incoming = saved as unknown as Record<string, unknown>;
+    for (const key of QUICK_LIMIT_KEYS) {
+      if (sameSettingValue(current[key], base[key])) current[key] = incoming[key];
+      base[key] = incoming[key];
+    }
+    settings.settings_revision = saved.settings_revision;
+    baseline.settings_revision = saved.settings_revision;
+    originalSettings = JSON.stringify(baseline);
   }
 
   function isSettingsRevisionConflict(error: unknown): boolean {
@@ -2678,6 +2721,22 @@
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">
+              <span class="toggle-title">{m.settings_launch_at_login_label()}</span>
+              <span class="hint">{m.settings_launch_at_login_hint()}</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.launch_at_login} ariaLabel={m.settings_launch_at_login_label()} />
+          </div>
+          {#if settings.launch_at_login}
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_start_hidden_at_login_label()}</span>
+                <span class="hint">{m.settings_start_hidden_at_login_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.start_hidden_at_login} ariaLabel={m.settings_start_hidden_at_login_label()} />
+            </div>
+          {/if}
+          <div class="field toggle-row">
+            <div class="toggle-info">
               <span class="toggle-title">{m.settings_prevent_sleep_label()}</span>
               <span class="hint">
                 {#if runtimeStatus && !runtimeStatus.sleep_inhibit_supported}
@@ -3352,6 +3411,17 @@
           </div>
           <div class="field">
             <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} />
+          </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_alt_speed_label()}</span>
+              <span class="hint">{m.settings_alt_speed_hint()}</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.alt_speed_enabled} ariaLabel={m.settings_alt_speed_label()} />
+          </div>
+          <div class="field alt-speed-limits" class:is-inactive={!settings.alt_speed_enabled}>
+            <SpeedInput label={m.settings_alt_max_upload_speed()} bind:value={settings.alt_max_upload_speed} idScope="alt" />
+            <SpeedInput label={m.settings_alt_max_download_speed()} bind:value={settings.alt_max_download_speed} idScope="alt" />
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">
@@ -6070,8 +6140,15 @@
   /* Only reachable now when the feature is off *and* a rule would block the
      save, so the editor is showing solely to be corrected. Dimmed to keep
      saying what it said before: these rules are not in force. */
-  .schedule-editor.is-inactive {
+  .schedule-editor.is-inactive,
+  .alt-speed-limits.is-inactive {
     opacity: 0.62;
+  }
+
+  .alt-speed-limits {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
   }
 
   .schedule-empty {

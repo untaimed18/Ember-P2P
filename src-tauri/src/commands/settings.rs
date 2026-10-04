@@ -855,6 +855,8 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         settings.max_download_speed = MAX_CONFIGURED_SPEED_BPS;
         changed = true;
     }
+    changed |= clamp_assign(&mut settings.alt_max_upload_speed, 0, MAX_CONFIGURED_SPEED_BPS);
+    changed |= clamp_assign(&mut settings.alt_max_download_speed, 0, MAX_CONFIGURED_SPEED_BPS);
     // Soft-disable USS when upload is unlimited (validate rejects that combo).
     if settings.uss_enabled && settings.max_upload_speed == 0 {
         settings.uss_enabled = false;
@@ -1173,6 +1175,24 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         return Err(coded_ctx(
             "settings_max_download_speed_invalid",
             format!("Max download speed must be 0 or at most {MAX_CONFIGURED_SPEED_BPS} B/s"),
+            MAX_CONFIGURED_SPEED_BPS,
+        ));
+    }
+    if settings.alt_max_upload_speed > MAX_CONFIGURED_SPEED_BPS {
+        return Err(coded_ctx(
+            "settings_max_upload_speed_invalid",
+            format!(
+                "Alternative upload speed must be 0 or at most {MAX_CONFIGURED_SPEED_BPS} B/s"
+            ),
+            MAX_CONFIGURED_SPEED_BPS,
+        ));
+    }
+    if settings.alt_max_download_speed > MAX_CONFIGURED_SPEED_BPS {
+        return Err(coded_ctx(
+            "settings_max_download_speed_invalid",
+            format!(
+                "Alternative download speed must be 0 or at most {MAX_CONFIGURED_SPEED_BPS} B/s"
+            ),
             MAX_CONFIGURED_SPEED_BPS,
         ));
     }
@@ -1603,6 +1623,25 @@ pub async fn update_settings(
         &active_shared_folders,
     );
     settings.settings_revision = old_settings.settings_revision.saturating_add(1);
+
+    // Before the write: a sign-in entry the OS refused must fail the save, not
+    // leave a setting that claims otherwise. A write that fails after this
+    // leaves the entry ahead of the file, which the next launch reconciles.
+    if settings.launch_at_login != old_settings.launch_at_login {
+        let enable = settings.launch_at_login;
+        let entry_app = app.clone();
+        let failed = |e: String| {
+            coded_ctx(
+                "settings_launch_at_login_failed",
+                "Could not change launch at sign-in",
+                e,
+            )
+        };
+        tokio::task::spawn_blocking(move || crate::login_launch::apply(&entry_app, enable))
+            .await
+            .map_err(|e| failed(e.to_string()))?
+            .map_err(failed)?;
+    }
 
     let port_changed =
         settings.tcp_port != old_settings.tcp_port || settings.udp_port != old_settings.udp_port;
@@ -2421,6 +2460,124 @@ pub async fn set_close_behavior(
     }
     *state.close_behavior.write() = normalized;
     Ok(())
+}
+
+/// The limits the tray and the status bar change without a trip to Settings.
+/// A field left out keeps its saved value.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuickLimitsPatch {
+    pub alt_speed_enabled: Option<bool>,
+    pub max_upload_speed: Option<u64>,
+    pub max_download_speed: Option<u64>,
+    pub alt_max_upload_speed: Option<u64>,
+    pub alt_max_download_speed: Option<u64>,
+}
+
+/// Carries the whole persisted [`AppSettings`] after a save made outside the
+/// Settings page, so open views can fold it in.
+pub const SETTINGS_CHANGED_EVENT: &str = "ember:settings-changed";
+
+/// Persist `patch`, put the resulting limits in force, and tell the frontend.
+pub async fn apply_quick_limits(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    patch: QuickLimitsPatch,
+) -> Result<AppSettings, String> {
+    let _settings_save_guard = state.settings_save_lock.lock().await;
+    let (new_settings, save_data) = {
+        let config = state.config.read().await;
+        let mut new_settings = config.settings.clone();
+        if let Some(on) = patch.alt_speed_enabled {
+            new_settings.alt_speed_enabled = on;
+        }
+        if let Some(speed) = patch.max_upload_speed {
+            new_settings.max_upload_speed = speed;
+        }
+        if let Some(speed) = patch.max_download_speed {
+            new_settings.max_download_speed = speed;
+        }
+        if let Some(speed) = patch.alt_max_upload_speed {
+            new_settings.alt_max_upload_speed = speed;
+        }
+        if let Some(speed) = patch.alt_max_download_speed {
+            new_settings.alt_max_download_speed = speed;
+        }
+        validate_quick_limits(&new_settings)?;
+        let limits = |s: &AppSettings| {
+            (
+                s.alt_speed_enabled,
+                s.max_upload_speed,
+                s.max_download_speed,
+                s.alt_max_upload_speed,
+                s.alt_max_download_speed,
+            )
+        };
+        if limits(&new_settings) == limits(&config.settings) {
+            return Ok(new_settings);
+        }
+        new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
+        let data = config.prepare_save_settings(&new_settings).map_err(|e| {
+            coded_ctx(
+                "settings_serialize_failed",
+                "Failed to serialize settings",
+                e,
+            )
+        })?;
+        (new_settings, data)
+    };
+    let (data, tmp, final_path) = save_data;
+    tokio::task::spawn_blocking(move || {
+        crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+    })
+    .await
+    .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?
+    .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
+    {
+        let mut config = state.config.write().await;
+        config.settings = new_settings.clone();
+    }
+    crate::background::apply_effective_limits(app, state, &new_settings);
+    if let Err(error) = app.emit(SETTINGS_CHANGED_EVENT, &new_settings) {
+        tracing::debug!("Could not emit the settings change: {error}");
+    }
+    Ok(new_settings)
+}
+
+/// The subset of [`validate_settings`] a [`QuickLimitsPatch`] can break.
+fn validate_quick_limits(settings: &AppSettings) -> Result<(), String> {
+    let uploads = [settings.max_upload_speed, settings.alt_max_upload_speed];
+    if uploads.iter().any(|speed| *speed > MAX_CONFIGURED_SPEED_BPS) {
+        return Err(coded_ctx(
+            "settings_max_upload_speed_invalid",
+            format!("Upload speed must be 0 or at most {MAX_CONFIGURED_SPEED_BPS} B/s"),
+            MAX_CONFIGURED_SPEED_BPS,
+        ));
+    }
+    let downloads = [settings.max_download_speed, settings.alt_max_download_speed];
+    if downloads.iter().any(|speed| *speed > MAX_CONFIGURED_SPEED_BPS) {
+        return Err(coded_ctx(
+            "settings_max_download_speed_invalid",
+            format!("Download speed must be 0 or at most {MAX_CONFIGURED_SPEED_BPS} B/s"),
+            MAX_CONFIGURED_SPEED_BPS,
+        ));
+    }
+    if settings.uss_enabled && settings.max_upload_speed == 0 {
+        return Err(coded(
+            "settings_uss_requires_upload_limit",
+            "Upload Speed Sense requires an upload speed limit to be set",
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_quick_limits(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    patch: QuickLimitsPatch,
+) -> Result<AppSettings, String> {
+    apply_quick_limits(&app, &state, patch).await
 }
 
 /// Official Ember project website (GitHub Pages).

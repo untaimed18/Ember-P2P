@@ -1058,6 +1058,17 @@ export interface AppSettings {
   /** Ordered timetable of clock-driven caps. The first rule whose window is
    *  open wins; when none is, the manual limits apply. */
   bandwidth_schedule: BandwidthScheduleRule[];
+
+  /** Use the alternative limits in place of the manual ones and the schedule.
+   *  Also switched from the tray and the status bar. */
+  alt_speed_enabled: boolean;
+  /** Bytes per second; 0 is unlimited. */
+  alt_max_upload_speed: number;
+  alt_max_download_speed: number;
+  /** Start Ember when the user signs in. */
+  launch_at_login: boolean;
+  /** A launch at sign-in comes up in the tray rather than on the desktop. */
+  start_hidden_at_login: boolean;
 }
 
 /** One window of the bandwidth timetable.
@@ -1102,6 +1113,8 @@ export interface RuntimeStatus {
   effective_download_speed: number;
   /** Absent when the manual limits are in force. */
   schedule?: ActiveScheduleRule;
+  /** The alternative limits are in force, overriding manual and schedule. */
+  alt_speed: boolean;
   /** Whether this platform can hold a sleep inhibitor at all. False means the
    *  `prevent_sleep_while_active` toggle would do nothing, so the UI disables
    *  it rather than offering a dead switch. */

@@ -145,6 +145,9 @@ pub struct TrayLabels {
     pub quit: String,
     /// Holds [`TIME_PLACEHOLDER`] exactly once.
     pub cancel_update: String,
+    pub pause_all: String,
+    pub resume_all: String,
+    pub alt_speed: String,
 }
 
 impl Default for TrayLabels {
@@ -153,6 +156,9 @@ impl Default for TrayLabels {
             show: "Show Ember".to_string(),
             quit: "Quit Ember".to_string(),
             cancel_update: format!("Cancel update ({TIME_PLACEHOLDER})"),
+            pause_all: "Pause all downloads".to_string(),
+            resume_all: "Resume all downloads".to_string(),
+            alt_speed: "Alternative speed limits".to_string(),
         }
     }
 }
@@ -205,7 +211,7 @@ fn clean(label: &str, needs_time: bool) -> Option<String> {
 
 /// The labels to use for what the frontend sent, each falling back to English
 /// on its own when it is not fit to show.
-fn accept(show: &str, quit: &str, cancel_update: &str) -> TrayLabels {
+fn accept(sent: &SentLabels) -> TrayLabels {
     let english = TrayLabels::default();
     let pick = |label: &str, needs_time: bool, fallback: String, name: &str| {
         clean(label, needs_time).unwrap_or_else(|| {
@@ -214,9 +220,12 @@ fn accept(show: &str, quit: &str, cancel_update: &str) -> TrayLabels {
         })
     };
     TrayLabels {
-        show: pick(show, false, english.show, "Show"),
-        quit: pick(quit, false, english.quit, "Quit"),
-        cancel_update: pick(cancel_update, true, english.cancel_update, "Cancel update"),
+        show: pick(&sent.show, false, english.show, "Show"),
+        quit: pick(&sent.quit, false, english.quit, "Quit"),
+        cancel_update: pick(&sent.cancel_update, true, english.cancel_update, "Cancel update"),
+        pause_all: pick(&sent.pause_all, false, english.pause_all, "Pause all"),
+        resume_all: pick(&sent.resume_all, false, english.resume_all, "Resume all"),
+        alt_speed: pick(&sent.alt_speed, false, english.alt_speed, "Alternative speed"),
     }
 }
 
@@ -228,16 +237,80 @@ fn store(labels: TrayLabels) {
     }
 }
 
+/// What the frontend sends. A label it leaves out stays English.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct SentLabels {
+    pub show: String,
+    pub quit: String,
+    pub cancel_update: String,
+    pub pause_all: String,
+    pub resume_all: String,
+    pub alt_speed: String,
+}
+
 /// The tray menu's labels in the frontend's language. `cancel_update` carries
 /// `{time}` where the countdown goes.
 #[tauri::command]
-pub fn set_tray_labels(show: String, quit: String, cancel_update: String) {
-    store(accept(&show, &quit, &cancel_update));
+pub fn set_tray_labels(labels: SentLabels) {
+    store(accept(&labels));
+}
+
+static ALT_SPEED_CHECKED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the tray's alternative-speed entry shows as on.
+pub fn alt_speed_checked() -> bool {
+    ALT_SPEED_CHECKED.load(Ordering::Acquire)
+}
+
+/// Record the alternative-speed state the menu should show. True when it
+/// differs from what the menu was last built with, so it needs building again.
+pub fn note_alt_speed(on: bool) -> bool {
+    ALT_SPEED_CHECKED.swap(on, Ordering::AcqRel) != on
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sent(show: &str, quit: &str, cancel_update: &str) -> SentLabels {
+        SentLabels {
+            show: show.to_string(),
+            quit: quit.to_string(),
+            cancel_update: cancel_update.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn accept(show: &str, quit: &str, cancel_update: &str) -> TrayLabels {
+        super::accept(&sent(show, quit, cancel_update))
+    }
+
+    #[test]
+    fn labels_the_frontend_leaves_out_stay_english() {
+        let english = TrayLabels::default();
+        let labels = accept("Ember anzeigen", "Ember beenden", "Abbrechen ({time})");
+        assert_eq!(labels.pause_all, english.pause_all);
+        assert_eq!(labels.resume_all, english.resume_all);
+        assert_eq!(labels.alt_speed, english.alt_speed);
+
+        let labels = super::accept(&SentLabels {
+            pause_all: "Alle pausieren".to_string(),
+            alt_speed: "Alt {time}".to_string(),
+            ..sent("a", "b", "{time}")
+        });
+        assert_eq!(labels.pause_all, "Alle pausieren");
+        assert_eq!(labels.alt_speed, english.alt_speed, "a placeholder nothing fills");
+    }
+
+    #[test]
+    fn the_alt_speed_state_reports_only_a_change() {
+        let start = alt_speed_checked();
+        assert!(!note_alt_speed(start));
+        assert!(note_alt_speed(!start));
+        assert!(!note_alt_speed(!start));
+        note_alt_speed(start);
+    }
 
     #[test]
     fn a_usable_translation_is_taken_as_is() {

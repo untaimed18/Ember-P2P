@@ -81,6 +81,9 @@ tauri-plugin-process = "2"
 # JS API is not exposed to the webview, so the text is composed (and localized)
 # in the frontend and the OS call is made here.
 tauri-plugin-notification = "2"
+# Launch at sign-in, driven by the `launch_at_login` setting. Used directly
+# rather than through `tauri-plugin-autostart`; see `login_launch.rs`.
+auto-launch = "0.6"
 # Clipboard access for the copy/paste affordances (eD2K links, Ember IDs,
 # channel invites). The webview's own `navigator.clipboard` is not a
 # substitute — WebKitGTK, the Linux webview, refuses programmatic reads

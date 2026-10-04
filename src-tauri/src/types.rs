@@ -1829,6 +1829,33 @@ pub struct AppSettings {
     /// See [`crate::bandwidth::schedule`].
     #[serde(default)]
     pub bandwidth_schedule: Vec<crate::bandwidth::schedule::BandwidthScheduleRule>,
+
+    /// Use [`Self::alt_max_upload_speed`] / [`Self::alt_max_download_speed`]
+    /// in place of every other limit, the schedule included, until switched
+    /// off again. Flipped from the tray and the status bar as well as Settings.
+    #[serde(default)]
+    pub alt_speed_enabled: bool,
+    /// Bytes per second; 0 is unlimited, as for the manual limits.
+    #[serde(default = "default_alt_max_upload_speed")]
+    pub alt_max_upload_speed: u64,
+    #[serde(default = "default_alt_max_download_speed")]
+    pub alt_max_download_speed: u64,
+
+    /// Register Ember to start when the user signs in. The OS entry is written
+    /// when this changes, and a leftover one removed at launch while it is off.
+    #[serde(default)]
+    pub launch_at_login: bool,
+    /// A launch at sign-in comes up in the tray rather than on the desktop.
+    #[serde(default = "default_true")]
+    pub start_hidden_at_login: bool,
+}
+
+fn default_alt_max_upload_speed() -> u64 {
+    50 * 1024
+}
+
+fn default_alt_max_download_speed() -> u64 {
+    200 * 1024
 }
 
 /// Live state of the features that act on their own between saves: the
@@ -1847,6 +1874,8 @@ pub struct RuntimeStatus {
     /// The schedule rule in force, or `None` when the manual limits are.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule: Option<crate::bandwidth::schedule::ActiveScheduleRule>,
+    /// The alternative limits are in force, overriding manual and schedule.
+    pub alt_speed: bool,
     /// Whether this platform can hold a sleep inhibitor at all.
     pub sleep_inhibit_supported: bool,
     /// Whether one is held right now.
@@ -2415,6 +2444,11 @@ impl Default for AppSettings {
             prevent_sleep_while_active: true,
             bandwidth_schedule_enabled: false,
             bandwidth_schedule: Vec::new(),
+            alt_speed_enabled: false,
+            alt_max_upload_speed: default_alt_max_upload_speed(),
+            alt_max_download_speed: default_alt_max_download_speed(),
+            launch_at_login: false,
+            start_hidden_at_login: true,
         }
     }
 }

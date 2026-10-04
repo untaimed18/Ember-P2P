@@ -201,12 +201,20 @@ pub fn resolve(
     }
 }
 
-/// [`resolve`] against the persisted settings.
+/// [`resolve`] against the persisted settings, with the alternative limits
+/// taking precedence over both the schedule and the manual limits.
 pub fn resolve_settings(
     settings: &crate::types::AppSettings,
     weekday: u8,
     minute: u16,
 ) -> ResolvedLimits {
+    if settings.alt_speed_enabled {
+        return ResolvedLimits {
+            max_upload_speed: settings.alt_max_upload_speed,
+            max_download_speed: settings.alt_max_download_speed,
+            active: None,
+        };
+    }
     resolve(
         settings.bandwidth_schedule_enabled,
         &settings.bandwidth_schedule,
@@ -541,6 +549,25 @@ mod tests {
             (111, 222)
         );
         assert!(disabled.active.is_none());
+    }
+
+    #[test]
+    fn alternative_limits_override_an_open_schedule_window() {
+        let mut settings = crate::types::AppSettings {
+            max_upload_speed: 111,
+            max_download_speed: 222,
+            bandwidth_schedule_enabled: true,
+            bandwidth_schedule: vec![rule(ALL_DAYS, 0, MINUTES_PER_DAY)],
+            alt_max_upload_speed: 7,
+            alt_max_download_speed: 0,
+            ..Default::default()
+        };
+        assert!(resolve_settings(&settings, MON, 600).active.is_some());
+
+        settings.alt_speed_enabled = true;
+        let resolved = resolve_settings(&settings, MON, 600);
+        assert_eq!((resolved.max_upload_speed, resolved.max_download_speed), (7, 0));
+        assert!(resolved.active.is_none());
     }
 
     /// Unlimited is `0` in `AppSettings`, so a rule must be able to *raise* the

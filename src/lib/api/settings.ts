@@ -104,6 +104,26 @@ export async function setCloseBehavior(behavior: 'ask' | 'tray' | 'exit'): Promi
   return invoke('set_close_behavior', { behavior });
 }
 
+/** The limits the tray and the status bar change directly. Fields left out
+ *  keep their saved values. */
+export interface QuickLimitsPatch {
+  alt_speed_enabled?: boolean;
+  max_upload_speed?: number;
+  max_download_speed?: number;
+  alt_max_upload_speed?: number;
+  alt_max_download_speed?: number;
+}
+
+/** Emitted with the full persisted settings after a save made outside the
+ *  Settings page (the tray's alternative-speed toggle, the status bar). */
+export const SETTINGS_CHANGED_EVENT = 'ember:settings-changed';
+
+/** Persist and apply speed limits without a full settings save. Resolves with
+ *  the settings as saved; {@link SETTINGS_CHANGED_EVENT} follows. */
+export async function setQuickLimits(patch: QuickLimitsPatch): Promise<AppSettings> {
+  return invoke('set_quick_limits', { patch });
+}
+
 /** Consume a native close request that preceded listener registration. */
 export async function takePendingCloseRequest(): Promise<boolean> {
   return invoke('take_pending_close_request');

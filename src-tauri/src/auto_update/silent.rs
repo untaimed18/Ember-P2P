@@ -968,6 +968,23 @@ fn on_main_thread(app: &AppHandle, change: impl FnOnce(&AppHandle) + Send + 'sta
     }
 }
 
+/// Build the tray menu again from the current labels and state, keeping the
+/// countdown's entry if one is showing.
+pub fn rebuild_tray_menu(app: &AppHandle) {
+    on_main_thread(app, |app| {
+        let item = TRAY_CANCEL.lock().clone();
+        let Some(tray) = app.tray_by_id("main") else {
+            return;
+        };
+        match crate::build_tray_menu(app, item.as_ref()) {
+            Ok(menu) => {
+                let _ = tray.set_menu(Some(menu));
+            }
+            Err(error) => tracing::warn!("Could not rebuild the tray menu: {error}"),
+        }
+    });
+}
+
 /// Put the countdown's "Cancel update" entry above the tray's others. Main
 /// thread only.
 fn show_tray_cancel(app: &AppHandle, label: &str) {

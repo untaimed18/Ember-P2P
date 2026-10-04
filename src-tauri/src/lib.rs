@@ -35,15 +35,17 @@ pub mod security;
 mod session_end;
 mod sharing;
 mod storage;
+mod login_launch;
 mod tray;
 mod types;
 mod webservices;
+mod window_state;
 
 use futures::FutureExt;
 use tauri::Emitter;
 
 use std::sync::Arc;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 use tokio::sync::{mpsc, RwLock};
@@ -170,13 +172,38 @@ pub(crate) fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(
 ) -> tauri::Result<Menu<R>> {
     let labels = tray::labels();
     let show_item = MenuItem::with_id(manager, "tray_show", &labels.show, true, None::<&str>)?;
+    let pause_item =
+        MenuItem::with_id(manager, "tray_pause_all", &labels.pause_all, true, None::<&str>)?;
+    let resume_item =
+        MenuItem::with_id(manager, "tray_resume_all", &labels.resume_all, true, None::<&str>)?;
+    let alt_speed_item = CheckMenuItem::with_id(
+        manager,
+        "tray_alt_speed",
+        &labels.alt_speed,
+        true,
+        tray::alt_speed_checked(),
+        None::<&str>,
+    )?;
     let quit_item = MenuItem::with_id(manager, "tray_quit", &labels.quit, true, None::<&str>)?;
+    let actions_separator = PredefinedMenuItem::separator(manager)?;
+    let quit_separator = PredefinedMenuItem::separator(manager)?;
+    let ordinary: [&dyn IsMenuItem<R>; 7] = [
+        &show_item,
+        &actions_separator,
+        &pause_item,
+        &resume_item,
+        &alt_speed_item,
+        &quit_separator,
+        &quit_item,
+    ];
     match cancel {
         Some(cancel) => {
             let separator = PredefinedMenuItem::separator(manager)?;
-            Menu::with_items(manager, &[cancel, &separator, &show_item, &quit_item])
+            let mut items: Vec<&dyn IsMenuItem<R>> = vec![cancel, &separator];
+            items.extend(ordinary);
+            Menu::with_items(manager, &items)
         }
-        None => Menu::with_items(manager, &[&show_item, &quit_item]),
+        None => Menu::with_items(manager, &ordinary),
     }
 }
 
@@ -1146,6 +1173,43 @@ pub fn run() {
                         }
                     }
                     auto_update::silent::TRAY_CANCEL_ID => auto_update::silent::postpone(),
+                    "tray_pause_all" | "tray_resume_all" => {
+                        let pause = event.id.as_ref() == "tray_pause_all";
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let Some(state) = app.try_state::<AppState>() else {
+                                return;
+                            };
+                            let result = if pause {
+                                commands::transfers::pause_all_transfers(app.clone(), state).await
+                            } else {
+                                commands::transfers::resume_all_transfers(app.clone(), state).await
+                            };
+                            if let Err(error) = result {
+                                tracing::warn!("Tray pause/resume all failed: {error}");
+                            }
+                        });
+                    }
+                    "tray_alt_speed" => {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let Some(state) = app.try_state::<AppState>() else {
+                                return;
+                            };
+                            let patch = commands::settings::QuickLimitsPatch {
+                                alt_speed_enabled: Some(!tray::alt_speed_checked()),
+                                ..Default::default()
+                            };
+                            if let Err(error) =
+                                commands::settings::apply_quick_limits(&app, &state, patch).await
+                            {
+                                tracing::warn!("Tray alternative speed toggle failed: {error}");
+                            }
+                            // The OS flips a check item on click by itself; put it back
+                            // in step with what was actually saved.
+                            auto_update::silent::rebuild_tray_menu(&app);
+                        });
+                    }
                     "tray_quit" => {
                         if let Some(state) = app.try_state::<AppState>() {
                             state
@@ -1201,12 +1265,20 @@ pub fn run() {
             // "launch maximized" preference is applied here too: it is a
             // launch-time preference, so toggling it in Settings only changes
             // how the *next* launch opens.
+            let launch_window = resume_window.or_else(|| {
+                window_state::for_launch(
+                    window_state::load(&data_dir),
+                    settings.launch_maximized,
+                    login_launch::launched_at_login() && settings.start_hidden_at_login,
+                )
+            });
             auto_update::resume::show_main_window(
                 &app_handle,
-                resume_window.as_ref(),
+                launch_window.as_ref(),
                 tray::reachable(),
                 settings.launch_maximized,
             );
+            login_launch::reconcile_at_launch(&app_handle, settings.launch_at_login);
             auto_update::silent::spawn(app_handle.clone());
 
             let index_clone = local_index.clone();
@@ -2390,6 +2462,7 @@ pub fn run() {
             commands::settings::show_main_window,
             commands::settings::quit_app,
             commands::settings::set_close_behavior,
+            commands::settings::set_quick_limits,
             commands::settings::take_pending_close_request,
             commands::settings::take_pending_ember_default_on_notice,
             commands::settings::take_pending_restore_failed_notice,
@@ -2637,6 +2710,12 @@ pub fn run() {
             std::process::exit(1);
         })
         .run(|app_handle, event| {
+            // Before the windows close, while the main one still reports where
+            // it is. An update install exits without this event; its own
+            // resume file carries the window instead.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                window_state::save(app_handle);
+            }
             if let tauri::RunEvent::Exit = event {
                 // Exit is delivered on the main thread, outside the async
                 // runtime, and the process is torn down the moment this

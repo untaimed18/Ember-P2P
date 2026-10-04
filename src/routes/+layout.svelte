@@ -35,6 +35,7 @@
     takePendingRestoreFailedNotice,
     takePendingRestoreExpiredNotice,
     takePendingKnownMetNotice,
+    SETTINGS_CHANGED_EVENT,
   } from '$lib/api/settings';
   import {
     applyBackgroundCheckResult,
@@ -296,6 +297,7 @@
     let handoffCheckTimer: number | undefined;
     let unlistenUpdateCheck: UnlistenFn | null = null;
     let unlistenUpdateResume: UnlistenFn | null = null;
+    let unlistenSettingsChanged: UnlistenFn | null = null;
     let unlistenSilentUpdate: UnlistenFn | null = null;
     const stopActivityReporting = startUserActivityReporting();
     let unlistenClose: UnlistenFn | null = null;
@@ -507,7 +509,17 @@
       show: m.tray_show(),
       quit: m.tray_quit(),
       cancelUpdate: m.tray_cancel_update({ time: '{time}' }),
+      pauseAll: m.tray_pause_all(),
+      resumeAll: m.tray_resume_all(),
+      altSpeed: m.tray_alt_speed(),
     }).catch((e) => console.error('Failed to set the tray labels:', e));
+
+    // The tray and the status bar save speed limits without the Settings page.
+    listen<AppSettings>(SETTINGS_CHANGED_EVENT, (event) => {
+      if (mounted) setAppSettings(event.payload);
+    })
+      .then((fn) => { if (mounted) unlistenSettingsChanged = fn; else fn(); })
+      .catch((e) => console.error('Failed to register settings-changed listener:', e));
 
     // An update restart asks for the page and search tabs just before it shuts
     // Ember down, so the launch after it can put them back.
@@ -721,6 +733,7 @@
       if (handoffCheckTimer !== undefined) window.clearTimeout(handoffCheckTimer);
       if (unlistenUpdateCheck) unlistenUpdateCheck();
       if (unlistenUpdateResume) unlistenUpdateResume();
+      if (unlistenSettingsChanged) unlistenSettingsChanged();
       if (unlistenSilentUpdate) unlistenSilentUpdate();
       stopActivityReporting();
       if (stopPoll) stopPoll();

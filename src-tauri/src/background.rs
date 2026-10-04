@@ -95,11 +95,12 @@ async fn run(app: tauri::AppHandle) {
         };
 
         let (weekday, minute) = schedule::local_now();
-        let (resolved, prevent_sleep) = {
+        let (resolved, prevent_sleep, alt_speed) = {
             let config = state.config.read().await;
             (
                 schedule::resolve_settings(&config.settings, weekday, minute),
                 config.settings.prevent_sleep_while_active,
+                config.settings.alt_speed_enabled,
             )
         };
 
@@ -122,11 +123,15 @@ async fn run(app: tauri::AppHandle) {
                     previous.0,
                     target.1,
                     previous.1,
-                    resolved
-                        .active
-                        .as_ref()
-                        .map(|rule| format!("schedule rule {}", rule.id))
-                        .unwrap_or_else(|| "manual limits".to_string()),
+                    if alt_speed {
+                        "alternative limits".to_string()
+                    } else {
+                        resolved
+                            .active
+                            .as_ref()
+                            .map(|rule| format!("schedule rule {}", rule.id))
+                            .unwrap_or_else(|| "manual limits".to_string())
+                    },
                 );
             }
             applied_limits = Some(target);
@@ -153,6 +158,7 @@ async fn run(app: tauri::AppHandle) {
             effective_upload_speed: state.bandwidth_limiter.effective_upload_rate(),
             effective_download_speed: target.1,
             schedule: resolved.active,
+            alt_speed,
             sleep_inhibit_supported,
             // What the OS accepted, not what was asked for: a refused
             // `SetThreadExecutionState` is backed off rather than retried every
@@ -331,10 +337,14 @@ pub fn apply_effective_limits(
         published.effective_upload_speed = upload_in_force;
         published.effective_download_speed = resolved.max_download_speed;
         published.schedule = resolved.active;
+        published.alt_speed = settings.alt_speed_enabled;
         published.clone()
     };
     if let Err(error) = app.emit("ember:runtime-status", &status) {
         tracing::debug!("Could not emit runtime status after a settings save: {error}");
+    }
+    if crate::tray::note_alt_speed(settings.alt_speed_enabled) {
+        crate::auto_update::silent::rebuild_tray_menu(app);
     }
 }
 
@@ -370,6 +380,7 @@ fn resolved_status(settings: &crate::types::AppSettings) -> RuntimeStatus {
         effective_upload_speed: resolved.max_upload_speed,
         effective_download_speed: resolved.max_download_speed,
         schedule: resolved.active,
+        alt_speed: settings.alt_speed_enabled,
         sleep_inhibit_supported: crate::power::supported(),
         sleep_inhibit_held: false,
     }
