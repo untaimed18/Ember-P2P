@@ -1553,7 +1553,7 @@
   "search_visibility_filters_aria": "Sichtbarkeitsfilter für Ergebnisse",
   "search_hide_spam": "Spam ausblenden",
   "search_hide_owned": "Vorhandene Dateien ausblenden",
-  "search_hide_owned_title": "Blendet Ergebnisse aus, die in deiner Bibliothek sind, schon fertig heruntergeladen wurden oder bereits in den Übertragungen stehen.",
+  "search_hide_owned_title": "Blendet Ergebnisse für Dateien aus, die schon in deiner Bibliothek sind. Laufende Downloads bleiben sichtbar.",
   "search_explain_spam_hiding": "Spam-Ausblendung erklären",
   "search_spam_hidden_count": "{count} Spam-Ergebnisse sind derzeit ausgeblendet.",
   "search_spam_hidden_count_one": "1 Spam-Ergebnis ist derzeit ausgeblendet.",

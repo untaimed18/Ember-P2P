@@ -1553,7 +1553,7 @@
   "search_visibility_filters_aria": "結果可見性篩選",
   "search_hide_spam": "隱藏垃圾結果",
   "search_hide_owned": "隱藏已有的檔案",
-  "search_hide_owned_title": "隱藏已在資料庫中、先前已下載完成或已在傳輸清單中的結果。",
+  "search_hide_owned_title": "隱藏資料庫中已有檔案的結果。正在下載的檔案仍會顯示。",
   "search_explain_spam_hiding": "瞭解垃圾結果隱藏規則",
   "search_spam_hidden_count": "當前已隱藏 {count} 個垃圾結果。",
   "search_spam_hidden_count_one": "當前已隱藏 1 個垃圾結果。",

@@ -1553,7 +1553,7 @@
   "search_visibility_filters_aria": "Filtros de visibilidade dos resultados",
   "search_hide_spam": "Ocultar spam",
   "search_hide_owned": "Ocultar arquivos que já tenho",
-  "search_hide_owned_title": "Oculta resultados que estão na sua biblioteca, que você já terminou de baixar ou que já estão em Transferências.",
+  "search_hide_owned_title": "Oculta resultados de arquivos que já estão na sua biblioteca. Downloads em andamento continuam visíveis.",
   "search_explain_spam_hiding": "Explicar ocultação de spam",
   "search_spam_hidden_count": "{count} resultados de spam estão ocultos.",
   "search_spam_hidden_count_one": "1 resultado de spam está oculto.",

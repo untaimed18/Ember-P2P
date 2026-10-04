@@ -1665,12 +1665,10 @@
   let spamHiddenCount = $derived(filterPass.spamCount);
   let ownedHiddenCount = $derived(filterPass.ownedCount);
 
-  /** In the library, finished before, or already in Transfers. */
+  /** Already in the library. A download still in progress, or a finished one
+   *  whose file has since left the library, is not something we have. */
   function alreadyHave(r: SearchResult): boolean {
-    if (r.result_origin?.includes('Local')) return true;
-    if (downloadHistoryMap[r.file.hash] === 'completed') return true;
-    const t = downloadsByHash.get(r.file.hash);
-    return !!t && (t.status === 'completed' || BLOCKING_DOWNLOAD_STATUSES.has(t.status));
+    return !!r.result_origin?.includes('Local');
   }
 
   /* --- Row windowing ---------------------------------------------------
