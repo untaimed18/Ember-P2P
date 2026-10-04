@@ -11092,7 +11092,11 @@ async fn download_parts_from_source(
                             } else if narrowed {
                                 PartHashOutcome::AichNarrowed
                             } else {
-                                if let std::net::IpAddr::V4(v4) = addr.ip() {
+                                // A wait we abandoned mid-packet says nothing
+                                // about what this peer can recover.
+                                if let (false, std::net::IpAddr::V4(v4)) =
+                                    (aich_wait_desynced, addr.ip())
+                                {
                                     if let Some(ref etx) = event_tx {
                                         let _ = etx
                                             .send(DownloadEvent::AichRecoveryFailed {

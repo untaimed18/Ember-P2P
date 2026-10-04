@@ -115,7 +115,7 @@ pub(in crate::network) async fn on_kad_callback_conn(
     });
     {
         let mut sm = source_manager.write().await;
-        if let Some((srv_ip, srv_port)) = server_info {
+        if let (true, Some((srv_ip, srv_port))) = (parts.answers_server_callback, server_info) {
             // Link this callback to the LowID row we already
             // track (matched by the peer's *listening* port
             // from its Hello, not this connection's ephemeral

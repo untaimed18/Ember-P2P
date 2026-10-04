@@ -1201,6 +1201,12 @@ pub struct KadCallbackParts {
     /// the connection is adopted, so without this the live row had nothing to
     /// inherit a label from and showed a dash.
     pub origin: Option<crate::types::SourceOrigin>,
+    /// Set only when this connection was taken for a LowID source's answer to
+    /// our `OP_CALLBACKREQUEST`. Only such a connection may stamp its user
+    /// hash onto that source's row: any other route's peer that shares the
+    /// row's listening port would claim the row, and the real peer's
+    /// callbacks would no longer match it.
+    pub answers_server_callback: bool,
 }
 
 /// Path B (eMule queued-source model) inbound reconnect index.
@@ -7557,6 +7563,7 @@ impl UploadHandler {
                             peer_caps: hello_caps.clone(),
                             friend_ember_hash: Some(peer.ember_hash),
                             origin: Some(crate::types::SourceOrigin::Ember),
+                            answers_server_callback: false,
                         })
                         .await;
                     return Ok(());
@@ -7716,6 +7723,7 @@ impl UploadHandler {
                     peer_caps: hello_caps.clone(),
                     friend_ember_hash: None,
                     origin: callback_origin,
+                    answers_server_callback: false,
                 };
                 let _ = self.kad_callback_tx.send(parts).await;
                 return Ok(());
@@ -7725,7 +7733,8 @@ impl UploadHandler {
         // Check if this is a server callback connection (LowID source connecting
         // back after we sent OP_CALLBACKREQUEST). We match by the TCP port the
         // peer reports in its Hello packet against registered LowID sources for
-        // our currently-connected server that we recently asked to call back.
+        // our currently-connected server that we recently asked to call back,
+        // or whose user hash an earlier callback confirmed.
         if let Some(peer_v4) = diversion_ip {
             let peer_hello_port = if hello_data.len() >= 23 {
                 u16::from_le_bytes([hello_data[21], hello_data[22]])
@@ -7785,6 +7794,7 @@ impl UploadHandler {
                         peer_caps: hello_caps.clone(),
                         friend_ember_hash: None,
                         origin: None,
+                        answers_server_callback: true,
                     };
                     let _ = self.kad_callback_tx.send(parts).await;
                     return Ok(());
@@ -7857,6 +7867,7 @@ impl UploadHandler {
                     peer_caps: hello_caps.clone(),
                     friend_ember_hash: None,
                     origin: None,
+                    answers_server_callback: false,
                 };
                 let _ = self.kad_callback_tx.send(parts).await;
                 return Ok(());
