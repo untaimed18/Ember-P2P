@@ -45,6 +45,25 @@ pub struct PendingFolderDrop {
     pub parents: Vec<String>,
 }
 
+/// The settings the network stack reads once, as this process started with
+/// them. A saved value that differs from one of these waits for a restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LaunchSettings {
+    pub tcp_port: u16,
+    pub udp_port: u16,
+    pub upnp_enabled: bool,
+}
+
+impl LaunchSettings {
+    pub fn from_settings(settings: &crate::types::AppSettings) -> Self {
+        Self {
+            tcp_port: settings.tcp_port,
+            udp_port: settings.udp_port,
+            upnp_enabled: settings.upnp_enabled,
+        }
+    }
+}
+
 /// Live shared-folder list visible to the upload server's security check.
 pub type SharedFolderList = Arc<RwLock<Vec<String>>>;
 
@@ -67,6 +86,8 @@ pub struct AppState {
     /// Process-wide persistent identity loaded exactly once during setup.
     pub identity: Arc<NodeIdentity>,
     pub config: Arc<RwLock<AppConfig>>,
+    /// See [`LaunchSettings`]. Fixed for the life of the process.
+    pub launch_settings: LaunchSettings,
     /// Serializes each read/modify/persist/commit settings transaction so
     /// concurrent commands cannot overwrite one another with stale clones.
     pub settings_save_lock: Arc<tokio::sync::Mutex<()>>,

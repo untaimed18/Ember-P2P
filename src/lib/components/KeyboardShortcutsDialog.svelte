@@ -154,6 +154,16 @@
       ],
     },
     {
+      title: () => m.nav_settings(),
+      shortcuts: [
+        { keys: ['/'], label: () => m.shortcuts_library_focus_search() },
+        { keys: [modifierKey, 'F'], label: () => m.shortcuts_library_focus_search() },
+        { keys: ['↑ / ↓'], label: () => m.shortcuts_settings_sections() },
+        { keys: ['Enter'], label: () => m.shortcuts_settings_apply() },
+        { keys: ['Esc'], label: () => m.shortcuts_settings_revert() },
+      ],
+    },
+    {
       title: () => m.shortcuts_section_transfers(),
       shortcuts: [
         { keys: ['↑ / ↓'], label: () => m.shortcuts_transfers_navigate() },

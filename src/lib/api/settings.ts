@@ -10,6 +10,18 @@ export async function getSettings(): Promise<AppSettings> {
   return invoke('get_settings');
 }
 
+/** The settings the network stack reads once, as this run of Ember started
+ *  with them. A saved value that differs takes effect after a restart. */
+export interface LaunchSettings {
+  tcp_port: number;
+  udp_port: number;
+  upnp_enabled: boolean;
+}
+
+export async function getLaunchSettings(): Promise<LaunchSettings> {
+  return invoke('get_launch_settings');
+}
+
 export interface UpdateSettingsResult {
   outcome: SettingsUpdateOutcome;
   settings: AppSettings;
@@ -31,8 +43,8 @@ export interface IpFilterDownloadResult {
 export interface UpdateSettingsOptions {
   /** Treat this save as consent to re-approve a download folder whose approval
    *  was revoked, which is otherwise unrecoverable in-app because re-picking the
-   *  same path is not a change. Only the Settings page's own save button sets
-   *  it: background callers (the UPnP auto-disable handler) reach this with no
+   *  same path is not a change. Only picking the folder in Settings sets it:
+   *  background callers (the UPnP auto-disable handler) reach this with no
    *  user present, and re-approval grants sandbox access to whatever object now
    *  sits at that path. */
   reapproveDownloadRoot?: boolean;

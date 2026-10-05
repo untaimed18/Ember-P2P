@@ -2,7 +2,7 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use tracing::{info, warn};
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, LaunchSettings};
 use crate::commands::errors::{coded, coded_ctx};
 use crate::network::kad::bootstrap;
 use crate::network::kad::ip_filter::count_valid_entries;
@@ -277,8 +277,8 @@ fn preview_player_was_picked(path: &std::path::Path) -> bool {
 /// the configured download path. That is the only way back for a root revoked
 /// because the user genuinely moved or reconnected the folder, and it is also
 /// exactly what an attacker wants after swapping a junction or a removable
-/// drive in underneath it. The flag itself arrives over IPC and the Settings
-/// page sets it on every save, so the flag cannot be the authorization —
+/// drive in underneath it. The flag itself arrives over IPC from a renderer
+/// that could set it on any save, so the flag cannot be the authorization —
 /// provenance is. Either this session's own picker produced that exact path,
 /// or the user answers a dialog the renderer can neither draw nor dismiss.
 ///
@@ -306,8 +306,7 @@ async fn download_root_reapproval_authorized(
         elide_for_dialog(download_folder)
     );
     // `None` means there is nothing to authorize, which is the ordinary case:
-    // the Settings page sends the flag on every save and almost every save
-    // finds the root intact.
+    // almost every save that carries the flag finds the root intact.
     let answer = tokio::task::spawn_blocking(move || {
         let path = std::path::Path::new(&folder);
         // An absent root keeps its record (`build_next` retains it on
@@ -690,6 +689,11 @@ fn prune_removed_shared_folder_state(
 pub async fn get_settings(state: tauri::State<'_, AppState>) -> Result<AppSettings, String> {
     let config = state.config.read().await;
     Ok(config.settings.clone())
+}
+
+#[tauri::command]
+pub fn get_launch_settings(state: tauri::State<'_, AppState>) -> LaunchSettings {
+    state.launch_settings
 }
 
 /// Upper bounds for IPC inputs. These exist to prevent a malicious/buggy
@@ -1659,16 +1663,6 @@ pub async fn update_settings(
             .map_err(failed)?;
     }
 
-    let port_changed =
-        settings.tcp_port != old_settings.tcp_port || settings.udp_port != old_settings.udp_port;
-    // The network loop reads UPnP once, at startup, to decide whether to map
-    // ports, renew the lease and tear the mapping down on exit. Reporting this
-    // as applied claimed a live change that never happened: disabling left the
-    // mappings and their renewals running, and enabling did nothing at all.
-    // Restarting is what actually honours the new value, and it is also what
-    // removes the existing mapping, because shutdown tears down on the value it
-    // started with.
-    let upnp_changed = settings.upnp_enabled != old_settings.upnp_enabled;
     let download_folder_changed = !settings.download_folder.is_empty()
         && normalized_path_components(std::path::Path::new(&settings.download_folder))
             != normalized_path_components(std::path::Path::new(&old_settings.download_folder));
@@ -1755,9 +1749,9 @@ pub async fn update_settings(
         // object now sits at the path, and `update_settings` is also reached
         // from background paths with no user present — the UPnP auto-disable
         // handler persists through it from a network event. The flag says the
-        // Settings save button was pressed, but it travels over IPC and the
-        // page sets it on every save, so it is treated as a request rather
-        // than as consent and `download_root_reapproval_authorized` decides.
+        // download folder was picked in Settings, but it travels over IPC, so
+        // it is treated as a request rather than as consent and
+        // `download_root_reapproval_authorized` decides.
         // It is also skipped unless something is actually there: a root that
         // is merely offline (unplugged drive, disconnected share) must keep
         // its record, which `build_next` retains on `NotFound`, rather than be
@@ -1927,7 +1921,15 @@ pub async fn update_settings(
         });
     }
 
-    let outcome = if port_changed || upnp_changed {
+    // Compared with what this process started on, not with the previous save,
+    // so changing a port and then changing it back needs no restart. The
+    // network loop reads UPnP once, at startup, to decide whether to map
+    // ports, renew the lease and tear the mapping down on exit: disabling it
+    // mid-session would leave the mappings and their renewals running, and
+    // enabling it would do nothing. Restarting is what honours the new value,
+    // and it is also what removes the existing mapping, because shutdown tears
+    // down on the value it started with.
+    let outcome = if LaunchSettings::from_settings(&settings) != state.launch_settings {
         SettingsUpdateOutcome::RestartRequired
     } else {
         SettingsUpdateOutcome::Applied

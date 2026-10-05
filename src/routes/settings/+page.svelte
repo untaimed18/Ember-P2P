@@ -1,6 +1,7 @@
 <script lang="ts">
   import {
     getSettings,
+    getLaunchSettings,
     updateSettings,
     downloadNodesDat,
     downloadIpfilter,
@@ -12,6 +13,7 @@
     importWebServicesFile,
     getExampleWebService,
     SETTINGS_CHANGED_EVENT,
+    type LaunchSettings,
     type UpdateSettingsResult,
     type NodesDatDownloadResult,
     type IpFilterDownloadResult,
@@ -96,7 +98,7 @@
     SpamStats,
     DownloadHistoryStats,
   } from '$lib/types';
-  import { onMount, untrack } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { beforeNavigate } from '$app/navigation';
   import { theme, applyTheme, followSystemTheme, themeFollowsSystem, type Theme } from '$lib/stores/theme';
   import {
@@ -127,7 +129,7 @@
   } from '$lib/stores/updater';
   import { silentUpdate, silentUpdateResume } from '$lib/stores/silentUpdate';
   import { toastError } from '$lib/stores/toast';
-  import { networkStats } from '$lib/stores/network';
+  import { networkStats, upnpAutoDisabled } from '$lib/stores/network';
   import { isShortcutLetter } from '$lib/shortcutKey';
 
   const appVersion = import.meta.env.VITE_APP_VERSION;
@@ -196,15 +198,12 @@
     }
   }
 
+  /** A restart is reported by the banner and prompt instead, which know
+   *  whether the change is still waiting for one. */
   function updateSettingsOutcomeMessage(result: UpdateSettingsResult): string {
-    switch (result.outcome) {
-      case 'restart_required':
-        return m.settings_save_restart_required();
-      case 'deferred':
-        return m.settings_save_live_apply_deferred();
-      default:
-        return m.settings_save_success();
-    }
+    return result.outcome === 'deferred'
+      ? m.settings_save_live_apply_deferred()
+      : m.settings_save_success();
   }
 
   function nodesDownloadOutcomeMessage(result: NodesDatDownloadResult): string {
@@ -324,7 +323,6 @@
   const LOW_DISK_CHOICES_MB = [512, 1024, 2048, 5120, 10240];
   let pageContentEl: HTMLDivElement | null = $state(null);
   let originalSettings: string = $state('');
-  let saving = $state(false);
   let saveMessage: string | null = $state(null);
   let saveIsWarning = $state(false);
   let loadError: string | null = $state(null);
@@ -333,16 +331,14 @@
   let nodesResultWarning = $state(false);
   let nodesError: string | null = $state(null);
 
-  // Restart-prompt state. Populated by `handleSave` when a save changes
-  // either the TCP or UDP port — those are the two settings that the
-  // network stack only reads once at startup (the upload listener binds
-  // them in `start_upload_server` before any settings hot-reload path
-  // can touch them), so a port change has no effect until the process
-  // is restarted. Using the same `relaunch` flow as `SetupWizard.svelte`
-  // so the experience is identical to first-time setup.
+  // The ports and UPnP are read once, when the network stack starts (the
+  // upload listener binds the TCP port in `start_upload_server` before any
+  // settings hot-reload path can touch it), so a saved change to one of them
+  // waits for a restart. Restarting uses the same `relaunch` flow as
+  // `SetupWizard.svelte` so the experience is identical to first-time setup.
+  let launchSettings: LaunchSettings | null = $state(null);
   let showRestartPrompt = $state(false);
   let restarting = $state(false);
-  let pendingRestartReason = $state('');
 
   // --- Backup / restore ---
   // A restore cannot be applied while the app is running (SQLite holds the
@@ -593,6 +589,7 @@
     if (!settings || !speedResult) return;
     settings.max_upload_speed = speedResult.recommended_upload_limit;
     settings.max_download_speed = speedResult.recommended_download_limit;
+    void applyFields(['max_upload_speed', 'max_download_speed']);
   }
 
   // ---------------------------------------------------------------------
@@ -607,9 +604,9 @@
   // ---------------------------------------------------------------------
   // Bandwidth schedule editing.
   //
-  // Rules are edited in place on `settings.bandwidth_schedule` and saved with
-  // the rest of the form, so the schedule follows the same unsaved-changes,
-  // Discard, and stale-revision rules as every other setting. Nothing here
+  // Rules are edited in place on `settings.bandwidth_schedule` and saved
+  // together by the schedule's Apply button, like a typed field, so a rule is
+  // never saved half-edited. Nothing here
   // applies a limit — the backend resolves the timetable once a second, and
   // `runtimeStatus` is what says which rule won.
   // ---------------------------------------------------------------------
@@ -732,11 +729,12 @@
   });
 
   /**
-   * Whether the schedule would be refused by the backend, which blocks Save.
+   * Whether the schedule would be refused by the backend, which blocks its
+   * Apply button.
    *
    * The list-level checks are here as well as the per-rule ones. A duplicate id
    * or an over-long list is refused by `schedule::validate` exactly as a
-   * malformed rule is, and without them Save stayed enabled and the failure
+   * malformed rule is, and without them Apply stayed enabled and the failure
    * came back as a page-level error naming no rule at all.
    */
   let scheduleHasError = $derived.by(() => {
@@ -790,25 +788,42 @@
    * `?section=network` opens straight to that card. Pages that send the user
    * here are pointing at one specific setting — the Ember page's "off" state
    * means "turn the overlay back on in Network" — and dropping them on
-   * General left them to find it. Unknown or missing values fall back to
-   * General, so a stale link can't land on a blank page.
+   * General left them to find it. Without one, Settings reopens on the
+   * section last open this session, so stepping out to check something and
+   * coming back does not mean finding your place again. Unknown values fall
+   * back to General, so a stale link can't land on a blank page.
    *
    * Read once at init rather than tracked: this is an entry point, not a
    * binding, and re-syncing would fight the nav buttons.
    */
   function initialSection(): SettingsSection {
+    const known = (value: string | null): value is SettingsSection =>
+      !!value && (sections as string[]).includes(value);
     try {
       const requested = get(page).url.searchParams.get('section');
-      if (requested && (sections as string[]).includes(requested)) {
-        return requested as SettingsSection;
-      }
+      if (known(requested)) return requested;
     } catch {
-      /* no URL available — General is the safe default */
+      /* no URL available — fall through */
+    }
+    try {
+      const remembered = sessionStorage.getItem(LAST_SECTION_KEY);
+      if (known(remembered)) return remembered;
+    } catch {
+      /* storage disabled — General is the safe default */
     }
     return 'general';
   }
 
+  const LAST_SECTION_KEY = 'settings-last-section';
   let activeSection: SettingsSection = $state(initialSection());
+  $effect(() => {
+    const section = activeSection;
+    try {
+      sessionStorage.setItem(LAST_SECTION_KEY, section);
+    } catch {
+      /* storage disabled — Settings just opens on General next time */
+    }
+  });
   // A link to a section followed while already on Settings (the status bar's
   // "More in Settings") reuses this page, so `initialSection` never sees it.
   // Only real navigations land here: `selectSection` writes the URL with
@@ -817,6 +832,9 @@
     const requested = navigation.to?.url.searchParams.get('section');
     if (requested && (sections as string[]).includes(requested) && requested !== activeSection) {
       activeSection = requested as SettingsSection;
+      // The link names the section; the filter's last-used field must not
+      // override it when the filter clears.
+      filterFocusField = null;
       settingsFilter = '';
     }
   });
@@ -1020,6 +1038,61 @@
     document.getElementById(tabId(sections[next]))?.focus();
   }
 
+  // In a narrow window the tabs are one row that scrolls sideways, and the
+  // selected one can sit off the edge — after arriving from a link, say.
+  $effect(() => {
+    const id = tabId(activeSection);
+    if (filtering) return;
+    void tick().then(() => {
+      document.getElementById(id)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    });
+  });
+
+  let settingsFilterEl: HTMLInputElement | null = $state(null);
+
+  /** Ctrl/Cmd+F, or "/" when not typing, finds a setting — the same keys
+   *  that focus the search box on Library, Search and Channels. */
+  function handleFindKey(e: KeyboardEvent) {
+    if (e.defaultPrevented || document.querySelector('[aria-modal="true"]')) return;
+    if (e.target instanceof Element && e.target.closest('.chat-dock')) return;
+    const target = e.target instanceof HTMLElement ? e.target : null;
+    const typing =
+      !!target && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
+    const findKey =
+      (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && isShortcutLetter(e, 'f');
+    if (!findKey && (typing || e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey)) return;
+    if (!settingsFilterEl) return;
+    e.preventDefault();
+    settingsFilterEl.focus();
+    settingsFilterEl.select();
+  }
+
+  // While filtering, the section of the setting last used. Clearing the
+  // filter opens it, rather than dropping back to whatever section was open
+  // before the search and leaving the setting just changed out of sight.
+  let filterFocusField: HTMLElement | null = null;
+  function noteFilterFocus(e: FocusEvent) {
+    if (filtering && e.target instanceof HTMLElement && e.target.closest('.card')) {
+      filterFocusField = e.target;
+    }
+  }
+
+  let wasFiltering = false;
+  $effect(() => {
+    const now = filtering;
+    untrack(() => {
+      const field = !now && wasFiltering ? filterFocusField : null;
+      wasFiltering = now;
+      if (!now) filterFocusField = null;
+      const cardId = field?.isConnected ? field.closest('.card')?.id : undefined;
+      const section = sections.find((s) => panelId(s) === cardId);
+      if (!field || !section) return;
+      selectSection(section);
+      // Switching sections scrolls to the top; bring the setting back.
+      void tick().then(() => field.scrollIntoView({ block: 'center' }));
+    });
+  });
+
   let unmounted = false;
   onMount(() => {
     let unlistenIpFilterReload: UnlistenFn | null = null;
@@ -1117,6 +1190,12 @@
         originalSettings = JSON.stringify(s);
       })
       .catch((e) => { loadError = translateError(e, m.settings_load_failed()); });
+    getLaunchSettings()
+      .then((launch) => {
+        if (!unmounted) launchSettings = launch;
+      })
+      // Only the restart banner is lost; every setting still saves.
+      .catch((e) => console.warn('Settings: launch settings unavailable', e));
 
     // Only covers window close/reload. In-app routing is guarded by the
     // `beforeNavigate` hook below, which is the path a desktop user actually
@@ -1124,22 +1203,16 @@
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
       if (hasUnsavedChanges) e.preventDefault();
     };
-    const handleKeyboardSave = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && isShortcutLetter(e, 's')) {
-        e.preventDefault();
-        if (hasUnsavedChanges) handleSave();
-      }
-    };
     window.addEventListener('beforeunload', handleBeforeUnload);
-    window.addEventListener('keydown', handleKeyboardSave);
+    window.addEventListener('keydown', handleFindKey);
     return () => {
       unmounted = true;
+      window.removeEventListener('keydown', handleFindKey);
       unlistenIpFilterReload?.();
       unlistenNodesBootstrap?.();
       unlistenRuntimeStatus?.();
       unlistenSettingsChanged?.();
       window.removeEventListener('beforeunload', handleBeforeUnload);
-      window.removeEventListener('keydown', handleKeyboardSave);
       for (const id of activeTimers) clearTimeout(id);
     };
   });
@@ -1274,8 +1347,7 @@
     // VPN that only forwards a single port for both protocols. The only
     // thing we still require is that the port is in the 1-65535 range.
     s.max_upload_speed = cn(s.max_upload_speed, MAX_CONFIGURED_SPEED_BPS, 0);
-    // The clearing effect waits for the cap field to lose focus, and a save
-    // can arrive before it does.
+    // USS needs a non-zero upload cap, so applying Unlimited turns it off.
     if (s.max_upload_speed === 0) s.uss_enabled = false;
     s.max_download_speed = cn(s.max_download_speed, MAX_CONFIGURED_SPEED_BPS, 0);
     s.max_concurrent_downloads = ci(s.max_concurrent_downloads, 1, 50, 5);
@@ -1300,38 +1372,6 @@
     return JSON.stringify(a) === JSON.stringify(b);
   }
 
-  /**
-   * Apply only fields changed in this page's draft over the latest persisted
-   * snapshot. This keeps unrelated out-of-band changes while preserving every
-   * unsaved field the user has edited here.
-   */
-  function mergeDraftOntoLatest(draft: AppSettings, latest: AppSettings): AppSettings {
-    let baseline: AppSettings | null = null;
-    try {
-      baseline = originalSettings ? JSON.parse(originalSettings) as AppSettings : null;
-    } catch {
-      // With no trustworthy baseline we cannot distinguish changed fields, so
-      // preserve the full visible draft and refresh only its concurrency token.
-    }
-
-    if (!baseline) {
-      return { ...draft, settings_revision: latest.settings_revision };
-    }
-
-    const merged = JSON.parse(JSON.stringify(latest)) as AppSettings;
-    const draftFields = draft as unknown as Record<string, unknown>;
-    const baselineFields = baseline as unknown as Record<string, unknown>;
-    const mergedFields = merged as unknown as Record<string, unknown>;
-    for (const key of Object.keys(draftFields)) {
-      if (key === 'settings_revision') continue;
-      if (!sameSettingValue(draftFields[key], baselineFields[key])) {
-        mergedFields[key] = draftFields[key];
-      }
-    }
-    merged.settings_revision = latest.settings_revision;
-    return merged;
-  }
-
   const QUICK_LIMIT_KEYS = [
     'alt_speed_enabled',
     'max_upload_speed',
@@ -1342,7 +1382,7 @@
 
   /** The tray or the status bar saved speed limits while this page was open.
    *  Show them, except in a field already edited here, which stays a change
-   *  to save. */
+   *  to apply. */
   function foldQuickLimits(saved: AppSettings): void {
     if (!settings || !originalSettings) return;
     let baseline: AppSettings;
@@ -1378,258 +1418,333 @@
     }
   }
 
-  /** Friend toggles apply immediately (frontend store + persist) so Chat /
-   * online toasts / browse gate don't wait for the page Save button.
-   * Session encryption is always kept on from this UI path. */
-  let friendTogglePersistInFlight = false;
-  let friendTogglePersistPending = false;
-  async function applyFriendTogglesLive() {
-    if (!settings) return;
-    settings.friend_session_encryption = true;
-    // Optimistic: push only friend fields so unsaved draft edits on other
-    // settings keys are not leaked into the process-wide store.
-    const cached = get(appSettings);
-    if (cached) {
-      setAppSettings({
-        ...cached,
-        friend_chat_disabled: settings.friend_chat_disabled,
-        friend_chat_read_receipts: settings.friend_chat_read_receipts,
-        friend_browse_disabled: settings.friend_browse_disabled,
-        friend_session_encryption: true,
-        channel_file_offers: settings.channel_file_offers,
+  /**
+   * Typed into a box, so each waits for its Apply button (or Enter) rather
+   * than saving a half-typed value on every keystroke. The schedule is here
+   * too: a rule is several fields that only make sense together.
+   */
+  const APPLY_FIELDS = [
+    'nickname',
+    'max_concurrent_downloads',
+    'max_concurrent_uploads',
+    'max_connections',
+    'max_connections_per_five_secs',
+    'max_sources_per_file',
+    'max_download_file_size_gib',
+    'search_timeout_secs',
+    'filename_cleanups',
+    'max_upload_speed',
+    'max_download_speed',
+    'alt_max_upload_speed',
+    'alt_max_download_speed',
+    'bandwidth_schedule',
+    'tcp_port',
+    'udp_port',
+    'chat_attachment_auto_accept_mb',
+    'max_friends',
+    'channel_username',
+  ] as const satisfies readonly (keyof AppSettings)[];
+  type ApplyField = (typeof APPLY_FIELDS)[number];
+  const APPLY_FIELD_SET: ReadonlySet<string> = new Set(APPLY_FIELDS);
+
+  /**
+   * Fields the automatic save leaves alone. The anti-leech and IP switches
+   * have commands of their own that apply them to the running filters, and
+   * the download folder is saved by its picker, which is the only place the
+   * save may ask to re-approve it.
+   */
+  const SEPARATELY_SAVED_FIELDS: ReadonlySet<string> = new Set([
+    'settings_revision',
+    'antileech_enabled',
+    'ip_filter_enabled',
+    'block_private_ips',
+    'download_folder',
+  ]);
+
+  /** What is on disk, as of this page's last load or save. */
+  let savedSettings = $derived.by((): AppSettings | null => {
+    if (!originalSettings) return null;
+    try {
+      return JSON.parse(originalSettings) as AppSettings;
+    } catch {
+      return null;
+    }
+  });
+
+  function fieldValue(source: AppSettings, key: string): unknown {
+    return (source as unknown as Record<string, unknown>)[key];
+  }
+
+  function cloneValue<T>(value: T): T {
+    return value === undefined ? value : (JSON.parse(JSON.stringify(value)) as T);
+  }
+
+  function fieldsDirty(fields: readonly string[]): boolean {
+    const current = settings;
+    const saved = savedSettings;
+    if (!current || !saved) return false;
+    return fields.some((key) => !sameSettingValue(fieldValue(current, key), fieldValue(saved, key)));
+  }
+
+  /** Fields that save the moment they change, and have changed. */
+  function pendingAutoFields(): string[] {
+    const current = settings;
+    const saved = savedSettings;
+    if (!current || !saved) return [];
+    return Object.keys(current).filter(
+      (key) =>
+        !APPLY_FIELD_SET.has(key)
+        && !SEPARATELY_SAVED_FIELDS.has(key)
+        && !sameSettingValue(fieldValue(current, key), fieldValue(saved, key)),
+    );
+  }
+
+  // Saves run one at a time, in the order they were asked for, so each starts
+  // from the revision the one before it left.
+  let saveQueue: Promise<unknown> = Promise.resolve();
+  function enqueueSave<T>(task: () => Promise<T>): Promise<T> {
+    const run = saveQueue.then(task, task);
+    saveQueue = run.catch(() => {});
+    return run;
+  }
+
+  /** Why the last Apply failed, shown under the field it was for until the
+   *  value that failed is edited. */
+  let applyError: { fields: string; attempt: string; message: string } | null = $state(null);
+
+  function fieldsSnapshot(fields: readonly string[], source: Record<string, unknown>): string {
+    return JSON.stringify(fields.map((key) => source[key]));
+  }
+
+  function applyErrorFor(fields: readonly string[]): string | null {
+    const error = applyError;
+    const current = settings as unknown as Record<string, unknown> | null;
+    if (!error || !current || error.fields !== fields.join(',')) return null;
+    return error.attempt === fieldsSnapshot(fields, current) ? error.message : null;
+  }
+
+  function applyFields(fields: readonly ApplyField[]): Promise<boolean> {
+    if (!fieldsDirty(fields)) return Promise.resolve(true);
+    return enqueueSave(() => saveFields(fields, { reportInline: true }));
+  }
+
+  /** Enter applies a typed field; Escape puts it back as it is saved. */
+  function applyOnEnter(event: KeyboardEvent, fields: readonly ApplyField[]) {
+    if (event.isComposing || !fieldsDirty(fields)) return;
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void applyFields(fields);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      const current = settings as unknown as Record<string, unknown> | null;
+      const saved = savedSettings;
+      if (!current || !saved) return;
+      for (const key of fields) current[key] = cloneValue(fieldValue(saved, key));
+      if (applyError?.fields === fields.join(',')) applyError = null;
+    }
+  }
+
+  // One queued run covers every switch flipped before it starts: it reads the
+  // changed fields when it runs, not when it was queued.
+  let autoSaveQueued = false;
+  function scheduleAutoSave() {
+    if (autoSaveQueued || pendingAutoFields().length === 0) return;
+    autoSaveQueued = true;
+    void enqueueSave(async () => {
+      autoSaveQueued = false;
+      const fields = pendingAutoFields();
+      if (fields.length > 0) await saveFields(fields, { revertOnFailure: true });
+    });
+  }
+
+  $effect(() => {
+    if (!settings || !originalSettings) return;
+    // Read deeply so a change anywhere in the form re-runs this.
+    JSON.stringify(settings);
+    untrack(scheduleAutoSave);
+  });
+
+  type RestartField = 'tcp_port' | 'udp_port' | 'upnp_enabled';
+
+  /** Saved values the running network stack has not picked up yet. */
+  let pendingRestart = $derived.by((): { field: RestartField; reason: string }[] => {
+    const saved = savedSettings;
+    const launch = launchSettings;
+    if (!saved || !launch) return [];
+    const pending: { field: RestartField; reason: string }[] = [];
+    if (saved.tcp_port !== launch.tcp_port) {
+      pending.push({
+        field: 'tcp_port',
+        reason: m.settings_restart_reason_tcp_only({
+          from: String(launch.tcp_port),
+          to: String(saved.tcp_port),
+        }),
       });
     }
-    if (friendTogglePersistInFlight) {
-      // A later toggle flipped while we were writing — coalesce and re-run
-      // with the latest values once the in-flight persist finishes.
-      friendTogglePersistPending = true;
-      return;
+    if (saved.udp_port !== launch.udp_port) {
+      pending.push({
+        field: 'udp_port',
+        reason: m.settings_restart_reason_udp_only({
+          from: String(launch.udp_port),
+          to: String(saved.udp_port),
+        }),
+      });
     }
-    friendTogglePersistInFlight = true;
+    // A failed start-up mapping turns UPnP off for the session and then saves
+    // it off, which matches what is running and needs no restart.
+    const runningUpnp = launch.upnp_enabled && !$upnpAutoDisabled;
+    if (saved.upnp_enabled !== runningUpnp) {
+      pending.push({
+        field: 'upnp_enabled',
+        reason: saved.upnp_enabled
+          ? m.settings_restart_reason_upnp_on()
+          : m.settings_restart_reason_upnp_off(),
+      });
+    }
+    return pending;
+  });
+
+  let restartReason = $derived(
+    new Intl.ListFormat(getLocale(), { type: 'conjunction' }).format(
+      pendingRestart.map((p) => p.reason),
+    ),
+  );
+
+  function restartPending(field: RestartField): boolean {
+    return pendingRestart.some((p) => p.field === field);
+  }
+
+  interface SaveFieldsOptions {
+    /** Put the fields back as they are on disk if the save fails, so a
+     *  switch never shows a state that is not in force. */
+    revertOnFailure?: boolean;
+    /** Show a failure under the field rather than in the header. */
+    reportInline?: boolean;
+    reapproveDownloadRoot?: boolean;
+  }
+
+  /**
+   * Save `fields` as the page has them over the latest settings on disk,
+   * leaving every other field as it is there. Re-reading first keeps changes
+   * made elsewhere (the tray, the status bar, another command) instead of
+   * overwriting them with this page's copy, and lets one revision race retry.
+   */
+  async function saveFields(
+    fields: readonly string[],
+    options: SaveFieldsOptions = {},
+  ): Promise<boolean> {
+    if (!settings) return false;
+    // Taken at the start: the form stays live while the save is in flight,
+    // and a field edited again meanwhile must stay a pending change.
+    const sent = cloneValue(settings as unknown as Record<string, unknown>);
+    const restartBefore = restartReason;
+    const errorKey = fields.join(',');
+    const fail = (message: string) => {
+      if (options.revertOnFailure) revertFields(fields, sent);
+      if (options.reportInline) {
+        applyError = { fields: errorKey, attempt: fieldsSnapshot(fields, sent), message };
+      }
+      else showSaveMsg(message, true, 6000);
+    };
     try {
-      do {
-        friendTogglePersistPending = false;
-        for (let attempt = 0; attempt < 2; attempt++) {
-          const latest = await getSettings();
-          const candidate = {
-            ...latest,
-            friend_chat_disabled: settings.friend_chat_disabled,
-            friend_chat_read_receipts: settings.friend_chat_read_receipts,
-            friend_browse_disabled: settings.friend_browse_disabled,
-            friend_session_encryption: true,
-            channel_file_offers: settings.channel_file_offers,
-          };
-          try {
-            const result = await updateSettings(candidate);
-            setAppSettings(result.settings);
-            settings.settings_revision = result.settings.settings_revision;
-            if (originalSettings) {
-              const baseline = JSON.parse(originalSettings) as AppSettings;
-              baseline.friend_chat_disabled = result.settings.friend_chat_disabled;
-              baseline.friend_chat_read_receipts = result.settings.friend_chat_read_receipts;
-              baseline.friend_browse_disabled = result.settings.friend_browse_disabled;
-              baseline.friend_session_encryption = true;
-              baseline.channel_file_offers = result.settings.channel_file_offers;
-              baseline.settings_revision = result.settings.settings_revision;
-              originalSettings = JSON.stringify(baseline);
-            }
-            break;
-          } catch (e) {
-            if (attempt === 0 && isSettingsRevisionConflict(e)) continue;
-            throw e;
-          }
+      let result: UpdateSettingsResult | null = null;
+      let adjusted = false;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const latest = await getSettings();
+        const candidate = cloneValue(latest);
+        const candidateFields = candidate as unknown as Record<string, unknown>;
+        for (const key of fields) candidateFields[key] = sent[key];
+        // Friend session encryption is not user-toggleable in Settings.
+        candidate.friend_session_encryption = true;
+        const validation = validateSettings(candidate);
+        if (validation.error) {
+          fail(validation.error);
+          return false;
         }
-      } while (friendTogglePersistPending);
-      // These persist without the Save button, which on a page where almost
-      // everything else needs it reads as "my change was ignored". Failure
-      // already rolls back and reports; success has to say so too.
-      showSaveMsg(m.settings_saved_automatically(), false, 2000);
+        adjusted = validation.adjusted;
+        try {
+          result = await updateSettings(candidate, {
+            reapproveDownloadRoot: options.reapproveDownloadRoot,
+          });
+          break;
+        } catch (e) {
+          if (attempt === 0 && isSettingsRevisionConflict(e)) continue;
+          throw e;
+        }
+      }
+      if (!result) return false;
+      if (applyError?.fields === errorKey) applyError = null;
+      // Keep the process-wide settings cache in step with the just-saved
+      // values so runtime consumers (friend online-notification toast, chat
+      // "disabled" state) react immediately.
+      setAppSettings(result.settings);
+      foldSaved(result.settings, fields, sent);
+      // `adjusted` means a typed number was outside its valid range and was
+      // clamped, so say so rather than saving a different value silently.
+      const outcome = updateSettingsOutcomeMessage(result);
+      const isWarn = result.outcome === 'deferred' || adjusted;
+      showSaveMsg(
+        adjusted ? `${outcome} ${m.settings_values_adjusted()}` : outcome,
+        isWarn,
+        isWarn ? 8000 : 2000,
+      );
+      if (!restartReason) showRestartPrompt = false;
+      else if (restartReason !== restartBefore) showRestartPrompt = true;
+      return true;
     } catch (e) {
-      // These are privacy controls, and the wire-level gates in the network
-      // task read its own copy of the settings, which is only refreshed by a
-      // successful `update_settings`. A swallowed failure therefore doesn't
-      // just fail to survive a restart — the toggle never takes effect at all,
-      // while the optimistic store keeps reporting it as on. Roll back.
-      const persisted = await getSettings().catch(() => null);
-      if (persisted) {
-        setAppSettings(persisted);
-        if (settings) {
-          settings.friend_chat_disabled = persisted.friend_chat_disabled;
-          settings.friend_chat_read_receipts = persisted.friend_chat_read_receipts;
-          settings.friend_browse_disabled = persisted.friend_browse_disabled;
-          settings.channel_file_offers = persisted.channel_file_offers;
-          settings.settings_revision = persisted.settings_revision;
-        }
-        // Move the baseline with it. If the revision advanced out from under us
-        // (both retries lost the race), a baseline still holding the old
-        // revision would make `hasUnsavedChanges` permanently true — enabling
-        // Save with nothing edited and popping the leave guard on every exit.
-        if (originalSettings) {
-          const baseline = JSON.parse(originalSettings) as AppSettings;
-          baseline.friend_chat_disabled = persisted.friend_chat_disabled;
-          baseline.friend_chat_read_receipts = persisted.friend_chat_read_receipts;
-          baseline.friend_browse_disabled = persisted.friend_browse_disabled;
-          baseline.channel_file_offers = persisted.channel_file_offers;
-          baseline.settings_revision = persisted.settings_revision;
-          originalSettings = JSON.stringify(baseline);
-        }
-      }
-      showSaveMsg(translateError(e, m.settings_save_failed()), true, 6000);
-    } finally {
-      friendTogglePersistInFlight = false;
-      if (friendTogglePersistPending) {
-        void applyFriendTogglesLive();
-      }
+      console.error('Failed to save settings:', e);
+      fail(translateError(e, m.settings_save_failed()));
+      return false;
     }
   }
 
   /**
-   * Fold the persisted snapshot back into untouched form fields after save.
-   * Fields edited again while IPC was in flight remain as unsaved changes.
+   * Take a save's result into the form. A field the save sent, or one with no
+   * pending change, shows what is now on disk; one edited again while the
+   * save was in flight keeps the newer edit, still waiting to be saved.
    */
-  function reconcileSavedSettings(draft: AppSettings, saved: AppSettings): void {
+  function foldSaved(saved: AppSettings, fields: readonly string[], sent: Record<string, unknown>) {
     if (!settings) return;
-    const currentFields = settings as unknown as Record<string, unknown>;
-    const draftFields = draft as unknown as Record<string, unknown>;
-    const savedFields = saved as unknown as Record<string, unknown>;
-    for (const key of Object.keys(savedFields)) {
+    const baseline = savedSettings;
+    const current = settings as unknown as Record<string, unknown>;
+    const incoming = cloneValue(saved) as unknown as Record<string, unknown>;
+    const sentSet = new Set(fields);
+    for (const key of Object.keys(incoming)) {
       if (key === 'settings_revision') continue;
-      if (sameSettingValue(currentFields[key], draftFields[key])) {
-        currentFields[key] = savedFields[key];
+      const reference = sentSet.has(key)
+        ? sent[key]
+        : baseline
+          ? fieldValue(baseline, key)
+          : current[key];
+      if (
+        sameSettingValue(current[key], reference)
+        && !sameSettingValue(current[key], incoming[key])
+      ) {
+        current[key] = incoming[key];
       }
     }
     settings.settings_revision = saved.settings_revision;
+    originalSettings = JSON.stringify(saved);
   }
 
-  async function handleSave() {
-    if (!settings || saving || scheduleHasError) return;
-    const antileechDirtyAtSave = antileechDraftDirty;
-    const validation = validateSettings(settings);
-    if (validation.error) {
-      showSaveMsg(validation.error, true, 5000);
-      return;
-    }
-    saving = true;
-    saveMessage = null;
-    // Deep-clone at save-start, and send/compare against that clone rather
-    // than the live `settings` object for the rest of this function. `settings`
-    // stays bound to the form inputs while `updateSettings` is in flight, so
-    // without this a mid-flight edit could change what gets attributed as
-    // "saved" — leaving `originalSettings` (and the tcp/udp restart-prompt
-    // comparison below) reflecting whatever `settings` drifted to by the time
-    // the await resolves, not what this save actually persisted.
-    const snapshot = JSON.stringify(settings);
-    const draft = JSON.parse(snapshot) as AppSettings;
-    // Friend session encryption is not user-toggleable in Settings; keep it on.
-    draft.friend_session_encryption = true;
-    settings.friend_session_encryption = true;
-    try {
-      let result: UpdateSettingsResult | null = null;
-      let saved: AppSettings | null = null;
-      let latestBeforeSave: AppSettings | null = null;
-
-      // Refresh immediately before each write. Another command may have saved
-      // settings while this page was open, and the backend correctly rejects
-      // an old revision. Retry one genuine revision race with a fresh merge.
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const latest = await getSettings();
-        latestBeforeSave = latest;
-        setAppSettings(latest);
-        if (settings) settings.settings_revision = latest.settings_revision;
-        const candidate = mergeDraftOntoLatest(draft, latest);
-        candidate.friend_session_encryption = true;
-        try {
-          // The explicit Save button is the one user action that counts as
-          // consent to re-approve a revoked download folder, which is otherwise
-          // unrecoverable in-app because re-picking the same path is no change.
-          result = await updateSettings(candidate, { reapproveDownloadRoot: true });
-          saved = result.settings;
-          break;
-        } catch (e) {
-          if (attempt === 0 && isSettingsRevisionConflict(e)) continue;
-          if (isSettingsRevisionConflict(e)) {
-            // Keep the page's token current even when sustained concurrent
-            // writers win both attempts; never replace the user's draft.
-            try {
-              const refreshed = await getSettings();
-              setAppSettings(refreshed);
-              if (settings) settings.settings_revision = refreshed.settings_revision;
-            } catch {
-              // Preserve the original conflict as the actionable error.
-            }
-          }
-          throw e;
-        }
+  function revertFields(fields: readonly string[], sent: Record<string, unknown>) {
+    const current = settings as unknown as Record<string, unknown> | null;
+    const saved = savedSettings;
+    if (!current || !saved) return;
+    for (const key of fields) {
+      if (sameSettingValue(current[key], sent[key])) {
+        current[key] = cloneValue(fieldValue(saved, key));
       }
-      if (!result || !saved || !latestBeforeSave) return;
-
-      // Keep the process-wide settings cache in step with the just-saved
-      // values so runtime consumers (friend online-notification toast, chat
-      // "disabled" state) react immediately instead of next launch.
-      setAppSettings(saved);
-      reconcileSavedSettings(draft, saved);
-      originalSettings = JSON.stringify(saved);
-      // `validation.adjusted` means at least one numeric field was outside
-      // its valid range and got silently clamped by `validateSettings`
-      // above — surface that alongside the normal save result instead of
-      // saving a different value than what was typed with no feedback.
-      const outcomeMessage = updateSettingsOutcomeMessage(result);
-      const message = validation.adjusted
-        ? `${outcomeMessage} ${m.settings_values_adjusted()}`
-        : outcomeMessage;
-      const isWarn = result.outcome !== 'applied' || validation.adjusted;
-      showSaveMsg(message, isWarn, isWarn ? 8000 : 3000);
-
-      // Compare against the authoritative pre-save snapshot, so an unrelated
-      // out-of-band port change does not look like a change made by this save.
-      // The TCP/UDP ports drive `start_upload_server` (TCP listen socket)
-      // and the KAD/server UDP socket; both are bound exactly once during
-      // app startup, so a hot save here updates the persisted value but
-      // not the running listener. Prompt the user to restart.
-      const previousTcpPort = latestBeforeSave.tcp_port;
-      const previousUdpPort = latestBeforeSave.udp_port;
-      const tcpChanged = previousTcpPort !== saved.tcp_port;
-      const udpChanged = previousUdpPort !== saved.udp_port;
-      if (tcpChanged || udpChanged) {
-        if (tcpChanged && udpChanged) {
-          pendingRestartReason = m.settings_restart_reason_both({
-            tcp_from: String(previousTcpPort),
-            tcp_to: String(saved.tcp_port),
-            udp_from: String(previousUdpPort),
-            udp_to: String(saved.udp_port),
-          });
-        } else if (tcpChanged) {
-          pendingRestartReason = m.settings_restart_reason_tcp_only({
-            from: String(previousTcpPort),
-            to: String(saved.tcp_port),
-          });
-        } else {
-          pendingRestartReason = m.settings_restart_reason_udp_only({
-            from: String(previousUdpPort),
-            to: String(saved.udp_port),
-          });
-        }
-        showRestartPrompt = true;
-      }
-      if (antileechDirtyAtSave) {
-        await handleSaveAntileech();
-      }
-    } catch (e) {
-      console.error('Failed to save:', e);
-      showSaveMsg(translateError(e, m.settings_save_failed()), true, 5000);
-    } finally {
-      saving = false;
     }
   }
 
-  /// Triggered from the restart confirmation modal. Mirrors SetupWizard's
+  /// Triggered from the restart prompt and banner. Mirrors SetupWizard's
   /// final-step behaviour: show a full-screen "Restarting Ember" overlay
   /// for ~600ms (so the user sees acknowledgement, not just an instant
   /// window disappearance), then call Tauri's `relaunch()` which kills
   /// the current process and spawns a fresh one. If `relaunch` fails for
   /// any reason (rare — usually only when the user lacks permission to
-  /// re-spawn) we surface the error and let them save again or restart
-  /// manually.
+  /// re-spawn) we surface the error and let them restart manually.
   async function performRestart() {
     showRestartPrompt = false;
     restarting = true;
@@ -1646,47 +1761,6 @@
         true,
         10000,
       );
-    }
-  }
-
-  function dismissRestartPrompt() {
-    showRestartPrompt = false;
-    showSaveMsg(
-      m.settings_restart_deferred(),
-      true,
-      6000,
-    );
-  }
-
-  function resetChanges() {
-    if (!settings || !originalSettings) return;
-    try {
-      settings = JSON.parse(originalSettings) as AppSettings;
-      // The anti-leech pattern textarea is edited via its own `antileechDraft`
-      // state (saved with a dedicated button), so a plain settings revert
-      // wouldn't touch it. Revert it to the last loaded/saved snapshot too so
-      // "Discard" reverts everything the user sees as pending.
-      if (antileechSnapshot) antileechDraft = antileechSnapshot.patterns.join('\n');
-      showSaveMsg(m.settings_changes_reverted(), false, 2000);
-    } catch (e) {
-      // `originalSettings` should always be valid JSON we serialized
-      // ourselves, but a storage glitch or an upstream bug elsewhere
-      // could leave it corrupt — surface the error and re-fetch from
-      // disk rather than crashing the Revert button.
-      console.error('resetChanges: originalSettings parse failed', e);
-      showSaveMsg(
-        m.settings_revert_failed(),
-        true,
-        3000,
-      );
-      void getSettings()
-        .then((s) => {
-          settings = s;
-          originalSettings = JSON.stringify(s);
-        })
-        .catch((err) => {
-          showSaveMsg(m.settings_reload_failed({ error: translateError(err) }), true, 4000);
-        });
     }
   }
 
@@ -1778,6 +1852,12 @@
       const selected = await pickDownloadFolderDialog();
       if (selected) {
         settings.download_folder = selected;
+        // Saved even when the same folder is picked again: that is how a
+        // folder Ember stopped recognising (moved, drive reconnected) is
+        // re-approved, and it is not a change the automatic save would see.
+        void enqueueSave(() =>
+          saveFields(['download_folder'], { reapproveDownloadRoot: true, revertOnFailure: true }),
+        );
       }
     } catch (e) {
       // Surface the failure in the same toast row that other settings
@@ -1856,9 +1936,9 @@
 
   // --- Web services (eMule's right-click → Web services) ---
   //
-  // Edited straight into `settings.web_services`, so the page's own Save,
-  // Ctrl+S, dirty tracking and Discard all apply without a second persistence
-  // path. The backend re-validates and de-duplicates on save regardless; the
+  // Edited straight into `settings.web_services`, so each add or remove saves
+  // like any other setting, without a second persistence path. The backend
+  // re-validates and de-duplicates on save regardless; the
   // checks here exist to give a reason next to the field the user typed in
   // rather than a silent drop.
   let newWebServiceName = $state('');
@@ -1988,10 +2068,8 @@
   let antileechCompileErrors: Array<[string, string]> = $state([]);
   let antileechLoaded = $state(false);
   // The anti-leech textarea has its own dedicated Save button
-  // (`handleSaveAntileech`) and isn't part of `settings`. Dirty drafts
-  // still fold into `hasUnsavedChanges` and the page Save / Ctrl+S path
-  // so they persist with the rest of Settings. Discard reverts
-  // `antileechDraft` in `resetChanges` below.
+  // (`handleSaveAntileech`) and isn't part of `settings`. A dirty draft
+  // arms the leave guard, like a typed field that hasn't been applied.
   let antileechDraftDirty = $derived.by(() => {
     // Narrow via a local const first — TS doesn't reliably narrow a
     // `$state`-backed getter read directly inside a ternary the way it
@@ -2003,12 +2081,10 @@
   // above) so `antileechDraftDirty`'s declaration precedes its use — Svelte's
   // `$derived` is lazy and immune to ordering at runtime, but the type
   // checker still applies plain TDZ analysis to the referenced binding.
-  let hasUnsavedChanges = $derived(
-    (settings ? JSON.stringify(settings) !== originalSettings : false) || antileechDraftDirty
-  );
+  let hasUnsavedChanges = $derived(fieldsDirty(APPLY_FIELDS) || antileechDraftDirty);
 
-  // In-app routing (the sidebar uses `goto`) would otherwise discard pending
-  // edits with no prompt — `beforeunload` never fires for it. `nav.cancel()`
+  // In-app routing (the sidebar uses `goto`) would otherwise discard typed
+  // edits not yet applied with no prompt — `beforeunload` never fires for it. `nav.cancel()`
   // must be called synchronously, so confirm out-of-band and re-issue the
   // navigation once the user agrees.
   let leaveConfirmOpen = $state(false);
@@ -2117,8 +2193,8 @@
         if (field === 'ip_filter_enabled') await setIpFilterEnabled(next);
         else await setBlockPrivateIps(next);
         if (unmounted) return;
-        // Already on disk, so it is not an unsaved change. Patch only this
-        // field so other genuinely-unsaved edits stay flagged.
+        // Already on disk, so it is not a pending change. Patch only this
+        // field so other pending edits stay pending.
         if (originalSettings) {
           try {
             const base = JSON.parse(originalSettings) as AppSettings;
@@ -2128,7 +2204,7 @@
         }
         const persisted = await getSettings().catch(() => null);
         if (persisted) setAppSettings(persisted);
-        showSaveMsg(m.settings_saved_automatically(), false, 2000);
+        showSaveMsg(m.settings_save_success(), false, 2000);
       } catch (e: unknown) {
         if (unmounted) return;
         if (settings) settings[field] = !next;
@@ -2145,11 +2221,9 @@
       // latest state (or write to a torn-down page).
       if (unmounted || gen !== antileechToggleGen) return;
       if (settings) settings.antileech_enabled = checked;
-      // The toggle is applied + persisted independently of the Save button, so
-      // fold it into the saved baseline too. Otherwise `hasUnsavedChanges` (a
-      // JSON diff against `originalSettings`) reports a phantom unsaved change
-      // — and the beforeunload guard fires — for a change already on disk.
-      // Patch only this one field so other genuinely-unsaved edits stay flagged.
+      // The toggle is applied + persisted by its own command, so fold it into
+      // the saved baseline too. Patch only this one field so other pending
+      // edits stay pending.
       if (originalSettings) {
         try {
           const base = JSON.parse(originalSettings) as AppSettings;
@@ -2163,9 +2237,9 @@
         if (unmounted || gen !== antileechToggleGen) return;
         antileechSnapshot = snap;
       }
-      // Applied live, like the friend toggles. Worth confirming for a control
-      // that turns protection off in one click.
-      showSaveMsg(m.settings_saved_automatically(), false, 2000);
+      // Confirmed like every other switch. Worth it for a control that turns
+      // protection off in one click.
+      showSaveMsg(m.settings_save_success(), false, 2000);
     } catch (e: unknown) {
       if (unmounted || gen !== antileechToggleGen) return;
       const text = m.settings_antileech_toggle_failed({ error: translateError(e) });
@@ -2343,35 +2417,19 @@
     });
   });
 
-  // Focus is inside the upload cap field. Emptying it to retype a value, or
-  // typing the "0" of "0.5", reads as 0 for a keystroke.
-  let uploadCapEditing = $state(false);
-
-  // USS needs a non-zero upload cap. Clear the flag when the user switches
-  // to Unlimited so save can't persist an inert/invalid combo. Not while the
-  // cap is being typed: the passing 0 would turn USS off for good.
+  // USS needs a non-zero upload cap. Applying Unlimited turns it off in the
+  // same save (`validateSettings`); this covers a config that already pairs
+  // the two on disk. Folded into the baseline, patching only this field: it
+  // is a correction, not an edit, and saving it automatically would rewrite
+  // the config of someone who only opened the page. The next save carries it.
   $effect(() => {
-    if (
-      settings &&
-      settings.max_upload_speed === 0 &&
-      settings.uss_enabled &&
-      !uploadCapEditing
-    ) {
+    const saved = savedSettings;
+    if (settings && saved && saved.max_upload_speed === 0 && saved.uss_enabled && settings.uss_enabled) {
       settings.uss_enabled = false;
-      // A config that already violated the invariant on disk makes this clear
-      // ours, not an edit: `onMount` snapshots `originalSettings` before
-      // effects flush, so `hasUnsavedChanges` (a JSON diff against it) reported
-      // a phantom unsaved change on a page nobody had touched — enabling
-      // Discard and arming both the beforeunload and beforeNavigate guards.
-      // Fold it into the baseline the way the anti-leech toggle does, patching
-      // only this field. A user-driven switch to Unlimited leaves the baseline
-      // alone (its cap is still non-zero there), so that disable stays a real
-      // unsaved change and is persisted by Save.
       untrack(() => {
         if (!originalSettings) return;
         try {
           const base = JSON.parse(originalSettings) as AppSettings;
-          if (base.max_upload_speed !== 0 || !base.uss_enabled) return;
           base.uss_enabled = false;
           originalSettings = JSON.stringify(base);
         } catch { /* malformed baseline; leave as-is */ }
@@ -2386,26 +2444,34 @@
     {#if saveMessage}
       <span class="save-status" class:warning={saveIsWarning} role="status">{saveMessage}</span>
     {/if}
-    {#if scheduleHasError}
-      <!-- The backend refuses the whole save for one malformed rule, and the
-           rejection names no rule. Blocking here instead points at the row
-           that is wrong, which is already showing its own reason. -->
-      <span class="save-status warning" role="status">{m.schedule_blocks_save()}</span>
-    {:else if hasUnsavedChanges}
-      <span class="unsaved-indicator">{m.settings_unsaved_changes()}</span>
-    {/if}
-    <button class="ghost" onclick={resetChanges} disabled={!hasUnsavedChanges || !settings}>
-      {m.settings_discard()}
-    </button>
-    <button class="save-btn" onclick={handleSave} disabled={saving || !settings || !hasUnsavedChanges || scheduleHasError}>
-      {#if saving}
-        <span class="spinner sm current"></span> {m.settings_saving()}
-      {:else}
-        {m.settings_save_changes()}
-      {/if}
-    </button>
   </div>
+  {#if restartReason}
+    <!-- Stays until the restart, or until the change is undone: "Later" on
+         the prompt must not leave a saved port silently not in force. -->
+    <div class="restart-pending-banner" role="status">
+      <span>{m.settings_restart_pending_banner({ reason: restartReason })}</span>
+      <button type="button" class="action-btn primary" onclick={performRestart}>
+        {m.settings_restart_now()}
+      </button>
+    </div>
+  {/if}
 </div>
+
+{#snippet applyButton(fields: readonly ApplyField[], name: string, blocked = false)}
+  {#if fieldsDirty(fields)}
+    {@const error = applyErrorFor(fields)}
+    <button
+      type="button"
+      class="action-btn primary field-apply"
+      disabled={blocked}
+      onclick={() => void applyFields(fields)}
+      aria-label={m.settings_apply_field_aria({ name })}
+    >{m.settings_apply()}</button>
+    {#if error}
+      <span class="field-apply-error" role="alert">{error}</span>
+    {/if}
+  {/if}
+{/snippet}
 
 <div class="page-content" bind:this={pageContentEl}>
   {#if loadError}
@@ -2428,7 +2494,9 @@
             class="settings-filter-input"
             placeholder={m.settings_filter_placeholder()}
             aria-label={m.settings_filter_placeholder()}
+            aria-keyshortcuts="Control+F /"
             bind:value={settingsFilter}
+            bind:this={settingsFilterEl}
           />
         </div>
         <!-- The tablist is hidden while filtering, because results span every
@@ -2551,7 +2619,7 @@
         {/if}
       </aside>
 
-      <div class="cards-grid" class:filtering bind:this={cardsGridEl}>
+      <div class="cards-grid" class:filtering bind:this={cardsGridEl} onfocusin={noteFilterFocus}>
 
       <!-- General -->
       <!-- `role` and `aria-labelledby` only apply in tab mode: while filtering
@@ -2726,14 +2794,18 @@
           <div class="divider"></div>
           <div class="field">
             <label for="nickname">{m.settings_nickname_label()}</label>
-            <input
-              id="nickname"
-              value={settings.nickname}
-              maxlength="128"
-              oninput={clampNicknameInput}
-              oncompositionend={clampNicknameInput}
-              placeholder={m.settings_nickname_placeholder()}
-            />
+            <div class="apply-input">
+              <input
+                id="nickname"
+                value={settings.nickname}
+                maxlength="128"
+                oninput={clampNicknameInput}
+                oncompositionend={clampNicknameInput}
+                onkeydown={(e) => applyOnEnter(e, ['nickname'])}
+                placeholder={m.settings_nickname_placeholder()}
+              />
+              {@render applyButton(['nickname'], m.settings_nickname_label())}
+            </div>
             <span class="hint">{m.settings_nickname_hint()}</span>
           </div>
           <div class="divider"></div>
@@ -3059,7 +3131,10 @@
             <div class="field-row">
               <div class="field half">
                 <label for="max-concurrent">{m.settings_max_downloads()}</label>
-                <input id="max-concurrent" type="number" min="1" max="50" bind:value={settings.max_concurrent_downloads} />
+                <div class="apply-input">
+                  <input id="max-concurrent" type="number" min="1" max="50" bind:value={settings.max_concurrent_downloads} onkeydown={(e) => applyOnEnter(e, ['max_concurrent_downloads'])} />
+                  {@render applyButton(['max_concurrent_downloads'], m.settings_max_downloads())}
+                </div>
                 <!-- The only two numeric inputs on the page that had no hint,
                      and the pair most in need of one: "Max Uploads" counts
                      slots, which is easy to read as a speed when the actual
@@ -3068,7 +3143,10 @@
               </div>
               <div class="field half">
                 <label for="max-uploads">{m.settings_max_uploads()}</label>
-                <input id="max-uploads" type="number" min="1" max="50" bind:value={settings.max_concurrent_uploads} />
+                <div class="apply-input">
+                  <input id="max-uploads" type="number" min="1" max="50" bind:value={settings.max_concurrent_uploads} onkeydown={(e) => applyOnEnter(e, ['max_concurrent_uploads'])} />
+                  {@render applyButton(['max_concurrent_uploads'], m.settings_max_uploads())}
+                </div>
                 <span class="hint">{m.settings_max_uploads_hint()}</span>
               </div>
             </div>
@@ -3081,12 +3159,18 @@
             <div class="field-row">
               <div class="field half">
                 <label for="max-connections">{m.settings_max_connections()}</label>
-                <input id="max-connections" type="number" min="1" max="2000" bind:value={settings.max_connections} />
+                <div class="apply-input">
+                  <input id="max-connections" type="number" min="1" max="2000" bind:value={settings.max_connections} onkeydown={(e) => applyOnEnter(e, ['max_connections'])} />
+                  {@render applyButton(['max_connections'], m.settings_max_connections())}
+                </div>
                 <span class="hint">{m.settings_max_connections_hint()}</span>
               </div>
               <div class="field half">
                 <label for="max-conn-per-five">{m.settings_max_conn_per_five()}</label>
-                <input id="max-conn-per-five" type="number" min="0" max="500" bind:value={settings.max_connections_per_five_secs} />
+                <div class="apply-input">
+                  <input id="max-conn-per-five" type="number" min="0" max="500" bind:value={settings.max_connections_per_five_secs} onkeydown={(e) => applyOnEnter(e, ['max_connections_per_five_secs'])} />
+                  {@render applyButton(['max_connections_per_five_secs'], m.settings_max_conn_per_five())}
+                </div>
                 <span class="hint">{m.settings_max_conn_per_five_hint()}</span>
               </div>
             </div>
@@ -3098,12 +3182,18 @@
             <div class="field-row">
               <div class="field half">
                 <label for="max-sources">{m.settings_max_sources_label()}</label>
-                <input id="max-sources" type="number" min="50" max="2000" bind:value={settings.max_sources_per_file} />
+                <div class="apply-input">
+                  <input id="max-sources" type="number" min="50" max="2000" bind:value={settings.max_sources_per_file} onkeydown={(e) => applyOnEnter(e, ['max_sources_per_file'])} />
+                  {@render applyButton(['max_sources_per_file'], m.settings_max_sources_label())}
+                </div>
                 <span class="hint">{m.settings_max_sources_hint()}</span>
               </div>
               <div class="field half">
                 <label for="max-dl-gib">{m.settings_max_file_size_label()}</label>
-                <input id="max-dl-gib" class="compact-number" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} />
+                <div class="apply-input">
+                  <input id="max-dl-gib" class="compact-number" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} onkeydown={(e) => applyOnEnter(e, ['max_download_file_size_gib'])} />
+                  {@render applyButton(['max_download_file_size_gib'], m.settings_max_file_size_label())}
+                </div>
                 <span class="hint">{m.settings_max_file_size_hint()}</span>
               </div>
             </div>
@@ -3385,21 +3475,28 @@
           <div class="divider"></div>
           <div class="field">
             <label for="search-timeout-secs">{m.settings_search_timeout_label()}</label>
-            <input
-              id="search-timeout-secs"
-              class="compact-number"
-              type="number"
-              min="30"
-              max="600"
-              step="1"
-              bind:value={settings.search_timeout_secs}
-            />
+            <div class="apply-input">
+              <input
+                id="search-timeout-secs"
+                class="compact-number"
+                type="number"
+                min="30"
+                max="600"
+                step="1"
+                bind:value={settings.search_timeout_secs}
+                onkeydown={(e) => applyOnEnter(e, ['search_timeout_secs'])}
+              />
+              {@render applyButton(['search_timeout_secs'], m.settings_search_timeout_label())}
+            </div>
             <span class="hint">{m.settings_search_timeout_hint()}</span>
           </div>
           <div class="field">
             <label for="filename-cleanups">{m.settings_filename_cleanups_label()}</label>
             <span class="hint">{m.settings_filename_cleanups_hint_prefix()} <code>{m.settings_filename_cleanups_placeholder()}</code>{m.settings_filename_cleanups_hint_suffix()}</span>
-            <input id="filename-cleanups" type="text" bind:value={settings.filename_cleanups} placeholder={m.settings_filename_cleanups_placeholder()} />
+            <div class="apply-input">
+              <input id="filename-cleanups" type="text" bind:value={settings.filename_cleanups} onkeydown={(e) => applyOnEnter(e, ['filename_cleanups'])} placeholder={m.settings_filename_cleanups_placeholder()} />
+              {@render applyButton(['filename_cleanups'], m.settings_filename_cleanups_label())}
+            </div>
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">
@@ -3482,17 +3579,22 @@
               </span>
             </div>
           {/if}
-          <div
-            class="field manual-speed-limit"
-            class:is-inactive={settings.alt_speed_enabled}
-            onfocusin={() => (uploadCapEditing = true)}
-            onfocusout={() => (uploadCapEditing = false)}
-          >
-            <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} />
+          <div class="field manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
+            <div class="apply-input">
+              <div class="apply-grow">
+                <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} onenter={() => void applyFields(['max_upload_speed'])} />
+              </div>
+              {@render applyButton(['max_upload_speed'], m.settings_max_upload_speed())}
+            </div>
             <span class="hint">{m.settings_max_upload_speed_hint()}</span>
           </div>
           <div class="field manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
-            <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} />
+            <div class="apply-input">
+              <div class="apply-grow">
+                <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} onenter={() => void applyFields(['max_download_speed'])} />
+              </div>
+              {@render applyButton(['max_download_speed'], m.settings_max_download_speed())}
+            </div>
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">
@@ -3502,8 +3604,18 @@
             <ToggleSwitch bind:checked={settings.alt_speed_enabled} ariaLabel={m.settings_alt_speed_label()} />
           </div>
           <div class="field alt-speed-limits" class:is-inactive={!settings.alt_speed_enabled}>
-            <SpeedInput label={m.settings_alt_max_upload_speed()} bind:value={settings.alt_max_upload_speed} idScope="alt" />
-            <SpeedInput label={m.settings_alt_max_download_speed()} bind:value={settings.alt_max_download_speed} idScope="alt" />
+            <div class="apply-input">
+              <div class="apply-grow">
+                <SpeedInput label={m.settings_alt_max_upload_speed()} bind:value={settings.alt_max_upload_speed} idScope="alt" onenter={() => void applyFields(['alt_max_upload_speed'])} />
+              </div>
+              {@render applyButton(['alt_max_upload_speed'], m.settings_alt_max_upload_speed())}
+            </div>
+            <div class="apply-input">
+              <div class="apply-grow">
+                <SpeedInput label={m.settings_alt_max_download_speed()} bind:value={settings.alt_max_download_speed} idScope="alt" onenter={() => void applyFields(['alt_max_download_speed'])} />
+              </div>
+              {@render applyButton(['alt_max_download_speed'], m.settings_alt_max_download_speed())}
+            </div>
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">
@@ -3512,7 +3624,7 @@
             </div>
             <ToggleSwitch
               bind:checked={settings.uss_enabled}
-              disabled={settings.max_upload_speed === 0}
+              disabled={savedSettings?.max_upload_speed === 0}
               ariaLabel={m.settings_uss_label()}
             />
           </div>
@@ -3537,7 +3649,7 @@
 
                The exception is a rule the backend would refuse. `validate`
                checks the list whether or not the feature is enabled, so such a
-               rule blocks Save either way, and hiding it would leave Save
+               rule blocks Apply either way, and hiding it would leave Apply
                blocked with nothing on screen to fix. Shown dimmed in that case:
                still not in force, but reachable. -->
           {#if settings.bandwidth_schedule_enabled || scheduleHasError}
@@ -3651,16 +3763,23 @@
                 </div>
               {/each}
 
-              <button
-                type="button"
-                class="schedule-add"
-                onclick={addScheduleRule}
-                disabled={settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES}
-              >
-                {settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES
-                  ? m.schedule_add_full({ max: MAX_SCHEDULE_RULES })
-                  : m.schedule_add_rule()}
-              </button>
+              <div class="schedule-footer">
+                <button
+                  type="button"
+                  class="schedule-add"
+                  onclick={addScheduleRule}
+                  disabled={settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES}
+                >
+                  {settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES
+                    ? m.schedule_add_full({ max: MAX_SCHEDULE_RULES })
+                    : m.schedule_add_rule()}
+                </button>
+                <!-- The backend refuses the whole schedule for one malformed
+                     rule, and the rejection names no rule. Blocking here
+                     instead points at the row that is wrong, which is already
+                     showing its own reason. -->
+                {@render applyButton(['bandwidth_schedule'], m.settings_schedule_label(), scheduleHasError)}
+              </div>
             </div>
           {/if}
 
@@ -3727,17 +3846,23 @@
                    announced as the input's description instead. -->
               <label for="tcp-port">
                 {m.settings_tcp_port()}
-                <span class="restart-badge" id="tcp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
+                <span class="restart-badge" class:pending={restartPending('tcp_port')} id="tcp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
               </label>
-              <input id="tcp-port" type="number" min="1" max="65535" aria-describedby="tcp-port-restart" bind:value={settings.tcp_port} />
+              <div class="apply-input">
+                <input id="tcp-port" type="number" min="1" max="65535" aria-describedby="tcp-port-restart" bind:value={settings.tcp_port} onkeydown={(e) => applyOnEnter(e, ['tcp_port'])} />
+                {@render applyButton(['tcp_port'], m.settings_tcp_port())}
+              </div>
               <span class="hint">{m.settings_tcp_port_hint()}</span>
             </div>
             <div class="field half">
               <label for="udp-port">
                 {m.settings_udp_port()}
-                <span class="restart-badge" id="udp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
+                <span class="restart-badge" class:pending={restartPending('udp_port')} id="udp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
               </label>
-              <input id="udp-port" type="number" min="1" max="65535" aria-describedby="udp-port-restart" bind:value={settings.udp_port} />
+              <div class="apply-input">
+                <input id="udp-port" type="number" min="1" max="65535" aria-describedby="udp-port-restart" bind:value={settings.udp_port} onkeydown={(e) => applyOnEnter(e, ['udp_port'])} />
+                {@render applyButton(['udp_port'], m.settings_udp_port())}
+              </div>
               <span class="hint">{m.settings_udp_port_hint()}</span>
             </div>
           </div>
@@ -3746,7 +3871,7 @@
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">{m.settings_upnp_label()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
+              <span class="toggle-title">{m.settings_upnp_label()} <span class="restart-badge" class:pending={restartPending('upnp_enabled')}>{m.settings_restart_badge()}</span></span>
               <span class="hint">{m.settings_upnp_hint()}</span>
             </div>
             <ToggleSwitch bind:checked={settings.upnp_enabled} ariaLabel={m.settings_upnp_label()} />
@@ -3801,7 +3926,7 @@
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">{m.settings_auto_connect_server()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
+              <span class="toggle-title">{m.settings_auto_connect_server()}</span>
               <span class="hint">{m.settings_auto_connect_server_hint()}</span>
             </div>
             <ToggleSwitch bind:checked={settings.auto_connect_server} ariaLabel={m.settings_auto_connect_server()} />
@@ -3809,9 +3934,9 @@
 
           <!--
             eD2K server-list discovery, after eMule's Options -> Servers.
-            New-server admission from server lists is read live after Save;
+            New-server admission from server lists is read live once saved;
             purging already-listed servers when "filter servers by IP" turns
-            on also runs on Save (and at startup / IP-filter reload). eMule's
+            on also runs on save (and at startup / IP-filter reload). eMule's
             third option, servers learned from clients, has no switch here:
             nothing in the backend adds servers from clients, so a toggle for
             it would only claim to do something.
@@ -3886,7 +4011,6 @@
             <div class="toggle-info">
               <span class="toggle-title">{m.settings_ip_filter_label()}</span>
               <span class="hint">{m.settings_ip_filter_hint()}</span>
-              <span class="hint hint-live">{m.settings_applies_immediately()}</span>
             </div>
             <ToggleSwitch
               bind:checked={settings.ip_filter_enabled}
@@ -3920,7 +4044,6 @@
             <div class="toggle-info">
               <span class="toggle-title">{m.settings_block_private_label()}</span>
               <span class="hint">{m.settings_block_private_hint()}</span>
-              <span class="hint hint-live">{m.settings_applies_immediately()}</span>
             </div>
             <ToggleSwitch
               bind:checked={settings.block_private_ips}
@@ -4033,7 +4156,7 @@
               <span class="toggle-title">{m.settings_friend_chat_disabled()}</span>
               <span class="hint">{m.settings_friend_chat_disabled_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_chat_disabled} ariaLabel={m.settings_friend_chat_disabled()} onchange={() => void applyFriendTogglesLive()} />
+            <ToggleSwitch bind:checked={settings.friend_chat_disabled} ariaLabel={m.settings_friend_chat_disabled()} />
           </div>
 
           <div class="field toggle-row">
@@ -4041,7 +4164,7 @@
               <span class="toggle-title">{m.settings_friend_chat_read_receipts()}</span>
               <span class="hint">{m.settings_friend_chat_read_receipts_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_chat_read_receipts} ariaLabel={m.settings_friend_chat_read_receipts()} onchange={() => void applyFriendTogglesLive()} />
+            <ToggleSwitch bind:checked={settings.friend_chat_read_receipts} ariaLabel={m.settings_friend_chat_read_receipts()} />
           </div>
 
           <div class="field toggle-row">
@@ -4049,23 +4172,27 @@
               <span class="toggle-title">{m.settings_friend_browse_disabled()}</span>
               <span class="hint">{m.settings_friend_browse_disabled_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_browse_disabled} ariaLabel={m.settings_friend_browse_disabled()} onchange={() => void applyFriendTogglesLive()} />
+            <ToggleSwitch bind:checked={settings.friend_browse_disabled} ariaLabel={m.settings_friend_browse_disabled()} />
           </div>
 
           <div class="field">
             <label for="chat-attach-auto">{m.settings_chat_attach_auto_label()}</label>
             <div class="chat-attach-row">
-              <div class="unit-input">
-                <input
-                  id="chat-attach-auto"
-                  type="number"
-                  min="0"
-                  max="2048"
-                  inputmode="numeric"
-                  aria-describedby="chat-attach-auto-unit chat-attach-auto-hint"
-                  bind:value={settings.chat_attachment_auto_accept_mb}
-                />
-                <span id="chat-attach-auto-unit" class="unit-input-suffix">{m.settings_chat_attach_auto_unit()}</span>
+              <div class="apply-input">
+                <div class="unit-input">
+                  <input
+                    id="chat-attach-auto"
+                    type="number"
+                    min="0"
+                    max="2048"
+                    inputmode="numeric"
+                    aria-describedby="chat-attach-auto-unit chat-attach-auto-hint"
+                    bind:value={settings.chat_attachment_auto_accept_mb}
+                    onkeydown={(e) => applyOnEnter(e, ['chat_attachment_auto_accept_mb'])}
+                  />
+                  <span id="chat-attach-auto-unit" class="unit-input-suffix">{m.settings_chat_attach_auto_unit()}</span>
+                </div>
+                {@render applyButton(['chat_attachment_auto_accept_mb'], m.settings_chat_attach_auto_label())}
               </div>
               <button type="button" class="action-btn chat-files-btn" onclick={() => void openChatFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -4079,19 +4206,23 @@
 
           <div class="field">
             <label for="max-friends">{m.settings_max_friends()}</label>
-            <input
-              id="max-friends"
-              class="compact-number"
-              type="number"
-              min="1"
-              max="500"
-              bind:value={settings.max_friends}
-            />
+            <div class="apply-input">
+              <input
+                id="max-friends"
+                class="compact-number"
+                type="number"
+                min="1"
+                max="500"
+                bind:value={settings.max_friends}
+                onkeydown={(e) => applyOnEnter(e, ['max_friends'])}
+              />
+              {@render applyButton(['max_friends'], m.settings_max_friends())}
+            </div>
             <span class="hint">{m.settings_max_friends_hint()}</span>
           </div>
 
-          <!-- Friend session encryption stays forced on (see handleSave /
-               applyFriendTogglesLive). Rendezvous URL remains in AppSettings
+          <!-- Friend session encryption stays forced on (see `saveFields`).
+               Rendezvous URL remains in AppSettings
                for config.json only. Channel file offers live in the Channels
                section. -->
 
@@ -4117,16 +4248,20 @@
         <div class="card-body">
           <div class="field">
             <label for="channel_username">{m.settings_channel_username_label()}</label>
-            <input
-              id="channel_username"
-              value={settings.channel_username}
-              maxlength={CHANNEL_USERNAME_MAX}
-              spellcheck="false"
-              autocomplete="username"
-              autocapitalize="off"
-              placeholder={m.settings_channel_username_placeholder()}
-              oninput={(e) => setChannelUsername(e.currentTarget)}
-            />
+            <div class="apply-input">
+              <input
+                id="channel_username"
+                value={settings.channel_username}
+                maxlength={CHANNEL_USERNAME_MAX}
+                spellcheck="false"
+                autocomplete="username"
+                autocapitalize="off"
+                placeholder={m.settings_channel_username_placeholder()}
+                oninput={(e) => setChannelUsername(e.currentTarget)}
+                onkeydown={(e) => applyOnEnter(e, ['channel_username'])}
+              />
+              {@render applyButton(['channel_username'], m.settings_channel_username_label())}
+            </div>
             <span class="hint">{m.settings_channel_username_hint()}</span>
           </div>
 
@@ -4138,7 +4273,6 @@
               <select
                 id="channel-file-offers"
                 bind:value={settings.channel_file_offers}
-                onchange={() => void applyFriendTogglesLive()}
               >
                 <option value="everyone">{m.settings_channel_file_offers_everyone()}</option>
                 <option value="friends">{m.settings_channel_file_offers_friends()}</option>
@@ -4152,14 +4286,6 @@
               </button>
             </div>
             <span class="hint">{m.settings_channel_file_offers_hint()}</span>
-            <!--
-              This select persists on change (`applyFriendTogglesLive`) while
-              the username field directly above it waits for Save. Two
-              different commit rules in one card, with nothing on screen
-              saying so, read as "my username didn't stick" — so the live one
-              says that it is live.
-            -->
-            <span class="hint hint-live">{m.settings_applies_immediately()}</span>
           </div>
 
           <div class="divider"></div>
@@ -4731,20 +4857,19 @@
 </div>
 
 <!--
-  Restart confirmation prompt — fires after `handleSave` notices the
-  user changed `tcp_port` or `udp_port`. Both ports are bound only at
-  process startup, so a hot save persists the value but the active
-  listener keeps using the old port until restart. Same UX as the
-  setup wizard's "Launch Ember" relaunch step.
+  Restart confirmation prompt — fires after a save leaves the ports or UPnP
+  different from what Ember started with. The network stack reads them only
+  at startup, so the save persists the value but the running listener keeps
+  the old one until restart. "Later" leaves the banner in the header. Same
+  UX as the setup wizard's "Launch Ember" relaunch step.
 -->
 <ConfirmDialog
   bind:open={showRestartPrompt}
   title={m.settings_restart_dialog_title()}
-  message={m.settings_restart_dialog_message({ reason: pendingRestartReason })}
+  message={m.settings_restart_dialog_message({ reason: restartReason })}
   confirmLabel={m.settings_restart_now()}
   cancelLabel={m.settings_restart_later()}
   onconfirm={performRestart}
-  oncancel={dismissRestartPrompt}
 />
 
 <!--
@@ -4856,32 +4981,33 @@
     box-shadow: var(--shadow-sm);
   }
 
+  .sticky-header {
+    flex-wrap: wrap;
+    row-gap: 12px;
+  }
+
   .header-actions {
     display: flex;
     align-items: center;
     gap: 12px;
   }
 
-  .save-btn {
-    display: inline-flex;
+  .restart-pending-banner {
+    flex-basis: 100%;
+    display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 7px 20px;
-    font-weight: 600;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 8px 8px 12px;
+    border: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--warning) 10%, transparent);
     font-size: var(--font-size-md);
-    border-radius: var(--radius-md);
+    color: var(--text-primary);
   }
 
-  .unsaved-indicator {
-    font-size: var(--font-size-sm);
-    color: var(--warning);
-    font-weight: 500;
-    animation: pulse 2s ease-in-out infinite;
-  }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
+  .restart-pending-banner .action-btn {
+    flex-shrink: 0;
   }
 
   .save-status {
@@ -4919,6 +5045,12 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     background: var(--bg-secondary);
+    /* Stays in view down a long section, so switching never means scrolling
+       back up first. Capped so a short window can still reach every tab. */
+    position: sticky;
+    top: 8px;
+    max-height: calc(100vh - 160px);
+    overflow-y: auto;
   }
 
   .settings-nav-title {
@@ -5223,11 +5355,30 @@
     width: 120px;
   }
 
-  /* Marks a control that persists on change rather than on Save. */
-  .hint-live {
-    margin-top: 4px;
-    color: var(--text-secondary);
-    font-weight: 600;
+  /* A typed field and the Apply button that appears once it is edited. */
+  .apply-input {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 8px;
+  }
+
+  .apply-input > input:not(.compact-number),
+  .apply-input > .apply-grow {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .field-apply {
+    flex-shrink: 0;
+    padding: 7px 14px;
+  }
+
+  /* Wraps onto its own line under the field and its Apply button. */
+  .field-apply-error {
+    flex-basis: 100%;
+    color: var(--danger);
+    font-size: var(--font-size-sm);
   }
 
   /* ── Restart badge ─────────────────────────────── */
@@ -5243,6 +5394,12 @@
     background: color-mix(in srgb, var(--warning) 14%, transparent);
     vertical-align: middle;
     line-height: 1.5;
+  }
+
+  /* Saved, and waiting for the restart the header banner offers. */
+  .restart-badge.pending {
+    background: color-mix(in srgb, var(--warning) 26%, transparent);
+    box-shadow: inset 0 0 0 1px var(--warning);
   }
 
   /* ── Toggle row ────────────────────────────────── */
@@ -6445,6 +6602,14 @@
     font-size: var(--font-size-sm);
   }
 
+  .schedule-footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
   .schedule-add {
     align-self: flex-start;
     padding: 6px 12px;
@@ -6663,12 +6828,16 @@
       max-width: none;
     }
 
+    /* The search box, then the tabs as one row that scrolls sideways,
+       pinned to the top. Stacked, thirteen tabs pushed every setting below
+       the fold before the first one could be reached. */
     .settings-nav {
-      position: static;
-      flex-direction: row;
-      flex-wrap: wrap;
+      top: 0;
+      z-index: 5;
+      gap: 8px;
       padding: 8px;
-      overflow-x: auto;
+      max-height: none;
+      overflow: visible;
       max-width: 100%;
     }
 
@@ -6676,11 +6845,32 @@
       display: none;
     }
 
+    .settings-filter {
+      padding: 0;
+    }
+
+    .settings-tablist {
+      display: flex;
+      gap: 4px;
+      overflow-x: auto;
+      scrollbar-width: thin;
+    }
+
     .settings-nav-item {
       width: auto;
       padding: 7px 10px;
       font-size: var(--font-size-sm);
       flex-shrink: 0;
+      white-space: nowrap;
+    }
+
+    .settings-filter-status,
+    .settings-filter-clear {
+      margin: 0;
+    }
+
+    .settings-filter-clear {
+      align-self: flex-start;
     }
   }
 
