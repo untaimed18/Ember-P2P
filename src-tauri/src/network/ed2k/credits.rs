@@ -276,6 +276,15 @@ pub struct CreditRecord {
     /// showed no IP and no flag. This field is what it falls back to instead,
     /// and nothing that scores or trusts a peer reads it.
     pub seen_ip: u32,
+    /// Ember node id a non-friend peer advertised, kept once SecIdent proved
+    /// the address it came from owns this `user_hash`.
+    ///
+    /// Display only: it is what keeps an Ember peer on the Known Ember Peers
+    /// tab after it leaves the queue or Ember restarts. [`Self::ember_hash`]
+    /// is the friend-proven link and is what friend recognition reads; this
+    /// never displaces it and nothing that grants, scores or recognises a
+    /// peer reads this. Set by [`CreditManager::promote_proven_ember`].
+    pub proven_ember_hash: Option<[u8; 16]>,
 }
 
 /// Credit record for verified Ember peers.
@@ -364,6 +373,7 @@ impl CreditRecord {
             peer_name: String::new(),
             client_software: String::new(),
             seen_ip: 0,
+            proven_ember_hash: None,
         }
     }
 }
@@ -442,11 +452,14 @@ pub struct CreditManager {
     #[zeroize(skip)]
     ember_seen: LastSeenIndex<[u8; 32]>,
     /// eD2K user hash → Ember hash learned from an offline binding check on a
-    /// session that was not Noise-authenticated. Anyone can mint a keypair
-    /// that passes binding and pair it with a public user hash, so these are
-    /// never persisted and never displace [`CreditRecord::ember_hash`].
+    /// session that was not Noise-authenticated, with the IPv4 that session
+    /// came from. Anyone can mint a keypair that passes binding and pair it
+    /// with a public user hash, so these are never persisted and never
+    /// displace [`CreditRecord::ember_hash`]; one only reaches
+    /// [`CreditRecord::proven_ember_hash`] once SecIdent verifies that same
+    /// address.
     #[zeroize(skip)]
-    bound_ember_hashes: HashMap<[u8; 16], [u8; 16]>,
+    bound_ember_hashes: HashMap<[u8; 16], ([u8; 16], u32)>,
     #[zeroize(skip)]
     our_public_key: Vec<u8>,
     our_private_key: Vec<u8>,
@@ -1119,6 +1132,7 @@ impl CreditManager {
         if record.ident_state == IdentState::Verified {
             record.ident_ip = current_ip;
         }
+        self.promote_proven_ember(user_hash);
     }
 
     /// eMule CClientCredits::GetCurrentIdentState(dwForIP): returns BadGuy
@@ -1374,7 +1388,10 @@ impl CreditManager {
     /// Writing it to the persisted record let anyone with a fresh keypair
     /// claim a friend's user hash and break friend source recognition. A
     /// persisted mapping always wins over this one in the lookups.
-    pub fn note_bound_ember_hash(&mut self, user_hash: [u8; 16], ember_hash: [u8; 16]) {
+    ///
+    /// `peer_ip` is the session's IPv4 (big-endian, as `ident_ip`), or 0
+    /// when it has none; it is what lets SecIdent later vouch for the link.
+    pub fn note_bound_ember_hash(&mut self, user_hash: [u8; 16], ember_hash: [u8; 16], peer_ip: u32) {
         if user_hash == [0u8; 16] || ember_hash == [0u8; 16] {
             return;
         }
@@ -1385,7 +1402,57 @@ impl CreditManager {
                 self.bound_ember_hashes.remove(&victim);
             }
         }
-        self.bound_ember_hashes.insert(user_hash, ember_hash);
+        self.bound_ember_hashes.insert(user_hash, (ember_hash, peer_ip));
+        self.promote_proven_ember(user_hash);
+    }
+
+    /// Put back a stored [`CreditRecord::proven_ember_hash`]. Like
+    /// [`Self::insert_loaded_credit`] it leaves `last_seen` and the save
+    /// state alone, and a link to a record no longer held is dropped.
+    pub fn restore_proven_ember_hash(&mut self, user_hash: [u8; 16], ember_hash: [u8; 16]) {
+        if let Some(record) = self.credits.get_mut(&user_hash) {
+            record.proven_ember_hash = Some(ember_hash);
+        }
+    }
+
+    /// A session address as [`CreditRecord::ident_ip`] stores it: big-endian
+    /// IPv4, IPv4-mapped IPv6 unwrapped, and 0 for anything else. Shared by
+    /// [`Self::note_bound_ember_hash`]'s callers and the SecIdent handler so
+    /// the two addresses compare.
+    pub fn ident_ip_of(addr: std::net::SocketAddr) -> u32 {
+        match addr.ip() {
+            std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(|v4| u32::from_be_bytes(v4.octets()))
+                .unwrap_or(0),
+        }
+    }
+
+    /// Keep the session's Ember binding for display once SecIdent has proven,
+    /// this run, that the address it came from owns `user_hash`.
+    ///
+    /// The binding shows the client is an Ember node with that key; SecIdent
+    /// shows the same address holds the user hash's RSA key. Together the
+    /// link is as strong as the rest of the credit row, so it is worth
+    /// remembering across sessions — for the Known Ember Peers tab only.
+    /// Runs from both ends, since either proof can land first.
+    fn promote_proven_ember(&mut self, user_hash: [u8; 16]) {
+        let Some(&(ember_hash, bound_ip)) = self.bound_ember_hashes.get(&user_hash) else {
+            return;
+        };
+        let proven = self.credits.get(&user_hash).is_some_and(|record| {
+            record.ident_state == IdentState::Verified
+                && record.ident_ip != 0
+                && record.ident_ip == bound_ip
+                && record.proven_ember_hash != Some(ember_hash)
+        });
+        if proven {
+            self.mark_credit_unsaved(user_hash);
+            if let Some(record) = self.credits.get_mut(&user_hash) {
+                record.proven_ember_hash = Some(ember_hash);
+            }
+        }
     }
 
     /// Reverse of [`Self::set_ember_hash`]: find the eD2K `user_hash` we last
@@ -1403,7 +1470,7 @@ impl CreditManager {
             .or_else(|| {
                 self.bound_ember_hashes
                     .iter()
-                    .find_map(|(user_hash, bound)| {
+                    .find_map(|(user_hash, (bound, _))| {
                         let persisted = self
                             .credits
                             .get(user_hash)
@@ -1426,7 +1493,7 @@ impl CreditManager {
         self.credits
             .get(user_hash)
             .and_then(|record| record.ember_hash)
-            .or_else(|| self.bound_ember_hashes.get(user_hash).copied())
+            .or_else(|| self.bound_ember_hashes.get(user_hash).map(|(eh, _)| *eh))
     }
 
     pub fn set_ident_state(&mut self, user_hash: [u8; 16], state: IdentState) {
@@ -1859,9 +1926,10 @@ impl CreditManager {
                 // user_hash and may name only some of these records.
                 peer_name: String::new(),
                 client_software: String::new(),
-                // `clients.met` has no field for it; the SQLite table, which
-                // is the primary store, does.
+                // `clients.met` has no field for these; the SQLite table,
+                // which is the primary store, does.
                 seen_ip: 0,
+                proven_ember_hash: None,
             };
             self.insert_loaded_credit(record);
             loaded_hashes.push(user_hash);
@@ -3211,7 +3279,7 @@ mod tests {
         let attacker_ember = [0x62u8; 16];
         cm.set_ember_hash(friend_user_hash, friend_ember);
 
-        cm.note_bound_ember_hash(friend_user_hash, attacker_ember);
+        cm.note_bound_ember_hash(friend_user_hash, attacker_ember, 0x0A00_0009);
         assert_eq!(cm.find_ember_by_user_hash(&friend_user_hash), Some(friend_ember));
         assert_eq!(cm.find_user_hash_by_ember(&friend_ember), Some(friend_user_hash));
         assert_eq!(cm.find_user_hash_by_ember(&attacker_ember), None);
@@ -3222,13 +3290,53 @@ mod tests {
 
         let stranger = [0x52u8; 16];
         let stranger_ember = [0x63u8; 16];
-        cm.note_bound_ember_hash(stranger, stranger_ember);
+        cm.note_bound_ember_hash(stranger, stranger_ember, 0x0A00_0009);
         assert_eq!(cm.find_ember_by_user_hash(&stranger), Some(stranger_ember));
         assert_eq!(cm.find_user_hash_by_ember(&stranger_ember), Some(stranger));
         assert!(
             cm.get_record(&stranger).is_none(),
             "a binding-only mapping must not create a persisted credit row"
         );
+    }
+
+    /// A binding is kept for display only once SecIdent has proven, this run,
+    /// that the same address owns the user hash — whichever proof lands first.
+    #[test]
+    fn a_binding_is_kept_for_display_only_once_secident_vouches_for_its_address() {
+        let ip = 0x0A00_0001;
+        let ember = [0x71u8; 16];
+
+        // SecIdent first, then the binding from the same address.
+        let mut cm = CreditManager::new();
+        let peer = [0x41u8; 16];
+        cm.set_ident_state(peer, IdentState::Verified);
+        cm.check_identity_ip(peer, ip);
+        cm.note_bound_ember_hash(peer, ember, ip);
+        let record = cm.get_record(&peer).expect("record");
+        assert_eq!(record.proven_ember_hash, Some(ember));
+        assert_eq!(record.ember_hash, None, "the friend link is left alone");
+
+        // The binding first, then SecIdent from the same address.
+        let late = [0x42u8; 16];
+        cm.note_bound_ember_hash(late, ember, ip);
+        assert_eq!(cm.get_record(&late).and_then(|r| r.proven_ember_hash), None);
+        cm.set_ident_state(late, IdentState::Verified);
+        cm.check_identity_ip(late, ip);
+        assert_eq!(cm.get_record(&late).and_then(|r| r.proven_ember_hash), Some(ember));
+
+        // A binding from another address than the one SecIdent proved is not
+        // vouched for: the user hash travels in the clear.
+        let claimed = [0x43u8; 16];
+        cm.set_ident_state(claimed, IdentState::Verified);
+        cm.check_identity_ip(claimed, ip);
+        cm.note_bound_ember_hash(claimed, [0x72u8; 16], 0x0A00_0002);
+        assert_eq!(cm.get_record(&claimed).and_then(|r| r.proven_ember_hash), None);
+
+        // Nor is one SecIdent has not verified at all.
+        let unverified = [0x44u8; 16];
+        cm.get_or_create(unverified);
+        cm.note_bound_ember_hash(unverified, ember, ip);
+        assert_eq!(cm.get_record(&unverified).and_then(|r| r.proven_ember_hash), None);
     }
 
     // ---- Ember credit tests ----

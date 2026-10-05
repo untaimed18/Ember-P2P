@@ -13052,7 +13052,11 @@ impl UploadHandler {
                                     info!("Ember binding: peer {peer_addr} pubkey matches advertised hash");
                                     if peer_user_hash != [0u8; 16] {
                                         let mut cm = self.credit_manager.write().await;
-                                        cm.note_bound_ember_hash(peer_user_hash, *peer_eh);
+                                        cm.note_bound_ember_hash(
+                                            peer_user_hash,
+                                            *peer_eh,
+                                            CreditManager::ident_ip_of(peer_addr),
+                                        );
                                     }
                                     // Unlock mesh + first EPX once HELLO
                                     // binding succeeds (friend privileges

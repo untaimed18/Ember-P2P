@@ -3819,7 +3819,11 @@ impl Ed2kDownload {
                                     );
                                     if peer_user_hash != [0u8; 16] {
                                         if let Some(cm) = &self.credit_manager {
-                                            cm.write().await.note_bound_ember_hash(peer_user_hash, *eh);
+                                            cm.write().await.note_bound_ember_hash(
+                                                peer_user_hash,
+                                                *eh,
+                                                CreditManager::ident_ip_of(self.source_addr),
+                                            );
                                         }
                                     }
                                 } else {
@@ -4565,7 +4569,11 @@ impl Ed2kDownload {
                                     );
                                     if peer_user_hash != [0u8; 16] {
                                         if let Some(cm) = &self.credit_manager {
-                                            cm.write().await.note_bound_ember_hash(peer_user_hash, *eh);
+                                            cm.write().await.note_bound_ember_hash(
+                                                peer_user_hash,
+                                                *eh,
+                                                CreditManager::ident_ip_of(self.source_addr),
+                                            );
                                         }
                                     }
                                     if peer_is_ember && !mesh_discovered_emitted {
@@ -6557,9 +6565,11 @@ impl Ed2kDownload {
                                             );
                                             if peer_user_hash != [0u8; 16] {
                                                 if let Some(cm) = &self.credit_manager {
-                                                    cm.write()
-                                                        .await
-                                                        .note_bound_ember_hash(peer_user_hash, *eh);
+                                                    cm.write().await.note_bound_ember_hash(
+                                                        peer_user_hash,
+                                                        *eh,
+                                                        CreditManager::ident_ip_of(self.source_addr),
+                                                    );
                                                 }
                                             }
                                             if peer_is_ember && !mesh_discovered_emitted {

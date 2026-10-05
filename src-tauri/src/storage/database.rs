@@ -4824,6 +4824,69 @@ impl Database {
         Ok(records)
     }
 
+    /// The Ember node id each non-friend peer proved alongside SecIdent
+    /// (`CreditRecord::proven_ember_hash`), kept beside `credits` rather than
+    /// as a column of it for the same reason as
+    /// [`Self::ensure_transfer_part_folders_locked`]: a numbered migration
+    /// would stop 1.7.0 from opening the database after a downgrade.
+    fn ensure_credit_ember_links_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS credit_ember_links (
+                user_hash BLOB PRIMARY KEY,
+                ember_hash BLOB NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    pub fn load_credit_ember_links(&self) -> anyhow::Result<Vec<([u8; 16], [u8; 16])>> {
+        let conn = self.conn.lock();
+        Self::ensure_credit_ember_links_locked(&conn)?;
+        let mut stmt = conn.prepare("SELECT user_hash, ember_hash FROM credit_ember_links")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)))?
+            .filter_map(|row| {
+                let (user_hash, ember_hash) = row.ok()?;
+                Some((user_hash.try_into().ok()?, ember_hash.try_into().ok()?))
+            })
+            .collect();
+        Ok(rows)
+    }
+
+    /// Write the links of the credit rows a flush touched: `Some` stores one,
+    /// `None` and `removed` clear one, and `full_sync` first clears the table
+    /// so it mirrors the ledger exactly.
+    pub fn save_credit_ember_links(
+        &self,
+        links: &[([u8; 16], Option<[u8; 16]>)],
+        removed: &[[u8; 16]],
+        full_sync: bool,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_credit_ember_links_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        if full_sync {
+            tx.execute("DELETE FROM credit_ember_links", [])?;
+        }
+        {
+            let mut upsert = tx.prepare(
+                "INSERT OR REPLACE INTO credit_ember_links (user_hash, ember_hash) VALUES (?1, ?2)",
+            )?;
+            let mut delete = tx.prepare("DELETE FROM credit_ember_links WHERE user_hash = ?1")?;
+            for (user_hash, ember_hash) in links {
+                match ember_hash {
+                    Some(eh) => upsert.execute(params![&user_hash[..], &eh[..]])?,
+                    None => delete.execute(params![&user_hash[..]])?,
+                };
+            }
+            for user_hash in removed {
+                delete.execute(params![&user_hash[..]])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn load_statistics(&self) -> anyhow::Result<Vec<(String, i64)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT key, value FROM statistics")?;
@@ -13824,6 +13887,27 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The Known Ember Peers links are written per flushed row, cleared with
+    /// `None` or a removed row, and mirrored exactly on a full sync — in a
+    /// table of their own, so the schema version 1.7.0 checks stays put.
+    #[test]
+    fn credit_ember_links_follow_the_flushed_rows() {
+        let db = credits_only_db();
+        let (a, b, c) = ([1u8; 16], [2u8; 16], [3u8; 16]);
+        db.save_credit_ember_links(&[(a, Some([0xA1; 16])), (b, Some([0xB1; 16]))], &[], false)
+            .unwrap();
+        let mut links = db.load_credit_ember_links().unwrap();
+        links.sort();
+        assert_eq!(links, vec![(a, [0xA1; 16]), (b, [0xB1; 16])]);
+
+        db.save_credit_ember_links(&[(a, None), (c, Some([0xC1; 16]))], &[b], false)
+            .unwrap();
+        assert_eq!(db.load_credit_ember_links().unwrap(), vec![(c, [0xC1; 16])]);
+
+        db.save_credit_ember_links(&[(a, Some([0xA2; 16]))], &[], true).unwrap();
+        assert_eq!(db.load_credit_ember_links().unwrap(), vec![(a, [0xA2; 16])]);
     }
 
     /// A download's part folder lives in a table of its own, not a column of

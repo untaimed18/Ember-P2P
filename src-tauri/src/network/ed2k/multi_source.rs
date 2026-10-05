@@ -6779,7 +6779,11 @@ async fn download_parts_from_source(
                                 info!("Ember binding: source {} at {} pubkey BLAKE3-binds to advertised hash", _src_idx, addr);
                                 if peer_user_hash != [0u8; 16] {
                                     if let Some(cm) = &credit_mgr {
-                                        cm.write().await.note_bound_ember_hash(peer_user_hash, *peer_eh);
+                                        cm.write().await.note_bound_ember_hash(
+                                            peer_user_hash,
+                                            *peer_eh,
+                                            CreditManager::ident_ip_of(addr),
+                                        );
                                     }
                                 }
                             } else {
@@ -7521,7 +7525,11 @@ async fn download_parts_from_source(
                             info!("Ember binding: source {} at {} pubkey BLAKE3-binds (file-status-wait)", _src_idx, addr);
                             if peer_user_hash != [0u8; 16] {
                                 if let Some(cm) = &credit_mgr {
-                                    cm.write().await.note_bound_ember_hash(peer_user_hash, *peer_eh);
+                                    cm.write().await.note_bound_ember_hash(
+                                        peer_user_hash,
+                                        *peer_eh,
+                                        CreditManager::ident_ip_of(addr),
+                                    );
                                 }
                             }
                             if hello_caps.is_ember && !mesh_discovered_emitted {
