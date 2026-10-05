@@ -127,6 +127,7 @@
       title: () => m.shortcuts_section_library(),
       shortcuts: [
         { keys: ['/'], label: () => m.shortcuts_library_focus_search() },
+        { keys: [modifierKey, 'F'], label: () => m.shortcuts_library_focus_search() },
         { keys: [modifierKey, 'A'], label: () => m.shortcuts_library_select_all() },
         { keys: [modifierKey, 'D'], label: () => m.shortcuts_library_clear_selection() },
         { keys: [modifierKey, 'C'], label: () => m.shortcuts_library_copy_links() },
@@ -142,6 +143,7 @@
       title: () => m.shortcuts_section_search(),
       shortcuts: [
         { keys: ['/'], label: () => m.shortcuts_library_focus_search() },
+        { keys: [modifierKey, 'F'], label: () => m.search_filter_results() },
         { keys: [modifierKey, 'C'], label: () => m.shortcuts_search_copy_links() },
         { keys: ['↑ / ↓'], label: () => m.shortcuts_search_navigate() },
         { keys: ['Shift', '↑ / ↓'], label: () => m.shortcuts_search_extend() },

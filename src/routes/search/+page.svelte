@@ -56,6 +56,10 @@
   import { openWebService } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
   import IconX from '$lib/components/IconX.svelte';
+  import FileTypeIcon from '$lib/components/FileTypeIcon.svelte';
+  import { extensionFromPath, fileTypeKey } from '$lib/fileTypes';
+  import { highlightTerms, splitHighlights } from '$lib/highlight';
+  import { highlightMatches } from '$lib/stores/highlight';
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import * as m from '$lib/paraglide/messages';
@@ -431,6 +435,16 @@
   // substring matching against the (now localized) status text.
   let bulkDownloadHasFailures = $state(false);
   let checkedCount = $derived(checkedKeys.size);
+  /** What the ticked results weigh, shown beside the count before a bulk
+   *  download. */
+  let checkedTotalSize = $derived.by(() => {
+    if (checkedKeys.size === 0) return 0;
+    let bytes = 0;
+    for (const result of activeTab?.results ?? []) {
+      if (checkedKeys.has(resultKey(result))) bytes += result.file.size;
+    }
+    return bytes;
+  });
   let spamExplainCache = $state<Record<string, SpamExplanation>>({});
   const SPAM_CACHE_MAX = 500;
   function setSpamCache(key: string, val: SpamExplanation) {
@@ -536,6 +550,10 @@
     const clean = (result.clean_name ?? '').replace(DISPLAY_NAME_STRIP_RE, '').trim();
     return clean || (result.file.name ?? '').replace(DISPLAY_NAME_STRIP_RE, '');
   }
+
+  function resultTypeKey(result: SearchResult) {
+    return fileTypeKey(result.file.extension || extensionFromPath(result.file.name ?? ''));
+  }
   let selectedOriginalName = $derived((selectedResult?.file.name ?? '').replace(DISPLAY_NAME_STRIP_RE, ''));
 
   /**
@@ -588,6 +606,11 @@
   let filterColumn: FilterColumn = $state('all');
   let filterTextInput = $state('');
   let filterText = $state('');
+  /** The tab's query and the result filter, marked in each name unless the
+   *  user turned highlighting off. */
+  let nameHighlightTerms = $derived(
+    $highlightMatches ? highlightTerms(activeTab?.query ?? '', filterText) : [],
+  );
   let filterDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let showAdvancedFilters = $state(false);
 
@@ -2160,6 +2183,33 @@
     return tab.query ? `${base}\n${m.search_related_tab_query({ query: tab.query })}` : base;
   }
 
+  /**
+   * Run a finished tab's search again, with its own network and type, in its
+   * place in the strip. The filter panel is shared by every tab, so the
+   * filters are whatever it holds now, as for any search.
+   */
+  function searchAgain(tab: SearchTab) {
+    if (tab.isSearching || tab.related || !tab.query) return;
+    barQuery = tab.query;
+    searchMethod = tab.method;
+    searchFileType = tab.fileType ?? '';
+    // `handleSearch` opens the new tab before its first await, so it is in
+    // the store by the time this returns, unless a gate refused the search.
+    void handleSearch(tab.query);
+    const newId = get(activeSearchTabId);
+    if (!newId || newId === tab.id) return;
+    searchTabs.update((tabs) => {
+      const oldIdx = tabs.findIndex((t) => t.id === tab.id);
+      const newIdx = tabs.findIndex((t) => t.id === newId);
+      if (oldIdx === -1 || newIdx === -1) return tabs;
+      const next = [...tabs];
+      const [fresh] = next.splice(newIdx, 1);
+      next.splice(next.findIndex((t) => t.id === tab.id), 1, fresh);
+      return next;
+    });
+    clearSearchTimeoutForRequest(tab.requestId);
+  }
+
   function requestCloseSearchTab(tab: SearchTab) {
     // Only confirm when closing would lose work: an in-flight search or
     // accumulated results. A closed, empty tab is always one click to drop.
@@ -3653,6 +3703,18 @@
     }
     return;
   }
+  // Ctrl/Cmd+F is find-in-results: the result filter, not the query box `/`
+  // goes to.
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && isShortcutLetter(e, 'f')) {
+    if (confirmOpen || networkAlertOpen || selectedResult) return;
+    const filterBox = document.getElementById('filter-text');
+    if (filterBox instanceof HTMLInputElement) {
+      e.preventDefault();
+      filterBox.focus();
+      filterBox.select();
+    }
+    return;
+  }
   // `/` jumps to the query box, matching the Library page. Ignored while a
   // field already has focus so it stays a typeable character there, and while a
   // modifier is held so it cannot shadow a browser or OS shortcut.
@@ -3752,7 +3814,20 @@
 {#if $searchTabs.length > 0}
   <div class="search-tabs" role="tablist" aria-label={m.search_sessions_aria()}>
     {#each $searchTabs as tab (tab.id)}
-      <div class="search-tab" class:active={tab.id === $activeSearchTabId} title={searchTabTitle(tab)}>
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="search-tab"
+        class:active={tab.id === $activeSearchTabId}
+        title={searchTabTitle(tab)}
+        onmousedown={(e) => { if (e.button === 1) e.preventDefault(); }}
+        onauxclick={(e) => {
+          // Middle-click closes, as a browser tab does; the mousedown above
+          // keeps it from starting autoscroll.
+          if (e.button !== 1) return;
+          e.preventDefault();
+          requestCloseSearchTab(tab);
+        }}
+      >
         <button
           type="button"
           class="search-tab-select"
@@ -3789,6 +3864,19 @@
             >
               <svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor" aria-hidden="true">
                 <rect x="4" y="4" width="8" height="8" rx="1.75"/>
+              </svg>
+            </button>
+          {:else if !tab.related && tab.query}
+            <button
+              type="button"
+              class="search-tab-action search-tab-again"
+              onclick={() => searchAgain(tab)}
+              title={m.search_again_tab()}
+              aria-label={m.search_again_tab_aria({ query: tab.query })}
+            >
+              <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M13 3.5v3.25H9.75"/>
+                <path d="M12.6 6.6A5 5 0 1 0 13 9.5"/>
               </svg>
             </button>
           {/if}
@@ -4153,7 +4241,7 @@
     </div>
     {#if checkedCount > 0}
       <div class="bulk-actions" role="toolbar" aria-label={m.search_bulk_actions_aria()}>
-        <span class="bulk-count">{m.search_bulk_selected({ count: checkedCount })}</span>
+        <span class="bulk-count">{m.search_bulk_selected({ count: formatNumber(checkedCount) })}<span class="bulk-size"> · {formatSize(checkedTotalSize)}</span></span>
         <button class="bulk-download-btn" onclick={downloadChecked} disabled={bulkDownloadPending}>
           {bulkDownloadPending ? m.search_downloading_ellipsis() : plural(checkedCount, { one: m.search_bulk_download_one, other: () => m.search_bulk_download_other({ count: checkedCount }) })}
         </button>
@@ -4307,7 +4395,8 @@
             </td>
             <td class="col-name" title={displayName(result)}>
               <div class="name-cell-wrap">
-                <button class="ghost link-btn" onclick={() => showFileDetails(result)}><bdi dir="auto">{displayName(result)}</bdi></button>
+                <FileTypeIcon kind={resultTypeKey(result)} size={18} />
+                <button class="ghost link-btn" onclick={() => showFileDetails(result)}><bdi dir="auto">{#each splitHighlights(displayName(result), nameHighlightTerms) as part, partIdx (partIdx)}{#if part.mark}<mark class="name-match">{part.text}</mark>{:else}{part.text}{/if}{/each}</bdi></button>
                 {#if dlTransfer}
                   <span class="badge sm {dlBadgeClass(dlTransfer)}" title="{dlBadgeLabel(dlTransfer)}: {dlTransfer.file_name}">
                     {dlBadgeLabel(dlTransfer)}
@@ -5027,6 +5116,12 @@
     outline-color: var(--danger);
   }
 
+  .search-tab-again:hover,
+  .search-tab-again:focus-visible {
+    color: var(--text-primary);
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+
   @media (max-width: 760px) {
     .search-tabs {
       gap: 6px;
@@ -5409,6 +5504,12 @@
     font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-accent);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .bulk-size {
+    font-weight: 500;
+    opacity: 0.8;
   }
 
   .bulk-download-btn {
@@ -6005,6 +6106,13 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .name-match {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    color: inherit;
+    border-radius: 2px;
+    padding: 0 1px;
   }
 
   .spam-flag-wrap {

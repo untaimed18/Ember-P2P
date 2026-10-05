@@ -60,7 +60,8 @@
     flex-shrink: 0;
     width: var(--size);
     height: var(--size);
-    border-radius: var(--radius-md);
+    /* The theme radius rounds an 18 px row tile into a blob. */
+    border-radius: min(var(--radius-md), calc(var(--size) * 0.28));
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -68,8 +69,9 @@
     color: var(--tile);
   }
 
+  /* Floored so the glyph stays legible in a table row's small tile. */
   .file-type-icon svg {
-    width: calc(var(--size) * 0.53);
-    height: calc(var(--size) * 0.53);
+    width: max(calc(var(--size) * 0.53), 11px);
+    height: max(calc(var(--size) * 0.53), 11px);
   }
 </style>

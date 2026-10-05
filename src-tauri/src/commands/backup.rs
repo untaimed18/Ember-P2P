@@ -242,6 +242,7 @@ const WEBVIEW_PREF_KEYS: &[&str] = &[
     "ember.channels.carried.v1",
     "search-recent-queries-v1",
     "search-prefs-v1",
+    "ember.highlight-matches.v1",
     "transfers-advanced-cols",
     "transfers-column-hidden-DownloadListCtrl",
     "transfers-column-hidden-UploadListCtrlV3",

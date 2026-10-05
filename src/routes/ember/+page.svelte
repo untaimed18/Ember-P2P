@@ -30,6 +30,7 @@
   import { checkForUpdates, installUpdate, restartToUpdate, updater } from '$lib/stores/updater';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import IconX from '$lib/components/IconX.svelte';
   import { relaunch } from '@tauri-apps/plugin-process';
   import { flushToastActionsBeforeExit } from '$lib/stores/toast';
   import * as m from '$lib/paraglide/messages';
@@ -39,7 +40,34 @@
   let searches = $state<EmberDhtSearchEntry[]>([]);
   let storeEntries = $state<EmberDhtStoreEntry[]>([]);
   let contactFilter = $state('');
+  let metricFilter = $state('');
   let detailsOpen = $state(false);
+
+  // Device-local view state, like collapsed sections elsewhere: not carried
+  // by a profile backup.
+  const DETAILS_OPEN_KEY = 'ember.page.details-open.v1';
+  const GROWING_DISMISSED_KEY = 'ember.page.growing-dismissed.v1';
+  function readFlag(key: string): boolean {
+    try {
+      return typeof localStorage !== 'undefined' && localStorage.getItem(key) === '1';
+    } catch {
+      return false;
+    }
+  }
+  function writeFlag(key: string, on: boolean) {
+    try {
+      if (on) localStorage.setItem(key, '1');
+      else localStorage.removeItem(key);
+    } catch {
+      // Storage disabled: the choice holds for this visit.
+    }
+  }
+  const detailsInitiallyOpen = readFlag(DETAILS_OPEN_KEY);
+  let growingDismissed = $state(readFlag(GROWING_DISMISSED_KEY));
+  function dismissGrowing() {
+    growingDismissed = true;
+    writeFlag(GROWING_DISMISSED_KEY, true);
+  }
   let showRestartPrompt = $state(false);
   let restarting = $state(false);
   let restartError = $state('');
@@ -111,6 +139,7 @@
 
   function onDetailsToggle(e: Event & { currentTarget: HTMLDetailsElement }) {
     detailsOpen = e.currentTarget.open;
+    writeFlag(DETAILS_OPEN_KEY, detailsOpen);
     void refreshLists();
   }
 
@@ -446,6 +475,26 @@
     ];
   });
 
+  let filteredMetrics = $derived.by(() => {
+    const q = metricFilter.trim().toLowerCase();
+    if (!q) return metrics;
+    return metrics.filter((metric) => metric.k.toLowerCase().includes(q));
+  });
+
+  /** Everything this page shows, as plain text for a bug report. */
+  function diagnosticsText(): string {
+    const lines = [
+      `${m.nav_ember_network()} — ${new Date().toISOString()}`,
+      `${statusLabel}${statusHint ? ` — ${statusHint}` : ''}`,
+      `${m.ember_health_reachability()}: ${reachabilityLabel}`,
+      `${m.ember_health_sharing()}: ${sharingPillLabel}`,
+      `${m.ember_node_id_label()}: ${diag?.ember_dht_node_id || '—'}`,
+      '',
+      ...metrics.map((metric) => `${metric.k}: ${metric.v}`),
+    ];
+    return lines.join('\n');
+  }
+
   onMount(() => {
     refreshDiag();
     // Skip the poll while the window is hidden, like every other poll in the
@@ -500,7 +549,20 @@
   {#if restartError}
     <div class="banner banner-error" role="alert">{restartError}</div>
   {/if}
-  <div class="banner banner-info" role="note">{m.ember_network_growing()}</div>
+  {#if !growingDismissed}
+    <div class="banner banner-info banner-dismissable" role="note">
+      <span>{m.ember_network_growing()}</span>
+      <button
+        type="button"
+        class="banner-dismiss"
+        onclick={dismissGrowing}
+        title={m.common_dismiss()}
+        aria-label={m.common_dismiss()}
+      >
+        <IconX size={11} />
+      </button>
+    </div>
+  {/if}
 
   <section class="hero" class:state-off={heroState === 'loading'} class:state-connecting={heroState === 'connecting'} class:state-connected={heroState === 'connected'} class:state-no-peers={heroState === 'no_peers'} aria-live="polite">
     <div class="hero-glow" aria-hidden="true"></div>
@@ -640,7 +702,7 @@
     and `onDetailsToggle` is what starts/stops polling the three snapshot
     commands that feed the tables.
   -->
-  <details class="card advanced" ontoggle={onDetailsToggle}>
+  <details class="card advanced" open={detailsInitiallyOpen} ontoggle={onDetailsToggle}>
     <summary>
       <span class="chevron" aria-hidden="true">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="12" height="12">
@@ -688,20 +750,45 @@
 
       {#if isActive}
         <section class="sub-card">
-          <h3>{m.ember_dht_status_title()}</h3>
+          <div class="panel-head">
+            <h3>{m.ember_dht_status_title()}</h3>
+            <div class="panel-tools">
+              <input
+                class="filter-input"
+                type="search"
+                bind:value={metricFilter}
+                placeholder={m.ember_metrics_filter()}
+                aria-label={m.ember_metrics_filter()}
+              />
+              <button
+                type="button"
+                class="copy-btn"
+                onclick={() => copyText(diagnosticsText(), 'diagnostics')}
+              >
+                {#if copiedKey === 'diagnostics'}{m.ember_copied()}
+                {:else if copiedKey === 'diagnostics:error'}{m.ember_copy_failed()}
+                {:else}{m.ember_copy_diagnostics()}{/if}
+              </button>
+            </div>
+          </div>
           <div class="metric-grid">
-            {#each metrics as metric (metric.id)}
+            {#each filteredMetrics as metric (metric.id)}
               <div class="metric">
                 <span class="metric-k">{metric.k}</span>
                 <span class="metric-v">{metric.v}</span>
               </div>
+            {:else}
+              <p class="hint metric-empty">{m.ember_metrics_filter_empty()}</p>
             {/each}
           </div>
         </section>
 
         <section class="sub-card">
           <div class="panel-head">
-            <h3>{m.ember_dht_contacts_title()}</h3>
+            <h3>
+              {m.ember_dht_contacts_title()}
+              <span class="count-pill">{contactFilter.trim() ? `${formatNumber(filteredContacts.length)} / ` : ''}{formatNumber(contacts.length)}</span>
+            </h3>
             <input
               class="filter-input"
               type="search"
@@ -737,7 +824,7 @@
         </section>
 
         <section class="sub-card">
-          <h3>{m.ember_dht_searches_title()}</h3>
+          <h3>{m.ember_dht_searches_title()} <span class="count-pill">{formatNumber(searches.length)}</span></h3>
           <div class="table-wrap">
             <table class="dht-table">
               <thead>
@@ -769,7 +856,7 @@
         </section>
 
         <section class="sub-card">
-          <h3>{m.ember_dht_store_title()}</h3>
+          <h3>{m.ember_dht_store_title()} <span class="count-pill">{formatNumber(storeEntries.length)}</span></h3>
           <p class="hint">{m.ember_dht_store_hint()}</p>
           <div class="table-wrap">
             <table class="dht-table">
@@ -1226,6 +1313,34 @@
     margin: 0;
   }
 
+  .panel-tools {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    justify-content: flex-end;
+    min-width: 0;
+  }
+
+  .count-pill {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 0 7px;
+    border-radius: var(--radius-pill);
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    line-height: 1.6;
+    vertical-align: 1px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .metric-empty {
+    grid-column: 1 / -1;
+    margin: 6px 0 0;
+  }
+
   .filter-input {
     flex: 1;
     min-width: 140px;
@@ -1339,6 +1454,31 @@
     display: flex;
     align-items: center;
     gap: 8px;
+  }
+
+  .banner-dismissable {
+    justify-content: space-between;
+  }
+
+  .banner-dismiss {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background var(--transition-fast) ease, color var(--transition-fast) ease;
+  }
+
+  .banner-dismiss:hover {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--text-primary);
   }
 
   .banner-error {

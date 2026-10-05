@@ -75,6 +75,7 @@
   } from '$lib/libraryFolderTree';
   import * as m from '$lib/paraglide/messages';
   import { codedErrorOf, translateError } from '$lib/i18n';
+  import { highlightMatches } from '$lib/stores/highlight';
   import { plural } from '$lib/plural';
   import { openChatFilesFolder } from '$lib/api/friends';
   import { openChannelFilesFolder } from '$lib/api/channels';
@@ -1474,6 +1475,13 @@
     for (const f of files) if (checkedPaths.has(f.path) && f.hash) n++;
     return n;
   });
+  /** What the selection weighs, for the bulk bar: worth knowing before a
+   *  Delete or a collection. */
+  let checkedTotalSize = $derived.by(() => {
+    let bytes = 0;
+    for (const p of checkedPaths) bytes += fileByPath.get(p)?.size ?? 0;
+    return bytes;
+  });
   let checkedRestrictCount = $derived.by(() => {
     let n = 0;
     for (const f of files) if (checkedPaths.has(f.path) && f.hash && f.shared && !f.friends_only) n++;
@@ -2340,8 +2348,11 @@
 
     const typing = isTypingTarget(e.target);
 
-    // "/" focuses the search input when not already typing.
-    if (!typing && e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    // "/" focuses the search input when not already typing; Ctrl/Cmd+F does
+    // from anywhere, as on Channels.
+    const findKey =
+      (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && isShortcutLetter(e, 'f');
+    if (findKey || (!typing && e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey)) {
       e.preventDefault();
       searchInputEl?.focus();
       searchInputEl?.select();
@@ -4028,12 +4039,13 @@
         onToggleCheck={toggleCheck}
         onToggleCheckAll={toggleCheckAll}
         missingPaths={missingPathSet}
+        highlight={$highlightMatches ? debouncedQuery : ''}
       />
     {/if}
 
     {#if checkedCount > 0}
       <div class="bulk-action-bar">
-        <span class="bulk-count">{plural(checkedCount, { one: m.library_bulk_count_one, other: () => m.library_bulk_count_other({ count: checkedCount }) })}</span>
+        <span class="bulk-count">{plural(checkedCount, { one: m.library_bulk_count_one, other: () => m.library_bulk_count_other({ count: formatNumber(checkedCount) }) })}<span class="bulk-size"> · {formatSize(checkedTotalSize)}</span></span>
         {#if checkedHiddenCount > 0}
           <button
             type="button"
@@ -5598,6 +5610,11 @@
     border-radius: var(--radius-pill);
     background: color-mix(in srgb, var(--accent) 16%, transparent);
     white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .bulk-size {
+    font-weight: 500;
+    opacity: 0.8;
   }
   .bulk-sep {
     width: 1px;

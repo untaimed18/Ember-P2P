@@ -114,6 +114,7 @@
   import * as m from '$lib/paraglide/messages';
   import { plural } from '$lib/plural';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
+  import { highlightMatches } from '$lib/stores/highlight';
   import SpeedInput from '$lib/components/SpeedInput.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import EmuleImport from '$lib/components/EmuleImport.svelte';
@@ -3399,6 +3400,17 @@
             <label for="filename-cleanups">{m.settings_filename_cleanups_label()}</label>
             <span class="hint">{m.settings_filename_cleanups_hint_prefix()} <code>{m.settings_filename_cleanups_placeholder()}</code>{m.settings_filename_cleanups_hint_suffix()}</span>
             <input id="filename-cleanups" type="text" bind:value={settings.filename_cleanups} placeholder={m.settings_filename_cleanups_placeholder()} />
+          </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_highlight_matches()}</span>
+              <span class="hint">{m.settings_highlight_matches_hint()}</span>
+            </div>
+            <ToggleSwitch
+              checked={$highlightMatches}
+              onchange={(on) => highlightMatches.set(on)}
+              ariaLabel={m.settings_highlight_matches()}
+            />
           </div>
           <div class="divider"></div>
           <div class="field toggle-row">
