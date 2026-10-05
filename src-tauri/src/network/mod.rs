@@ -172,6 +172,15 @@ pub use self::state::{
 #[cfg(debug_assertions)]
 pub use self::state::{EmberDhtFindPending, EmberDhtLookupPending, EmberPingPending};
 
+/// Whole seconds on a clock that a change of the system time does not move,
+/// for gaps the event loop measures in `i64` seconds. Starts well above zero,
+/// which those fields use for "never".
+pub(crate) fn monotonic_secs() -> i64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let elapsed = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
+    1_000_000_i64.saturating_add(i64::try_from(elapsed).unwrap_or(i64::MAX))
+}
+
 fn relay_ticket_next_round_delay(
     round_started_at: tokio::time::Instant,
     completed_at: tokio::time::Instant,
@@ -877,7 +886,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         external_ip_shared: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         self_lookup_done: false,
         last_self_lookup: 0,
-        kad_started_at: chrono::Utc::now().timestamp(),
+        kad_started_at: monotonic_secs(),
         last_kad_contact: None,
         udp_firewalled: true,
         udp_fw_verified: false,
@@ -2228,8 +2237,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let mut nat_probe_started_at: Option<tokio::time::Instant> = None;
     let mut nat_probe_backoff_until: Option<tokio::time::Instant> = None;
     let mut credit_flush_handle: Option<tokio::task::JoinHandle<()>> = None;
-    let mut last_server_activity_at = chrono::Utc::now().timestamp();
-    let mut last_kad_activity_at = chrono::Utc::now().timestamp();
+    let mut last_server_activity_at = monotonic_secs();
+    let mut last_kad_activity_at = monotonic_secs();
     let mut last_cache_refresh_started_at = 0i64;
     // `(known.met dirty generation, publish-badge fingerprint)` the cached
     // shared-file list was last built from. `None` until the first refresh, so
@@ -2421,8 +2430,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let mut pending_offer_signature: Option<(usize, u64)> = None;
     let mut next_offer_packet_at: Option<tokio::time::Instant> = None;
 
+    // Drained only by the 120 s known.met tick, and its senders `try_send`, so
+    // a burst of completions between drains is dropped past this capacity.
     let (aich_set_tx, mut aich_set_rx) =
-        tokio::sync::mpsc::channel::<ed2k::aich::AICHRecoveryHashSet>(128);
+        tokio::sync::mpsc::channel::<ed2k::aich::AICHRecoveryHashSet>(MAX_AICH_HASH_SETS);
 
     info!("Network event loop starting");
     let mut shutdown_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
@@ -2985,7 +2996,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         // well as KAD, and it gates the KAD half on connection
                         // state itself. Only the KAD accounting is conditional.
                         if state.stats.status != NetworkStatus::Disconnected {
-                            last_kad_activity_at = chrono::Utc::now().timestamp();
+                            last_kad_activity_at = monotonic_secs();
                             stats_manager.add_overhead(
                                 crate::storage::statistics::OverheadCategory::Kad,
                                 crate::storage::statistics::OverheadDirection::Download,

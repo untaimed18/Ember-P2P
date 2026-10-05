@@ -103,7 +103,7 @@ pub(in crate::network) async fn on_server_connect_result(
                     warn!("Failed to persist last eD2K server: {e}");
                 }
             }
-            *last_server_activity_at = chrono::Utc::now().timestamp();
+            *last_server_activity_at = crate::network::monotonic_secs();
             state.server_logged_in_at = Some(std::time::Instant::now());
             state.server_addr = Some(addr);
             *shared_server_addr.write().await = Some(addr);

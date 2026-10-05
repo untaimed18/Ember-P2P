@@ -2817,6 +2817,10 @@ pub(super) fn ingest_channel_epoch_records(
 }
 
 pub(super) const CHANNEL_HANDOFF_FETCH_PER_TICK: usize = 2;
+/// How long a nominee's successor seed keeps a room it walked out of on the
+/// handoff fetch, and a forgotten room's seed on disk: as long as the old
+/// room's signer republishes the record that could name it.
+pub(super) const HANDOFF_SEED_FOLLOW_SECS: i64 = ember::channel::HANDOFF_RETIRED_KEEP_SECS;
 
 /// FIND_VALUE the owner-signed successor record. Separate from moderation:
 /// extra FIND_VALUE keys intersect by `file_hash`, and these records share
@@ -2836,12 +2840,28 @@ pub(super) async fn maybe_refresh_channel_handoff(
     maybe_drive_channel_handoffs(socket, state, db).await;
     maybe_republish_retired_channel_handoffs(socket, state, db).await;
     let now = chrono::Utc::now().timestamp();
+    let seed_horizon = now.saturating_sub(HANDOFF_SEED_FOLLOW_SECS);
+    let _ = db.prune_forgotten_handoff_seeds(seed_horizon);
     let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
+    // A nominee who walked out after answering an offer still holds the only
+    // key to the successor the owner may have published, so its rooms are
+    // still asked about until the owner stops republishing that record.
+    let seeded: HashSet<String> = if channels
+        .iter()
+        .any(|ch| !ch.in_room && !ch.deleted && ch.successor_id.is_empty())
+    {
+        db.handoff_seed_rooms(seed_horizon)
+            .map(|rooms| rooms.into_iter().collect())
+            .unwrap_or_default()
+    } else {
+        HashSet::new()
+    };
     let mut started = 0usize;
     for ch in channels.iter() {
-        if !ch.in_room_now() {
+        let walked_out = !ch.in_room_now();
+        if walked_out && (ch.deleted || ch.is_owner || !seeded.contains(&ch.channel_id)) {
             continue;
         }
         if started >= CHANNEL_HANDOFF_FETCH_PER_TICK {
@@ -2886,6 +2906,9 @@ pub(super) async fn maybe_refresh_channel_handoff(
         drive_ember_search(socket, state, search_id).await;
         state.channel_handoff_fetch_at.insert(channel_id, now);
         started += 1;
+        if walked_out {
+            continue;
+        }
 
         // A succession claim lives under its own key, because it is signed by
         // the nominee rather than the room. Only worth asking for once the
@@ -3021,6 +3044,11 @@ pub(super) fn ingest_channel_handoff_records(
         .load_handoff_pending_seed(&channel_id_hex, &successor_pk, handoff.version)
         .ok()
         .flatten();
+    // Asked about only because we hold a seed: a record naming some other
+    // successor is not one to follow out of a room we left.
+    if !ch.in_room_now() && seed.is_none() {
+        return ChannelHandoffIngest::Nothing;
+    }
     if db
         .apply_channel_handoff(
             &channel_id_hex,

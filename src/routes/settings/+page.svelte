@@ -435,12 +435,13 @@
       }
       backupPassphrase = '';
       backupPassphraseConfirm = '';
+      const done = m.settings_backup_export_done({
+        files: summary.files,
+        size: formatSize(summary.bytes),
+        path: summary.path,
+      });
       showBackupMsg(
-        m.settings_backup_export_done({
-          files: summary.files,
-          size: formatSize(summary.bytes),
-          path: summary.path,
-        }),
+        summary.skipped.length > 0 ? `${done} ${m.settings_backup_export_skipped_chat_key()}` : done,
         'success',
       );
     } catch (e) {
@@ -4448,6 +4449,14 @@
                   <strong>{restorePreview.includes_identity ? m.common_yes() : m.common_no()}</strong>
                 </div>
               </div>
+              {#if restorePreview.missing.length > 0}
+                <span class="hint">
+                  {m.settings_backup_preview_missing({ files: restorePreview.missing.join(', ') })}
+                </span>
+              {/if}
+              {#if restorePreview.chat_key_set_aside}
+                <span class="hint">{m.settings_backup_preview_chat_key_set_aside()}</span>
+              {/if}
               <span class="hint">{m.settings_backup_restore_warning()}</span>
             {/if}
           </div>

@@ -3,6 +3,7 @@ import { get } from 'svelte/store';
 import {
   awaitingChannelOffers,
   bumpChannelUnread,
+  carriedChannels,
   channelLineIsStale,
   channelMayAlert,
   channelTransfers,
@@ -15,6 +16,7 @@ import {
   clearChannelUnread,
   favouriteChannels,
   forgetChannelFavourite,
+  initChannelsStore,
   loadChannelFavourites,
   loadChannelNotifyLevels,
   mergeChannelUnreadFromSnapshot,
@@ -29,14 +31,30 @@ import {
   xferStartsAsking,
 } from './channels';
 import { listChannels, type ChannelInfo, type ChannelTransferInfo } from '$lib/api/channels';
+import { toast } from '$lib/stores/toast';
+import { notify } from '$lib/notifications';
 
 vi.mock('$lib/api/channels', async () => {
   const actual = await vi.importActual<typeof import('$lib/api/channels')>('$lib/api/channels');
   return {
     ...actual,
     listChannels: vi.fn(),
+    listChannelTransfers: vi.fn(async () => []),
   };
 });
+
+/** Handlers `initChannelsStore` registered, by event name. */
+const eventHandlers = new Map<string, (event: { payload: unknown }) => void>();
+
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn(async (name: string, handler: (event: { payload: unknown }) => void) => {
+    eventHandlers.set(name, handler);
+    return () => eventHandlers.delete(name);
+  }),
+}));
+
+vi.mock('$lib/stores/toast', () => ({ toast: vi.fn() }));
+vi.mock('$lib/notifications', () => ({ notify: vi.fn(async () => {}) }));
 
 function room(partial: Partial<ChannelInfo> & { channel_id: string }): ChannelInfo {
   return {
@@ -80,7 +98,10 @@ beforeEach(() => {
   channels.set([]);
   channelNotifyLevels.set({});
   favouriteChannels.set([]);
+  carriedChannels.set([]);
   ignoredMembers.set([]);
+  vi.mocked(toast).mockClear();
+  vi.mocked(notify).mockClear();
 });
 
 /** A `localStorage` stand-in; the test environment has none. */
@@ -123,6 +144,17 @@ describe('totalChannelUnread', () => {
     clearChannelUnread(B);
     expect(get(channelUnreadMentions)).toEqual([]);
     expect(get(totalChannelUnread)).toBe(2);
+  });
+
+  // The copy marks the old room's copied lines read, so a moved room only
+  // counts what arrived after it moved — or everything, when nothing was
+  // copied because the user had joined the successor on their own.
+  it('still counts what a moved room holds unread', () => {
+    channels.set([
+      room({ channel_id: A, unread: 2, successor_id: B }),
+      room({ channel_id: B, unread: 3, predecessor_id: A }),
+    ]);
+    expect(get(totalChannelUnread)).toBe(5);
   });
 });
 
@@ -248,7 +280,7 @@ describe('favourites', () => {
 describe('handoff carries preferences to the successor', () => {
   const C = '33'.repeat(16);
 
-  it('moves the star and the level once the user is in the new room', async () => {
+  it('moves the star and copies the level once the user is in the new room', async () => {
     favouriteChannels.set([A]);
     setChannelNotifyLevel(A, 'mentions');
     vi.mocked(listChannels).mockResolvedValueOnce([
@@ -257,7 +289,8 @@ describe('handoff carries preferences to the successor', () => {
     ]);
     await refreshChannels();
     expect(get(favouriteChannels)).toEqual([B]);
-    expect(get(channelNotifyLevels)).toEqual({ [B]: 'mentions' });
+    // The old room keeps its level: members who have not followed still talk there.
+    expect(get(channelNotifyLevels)).toEqual({ [A]: 'mentions', [B]: 'mentions' });
 
     // Turning the successor back up to All must hold on the next refresh.
     setChannelNotifyLevel(B, 'all');
@@ -266,7 +299,28 @@ describe('handoff carries preferences to the successor', () => {
       room({ channel_id: B, predecessor_id: A }),
     ]);
     await refreshChannels();
-    expect(get(channelNotifyLevels)).toEqual({});
+    expect(get(channelNotifyLevels)).toEqual({ [A]: 'mentions' });
+    expect(get(carriedChannels)).toEqual([A]);
+  });
+
+  it('carries an unread mention to the successor holding the copied line', async () => {
+    setChannelNotifyLevel(A, 'mentions');
+    channels.set([room({ channel_id: A, unread: 1 })]);
+    channelUnreadMentions.set([A]);
+    vi.mocked(listChannels).mockResolvedValueOnce([
+      room({ channel_id: A, unread: 0, successor_id: B }),
+      room({ channel_id: B, unread: 1, predecessor_id: A }),
+    ]);
+    await refreshChannels();
+    expect(get(channelUnreadMentions)).toEqual([B]);
+    expect(get(totalChannelUnread)).toBe(1);
+  });
+
+  it('forgets the carried mark with the room it names', async () => {
+    carriedChannels.set([A]);
+    vi.mocked(listChannels).mockResolvedValueOnce([room({ channel_id: B })]);
+    await refreshChannels();
+    expect(get(carriedChannels)).toEqual([]);
   });
 
   it('waits while the user has not followed the handoff', async () => {
@@ -291,8 +345,33 @@ describe('handoff carries preferences to the successor', () => {
       room({ channel_id: C }),
     ]);
     await refreshChannels();
-    expect(get(channelNotifyLevels)).toEqual({ [B]: 'mentions' });
+    expect(get(channelNotifyLevels)).toEqual({ [A]: 'none', [B]: 'mentions' });
     expect(get(favouriteChannels)).toEqual([B, C]);
+  });
+});
+
+describe('message toasts', () => {
+  const deliver = (channelId: string) =>
+    eventHandlers.get('ember:channel-message')?.({
+      payload: {
+        channel_id: channelId,
+        direction: 'received',
+        message: 'hello there',
+        sender_pubkey: 'ee'.repeat(32),
+      },
+    });
+
+  // A room whose handoff the user has not followed is the room they stand in,
+  // and its copied level (not its move) decides whether it interrupts.
+  it('still announces a line in a room that moved to a successor', async () => {
+    vi.mocked(listChannels).mockResolvedValue([
+      room({ channel_id: A, successor_id: B }),
+      room({ channel_id: B, predecessor_id: A }),
+    ]);
+    await initChannelsStore();
+    deliver(A);
+    expect(toast).toHaveBeenCalledTimes(1);
+    expect(get(channels).find((r) => r.channel_id === A)?.unread).toBe(1);
   });
 });
 

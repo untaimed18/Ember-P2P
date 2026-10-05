@@ -1256,6 +1256,15 @@ pub(crate) async fn prepare_part_dir(
     Ok((root, temp))
 }
 
+/// Create `<download_root>/Downloads` inside the approved root. Blocking.
+pub(crate) fn prepare_completed_dir(
+    download_root: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let allowed = vec![download_root.to_string_lossy().into_owned()];
+    crate::security::filesystem::prepare_approved_subdir(download_root, "Downloads", &allowed)
+        .map_err(|e| download_folder_error("preparing Downloads", download_root, e))
+}
+
 /// Move a verified `.part` into `<download_root>/Downloads/<file_name>`.
 /// `download_root` is the download folder current at completion, which need
 /// not be the one holding the `.part`. Blocking.
@@ -1266,10 +1275,7 @@ pub(crate) fn move_part_to_downloads(
     file_name: &str,
     expected_source_identity: &crate::security::filesystem::ObjectIdentity,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let allowed = vec![download_root.to_string_lossy().into_owned()];
-    let completed_dir =
-        crate::security::filesystem::prepare_approved_subdir(download_root, "Downloads", &allowed)
-            .map_err(|e| download_folder_error("preparing Downloads", download_root, e))?;
+    let completed_dir = prepare_completed_dir(download_root)?;
     move_part_between_roots_approved(
         part_path,
         part_root,
@@ -1392,6 +1398,11 @@ pub(crate) fn classify_failure(error: &str, kind: &SourceFailureKind) -> Transfe
         return TransferFailureCode::PartFolderOffline;
     }
     if is_download_folder_error(error) {
+        // Sizing a new `.part` runs inside the folder stage; a full volume is
+        // not a folder the user has to fix in Settings.
+        if matches!(kind, SourceFailureKind::InsufficientDisk) || is_disk_full_error(error) {
+            return TransferFailureCode::InsufficientDisk;
+        }
         return TransferFailureCode::DownloadFolderUnavailable;
     }
     if error.contains(COMPLETION_MOVE_STAGE) {
@@ -1668,6 +1679,11 @@ mod tests {
                 "stage:download_folder: opening the part file in /x: Permission denied",
                 Transient,
                 C::DownloadFolderUnavailable,
+            ),
+            (
+                "stage:download_folder: opening the part file in /x: No space left on device",
+                Transient,
+                C::InsufficientDisk,
             ),
             (
                 "stage:download_folder: stage:part_folder_offline: /x cannot be reached",
@@ -6952,7 +6968,11 @@ impl Ed2kDownload {
                     if pending_credit_bytes > 0 {
                         if let Some(cm) = &self.credit_manager {
                             let mut cm = cm.write().await;
-                            cm.add_downloaded(peer_user_hash, pending_credit_bytes);
+                            cm.add_downloaded(
+                                peer_user_hash,
+                                super::credits::credit_ip(self.source_addr),
+                                pending_credit_bytes,
+                            );
                             // Mirror for the Ember ledger — same
                             // rationale as `multi_source.rs`. Only
                             // write when the peer completed full
@@ -8196,7 +8216,7 @@ pub(crate) enum CopyRecovery {
 
 /// `name` in `dir` and every name completion gives it there when that one
 /// is taken (`name (1)`, `name (2)`, …), lowest first. Blocking.
-fn published_names(dir: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
+pub(crate) fn published_names(dir: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
     let base = dir.join(name);
     let mut variants: Vec<(u32, std::path::PathBuf)> = std::fs::read_dir(dir)
         .into_iter()

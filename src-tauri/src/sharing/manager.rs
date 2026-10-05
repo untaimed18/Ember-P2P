@@ -711,17 +711,32 @@ impl TransferManager {
         // Seed download priority from the transfer (if already known) so a
         // non-default priority chosen before the download started (e.g. restored
         // from DB) is respected by slot allocation from the first connection.
-        let ord = self
+        let seed = self
             .active
             .get(id)
             .or_else(|| self.queued(id))
-            .map(|t| Self::priority_ordinal(&t.priority));
-        self.install_control(id, control, ord);
+            .map(Self::control_seed);
+        self.install_control(id, control, seed);
     }
 
-    fn install_control(&mut self, id: &str, control: Arc<TransferControl>, ord: Option<u8>) {
-        if let Some(ord) = ord {
+    /// The per-row settings a fresh control must carry: priority ordinal and
+    /// the per-file preview flag.
+    fn control_seed(transfer: &Transfer) -> (u8, bool) {
+        (
+            Self::priority_ordinal(&transfer.priority),
+            transfer.preview_priority,
+        )
+    }
+
+    fn install_control(
+        &mut self,
+        id: &str,
+        control: Arc<TransferControl>,
+        seed: Option<(u8, bool)>,
+    ) {
+        if let Some((ord, preview_priority)) = seed {
             control.set_download_priority_ordinal(ord);
+            control.set_preview_priority(preview_priority);
         }
         self.controls.insert(id.to_string(), control);
     }
@@ -2024,13 +2039,13 @@ impl TransferManager {
             }
             if register_missing_controls && !self.controls.contains_key(id) {
                 // Only for a row this can resume; see `resume_transfer`.
-                if let Some(ord) = self
+                if let Some(seed) = self
                     .active
                     .get(id)
                     .or_else(|| queue_index.get(id).map(|&idx| &self.queue[idx]))
-                    .map(|t| Self::priority_ordinal(&t.priority))
+                    .map(Self::control_seed)
                 {
-                    self.install_control(id, TransferControl::new(), Some(ord));
+                    self.install_control(id, TransferControl::new(), Some(seed));
                 }
             }
             if let Some(transfer) = self.active.get(id) {
@@ -3341,6 +3356,27 @@ mod tests {
         manager.resume_many(&owned(&["missing", "a"]), true);
         assert!(manager.get_control("missing").is_none());
         assert!(manager.get_control("a").is_some());
+    }
+
+    #[test]
+    fn a_replaced_control_keeps_the_rows_preview_priority() {
+        let mut manager = TransferManager::new(2);
+        for id in ["registered", "resumed"] {
+            let mut row = download(id);
+            row.preview_priority = true;
+            row.status = TransferStatus::Paused;
+            manager.enqueue(row);
+        }
+
+        manager.register_control("registered", TransferControl::new());
+        manager.resume_many(&owned(&["resumed"]), true);
+
+        for id in ["registered", "resumed"] {
+            assert!(
+                manager.get_control(id).is_some_and(|c| c.is_preview_priority()),
+                "{id}'s new control carries the per-file toggle"
+            );
+        }
     }
 
     #[test]

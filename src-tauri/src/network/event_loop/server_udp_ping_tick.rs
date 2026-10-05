@@ -38,7 +38,7 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
         let idx = *server_udp_ping_idx % server_count;
         *server_udp_ping_idx = server_udp_ping_idx.wrapping_add(1);
         let server = state.server_list.servers()[idx].clone();
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::network::monotonic_secs();
         match server_udp.send_status_ping(&server, now).await {
             Ok(bytes) if bytes > 0 => {
                 state

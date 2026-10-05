@@ -6,6 +6,9 @@ export interface BackupSummary {
   files: number;
   /** Unix seconds. */
   created_at: number;
+  /** Files left out because they could not be read: only `chat-history.key`,
+   *  when chat is locked. */
+  skipped: string[];
 }
 
 export interface BackupPreview {
@@ -18,13 +21,20 @@ export interface BackupPreview {
   /** The backup's database is newer than this build can open, so a restore
    *  would be refused. */
   schema_too_new: boolean;
+  /** Profile files the backup does not carry, which keep this device's copy. */
+  missing: string[];
+  /** The backup brings a database but no chat-history key, so this device's
+   *  key is set aside and chat history stays locked after the restore. */
+  chat_key_set_aside: boolean;
 }
 
 export interface RestoreSummary {
   /** Files written to the staging directory, applied on the next launch. */
   staged: string[];
-  /** Files this build knows about that the backup did not carry. */
+  /** Profile files the backup does not carry, which keep this device's copy. */
   missing: string[];
+  /** See `BackupPreview.chat_key_set_aside`. */
+  chat_key_set_aside: boolean;
   app_version: string;
   created_at: number;
 }

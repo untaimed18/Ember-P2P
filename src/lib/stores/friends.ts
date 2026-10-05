@@ -292,10 +292,11 @@ const announcedAttachments = new Set<string>();
 // Dedup window for inbound `ember:chat-message` events. The backend can deliver
 // the same logical message twice in quick succession (the download- and
 // upload-side session loops both surface it), which would otherwise double-bump
-// the unread badge. The signature includes the message timestamp, so two
-// genuinely-distinct messages (different timestamps) are never collapsed — only
-// true re-emits of the same `(hash, timestamp, body)` tuple are suppressed.
-// `ChatConversation` applies an equivalent dedup to the rendered bubble list.
+// the unread badge. Keyed by the durable row id when the event carries one: the
+// timestamp is whole seconds, so the same word sent twice inside one second is
+// two messages with one `(hash, timestamp, body)` tuple. The tuple is only the
+// fallback for an emit without an id. `ChatConversation` applies an equivalent
+// dedup to the rendered bubble list.
 const recentChatSigs = new Map<string, number>();
 const CHAT_SIG_TTL_MS = 10_000;
 
@@ -391,7 +392,7 @@ export async function initFriendsStore() {
       }),
     );
     registered.push(
-      await listen<{ user_hash: string; direction: string; message?: string; timestamp?: number }>('ember:chat-message', (event) => {
+      await listen<{ user_hash: string; id?: number; direction: string; message?: string; timestamp?: number }>('ember:chat-message', (event) => {
         const p = event.payload;
         const hash = validFriendHash(p?.user_hash);
         if (!hash) return;
@@ -402,7 +403,10 @@ export async function initFriendsStore() {
         for (const [k, exp] of recentChatSigs) {
           if (exp <= now) recentChatSigs.delete(k);
         }
-        const sig = `${hash}|${p.timestamp ?? ''}|${safeEventText(p.message)}`;
+        const sig =
+          typeof p.id === 'number' && p.id > 0
+            ? `${hash}#${p.id}`
+            : `${hash}|${p.timestamp ?? ''}|${safeEventText(p.message)}`;
         if (recentChatSigs.has(sig)) return;
         recentChatSigs.set(sig, now + CHAT_SIG_TTL_MS);
         // If the chat with this friend is open and focused, the

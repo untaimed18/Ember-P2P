@@ -1407,7 +1407,9 @@ enum ReadTimeoutAction {
     /// longer needs it, and the part claim it holds is the only thing keeping
     /// `all_complete_and_settled` false and the transfer out of Verifying.
     FileComplete,
-    /// Nothing outstanding and no batch left to send.
+    /// Nothing outstanding and no batch left to send, once this part has
+    /// received data. Before that, a window emptied by the request timeout is
+    /// a peer slow to start, which eMule gives `DOWNLOADTIMEOUT` (100 s).
     RequestsDrained,
     /// Slot granted but not a byte has arrived. eMule stays connected and
     /// re-states the request rather than dropping a peer that may just be
@@ -1437,16 +1439,28 @@ fn read_timeout_action(
     if file_complete {
         return ReadTimeoutAction::FileComplete;
     }
-    if outstanding_empty && batches_drained {
-        return ReadTimeoutAction::RequestsDrained;
-    }
     if got_any_data {
+        if outstanding_empty && batches_drained {
+            return ReadTimeoutAction::RequestsDrained;
+        }
         return ReadTimeoutAction::GiveUpStalled;
     }
     if reasserts_used < max_reasserts && within_patience_budget && has_blocks {
         return ReadTimeoutAction::Reassert;
     }
     ReadTimeoutAction::GiveUpNoData
+}
+
+/// Whose user hash a part that failed its MD4 is reported under: this
+/// worker's peer only when the bytes it wrote into the part cover all of it.
+/// Short of that it may have sent none of the bad bytes, and the event loop
+/// would pair its hash with the address of whoever did.
+fn corrupt_part_sender(
+    credited_bytes: u64,
+    part_len: u64,
+    peer_user_hash: [u8; 16],
+) -> Option<[u8; 16]> {
+    (credited_bytes >= part_len).then_some(peer_user_hash)
 }
 
 fn injection_wait_action(
@@ -4645,11 +4659,13 @@ impl MultiSourceDownload {
             });
 
             let mut retry_handles = Vec::new();
-            for (src_idx, parts) in retry_assignments.into_iter().enumerate() {
+            for (source_idx, parts) in retry_assignments.into_iter().enumerate() {
                 if parts.is_empty() {
                     continue;
                 }
-                let source = all_sources[src_idx].clone();
+                let source = all_sources[source_idx].clone();
+                let src_idx = next_src_idx;
+                next_src_idx += 1;
                 let tracker = tracker.clone();
                 let part_path = part_path.clone();
                 let file_hash = self.file_hash;
@@ -4673,7 +4689,7 @@ impl MultiSourceDownload {
                 // `download_parts_from_source`, and this round has to restore
                 // the source's frequency contribution around that call.
                 let rcs_freq = chunk_selector.clone();
-                let ravail = all_sources[src_idx].available_parts.clone();
+                let ravail = source.available_parts.clone();
                 let retx = event_tx.clone();
                 let rtid = self.transfer_id.clone();
                 let rbi = self.shared_buddy_info.clone();
@@ -4927,6 +4943,15 @@ impl MultiSourceDownload {
         };
 
         if all_done {
+            // Checked before the whole-file read: a folder error from the move
+            // after it re-queues the download, and every restart read the file
+            // again only to fail the same way.
+            let download_root = self.download_folders.read().current.clone();
+            tokio::task::spawn_blocking(move || {
+                super::transfer::prepare_completed_dir(&download_root)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("download folder task failed: {e}"))??;
             let retry_delay =
                 final_verify_retry_delay(prior_inconclusive_final_verifies(&self.transfer_id));
             if !retry_delay.is_zero() {
@@ -11221,7 +11246,11 @@ async fn download_parts_from_source(
                         if verified_bytes > 0 {
                             if let Some(cm) = &credit_mgr {
                                 let mut cm = cm.write().await;
-                                cm.add_downloaded(peer_user_hash, verified_bytes);
+                                cm.add_downloaded(
+                                    peer_user_hash,
+                                    super::credits::credit_ip(addr),
+                                    verified_bytes,
+                                );
                                 // Name the row these bytes just created.
                                 //
                                 // The download side learns the peer's Hello
@@ -11315,7 +11344,7 @@ async fn download_parts_from_source(
                     // accrues for this part. With cross-part pipelining
                     // we leave other parts' buckets intact (they verify
                     // independently).
-                    per_part_credit.remove(&part_idx);
+                    let credited = per_part_credit.remove(&part_idx).unwrap_or(0);
                     let _ = progress_tx.try_send((_src_idx, 0i64));
                     if !superseded {
                         mismatched_here.insert(part_idx);
@@ -11331,7 +11360,11 @@ async fn download_parts_from_source(
                                 file_hash: *file_hash,
                                 part_start: ps,
                                 part_end: pe,
-                                sender_user_hash: Some(peer_user_hash),
+                                sender_user_hash: corrupt_part_sender(
+                                    credited,
+                                    pe - ps,
+                                    peer_user_hash,
+                                ),
                             })
                             .await;
                     }
@@ -13116,16 +13149,13 @@ mod tests {
         );
     }
 
-    /// Having drained every request is an ordinary exit, not a failure, so it
-    /// must be reached before either give-up arm marks the source bad.
+    /// Having drained every request after data arrived is an ordinary exit,
+    /// not a failure, so it must be reached before the stall arm marks the
+    /// source bad.
     #[test]
     fn a_worker_with_nothing_left_in_flight_exits_cleanly() {
         assert_eq!(
             read_timeout_action(false, true, true, true, 0, 5, true, true),
-            ReadTimeoutAction::RequestsDrained,
-        );
-        assert_eq!(
-            read_timeout_action(false, true, true, false, 0, 5, true, true),
             ReadTimeoutAction::RequestsDrained,
         );
         // Outstanding empty but batches left (or the reverse) is not drained:
@@ -13137,6 +13167,32 @@ mod tests {
         assert_eq!(
             read_timeout_action(false, false, true, false, 0, 5, true, true),
             ReadTimeoutAction::Reassert,
+        );
+    }
+
+    /// A worker that only verified a part, or wrote some of it, is not named
+    /// as the sender of its corruption; one that wrote every byte is.
+    #[test]
+    fn a_corrupt_part_names_its_verifier_only_when_it_sent_the_whole_part() {
+        let peer = [7u8; 16];
+        assert_eq!(corrupt_part_sender(0, PARTSIZE, peer), None);
+        assert_eq!(corrupt_part_sender(PARTSIZE - 1, PARTSIZE, peer), None);
+        assert_eq!(corrupt_part_sender(PARTSIZE, PARTSIZE, peer), Some(peer));
+    }
+
+    /// Every batch went out up front and the 30 s request timeout emptied the
+    /// window before the first byte: a slot-granting peer slow to start, not a
+    /// finished worker. It is re-asserted like any other, and given up only
+    /// once that budget is spent.
+    #[test]
+    fn a_window_drained_before_the_first_byte_is_re_asserted_not_ended() {
+        assert_eq!(
+            read_timeout_action(false, true, true, false, 0, 5, true, true),
+            ReadTimeoutAction::Reassert,
+        );
+        assert_eq!(
+            read_timeout_action(false, true, true, false, 5, 5, true, true),
+            ReadTimeoutAction::GiveUpNoData,
         );
     }
 

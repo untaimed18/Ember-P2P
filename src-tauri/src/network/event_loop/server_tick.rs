@@ -53,7 +53,7 @@ pub(in crate::network) async fn on_server_tick(
             // when both happened.
             server_disconnect_reason = server_write_failure_reason(&conn).or(closed);
             if !events.is_empty() {
-                *last_server_activity_at = chrono::Utc::now().timestamp();
+                *last_server_activity_at = crate::network::monotonic_secs();
             }
             for event in events {
                 match event {
@@ -1009,7 +1009,7 @@ pub(in crate::network) async fn on_server_tick(
                     // write behind it resolves one way or the other, or a
                     // broken session, which the check below drops.
                     match conn.keep_alive() {
-                        Ok(()) => *last_server_activity_at = chrono::Utc::now().timestamp(),
+                        Ok(()) => *last_server_activity_at = crate::network::monotonic_secs(),
                         Err(e) => debug!("Server keep-alive not queued: {e}"),
                     }
                 }

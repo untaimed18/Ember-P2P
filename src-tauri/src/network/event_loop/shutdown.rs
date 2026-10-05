@@ -238,15 +238,31 @@ pub(in crate::network) async fn save_on_shutdown(
 
     let contacts = state.routing_table.export_bootstrap_contacts(200);
     let nodes_path = state.data_dir.join("nodes.dat");
+    let nodes_phase_deadline =
+        shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5));
     match tokio::time::timeout_at(
-        shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5)),
-        state.nodes_save_lock.lock(),
+        nodes_phase_deadline,
+        state.nodes_save_lock.clone().lock_owned(),
     )
     .await
     {
-        Ok(_ownership) => {
-            if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
-                error!("Failed to save nodes.dat: {e}");
+        Ok(ownership) => {
+            let writer = tokio::task::spawn_blocking(move || {
+                let _ownership = ownership;
+                bootstrap::save_nodes_dat(&nodes_path, &contacts)
+            });
+            // Its own budget once the lock is held: waiting out a slow
+            // periodic writer must not leave the final write a fraction of one.
+            let write_deadline =
+                shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5));
+            match tokio::time::timeout_at(write_deadline, writer).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => error!("Failed to save nodes.dat: {e}"),
+                Ok(Err(e)) => error!("nodes.dat shutdown writer failed: {e}"),
+                Err(_) => warn!(
+                    "Stopped waiting for the nodes.dat shutdown writer at its phase deadline; \
+                     the save may not complete"
+                ),
             }
         }
         Err(_) => {
@@ -394,11 +410,11 @@ pub(in crate::network) async fn save_on_shutdown(
     }
 
     // Drain any in-flight periodic statistics save before the final write.
-    // The 60s timer spawns a detached `spawn_blocking` with a snapshot of
-    // `cumulative_save_pairs()` — the same stale-overwrite race we already
-    // document for known.met. If that task lands after this final save, it
-    // silently rolls back session bytes (and completed counts) accrued
-    // after the snapshot was taken.
+    // The 60s timer spawns a detached `spawn_blocking` with an older snapshot
+    // of `cumulative_save_pairs()`. Landing after the final save cannot roll
+    // totals back — `save_statistics` keeps the larger of the stored and
+    // written value of every cumulative counter — so a writer that outlives
+    // this join is no reason to skip the final save.
     if *stats_save_in_flight {
         let deadline =
             shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5));
@@ -457,8 +473,23 @@ pub(in crate::network) async fn save_on_shutdown(
         }
     }
 
-    stats_manager.save_cumulative(db);
-    info!("Statistics saved on shutdown");
+    let pairs = stats_manager.cumulative_save_pairs();
+    let stats_db = db.clone();
+    let writer = tokio::task::spawn_blocking(move || stats_db.save_statistics(&pairs));
+    match tokio::time::timeout_at(
+        shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5)),
+        writer,
+    )
+    .await
+    {
+        Ok(Ok(Ok(()))) => info!("Statistics saved on shutdown"),
+        Ok(Ok(Err(e))) => error!("Failed to save statistics on shutdown: {e}"),
+        Ok(Err(e)) => error!("Statistics shutdown writer failed: {e}"),
+        Err(_) => warn!(
+            "Stopped waiting for the statistics shutdown writer at its phase deadline; \
+             the save may not complete"
+        ),
+    }
 
     // Drain any in-flight periodic known.met background save before doing
     // this shutdown's own authoritative save below. `known_met_save_timer`
@@ -540,18 +571,30 @@ pub(in crate::network) async fn save_on_shutdown(
         &state.ember_keyword_publish_unix,
         known_files,
     );
+    let known_met_phase_deadline =
+        shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5));
     match tokio::time::timeout_at(
-        shutdown_phase_deadline(
-            shutdown_deadline,
-            std::time::Duration::from_secs(5),
-        ),
-        state.known_met_save_lock.lock(),
+        known_met_phase_deadline,
+        state.known_met_save_lock.clone().lock_owned(),
     )
     .await
     {
-        Ok(_ownership) => {
-            if let Err(e) = known_files.save(&known_path) {
-                error!("Failed to save known.met on shutdown: {e}");
+        Ok(ownership) => {
+            let mut snapshot = known_files.snapshot();
+            let writer = tokio::task::spawn_blocking(move || {
+                let _ownership = ownership;
+                snapshot.save(&known_path)
+            });
+            let write_deadline =
+                shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5));
+            match tokio::time::timeout_at(write_deadline, writer).await {
+                Ok(Ok(Ok(_))) => {}
+                Ok(Ok(Err(e))) => error!("Failed to save known.met on shutdown: {e}"),
+                Ok(Err(e)) => error!("known.met shutdown writer failed: {e}"),
+                Err(_) => warn!(
+                    "Stopped waiting for the known.met shutdown writer at its phase deadline; \
+                     the save may not complete"
+                ),
             }
         }
         Err(_) => warn!(
@@ -687,51 +730,34 @@ pub(in crate::network) async fn save_on_shutdown(
     // Reputation carries active automatic bans. Join any stale periodic
     // writer before the final authoritative snapshot so it cannot rename an
     // older ban set over the shutdown save.
-    let reputation_join_deadline =
-        shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5));
-    while *reputation_save_in_flight {
-        match tokio::time::timeout_at(reputation_join_deadline, periodic_save_result_rx.recv())
-            .await
-        {
-            Ok(Some(result)) => {
-                match result.job {
-                    PeriodicSaveJob::Reputation => *reputation_save_in_flight = false,
-                    PeriodicSaveJob::Known2 | PeriodicSaveJob::Nodes | PeriodicSaveJob::Stats => {}
-                }
-                if let Err(error) = result.result {
-                    error!("Periodic shutdown writer failed before final save: {error}");
-                }
-            }
-            Ok(None) => break,
-            Err(_) => {
-                error!(
-                    "Shutdown deadline exhausted joining the periodic reputation/ban writer; shutdown result is explicitly truncated"
-                );
-                break;
-            }
-        }
+    if !join_periodic_reputation_writer(
+        periodic_save_result_rx,
+        reputation_save_in_flight,
+        shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5)),
+    )
+    .await
+    {
+        warn!(
+            "Periodic reputation/ban save still in flight 5s into shutdown; writing the final \
+             snapshot now and again once that writer lands"
+        );
     }
 
     let rep_path = state.data_dir.join("reputation.json");
+    // Kept while a periodic writer that outlived its join is still running: it
+    // renames an older ban set over whatever is on disk when it finishes, so the
+    // final snapshot is written again after it, at the end of the sequence.
+    let mut reputation_rewrite = None;
     if tokio::time::Instant::now() >= shutdown_deadline {
         error!(
             "Shutdown deadline exhausted before reputation/ban save; shutdown result is explicitly truncated"
         );
-    } else {
-        let reputation_snapshot = state.reputation.clone();
-        let tracked = reputation_snapshot.tracked_count();
-        let writer = tokio::task::spawn_blocking(move || reputation_snapshot.save(&rep_path));
-        match tokio::time::timeout_at(shutdown_deadline, writer).await {
-            Ok(Ok(Ok(()))) => {
-                info!("Reputation data saved on shutdown ({tracked} peers tracked)")
-            }
-            Ok(Ok(Err(error))) => {
-                error!("Failed to save reputation.json on shutdown: {error}")
-            }
-            Ok(Err(error)) => error!("Reputation shutdown writer failed: {error}"),
-            Err(_) => error!(
-                "Shutdown deadline exhausted joining reputation/ban writer; shutdown result is explicitly truncated"
-            ),
+    } else if let Some(snapshot) =
+        write_reputation_snapshot(state.reputation.clone(), rep_path.clone(), shutdown_deadline)
+            .await
+    {
+        if *reputation_save_in_flight {
+            reputation_rewrite = Some(snapshot);
         }
     }
 
@@ -851,6 +877,23 @@ pub(in crate::network) async fn save_on_shutdown(
         }
     }
 
+    if let Some(snapshot) = reputation_rewrite {
+        if join_periodic_reputation_writer(
+            periodic_save_result_rx,
+            reputation_save_in_flight,
+            shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(2)),
+        )
+        .await
+        {
+            write_reputation_snapshot(snapshot, rep_path, shutdown_deadline).await;
+        } else {
+            error!(
+                "Periodic reputation/ban writer never finished during shutdown; its older ban set \
+                 may replace the shutdown save"
+            );
+        }
+    }
+
     // Unregister from the rendezvous server LAST and with a short bound.
     // This is a best-effort courtesy call to a remote host that may be slow
     // or unreachable; running it before the local saves above (with the
@@ -883,5 +926,126 @@ pub(in crate::network) async fn save_on_shutdown(
             upnp_mappings.teardown(),
         )
         .await;
+    }
+}
+
+/// Wait until the periodic reputation writer has reported, or `deadline`.
+/// Returns whether it is no longer in flight.
+async fn join_periodic_reputation_writer(
+    periodic_save_result_rx: &mut mpsc::UnboundedReceiver<PeriodicSaveResult>,
+    reputation_save_in_flight: &mut bool,
+    deadline: tokio::time::Instant,
+) -> bool {
+    while *reputation_save_in_flight {
+        match tokio::time::timeout_at(deadline, periodic_save_result_rx.recv()).await {
+            Ok(Some(result)) => {
+                match result.job {
+                    PeriodicSaveJob::Reputation => *reputation_save_in_flight = false,
+                    PeriodicSaveJob::Known2 | PeriodicSaveJob::Nodes | PeriodicSaveJob::Stats => {}
+                }
+                if let Err(error) = result.result {
+                    error!("Periodic shutdown writer failed before final save: {error}");
+                }
+            }
+            // Only the loop's own periodic tasks hold senders; with all of them
+            // gone nothing is left to land.
+            Ok(None) => return true,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Write the reputation/ban snapshot off the runtime, bounded by `deadline`.
+/// Hands the snapshot back when the writer finished in time.
+async fn write_reputation_snapshot(
+    snapshot: ember::reputation::ReputationManager,
+    path: std::path::PathBuf,
+    deadline: tokio::time::Instant,
+) -> Option<ember::reputation::ReputationManager> {
+    let tracked = snapshot.tracked_count();
+    let writer = tokio::task::spawn_blocking(move || {
+        let result = snapshot.save(&path);
+        (snapshot, result)
+    });
+    match tokio::time::timeout_at(deadline, writer).await {
+        Ok(Ok((snapshot, Ok(())))) => {
+            info!("Reputation data saved on shutdown ({tracked} peers tracked)");
+            Some(snapshot)
+        }
+        Ok(Ok((snapshot, Err(error)))) => {
+            error!("Failed to save reputation.json on shutdown: {error}");
+            Some(snapshot)
+        }
+        Ok(Err(error)) => {
+            error!("Reputation shutdown writer failed: {error}");
+            None
+        }
+        Err(_) => {
+            error!(
+                "Shutdown deadline exhausted joining reputation/ban writer; shutdown result is explicitly truncated"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn periodic_result(job: PeriodicSaveJob) -> PeriodicSaveResult {
+        PeriodicSaveResult { job, result: Ok(()) }
+    }
+
+    #[tokio::test]
+    async fn reputation_join_skips_sibling_results_until_its_own_lands() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(periodic_result(PeriodicSaveJob::Stats)).unwrap();
+        tx.send(periodic_result(PeriodicSaveJob::Reputation)).unwrap();
+        let mut in_flight = true;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        assert!(join_periodic_reputation_writer(&mut rx, &mut in_flight, deadline).await);
+        assert!(!in_flight);
+    }
+
+    #[tokio::test]
+    async fn reputation_join_reports_a_writer_still_running_at_the_deadline() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(periodic_result(PeriodicSaveJob::Nodes)).unwrap();
+        let mut in_flight = true;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+
+        assert!(!join_periodic_reputation_writer(&mut rx, &mut in_flight, deadline).await);
+        assert!(in_flight);
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn reputation_rewrite_replaces_an_older_snapshot_written_after_the_final_save() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-shutdown-reputation-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("reputation.json");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let older = ember::reputation::ReputationManager::new();
+        let mut newer = older.clone();
+        newer.record_event(&[9u8; 16], ember::reputation::ReputationEvent::ProtocolViolation);
+
+        let snapshot = write_reputation_snapshot(newer, path.clone(), deadline)
+            .await
+            .expect("final save finishes");
+        older.save(&path).unwrap();
+        write_reputation_snapshot(snapshot, path.clone(), deadline)
+            .await
+            .expect("rewrite finishes");
+
+        let on_disk = ember::reputation::ReputationManager::load_checked(&path).unwrap();
+        assert_eq!(on_disk.tracked_count(), 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

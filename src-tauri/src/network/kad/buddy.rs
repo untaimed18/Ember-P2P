@@ -180,7 +180,7 @@ pub struct BuddyManager {
     /// connection; a callback request has to reach the buddy's UDP socket
     /// instead, and the two are not related by any fixed offset.
     buddy_udp_port: Option<u16>,
-    last_find_attempt: i64,
+    last_find_attempt: Option<Instant>,
     find_attempt_count: u32,
 
     buddy_writer: Option<BuddyWriteQueue>,
@@ -218,7 +218,7 @@ impl BuddyManager {
             buddy_id: None,
             buddy_addr: None,
             buddy_udp_port: None,
-            last_find_attempt: 0,
+            last_find_attempt: None,
             find_attempt_count: 0,
             buddy_writer: None,
             buddy_reader_handle: None,
@@ -240,7 +240,7 @@ impl BuddyManager {
         self.buddy_id = None;
         self.buddy_addr = None;
         self.buddy_udp_port = None;
-        self.last_find_attempt = 0;
+        self.last_find_attempt = None;
         self.find_attempt_count = 0;
         if let Some(h) = self.buddy_reader_handle.take() {
             h.abort();
@@ -366,13 +366,13 @@ impl BuddyManager {
             4 => 480,
             _ => 600,
         };
-        let now = chrono::Utc::now().timestamp();
-        now - self.last_find_attempt > cooldown
+        self.last_find_attempt
+            .is_none_or(|at| at.elapsed() > Duration::from_secs(cooldown))
     }
 
     pub fn start_finding(&mut self) {
         self.state = BuddyState::FindingBuddy;
-        self.last_find_attempt = chrono::Utc::now().timestamp();
+        self.last_find_attempt = Some(Instant::now());
         self.find_attempt_count += 1;
         info!(
             "Starting buddy search (attempt #{})",
@@ -382,7 +382,7 @@ impl BuddyManager {
 
     pub fn find_failed(&mut self) {
         self.state = BuddyState::NoBuddy;
-        let elapsed = chrono::Utc::now().timestamp() - self.last_find_attempt;
+        let elapsed = self.last_find_attempt.map_or(0, |at| at.elapsed().as_secs());
         info!(
             "Buddy search attempt #{} failed after {}s, next retry cooldown={}s",
             self.find_attempt_count,
@@ -404,8 +404,8 @@ impl BuddyManager {
         if self.state != BuddyState::FindingBuddy {
             return false;
         }
-        let now = chrono::Utc::now().timestamp();
-        now - self.last_find_attempt > 180
+        self.last_find_attempt
+            .is_some_and(|at| at.elapsed() > Duration::from_secs(180))
     }
 
     /// Handle FindBuddyRes: connect to buddy, do Hello handshake, start read loop.
@@ -1243,6 +1243,35 @@ mod tests {
         // A search is already in flight; don't start another even though both
         // ports are firewalled.
         assert!(!mgr.should_find_buddy(FirewallStatus::Firewalled, FirewallStatus::Firewalled));
+    }
+
+    #[test]
+    fn failed_buddy_search_waits_out_its_cooldown_on_the_monotonic_clock() {
+        let mut mgr = test_manager();
+        mgr.start_finding();
+        mgr.find_failed();
+        assert!(!mgr.should_find_buddy(FirewallStatus::Firewalled, FirewallStatus::Firewalled));
+
+        // `Instant` cannot go back past boot; on a machine up for less than
+        // this there is nothing to wait out.
+        let Some(past) = Instant::now().checked_sub(Duration::from_secs(61)) else {
+            return;
+        };
+        mgr.last_find_attempt = Some(past);
+        assert!(mgr.should_find_buddy(FirewallStatus::Firewalled, FirewallStatus::Firewalled));
+    }
+
+    #[test]
+    fn buddy_search_times_out_after_three_minutes() {
+        let mut mgr = test_manager();
+        mgr.start_finding();
+        assert!(!mgr.finding_timed_out());
+
+        let Some(past) = Instant::now().checked_sub(Duration::from_secs(181)) else {
+            return;
+        };
+        mgr.last_find_attempt = Some(past);
+        assert!(mgr.finding_timed_out());
     }
 
     #[tokio::test]

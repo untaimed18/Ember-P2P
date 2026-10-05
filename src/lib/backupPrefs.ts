@@ -21,6 +21,7 @@ export const BACKED_UP_STORAGE_KEYS = [
   'ember.channels.favourites.v1',
   'ember.channels.hidden.v1',
   'ember.channels.ignored.v1',
+  'ember.channels.carried.v1',
   'search-recent-queries-v1',
   'search-prefs-v1',
   'transfers-advanced-cols',

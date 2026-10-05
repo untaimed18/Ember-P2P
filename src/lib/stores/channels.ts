@@ -772,17 +772,48 @@ export async function mergeChannelTransfers(): Promise<void> {
 }
 
 /**
- * Move a room's star and notification level onto the room it handed off to.
+ * Rooms whose notification level and mention flag were already carried to
+ * the room they handed off to. Kept on the device beside the levels, and like
+ * them survives `cleanupChannelsStore`.
+ */
+const CARRIED_KEY = 'ember.channels.carried.v1';
+
+export function loadCarriedChannels(storage: StorageLike | null = browserStorage()): string[] {
+  if (!storage) return [];
+  try {
+    return parseChannelIds(storage.getItem(CARRIED_KEY));
+  } catch {
+    return [];
+  }
+}
+
+export const carriedChannels = writable<string[]>(loadCarriedChannels());
+
+carriedChannels.subscribe((ids) => {
+  const storage = browserStorage();
+  if (!storage) return;
+  try {
+    storage.setItem(CARRIED_KEY, JSON.stringify(ids));
+  } catch {
+    // Quota exceeded / private mode. Holds for this session.
+  }
+});
+
+/**
+ * Bring a room's star, notification level and mention flag to the room it
+ * handed off to.
  *
- * Both are keyed by room id, and an ownership handoff carries the conversation
+ * All are keyed by room id, and an ownership handoff carries the conversation
  * to a new id — so the star was pruned once the user left the old room, and
  * the level sat on an id nothing reads any more. Waits until the user is in
  * the successor, because a star is only kept for rooms they stand in.
  *
- * Moved rather than copied. "All messages" is stored as no entry, so a level
- * left behind on the old room would be carried again, on every refresh, over
- * a successor the user had since turned back up to All. A level the successor
- * already has was set there on purpose and wins.
+ * The star moves. The level is copied, because the old room still hears from
+ * members who have not followed, and a room the user muted must not start
+ * speaking up for them. Copied once: "All messages" is stored as no entry, so
+ * copying on every refresh would carry the old level back over a successor the
+ * user had since turned up to All. A level the successor already has was set
+ * there on purpose and wins.
  */
 function carryPrefsToSuccessors(list: ChannelInfo[]): void {
   const standingIn = new Set(
@@ -797,18 +828,22 @@ function carryPrefsToSuccessors(list: ChannelInfo[]): void {
   if (moves.length === 0) return;
   let favourites = get(favouriteChannels);
   let levels = get(channelNotifyLevels);
+  let mentioned = get(channelUnreadMentions);
+  let carried = get(carriedChannels);
   for (const [from, to] of moves) {
     if (favourites.includes(from)) {
       favourites = favourites.filter((id) => id !== from);
       if (!favourites.includes(to)) favourites = [...favourites, to];
     }
-    if (from in levels) {
-      const { [from]: level, ...rest } = levels;
-      levels = to in rest ? rest : { ...rest, [to]: level };
-    }
+    if (carried.includes(from)) continue;
+    carried = [...carried, from];
+    if (from in levels && !(to in levels)) levels = { ...levels, [to]: levels[from] };
+    if (mentioned.includes(from) && !mentioned.includes(to)) mentioned = [...mentioned, to];
   }
   if (favourites !== get(favouriteChannels)) favouriteChannels.set(favourites);
   if (levels !== get(channelNotifyLevels)) channelNotifyLevels.set(levels);
+  if (mentioned !== get(channelUnreadMentions)) channelUnreadMentions.set(mentioned);
+  if (carried !== get(carriedChannels)) carriedChannels.set(carried);
 }
 
 let latestRefresh: Promise<void> | null = null;
@@ -851,6 +886,10 @@ async function refreshChannelsOnce(): Promise<void> {
     channelNotifyLevels.set(
       Object.fromEntries(Object.entries(levels).filter(([id]) => keep.has(id))),
     );
+  }
+  const carried = get(carriedChannels);
+  if (carried.some((id) => !keep.has(id))) {
+    carriedChannels.set(carried.filter((id) => keep.has(id)));
   }
   // Pruned against the snapshot rather than on each leave, so walking out by
   // any route drops the star with it, and a leave that failed and rolled back

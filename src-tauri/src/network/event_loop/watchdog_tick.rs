@@ -38,18 +38,14 @@ pub(in crate::network) async fn on_watchdog_tick(
     upnp_maintain_in_flight: &mut bool,
     upnp_maintain_started_at: &mut Option<tokio::time::Instant>,
 ) {
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::network::monotonic_secs();
 
-    if state.server_connected
-        && state.server_connection.is_some()
-        && now.saturating_sub(last_server_activity_at) > 120
-    {
-        handle_server_disconnect(
-            state,
-            shared_server_addr,
-            app_handle,
-            "watchdog: no server activity for 120s",
-        ).await;
+    if let Some(reason) = server_watchdog_disconnect_reason(
+        state.server_connected,
+        state.server_connection.is_some(),
+        now.saturating_sub(last_server_activity_at),
+    ) {
+        handle_server_disconnect(state, shared_server_addr, app_handle, reason).await;
     }
 
     if cache_write_handle.as_ref().is_some_and(|h| !h.is_finished())
@@ -152,5 +148,53 @@ pub(in crate::network) async fn on_watchdog_tick(
             state.pending_downloads.len()
         );
         *last_kad_activity_at = now;
+    }
+}
+
+/// Why the watchdog should drop the eD2K session, if it should.
+///
+/// The server tick takes the link out of `state` while it works on it, so a
+/// panic there loses the link and leaves `server_connected` set. Nothing else
+/// clears that pair: reconnecting waits for `!server_connected`, and the
+/// silence check below needs a link to judge.
+fn server_watchdog_disconnect_reason(
+    server_connected: bool,
+    has_server_link: bool,
+    secs_since_server_activity: i64,
+) -> Option<&'static str> {
+    if !server_connected {
+        return None;
+    }
+    if !has_server_link {
+        return Some("watchdog: server marked connected without a live session");
+    }
+    (secs_since_server_activity > 120).then_some("watchdog: no server activity for 120s")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watchdog_resets_a_connected_status_whose_session_was_lost() {
+        assert_eq!(
+            server_watchdog_disconnect_reason(true, false, 0),
+            Some("watchdog: server marked connected without a live session")
+        );
+    }
+
+    #[test]
+    fn watchdog_drops_a_silent_server_session() {
+        assert_eq!(server_watchdog_disconnect_reason(true, true, 120), None);
+        assert_eq!(
+            server_watchdog_disconnect_reason(true, true, 121),
+            Some("watchdog: no server activity for 120s")
+        );
+    }
+
+    #[test]
+    fn watchdog_leaves_a_disconnected_server_alone() {
+        assert_eq!(server_watchdog_disconnect_reason(false, false, 10_000), None);
+        assert_eq!(server_watchdog_disconnect_reason(false, true, 10_000), None);
     }
 }

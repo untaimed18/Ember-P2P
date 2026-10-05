@@ -1091,8 +1091,11 @@ impl CreditManager {
     /// Accumulate upload credit, unless the peer's identity state forbids it —
     /// see [`Self::credit_accepted`] for which states those are and why.
     /// Returns false if the accrual was rejected.
-    pub fn add_uploaded(&mut self, user_hash: [u8; 16], bytes: u64) -> bool {
-        if !self.credit_accepted(&user_hash) {
+    ///
+    /// `current_ip` is the peer's live IPv4 as a big-endian `u32` (`0` when
+    /// unknown), judged like eMule's `AddUploaded(bytes, dwForIP)`.
+    pub fn add_uploaded(&mut self, user_hash: [u8; 16], current_ip: u32, bytes: u64) -> bool {
+        if !self.credit_accepted(&user_hash, current_ip) {
             return false;
         }
         let record = self.get_or_create(user_hash);
@@ -1101,8 +1104,9 @@ impl CreditManager {
         true
     }
 
-    pub fn add_downloaded(&mut self, user_hash: [u8; 16], bytes: u64) -> bool {
-        if !self.credit_accepted(&user_hash) {
+    /// `current_ip` as for [`Self::add_uploaded`]; see [`credit_ip`].
+    pub fn add_downloaded(&mut self, user_hash: [u8; 16], current_ip: u32, bytes: u64) -> bool {
+        if !self.credit_accepted(&user_hash, current_ip) {
             return false;
         }
         let record = self.get_or_create(user_hash);
@@ -1135,22 +1139,24 @@ impl CreditManager {
     /// by refusing honest peers credit.
     ///
     /// Still judged from the *existing* record without creating one, so the
-    /// rejected states cannot seed an entry per rotated hash.
-    fn credit_accepted(&self, user_hash: &[u8; 16]) -> bool {
+    /// rejected states cannot seed an entry per rotated hash. The state is the
+    /// IP-aware one, so a verified hash replayed from another address is
+    /// `BadGuy` here too.
+    fn credit_accepted(&self, user_hash: &[u8; 16], current_ip: u32) -> bool {
         if self.crypto_unreadable {
             return false;
         }
-        let ident_state = self.credits.get(user_hash).map(|r| r.ident_state);
+        let ident_state = self.get_current_ident_state(user_hash, current_ip);
         let rejected = if self.crypto_available {
             matches!(
                 ident_state,
-                Some(IdentState::Failed | IdentState::BadGuy | IdentState::Needed)
+                IdentState::Failed | IdentState::BadGuy | IdentState::Needed
             )
         } else {
             // No local key, so `Needed` is a state we can never resolve and must
             // not punish; eMule likewise skips the whole check when
             // `CryptoAvailable()` is false.
-            matches!(ident_state, Some(IdentState::Failed | IdentState::BadGuy))
+            matches!(ident_state, IdentState::Failed | IdentState::BadGuy)
         };
         !rejected
     }
@@ -2244,6 +2250,17 @@ fn generate_rsa_keypair() -> (Vec<u8>, Vec<u8>) {
     (pub_der.as_ref().to_vec(), priv_der.as_bytes().to_vec())
 }
 
+/// A peer address as the IPv4 `u32` the identity checks compare, `0` when it
+/// has none.
+pub(crate) fn credit_ip(addr: std::net::SocketAddr) -> u32 {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(0, |v4| u32::from_be_bytes(v4.octets())),
+    }
+}
+
 /// `cryptkey.dat` as eMule and aMule write it: the RSA-384 private key as
 /// PKCS#8 DER, base64-encoded by Crypto++ with a line break every 72 columns
 /// (`CClientCreditsList::CreateKeyPair`). Raw DER, and PKCS#1 rather than
@@ -2455,6 +2472,23 @@ mod tests {
             IdentState::Verified,
             "a peer that re-proved its identity must not stay BadGuy",
         );
+    }
+
+    #[test]
+    fn upload_credit_is_refused_for_a_verified_hash_seen_from_another_ip() {
+        let mut cm = CreditManager::new();
+        let peer = [0x23u8; 16];
+        let proven_ip = 0x0A00_0001u32;
+        let other_ip = 0x0A00_0002u32;
+        cm.set_ident_state(peer, IdentState::Verified);
+        cm.check_identity_ip(peer, proven_ip);
+
+        assert!(!cm.add_uploaded(peer, other_ip, 4096));
+        assert_eq!(cm.get_record(&peer).unwrap().uploaded, 0);
+
+        assert!(cm.add_uploaded(peer, proven_ip, 4096));
+        assert!(cm.add_uploaded(peer, 0, 1024), "no live IP falls back to the stored state");
+        assert_eq!(cm.get_record(&peer).unwrap().uploaded, 5120);
     }
 
     /// The inbound (upload) ordering is `Unknown -> Needed -> Verified`,
@@ -3026,7 +3060,7 @@ mod tests {
             let r = cm.get_or_create(user);
             r.last_seen = stale_ts;
         }
-        let _ = cm.add_uploaded(user, 1024);
+        let _ = cm.add_uploaded(user, 0, 1024);
         assert!(
             cm.get_record(&user).unwrap().last_seen >= now_floor,
             "add_uploaded must bump last_seen",
@@ -3035,7 +3069,7 @@ mod tests {
             let r = cm.get_or_create(user);
             r.last_seen = stale_ts;
         }
-        let _ = cm.add_downloaded(user, 1024);
+        let _ = cm.add_downloaded(user, 0, 1024);
         assert!(
             cm.get_record(&user).unwrap().last_seen >= now_floor,
             "add_downloaded must bump last_seen",
@@ -3091,14 +3125,14 @@ mod tests {
         let mut cm = CreditManager::new();
         assert!(!cm.is_dirty(), "a new manager has nothing to persist");
 
-        cm.add_uploaded([0x01u8; 16], 4096);
+        cm.add_uploaded([0x01u8; 16], 0, 4096);
         assert!(cm.is_dirty(), "granting upload credit must request a flush");
 
         let generation = cm.dirty_generation();
         cm.mark_saved_if_generation(generation);
         assert!(!cm.is_dirty(), "a completed flush clears the debt");
 
-        cm.add_downloaded([0x01u8; 16], 4096);
+        cm.add_downloaded([0x01u8; 16], 0, 4096);
         assert!(cm.is_dirty(), "a later edit re-arms the flush");
     }
 
@@ -3109,11 +3143,11 @@ mod tests {
     #[test]
     fn an_edit_during_a_flush_is_not_marked_saved() {
         let mut cm = CreditManager::new();
-        cm.add_uploaded([0x07u8; 16], 1024);
+        cm.add_uploaded([0x07u8; 16], 0, 1024);
         let in_flight = cm.dirty_generation();
 
         // Lands while the blocking write is still running.
-        cm.add_uploaded([0x08u8; 16], 2048);
+        cm.add_uploaded([0x08u8; 16], 0, 2048);
 
         cm.mark_saved_if_generation(in_flight);
         assert!(
@@ -3165,7 +3199,7 @@ mod tests {
         let a = [0x11u8; 16];
         let b = [0x12u8; 16];
         let pk = [0x21u8; 32];
-        cm.add_uploaded(a, 10);
+        cm.add_uploaded(a, 0, 10);
         cm.add_ember_uploaded(pk, 10, true);
         let failed = cm.begin_flush();
         assert!(!failed.full_sync);
@@ -3173,7 +3207,7 @@ mod tests {
         assert_eq!(failed.ember_keys, vec![pk]);
 
         // That flush failed (no `finish_flush`); a later edit joins the retry.
-        cm.add_uploaded(b, 10);
+        cm.add_uploaded(b, 0, 10);
         let retry = cm.begin_flush();
         let mut keys = retry.credit_keys.clone();
         keys.sort();
@@ -3203,7 +3237,7 @@ mod tests {
         let b = [0x32u8; 16];
 
         let startup = cm.begin_flush();
-        cm.add_uploaded(a, 10);
+        cm.add_uploaded(a, 0, 10);
         let periodic = cm.begin_flush();
         assert!(periodic.full_sync, "nothing has confirmed the first sync yet");
         cm.finish_flush(&startup);
@@ -3213,9 +3247,9 @@ mod tests {
         cm.finish_flush(&retry);
         assert!(cm.begin_flush().is_empty(), "the latest flush settles everything");
 
-        cm.add_uploaded(a, 10);
+        cm.add_uploaded(a, 0, 10);
         let older = cm.begin_flush();
-        cm.add_uploaded(b, 10);
+        cm.add_uploaded(b, 0, 10);
         let _newer = cm.begin_flush();
         cm.finish_flush(&older);
         // `newer` fails.
@@ -3345,7 +3379,7 @@ mod tests {
         }
         cm.cleanup_stale(90);
         // key(0) is among the oldest until it is seen again.
-        cm.add_uploaded(key(0), 1);
+        cm.add_uploaded(key(0), 0, 1);
         cm.get_or_create(key(u64::MAX));
         assert!(cm.get_record(&key(0)).is_some(), "a freshly seen record survives");
         assert_eq!(cm.credits.len(), MAX_CREDIT_RECORDS);
@@ -3857,7 +3891,7 @@ mod tests {
         assert!(cm.crypto_unreadable());
         assert_eq!(cm.secident_status(), "broken");
         let peer = [0x33u8; 16];
-        assert!(!cm.add_uploaded(peer, 2_000_000));
+        assert!(!cm.add_uploaded(peer, 0, 2_000_000));
         assert!(!cm.has_download_bonus(&peer, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }

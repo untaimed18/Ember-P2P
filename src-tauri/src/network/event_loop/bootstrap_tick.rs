@@ -81,7 +81,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
     const SELF_LOOKUP_WARM_DELAY_SECS: i64 = 20;
     const SELF_LOOKUP_WARM_VERIFIED: usize = 16;
     const SELF_LOOKUP_REPEAT_SECS: i64 = 4 * 3600;
-    let now_ts = chrono::Utc::now().timestamp();
+    let now_ts = crate::network::monotonic_secs();
     let self_lookup_due = if !state.self_lookup_done {
         let elapsed = now_ts - state.kad_started_at;
         // eMule waits a flat 3 minutes before the first self-lookup.

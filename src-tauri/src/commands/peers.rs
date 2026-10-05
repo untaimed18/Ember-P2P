@@ -873,7 +873,7 @@ pub async fn send_chat_message(
                 id,
             })
         }
-        Err(reason) if chat_failure_is_permanent(&reason) => Err(reason),
+        Err(reason) if chat_failure_is_permanent(&reason) => Err(code_permanent_chat_failure(reason)),
         Err(reason) => {
             // Every remaining failure means "we could not reach them right
             // now" — offline, a dial in flight, a dead channel. Keep the
@@ -949,6 +949,24 @@ fn chat_failure_is_permanent(reason: &str) -> bool {
     lowered.contains("chatencryptfailed")
         || lowered.contains("can only chat with friends")
         || lowered.contains("chat is disabled")
+}
+
+/// The composer shows a permanent failure as it comes back, so the network
+/// task's bare English becomes a code the frontend translates.
+/// `ChatEncryptFailed` passes through: it is already a key `translateError`
+/// recognises.
+fn code_permanent_chat_failure(reason: String) -> String {
+    let lowered = reason.to_ascii_lowercase();
+    if lowered.contains("can only chat with friends") {
+        coded("peers_not_friend", "Can only chat with friends")
+    } else if lowered.contains("chat is disabled") {
+        coded(
+            "peers_attach_disabled",
+            "Chatting with friends is turned off in Settings",
+        )
+    } else {
+        reason
+    }
 }
 
 /// Whether chat history is sealed because its encryption key could not be
@@ -2826,8 +2844,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        chat_failure_is_permanent, format_friend_code, parse_friend_code,
-        require_public_ember_peer_ip_for_mode, INTRO_SECRET_LEN,
+        chat_failure_is_permanent, code_permanent_chat_failure, format_friend_code,
+        parse_friend_code, require_public_ember_peer_ip_for_mode, INTRO_SECRET_LEN,
     };
 
     /// "Copy member ID" in a room yields a bare Ed25519 key. Add Friend has to
@@ -2993,6 +3011,23 @@ mod tests {
                 "{transient:?} must be queued and retried"
             );
         }
+    }
+
+    #[test]
+    fn permanent_chat_failures_reach_the_composer_coded() {
+        for (reason, code) in [
+            ("Chat is disabled in Friends settings", "peers_attach_disabled"),
+            ("Can only chat with friends", "peers_not_friend"),
+        ] {
+            let coded: serde_json::Value =
+                serde_json::from_str(&code_permanent_chat_failure(reason.to_string()))
+                    .expect("a coded error");
+            assert_eq!(coded["code"], code, "{reason:?}");
+        }
+        assert_eq!(
+            code_permanent_chat_failure("ChatEncryptFailed".to_string()),
+            "ChatEncryptFailed"
+        );
     }
 
     #[test]

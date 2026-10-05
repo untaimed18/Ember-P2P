@@ -4421,7 +4421,7 @@ async fn handle_command_inner(
             state.stats.status = NetworkStatus::Connecting;
             state.self_lookup_done = false;
             state.last_self_lookup = 0;
-            state.kad_started_at = chrono::Utc::now().timestamp();
+            state.kad_started_at = crate::network::monotonic_secs();
             state
                 .routing_table
                 .reset_big_timer_global(chrono::Utc::now().timestamp());

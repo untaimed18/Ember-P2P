@@ -20,6 +20,10 @@ const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
 /// Rooms kept in the Discover cache. Far more than a browse can usefully show,
 /// and small enough that the table stays a rounding error on disk.
 const MAX_CHANNEL_CACHE_ROWS: i64 = 500;
+/// Seeds of earlier offers a nominee keeps beside the newest, per room. An
+/// owner re-offers only after an offer lapses or is withdrawn, so a record it
+/// can still adopt is one of the last few.
+const HANDOFF_SUPERSEDED_SEEDS_KEPT: i64 = 3;
 /// A cached listing this old has been absent from the DHT for many times the
 /// index record's own lifetime, so offering it would only send the user at a
 /// room that no longer answers.
@@ -1036,7 +1040,7 @@ impl Database {
     /// `starts_with` elsewhere: under LIKE a plaintext body beginning
     /// `embrchat1:` would count as ciphertext and seal chat permanently instead
     /// of minting a fresh key.
-    const CHAT_KEYED_COLUMNS: [(&'static str, &'static str); 7] = [
+    const CHAT_KEYED_COLUMNS: [(&'static str, &'static str); 8] = [
         ("chat_messages", "message GLOB 'EMBRCHAT1:*'"),
         ("channel_messages", "message GLOB 'EMBRCHAT1:*'"),
         (
@@ -1045,6 +1049,7 @@ impl Database {
         ),
         ("channel_key_epochs", "secret_enc GLOB 'EMBRCSEC1:*'"),
         ("channel_handoff_pending", "owner_seed GLOB 'EMBRCSEC1:*'"),
+        ("channel_handoff_superseded", "owner_seed GLOB 'EMBRCSEC1:*'"),
         ("channel_handoff_retired", "owner_seed GLOB 'EMBRCSEC1:*'"),
         (
             "chat_attachments",
@@ -7607,10 +7612,7 @@ impl Database {
                 "DELETE FROM channel_message_tombstones WHERE channel_id = ?1",
                 params![channel_id],
             )?;
-            tx.execute(
-                "DELETE FROM channel_handoff_pending WHERE old_channel_id = ?1",
-                params![channel_id],
-            )?;
+            Self::clear_handoff_seeds_locked(&tx, channel_id)?;
         }
         tx.commit()?;
         if n > 0 {
@@ -7674,12 +7676,11 @@ impl Database {
             "DELETE FROM channel_message_reactions WHERE channel_id = ?1",
             params![channel_id],
         )?;
-        // Any half-finished handoff goes with the room. Left behind it is an
-        // unreachable row keyed to a channel that no longer exists.
-        tx.execute(
-            "DELETE FROM channel_handoff_pending WHERE old_channel_id = ?1",
-            params![channel_id],
-        )?;
+        // A nominee's seeds stay. The owner may already have published a
+        // handoff naming one, and it is then the only key to a successor every
+        // other member is following; rejoining this room finds the record and
+        // installs it. `prune_forgotten_handoff_seeds` drops them
+        // once nothing can still be following that record.
         Self::ensure_channel_claims_declined_locked(&tx)?;
         tx.execute(
             "DELETE FROM channel_claims_declined WHERE channel_id = ?1",
@@ -8045,6 +8046,11 @@ impl Database {
     /// already have published a handoff naming its pubkey, so a replayed or
     /// reordered older offer — or a repeat of the same one — overwriting it
     /// would leave this device unable to sign for the room it was handed.
+    ///
+    /// The seed a newer offer replaces is kept aside in
+    /// `channel_handoff_superseded` (the newest [`HANDOFF_SUPERSEDED_SEEDS_KEPT`]
+    /// of them) until the room finishes its handoff: the record the owner ends
+    /// up adopting can be one it stored for the earlier offer.
     pub fn store_handoff_pending_seed(
         &self,
         old_channel_id: &str,
@@ -8060,7 +8066,16 @@ impl Database {
         )?;
         let now = chrono::Utc::now().timestamp();
         let conn = self.conn.lock();
-        let n = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        Self::ensure_channel_handoff_superseded_locked(&tx)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO channel_handoff_superseded
+                (old_channel_id, version, successor_pubkey, owner_seed, created_at)
+             SELECT old_channel_id, version, successor_pubkey, owner_seed, created_at
+             FROM channel_handoff_pending WHERE old_channel_id = ?1 AND version < ?2",
+            params![old_channel_id, version as i64],
+        )?;
+        let n = tx.execute(
             "INSERT INTO channel_handoff_pending (old_channel_id, version, successor_pubkey, owner_seed, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(old_channel_id) DO UPDATE SET
@@ -8071,7 +8086,34 @@ impl Database {
              WHERE excluded.version > channel_handoff_pending.version",
             params![old_channel_id, version as i64, successor_pubkey, enc, now],
         )?;
+        tx.execute(
+            "DELETE FROM channel_handoff_superseded
+             WHERE old_channel_id = ?1 AND version NOT IN (
+                 SELECT version FROM channel_handoff_superseded
+                 WHERE old_channel_id = ?1 ORDER BY version DESC LIMIT ?2
+             )",
+            params![old_channel_id, HANDOFF_SUPERSEDED_SEEDS_KEPT],
+        )?;
+        tx.commit()?;
         Ok(n > 0)
+    }
+
+    /// Seeds a newer offer replaced, created on first use like
+    /// `channel_handoff_commits`. `channel_handoff_pending` keeps the newest
+    /// alone, which is what builds predating this table read. `owner_seed` is
+    /// sealed like the newest one's and is listed in `CHAT_KEYED_COLUMNS`.
+    fn ensure_channel_handoff_superseded_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_handoff_superseded (
+                old_channel_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                successor_pubkey TEXT NOT NULL,
+                owner_seed TEXT,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (old_channel_id, version)
+            );",
+        )?;
+        Ok(())
     }
 
     pub fn load_handoff_pending_row(
@@ -8100,25 +8142,93 @@ impl Database {
         Ok(Some((pk, ver as u64, seed)))
     }
 
+    /// The seed minted for the offer at `version`, the newest or one it
+    /// superseded, if it is the one behind `successor_pubkey`.
     pub fn load_handoff_pending_seed(
         &self,
         old_channel_id: &str,
         successor_pubkey: &str,
         version: u64,
     ) -> anyhow::Result<Option<[u8; 32]>> {
-        let Some((pk, ver, seed)) = self.load_handoff_pending_row(old_channel_id)? else {
+        let stored: Option<(String, String)> = {
+            let conn = self.conn.lock();
+            Self::ensure_channel_handoff_superseded_locked(&conn)?;
+            conn.query_row(
+                "SELECT successor_pubkey, owner_seed FROM channel_handoff_pending
+                 WHERE old_channel_id = ?1 AND version = ?2
+                 UNION ALL
+                 SELECT successor_pubkey, owner_seed FROM channel_handoff_superseded
+                 WHERE old_channel_id = ?1 AND version = ?2
+                 LIMIT 1",
+                params![old_channel_id, version as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        };
+        let Some((pk, enc)) = stored else {
             return Ok(None);
         };
-        if pk != successor_pubkey || ver != version {
+        if pk != successor_pubkey {
             return Ok(None);
         }
-        Ok(Some(seed))
+        Ok(Some(Self::decrypt_channel_secret(
+            self.require_chat_key()?,
+            old_channel_id,
+            "handoff",
+            &enc,
+        )?))
+    }
+
+    /// Rooms holding a seed, the newest or a superseded one, minted at or
+    /// after `minted_since`.
+    pub fn handoff_seed_rooms(&self, minted_since: i64) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_handoff_superseded_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT old_channel_id FROM channel_handoff_pending WHERE created_at >= ?1
+             UNION
+             SELECT old_channel_id FROM channel_handoff_superseded WHERE created_at >= ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![minted_since], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    /// Drop seeds minted before `minted_before` for rooms this device no
+    /// longer lists. Forgetting a room keeps its seeds (see
+    /// [`Self::delete_channel`]), and with the row gone no handoff will ever
+    /// finish and clear them.
+    pub fn prune_forgotten_handoff_seeds(&self, minted_before: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        Self::ensure_channel_handoff_superseded_locked(&tx)?;
+        for table in ["channel_handoff_pending", "channel_handoff_superseded"] {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE created_at < ?1
+                       AND old_channel_id NOT IN (SELECT channel_id FROM channels)"
+                ),
+                params![minted_before],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn clear_handoff_pending(&self, old_channel_id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
+        Self::clear_handoff_seeds_locked(&conn, old_channel_id)
+    }
+
+    fn clear_handoff_seeds_locked(conn: &Connection, old_channel_id: &str) -> anyhow::Result<()> {
+        Self::ensure_channel_handoff_superseded_locked(conn)?;
         conn.execute(
             "DELETE FROM channel_handoff_pending WHERE old_channel_id = ?1",
+            params![old_channel_id],
+        )?;
+        conn.execute(
+            "DELETE FROM channel_handoff_superseded WHERE old_channel_id = ?1",
             params![old_channel_id],
         )?;
         Ok(())
@@ -8403,17 +8513,23 @@ impl Database {
         Ok(())
     }
 
-    /// Copy history into the successor and drop the nominee-side seed row.
+    /// Copy history into the successor and drop the nominee-side seed rows.
     ///
     /// Outside the handoff transaction: 5,000 inserts is too long to hold the
     /// write lock for, and it is safe to resume because `predecessor_id` is
     /// already recorded and the message IDs are deterministic.
+    ///
+    /// Copies keep their read flag, and the old room's copied lines are then
+    /// marked read, so an unread line is counted once, in the successor.
+    /// Marked only after every copy: a resumed copy takes its flag from the
+    /// old line.
     fn finish_channel_handoff(
         &self,
         old_channel_id: &str,
         successor_channel_id: &str,
     ) -> anyhow::Result<()> {
         let history = self.get_channel_messages(old_channel_id, 5_000, None)?;
+        let mut copied_unread = Vec::new();
         for row in history.into_iter().rev() {
             let msg_id = format!("handoff-{old_channel_id}-{}", row.id);
             // No signature travels with a handoff copy. The author signed the
@@ -8435,12 +8551,31 @@ impl Database {
             // not verify here anyway, so the quote is carried by pointing the
             // copy at its parent's copy. Oldest first, so that copy is already
             // written; local-only like the rest of a handoff copy.
+            if copied.is_ok() && !row.read {
+                copied_unread.push(row.id);
+            }
             if let (Ok(copy_id), Some(parent)) = (copied, row.reply_parent.as_ref()) {
                 let _ = self.conn.lock().execute(
                     "UPDATE channel_messages SET reply_to = ?1 WHERE id = ?2",
                     params![format!("handoff-{old_channel_id}-{}", parent.id), copy_id],
                 );
             }
+        }
+        // Only lines whose copy landed, so each unread line is counted once:
+        // in the successor if it was copied, here if it was not (past the copy
+        // window, or a copy that failed).
+        if !copied_unread.is_empty() {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction()?;
+            {
+                let mut mark = tx.prepare(
+                    "UPDATE channel_messages SET read = 1 WHERE channel_id = ?1 AND id = ?2",
+                )?;
+                for id in copied_unread {
+                    mark.execute(params![old_channel_id, id])?;
+                }
+            }
+            tx.commit()?;
         }
         let _ = self.clear_handoff_pending(old_channel_id);
         Ok(())
@@ -18214,6 +18349,140 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A re-offer mints a new seed, but the record the owner ends up adopting
+    /// can be the one it stored for an earlier offer. That seed has to stay
+    /// installable until the room has moved.
+    #[test]
+    fn a_superseded_handoff_seed_stays_installable_until_the_room_moves() {
+        let (db, path) = handoff_test_db("superseded-seeds");
+        let room = "5f".repeat(16);
+        let key = |n: u8| format!("{n:02x}").repeat(32);
+        for n in 1..=6u8 {
+            assert!(db
+                .store_handoff_pending_seed(&room, 99 + u64::from(n), &key(n), &[n; 32])
+                .unwrap());
+        }
+        assert_eq!(
+            db.load_handoff_pending_row(&room).unwrap(),
+            Some((key(6), 105, [6; 32])),
+            "the newest offer's seed is still the one an offer is answered with"
+        );
+        assert_eq!(db.load_handoff_pending_seed(&room, &key(5), 104).unwrap(), Some([5; 32]));
+        assert_eq!(db.load_handoff_pending_seed(&room, &key(3), 102).unwrap(), Some([3; 32]));
+        assert!(
+            db.load_handoff_pending_seed(&room, &key(2), 101).unwrap().is_none(),
+            "only the last few offers' seeds are kept"
+        );
+        assert!(
+            db.load_handoff_pending_seed(&room, &key(4), 102).unwrap().is_none(),
+            "a seed answers only for the key it was minted as"
+        );
+
+        assert!(
+            !db.store_handoff_pending_seed(&room, 103, &key(9), &[9; 32]).unwrap(),
+            "an earlier offer replayed late still mints nothing"
+        );
+        assert_eq!(db.load_handoff_pending_seed(&room, &key(4), 103).unwrap(), Some([4; 32]));
+
+        db.clear_handoff_pending(&room).unwrap();
+        assert!(db.load_handoff_pending_seed(&room, &key(5), 104).unwrap().is_none());
+        assert!(db.load_handoff_pending_row(&room).unwrap().is_none());
+
+        drop_handoff_test_db(db, path);
+    }
+
+    /// Forgetting a room the owner may already have handed to us must not
+    /// throw away the only key to the successor its members are following.
+    #[test]
+    fn forgetting_a_room_keeps_its_handoff_seeds_until_they_age_out() {
+        let (db, path) = handoff_test_db("forgotten-seeds");
+        let room = "6a".repeat(16);
+        let listed = "6b".repeat(16);
+        for id in [&room, &listed] {
+            db.insert_channel(id, &"d4".repeat(32), "Room", "public", false, None, None)
+                .unwrap();
+        }
+        assert!(db
+            .store_handoff_pending_seed(&room, 100, &"a1".repeat(32), &[0x11; 32])
+            .unwrap());
+        assert!(db
+            .store_handoff_pending_seed(&room, 101, &"b2".repeat(32), &[0x22; 32])
+            .unwrap());
+        assert!(db
+            .store_handoff_pending_seed(&listed, 100, &"c3".repeat(32), &[0x33; 32])
+            .unwrap());
+        let now = chrono::Utc::now().timestamp();
+        let mut seeded = db.handoff_seed_rooms(now - 60).unwrap();
+        seeded.sort();
+        assert_eq!(seeded, vec![room.clone(), listed.clone()]);
+        assert!(
+            db.handoff_seed_rooms(now + 60).unwrap().is_empty(),
+            "a seed minted before the horizon no longer counts"
+        );
+
+        assert!(db.set_channel_in_room(&room, false).unwrap());
+        assert!(db.delete_channel(&room, None).unwrap());
+        assert_eq!(
+            db.load_handoff_pending_seed(&room, &"a1".repeat(32), 100).unwrap(),
+            Some([0x11; 32])
+        );
+        db.prune_forgotten_handoff_seeds(now - 60).unwrap();
+        assert_eq!(
+            db.load_handoff_pending_seed(&room, &"b2".repeat(32), 101).unwrap(),
+            Some([0x22; 32]),
+            "a recent seed outlives forgetting its room"
+        );
+
+        db.prune_forgotten_handoff_seeds(now + 60).unwrap();
+        assert!(db.load_handoff_pending_seed(&room, &"a1".repeat(32), 100).unwrap().is_none());
+        assert!(db.load_handoff_pending_seed(&room, &"b2".repeat(32), 101).unwrap().is_none());
+        assert_eq!(
+            db.load_handoff_pending_seed(&listed, &"c3".repeat(32), 100).unwrap(),
+            Some([0x33; 32]),
+            "a room still listed keeps its seed whatever its age"
+        );
+
+        assert!(db.tombstone_channel(&listed).unwrap());
+        assert!(db.load_handoff_pending_seed(&listed, &"c3".repeat(32), 100).unwrap().is_none());
+
+        drop_handoff_test_db(db, path);
+    }
+
+    /// Copies keep each line's read flag, so the old room's copied lines have
+    /// to stop counting or every unread line is counted twice.
+    #[test]
+    fn a_followed_handoff_counts_each_unread_line_once_in_the_successor() {
+        let (db, path) = handoff_test_db("unread-once");
+        let old_id = "7c".repeat(16);
+        let successor_id = "8e".repeat(16);
+        let them = "b2".repeat(32);
+        db.insert_channel(&old_id, &"a1".repeat(32), "Room", "public", false, None, None)
+            .unwrap();
+        db.insert_channel_message(&old_id, &them, "received", "seen", "m1", 100, "", true)
+            .unwrap();
+        db.insert_channel_message(&old_id, &them, "received", "unseen", "m2", 101, "", false)
+            .unwrap();
+        db.insert_channel_message(&old_id, &them, "received", "unseen too", "m3", 102, "", false)
+            .unwrap();
+        assert_eq!(db.get_channel(&old_id).unwrap().unwrap().unread, 2);
+
+        assert!(db
+            .apply_channel_handoff(&old_id, &"9d".repeat(32), &successor_id, 1, false, None)
+            .unwrap());
+        assert_eq!(db.get_channel(&successor_id).unwrap().unwrap().unread, 2);
+        assert_eq!(db.get_channel(&old_id).unwrap().unwrap().unread, 0);
+
+        db.insert_channel_message(&old_id, &them, "received", "not followed yet", "m4", 103, "", false)
+            .unwrap();
+        assert_eq!(
+            db.get_channel(&old_id).unwrap().unwrap().unread,
+            1,
+            "a line arriving after the copy is the old room's own"
+        );
+
+        drop_handoff_test_db(db, path);
     }
 
     fn handoff_test_db(tag: &str) -> (Database, std::path::PathBuf) {

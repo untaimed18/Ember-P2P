@@ -1361,7 +1361,7 @@ pub(super) async fn handle_udp_packet_inner(
 
             // eMule: first FindNode(self) only after MIN2S(3) from KAD start (not on first packet).
             const SELF_LOOKUP_FIRST_DELAY_SECS: i64 = 3 * 60;
-            let now_ts = chrono::Utc::now().timestamp();
+            let now_ts = crate::network::monotonic_secs();
             if !state.self_lookup_done
                 && table_size >= 2
                 && now_ts >= state.kad_started_at + SELF_LOOKUP_FIRST_DELAY_SECS
@@ -2383,7 +2383,7 @@ pub(super) async fn handle_udp_packet_inner(
             }
             if load >= 100 {
                 if let std::net::IpAddr::V4(ipv4) = from.ip() {
-                    let now = chrono::Utc::now().timestamp();
+                    let now = crate::network::monotonic_secs();
                     state.overloaded_nodes.insert(ipv4, now);
                     info!("Node {from} reported full load, will avoid publishing to it for 10 min");
                 }

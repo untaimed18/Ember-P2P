@@ -336,13 +336,6 @@ impl StatsManager {
         ]
     }
 
-    pub fn save_cumulative(&self, db: &Database) {
-        let pairs = self.cumulative_save_pairs();
-        if let Err(e) = db.save_statistics(&pairs) {
-            tracing::warn!("Failed to save statistics: {e}");
-        }
-    }
-
     /// Snapshot the session byte counters and recompute the smoothed
     /// download/upload rates. `now` is the current unix timestamp in
     /// seconds (injected rather than read internally so the rate math is

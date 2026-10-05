@@ -1638,7 +1638,12 @@ struct FileRequestTracker {
     /// requests from different people looked like one client re-asking inside
     /// `MIN_REQUESTTIME` and `BADCLIENTBAN` banned the whole address for
     /// seven days. Only a peer that sent no user hash falls back to its IP.
-    entries: HashMap<(QueueIdentity, [u8; 16]), (std::time::Instant, u32)>,
+    ///
+    /// The value also carries the address the strikes were earned from: the
+    /// user hash travels in the clear and the ban lands on an IP, so strikes
+    /// primed under a hash from one address must not count toward banning
+    /// another.
+    entries: HashMap<(QueueIdentity, [u8; 16]), (std::time::Instant, u32, IpAddr)>,
     /// When the 1h expiry sweep last ran. The sweep is driven from the
     /// `OP_STARTUPLOADREQ` path, which every uploading peer shares through one
     /// mutex, so running it per request made a full `retain` part of the cost
@@ -1693,13 +1698,21 @@ impl FileRequestTracker {
     fn record_request(
         &mut self,
         identity: QueueIdentity,
+        peer_ip: IpAddr,
         file_hash: [u8; 16],
         is_friend_slot: bool,
         downloading_from_peer: bool,
     ) -> bool {
         let now = std::time::Instant::now();
+        let peer_ip = peer_ip.to_canonical();
         let key = (identity, file_hash);
-        if let Some((last_time, bad_count)) = self.entries.get_mut(&key) {
+        if let Some((last_time, bad_count, strike_ip)) = self.entries.get_mut(&key) {
+            if *strike_ip != peer_ip {
+                *strike_ip = peer_ip;
+                *bad_count = 0;
+                *last_time = now;
+                return false;
+            }
             if last_time.elapsed().as_secs() < MIN_REQUESTTIME_SECS && !is_friend_slot {
                 // eMule adds `(GetDownloadState() != DS_DOWNLOADING)`, i.e. zero
                 // while the peer is uploading to us, which still refreshes the
@@ -1716,7 +1729,7 @@ impl FileRequestTracker {
             *last_time = now;
             false
         } else {
-            self.entries.insert(key, (now, 0));
+            self.entries.insert(key, (now, 0, peer_ip));
             false
         }
     }
@@ -1727,7 +1740,7 @@ impl FileRequestTracker {
     /// `OP_OUTOFPARTREQS` — so a rotation we initiated cannot be counted
     /// against the peer that complied with it.
     fn forgive_requeue(&mut self, identity: QueueIdentity, file_hash: [u8; 16]) {
-        if let Some((_, bad_count)) = self.entries.get_mut(&(identity, file_hash)) {
+        if let Some((_, bad_count, _)) = self.entries.get_mut(&(identity, file_hash)) {
             *bad_count = 0;
         }
     }
@@ -1742,7 +1755,7 @@ impl FileRequestTracker {
         {
             self.last_sweep = Some(now);
             self.entries
-                .retain(|_, (t, _)| t.elapsed().as_secs() < 3600);
+                .retain(|_, (t, _, _)| t.elapsed().as_secs() < 3600);
         }
         // Hard cap: a peer rotating through millions of distinct file
         // hashes within the 1h window could otherwise grow this map
@@ -1755,13 +1768,13 @@ impl FileRequestTracker {
             // map and building a `HashSet` of survivors: O(n) instead of
             // O(n log n), and no second allocation the size of the map.
             let mut times: Vec<std::time::Instant> =
-                self.entries.values().map(|(t, _)| *t).collect();
+                self.entries.values().map(|(t, _, _)| *t).collect();
             if FILE_REQUEST_TRIM_TARGET < times.len() {
                 // Descending, so index `FILE_REQUEST_TRIM_TARGET` is the oldest
                 // entry we still intend to keep.
                 times.select_nth_unstable_by(FILE_REQUEST_TRIM_TARGET, |a, b| b.cmp(a));
                 let cutoff = times[FILE_REQUEST_TRIM_TARGET];
-                self.entries.retain(|_, (t, _)| *t > cutoff);
+                self.entries.retain(|_, (t, _, _)| *t > cutoff);
             }
         }
     }
@@ -3403,6 +3416,8 @@ struct SlotBandwidth {
     /// the wire, advanced by `bytes / share` on every grant.
     send_by: std::time::Instant,
     last_send: std::time::Instant,
+    /// The share `send_by` was last booked against.
+    share: Option<u64>,
 }
 
 impl SlotBandwidth {
@@ -3411,7 +3426,41 @@ impl SlotBandwidth {
         Self {
             send_by: now,
             last_send: now,
+            share: None,
         }
+    }
+
+    /// How long `bytes` takes at `share`; a slot with no share is held to the
+    /// trickle's own rate, one packet per [`TRICKLE_BLOCK_DEADLINE`], which is
+    /// all `GetNeededBytes` ever grants it.
+    fn owed(bytes: u64, share: Option<u64>) -> std::time::Duration {
+        match share {
+            Some(share) => std::time::Duration::from_nanos(
+                (u128::from(bytes) * 1_000_000_000 / u128::from(share.max(1)))
+                    .min(u128::from(u64::MAX)) as u64,
+            ),
+            None => TRICKLE_BLOCK_DEADLINE,
+        }
+    }
+
+    /// Debt booked at an old share — before promotion past `maxSlot`, a slot
+    /// opening or closing, a new limit — is not owed at the new one: the slot
+    /// waits at most one `bytes`-sized packet at the share it now has.
+    ///
+    /// Only a change of standing counts: gaining or losing a share, or one that
+    /// moved by more than a tenth. USS retunes the rate about every second, and
+    /// rebasing on each of those would forgive every slot its spare-token debt.
+    fn rebase(&mut self, bytes: u64, share: Option<u64>) {
+        let changed = match (self.share, share) {
+            (Some(old), Some(new)) => old.abs_diff(new).saturating_mul(10) > old.max(1),
+            (old, new) => old != new,
+        };
+        if !changed {
+            return;
+        }
+        self.share = share;
+        let cap = std::time::Instant::now() + Self::owed(bytes, share);
+        self.send_by = self.send_by.min(cap);
     }
 
     /// Whether the trickle pass owes this slot the `bytes`-sized packet it is
@@ -3441,19 +3490,17 @@ impl SlotBandwidth {
     ///
     /// `send_by` is floored at `now` so an idle slot banks no credit — eMule's
     /// budget is global and likewise carries nothing forward per slot. A slot
-    /// with no share is held to the trickle's own rate, one packet per
-    /// [`TRICKLE_BLOCK_DEADLINE`], which is all `GetNeededBytes` ever grants it.
+    /// with no share does not accumulate either: every packet it sends went
+    /// out on the trickle or on spare tokens, never against a share it owes.
     fn charge(&mut self, bytes: u64, share: Option<u64>) {
         let now = std::time::Instant::now();
         self.last_send = now;
-        let owed = match share {
-            Some(share) => std::time::Duration::from_nanos(
-                (u128::from(bytes) * 1_000_000_000 / u128::from(share.max(1)))
-                    .min(u128::from(u64::MAX)) as u64,
-            ),
-            None => TRICKLE_BLOCK_DEADLINE,
+        self.share = share;
+        let owed = Self::owed(bytes, share);
+        self.send_by = match share {
+            Some(_) => self.send_by.max(now) + owed,
+            None => now + owed,
         };
-        self.send_by = self.send_by.max(now) + owed;
     }
 }
 
@@ -6737,6 +6784,9 @@ impl UploadHandler {
         let skip_diversions = outbound || inbound_stream;
         let relayed = matches!(init, ConnInit::InboundStream { relayed: true, .. });
         let attach_addr = (!relayed).then_some(peer_addr);
+        // A relayed session's address is the relay's, never the IP a verified
+        // identity was pinned to, so credit is judged as for an unknown address.
+        let credit_peer_ip = if relayed { 0 } else { peer_ip_u32(Some(peer_addr)) };
 
         // Check if already banned (fast path), but don't count yet --
         // buddy/KAD callback connections are legitimate and shouldn't
@@ -8885,14 +8935,15 @@ impl UploadHandler {
                             "Re-sending EPX to {peer_addr} (gen {}->{}, {} bytes)",
                             last_epx_generation, current_gen, epx_data.len()
                         );
+                        self.bandwidth_limiter.charge_upload((6 + epx_data.len()) as u64);
                         if write_packet_async(
-                            &mut writer,
-                            OP_EMULEPROT,
-                            OP_EMBER_SOURCEEXCHANGE,
-                            &epx_data,
-                        )
-                        .await
-                        .is_ok()
+                                &mut writer,
+                                OP_EMULEPROT,
+                                OP_EMBER_SOURCEEXCHANGE,
+                                &epx_data,
+                            )
+                            .await
+                            .is_ok()
                         {
                             last_epx_generation = current_gen;
                             self.epx_overhead.record_upload((6 + epx_data.len()) as u64);
@@ -8945,7 +8996,14 @@ impl UploadHandler {
                         })
                         .await;
                         match wrote {
-                            Ok(Ok(())) => continue,
+                            Ok(Ok(())) => {
+                                // Charged after the fact and never waited on:
+                                // these frames are chat, browse and acks, which
+                                // must not queue behind the slots' data.
+                                self.bandwidth_limiter
+                                    .charge_upload(outbound_data.len() as u64);
+                                continue;
+                            }
                             Ok(Err(e)) => {
                                 info!("Ending session with {peer_addr}: outbound write failed: {e}");
                             }
@@ -9614,6 +9672,7 @@ impl UploadHandler {
                                     }
                                 }
                             }
+                            self.bandwidth_limiter.charge_upload((6 + status_payload.len()) as u64);
                             write_packet_async(
                                 &mut writer,
                                 OP_EDONKEYHEADER,
@@ -9696,6 +9755,7 @@ impl UploadHandler {
                             resp.extend_from_slice(&hash);
                             resp.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
                             resp.extend_from_slice(name_bytes);
+                            self.bandwidth_limiter.charge_upload((6 + resp.len()) as u64);
                             write_packet_async(
                                 &mut writer,
                                 OP_EDONKEYHEADER,
@@ -9831,6 +9891,7 @@ impl UploadHandler {
                                 tracker.cleanup_stale();
                                 tracker.record_request(
                                     QueueIdentity::from_peer(peer_user_hash, peer_addr),
+                                    peer_addr.ip(),
                                     h,
                                     is_friend_slot,
                                     downloading_from_peer,
@@ -10149,7 +10210,7 @@ impl UploadHandler {
                             // wait=0 got almost everyone refused.
                             let new_fh = current_file_hash.unwrap_or([0u8; 16]);
                             let ember_verified = secure_v2_authenticated;
-                            let peer_ip = peer_ip_u32(Some(peer_addr));
+                            let peer_ip = credit_peer_ip;
                             let queued = QueuedPerFile::new(&queue);
                             let new_combined = combined_file_prio_and_credit(
                                 &cm,
@@ -11349,7 +11410,11 @@ impl UploadHandler {
                         unflushed_credit_bytes = 0;
                         {
                             let mut cm = self.credit_manager.write().await;
-                            cm.add_uploaded(peer_user_hash, batch_credited_bytes);
+                            cm.add_uploaded(
+                                peer_user_hash,
+                                credit_peer_ip,
+                                batch_credited_bytes,
+                            );
                             // Ember credit ledger: mirrors the eMule
                             // credit write for peers that have
                             // advertised an Ed25519 pubkey AND
@@ -11809,7 +11874,7 @@ impl UploadHandler {
                                 // eMule soft→hard: CombinedFilePrioAndCredit (no wait)
                                 let new_fh = current_file_hash.unwrap_or([0u8; 16]);
                                 let ember_verified = secure_v2_authenticated;
-                                let peer_ip = peer_ip_u32(Some(peer_addr));
+                                let peer_ip = credit_peer_ip;
                                 let queued = QueuedPerFile::new(&queue);
                                 let new_combined = combined_file_prio_and_credit(
                                     &cm,
@@ -12618,6 +12683,7 @@ impl UploadHandler {
                                 } else {
                                     OP_MULTIPACKETANSWER
                                 };
+                                self.bandwidth_limiter.charge_upload((6 + answer.len()) as u64);
                                 write_packet_async(
                                     &mut writer,
                                     OP_EMULEPROT,
@@ -12648,6 +12714,7 @@ impl UploadHandler {
                                                     peer_source_exchange_ver,
                                                 )
                                             };
+                                            self.bandwidth_limiter.charge_upload((6 + resp.len()) as u64);
                                             write_packet_async(
                                                 &mut writer,
                                                 OP_EMULEPROT,
@@ -12666,6 +12733,7 @@ impl UploadHandler {
                                                 let sm = self.source_manager.read().await;
                                                 sm.build_answer_sources2_versioned(&mpreq.file_hash, exclude_ip, *version)
                                             };
+                                            self.bandwidth_limiter.charge_upload((6 + resp.len()) as u64);
                                             write_packet_async(
                                                 &mut writer,
                                                 OP_EMULEPROT,
@@ -12704,8 +12772,10 @@ impl UploadHandler {
                     // adds a few bytes when enabled; the unobfuscated
                     // size is a reasonable lower bound.
                     self.sx_overhead.record_download((6 + payload.len()) as u64);
-                    // SX v1: respond with OP_ANSWERSOURCES (legacy v1 format)
-                    if let Some(hash) = current_file_hash {
+                    // SX v1: Hash(16), answered with OP_ANSWERSOURCES (legacy v1 format)
+                    if payload.len() >= 16 {
+                        let mut hash = [0u8; 16];
+                        hash.copy_from_slice(&payload[..16]);
                         let peer = PeerFileAccess {
                             ember_hash: peer_ember_hash,
                             secure_v2_authenticated,
@@ -12725,6 +12795,7 @@ impl UploadHandler {
                                 peer_source_exchange_ver,
                             )
                         };
+                        self.bandwidth_limiter.charge_upload((6 + resp.len()) as u64);
                         write_packet_async(
                             &mut writer,
                             OP_EMULEPROT,
@@ -12758,6 +12829,7 @@ impl UploadHandler {
                             let sm = self.source_manager.read().await;
                             sm.build_answer_sources2_versioned(&hash, exclude_ip, requested_version)
                         };
+                        self.bandwidth_limiter.charge_upload((6 + resp.len()) as u64);
                         write_packet_async(
                             &mut writer,
                             OP_EMULEPROT,
@@ -13167,14 +13239,15 @@ impl UploadHandler {
                                                 "Sending EPX to bound Ember peer {peer_addr} ({} bytes, gen {gen})",
                                                 epx_data.len()
                                             );
+                                            self.bandwidth_limiter.charge_upload((6 + epx_data.len()) as u64);
                                             if write_packet_async(
-                                                &mut writer,
-                                                OP_EMULEPROT,
-                                                OP_EMBER_SOURCEEXCHANGE,
-                                                &epx_data,
-                                            )
-                                            .await
-                                            .is_ok()
+                                                    &mut writer,
+                                                    OP_EMULEPROT,
+                                                    OP_EMBER_SOURCEEXCHANGE,
+                                                    &epx_data,
+                                                )
+                                                .await
+                                                .is_ok()
                                             {
                                                 last_epx_generation = gen;
                                                 last_epx_resend = std::time::Instant::now();
@@ -13478,14 +13551,15 @@ impl UploadHandler {
                                         "Sending EPX to verified Ember peer {peer_addr} ({} bytes, gen {gen})",
                                         epx_data.len()
                                     );
+                                    self.bandwidth_limiter.charge_upload((6 + epx_data.len()) as u64);
                                     if write_packet_async(
-                                        &mut writer,
-                                        OP_EMULEPROT,
-                                        OP_EMBER_SOURCEEXCHANGE,
-                                        &epx_data,
-                                    )
-                                    .await
-                                    .is_ok()
+                                            &mut writer,
+                                            OP_EMULEPROT,
+                                            OP_EMBER_SOURCEEXCHANGE,
+                                            &epx_data,
+                                        )
+                                        .await
+                                        .is_ok()
                                     {
                                         last_epx_generation = gen;
                                         last_epx_resend = std::time::Instant::now();
@@ -14032,7 +14106,11 @@ impl UploadHandler {
 
         if unflushed_credit_bytes > 0 {
             let mut cm = self.credit_manager.write().await;
-            cm.add_uploaded(peer_user_hash, unflushed_credit_bytes);
+            cm.add_uploaded(
+                peer_user_hash,
+                credit_peer_ip,
+                unflushed_credit_bytes,
+            );
             if let Some(pk) = hello_caps.ember_pubkey {
                 cm.add_ember_uploaded(pk, unflushed_credit_bytes, secure_v2_authenticated);
             }
@@ -14187,6 +14265,7 @@ impl UploadHandler {
         };
 
         let share = slot_share_per_sec(allowed, open_slots, index);
+        slot.rebase(bytes, share);
         // eMule's leftover pass will spend down to its last fragment rather than
         // let the uplink idle (`max(bytesToSpend - spentBytes, doubleSendSize)`,
         // `UploadBandwidthThrottler.cpp:593`), so surplus counts from one
@@ -16660,6 +16739,32 @@ mod abuse_and_seniority_tests {
         );
     }
 
+    #[test]
+    fn a_shareless_slot_builds_no_debt_and_promotion_caps_what_it_owes() {
+        use std::time::Duration;
+        let mut slot = SlotBandwidth::new();
+        for _ in 0..100 {
+            slot.charge(10_240, None);
+        }
+        let owed = slot.send_by.duration_since(std::time::Instant::now());
+        assert!(
+            owed <= TRICKLE_BLOCK_DEADLINE,
+            "packets sent on spare tokens must not stack debt, got {owed:?}"
+        );
+
+        // Promoted into `maxSlot`: one packet at the new share is all it waits.
+        slot.rebase(10_240, Some(10_240));
+        let owed = slot.send_by.duration_since(std::time::Instant::now());
+        assert!(owed <= Duration::from_secs(1), "promotion left {owed:?} of debt");
+
+        // Debt booked at the share it still has is kept.
+        slot.charge(10_240, Some(10_240));
+        slot.charge(10_240, Some(10_240));
+        let before = slot.send_by;
+        slot.rebase(10_240, Some(10_240));
+        assert_eq!(slot.send_by, before);
+    }
+
     /// The hard limit is derived from the soft one, so the pair has to stay in
     /// eMule's relationship: `soft + max(soft, 800) / 4` (`UploadQueue.cpp:621`).
     #[test]
@@ -16859,6 +16964,8 @@ mod abuse_and_seniority_tests {
         QueueIdentity::Ip(ip.parse().unwrap())
     }
 
+    const STRIKE_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 1));
+
     /// Two eMules behind one NAT are two clients, and eMule's own
     /// `AddRequestCount` counts per client. Sharing one counter meant their
     /// ordinary interleaved requests looked like a single peer re-asking
@@ -16873,13 +16980,13 @@ mod abuse_and_seniority_tests {
 
         // Both clients ask, then each re-asks immediately. Per-identity that
         // is one strike each, nowhere near BADCLIENTBAN.
-        assert!(!tracker.record_request(a.clone(), hash, false, false));
-        assert!(!tracker.record_request(b.clone(), hash, false, false));
+        assert!(!tracker.record_request(a.clone(), STRIKE_IP, hash, false, false));
+        assert!(!tracker.record_request(b.clone(), STRIKE_IP, hash, false, false));
         backdate(&mut tracker, &a, hash, 1);
         backdate(&mut tracker, &b, hash, 1);
-        assert!(!tracker.record_request(a.clone(), hash, false, false));
+        assert!(!tracker.record_request(a.clone(), STRIKE_IP, hash, false, false));
         assert!(
-            !tracker.record_request(b.clone(), hash, false, false),
+            !tracker.record_request(b.clone(), STRIKE_IP, hash, false, false),
             "one client's re-ask must not push another client toward a ban"
         );
         assert_eq!(tracker.entries[&(a, hash)].1, 1);
@@ -17006,13 +17113,13 @@ mod abuse_and_seniority_tests {
         let id = ident("203.0.113.9");
         let hash = [3u8; 16];
 
-        tracker.record_request(id.clone(), hash, false, false);
+        tracker.record_request(id.clone(), STRIKE_IP, hash, false, false);
         backdate(&mut tracker, &id, hash, 1);
-        assert!(!tracker.record_request(id.clone(), hash, false, false));
+        assert!(!tracker.record_request(id.clone(), STRIKE_IP, hash, false, false));
         assert_eq!(tracker.entries[&(id.clone(), hash)].1, 1);
 
         backdate(&mut tracker, &id, hash, MIN_REQUESTTIME_SECS + 1);
-        assert!(!tracker.record_request(id.clone(), hash, false, false));
+        assert!(!tracker.record_request(id.clone(), STRIKE_IP, hash, false, false));
         assert_eq!(
             tracker.entries[&(id, hash)].1,
             0,
@@ -17029,14 +17136,14 @@ mod abuse_and_seniority_tests {
         let id = ident("203.0.113.10");
         let hash = [4u8; 16];
 
-        tracker.record_request(id.clone(), hash, false, false);
+        tracker.record_request(id.clone(), STRIKE_IP, hash, false, false);
         backdate(&mut tracker, &id, hash, 1);
-        assert!(!tracker.record_request(id.clone(), hash, false, false));
+        assert!(!tracker.record_request(id.clone(), STRIKE_IP, hash, false, false));
 
         tracker.forgive_requeue(id.clone(), hash);
         backdate(&mut tracker, &id, hash, 1);
         assert!(
-            !tracker.record_request(id, hash, false, false),
+            !tracker.record_request(id, STRIKE_IP, hash, false, false),
             "a forgiven rotation must not leave the peer one request from a ban"
         );
     }
@@ -17047,13 +17154,43 @@ mod abuse_and_seniority_tests {
         let id = ident("203.0.113.11");
         let hash = [5u8; 16];
 
-        tracker.record_request(id.clone(), hash, false, false);
+        tracker.record_request(id.clone(), STRIKE_IP, hash, false, false);
         let mut banned = false;
         for _ in 0..BADCLIENTBAN {
             backdate(&mut tracker, &id, hash, 1);
-            banned |= tracker.record_request(id.clone(), hash, false, false);
+            banned |= tracker.record_request(id.clone(), STRIKE_IP, hash, false, false);
         }
         assert!(banned, "the ban must stay reachable for a genuinely abusive peer");
+    }
+
+    #[test]
+    fn strikes_primed_under_a_user_hash_do_not_ban_another_address() {
+        let mut tracker = FileRequestTracker::new();
+        let id = QueueIdentity::UserHash([0xCC; 16]);
+        let hash = [8u8; 16];
+        let primer: IpAddr = "198.51.100.30".parse().unwrap();
+        let victim: IpAddr = "198.51.100.31".parse().unwrap();
+
+        tracker.record_request(id.clone(), primer, hash, false, false);
+        for _ in 0..BADCLIENTBAN - 1 {
+            backdate(&mut tracker, &id, hash, 1);
+            assert!(!tracker.record_request(id.clone(), primer, hash, false, false));
+        }
+        backdate(&mut tracker, &id, hash, 1);
+        assert!(
+            !tracker.record_request(id.clone(), victim, hash, false, false),
+            "the request that would cross BADCLIENTBAN came from a different address"
+        );
+        assert_eq!(tracker.entries[&(id.clone(), hash)].1, 0);
+
+        let mapped: IpAddr = "::ffff:198.51.100.31".parse().unwrap();
+        backdate(&mut tracker, &id, hash, 1);
+        tracker.record_request(id.clone(), mapped, hash, false, false);
+        assert_eq!(
+            tracker.entries[&(id, hash)].1,
+            1,
+            "the IPv4-mapped form is the same address"
+        );
     }
 
     /// eMule never strikes a friend holding a friend slot, and adds nothing while
@@ -17070,11 +17207,11 @@ mod abuse_and_seniority_tests {
         ] {
             let mut tracker = FileRequestTracker::new();
             let id = ident("203.0.113.12");
-            tracker.record_request(id.clone(), hash, is_friend, downloading);
+            tracker.record_request(id.clone(), STRIKE_IP, hash, is_friend, downloading);
             for _ in 0..(BADCLIENTBAN * 3) {
                 backdate(&mut tracker, &id, hash, 1);
                 assert!(
-                    !tracker.record_request(id.clone(), hash, is_friend, downloading),
+                    !tracker.record_request(id.clone(), STRIKE_IP, hash, is_friend, downloading),
                     "{label} must never be banned by the request-frequency counter"
                 );
             }

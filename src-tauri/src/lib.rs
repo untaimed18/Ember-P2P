@@ -400,19 +400,19 @@ pub(crate) async fn run_graceful_shutdown(
     network::ed2k::peer_sessions::save_upload_requests(&storage::paths::resolve_data_dir());
 
     // Flush any learned spam signals not yet persisted by the periodic flush
-    // (e.g. an auto-not-spam that landed since the last tick). Wait briefly for
-    // the lock rather than the old non-blocking `try_write`, which silently
-    // skipped the save under contention. The network task has already shut down
-    // here, so the lock is normally free; the timeout is a safety net so
-    // shutdown can't hang.
+    // (e.g. an auto-not-spam that landed since the last tick). Through the save
+    // gate like every other spam-filter write: a periodic or IPC save still in
+    // flight would otherwise rename its older snapshot over this one. Bounded so
+    // a stuck writer cannot hang shutdown.
     match tokio::time::timeout_at(
         tokio::time::Instant::from_std(shutdown_deadline),
-        state.spam_filter.write(),
+        search::spam::SpamFilter::drain_saves(&state.spam_filter),
     )
     .await
     {
-        Ok(mut filter) => filter.save(),
-        Err(_) => tracing::warn!("Spam filter save skipped on shutdown: lock busy"),
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("Failed to save spam filter on shutdown: {e}"),
+        Err(_) => tracing::warn!("Spam filter save did not finish before the shutdown deadline"),
     };
 
     state.db.mark_clean_shutdown();
@@ -809,6 +809,9 @@ pub fn run() {
                             restore_download_folder_notice = download_folder_replaced;
                         }
                         Ok(StartupRestore::Expired) => restore_expired_notice = true,
+                        // The restored profile is the one in use; only the
+                        // staged copies were left behind, and are retried.
+                        Ok(StartupRestore::AlreadyApplied) => {}
                     }
                 }
                 Err(e) => tracing::error!("Failed to prepare the data dir: {e}"),

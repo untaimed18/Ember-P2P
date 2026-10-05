@@ -175,7 +175,7 @@ pub(in crate::network) async fn on_cache_refresh_tick(
     let db_ref = db.clone();
     let li_ref = local_index.clone();
     let app_for_cache = app_handle.clone();
-    *last_cache_refresh_started_at = chrono::Utc::now().timestamp();
+    *last_cache_refresh_started_at = crate::network::monotonic_secs();
     // Marked applied here rather than inside the task: the watchdog
     // never aborts this one, and a task that panics only costs a
     // delayed merge, which the next known.met change re-triggers.

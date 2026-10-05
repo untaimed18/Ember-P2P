@@ -278,6 +278,55 @@ fn verify_restored_file(
     Ok(Ok(()))
 }
 
+/// The first of `candidates`, in the download folder `root`, that is this
+/// download's `size`-byte file. `Err` is why none was: a mismatch that only
+/// this download's bytes can give (its ed2k hash matched) wins, then a file
+/// that could not be read, as worth retrying. Blocking.
+fn find_published_file(
+    candidates: &[PathBuf],
+    root: &str,
+    size: u64,
+    expected: &str,
+    expected_aich: Option<&str>,
+    expected_ember: Option<&str>,
+) -> Result<PathBuf, String> {
+    const MISMATCH: &str = "Restored final file hash mismatch";
+    let mut unreadable = false;
+    let mut pin_mismatch = None;
+    for candidate in candidates {
+        // `None`: the file could not be read at all.
+        let verdict = (|| {
+            let verified =
+                crate::security::filesystem::verify_existing_path(candidate, &[root.to_string()])
+                    .ok()?;
+            let mut file = std::fs::File::open(&verified).ok()?;
+            if file.metadata().ok()?.len() != size {
+                return Some(Err(MISMATCH.to_string()));
+            }
+            // All three digests from one read. Checked one at a time, this
+            // walked a restored multi-GB file up to three times over — and a
+            // restore re-verification is the moment a user is waiting to
+            // learn whether their file survived.
+            verify_restored_file(&mut file, expected, expected_aich, expected_ember).ok()
+        })();
+        match verdict {
+            Some(Ok(())) => return Ok(candidate.clone()),
+            Some(Err(error)) if error != MISMATCH => {
+                pin_mismatch.get_or_insert(error);
+            }
+            Some(Err(_)) => {}
+            None => unreadable = true,
+        }
+    }
+    Err(pin_mismatch.unwrap_or_else(|| {
+        if unreadable {
+            "Restored final file could not be read".to_string()
+        } else {
+            MISMATCH.to_string()
+        }
+    }))
+}
+
 /// Run a restored download's blocking re-verification `check` and send the
 /// event it returns from the blocking task itself. Pause, Stop and Cancel
 /// abort the returned task but cannot stop the check, which may still publish
@@ -601,10 +650,32 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 TransferStatus::Verifying | TransferStatus::Completing
             ) {
                 let safe_name = crate::security::sanitize_filename(&transfer.file_name);
-                let final_path = PathBuf::from(&dl_folder).join("Downloads").join(&safe_name);
+                let published: Vec<PathBuf> = if part_path.exists() {
+                    Vec::new()
+                } else {
+                    // Listing Downloads is blocking I/O, and on a share that is
+                    // not answering it is a long one: off the network task, and
+                    // given up on rather than waited out.
+                    let downloads = PathBuf::from(&dl_folder).join("Downloads");
+                    let name = safe_name.clone();
+                    let listing = tokio::task::spawn_blocking(move || {
+                        ed2k::transfer::published_names(&downloads, &name)
+                            .into_iter()
+                            .filter(|path| path.exists())
+                            .collect::<Vec<_>>()
+                    });
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), listing).await {
+                        Ok(Ok(found)) => found,
+                        _ => {
+                            warn!("Could not list {dl_folder}/Downloads in time to recover {}", transfer.id);
+                            Vec::new()
+                        }
+                    }
+                };
 
-                if !part_path.exists() && final_path.exists() {
-                    // The .part is gone and a file with the target name
+                if !published.is_empty() {
+                    // The .part is gone and a file with the target name, or
+                    // the `name (N)` completion gives it when that is taken,
                     // exists. That usually means completion already moved
                     // the verified file and the app crashed before writing
                     // the terminal status. But a *pre-existing, unrelated*
@@ -625,7 +696,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                     // this file's official Ember hash.
                     let expected_ember = transfer.ember_file_hash.clone();
                     let ember_pinned = expected_ember.is_some();
-                    let verify_path = final_path.clone();
+                    let file_size = transfer.total_size;
                     let allowed_root = dl_folder.clone();
                     let tid = transfer.id.clone();
                     let tid_handle = tid.clone();
@@ -646,36 +717,15 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                         generation,
                         "Restored final file could not be read",
                         move || {
-                            // `Ok(())` verified, `Err(msg)` mismatched, and
-                            // `None` means the file could not be read at all.
-                            // Which check failed decides whether this is
-                            // worth retrying, so the reason travels with it.
-                            let read_and_verify = || {
-                                let verified_path =
-                                    crate::security::filesystem::verify_existing_path(
-                                        &verify_path,
-                                        &[allowed_root],
-                                    )
-                                    .ok()?;
-                                // All three digests from one read. Checked one
-                                // at a time, this walked a restored multi-GB
-                                // file up to three times over — and a restore
-                                // re-verification is the moment a user is
-                                // waiting to learn whether their file survived.
-                                let mut file = std::fs::File::open(&verified_path).ok()?;
-                                verify_restored_file(
-                                    &mut file,
-                                    &expected,
-                                    expected_aich.as_deref(),
-                                    expected_ember.as_deref(),
-                                )
-                                .ok()
-                            };
-                            let verdict = read_and_verify().unwrap_or_else(|| {
-                                Err("Restored final file could not be read".to_string())
-                            });
-                            match verdict {
-                                Ok(()) => DownloadEvent::Completed {
+                            match find_published_file(
+                                &published,
+                                &allowed_root,
+                                file_size,
+                                &expected,
+                                expected_aich.as_deref(),
+                                expected_ember.as_deref(),
+                            ) {
+                                Ok(final_path) => DownloadEvent::Completed {
                                     transfer_id: tid,
                                     final_path: Some(final_path.to_string_lossy().into_owned()),
                                     part_hashes: Vec::new(),
@@ -1338,6 +1388,41 @@ mod tests {
         assert_eq!(published, downloads.join("movie (1).bin"), "the same file by its hash");
         assert!(!same_bytes.exists());
         assert!(!downloads.join("movie (2).bin").exists());
+    }
+
+    /// Completion published the file as `name (1)` because `name` was taken,
+    /// then the app stopped before recording it: the restore finds it there.
+    #[test]
+    fn a_crash_after_a_numbered_publish_completes_from_the_numbered_name() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let scratch = Scratch::new("numbered-publish");
+        let (current, data) = (scratch.folder("current"), scratch.0.join("data"));
+        std::fs::create_dir_all(&data).unwrap();
+        let root = current.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(&data, std::slice::from_ref(&root))
+            .unwrap();
+        let finished = vec![5u8; 100];
+        let downloads = current.join("Downloads");
+        std::fs::write(downloads.join("movie.bin"), vec![6u8; 100]).unwrap();
+        std::fs::write(downloads.join("movie (1).bin"), &finished).unwrap();
+        let hash = ed2k::hash::ed2k_hash_open_file(
+            &mut std::fs::File::open(downloads.join("movie (1).bin")).unwrap(),
+        )
+        .unwrap();
+
+        let candidates = ed2k::transfer::published_names(&downloads, "movie.bin");
+        assert_eq!(
+            find_published_file(&candidates, &root, 100, &hash, None, None),
+            Ok(downloads.join("movie (1).bin"))
+        );
+
+        std::fs::remove_file(downloads.join("movie (1).bin")).unwrap();
+        let candidates = ed2k::transfer::published_names(&downloads, "movie.bin");
+        assert_eq!(
+            find_published_file(&candidates, &root, 100, &hash, None, None),
+            Err("Restored final file hash mismatch".to_string()),
+            "an unrelated file of the same name is not this download"
+        );
     }
 
     #[tokio::test]

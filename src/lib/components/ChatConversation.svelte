@@ -286,6 +286,9 @@
   let inputText = $state('');
   let loading = $state(false);
   let sending = $state(false);
+  /** Which send owns `sending`. A send that outlives a conversation switch
+   *  must not unlock the composer of a send started in the next one. */
+  let sendSeq = 0;
   let sendError: string | null = $state(null);
   let loadError: string | null = $state(null);
   // Non-blocking notice shown above the (successfully loaded) message list when
@@ -365,6 +368,24 @@
   let loadingOlder = $state(false);
   let hasMoreHistory = $state(false);
   let olderError = $state(false);
+  /**
+   * Holds the transcript's live region quiet while a page of history lands, so
+   * a screen reader announces arriving lines rather than reading out every row
+   * a load or "Load older" inserted. Released a frame after the load settles:
+   * the rows and the end of the load reach the DOM in the same flush, and a
+   * log that goes idle in that mutation announces all of them.
+   */
+  let transcriptBusy = $state(false);
+  $effect(() => {
+    if (loading || loadingOlder) {
+      transcriptBusy = true;
+      return;
+    }
+    const frame = requestAnimationFrame(() => {
+      transcriptBusy = false;
+    });
+    return () => cancelAnimationFrame(frame);
+  });
   // Pagination cursor: the smallest (oldest) DB row id we've loaded. Tracked
   // separately from `messages` because live messages use negative ids and the
   // MAX_LIVE_MESSAGES trim drops oldest-first — in a busy session that can
@@ -1023,6 +1044,7 @@
     const friend = friendHash;
     if (key) {
       sendError = null;
+      sendSeq++;
       sending = false;
       inputText = getDraft(key);
       // Channel unread is cleared only after `markAsRead` succeeds. Clearing
@@ -1052,6 +1074,7 @@
       loading = true;
       loadingOlder = false;
       hasMoreHistory = false;
+      olderError = false;
       oldestDbId = null;
       unreadMarkerId = null;
       markerResolved = false;
@@ -1265,28 +1288,42 @@
         if (direction === null) return;
           // Dedup duplicate backend emits: inbound chat can be delivered on
           // both the download and upload event loops for the same logical
-          // message. Inbound only — the outbound echo has a single emit site, so
-          // deduping it could only ever collapse two real messages.
+          // message.
           //
           // By durable row id when there is one, because it names the row: a
           // re-emit is caught exactly and two distinct messages never collide.
-          // The content tuple below cannot manage that — its timestamp is whole
-          // seconds, so a friend sending the same word twice inside one second
-          // produced one signature and the second bubble was dropped for good.
-          // `handleSend` renders nothing for a delivered message and relies on
-          // this echo, so there was nothing to reveal it short of a reload. The
-          // tuple stays as the fallback for an emit that carries no id.
+          // That holds for the outbound echo too — a snapshot taken after the
+          // row was marked delivered already holds it. The content tuple below
+          // cannot manage that — its timestamp is whole seconds, so a friend
+          // sending the same word twice inside one second produced one
+          // signature and the second bubble was dropped for good. `handleSend`
+          // renders nothing for a delivered message and relies on this echo, so
+          // there was nothing to reveal it short of a reload. The tuple stays
+          // as the fallback for an inbound emit that carries no id; the
+          // outbound echo has a single emit site, so a tuple match there could
+          // only ever collapse two real messages.
           const durableId = event.payload.id;
           const hasDurableId = typeof durableId === 'number' && durableId > 0;
-          const sig = `${event.payload.timestamp}|${direction}|${event.payload.message}`;
-          const isDuplicate =
-            direction === 'received' &&
-            (hasDurableId
-              ? messages.some((mm) => mm.id === durableId)
-              : messages
-                  .slice(-5)
-                  .some((mm) => `${mm.timestamp}|${mm.direction}|${mm.message}` === sig));
-          if (isDuplicate) return;
+          if (hasDurableId) {
+            const at = messages.findIndex((mm) => mm.id === durableId);
+            if (at !== -1) {
+              if (messages[at].delivery === 'queued') {
+                const next = [...messages];
+                next[at] = { ...next[at], delivery: 'delivered' };
+                messages = next;
+              }
+              return;
+            }
+          } else if (direction === 'received') {
+            const sig = `${event.payload.timestamp}|${direction}|${event.payload.message}`;
+            if (
+              messages
+                .slice(-5)
+                .some((mm) => `${mm.timestamp}|${mm.direction}|${mm.message}` === sig)
+            ) {
+              return;
+            }
+          }
           if (direction === 'received') setFriendTyping(false);
           const wasPinned = isPinnedToBottom();
           const next = [...messages, {
@@ -1551,6 +1588,7 @@
     if (unlistenRead) { unlistenRead(); unlistenRead = null; }
     if (unlistenAttach) { unlistenAttach(); unlistenAttach = null; }
     liveError = false;
+    olderError = false;
     const listenerOk = await setupListener(gen, hash, channel);
     if (gen !== loadGen) return;
     await loadMessages(gen, hash, channel);
@@ -1861,6 +1899,16 @@
     const prevScrollHeight = trimmed && !pinToBottom ? (el?.scrollHeight ?? 0) : 0;
     const prevScrollTop = trimmed && !pinToBottom ? (el?.scrollTop ?? 0) : 0;
     messages = trimmed ? next.slice(next.length - MAX_LIVE_MESSAGES) : next;
+    if (trimmed) {
+      // The cursor named a row that has just been dropped; paging on from it
+      // would leave a gap between it and what is still loaded. Kept as it was
+      // when the trim evicted every stored row.
+      let oldestKept: number | null = null;
+      for (const message of messages) {
+        if (message.id > 0 && (oldestKept === null || message.id < oldestKept)) oldestKept = message.id;
+      }
+      if (oldestKept !== null) oldestDbId = oldestKept;
+    }
     if (pinToBottom) {
       scrollToBottom();
     } else if (trimmed) {
@@ -2277,6 +2325,7 @@
     const waitSecs = slowModeSecs;
     const h = friendHash;
     const key = conversationKey;
+    const seq = ++sendSeq;
     sending = true;
     sendError = null;
     if (channel) {
@@ -2346,9 +2395,9 @@
         toastError(failed);
       }
     } finally {
-      // `sending` is the editor's state, not tied to a friend — always release
-      // it so the (possibly newly-active) conversation's input is usable.
-      sending = false;
+      // A switch already released the composer for the next conversation, and
+      // a send started there owns it now.
+      if (seq === sendSeq) sending = false;
       // A disabled/readonly composer (and a clicked Send button) drop the
       // caret; put it back so the next message can be typed without a click.
       const stillHere = channel ? channel === channelId : h === friendHash;
@@ -2696,15 +2745,25 @@
     // Run and day boundaries stay outside the cache: they depend on a
     // message's neighbours, so inserting a line can change the row above it.
     // Both are plain comparisons rather than regex work.
+    //
+    // A day only ever opens forwards. Room catch-up appends lines in arrival
+    // order, not time order, so an older line landing after today's would
+    // otherwise close today and open it again under a second "Today". It sits
+    // in the day already open instead.
+    let latestDay: number | null = null;
+    const opensDay = derivedRows.map(({ day }) => {
+      if (day === null || (latestDay !== null && day <= latestDay)) return false;
+      latestDay = day;
+      return true;
+    });
     return messages.map((msg, i) => {
       const { day, mentionsMe, blocks } = derivedRows[i];
       const hasNext = i + 1 < messages.length;
-      const newDay = day !== null && (i === 0 || derivedRows[i - 1].day !== day);
+      const newDay = opensDay[i];
       const sameAuthorAsPrev = i > 0 && sameChannelAuthor(messages[i - 1], msg);
       const sameAuthorAsNext = hasNext && sameChannelAuthor(messages[i + 1], msg);
       // An undated row neither opens nor closes a day, so it stays with its run.
-      const sameDayAsNext =
-        hasNext && (day === null || derivedRows[i + 1].day === null || derivedRows[i + 1].day === day);
+      const sameDayAsNext = hasNext && (day === null || !opensDay[i + 1]);
       // Someone answering one of our lines is addressed to us the way a
       // mention is, so it is marked the same way. The backend's verdict covers
       // a parent paged out of view; a loaded one is checked directly.
@@ -2999,7 +3058,7 @@
   <!-- Anchors the unread pill to the transcript's top edge, which moves with
        whether the header is shown. -->
   <div class="conv-transcript">
-  <div class="conv-messages" role="log" aria-label={m.chat_messages_label()} bind:this={messagesContainerEl} use:passiveScroll={onMessagesScroll}>
+  <div class="conv-messages" role="log" aria-label={m.chat_messages_label()} aria-busy={transcriptBusy} bind:this={messagesContainerEl} use:passiveScroll={onMessagesScroll}>
     {#if liveError && !loading && !loadError}
       <div class="conv-live-error" role="status">
         <span>{m.chat_live_unavailable()}</span>

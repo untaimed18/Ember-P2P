@@ -22,7 +22,7 @@ pub(in crate::network) async fn on_flood_cleanup_tick(
     }
 
     // Expire overloaded node entries after 10 minutes
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::network::monotonic_secs();
     state.overloaded_nodes.retain(|_, &mut ts| now - ts < 600);
 
     // Expire online_friends entries not seen in 5 minutes, but only

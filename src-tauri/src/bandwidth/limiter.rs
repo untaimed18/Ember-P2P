@@ -50,6 +50,9 @@ pub struct BandwidthLimiter {
     /// instead of being rounded up to a 1-token-per-tick floor.
     upload_refill_rem: AtomicU64,
     download_refill_rem: AtomicU64,
+    /// Upload already sent by [`Self::charge_upload`] beyond the tokens there
+    /// were. Paid off from the next refills before anything reaches the bucket.
+    upload_debt: AtomicU64,
     total_uploaded: AtomicU64,
     total_downloaded: AtomicU64,
     upload_speed: AtomicU64,
@@ -81,6 +84,7 @@ impl BandwidthLimiter {
             priority_uploads: AtomicUsize::new(0),
             upload_refill_rem: AtomicU64::new(0),
             download_refill_rem: AtomicU64::new(0),
+            upload_debt: AtomicU64::new(0),
             total_uploaded: AtomicU64::new(0),
             total_downloaded: AtomicU64::new(0),
             upload_speed: AtomicU64::new(0),
@@ -208,6 +212,48 @@ impl BandwidthLimiter {
         }
     }
 
+    /// Bill `bytes` of upload that has already gone out, without waiting.
+    ///
+    /// For control traffic, which eMule sends ahead of file data rather than
+    /// queueing it behind the slots: what the bucket holds is taken now, the
+    /// rest is owed and paid from the next refills before the slots see any of
+    /// it. The debt is capped at two seconds of the limit, so a burst of
+    /// control frames costs the slots at most that.
+    pub fn charge_upload(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
+        let max = self.max_upload_rate.load(Ordering::Relaxed);
+        if max == 0 {
+            return;
+        }
+        let mut owed = bytes;
+        loop {
+            let current = self.upload_tokens.load(Ordering::Acquire);
+            let take = owed.min(current);
+            if take == 0 {
+                break;
+            }
+            if self
+                .upload_tokens
+                .compare_exchange_weak(current, current - take, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                owed -= take;
+                break;
+            }
+        }
+        if owed > 0 {
+            let cap = max.saturating_mul(2);
+            let _ = self
+                .upload_debt
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |debt| {
+                    Some(debt.saturating_add(owed).min(cap))
+                });
+        }
+    }
+
     /// Acquire download bandwidth. Returns `false` if the refill task has died
     /// and tokens cannot be obtained without bypassing the cap.
     pub async fn acquire_download(&self, bytes: u64) -> bool {
@@ -306,6 +352,14 @@ impl BandwidthLimiter {
             let add = numer / divisor;
             self.upload_refill_rem
                 .store(numer % divisor, Ordering::Relaxed);
+            let add = match self
+                .upload_debt
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |debt| {
+                    (debt > 0).then(|| debt - debt.min(add))
+                }) {
+                Ok(debt) => add - debt.min(add),
+                Err(_) => add,
+            };
             let add = if self.priority_uploads.load(Ordering::Acquire) > 0 {
                 let held = self.priority_tokens.load(Ordering::Acquire);
                 let room = priority_reserve_cap(max_up).saturating_sub(held);
@@ -336,6 +390,7 @@ impl BandwidthLimiter {
             }
         } else {
             self.upload_refill_rem.store(0, Ordering::Relaxed);
+            self.upload_debt.store(0, Ordering::Relaxed);
         }
         if max_down > 0 {
             let prev_rem = self.download_refill_rem.load(Ordering::Relaxed);
@@ -875,6 +930,29 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// Control traffic is billed after it has gone out: what the bucket holds
+    /// now, the rest from the next refills before the slots see them, and
+    /// never more than two seconds of the limit owed.
+    #[test]
+    fn a_charge_past_the_bucket_is_paid_from_the_next_refills() {
+        let bw = BandwidthLimiter::new(1_000, 0);
+        assert_eq!(bw.available_upload_tokens(), 1_000);
+        bw.charge_upload(1_500);
+        assert_eq!(bw.available_upload_tokens(), 0);
+        assert_eq!(bw.total_uploaded(), 1_500);
+
+        bw.refill_tokens_incremental(1, 2);
+        assert_eq!(bw.available_upload_tokens(), 0, "half a second pays the 500 owed");
+        bw.refill_tokens_incremental(1, 2);
+        assert_eq!(bw.available_upload_tokens(), 500);
+
+        bw.charge_upload(100_000);
+        bw.refill_tokens_incremental(2, 1);
+        assert_eq!(bw.available_upload_tokens(), 0, "two seconds owed at most");
+        bw.refill_tokens_incremental(1, 1);
+        assert_eq!(bw.available_upload_tokens(), 1_000);
+    }
 
     #[test]
     fn file_uploads_own_uplink_requires_a_saturated_cap() {
