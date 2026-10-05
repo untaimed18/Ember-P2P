@@ -520,6 +520,7 @@
   "layout_download_folder_unavailable": "Os downloads não podem começar: o Ember não consegue gravar na pasta de downloads. Verifique se ela existe e se você tem permissão de gravação, ou escolha outra nas Configurações.",
   "layout_ember_default_on": "A Ember Network fica sempre ativada a partir desta versão, por isso foi ativada neste perfil. Ela publica os arquivos que você compartilha, e o seu endereço, para outros usuários do Ember.",
   "layout_restore_failed": "A restauração do perfil não foi concluída. O Ember está usando seus arquivos anteriores. Abra Configurações → Backup para tentar de novo ou descartar a restauração pendente.",
+  "layout_restore_download_folder_replaced": "A pasta de downloads restaurada estava em um compartilhamento de rede, ao qual uma restauração não se conecta, então os downloads agora vão para {path}. Se esse compartilhamento é seu, escolha-o de novo em Configurações → Transferências.",
   "layout_restore_expired": "Uma restauração do perfil preparada há mais de 30 dias foi descartada sem ser aplicada, então o Ember continua usando seu perfil atual. Para restaurar esse backup, escolha-o de novo em Configurações → Backup.",
   "layout_db_corrupt_backup": "Seu banco de dados local estava corrompido e foi recriado. Um backup do original foi salvo em {path}.",
   "speed_input_unlimited": "Sem limite",

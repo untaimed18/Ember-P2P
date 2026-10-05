@@ -37,11 +37,6 @@ harness = ["tauri/devtools"]
 tauri = { version = "2", features = ["tray-icon"] }
 
 tauri-plugin-dialog = "2"
-# The copy `tauri-plugin-dialog` already links, for the one dialog that has to
-# appear before the event loop runs: a database that cannot be opened ends the
-# launch inside `setup`. The plugin's default `gtk3` feature picks the Linux
-# backend.
-rfd = { version = "0.16", default-features = false, features = ["common-controls-v6"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -169,6 +164,13 @@ trash = "5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# The copy `tauri-plugin-dialog` already links, for the one dialog a launch
+# that ends inside `setup` shows: a database that cannot be opened. Not on
+# Linux, where its GTK dialog would wait on the main context the event loop
+# already holds.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+rfd = { version = "0.16", default-features = false, features = ["common-controls-v6"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }

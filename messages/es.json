@@ -520,6 +520,7 @@
   "layout_download_folder_unavailable": "Las descargas no pueden empezar: Ember no puede escribir en la carpeta de descargas. Comprueba que existe y que tienes permiso de escritura, o elige otra en Ajustes.",
   "layout_ember_default_on": "La Red Ember está siempre activada a partir de esta versión, así que se activó para este perfil. Publica los archivos que compartes, y tu dirección, a otros usuarios de Ember.",
   "layout_restore_failed": "No se completó la restauración del perfil. Ember está usando sus archivos anteriores. Abra Ajustes → Copia de seguridad para reintentar o descartar la restauración pendiente.",
+  "layout_restore_download_folder_replaced": "La carpeta de descargas restaurada estaba en un recurso compartido de red, al que una restauración no se conecta, así que las descargas van ahora a {path}. Si ese recurso es suyo, vuelva a elegirlo en Ajustes → Transferencias.",
   "layout_restore_expired": "Se descartó sin aplicarse una restauración del perfil preparada hace más de 30 días, así que Ember sigue usando su perfil actual. Para restaurar esa copia, vuelva a elegirla en Ajustes → Copia de seguridad.",
   "layout_db_corrupt_backup": "Tu base de datos local estaba dañada y se ha recreado. Se guardó una copia de seguridad del original en {path}.",
   "speed_input_unlimited": "Sin límite",

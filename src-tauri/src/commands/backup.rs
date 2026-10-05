@@ -1675,7 +1675,11 @@ pub enum StartupRestore {
     /// the restore was refused and left staged for a later launch.
     NotApplied,
     /// Applied, with the displaced originals kept in `pre-restore-*`.
-    Applied,
+    /// `download_folder_replaced` is the local folder that took the place of a
+    /// restored download folder on a network share.
+    Applied {
+        download_folder_replaced: Option<String>,
+    },
     /// Staged longer than [`STAGED_RESTORE_MAX_AGE_SECS`] ago, and discarded
     /// without being applied.
     Expired,
@@ -1831,6 +1835,10 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<StartupRestore>
     // restore can then be retried on the next launch, or discarded from
     // Settings > Backup if the cause is permanent. Removing staging here is
     // what previously turned a mid-restore failure into an unrecoverable one.
+    use crate::commands::transfers::OrphanDisposal;
+    if let Err(e) = OrphanDisposal::record_database_replacement(data_dir) {
+        tracing::warn!("Could not record that orphaned downloads are to be set aside: {e}");
+    }
     let (backup_dir, outcome) =
         swap_in_staged_files(data_dir, &staging, &pending.files, copy_into_place)?;
     let applied = match outcome {
@@ -1847,9 +1855,11 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<StartupRestore>
 
     // Before staging goes: while it exists a crash here re-runs the whole
     // apply, which ends up here again, and the repair is idempotent.
-    if pending.files.iter().any(|name| name == "config.json") {
-        sanitize_restored_config(data_dir);
-    }
+    let download_folder_replaced = if pending.files.iter().any(|name| name == "config.json") {
+        sanitize_restored_config(data_dir)
+    } else {
+        None
+    };
     hand_over_webview_prefs(data_dir, &staging, pending.webview_prefs);
     retire_applied_staging(&staging);
     tracing::warn!(
@@ -1858,7 +1868,9 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<StartupRestore>
         pending.source_app_version,
         backup_dir.display()
     );
-    Ok(StartupRestore::Applied)
+    Ok(StartupRestore::Applied {
+        download_folder_replaced,
+    })
 }
 
 /// Leave an applied restore's app-window preferences where
@@ -2611,28 +2623,27 @@ fn mark_restore_applied(staging: &Path) -> bool {
 /// otherwise leave Ember unable to launch at all on a machine without that
 /// drive, on the very path this feature exists to serve.
 ///
-/// The media player is always cleared. Of the folders, only the download
-/// folder is touched, and not when it is on a network share. Shared folders
-/// are left alone, missing or not: a restore does not approve them (see
-/// `run`), so nothing in them is shared until the user re-approves them in the
-/// Library, and dropping the missing ones here would silently delete a user's
-/// shares whenever they restored with an external drive unplugged.
+/// The media player is always cleared. A download folder that cannot be
+/// created, or is on a network share, is replaced by the local default, and
+/// every folder on a network share is dropped. Other shared folders are left
+/// alone, missing or not: a restore does not approve them (see `run`), so
+/// nothing in them is shared until the user re-approves them in the Library,
+/// and dropping the missing ones here would silently delete a user's shares
+/// whenever they restored with an external drive unplugged.
+///
+/// Returns the folder that replaced a download folder on a network share, for
+/// the notice telling the user to choose theirs again.
 ///
 /// Edited as raw JSON on purpose: this runs before the config is loaded, and
 /// round-tripping it through AppSettings here would rewrite fields the
 /// loader's own repair pass owns.
-fn sanitize_restored_config(data_dir: &Path) {
+fn sanitize_restored_config(data_dir: &Path) -> Option<String> {
     let path = data_dir.join("config.json");
-    let Ok(raw) = std::fs::read(&path) else {
-        return;
-    };
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
-        return;
-    };
-    let Some(obj) = value.as_object_mut() else {
-        return;
-    };
+    let raw = std::fs::read(&path).ok()?;
+    let mut value = serde_json::from_slice::<serde_json::Value>(&raw).ok()?;
+    let obj = value.as_object_mut()?;
     let mut changed = false;
+    let mut replaced_share = None;
 
     // A program Ember will execute. Settings only accepts one the native
     // picker produced this session; an archive is not that, and one carried
@@ -2675,45 +2686,59 @@ fn sanitize_restored_config(data_dir: &Path) {
                 fallback.display()
             );
             let _ = std::fs::create_dir_all(&fallback);
+            let fallback = fallback.to_string_lossy().to_string();
+            if on_share {
+                replaced_share = Some(fallback.clone());
+            }
             obj.insert(
                 "download_folder".to_string(),
-                serde_json::Value::String(fallback.to_string_lossy().to_string()),
+                serde_json::Value::String(fallback),
             );
             changed = true;
         }
     }
 
-    // The earlier download folders are approved and swept at startup too.
-    if let Some(earlier) = obj
-        .get_mut("previous_download_folders")
-        .and_then(|v| v.as_array_mut())
-    {
-        let before = earlier.len();
-        earlier.retain(|folder| {
+    // The earlier download folders are approved and swept at startup too, and
+    // a shared folder without an approval on this machine is still looked at
+    // to offer re-approving it.
+    for (key, what) in [
+        ("previous_download_folders", "earlier download folder(s)"),
+        ("shared_folders", "shared folder(s)"),
+    ] {
+        let Some(folders) = obj.get_mut(key).and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        let before = folders.len();
+        folders.retain(|folder| {
             !folder
                 .as_str()
                 .is_some_and(crate::security::is_network_path)
         });
-        if earlier.len() != before {
+        if folders.len() != before {
             tracing::warn!(
-                "Dropped {} earlier download folder(s) on a network share from the restored config",
-                before - earlier.len()
+                "Dropped {} {what} on a network share from the restored config",
+                before - folders.len()
             );
             changed = true;
         }
     }
 
     if !changed {
-        return;
+        return None;
     }
     match serde_json::to_vec_pretty(&value) {
         Ok(data) => {
             if let Err(e) = crate::security::atomic_write(&path, &data, true) {
                 tracing::error!("Failed to write the repaired config after a restore: {e}");
+                return None;
             }
         }
-        Err(e) => tracing::error!("Failed to serialize the repaired config after a restore: {e}"),
+        Err(e) => {
+            tracing::error!("Failed to serialize the repaired config after a restore: {e}");
+            return None;
+        }
     }
+    replaced_share
 }
 
 #[cfg(test)]
@@ -2722,7 +2747,7 @@ mod tests {
 
     impl StartupRestore {
         fn applied(&self) -> bool {
-            matches!(self, StartupRestore::Applied)
+            matches!(self, StartupRestore::Applied { .. })
         }
     }
 
@@ -2731,6 +2756,10 @@ mod tests {
     fn apply_expecting_success(dir: &Path) -> PathBuf {
         let outcome = apply_pending_restore(dir).unwrap();
         assert!(outcome.applied(), "{outcome:?}");
+        assert!(
+            dir.join("set-aside-orphans").exists(),
+            "orphaned downloads are set aside from the moment the database is replaced"
+        );
         let mut backup_dirs = pre_restore_dirs(dir);
         assert_eq!(backup_dirs.len(), 1, "{backup_dirs:?}");
         backup_dirs.pop().unwrap()
@@ -3748,7 +3777,11 @@ mod tests {
         )
         .unwrap();
 
-        sanitize_restored_config(&dir);
+        assert_eq!(
+            sanitize_restored_config(&dir),
+            None,
+            "only a download folder on a share is announced"
+        );
 
         let repaired: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
@@ -3772,30 +3805,38 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_download_folder_on_a_network_share_is_not_kept() {
+    fn restored_folders_on_a_network_share_are_not_kept() {
         let dir = scratch("sanitize-share");
         let share = r"\\192.0.2.1\share\Ember";
         let local = dir.join("earlier").to_string_lossy().into_owned();
+        let local_share = dir.join("music").to_string_lossy().into_owned();
         std::fs::write(
             dir.join("config.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "download_folder": share,
                 "previous_download_folders": [r"\\192.0.2.1\old", local],
+                "shared_folders": [r"\\192.0.2.1\media", local_share],
             }))
             .unwrap(),
         )
         .unwrap();
 
-        sanitize_restored_config(&dir);
+        let replaced = sanitize_restored_config(&dir);
 
         let repaired: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
         let folder = repaired["download_folder"].as_str().unwrap();
         assert!(!crate::security::is_network_path(folder), "{folder}");
+        assert_eq!(replaced.as_deref(), Some(folder), "the replacement is announced");
         assert_eq!(
             repaired["previous_download_folders"],
             serde_json::json!([local]),
             "a local earlier folder stays, a share goes"
+        );
+        assert_eq!(
+            repaired["shared_folders"],
+            serde_json::json!([local_share]),
+            "a local shared folder stays, a share goes"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

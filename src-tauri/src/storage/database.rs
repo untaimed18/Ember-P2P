@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use parking_lot::Mutex;
 
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
@@ -742,8 +743,8 @@ impl OpenFailure {
 
 impl Database {
     pub fn new(app_handle: &tauri::AppHandle) -> anyhow::Result<Self> {
-        let app_dir = paths::ensure_data_dir_with_app(app_handle)
-            .map_err(|e| anyhow::anyhow!("Failed to prepare data dir: {e}"))?;
+        let app_dir =
+            paths::ensure_data_dir_with_app(app_handle).context("Failed to prepare data dir")?;
 
         Self::open_for_session(&app_dir.join("ember.db"))
     }
@@ -766,14 +767,25 @@ impl Database {
         let opened = match Self::open_with(&db_path, unclean) {
             Ok(db) => Ok(db),
             Err(e) if db_path.exists() && Self::is_corruption_error(&e) => {
+                if let Some(data_dir) = db_path.parent() {
+                    if let Err(error) =
+                        crate::commands::transfers::OrphanDisposal::record_database_replacement(
+                            data_dir,
+                        )
+                    {
+                        tracing::warn!(
+                            "Could not record that orphaned downloads are to be set aside: {error}"
+                        );
+                    }
+                }
                 let backup = Self::backup_corrupt_database(&db_path)?;
                 tracing::warn!(
                     "ember.db was corrupt and has been preserved at {}; creating a fresh database",
                     backup.display()
                 );
-                let mut db = Self::open_at(&db_path).map_err(|retry| {
-                    anyhow::anyhow!(
-                        "Failed to initialize a fresh database after preserving the corrupt one at {}: {retry}",
+                let mut db = Self::open_at(&db_path).with_context(|| {
+                    format!(
+                        "Failed to initialize a fresh database after preserving the corrupt one at {}",
                         backup.display()
                     )
                 })?;
@@ -2043,12 +2055,20 @@ impl Database {
                 // VACUUM rewrites the whole file, so it fails on a disk without
                 // that much room — every launch, were it fatal, for what only
                 // reclaims space.
+                // A corrupt page it reads is still fatal, so that recovery
+                // preserves the file and starts afresh.
                 match conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;") {
                     Ok(()) => info!("Enabled incremental auto_vacuum on existing database (v21)"),
-                    Err(e) => warn!(
-                        "Could not enable incremental auto_vacuum on the existing database \
-                         (v21); continuing without it: {e}"
-                    ),
+                    Err(e) => {
+                        let e = anyhow::Error::from(e);
+                        if Self::is_corruption_error(&e) {
+                            return Err(e.context("VACUUM found ember.db corrupt (v21)"));
+                        }
+                        warn!(
+                            "Could not enable incremental auto_vacuum on the existing database \
+                             (v21); continuing without it: {e}"
+                        );
+                    }
                 }
             }
             // Only drop a legacy snapshot this database already carried when
@@ -14803,6 +14823,7 @@ mod tests {
             file.write_all(&[0xFF; 16]).unwrap();
         }
 
+        let set_aside_marker = dir.join("set-aside-orphans");
         let after_clean = Database::open_for_session(&path).expect("open after a clean exit");
         assert!(
             after_clean.corrupt_backup.is_none(),
@@ -14810,13 +14831,70 @@ mod tests {
         );
         drop(after_clean);
         assert!(marker.exists(), "that session never reached its shutdown");
+        assert!(!set_aside_marker.exists());
 
         let after_crash = Database::open_for_session(&path).expect("open after a crash");
         assert!(
             after_crash.corrupt_backup.is_some(),
             "after an unclean shutdown the check runs and preserves the damaged file"
         );
+        assert!(
+            set_aside_marker.exists(),
+            "orphaned downloads are set aside from the moment the database is replaced"
+        );
         drop(after_crash);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The v21 VACUUM reads every page, so it can be what finds a database
+    /// corrupt. That still ends in recovery rather than a warning.
+    #[test]
+    fn corruption_found_by_the_v21_vacuum_still_recovers_the_database() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = std::env::temp_dir().join(format!(
+            "ember-vacuum-corrupt-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ember.db");
+        let db = Database::open_at(&path).expect("first open");
+        let (last_page, page_size) = {
+            let conn = db.conn.lock();
+            conn.execute_batch("PRAGMA auto_vacuum=NONE; VACUUM; CREATE TABLE filler(x BLOB);")
+                .unwrap();
+            for _ in 0..40 {
+                conn.execute("INSERT INTO filler VALUES (randomblob(2000))", [])
+                    .unwrap();
+            }
+            conn.execute("UPDATE schema_version SET version = 20", [])
+                .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap();
+            assert_eq!(auto_vacuum, 0, "v21 vacuums only a database without auto_vacuum");
+            let last_page: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
+            let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+            (last_page, page_size)
+        };
+        drop(db);
+
+        // A leaf the filler's inserts appended, which nothing before the
+        // VACUUM reads.
+        {
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(((last_page - 2) * page_size) as u64)).unwrap();
+            file.write_all(&[0xFF; 16]).unwrap();
+        }
+        // With the chat history locked, v23 leaves it as it is and runs no
+        // VACUUM of its own.
+        std::fs::write(dir.join(CHAT_KEY_FILE), b"locked").unwrap();
+
+        let recovered = Database::open_for_session(&path).expect("recovered");
+        assert!(
+            recovered.corrupt_backup.is_some(),
+            "the damaged file is preserved and replaced"
+        );
+        drop(recovered);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

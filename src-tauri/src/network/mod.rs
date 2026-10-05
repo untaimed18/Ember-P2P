@@ -2614,11 +2614,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         orphan_disposal,
                     )
                     .await;
-                    if complete && orphan_disposal == OrphanDisposal::SetAside {
-                        let _ = tokio::task::spawn_blocking(move || {
-                            OrphanDisposal::set_aside_finished(&data_dir)
-                        })
-                        .await;
+                    if let OrphanDisposal::SetAside { .. } = orphan_disposal {
+                        if complete {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                OrphanDisposal::set_aside_finished(&data_dir)
+                            })
+                            .await;
+                        } else {
+                            tracing::warn!(
+                                "Orphan sweep did not reach every part file the replaced \
+                                 database does not list; the next launch sets them aside again"
+                            );
+                        }
                     }
                 });
             }

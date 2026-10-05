@@ -169,6 +169,14 @@ export async function takePendingRestoreExpiredNotice(): Promise<boolean> {
 }
 
 /**
+ * Consume the folder an applied restore put in place of a download folder on
+ * a network share, or null. Nothing else records that it happened.
+ */
+export async function takePendingRestoreDownloadFolderNotice(): Promise<string | null> {
+  return invoke('take_pending_restore_download_folder_notice');
+}
+
+/**
  * Consume the notice that known.met could not be read this session (`reset`:
  * the catalog was lost and sharing reset to fail-closed), or null.
  */

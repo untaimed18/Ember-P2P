@@ -520,6 +520,7 @@
   "layout_download_folder_unavailable": "下载无法开始：Ember 无法写入下载文件夹。请确认该文件夹存在且你有写入权限，或在设置中选择其他文件夹。",
   "layout_ember_default_on": "从此版本起 Ember 网络始终开启，因此已为此配置文件启用。它会向其他 Ember 用户发布你分享的文件以及你的地址。",
   "layout_restore_failed": "配置文件还原未完成。Ember 正在使用你原来的文件。请打开设置 → 备份以重试或丢弃暂存的还原。",
+  "layout_restore_download_folder_replaced": "还原的下载文件夹位于网络共享上，而还原不会连接网络共享，因此下载现在保存到 {path}。如果该共享是你的，请在设置 → 传输中重新选择它。",
   "layout_restore_expired": "一项在 30 多天前准备的配置文件还原未被应用就已丢弃，因此 Ember 仍在使用你当前的配置文件。如需还原该备份，请在设置 → 备份中重新选择它。",
   "layout_db_corrupt_backup": "本地数据库已损坏并已重建。原始文件已备份至 {path}。",
   "speed_input_unlimited": "不限速",

@@ -391,6 +391,15 @@ impl ApprovedRootRegistry {
                     }
                     Err(error) => return Err(error),
                 }
+            } else if crate::security::is_network_path(configured) {
+                // Looking at it would connect to its server and offer it the
+                // user's credentials, which only their approval may bring
+                // about. Treated as offline, and so unapproved, untouched.
+                tracing::warn!(
+                    "configured root on a network share has no approved identity record and is \
+                     not opened until re-approved: {}",
+                    configured_path.display()
+                );
             } else if std::fs::metadata(configured_path)
                 .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
             {
@@ -513,6 +522,12 @@ impl ApprovedRootRegistry {
             .read()
             .get(&path_key(Path::new(configured)))
             .map(|record| record.canonical.clone())
+    }
+
+    /// Whether `configured` has an approval record, from memory: no disk
+    /// access.
+    pub fn is_recorded(&self, configured: &Path) -> bool {
+        self.roots.read().contains_key(&path_key(configured))
     }
 
     pub fn verify_root(&self, configured: &Path) -> io::Result<PathBuf> {
@@ -1730,20 +1745,56 @@ pub fn rename_approved_no_replace(
     allowed_roots: &[String],
     expected_source: &ObjectIdentity,
 ) -> io::Result<PathBuf> {
+    move_approved_no_replace_inner(
+        source_path,
+        destination_path,
+        allowed_roots,
+        expected_source,
+        true,
+    )
+}
+
+/// [`rename_approved_no_replace`] into another approved directory on the same
+/// volume, so the file is renamed rather than copied: across volumes it fails
+/// instead. Both directories are pinned, and on Windows the exact opened
+/// object is moved.
+pub fn move_approved_no_replace(
+    source_path: &Path,
+    destination_path: &Path,
+    allowed_roots: &[String],
+    expected_source: &ObjectIdentity,
+) -> io::Result<PathBuf> {
+    move_approved_no_replace_inner(
+        source_path,
+        destination_path,
+        allowed_roots,
+        expected_source,
+        false,
+    )
+}
+
+fn move_approved_no_replace_inner(
+    source_path: &Path,
+    destination_path: &Path,
+    allowed_roots: &[String],
+    expected_source: &ObjectIdentity,
+    same_directory: bool,
+) -> io::Result<PathBuf> {
     let (parent, parent_handle, parent_identity, source_name) =
         split_verified_file_parent(source_path, allowed_roots)?;
-    let (_, _, destination_parent_identity, destination_name) =
+    let (destination_parent, destination_handle, destination_parent_identity, destination_name) =
         split_verified_file_parent(destination_path, allowed_roots)?;
-    if destination_parent_identity != parent_identity {
+    if same_directory && destination_parent_identity != parent_identity {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "approved rename must stay in one directory",
         ));
     }
-    let destination = parent.join(&destination_name);
+    let destination = destination_parent.join(&destination_name);
 
     #[cfg(unix)]
     {
+        let _ = &parent;
         let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         let source = openat_child(&parent_handle, &source_name, flags, 0)?;
         if &object_identity_from_file(&source)? != expected_source {
@@ -1752,8 +1803,8 @@ pub fn rename_approved_no_replace(
                 "approved rename source changed identity",
             ));
         }
-        rename_at_no_replace(&parent_handle, &source_name, &destination_name)?;
-        let renamed = openat_child(&parent_handle, &destination_name, flags, 0)?;
+        rename_at_no_replace(&parent_handle, &source_name, &destination_handle, &destination_name)?;
+        let renamed = openat_child(&destination_handle, &destination_name, flags, 0)?;
         if &object_identity_from_file(&renamed)? != expected_source {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1766,6 +1817,7 @@ pub fn rename_approved_no_replace(
     {
         use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
         const DELETE_ACCESS: u32 = 0x0001_0000;
+        let _ = &parent_handle;
         let source = open_windows_path(
             &parent.join(&source_name),
             FILE_READ_ATTRIBUTES | DELETE_ACCESS,
@@ -1783,9 +1835,9 @@ pub fn rename_approved_no_replace(
                 "approved rename source changed before handle pinning",
             ));
         }
-        rename_opened_file_at(&source, &parent_handle, &destination_name)?;
-        if object_identity(&parent)? != parent_identity
-            || !opened_child_parent_matches(&source, &parent)?
+        rename_opened_file_at(&source, &destination_handle, &destination_name)?;
+        if object_identity(&destination_parent)? != destination_parent_identity
+            || !opened_child_parent_matches(&source, &destination_parent)?
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1799,29 +1851,60 @@ pub fn rename_approved_no_replace(
 
 #[cfg(target_os = "linux")]
 fn rename_at_no_replace(
-    parent: &File,
+    from_parent: &File,
     from: &std::ffi::OsStr,
+    to_parent: &File,
     to: &std::ffi::OsStr,
 ) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    let (from, to) = (component_cstring(from)?, component_cstring(to)?);
-    let fd = parent.as_raw_fd();
-    if unsafe { libc::renameat2(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_NOREPLACE) } != 0 {
-        return Err(io::Error::last_os_error());
+    let (from_c, to_c) = (component_cstring(from)?, component_cstring(to)?);
+    let (from_fd, to_fd) = (from_parent.as_raw_fd(), to_parent.as_raw_fd());
+    if unsafe {
+        libc::renameat2(from_fd, from_c.as_ptr(), to_fd, to_c.as_ptr(), libc::RENAME_NOREPLACE)
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        // A file system without RENAME_NOREPLACE.
+        if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) {
+            return link_then_unlink_at(from_parent, from, to_parent, to);
+        }
+        return Err(error);
     }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn rename_at_no_replace(
-    parent: &File,
+    from_parent: &File,
     from: &std::ffi::OsStr,
+    to_parent: &File,
     to: &std::ffi::OsStr,
 ) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     let (from, to) = (component_cstring(from)?, component_cstring(to)?);
-    let fd = parent.as_raw_fd();
-    if unsafe { libc::renameatx_np(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_EXCL) } != 0 {
+    let (from_fd, to_fd) = (from_parent.as_raw_fd(), to_parent.as_raw_fd());
+    if unsafe { libc::renameatx_np(from_fd, from.as_ptr(), to_fd, to.as_ptr(), libc::RENAME_EXCL) }
+        != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn link_then_unlink_at(
+    from_parent: &File,
+    from: &std::ffi::OsStr,
+    to_parent: &File,
+    to: &std::ffi::OsStr,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (from, to) = (component_cstring(from)?, component_cstring(to)?);
+    let (from_fd, to_fd) = (from_parent.as_raw_fd(), to_parent.as_raw_fd());
+    if unsafe { libc::linkat(from_fd, from.as_ptr(), to_fd, to.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::unlinkat(from_fd, from.as_ptr(), 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -1829,14 +1912,12 @@ fn rename_at_no_replace(
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn rename_at_no_replace(
-    _parent: &File,
-    _from: &std::ffi::OsStr,
-    _to: &std::ffi::OsStr,
+    from_parent: &File,
+    from: &std::ffi::OsStr,
+    to_parent: &File,
+    to: &std::ffi::OsStr,
 ) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "this platform has no rename that refuses to replace",
-    ))
+    link_then_unlink_at(from_parent, from, to_parent, to)
 }
 
 /// Rename the opened `file` to `parent/<name>`, refusing to replace an
@@ -3070,6 +3151,49 @@ mod tests {
         assert_eq!(std::fs::read(&published).unwrap(), b"copy");
         assert!(!staged.exists());
         assert_eq!(object_identity(&published).unwrap(), identity);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn approved_move_renames_the_pinned_file_into_another_directory_and_never_replaces() {
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-approved-move-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let (root, data) = (base.join("root"), base.join("data"));
+        let (dir, aside) = (root.join("Temp"), root.join("Temp").join("orphaned"));
+        for path in [&aside, &data] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let allowed = [root.to_string_lossy().into_owned()];
+        initialize_approved_roots(&data, &allowed).unwrap();
+        let part = dir.join("a.part");
+        std::fs::write(&part, b"progress").unwrap();
+        let identity = object_identity(&part).unwrap();
+        let taken = aside.join("taken.part");
+        std::fs::write(&taken, b"theirs").unwrap();
+
+        let error = move_approved_no_replace(&part, &taken, &allowed, &identity).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(std::fs::read(&taken).unwrap(), b"theirs");
+        let other = dir.join("b.part");
+        std::fs::write(&other, b"other").unwrap();
+        assert!(
+            move_approved_no_replace(&other, &aside.join("b.part"), &allowed, &identity).is_err(),
+            "only the pinned object is moved"
+        );
+
+        let moved = move_approved_no_replace(&part, &aside.join("a.part"), &allowed, &identity)
+            .unwrap();
+        assert_eq!(std::fs::read(aside.join("a.part")).unwrap(), b"progress");
+        assert!(!part.exists());
+        assert_eq!(
+            object_identity(&moved).unwrap(),
+            identity,
+            "renamed, not copied"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 

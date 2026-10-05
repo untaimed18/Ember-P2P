@@ -2455,6 +2455,15 @@ pub fn take_pending_restore_expired_notice(
         .swap(false, std::sync::atomic::Ordering::AcqRel))
 }
 
+/// Consume the folder an applied restore put in place of a download folder on
+/// a network share, if it did. One-shot like the latches above.
+#[tauri::command]
+pub fn take_pending_restore_download_folder_notice(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    Ok(state.pending_restore_download_folder_notice.lock().take())
+}
+
 const KNOWN_MET_NOTICE_NONE: u8 = 0;
 const KNOWN_MET_NOTICE_UNREADABLE: u8 = 1;
 const KNOWN_MET_NOTICE_RESET: u8 = 2;

@@ -520,6 +520,7 @@
   "layout_download_folder_unavailable": "I download non possono partire: Ember non riesce a scrivere nella cartella download. Controlla che esista e che tu abbia i permessi di scrittura, oppure scegline un'altra nelle Impostazioni.",
   "layout_ember_default_on": "La rete Ember è sempre attiva a partire da questa versione, quindi è stata attivata per questo profilo. Pubblica i file che condividi, e il tuo indirizzo, agli altri utenti Ember.",
   "layout_restore_failed": "Il ripristino del profilo non è stato completato. Ember sta usando i file precedenti. Apri Impostazioni → Backup per riprovare o scartare il ripristino in attesa.",
+  "layout_restore_download_folder_replaced": "La cartella download ripristinata era su una condivisione di rete, a cui un ripristino non si collega, quindi ora i download vanno in {path}. Se quella condivisione è tua, sceglila di nuovo in Impostazioni → Trasferimenti.",
   "layout_restore_expired": "Un ripristino del profilo preparato più di 30 giorni fa è stato scartato senza essere applicato, quindi Ember usa ancora il profilo attuale. Per ripristinare quel backup, sceglilo di nuovo in Impostazioni → Backup.",
   "layout_db_corrupt_backup": "Il database locale era corrotto ed è stato ricreato. Una copia di backup dell'originale è stata salvata in {path}.",
   "speed_input_unlimited": "Illimitato",

@@ -425,20 +425,48 @@ pub fn run_update_watchdog_if_requested() -> bool {
     auto_update::watchdog::run_if_requested()
 }
 
+const FATAL_STARTUP_TITLE: &str = "Ember cannot start";
+
 /// Tell the user why Ember is about to exit when that happens before any
 /// window exists. Blocks until the dialog is dismissed. The text is English:
 /// the translations live in the frontend, which never loaded.
 ///
-/// `rfd`'s synchronous dialog rather than the dialog plugin's
-/// `blocking_show`, whose dialog is shown through the event loop that
-/// `setup` runs ahead of, so on macOS it would wait on this thread forever.
+/// `setup` runs inside the event loop's first callback, on its thread, so
+/// nothing shown through that loop can appear until it returns: the dialog
+/// plugin's `blocking_show` would wait forever. `rfd`'s synchronous dialog
+/// runs a modal loop of its own on Windows and macOS.
+#[cfg(any(windows, target_os = "macos"))]
 fn show_fatal_startup_dialog(message: &str) {
     rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
-        .set_title("Ember cannot start")
+        .set_title(FATAL_STARTUP_TITLE)
         .set_description(message)
         .set_buttons(rfd::MessageButtons::Ok)
         .show();
+}
+
+/// [`show_fatal_startup_dialog`] elsewhere, where `rfd`'s GTK dialog waits on
+/// the GLib main context the event loop holds, which would leave Ember running
+/// without a window and holding its instance lock. A separate dialog program
+/// has a main loop of its own; without one the log is all there is.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn show_fatal_startup_dialog(message: &str) {
+    let dialogs: [(&str, Vec<&str>); 3] = [
+        (
+            "zenity",
+            vec!["--error", "--no-markup", "--title", FATAL_STARTUP_TITLE, "--text", message],
+        ),
+        ("kdialog", vec!["--error", message, "--title", FATAL_STARTUP_TITLE]),
+        ("xmessage", vec!["-center", message]),
+    ];
+    for (program, args) in dialogs {
+        match std::process::Command::new(program).args(&args).status() {
+            // 1 is the dialog closed without its button.
+            Ok(status) if matches!(status.code(), Some(0 | 1)) => return,
+            Ok(status) => tracing::debug!("{program} could not show the startup error: {status}"),
+            Err(error) => tracing::debug!("{program} could not show the startup error: {error}"),
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -755,6 +783,7 @@ pub fn run() {
             let mut restore_failed_notice = false;
             let mut restore_expired_notice = false;
             let mut restore_applied = false;
+            let mut restore_download_folder_notice = None;
             match storage::paths::ensure_data_dir_with_app(&app_handle) {
                 Ok(dir) => {
                     use commands::backup::StartupRestore;
@@ -773,7 +802,12 @@ pub fn run() {
                                 restore_failed_notice = true;
                             }
                         }
-                        Ok(StartupRestore::Applied) => restore_applied = true,
+                        Ok(StartupRestore::Applied {
+                            download_folder_replaced,
+                        }) => {
+                            restore_applied = true;
+                            restore_download_folder_notice = download_folder_replaced;
+                        }
                         Ok(StartupRestore::Expired) => restore_expired_notice = true,
                     }
                 }
@@ -1109,6 +1143,9 @@ pub fn run() {
                 )),
                 pending_restore_expired_notice: Arc::new(std::sync::atomic::AtomicBool::new(
                     restore_expired_notice,
+                )),
+                pending_restore_download_folder_notice: Arc::new(parking_lot::Mutex::new(
+                    restore_download_folder_notice,
                 )),
                 close_behavior: Arc::new(parking_lot::RwLock::new(
                     settings.close_to_tray_behavior.clone(),
@@ -2523,6 +2560,7 @@ pub fn run() {
             commands::settings::take_pending_ember_default_on_notice,
             commands::settings::take_pending_restore_failed_notice,
             commands::settings::take_pending_restore_expired_notice,
+            commands::settings::take_pending_restore_download_folder_notice,
             commands::settings::take_pending_known_met_notice,
             commands::settings::open_ember_website,
             commands::settings::open_support_page,

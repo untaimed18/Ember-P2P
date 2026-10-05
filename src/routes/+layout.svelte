@@ -39,6 +39,7 @@
     takePendingEmberDefaultOnNotice,
     takePendingRestoreFailedNotice,
     takePendingRestoreExpiredNotice,
+    takePendingRestoreDownloadFolderNotice,
     takePendingKnownMetNotice,
     SETTINGS_CHANGED_EVENT,
     QUIT_REQUESTED_EVENT,
@@ -443,6 +444,13 @@
         if (mounted && expired) addToast('warning', m.layout_restore_expired(), 0);
       })
       .catch((e) => console.error('Failed to consume the restore-expired latch:', e));
+
+    // Sticky: downloads now land somewhere the user did not choose.
+    takePendingRestoreDownloadFolderNotice()
+      .then((path) => {
+        if (mounted && path) addToast('warning', m.layout_restore_download_folder_replaced({ path }), 0);
+      })
+      .catch((e) => console.error('Failed to consume the restore download-folder latch:', e));
 
     listen<{ loaded: boolean; resetRequired: boolean; reason?: string }>(
       'security-policy-reset-required',

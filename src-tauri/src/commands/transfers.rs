@@ -863,9 +863,11 @@ pub async fn sweep_orphan_part_files(
     let owns_partial = &owns_partial;
     let set_aside_in = match disposal {
         OrphanDisposal::Delete => None,
-        OrphanDisposal::SetAside => Some(format!(
+        OrphanDisposal::SetAside { since } => Some(format!(
             "orphaned-{}",
-            chrono::Local::now().format("%Y%m%d-%H%M%S")
+            local_time(since)
+                .unwrap_or_else(chrono::Local::now)
+                .format("%Y%m%d-%H%M%S")
         )),
     };
     let set_aside_in = set_aside_in.as_deref();
@@ -897,31 +899,104 @@ pub enum OrphanDisposal {
     /// `ember.db` was replaced, by corruption recovery or a restore, so a
     /// download it does not list may still be one the user wants: only the
     /// database that knew about it is gone.
-    SetAside,
+    ///
+    /// `since` is when, in Unix seconds. Every sweep until one finishes moves
+    /// into the same `orphaned-<since>` folder, so a `.part` and its
+    /// `.part.met` set aside on different launches still end up together.
+    SetAside { since: i64 },
 }
 
-/// In the data folder from a launch that replaced `ember.db` until a sweep
-/// has set aside every orphan in every download folder. A folder that was
-/// offline or given up on then is still swept that way once it is back,
-/// instead of having its orphans removed by a later, ordinary launch.
+/// In the data folder, holding when `ember.db` was replaced, from just before
+/// it is until a sweep has set aside every orphan in every download folder. A
+/// folder that was offline or given up on then is still swept that way once
+/// it is back, instead of having its orphans removed by a later, ordinary
+/// launch.
 const SET_ASIDE_ORPHANS_MARKER: &str = "set-aside-orphans";
 
+/// How long after `ember.db` was replaced orphans are still set aside. A part
+/// file that can never be moved, or a download folder that never comes back,
+/// would otherwise stop every later launch from removing any orphan at all.
+const SET_ASIDE_ORPHANS_MAX_SECS: i64 = 14 * 24 * 60 * 60;
+
+fn local_time(unix_secs: i64) -> Option<chrono::DateTime<chrono::Local>> {
+    chrono::DateTime::from_timestamp(unix_secs, 0).map(|time| time.with_timezone(&chrono::Local))
+}
+
 impl OrphanDisposal {
-    /// How this launch's sweep treats orphans. Blocking.
-    pub fn at_startup(data_dir: &Path, db_replaced: bool) -> Self {
+    /// Record that `ember.db` in `data_dir` is about to be replaced. Called
+    /// before it is, so a launch that ends between the two still leaves the
+    /// next one setting orphans aside. Blocking.
+    pub fn record_database_replacement(data_dir: &Path) -> std::io::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        crate::security::atomic_write(
+            &data_dir.join(SET_ASIDE_ORPHANS_MARKER),
+            format!("{now}\n").as_bytes(),
+            false,
+        )
+    }
+
+    /// When the marker says `ember.db` was replaced, if there is one. Blocking.
+    fn recorded_replacement(data_dir: &Path, now: i64) -> Option<i64> {
         let marker = data_dir.join(SET_ASIDE_ORPHANS_MARKER);
-        if db_replaced {
-            if let Err(error) = std::fs::write(&marker, b"") {
-                tracing::warn!(
-                    "Could not record that orphans are to be set aside at {}: {error}",
-                    marker.display()
-                );
+        let modified = || {
+            std::fs::metadata(&marker)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .map(|time| chrono::DateTime::<chrono::Utc>::from(time).timestamp())
+                .unwrap_or(now)
+        };
+        match std::fs::read(&marker) {
+            Ok(raw) => Some(
+                std::str::from_utf8(&raw)
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok())
+                    // Written empty before the time was recorded.
+                    .unwrap_or_else(modified),
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                tracing::warn!("Could not read {}: {error}", marker.display());
+                Some(modified())
             }
-            return Self::SetAside;
         }
-        if marker.exists() {
-            Self::SetAside
+    }
+
+    /// How this launch's sweep treats orphans. `db_replaced` is whether this
+    /// launch replaced `ember.db`, which sets them aside even if the marker
+    /// could not be written. Blocking.
+    pub fn at_startup(data_dir: &Path, db_replaced: bool) -> Self {
+        let now = chrono::Utc::now().timestamp();
+        let recorded = Self::recorded_replacement(data_dir, now);
+        if db_replaced {
+            return Self::SetAside {
+                since: recorded.unwrap_or(now),
+            };
+        }
+        let Some(since) = recorded else {
+            return Self::Delete;
+        };
+        let format = |secs: i64| {
+            local_time(secs).map_or_else(
+                || secs.to_string(),
+                |time| time.format("%Y-%m-%d %H:%M").to_string(),
+            )
+        };
+        if now.saturating_sub(since) <= SET_ASIDE_ORPHANS_MAX_SECS {
+            tracing::warn!(
+                "ember.db was replaced on {} and no sweep since has reached every part file it \
+                 does not list, so they are set aside again instead of removed, until {}",
+                format(since),
+                format(since.saturating_add(SET_ASIDE_ORPHANS_MAX_SECS))
+            );
+            Self::SetAside { since }
         } else {
+            tracing::warn!(
+                "ember.db was replaced on {}, more than {} days ago, and no sweep since has \
+                 reached every part file it does not list; removing them again from now on",
+                format(since),
+                SET_ASIDE_ORPHANS_MAX_SECS / 86_400
+            );
+            Self::set_aside_finished(data_dir);
             Self::Delete
         }
     }
@@ -941,7 +1016,8 @@ impl OrphanDisposal {
 const ORPHAN_SWEEP_FOLDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Move `path`, a part file in `<download_folder>/Temp`, into
-/// `<download_folder>/Temp/<folder>/` under its own name. Blocking.
+/// `<download_folder>/Temp/<folder>/` under its own name, by a rename that
+/// never replaces a file already there. Blocking.
 fn set_aside_orphan(
     path: &Path,
     download_folder: &Path,
@@ -960,12 +1036,12 @@ fn set_aside_orphan(
         folder,
         &allowed,
     )?;
-    crate::network::ed2k::transfer::move_part_to_final_approved(
+    Ok(crate::security::filesystem::move_approved_no_replace(
         &verified,
         &aside.join(name),
-        download_folder,
+        &allowed,
         &identity,
-    )
+    )?)
 }
 
 async fn sweep_orphan_part_files_in(
@@ -3549,7 +3625,9 @@ mod ipc_lifecycle_tests {
             &known,
             &db,
             later,
-            super::OrphanDisposal::SetAside,
+            super::OrphanDisposal::SetAside {
+                since: chrono::Utc::now().timestamp(),
+            },
         )
         .await;
 
@@ -3580,9 +3658,51 @@ mod ipc_lifecycle_tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
-    /// Orphans are set aside from the launch that replaced the database until
-    /// a sweep has reached every download folder, so one that was not there
-    /// then is not swept by deletion when it comes back.
+    /// Each launch of one replacement sets aside into the same folder, so a
+    /// `.part.met` that could only be moved later joins its `.part`, and what
+    /// is already there is never replaced.
+    #[tokio::test]
+    async fn a_later_sweep_sets_aside_beside_what_an_earlier_one_moved_without_replacing_it() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (folders, base) = approved_old_and_new_folders("set-aside-later");
+        let db = test_db(&base);
+        let temp = folders.current.join("Temp");
+        let orphan = uuid::Uuid::new_v4();
+        let (part, met) = (
+            temp.join(format!("{orphan}.part")),
+            temp.join(format!("{orphan}.part.met")),
+        );
+        std::fs::write(&part, b"progress").unwrap();
+        let disposal = super::OrphanDisposal::SetAside {
+            since: chrono::Utc::now().timestamp() - 3600,
+        };
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let (roots, known) = (folders.roots(), std::collections::HashSet::new());
+        let sweep = || super::sweep_orphan_part_files(&roots, &known, &db, later, disposal);
+
+        assert!(sweep().await);
+        std::fs::write(&met, b"metadata").unwrap();
+        assert!(sweep().await);
+        let aside = set_aside_folders(&temp);
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        let (kept_part, kept_met) = (
+            aside[0].join(format!("{orphan}.part")),
+            aside[0].join(format!("{orphan}.part.met")),
+        );
+        assert_eq!(std::fs::read(&kept_part).unwrap(), b"progress");
+        assert_eq!(std::fs::read(&kept_met).unwrap(), b"metadata");
+
+        std::fs::write(&part, b"another").unwrap();
+        assert!(!sweep().await, "a name already set aside is not replaced");
+        assert_eq!(std::fs::read(&part).unwrap(), b"another");
+        assert_eq!(std::fs::read(&kept_part).unwrap(), b"progress");
+        drop(db);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Orphans are set aside from the moment the database is about to be
+    /// replaced until a sweep has reached every download folder, so one that
+    /// was not there then is not swept by deletion when it comes back.
     #[tokio::test]
     async fn orphans_are_set_aside_until_a_sweep_reaches_every_download_folder() {
         let _registry_guard = crate::security::filesystem::test_registry_lock();
@@ -3590,33 +3710,33 @@ mod ipc_lifecycle_tests {
         let data = base.join("data");
         let db = test_db(&base);
         use super::OrphanDisposal;
+        let set_aside =
+            |disposal: OrphanDisposal| matches!(disposal, OrphanDisposal::SetAside { .. });
 
         assert_eq!(OrphanDisposal::at_startup(&data, false), OrphanDisposal::Delete);
-        assert_eq!(OrphanDisposal::at_startup(&data, true), OrphanDisposal::SetAside);
-        assert_eq!(
-            OrphanDisposal::at_startup(&data, false),
-            OrphanDisposal::SetAside,
-            "the next launch still sets aside"
+        assert!(
+            set_aside(OrphanDisposal::at_startup(&data, true)),
+            "a launch that replaced the database sets aside even without the marker"
         );
+        assert_eq!(OrphanDisposal::at_startup(&data, false), OrphanDisposal::Delete);
+        OrphanDisposal::record_database_replacement(&data).unwrap();
+        let disposal = OrphanDisposal::at_startup(&data, false);
+        assert!(set_aside(disposal), "a launch that ended after the replacement still counts");
+        assert_eq!(OrphanDisposal::at_startup(&data, true), disposal);
 
         let mut roots = folders.roots();
         roots.push(base.join("unplugged").to_string_lossy().into_owned());
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
-        let complete = super::sweep_orphan_part_files(
-            &roots,
-            &Default::default(),
-            &db,
-            later,
-            OrphanDisposal::SetAside,
-        )
-        .await;
+        let complete =
+            super::sweep_orphan_part_files(&roots, &Default::default(), &db, later, disposal).await;
         assert!(!complete, "a download folder that is not there was not swept");
+        assert!(set_aside(OrphanDisposal::at_startup(&data, false)));
         let complete = super::sweep_orphan_part_files(
             &folders.roots(),
             &Default::default(),
             &db,
             later,
-            OrphanDisposal::SetAside,
+            disposal,
         )
         .await;
         assert!(complete);
@@ -3625,6 +3745,40 @@ mod ipc_lifecycle_tests {
         assert_eq!(OrphanDisposal::at_startup(&data, false), OrphanDisposal::Delete);
         drop(db);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn orphans_are_removed_again_once_the_replacement_is_two_weeks_old() {
+        let data = std::env::temp_dir().join(format!(
+            "ember-set-aside-bound-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&data).unwrap();
+        use super::OrphanDisposal;
+        let marker = data.join(super::SET_ASIDE_ORPHANS_MARKER);
+        let now = chrono::Utc::now().timestamp();
+
+        let recent = now - 13 * 24 * 60 * 60;
+        std::fs::write(&marker, format!("{recent}\n")).unwrap();
+        assert_eq!(
+            OrphanDisposal::at_startup(&data, false),
+            OrphanDisposal::SetAside { since: recent }
+        );
+
+        std::fs::write(&marker, format!("{}\n", now - 15 * 24 * 60 * 60)).unwrap();
+        assert_eq!(OrphanDisposal::at_startup(&data, false), OrphanDisposal::Delete);
+        assert!(!marker.exists(), "the marker is dropped with the bound");
+
+        std::fs::write(&marker, b"").unwrap();
+        assert!(
+            matches!(
+                OrphanDisposal::at_startup(&data, false),
+                OrphanDisposal::SetAside { since } if since >= now - 60
+            ),
+            "an empty marker from an earlier build counts from when it was written"
+        );
+        let _ = std::fs::remove_dir_all(data);
     }
 
     #[test]

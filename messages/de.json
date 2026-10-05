@@ -520,6 +520,7 @@
   "layout_download_folder_unavailable": "Downloads können nicht starten: Ember kann nicht in den Downloadordner schreiben. Prüfen Sie, ob er existiert und Sie Schreibrechte haben, oder wählen Sie in den Einstellungen einen anderen.",
   "layout_ember_default_on": "Das Ember-Netzwerk ist ab dieser Version immer aktiv und wurde daher für dieses Profil eingeschaltet. Es veröffentlicht die von Ihnen freigegebenen Dateien und Ihre Adresse gegenüber anderen Ember-Nutzern.",
   "layout_restore_failed": "Eine Profilwiederherstellung wurde nicht abgeschlossen. Ember verwendet Ihre bisherigen Dateien. Öffnen Sie Einstellungen → Sicherung, um die vorbereitete Wiederherstellung erneut zu versuchen oder zu verwerfen.",
+  "layout_restore_download_folder_replaced": "Der wiederhergestellte Downloadordner lag auf einer Netzwerkfreigabe, mit der sich eine Wiederherstellung nicht verbindet. Downloads werden daher jetzt in {path} gespeichert. Wenn es Ihre Freigabe ist, wählen Sie sie unter Einstellungen → Übertragungen erneut aus.",
   "layout_restore_expired": "Eine vor mehr als 30 Tagen vorbereitete Profilwiederherstellung wurde verworfen, ohne angewendet zu werden. Ember verwendet weiterhin Ihr aktuelles Profil. Um dieses Backup wiederherzustellen, wählen Sie es unter Einstellungen → Sicherung erneut aus.",
   "layout_db_corrupt_backup": "Ihre lokale Datenbank war beschädigt und wurde neu erstellt. Eine Sicherung des Originals wurde unter {path} gespeichert.",
   "speed_input_unlimited": "Unbegrenzt",

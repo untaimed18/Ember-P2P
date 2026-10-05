@@ -185,6 +185,10 @@ pub struct AppState {
     /// waited longer than a launch will apply one. Consumed like the latch
     /// above: the staging directory is already gone, so it is the only trace.
     pub pending_restore_expired_notice: Arc<AtomicBool>,
+    /// The local folder an applied restore put in place of a download folder
+    /// on a network share, until the layout takes it to tell the user. The
+    /// config already names the replacement, so this is the only trace.
+    pub pending_restore_download_folder_notice: Arc<parking_lot::Mutex<Option<String>>>,
     /// Mirror of `config.settings.close_to_tray_behavior` behind a synchronous
     /// `parking_lot::RwLock` so the `WindowEvent::CloseRequested` handler can
     /// read it from the main UI thread without blocking on the async tokio

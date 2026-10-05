@@ -5713,6 +5713,8 @@ pub async fn get_shared_folders(state: tauri::State<'_, AppState>) -> Result<Vec
 ///
 /// An offline folder is not one of them: it keeps whatever approval it had and
 /// comes back with its drive, and re-approving it could not capture anything.
+/// Nor is a network share with no approval record, which is not looked at:
+/// that would connect to its server and offer it the user's credentials.
 #[tauri::command]
 pub async fn get_unapproved_shared_folders(
     state: tauri::State<'_, AppState>,
@@ -5726,6 +5728,9 @@ pub async fn get_unapproved_shared_folders(
             .into_iter()
             .filter(|folder| {
                 let path = std::path::Path::new(folder);
+                if crate::security::is_network_path(folder) && !registry.is_recorded(path) {
+                    return false;
+                }
                 std::fs::symlink_metadata(path).is_ok() && registry.verify_root(path).is_err()
             })
             .collect()

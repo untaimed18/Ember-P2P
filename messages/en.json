@@ -520,6 +520,7 @@
   "layout_download_folder_unavailable": "Downloads can't start: Ember can't write to the download folder. Check that it exists and that you have write permission, or choose another one in Settings.",
   "layout_ember_default_on": "The Ember Network is always on from this version, so it was switched on for this profile. It publishes the files you share, and your address, to other Ember users.",
   "layout_restore_failed": "A profile restore did not finish. Ember is using your previous files. Open Settings → Backup to retry or discard the staged restore.",
+  "layout_restore_download_folder_replaced": "The restored download folder was on a network share, which a restore does not connect to, so downloads now go to {path}. If that share is yours, choose it again in Settings → Transfers.",
   "layout_restore_expired": "A profile restore prepared more than 30 days ago was discarded without being applied, so Ember is still using your current profile. To restore that backup, choose it again in Settings → Backup.",
   "layout_db_corrupt_backup": "Your local database was corrupt and has been recreated. A backup of the original was saved to {path}.",
   "speed_input_unlimited": "Unlimited",
