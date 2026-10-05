@@ -1359,6 +1359,15 @@ impl SignedRecord {
         blob: &[u8],
         expected_channel_id: &[u8; 16],
     ) -> Option<([u8; 32], [u8; 32], [u8; 16], i64, bool)> {
+        Self::parse_channel_succession_claim_signed(blob, expected_channel_id).map(|(claim, _)| claim)
+    }
+
+    /// [`Self::parse_channel_succession_claim`] with the time the claimant
+    /// signed this copy at, which it chooses and renews on every republish.
+    pub fn parse_channel_succession_claim_signed(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+    ) -> Option<(([u8; 32], [u8; 32], [u8; 16], i64, bool), i64)> {
         let rec = Self::from_value_blob(blob)?;
         if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
             return None;
@@ -1374,11 +1383,8 @@ impl SignedRecord {
             channel::decode_claim_extra(&meta.extra)?;
         let keep = meta.flags & CHANNEL_FLAG_PRIVATE != 0;
         Some((
-            rec.publisher_key,
-            successor_pubkey,
-            successor_channel_id,
-            ts,
-            keep,
+            (rec.publisher_key, successor_pubkey, successor_channel_id, ts, keep),
+            rec.timestamp,
         ))
     }
 

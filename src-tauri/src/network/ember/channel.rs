@@ -553,6 +553,14 @@ pub const HANDOFF_RETIRED_KEEP_SECS: i64 = 90 * 86_400;
 /// no offer: the members are already following the claim, and the record is
 /// what brings the rest of them along.
 pub const HANDOFF_CLAIMED_REPUBLISH_SECS: i64 = 5 * 60;
+/// How long after coming back from a claimable silence an owner still takes a
+/// claim it finds as one the silence allowed: a dozen of its handoff fetches.
+///
+/// Past that, finding a claim shows only that the claimant has one out now.
+/// They re-sign it every few hours and choose the time they sign it with, so
+/// neither its date nor the stamp it cites can show it was made before we came
+/// back; a claim first published since then is a race against our return.
+pub const OWNER_RETURN_CLAIM_WINDOW_SECS: i64 = 12 * HANDOFF_FETCH_SECS;
 
 /// Whether a succession claim citing `witnessed_ts` is one the members could
 /// rightly have honoured while we, the owner, were silent from `silent_from`

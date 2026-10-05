@@ -1458,6 +1458,10 @@ pub(super) struct NetworkState {
     /// Rooms whose committed handoff has already been reported as not landing,
     /// so the report goes out once per window rather than every pass.
     pub(super) channel_handoff_failure_noted: HashSet<[u8; 16]>,
+    /// When the latest handoff fetch of each owned room that found no record
+    /// of ours was started. What tells a commitment that was never stored from
+    /// one whose acknowledgement went missing.
+    pub(super) channel_handoff_absent_at: HashMap<[u8; 16], i64>,
     /// Consecutive history-sync attempts that found no path to the neighbor,
     /// per (channel_id, neighbor pubkey). Cleared on a send; drives
     /// [`ember::channel::history_sync_retry_secs`].

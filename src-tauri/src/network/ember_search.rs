@@ -440,9 +440,14 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             } else if let Some(channel_id) =
                 state.ember_channel_handoff_searches.remove(&search_id)
             {
-                state
-                    .ember_pending_channel_handoff
-                    .push((channel_id, into_blobs(held)));
+                // Same as moderation: finding nothing because nobody answered
+                // must not read, for a room we own, as our record being stored
+                // nowhere, which is what lets a banned nominee's commitment go.
+                let answered = search.as_ref().map_or(0, |s| s.responded_count());
+                let blobs = into_blobs(held);
+                if answered > 0 || !blobs.is_empty() {
+                    state.ember_pending_channel_handoff.push((channel_id, blobs));
+                }
             }
         }
     }

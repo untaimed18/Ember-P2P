@@ -259,109 +259,225 @@ fn a_succession_claim_is_refused_unless_both_we_and_it_show_real_silence() {
     );
 }
 
+/// A private room this device owns, whose nominee has a claim ready, and whose
+/// owner last spoke a month ago with a 14-day window.
+struct SilentOwnerRoom {
+    db: Database,
+    path: std::path::PathBuf,
+    room: crate::network::ember::channel::ChannelIdentity,
+    successor: crate::network::ember::channel::ChannelIdentity,
+    nominee: ed25519_dalek::SigningKey,
+    last_word: i64,
+}
+
+impl SilentOwnerRoom {
+    fn new() -> Self {
+        use crate::network::ember::channel::ChannelIdentity;
+        use rand::rngs::OsRng as RandOsRng;
+
+        let path = std::env::temp_dir().join(format!(
+            "ember-owner-claim-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let room = ChannelIdentity::generate();
+        let nominee = ed25519_dalek::SigningKey::generate(&mut RandOsRng);
+        let nominee_pk = nominee.verifying_key().to_bytes();
+        let channel_id_hex = hex::encode(room.channel_id);
+        db.insert_channel(
+            &channel_id_hex,
+            &hex::encode(room.pubkey),
+            "Room",
+            "private",
+            true,
+            Some(&room.seed()),
+            Some(&[0xABu8; 32]),
+        )
+        .expect("insert channel");
+        db.upsert_channel_member(&channel_id_hex, &hex::encode(nominee_pk), "Nominee", 1, None)
+            .unwrap();
+        let last_word = chrono::Utc::now().timestamp() - 30 * 86_400;
+        db.apply_channel_moderation(
+            &channel_id_hex,
+            "Topic",
+            "",
+            last_word,
+            &[],
+            &[],
+            Some(&[0x11u8; 32]),
+            Some(&nominee_pk),
+            Some(14),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        Self {
+            db,
+            path,
+            room,
+            successor: ChannelIdentity::generate(),
+            nominee,
+            last_word,
+        }
+    }
+
+    fn channel_id_hex(&self) -> String {
+        hex::encode(self.room.channel_id)
+    }
+
+    fn nominee_hex(&self) -> String {
+        hex::encode(self.nominee.verifying_key().to_bytes())
+    }
+
+    /// A claim citing `witnessed_ts`, in a copy signed at `signed_at`. The
+    /// claimant picks both.
+    fn claim_blob(&self, witnessed_ts: i64, signed_at: i64) -> Vec<u8> {
+        let rec = crate::network::ember::dht::publish::SignedRecord::channel_succession_claim(
+            self.room.channel_id,
+            self.room.pubkey,
+            &self.successor.pubkey,
+            witnessed_ts,
+            true,
+            &self.nominee,
+        );
+        let mut blob = rec.data.clone();
+        blob[105..113].copy_from_slice(&signed_at.to_le_bytes());
+        let signature = crate::network::ember::crypto::sign(&self.nominee, &blob);
+        blob.extend_from_slice(&signature);
+        blob
+    }
+
+    fn ingest(&self, witnessed_ts: i64, signed_at: i64) -> Option<[u8; 16]> {
+        ingest_channel_claim_records(
+            &self.db,
+            self.room.channel_id,
+            &[self.claim_blob(witnessed_ts, signed_at)],
+        )
+    }
+
+    fn finish(self) {
+        drop(self.db);
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(format!("{}-wal", self.path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", self.path.display()));
+    }
+}
+
 /// An owner coming back to a claim its nominee made while it was away follows
 /// it rather than carrying on in a room its members have left — judged against
 /// the silence it recorded on coming back, since its own snapshot is by then
 /// newer than anything a claimant could cite.
 #[test]
 fn an_owner_back_from_silence_follows_only_a_claim_that_silence_allowed() {
-    use crate::network::ember::channel::ChannelIdentity;
-    use crate::network::ember::dht::publish::SignedRecord;
-    use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng as RandOsRng;
-
-    let path = std::env::temp_dir().join(format!(
-        "ember-owner-claim-{}-{}.db",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    let _ = std::fs::remove_file(&path);
-    let db = Database::open_at(&path).expect("open db");
-
-    let room = ChannelIdentity::generate();
-    let successor = ChannelIdentity::generate();
-    let nominee = SigningKey::generate(&mut RandOsRng);
-    let nominee_pk = nominee.verifying_key().to_bytes();
-    let channel_id_hex = hex::encode(room.channel_id);
-    db.insert_channel(
-        &channel_id_hex,
-        &hex::encode(room.pubkey),
-        "Room",
-        "private",
-        true,
-        Some(&room.seed()),
-        Some(&[0xABu8; 32]),
-    )
-    .expect("insert channel");
-    db.upsert_channel_member(&channel_id_hex, &hex::encode(nominee_pk), "Nominee", 1, None)
-        .unwrap();
-
+    let fx = SilentOwnerRoom::new();
     let now = chrono::Utc::now().timestamp();
     let day = 86_400i64;
-    let last_word = now - 30 * day;
-    db.apply_channel_moderation(
-        &channel_id_hex,
-        "Topic",
-        "",
-        last_word,
-        &[],
-        &[],
-        Some(&[0x11u8; 32]),
-        Some(&nominee_pk),
-        Some(14),
-        None,
-        None,
-        None,
-    )
-    .unwrap();
-    let claim_blob = |witnessed_ts: i64| -> Vec<u8> {
-        let rec = SignedRecord::channel_succession_claim(
-            room.channel_id,
-            room.pubkey,
-            &successor.pubkey,
-            witnessed_ts,
-            true,
-            &nominee,
-        );
-        let mut blob = rec.data.clone();
-        blob.extend_from_slice(&rec.signature);
-        blob
-    };
+    let last_word = fx.last_word;
+    let during = last_word + 15 * day;
 
     assert_eq!(
-        ingest_channel_claim_records(&db, room.channel_id, &[claim_blob(last_word)]),
+        fx.ingest(last_word, during),
         None,
         "an owner that never went quiet has nothing to follow"
     );
 
     // Coming back: the first stamp is what notices the silence.
-    db.stamp_owner_snapshot(&channel_id_hex, now).unwrap();
+    fx.db.stamp_owner_snapshot(&fx.channel_id_hex(), now).unwrap();
     assert_eq!(
-        ingest_channel_claim_records(&db, room.channel_id, &[claim_blob(now - 3_600)]),
+        fx.ingest(now - 3_600, during),
         None,
         "a claim whose window had not run out when we came back raced our return"
     );
     assert_eq!(
-        ingest_channel_claim_records(&db, room.channel_id, &[claim_blob(last_word - day)]),
+        fx.ingest(last_word - day, during),
         None,
         "members held our last word, so a claim citing an older one was refused"
     );
     assert_eq!(
-        ingest_channel_claim_records(&db, room.channel_id, &[claim_blob(last_word)]),
-        Some(successor.channel_id),
+        fx.ingest(last_word, now + 60),
+        None,
+        "a copy signed after we came back says nothing about the silence"
+    );
+    assert_eq!(
+        fx.ingest(last_word, during),
+        Some(fx.successor.channel_id),
         "the claim the members followed is the one we follow"
     );
-    let commit = db
-        .channel_handoff_commit(&channel_id_hex)
+    let commit = fx
+        .db
+        .channel_handoff_commit(&fx.channel_id_hex())
         .unwrap()
         .expect("the room is committed to the claimed successor");
-    assert!(commit.nominee.is_empty());
-    assert_eq!(commit.successor_pubkey, hex::encode(successor.pubkey));
+    assert!(commit.claimed, "followed as a claim, which asks for no offer");
+    assert_eq!(commit.nominee, fx.nominee_hex(), "and names the claimant, so a ban can reach it");
+    assert_eq!(commit.successor_pubkey, hex::encode(fx.successor.pubkey));
 
-    drop(db);
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
-    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    fx.finish();
+}
+
+/// Claims are re-signed every few hours for months, so one found long after
+/// the owner came back may as well have been made since: the owner stops
+/// looking once its return window closes, and forgets the silence.
+#[test]
+fn an_owner_ignores_a_claim_found_after_its_return_window() {
+    use crate::network::ember::channel::OWNER_RETURN_CLAIM_WINDOW_SECS;
+
+    let fx = SilentOwnerRoom::new();
+    let back_at = chrono::Utc::now().timestamp() - OWNER_RETURN_CLAIM_WINDOW_SECS - 60;
+    fx.db.stamp_owner_snapshot(&fx.channel_id_hex(), back_at).unwrap();
+    assert!(fx.db.channel_owner_silence(&fx.channel_id_hex()).unwrap().is_some());
+
+    assert_eq!(
+        fx.ingest(fx.last_word, fx.last_word + 15 * 86_400),
+        None,
+        "a claim the silence allowed, but found too late to show it"
+    );
+    assert!(
+        fx.db.channel_owner_silence(&fx.channel_id_hex()).unwrap().is_none(),
+        "the silence is forgotten with the window"
+    );
+    assert!(fx.db.channel_handoff_commit(&fx.channel_id_hex()).unwrap().is_none());
+
+    fx.finish();
+}
+
+/// Banning the claimant has to stop a claim the owner was about to follow, and
+/// one the owner gave up on stays given up, however many times its claimant
+/// republishes it.
+#[test]
+fn an_owner_does_not_follow_a_banned_or_declined_claim() {
+    let fx = SilentOwnerRoom::new();
+    let now = chrono::Utc::now().timestamp();
+    let during = fx.last_word + 15 * 86_400;
+    fx.db.stamp_owner_snapshot(&fx.channel_id_hex(), now).unwrap();
+
+    assert_eq!(fx.ingest(fx.last_word, during), Some(fx.successor.channel_id));
+    let commit = fx.db.channel_handoff_commit(&fx.channel_id_hex()).unwrap().unwrap();
+    assert!(
+        !fx.db.drop_banned_channel_handoff_commit(&fx.channel_id_hex(), &commit, now).unwrap(),
+        "a claimant nobody banned keeps the room committed"
+    );
+    fx.db
+        .apply_channel_ban_action(&fx.channel_id_hex(), &fx.nominee_hex(), true, now)
+        .unwrap();
+    assert!(fx.db.drop_banned_channel_handoff_commit(&fx.channel_id_hex(), &commit, now).unwrap());
+    assert!(fx.db.channel_handoff_commit(&fx.channel_id_hex()).unwrap().is_none());
+
+    assert_eq!(fx.ingest(fx.last_word, during), None, "the banned claimant's claim");
+    fx.db
+        .apply_channel_ban_action(&fx.channel_id_hex(), &fx.nominee_hex(), false, now + 1)
+        .unwrap();
+    assert_eq!(
+        fx.ingest(fx.last_word, during),
+        None,
+        "nor, once declined, the same successor again under a new version"
+    );
+    assert!(fx.db.channel_handoff_commit(&fx.channel_id_hex()).unwrap().is_none());
+
+    fx.finish();
 }
 use crate::network::kad::messages::SearchResultEntry;
 use crate::network::kad::types::{

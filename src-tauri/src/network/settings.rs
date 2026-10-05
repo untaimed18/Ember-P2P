@@ -146,6 +146,7 @@ pub(super) fn ember_disable_cleanup(state: &mut NetworkState) -> Option<u64> {
     state.ember_channel_handoff_searches.clear();
     state.ember_pending_channel_handoff.clear();
     state.channel_handoff_fetch_at.clear();
+    state.channel_handoff_absent_at.clear();
     state.xfer_send.clear();
     state.xfer_recv.clear();
     state.xfer_pending.clear();

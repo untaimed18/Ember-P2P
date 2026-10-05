@@ -1140,6 +1140,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_handoff_publishes: HashMap::new(),
         channel_handoff_completing: Arc::new(std::sync::Mutex::new(HashSet::new())),
         channel_handoff_failure_noted: HashSet::new(),
+        channel_handoff_absent_at: HashMap::new(),
         channel_history_sync_mark: HashMap::new(),
         channel_history_sync_ingested: HashMap::new(),
         ember_channel_presence_searches: HashMap::new(),

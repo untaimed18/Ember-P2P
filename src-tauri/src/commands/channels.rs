@@ -4148,10 +4148,15 @@ pub async fn ban_channel_member(
         ));
     }
     if is_owner {
-        // Once a handoff record naming them is known to be stored, the members
-        // are following it to the room they now own, and nothing this device
-        // signs can call it back. Banning them here would only ban them from a
-        // room nobody is left in.
+        // From the first publish of a handoff record naming them it may be
+        // stored, whether or not anyone said so, and once it is the members
+        // follow it to the room they now own; nothing this device signs can
+        // call it back, and our own fetch adopts it when it turns up. Banning
+        // them here would only ban them from a room nobody is left in.
+        //
+        // Except a claim of theirs we are following that is not known to be
+        // stored yet: the ban stops it being published, and it is given up
+        // once our fetch shows it never landed.
         let db = state.db.clone();
         let id = channel_id.clone();
         let commit = tokio::task::spawn_blocking(move || db.channel_handoff_commit(&id))
@@ -4159,7 +4164,7 @@ pub async fn ban_channel_member(
             .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
             .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load channel", e))?;
         if commit.is_some_and(|commit| {
-            commit.confirmed && commit.nominee.eq_ignore_ascii_case(&hex::encode(pk))
+            commit.nominee.eq_ignore_ascii_case(&hex::encode(pk)) && (commit.confirmed || !commit.claimed)
         }) {
             return Err(coded(
                 "channels_ban_transfer_nominee",
@@ -4643,20 +4648,20 @@ pub async fn claim_channel_ownership(
     let old = channel_id.clone();
     let successor_pk_hex = hex::encode(successor.pubkey);
     let successor_id_hex = hex::encode(successor.channel_id);
-    let version = row.moderation_updated_at.max(1) as u64;
-    tokio::task::spawn_blocking(move || {
-        db.apply_channel_handoff(
-            &old,
-            &successor_pk_hex,
-            &successor_id_hex,
-            version,
-            private,
-            Some(&seed),
-        )
+    let applied = tokio::task::spawn_blocking(move || {
+        db.apply_claimed_channel_handoff(&old, &successor_pk_hex, &successor_id_hex, private, Some(&seed))
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_handoff_failed", "Could not claim the room", e))?;
+    // Refused: the room moved or was deleted since it was loaded. Publishing
+    // the claim anyway would send the members to a successor nobody holds.
+    if !applied {
+        return Err(coded(
+            "channels_handoff_failed",
+            "This room does not need claiming",
+        ));
+    }
 
     // Everything that needed serialising is now in the database, and the room
     // reads as claimed, so a second attempt is refused by the guard above
@@ -4782,17 +4787,19 @@ pub async fn claim_channel_ownership(
             )
             .await
             {
-                // The handoff left the room owing a rotation; this was it. One
-                // that failed stays owed, and the owned-room pass retries it.
-                Ok(_) if rotated.is_some() => {
+                Ok(_) if rotated.is_some() || !private => {}
+                // The one rotation this room is owed, and nothing else is going
+                // to mint it: the claim left no mark for the owned-room pass,
+                // whose rotation would have raced this one for the same epoch.
+                // Marked now that ours did not land, and that pass retries it.
+                outcome => {
+                    if let Err(e) = outcome {
+                        tracing::warn!(channel_id = %successor_id_hex, error = %e, "could not publish the claimed room's first record");
+                        undo_rotation(&state, &owned, rotated).await;
+                    }
                     let db = state.db.clone();
                     let id = successor_id_hex.clone();
-                    let _ = tokio::task::spawn_blocking(move || db.clear_channel_rotate_pending(&id)).await;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(channel_id = %successor_id_hex, error = %e, "could not publish the claimed room's first record");
-                    undo_rotation(&state, &owned, rotated).await;
+                    let _ = tokio::task::spawn_blocking(move || db.mark_channel_rotate_pending(&id)).await;
                 }
             }
         }
@@ -5455,7 +5462,9 @@ pub async fn transfer_channel_ownership(
                 "This room's ownership transfer is still being published",
             )
         };
-        if commit.confirmed {
+        // A claim we are following has no offer to lapse: the members who
+        // honoured it have already left for its successor.
+        if commit.confirmed || commit.claimed {
             return Err(publishing());
         }
         if channel::handoff_offer_live(commit.version, now) {

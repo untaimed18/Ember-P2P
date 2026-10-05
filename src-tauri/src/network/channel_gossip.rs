@@ -1960,10 +1960,9 @@ async fn complete_owned_channel_handoff(
     let prepare_hex = channel_hex.clone();
     let prepared = tokio::task::spawn_blocking(move || {
         let commit = prepare_db
-            .channel_handoff_commit(&prepare_hex)
+            .completable_channel_handoff_commit(&prepare_hex)
             .ok()
-            .flatten()
-            .filter(|commit| commit.confirmed)?;
+            .flatten()?;
         prepare_db
             .get_channel_lite(&prepare_hex)
             .ok()
@@ -2033,6 +2032,7 @@ pub(super) async fn maybe_drive_channel_handoffs(
     if commits.is_empty() {
         state.channel_handoff_publishes.clear();
         state.channel_handoff_failure_noted.clear();
+        state.channel_handoff_absent_at.clear();
         return;
     }
     let now = chrono::Utc::now().timestamp();
@@ -2066,9 +2066,39 @@ pub(super) async fn maybe_drive_channel_handoffs(
             .get(&channel_id)
             .map(|(_, at)| *at)
             .unwrap_or(0);
+        // Banned since we committed — by a moderator's gossip, or by us while
+        // following their claim. Nothing more goes out for them, and once a
+        // fetch begun well after the last publish finds nothing of ours, the
+        // commitment goes too. A record that did land after all is found and
+        // adopted like any other, since the members follow it either way.
+        if !commit.nominee.is_empty()
+            && db
+                .channel_member_is_banned(&channel_hex, &commit.nominee)
+                .unwrap_or(false)
+        {
+            let unstored = state
+                .channel_handoff_absent_at
+                .get(&channel_id)
+                .is_some_and(|at| *at >= last.saturating_add(ember::channel::HANDOFF_REPUBLISH_SECS));
+            if unstored
+                && db
+                    .drop_banned_channel_handoff_commit(&channel_hex, &commit, now)
+                    .unwrap_or(false)
+            {
+                live.remove(&channel_id);
+                let _ = app_handle.emit(
+                    "ember:channel-handoff",
+                    serde_json::json!({
+                        "channel_id": channel_hex,
+                        "phase": "withdrawn",
+                    }),
+                );
+            }
+            continue;
+        }
         // Following our nominee's claim: there is no offer to lapse, and
         // nothing to give up on, since the members are already leaving.
-        if commit.nominee.is_empty() {
+        if commit.claimed || commit.nominee.is_empty() {
             if ember::channel::schedule_due(last, now, ember::channel::HANDOFF_CLAIMED_REPUBLISH_SECS) {
                 publish_committed_channel_handoff(
                     socket,
@@ -2115,6 +2145,7 @@ pub(super) async fn maybe_drive_channel_handoffs(
     }
     state.channel_handoff_publishes.retain(|id, _| live.contains(id));
     state.channel_handoff_failure_noted.retain(|id| live.contains(id));
+    state.channel_handoff_absent_at.retain(|id, _| live.contains(id));
 }
 
 /// Republish the records of moves this device signed, for the members who were

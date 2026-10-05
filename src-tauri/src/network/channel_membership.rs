@@ -2264,15 +2264,15 @@ pub(super) async fn maybe_publish_owned_channel_records(
         if !ember::channel::schedule_due(last, now, ember::channel::MODERATION_REPUBLISH_SECS) {
             continue;
         }
-        // A commitment with no nominee is one this device did not offer: a
-        // record it found stored, or its nominee's claim it is following. The
-        // members are leaving for that successor, and a fresh snapshot from us
-        // is exactly what makes the ones still deciding refuse the claim.
+        // A commitment this device did not offer: a record it found stored, or
+        // its nominee's claim it is following. The members are leaving for that
+        // successor, and a fresh snapshot from us is exactly what makes the
+        // ones still deciding refuse the claim.
         if db
             .channel_handoff_commit(&ch.channel_id)
             .ok()
             .flatten()
-            .is_some_and(|commit| commit.nominee.is_empty())
+            .is_some_and(|commit| commit.claimed || commit.nominee.is_empty())
         {
             continue;
         }
@@ -2890,15 +2890,13 @@ pub(super) async fn maybe_refresh_channel_handoff(
         // A succession claim lives under its own key, because it is signed by
         // the nominee rather than the room. Only worth asking for once the
         // owner has actually been silent long enough to honour one — and by
-        // the owner, once back from such a silence, for as long as the claimant
-        // keeps a claim made in it published.
+        // the owner, just back from such a silence, while a claim it finds can
+        // still be one that silence allowed.
         let claim_due = if ch.is_owner {
-            db.channel_owner_silence(&ch.channel_id)
+            db.live_channel_owner_silence(&ch.channel_id, now)
                 .ok()
                 .flatten()
-                .is_some_and(|silence| {
-                    now.saturating_sub(silence.silent_until) < ember::channel::HANDOFF_RETIRED_KEEP_SECS
-                })
+                .is_some()
         } else {
             !ch.successor_nominee.is_empty()
                 && ch.claim_after_days > 0
@@ -2932,20 +2930,33 @@ pub(super) async fn maybe_refresh_channel_handoff(
     }
 }
 
+/// What a handoff fetch told us about a room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChannelHandoffIngest {
+    Nothing,
+    /// We followed the room to this successor.
+    Followed([u8; 16]),
+    /// A room we own, and no record signed by it is stored where we looked.
+    OwnAbsent,
+    /// A room we own, now committed to a stored record naming this successor
+    /// that it was not committed to before.
+    OwnAdopted([u8; 16]),
+}
+
 pub(super) fn ingest_channel_handoff_records(
     db: &Database,
     channel_id: [u8; 16],
     records: &[Vec<u8>],
-) -> Option<[u8; 16]> {
+) -> ChannelHandoffIngest {
     if db.chat_locked() {
-        return None;
+        return ChannelHandoffIngest::Nothing;
     }
     let channel_id_hex = hex::encode(channel_id);
     let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
-        return None;
+        return ChannelHandoffIngest::Nothing;
     };
     let Ok(stored_pk) = hex::decode(&ch.pubkey) else {
-        return None;
+        return ChannelHandoffIngest::Nothing;
     };
     let mut best: Option<ember::dht::publish::ChannelHandoff> = None;
     for blob in records {
@@ -2971,23 +2982,40 @@ pub(super) fn ingest_channel_handoff_records(
             best = Some(parsed);
         }
     }
-    let handoff = best?;
+    let Some(handoff) = best else {
+        return if ch.is_owner && ch.successor_id.is_empty() {
+            ChannelHandoffIngest::OwnAbsent
+        } else {
+            ChannelHandoffIngest::Nothing
+        };
+    };
     let keep = handoff.flags & ember::channel::HANDOFF_FLAG_KEEP_JOIN_SECRET != 0;
     let successor_pk = hex::encode(handoff.successor_pubkey);
     let successor_id = hex::encode(handoff.successor_channel_id);
     // Our own record, found stored — possibly one whose acknowledgement never
-    // came back. It is not applied here: that would drop our seed before the
-    // registry name was signed over to the successor. Confirming it hands the
-    // rest to `maybe_drive_channel_handoffs`, which does both in order.
+    // came back, or one we have since withdrawn. It is not applied here: that
+    // would drop our seed before the registry name was signed over to the
+    // successor. Confirming it hands the rest to `maybe_drive_channel_handoffs`,
+    // which does both in order.
     if ch.is_owner {
-        let _ = db.confirm_channel_handoff(
-            &channel_id_hex,
-            handoff.version,
-            &successor_pk,
-            chrono::Utc::now().timestamp(),
-            true,
-        );
-        return None;
+        let held = db.channel_handoff_commit(&channel_id_hex).ok().flatten();
+        let already = held.is_some_and(|held| {
+            held.version == handoff.version && held.successor_pubkey.eq_ignore_ascii_case(&successor_pk)
+        });
+        let confirmed = db
+            .confirm_channel_handoff(
+                &channel_id_hex,
+                handoff.version,
+                &successor_pk,
+                chrono::Utc::now().timestamp(),
+                true,
+            )
+            .unwrap_or(false);
+        return if confirmed && !already {
+            ChannelHandoffIngest::OwnAdopted(handoff.successor_channel_id)
+        } else {
+            ChannelHandoffIngest::Nothing
+        };
     }
     let seed = db
         .load_handoff_pending_seed(&channel_id_hex, &successor_pk, handoff.version)
@@ -3004,9 +3032,9 @@ pub(super) fn ingest_channel_handoff_records(
         )
         .unwrap_or(false)
     {
-        Some(handoff.successor_channel_id)
+        ChannelHandoffIngest::Followed(handoff.successor_channel_id)
     } else {
-        None
+        ChannelHandoffIngest::Nothing
     }
 }
 
@@ -3102,13 +3130,10 @@ pub(super) fn ingest_channel_claim_records(
         let successor_pk_hex = hex::encode(successor_pk);
         let successor_id_hex = hex::encode(successor_id);
         if db
-            .apply_channel_handoff(
+            .apply_claimed_channel_handoff(
                 &channel_id_hex,
                 &successor_pk_hex,
                 &successor_id_hex,
-                // Version is the claim's own witness timestamp: monotonic, and
-                // it cannot collide with the owner's own handoff versions.
-                witnessed_ts.max(1) as u64,
                 keep,
                 None,
             )
@@ -3135,7 +3160,11 @@ pub(super) fn ingest_channel_claim_records(
 /// meanwhile.
 ///
 /// Judged against the silence we recorded on coming back, not our current
-/// snapshot, which is newer than anything the claimant could have cited.
+/// snapshot, which is newer than anything the claimant could have cited. And
+/// only for a claim found within [`ember::channel::OWNER_RETURN_CLAIM_WINDOW_SECS`]
+/// of that return, in a copy signed before it: nothing the claimant signs can
+/// show when a claim was first made, so its turning up at once, dated inside
+/// the silence, is the evidence there is that it was made then.
 fn follow_claim_on_owned_channel(
     db: &Database,
     ch: &crate::storage::database::StoredChannel,
@@ -3145,12 +3174,15 @@ fn follow_claim_on_owned_channel(
     if ch.deleted || !ch.successor_id.is_empty() {
         return None;
     }
-    let silence = db.channel_owner_silence(&ch.channel_id).ok().flatten()?;
+    let now = chrono::Utc::now().timestamp();
+    let silence = db.live_channel_owner_silence(&ch.channel_id, now).ok().flatten()?;
     let mut candidates: Vec<([u8; 32], [u8; 32], [u8; 16], i64, bool)> = records
         .iter()
         .filter_map(|blob| {
-            ember::dht::publish::SignedRecord::parse_channel_succession_claim(blob, &channel_id)
+            ember::dht::publish::SignedRecord::parse_channel_succession_claim_signed(blob, &channel_id)
         })
+        .filter(|(_, signed_at)| *signed_at <= silence.silent_until)
+        .map(|(claim, _)| claim)
         .filter(|(claimant, ..)| silence.nominee.eq_ignore_ascii_case(&hex::encode(claimant)))
         .filter(|(_, _, _, witnessed_ts, _)| {
             ember::channel::claim_fits_owner_silence(
@@ -3165,14 +3197,12 @@ fn follow_claim_on_owned_channel(
     candidates.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.2.cmp(&b.2)));
     for (claimant, successor_pk, successor_id, _, _) in candidates {
         if db
-            .channel_member_is_banned(&ch.channel_id, &hex::encode(claimant))
-            .unwrap_or(true)
-        {
-            continue;
-        }
-        let now = chrono::Utc::now().timestamp();
-        if db
-            .commit_claimed_channel_handoff(&ch.channel_id, &hex::encode(successor_pk), now)
+            .commit_claimed_channel_handoff(
+                &ch.channel_id,
+                &hex::encode(claimant),
+                &hex::encode(successor_pk),
+                now,
+            )
             .unwrap_or(false)
         {
             tracing::info!(
@@ -3402,6 +3432,11 @@ pub(super) struct ChannelIngestResults {
     pub(super) rekeyed: Vec<[u8; 16]>,
     /// `(room, successor)` for each handoff followed.
     pub(super) followed: Vec<([u8; 16], [u8; 16])>,
+    /// `(room, successor)` for each room we own committed to a stored record
+    /// of ours it was not committed to.
+    pub(super) adopted: Vec<([u8; 16], [u8; 16])>,
+    /// Rooms we own whose handoff fetch found no record of ours.
+    pub(super) handoff_absent: Vec<[u8; 16]>,
 }
 
 /// Apply a batch to the database. Blocking: every step takes the database lock.
@@ -3440,8 +3475,11 @@ pub(super) fn run_channel_ingest(
         }
     }
     for (channel_id, records) in batch.handoff {
-        if let Some(successor) = ingest_channel_handoff_records(db, channel_id, &records) {
-            results.followed.push((channel_id, successor));
+        match ingest_channel_handoff_records(db, channel_id, &records) {
+            ChannelHandoffIngest::Nothing => {}
+            ChannelHandoffIngest::Followed(successor) => results.followed.push((channel_id, successor)),
+            ChannelHandoffIngest::OwnAbsent => results.handoff_absent.push(channel_id),
+            ChannelHandoffIngest::OwnAdopted(successor) => results.adopted.push((channel_id, successor)),
         }
     }
     results
