@@ -585,6 +585,14 @@
     }
   }
 
+  /** Auto is a switch, so it applies at once like the others. Turning it off
+   *  starts from the old fixed default, which the number box then edits. */
+  function setMaxUploadsAuto(auto: boolean) {
+    if (!settings) return;
+    settings.max_concurrent_uploads = auto ? 0 : 5;
+    void applyFields(['max_concurrent_uploads']);
+  }
+
   function applyRecommended() {
     if (!settings || !speedResult) return;
     settings.max_upload_speed = speedResult.recommended_upload_limit;
@@ -1351,7 +1359,8 @@
     if (s.max_upload_speed === 0) s.uss_enabled = false;
     s.max_download_speed = cn(s.max_download_speed, MAX_CONFIGURED_SPEED_BPS, 0);
     s.max_concurrent_downloads = ci(s.max_concurrent_downloads, 1, 50, 5);
-    s.max_concurrent_uploads = ci(s.max_concurrent_uploads, 1, 50, 5);
+    // 0 is Auto, not an empty box — `numericFields` above rejects those.
+    if (s.max_concurrent_uploads !== 0) s.max_concurrent_uploads = ci(s.max_concurrent_uploads, 1, 50, 5);
     s.max_sources_per_file = ci(s.max_sources_per_file, 50, 2000, 400);
     s.max_connections = ci(s.max_connections, 1, 2000, 500);
     // Lower bound 0: that is the documented "no burst gate" value, not an
@@ -1372,12 +1381,14 @@
     return JSON.stringify(a) === JSON.stringify(b);
   }
 
+  // `uss_enabled` too: an Unlimited upload set there turns USS off.
   const QUICK_LIMIT_KEYS = [
     'alt_speed_enabled',
     'max_upload_speed',
     'max_download_speed',
     'alt_max_upload_speed',
     'alt_max_download_speed',
+    'uss_enabled',
   ] as const;
 
   /** The tray or the status bar saved speed limits while this page was open.
@@ -1469,6 +1480,14 @@
     } catch {
       return null;
     }
+  });
+
+  // Shown while either the saved or the edited value is a number, so a 0
+  // typed into the box (Auto) stays visible with its Apply button.
+  let maxUploadsBoxShown = $derived.by(() => {
+    const current = settings;
+    const saved = savedSettings;
+    return current?.max_concurrent_uploads !== 0 || saved?.max_concurrent_uploads !== 0;
   });
 
   function fieldValue(source: AppSettings, key: string): unknown {
@@ -3142,10 +3161,21 @@
                 <span class="hint">{m.settings_max_downloads_hint()}</span>
               </div>
               <div class="field half">
-                <label for="max-uploads">{m.settings_max_uploads()}</label>
+                <label for={maxUploadsBoxShown ? 'max-uploads' : 'max-uploads-auto'}>{m.settings_max_uploads()}</label>
                 <div class="apply-input">
-                  <input id="max-uploads" type="number" min="1" max="50" bind:value={settings.max_concurrent_uploads} onkeydown={(e) => applyOnEnter(e, ['max_concurrent_uploads'])} />
-                  {@render applyButton(['max_concurrent_uploads'], m.settings_max_uploads())}
+                  <label class="auto-choice">
+                    <input
+                      id="max-uploads-auto"
+                      type="checkbox"
+                      checked={settings.max_concurrent_uploads === 0}
+                      onchange={(e) => setMaxUploadsAuto(e.currentTarget.checked)}
+                    />
+                    {m.settings_max_uploads_auto()}
+                  </label>
+                  {#if maxUploadsBoxShown}
+                    <input id="max-uploads" type="number" min="1" max="50" bind:value={settings.max_concurrent_uploads} onkeydown={(e) => applyOnEnter(e, ['max_concurrent_uploads'])} />
+                    {@render applyButton(['max_concurrent_uploads'], m.settings_max_uploads())}
+                  {/if}
                 </div>
                 <span class="hint">{m.settings_max_uploads_hint()}</span>
               </div>
@@ -5372,6 +5402,16 @@
   .field-apply {
     flex-shrink: 0;
     padding: 7px 14px;
+  }
+
+  .auto-choice {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    align-self: center;
+    font-size: var(--font-size-md);
+    color: var(--text-secondary);
+    white-space: nowrap;
   }
 
   /* Wraps onto its own line under the field and its Apply button. */

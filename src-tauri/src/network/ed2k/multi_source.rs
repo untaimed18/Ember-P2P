@@ -11281,10 +11281,9 @@ async fn download_parts_from_source(
                                 );
                                 // Ember credit mirror: record how much
                                 // PoP-verified peers have uploaded to
-                                // us, so their `downloaded` column (from
-                                // our perspective) feeds the decayed
-                                // ratio in `get_ember_score_ratio` when
-                                // THEY later ask to be served by us.
+                                // us in the Ember ledger, beside the
+                                // `user_hash` record the upload queue
+                                // scores from.
                                 // Gated on `ember_auth_verified` — the
                                 // binding-only fallback isn't strong
                                 // enough to prevent a spoofer from

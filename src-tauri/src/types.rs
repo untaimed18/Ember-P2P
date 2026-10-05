@@ -1396,6 +1396,9 @@ pub struct AppSettings {
     pub max_upload_speed: u64,
     pub max_download_speed: u64,
     pub max_concurrent_downloads: u32,
+    /// Most upload slots open at once, or `0` for Auto: eMule has no such
+    /// setting and opens slots by how much the upload rate can feed
+    /// (`CUploadQueue::AcceptNewClient`).
     #[serde(default = "default_max_uploads")]
     pub max_concurrent_uploads: u32,
     pub tcp_port: u16,
@@ -2173,8 +2176,9 @@ pub struct KnownClient {
     pub nickname: String,
 }
 
+/// Auto: as many upload slots as the upload rate can feed, by eMule's rule.
 fn default_max_uploads() -> u32 {
-    5
+    0
 }
 
 fn default_max_sources_per_file() -> u32 {
@@ -2373,7 +2377,7 @@ impl Default for AppSettings {
             max_upload_speed: 0,
             max_download_speed: 0,
             max_concurrent_downloads: 5,
-            max_concurrent_uploads: 5,
+            max_concurrent_uploads: default_max_uploads(),
             tcp_port: DEFAULT_TCP_PORT,
             udp_port: DEFAULT_UDP_PORT,
             folder_priorities: std::collections::HashMap::new(),

@@ -98,9 +98,13 @@
 
   async function save(patch: QuickLimitsPatch) {
     saving = true;
+    const ussBefore = get(appSettings)?.uss_enabled === true;
     try {
       const saved = await setQuickLimits(patch);
       setAppSettings(saved);
+      // Unlimited upload turns Upload Speed Sense off, which nothing in the
+      // popover would otherwise show.
+      if (ussBefore && !saved.uss_enabled) addToast('info', m.statusbar_limits_uss_off());
       // Written fields are now the baseline; anything else edited stays a draft.
       const next = limitsOf(saved);
       baseline = next;

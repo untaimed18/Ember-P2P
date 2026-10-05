@@ -850,7 +850,8 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     }
 
     changed |= clamp_assign(&mut settings.max_concurrent_downloads, 1, 50);
-    changed |= clamp_assign(&mut settings.max_concurrent_uploads, 1, 50);
+    // 0 is Auto.
+    changed |= clamp_assign(&mut settings.max_concurrent_uploads, 0, 50);
     if settings.max_upload_speed > MAX_CONFIGURED_SPEED_BPS {
         settings.max_upload_speed = MAX_CONFIGURED_SPEED_BPS;
         changed = true;
@@ -1153,7 +1154,7 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "Max concurrent downloads must be between 1 and 50",
         ));
     }
-    if settings.max_concurrent_uploads == 0 || settings.max_concurrent_uploads > 50 {
+    if settings.max_concurrent_uploads > 50 {
         return Err(coded(
             "settings_max_concurrent_uploads_invalid",
             "Max concurrent uploads must be between 1 and 50",
@@ -2563,6 +2564,36 @@ pub struct QuickLimitsPatch {
 /// Settings page, so open views can fold it in.
 pub const SETTINGS_CHANGED_EVENT: &str = "ember:settings-changed";
 
+/// Write `patch` into `settings`, returning whether Upload Speed Sense had to
+/// be turned off.
+///
+/// USS senses against the manual upload cap, so setting that cap to Unlimited
+/// turns it off — the same as applying Unlimited in Settings does. Refusing
+/// instead left the status bar's Unlimited button failing with an error
+/// about a feature the popover does not show.
+fn apply_quick_limits_patch(settings: &mut AppSettings, patch: &QuickLimitsPatch) -> bool {
+    if let Some(on) = patch.alt_speed_enabled {
+        settings.alt_speed_enabled = on;
+    }
+    if let Some(speed) = patch.max_upload_speed {
+        settings.max_upload_speed = speed;
+    }
+    if let Some(speed) = patch.max_download_speed {
+        settings.max_download_speed = speed;
+    }
+    if let Some(speed) = patch.alt_max_upload_speed {
+        settings.alt_max_upload_speed = speed;
+    }
+    if let Some(speed) = patch.alt_max_download_speed {
+        settings.alt_max_download_speed = speed;
+    }
+    let uss_off = settings.uss_enabled && settings.max_upload_speed == 0;
+    if uss_off {
+        settings.uss_enabled = false;
+    }
+    uss_off
+}
+
 /// Persist `patch`, put the resulting limits in force, and tell the frontend.
 pub async fn apply_quick_limits(
     app: &tauri::AppHandle,
@@ -2570,24 +2601,10 @@ pub async fn apply_quick_limits(
     patch: QuickLimitsPatch,
 ) -> Result<AppSettings, String> {
     let _settings_save_guard = state.settings_save_lock.lock().await;
-    let (new_settings, save_data) = {
+    let (new_settings, save_data, uss_turned_off) = {
         let config = state.config.read().await;
         let mut new_settings = config.settings.clone();
-        if let Some(on) = patch.alt_speed_enabled {
-            new_settings.alt_speed_enabled = on;
-        }
-        if let Some(speed) = patch.max_upload_speed {
-            new_settings.max_upload_speed = speed;
-        }
-        if let Some(speed) = patch.max_download_speed {
-            new_settings.max_download_speed = speed;
-        }
-        if let Some(speed) = patch.alt_max_upload_speed {
-            new_settings.alt_max_upload_speed = speed;
-        }
-        if let Some(speed) = patch.alt_max_download_speed {
-            new_settings.alt_max_download_speed = speed;
-        }
+        let uss_turned_off = apply_quick_limits_patch(&mut new_settings, &patch);
         validate_quick_limits(&new_settings)?;
         let limits = |s: &AppSettings| {
             (
@@ -2596,6 +2613,7 @@ pub async fn apply_quick_limits(
                 s.max_download_speed,
                 s.alt_max_upload_speed,
                 s.alt_max_download_speed,
+                s.uss_enabled,
             )
         };
         if limits(&new_settings) == limits(&config.settings) {
@@ -2609,7 +2627,7 @@ pub async fn apply_quick_limits(
                 e,
             )
         })?;
-        (new_settings, data)
+        (new_settings, data, uss_turned_off)
     };
     let (data, tmp, final_path) = save_data;
     tokio::task::spawn_blocking(move || {
@@ -2621,6 +2639,26 @@ pub async fn apply_quick_limits(
     {
         let mut config = state.config.write().await;
         config.settings = new_settings.clone();
+    }
+    // The limits need nothing from the network loop, but USS does: its
+    // enabled flag and ping host live there, and only a settings update
+    // reaches them. Sent under the save lock, as `update_settings` does, so a
+    // concurrent save cannot land in the loop ahead of this one.
+    if uss_turned_off {
+        if let Err(e) = state
+            .network_tx
+            .send_timeout(
+                NetworkCommand::UpdateSettings {
+                    settings: Box::new(new_settings.clone()),
+                },
+                std::time::Duration::from_secs(5),
+            )
+            .await
+        {
+            tracing::warn!(
+                "Upload Speed Sense was turned off on disk, but the live network update was dropped: {e}"
+            );
+        }
     }
     crate::background::apply_effective_limits(app, state, &new_settings);
     if let Err(error) = app.emit(SETTINGS_CHANGED_EVENT, &new_settings) {
@@ -2645,12 +2683,6 @@ fn validate_quick_limits(settings: &AppSettings) -> Result<(), String> {
             "settings_max_download_speed_invalid",
             format!("Download speed must be 0 or at most {MAX_CONFIGURED_SPEED_BPS} B/s"),
             MAX_CONFIGURED_SPEED_BPS,
-        ));
-    }
-    if settings.uss_enabled && settings.max_upload_speed == 0 {
-        return Err(coded(
-            "settings_uss_requires_upload_limit",
-            "Upload Speed Sense requires an upload speed limit to be set",
         ));
     }
     Ok(())
@@ -3856,6 +3888,38 @@ mod tests {
 
         let many: Vec<String> = (0..MAX_DOWNLOAD_CATEGORIES + 3).map(|i| format!("Cat {i}")).collect();
         assert_eq!(normalize_download_categories(&many).len(), MAX_DOWNLOAD_CATEGORIES);
+    }
+
+    #[test]
+    fn quick_unlimited_upload_turns_uss_off_instead_of_failing() {
+        let mut settings = AppSettings {
+            uss_enabled: true,
+            max_upload_speed: 512 * 1024,
+            ..AppSettings::default()
+        };
+        let patch = QuickLimitsPatch {
+            max_upload_speed: Some(0),
+            ..Default::default()
+        };
+        assert!(apply_quick_limits_patch(&mut settings, &patch));
+        assert!(!settings.uss_enabled);
+        assert!(validate_quick_limits(&settings).is_ok());
+        assert!(validate_settings(&settings).is_ok());
+
+        // A cap, or a patch that leaves the manual upload alone, keeps USS.
+        let mut capped = AppSettings {
+            uss_enabled: true,
+            max_upload_speed: 512 * 1024,
+            ..AppSettings::default()
+        };
+        let lower = QuickLimitsPatch {
+            max_upload_speed: Some(64 * 1024),
+            alt_speed_enabled: Some(true),
+            alt_max_upload_speed: Some(0),
+            ..Default::default()
+        };
+        assert!(!apply_quick_limits_patch(&mut capped, &lower));
+        assert!(capped.uss_enabled);
     }
 
     #[test]
