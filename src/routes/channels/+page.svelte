@@ -462,10 +462,10 @@
       : m.channels_notify_title({ level: notifyLevelLabel(selectedNotifyLevel) }),
   );
   /**
-   * Welcome messages the reader folded to one line, by room, against the text
-   * they folded. A fingerprint rather than the text, so the page does not keep
-   * a second copy of every room's welcome; when the owner rewrites it the
-   * fingerprint stops matching and the new one is shown in full.
+   * Welcome messages the reader hid, by room, against the text they hid. A
+   * fingerprint rather than the text, so the page does not keep a second copy
+   * of every room's welcome; when the owner rewrites it the fingerprint stops
+   * matching and the new one is shown again.
    */
   const FOLDED_WELCOMES_KEY = 'ember.channels.welcome-folded.v1';
   const FOLDED_WELCOMES_MAX = 200;
@@ -491,6 +491,10 @@
   }
 
   let foldedWelcomes = $state<Record<string, string>>(loadFoldedWelcomes());
+  let selectedWelcomeHidden = $derived(
+    !!selected?.welcome.trim()
+      && foldedWelcomes[selected.channel_id] === welcomeFingerprint(selected.welcome),
+  );
 
   function toggleWelcomeFold(channelId: string, welcome: string) {
     const print = welcomeFingerprint(welcome);
@@ -3123,6 +3127,22 @@
                     <span class="toggle-badge" aria-hidden="true">{roomOffersWaiting}</span>
                   {/if}
                 </button>
+                {#if selectedWelcomeHidden}
+                  <!-- The way back to a welcome the reader hid. Only here while
+                       it is hidden, so it costs the header nothing otherwise. -->
+                  <button
+                    class="icon-btn"
+                    onclick={() => toggleWelcomeFold(selected.channel_id, selected.welcome)}
+                    title={m.channels_welcome_show()}
+                    aria-label={m.channels_welcome_show()}
+                  >
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M2.5 6.5v3h2l4.5 3v-9l-4.5 3z"/>
+                      <path d="M11.2 5.6a3.4 3.4 0 010 4.8"/>
+                      <path d="M12.9 4a5.6 5.6 0 010 8"/>
+                    </svg>
+                  </button>
+                {/if}
                 <button
                   class="icon-btn"
                   class:on={searchOpen}
@@ -3173,20 +3193,18 @@
                 <button class="conv-action conv-leave" onclick={() => requestLeave(selected.channel_id)}>{m.channels_leave()}</button>
               </div>
             </header>
-            {#if selected.welcome.trim()}
-              {@const welcomeFolded = foldedWelcomes[selected.channel_id] === welcomeFingerprint(selected.welcome)}
-              <div class="welcome-banner" class:folded={welcomeFolded} role="note">
+            {#if selected.welcome.trim() && !selectedWelcomeHidden}
+              <div class="welcome-banner" role="note">
                 <p><bdi dir="auto">{selected.welcome}</bdi></p>
                 <button
                   type="button"
                   class="welcome-toggle"
-                  aria-expanded={!welcomeFolded}
-                  title={welcomeFolded ? m.channels_welcome_expand() : m.channels_welcome_collapse()}
-                  aria-label={welcomeFolded ? m.channels_welcome_expand() : m.channels_welcome_collapse()}
+                  title={m.channels_welcome_hide()}
+                  aria-label={m.channels_welcome_hide()}
                   onclick={() => toggleWelcomeFold(selected.channel_id, selected.welcome)}
                 >
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d={welcomeFolded ? 'M4 6l4 4 4-4' : 'M4 10l4-4 4 4'}/>
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+                    <path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/>
                   </svg>
                 </button>
               </div>
@@ -5436,18 +5454,6 @@
     flex: 1;
     min-width: 0;
     margin: 0;
-  }
-
-  .welcome-banner.folded {
-    align-items: center;
-    padding-block: 4px;
-    overflow: hidden;
-  }
-
-  .welcome-banner.folded p {
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
   }
 
   .welcome-toggle {
