@@ -1,7 +1,8 @@
 # After 1.7.1
 
 Work found by the 1.7.1 audit and deliberately left for 1.7.2, with why it
-waited and what it needs. Ordered by priority.
+waited and what it needs. Ordered by priority. Items 1 and 2 are done; each
+says how.
 
 ## Sharing
 
@@ -25,24 +26,29 @@ share-intent store (`storage/share_intent.rs`). `admit_known_files` /
 `newly_admitted_unshared` cannot tell them apart, so widening writes an
 explicit allow over both.
 
-**To do:**
+**Done.** `PersistedShareIntent` records an origin for each denial through
+two subsets of `denied`, as `UnshareOrigin`:
 
-- Record where an unshare came from. Add an `auto_denied` set (or an origin
-  per `denied` entry) to `PersistedShareIntent`, written only by the
-  allowlist path (`keep_unlisted_copies_unshared` and the withhold helpers).
-  An explicit unshare removes the hash from `auto_denied`; an explicit share
-  removes it from both.
-- Widening re-admits only `auto_denied` content. Content that is merely
-  `denied` stays unshared.
-- Entries written before 1.7.2 carry no origin. Treat them as the user's, so
-  nothing is re-shared that might have been, and have the widen confirmation
-  say how many files stay unshared, with a choice to include them.
-- `#[serde(default)]` on the new field, so a 1.7.1 that reads the store after
-  a downgrade ignores it and keeps today's behaviour.
+- `auto_denied`: written by the two places a list withholds known files at
+  add time, the only automatic unshares (`keep_unlisted_copies_unshared`
+  turned out to revert Library rows only and writes no denial).
+- `origin_unknown`: denials the store could not attribute, plus re-asserted
+  ones (the reconcile's, known.met's on load, a rolled-back share).
 
-**Tests:** widening after an automatic unshare re-shares; after a Library
-unshare it does not; a legacy store re-shares nothing without the user's
-choice; an explicit share or unshare moves the hash between the sets.
+Only the user's own unshare relabels a hash that is already denied, and a
+share clears both sets. Widening (`admit_known_files`) re-shares only
+`auto_denied` content and keeps the user's own unshares. For unknown-origin
+content it asks in a second native dialog after the widen confirmation
+("Share N more files?"), which defaults to keeping them unshared and says
+they stay listed in the Library.
+A store without `origins_recorded`, from before 1.7.2 or rewritten by 1.7.1
+after a downgrade, loads with every denial unknown. 1.7.1 ignores the new
+fields.
+
+Tests: `an_unshare_keeps_who_made_it`,
+`a_store_without_origins_loads_its_denials_as_unknown`,
+`widening_sorts_what_it_finds_by_who_unshared_it`,
+`the_earlier_unshared_question_counts_the_files`.
 
 ### 2. Keep the withheld-files list out of `config.json`
 
@@ -55,27 +61,92 @@ to disk on every settings save (scan cursors and pending intents save often).
 likely: Unshare folder on a whole share now gives it an empty allowlist and
 withholds its indexed files (the M4 fix in the 1.7.1 audit).
 
+**Done, differently from the plan.** The withheld entries never keep anything
+unshared: what is offered is the allowlist alone. They only keep discovery
+walking those files so the Library lists them, and discovery scopes by the
+shared root's list alone. So an entry can name a folder rather than every
+file in it. `withhold_under` now withholds what the lists stop offering as
+it was listed: a dropped folder entry stays one entry, and a folder that was
+offered whole is withheld as itself. Discovery walks the same files as
+before, and the list is no larger than the allowlists it came from. That
+removes the large case without a store of its own. A separate store would
+also have meant handling backups, restores and the eMule import, which all
+carry `config.json`.
+
+- Downgrade is safe: 1.7.1 reads folder entries the same way. The exception
+  is a withheld drive root, which needed the separator fix in
+  `allowlist_permits` / `path_key_covers`; 1.7.1 then lists none of those
+  rows, and still offers nothing.
+- A file added later to a folder unshared as a whole now shows in the Library
+  as unshared, as it already did in an unshared subfolder of a whole share.
+- Lists already written by 1.7.1 keep their per-file entries; nothing can
+  tell which of them came from a whole folder.
+
+Tests: `unsharing_a_whole_share_stops_its_later_files`,
+`unsharing_a_partial_share_keeps_it_limited_and_its_files_listed`,
+`a_file_inside_a_withheld_folder_is_not_listed_again`,
+`a_drive_root_entry_covers_the_drive`,
+`a_withheld_folder_keeps_every_file_under_it_unshared_on_widening`.
+
+## Cleanup
+
+### 3. Remove the legacy friend authentication
+
+**Why:** `LEGACY_FRIEND_AUTH_ENABLED` (`network/ed2k/mod.rs`) is a `const
+false`, and nothing turns it on: v1 signed nonces the peer chose, which made
+it a signing oracle, so it was retired. The path it guards is still compiled:
+`ed2k/ember_auth.rs`, the four `LEGACY_FRIEND_AUTH_ENABLED` branches in
+`ed2k/multi_source.rs` and the one in `ed2k/upload.rs`, plus the compile-time
+assert that keeps it off. The dead-code pass left it because the compiler
+does not report a `const false` branch as unused.
+
 **To do:**
 
-- First check whether a folder with an **empty** allowlist needs per-path
-  withheld entries at all. The empty list already keeps every file under it
-  unshared. If the entries only keep those rows showing as "unshared" in the
-  Library, derive that from the allowlist instead and stop writing them for
-  empty lists. This alone removes the large case.
-- For what remains (partial lists), move the withheld set into its own store:
-  a table in `ember.db`, or a dedicated file next to `share_intent.json`.
-  Either way it is written incrementally rather than rewritten with every
-  settings save.
-- Migrate on first load: move the entries out of `config.json` and clear the
-  field.
-- Downgrade: find out what 1.7.1 does with the field empty before choosing.
-  If it would then offer files that should stay withheld, keep writing a
-  bounded copy to `config.json` (for example only for folders under some size)
-  until the next release that can drop downgrade support.
+- Delete the branches and the state and helpers only they reach, then
+  `ember_auth.rs` itself once nothing else uses it.
+- Keep the arms that log and ignore `OP_EMBER_AUTH_CHALLENGE` and
+  `OP_EMBER_AUTH_RESPONSE`: an old client may still send them, and they must
+  not fall through to another handler.
 
-**Tests:** migration moves the entries and leaves `config.json` small; a
-100,000-file Unshare folder adds nothing large to `config.json`; withheld rows
-still show and stay unshared across a restart; a re-share clears them.
+**Tests:** the full suite, and both retired opcodes received from a peer are
+ignored without changing that peer's state.
+
+### 4. Fold the `user_offline` flag
+
+**Why:** `user_offline` (`network/state.rs`) is an `AtomicBool` set to `false`
+at startup; the four places that still store to it store `false`. About 25
+sites clone it into tasks or check it (`friend_connect.rs`,
+`command.rs`, `downloads.rs`, `search.rs`, `server_tick.rs`, `friends.rs`,
+`download_event.rs`, `server.rs`). Every check is false, so each guarded
+branch is dead.
+
+**To do:** remove the field and its clones, and inline each check as `false`:
+drop the early returns it guards and keep the code that runs when online.
+`search.rs`'s `user_offline` parameter goes with it. Read `server.rs`'s
+comment about the KAD-disconnect exemption first: it explains an earlier bug
+around this flag and has to stay true afterwards.
+
+**Tests:** the full suite. Nothing should change behaviour; a test that needs
+`user_offline = true` (`friend_connect.rs` has one) was testing a mode the app
+no longer has and goes with it.
+
+## Investigation
+
+### 5. Why most known peers show verification as Needed
+
+**Why:** In the Known Clients list, the earlier session showed only 1 of 74
+recently seen peers as Verified and none as Failed. SecureIdent verification
+is per session, so a stored Verified or Failed loads as Needed, and the list
+includes peers not seen this session. That explains part of it, not all.
+A short session with debug logging showed upload-side verification working
+(2 of 2 genuine peers). Queued peers or the download side may never reach the
+signature step.
+
+**To do:** run 30 to 60 minutes with
+`RUST_LOG=info,ember_lib::network::ed2k::transfer=debug` (the `SecIdent:` lines)
+and compare, per peer, the state reached with the Known Clients row. If queued
+or download-side peers never get a challenge, send one when their session
+starts rather than at the first upload.
 
 ## Considered and left as they are
 

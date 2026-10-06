@@ -1644,6 +1644,65 @@ pub(crate) async fn confirm_share_roots(
     .unwrap_or(false)
 }
 
+/// Title and body of the dialog asking whether a widened share should also
+/// offer `count` files unshared before Ember recorded who unshared what.
+pub(crate) fn earlier_unshared_text(count: usize) -> (String, String) {
+    if count == 1 {
+        return (
+            "Share 1 more file?".to_string(),
+            "1 file in what you just shared was unshared in an older version of Ember. \
+             That version did not record whether you unshared it or Ember did, so it \
+             stays unshared unless you choose to share it.\n\n\
+             If you keep it unshared, it is listed in the Library, where you can share \
+             it later."
+                .to_string(),
+        );
+    }
+    (
+        format!("Share {count} more files?"),
+        format!(
+            "{count} files in what you just shared were unshared in an older version of \
+             Ember. That version did not record whether you unshared them or Ember did, \
+             so they stay unshared unless you choose to share them.\n\n\
+             If you keep them unshared, they are listed in the Library, where you can \
+             share them later."
+        ),
+    )
+}
+
+/// Ask whether a widened share should also offer `count` files unshared
+/// before origins were recorded. False for a dismissed dialog, and while a
+/// share confirmation is still open.
+pub(crate) async fn confirm_share_earlier_unshared(app: &tauri::AppHandle, count: usize) -> bool {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            CONFIRMING.store(false, Ordering::Release);
+        }
+    }
+    if CONFIRMING.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let release = Release;
+    let (title, prompt) = earlier_unshared_text(count);
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        let _release = release;
+        app.dialog()
+            .message(prompt)
+            .title(title)
+            .kind(MessageDialogKind::Info)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                if count == 1 { "Share it" } else { "Share them" }.to_string(),
+                "Keep unshared".to_string(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Share every selected browser entry. A folder is shared in full. Files are
 /// shared through their parent folder's allowlist, which is how a drop shares
 /// only the files that were dropped. Ids the session does not know are
@@ -1802,7 +1861,7 @@ pub async fn share_browser_selection(
         .collect();
     if !cleared.is_empty() {
         persist_folder_allowlists(&state, &[], &cleared).await?;
-        admit_known_files(&state, &lists_before, &cleared).await;
+        admit_known_files(&app, &state, &lists_before, &cleared).await;
         crate::commands::sharing::queue_rescan(&app, cleared.iter().map(PathBuf::from).collect());
     }
 
@@ -1836,7 +1895,7 @@ pub async fn share_browser_selection(
         let mut failed = false;
         if add.allowlist_grew {
             let admitted: Vec<String> = add.files.iter().chain(&add.dirs).cloned().collect();
-            admit_known_files(&state, &lists_before, &admitted).await;
+            admit_known_files(&app, &state, &lists_before, &admitted).await;
         }
         if !add.files.is_empty() {
             match batch_share(app.clone(), state.clone(), add.files.clone()).await {
@@ -2667,6 +2726,18 @@ mod tests {
         assert!(body.contains(&format!("\n\n{path}\n")), "{body}");
         assert!(!body.contains("entire drive"), "{body}");
         assert!(body.ends_with("in Ember's folder browser."), "{body}");
+    }
+
+    #[test]
+    fn the_earlier_unshared_question_counts_the_files() {
+        let (title, body) = earlier_unshared_text(1);
+        assert_eq!(title, "Share 1 more file?");
+        assert!(body.starts_with("1 file in what you just shared was unshared"), "{body}");
+        assert!(body.ends_with("where you can share it later."), "{body}");
+        let (title, body) = earlier_unshared_text(12);
+        assert_eq!(title, "Share 12 more files?");
+        assert!(body.starts_with("12 files in what you just shared were unshared"), "{body}");
+        assert!(body.contains("whether you unshared them or Ember did"), "{body}");
     }
 
     #[test]

@@ -4945,7 +4945,7 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(()));
         }
 
-        NetworkCommand::SetFilesShared { updates, tx } => {
+        NetworkCommand::SetFilesShared { updates, origin, tx } => {
             let mut parsed = Vec::with_capacity(updates.len());
             let mut error = None;
             for (file_hash_hex, shared) in updates {
@@ -5054,7 +5054,10 @@ async fn handle_command_inner(
                         .collect();
                     if !strays.is_empty() {
                         if let Err(rollback_error) =
-                            crate::storage::share_intent::set_explicit_batch(&strays)
+                            crate::storage::share_intent::set_explicit_batch_from(
+                                &strays,
+                                crate::storage::share_intent::UnshareOrigin::Unknown,
+                            )
                         {
                             error!(
                                 "Failed to withdraw share intent after a known.met save failure; \
@@ -5068,7 +5071,9 @@ async fn handle_command_inner(
                     return;
                 }
                 if !denies.is_empty() {
-                    if let Err(e) = crate::storage::share_intent::set_explicit_batch(&denies) {
+                    if let Err(e) =
+                        crate::storage::share_intent::set_explicit_batch_from(&denies, origin)
+                    {
                         *known_files = before.clone();
                         let ownership = state.known_met_save_lock.clone().lock_owned().await;
                         let known_path = state.data_dir.join("known.met");

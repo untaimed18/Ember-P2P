@@ -86,12 +86,13 @@ impl DiscoveryResult {
 }
 
 /// Whether an allowlist of `normalize_path_key` forms offers the file or
-/// folder at `key`: it is listed, or sits inside a listed folder.
+/// folder at `key`: it is listed, or sits inside a listed folder. `..=at` as
+/// well, for a drive root, whose key keeps its separator.
 pub(crate) fn allowlist_permits(allowed: &HashSet<String>, key: &str) -> bool {
     allowed.contains(key)
-        || key
-            .rmatch_indices(std::path::MAIN_SEPARATOR)
-            .any(|(at, _)| allowed.contains(&key[..at]))
+        || key.rmatch_indices(std::path::MAIN_SEPARATOR).any(|(at, _)| {
+            allowed.contains(&key[..at]) || allowed.contains(&key[..=at])
+        })
 }
 
 /// The folder allowlists as sets, for asking about many paths.

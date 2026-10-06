@@ -367,6 +367,8 @@ pub enum NetworkCommand {
     /// in-memory known.met catalog, then acknowledges central processing.
     SetFilesShared {
         updates: Vec<(String, bool)>,
+        /// Who the unshares in `updates` are by.
+        origin: crate::storage::share_intent::UnshareOrigin,
         tx: oneshot::Sender<Result<usize, String>>,
     },
     /// Persist the friends-only scope for a batch of content hashes.
