@@ -1101,6 +1101,7 @@
         cancelAnimationFrame(scrollSpotFrame);
         scrollSpotFrame = 0;
       }
+      freshIds.clear();
       // A jump asked for in the room being left means nothing in this one.
       queuedFocus = null;
       focusedId = null;
@@ -1990,7 +1991,23 @@
     return el.scrollHeight - (el.scrollTop + el.clientHeight) < 80;
   }
 
+  /**
+   * Messages that arrived while the conversation was open, which slide in.
+   * The ones a load or a page of history brings are not here, so opening a
+   * room does not animate a hundred bubbles at once. Read when a row is first
+   * drawn, so it is written before the row is added and need not be reactive.
+   */
+  const freshIds = new Set<number>();
+
+  function markFresh(next: readonly ConvMessage[]): void {
+    const known = new Set(messages.map((message) => message.id));
+    for (const message of next) {
+      if (!known.has(message.id)) freshIds.add(message.id);
+    }
+  }
+
   function commitLiveMessages(next: ConvMessage[], pinToBottom: boolean): void {
+    markFresh(next);
     const trimmed = next.length > MAX_LIVE_MESSAGES;
     const el = messagesContainerEl;
     const prevScrollHeight = trimmed && !pinToBottom ? (el?.scrollHeight ?? 0) : 0;
@@ -2348,6 +2365,7 @@
       const alreadyDelivered = result.id !== null && earlyDeliveredIds.delete(result.id);
       const existing = messages.findIndex((message) => message.id === durableId);
       if (existing === -1) {
+        freshIds.add(durableId);
         messages = [...messages, {
           id: durableId,
           direction: 'sent' as const,
@@ -2521,6 +2539,7 @@
         if (reply && getPendingReply(channel)?.msgId === reply.msgId) setPendingReply(channel, null);
         if (channel === channelId) {
           if (!messages.some((message) => message.id === sent.id)) {
+            freshIds.add(sent.id);
             messages = [...messages, fromChannelRow(sent)];
           }
           if (reply && replyTarget?.msgId === reply.msgId) replyTarget = null;
@@ -3333,6 +3352,7 @@
           class:sent={row.msg.direction === 'sent'}
           class:received={row.msg.direction === 'received'}
           class:starts-run={row.startsRun}
+          class:fresh={freshIds.has(row.msg.id)}
         >
         {#if isChannel}
           <div class="bubble-who">
@@ -4167,6 +4187,27 @@
 
   .conv-msg.sent { align-self: flex-end; align-items: flex-end; }
   .conv-msg.received { align-self: flex-start; align-items: flex-start; }
+
+  /* Grows from the side it belongs to, with a small overshoot. */
+  .conv-msg.fresh {
+    animation: conv-msg-in 220ms cubic-bezier(0.2, 0.9, 0.3, 1.15);
+  }
+
+  .conv-msg.fresh.sent { transform-origin: bottom right; }
+  .conv-msg.fresh.received { transform-origin: bottom left; }
+
+  @keyframes conv-msg-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px) scale(0.96);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .conv-msg.fresh {
+      animation: none;
+    }
+  }
 
   .conv-msg .conv-bubble {
     max-width: 100%;
