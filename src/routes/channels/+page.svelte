@@ -2361,6 +2361,12 @@
   });
 </script>
 
+{#snippet howBody()}
+  <p class="how-lede">{m.channels_page_subtitle()}</p>
+  <p class="how-limits">{m.channels_public_readable()}</p>
+  <p class="how-limits">{m.channels_limits_note()}</p>
+{/snippet}
+
 <div class="page-header">
   <div class="header-title">
     <h2>
@@ -2377,6 +2383,21 @@
           other: () => m.channels_count_other({ count: joinedCount }),
         })}
       </span>
+      <!-- Someone already in a room has read this, or does not need it, so it
+           folds into a button instead of holding a row above every room. -->
+      <details class="card-more how-more">
+        <summary title={m.channels_how_title()} aria-label={m.channels_how_title()}>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="8" cy="8" r="6.5"/>
+            <path d="M6.2 6.2a1.9 1.9 0 113.2 1.4c-.7.5-1.4.9-1.4 1.9"/>
+            <path d="M8 11.7v.1"/>
+          </svg>
+        </summary>
+        <div class="how-pop">
+          <p class="how-pop-title">{m.channels_how_title()}</p>
+          {@render howBody()}
+        </div>
+      </details>
     {/if}
   </div>
   <div class="header-actions">
@@ -2405,12 +2426,12 @@
 </div>
 
 <div class="page-content channels-page">
-  <details class="how-panel">
-    <summary class="how-title">{m.channels_how_title()}</summary>
-    <p class="how-lede">{m.channels_page_subtitle()}</p>
-    <p class="how-limits">{m.channels_public_readable()}</p>
-    <p class="how-limits">{m.channels_limits_note()}</p>
-  </details>
+  {#if joinedCount === 0}
+    <details class="how-panel">
+      <summary class="how-title">{m.channels_how_title()}</summary>
+      {@render howBody()}
+    </details>
+  {/if}
 
   {#if error}
     <div class="banner error-banner" role="alert">
@@ -2794,14 +2815,20 @@
                           >{rowFavourite ? m.channels_favourite_remove() : m.channels_favourite_add()}</button>
                           <div class="menu-sep" role="separator"></div>
                           {@render notifyChoices(ch.channel_id, rowLevel)}
+                          <!-- Last and on its own: a red button on every row made
+                               walking out the loudest thing in the list. It still
+                               asks before it goes. -->
+                          <div class="menu-sep" role="separator"></div>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            tabindex="-1"
+                            class="menu-item-danger"
+                            disabled={joiningIds.includes(ch.channel_id)}
+                            onclick={(e) => { closeCardMenu(e.currentTarget); requestLeave(ch.channel_id); }}
+                          >{m.channels_leave()}</button>
                         </div>
                       </details>
-                      <button
-                        type="button"
-                        class="chan-door chan-leave"
-                        disabled={joiningIds.includes(ch.channel_id)}
-                        onclick={() => requestLeave(ch.channel_id)}
-                      >{m.channels_leave()}</button>
                     {:else}
                       <button
                         type="button"
@@ -3084,6 +3111,7 @@
                 <!-- Delete room used to sit here, identical red text one gap
                      away from Leave. Only one of the two can be undone, so it
                      moved in beside the owner's other room settings. -->
+                <span class="conv-actions-sep" aria-hidden="true"></span>
                 <button class="conv-action conv-leave" onclick={() => requestLeave(selected.channel_id)}>{m.channels_leave()}</button>
               </div>
             </header>
@@ -3982,6 +4010,31 @@
 
   .how-lede { color: var(--text-secondary); }
 
+  .how-more > summary svg { width: 16px; height: 16px; }
+
+  /* Opens under the title it sits beside, so it grows toward the page rather
+     than off the window's left edge. */
+  .how-pop {
+    position: absolute;
+    top: calc(100% + 6px);
+    inset-inline-start: 0;
+    z-index: 20;
+    width: 380px;
+    max-width: calc(100vw - 32px);
+    padding: 12px 14px 4px;
+    background: var(--ctx-surface);
+    border: 1px solid var(--ctx-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--ctx-shadow);
+  }
+
+  .how-pop-title {
+    margin: 0 0 6px;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
   .banner {
     flex-shrink: 0;
     display: flex;
@@ -4453,27 +4506,6 @@
 
   .chan-join:hover:not(:disabled) { background: var(--accent-hover); }
 
-  /* Tinted rather than solid red: walking out of a room is reversible, so it
-     should read as the deliberate opposite of Join, not as a delete. Hover
-     commits to solid, which is where the click actually happens. */
-  .chan-leave {
-    background: color-mix(in srgb, var(--danger) 10%, transparent);
-    border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
-    color: var(--danger);
-    font-weight: 600;
-    transition:
-      background-color var(--transition-fast) ease,
-      border-color var(--transition-fast) ease,
-      color var(--transition-fast) ease,
-      transform var(--transition-fast) ease;
-  }
-
-  .chan-leave:hover:not(:disabled) {
-    background: var(--danger);
-    border-color: var(--danger);
-    color: var(--on-danger);
-  }
-
   .chan-door:active:not(:disabled) { transform: scale(0.94); }
 
   /* Plain text, not a chip. Bordered and filled it competed with the action
@@ -4536,6 +4568,13 @@
   .chan-row:hover .row-more > summary,
   .chan-row:focus-within .row-more > summary,
   .row-more[open] > summary { opacity: 1; }
+
+  /* With Leave inside it, the menu is the only way out of a room from the
+     list, and a touch screen has no hover to reveal it. */
+  @media (hover: none) {
+    .row-more > summary,
+    .chan-forget { opacity: 1; }
+  }
 
   .chan-row.active {
     background: color-mix(in srgb, var(--accent) 12%, var(--bg-hover));
@@ -4755,12 +4794,12 @@
     align-items: center;
     justify-content: center;
     width: 22px;
-    height: 30px;
+    height: 32px;
     color: var(--accent);
     flex-shrink: 0;
   }
 
-  .enc-lock svg { width: 13px; height: 13px; }
+  .enc-lock svg { width: 14px; height: 14px; }
 
   .conv-actions-sep {
     width: 1px;
@@ -4777,20 +4816,21 @@
     border-radius: var(--radius-pill);
   }
 
-  /* Same treatment as Leave on the room card, so the two agree. Tinted at
-     rest because walking out is reversible; solid on hover, where the click
-     lands. */
+  /* Plain at rest: tinted red beside Copy invite, it was the loudest thing in
+     the header for the action least often wanted. Red once the pointer or
+     focus is on it, and it still asks before it goes. */
   .conv-leave {
-    background: color-mix(in srgb, var(--danger) 10%, transparent);
-    border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
-    color: var(--danger);
-    font-weight: 600;
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--text-secondary);
+    font-weight: 500;
   }
 
-  .conv-leave:hover:not(:disabled) {
-    background: var(--danger);
-    border-color: var(--danger);
-    color: var(--on-danger);
+  .conv-leave:hover:not(:disabled),
+  .conv-leave:focus-visible {
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+    border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+    color: var(--danger);
   }
 
   .conv-delete {
@@ -4898,12 +4938,12 @@
   .back-btn { display: none; }
 
   .icon-btn {
-    width: 30px;
-    height: 30px;
+    width: 32px;
+    height: 32px;
     border: none;
     border-radius: var(--radius-sm);
     background: transparent;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     cursor: pointer;
     display: inline-flex;
     align-items: center;
@@ -4928,7 +4968,7 @@
 
   .icon-btn:active { transform: scale(0.94); }
 
-  .icon-btn svg { width: 16px; height: 16px; }
+  .icon-btn svg { width: 18px; height: 18px; }
 
   .successor-banner {
     display: flex;
@@ -5301,7 +5341,7 @@
     border-bottom: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
     background: color-mix(in srgb, var(--accent) 8%, var(--bg-tertiary));
     font-size: var(--font-size-sm);
-    color: var(--text-secondary);
+    color: var(--text-primary);
     line-height: 1.45;
     flex-shrink: 0;
     max-height: 4.8em;
@@ -5510,10 +5550,10 @@
 
   .present-dot {
     position: absolute;
-    right: -1px;
-    bottom: -1px;
-    width: 9px;
-    height: 9px;
+    right: -2px;
+    bottom: -2px;
+    width: 11px;
+    height: 11px;
     border-radius: 50%;
     background: var(--success);
     box-shadow: 0 0 0 2px var(--bg-secondary);
@@ -5526,9 +5566,38 @@
     border: 2px solid var(--text-muted);
   }
 
+  /* The ring is cut from the row's own colour, so a hovered row does not
+     leave a halo of the panel's around the dot. */
+  .member-list li:hover .present-dot,
+  .member-list li:focus-within .present-dot {
+    box-shadow: 0 0 0 2px var(--bg-hover);
+  }
+
+  .member-list li:hover .present-dot.away,
+  .member-list li:focus-within .present-dot.away {
+    background: var(--bg-hover);
+  }
+
+  /* One per row was a column of identical dots down the panel. Revealed the
+     way the room list's are; right-click on the row opens it too. */
+  .member-list .card-more > summary {
+    opacity: 0;
+    transition:
+      opacity var(--transition-fast) ease,
+      background-color var(--transition-fast) ease;
+  }
+
+  .member-list li:hover .card-more > summary,
+  .member-list li:focus-within .card-more > summary,
+  .member-list .card-more[open] > summary { opacity: 1; }
+
+  @media (hover: none) {
+    .member-list .card-more > summary { opacity: 1; }
+  }
+
   .member-seen {
     font-size: var(--font-size-2xs);
-    color: var(--text-muted);
+    color: var(--text-secondary);
     white-space: nowrap;
   }
 
@@ -5686,8 +5755,9 @@
   /* The header's bell is an `icon-btn` that happens to open a menu, so it
      keeps that size rather than the row menus' smaller trigger. */
   .notify-more > summary {
-    width: 30px;
-    height: 30px;
+    width: 32px;
+    height: 32px;
+    color: var(--text-secondary);
   }
 
   .empty-state {

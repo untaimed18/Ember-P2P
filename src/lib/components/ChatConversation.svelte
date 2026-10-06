@@ -3354,7 +3354,11 @@
           class:starts-run={row.startsRun}
           class:fresh={freshIds.has(row.msg.id)}
         >
-        {#if isChannel}
+        {#if isChannel && row.msg.direction === 'sent'}
+          <!-- Blue and on the right already says it is yours; the chip only
+               crowded the bubble. A screen reader still hears whose it is. -->
+          <span class="sr-only">{senderLabel(row.msg.sender_pubkey)}</span>
+        {:else if isChannel}
           <div class="bubble-who">
             <bdi dir="auto">{senderLabel(row.msg.sender_pubkey)}</bdi>
           </div>
@@ -4115,7 +4119,7 @@
     padding: 3px 10px;
     border-radius: var(--radius-pill);
     background: var(--bg-tertiary);
-    color: var(--text-muted);
+    color: var(--text-secondary);
     font-size: var(--font-size-xs);
     font-weight: 600;
     letter-spacing: 0.4px;
@@ -4181,7 +4185,7 @@
   .conv-msg {
     display: flex;
     flex-direction: column;
-    max-width: 80%;
+    max-width: min(640px, 80%);
     min-width: 0;
   }
 
@@ -4213,9 +4217,11 @@
     max-width: 100%;
   }
 
+  /* Narrow enough that a long line stays readable on a wide window: past
+     about 640px a paragraph runs well over the 75 characters an eye tracks. */
   .conversation.channel .conv-msg {
     position: relative;
-    max-width: min(720px, 72%);
+    max-width: min(640px, 72%);
     min-width: min(156px, 72%);
   }
 
@@ -4226,9 +4232,13 @@
     box-shadow: none;
   }
 
-  /* The sender's name chip sits in this corner, so it stays tight. */
-  .conversation.channel .conv-msg.received .conv-bubble,
+  /* No name chip on your own lines, so no room is kept for one. */
   .conversation.channel .conv-msg.sent .conv-bubble {
+    padding-top: 8px;
+  }
+
+  /* The sender's name chip sits in this corner, so it stays tight. */
+  .conversation.channel .conv-msg.received .conv-bubble {
     border-top-left-radius: var(--radius-md);
   }
 
@@ -4465,15 +4475,6 @@
   .conversation.channel .conv-msg.received .bubble-who {
     top: -1px;
     inset-inline-start: -1px;
-  }
-
-  .conversation.channel .conv-msg.sent .bubble-who {
-    background: var(--on-accent);
-    border-color: color-mix(in srgb, var(--on-accent) 55%, var(--accent));
-    color: var(--accent);
-    box-shadow:
-      -1px -1px 0 var(--on-accent),
-      0 1px 2px color-mix(in srgb, #000 12%, transparent);
   }
 
   .conversation.channel .bubble-who bdi {
@@ -5196,6 +5197,15 @@
     color: color-mix(in srgb, var(--reaction-heart) 65%, var(--text-primary));
   }
 
+  /* On your own bubble the accent fill swallowed the gold and red, and the
+     counts with them. A face of their own keeps them as legible there as on
+     anyone else's. These chips are only a tally: nobody reacts to their own
+     line, so no hover or chosen state needs covering. */
+  .conversation.channel .conv-bubble.sent .reaction-btn {
+    background-color: var(--bg-surface);
+    border-color: color-mix(in srgb, var(--on-accent) 40%, transparent);
+  }
+
   .conversation.channel .reaction-btn.pulse-add {
     animation: reaction-pop 0.36s ease;
   }
@@ -5608,21 +5618,32 @@
   }
 
   .conv-emoji-toggle svg {
-    width: 18px;
-    height: 18px;
+    width: 20px;
+    height: 20px;
   }
 
+  /* The attach button's shape, so the composer's controls read as one row
+     beside Send rather than a pair of afterthoughts. A little smaller than it,
+     because the dock's composer can be 320px wide and the text box comes
+     first. */
   .conv-format-toggle {
-    width: 26px;
-    height: 26px;
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
     padding: 0;
     border: none;
-    border-radius: var(--radius-sm);
+    border-radius: 50%;
     background: transparent;
-    color: var(--text-muted);
-    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
     font-weight: 700;
     cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast);
+  }
+
+  .conv-format-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 
   .conv-format-toggle:hover,
