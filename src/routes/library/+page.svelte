@@ -1037,8 +1037,11 @@
   }
 
   async function openSharedFileExternally(path: string) {
-    // Stop in-app playback before handing the file to the OS player.
-    playerStopToken += 1;
+    // Stop in-app playback before handing media to the OS player, so the two
+    // do not play over each other. Any other file leaves it playing.
+    if (playableKind(fileByPath.get(path)?.extension || extensionFromPath(path))) {
+      playerStopToken += 1;
+    }
     try {
       await openSharedFileCommand(path);
     } catch (e: unknown) {
@@ -2555,7 +2558,7 @@
         case 'properties':
           requestSelectPath(f.path);
           break;
-        case 'open_file': await openSharedFile(f.path); break;
+        case 'open_file': await openSharedFileExternally(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
         // The backend reads the template from settings by index and does the
         // substituting, and collects the native confirmation — so there is
