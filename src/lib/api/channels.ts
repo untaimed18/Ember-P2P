@@ -307,9 +307,21 @@ export async function getChannelDraft(channelId: string): Promise<string> {
   return invoke('get_channel_draft', { channelId });
 }
 
+/** Writes per room, chained so they land in the order they were made: each is
+ *  its own blocking task on the backend, and a save that overtook the clear
+ *  sent after it put a line already sent back as the draft. */
+const draftWrites = new Map<string, Promise<void>>();
+
 /** Keep a room's draft across restarts; an empty `text` drops it. */
-export async function setChannelDraft(channelId: string, text: string): Promise<void> {
-  return invoke('set_channel_draft', { channelId, text });
+export function setChannelDraft(channelId: string, text: string): Promise<void> {
+  const write = (draftWrites.get(channelId) ?? Promise.resolve())
+    .catch(() => {})
+    .then(() => invoke<void>('set_channel_draft', { channelId, text }));
+  draftWrites.set(channelId, write);
+  void write.finally(() => {
+    if (draftWrites.get(channelId) === write) draftWrites.delete(channelId);
+  }).catch(() => {});
+  return write;
 }
 
 /** Substring search over this device's stored history for one room. Local

@@ -1,6 +1,7 @@
 /**
- * Where the reader left each conversation, so coming back to one lands where
- * they were reading instead of at the bottom.
+ * Where the reader left each conversation, so coming back to one with nothing
+ * new in it lands where they were reading instead of at the bottom. With
+ * unread lines the conversation opens on those instead.
  *
  * Kept for this session only and in this window only. The spot is a message
  * and how far its top sat below the top of the transcript, rather than a pixel

@@ -195,6 +195,10 @@ describe('formatMessage: lists', () => {
     expect(render('- a\n- b\n1. c\n2. d')).toBe('[ul:a;b]|[ol:c;d]');
   });
 
+  it('drops the blank lines around a code block too', () => {
+    expect(render('Look:\n\n```\nx\n```\n\nDone')).toBe('Look:|[pre:x]|Done');
+  });
+
   it('leaves list markers inside a code block alone', () => {
     expect(render('```\n- a\n- b\n```')).toBe('[pre:- a\n- b]');
   });

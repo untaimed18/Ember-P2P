@@ -119,10 +119,13 @@ export function formatMessage(text: string): FormatBlock[] {
     // `close > i + 1`: an empty fence pair is two literal lines, not an empty
     // box. An opener with no closer below it is literal too.
     if (close > i + 1 && FENCE_OPEN_RE.test(lines[i])) {
-      pushTextBlock(blocks, lines, textStart, i);
+      // The block keeps its own margin, so the blank lines that set it apart
+      // in the source would draw as extra empty lines either side, as they
+      // would around a list.
+      pushTextBlock(blocks, lines, textStart, trimBlankEnd(lines, textStart, i));
       blocks.push({ type: 'code', text: lines.slice(i + 1, close).map(stripCr).join('\n') });
       i = close + 1;
-      textStart = i;
+      textStart = trimBlankStart(lines, i, lines.length);
     } else {
       i++;
     }

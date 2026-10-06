@@ -1092,8 +1092,8 @@
       unreadDividerSeen = false;
       unreadDividerAbove = false;
       // Scroll position belongs to the conversation being left, not the one
-      // being opened: `loadMessages` lands this one where the reader last
-      // left it, or else on its own unread marker or at the bottom.
+      // being opened: `loadMessages` lands this one on its own unread marker,
+      // or with nothing unread where the reader last left it, or at the bottom.
       scrolledAway = false;
       missedWhileAway = false;
       scrollSpotReady = false;
@@ -1201,27 +1201,40 @@
     if (pending) void setChannelDraft(pending.channel, pending.text).catch(() => {});
   }
 
+  /** A room whose stored draft was dropped while its read was still out, so
+   *  what that read brings back is the line just sent, not a draft. */
+  let roomDraftDropped: string | null = null;
+
+  /** Cancel a write of this room's draft that has not gone out yet. Called as
+   *  a send starts, so the timer cannot store the line while it is sending. */
+  function cancelRoomDraftWrite(channel: string) {
+    if (roomDraftPending?.channel !== channel) return;
+    roomDraftPending = null;
+    if (roomDraftTimer) {
+      clearTimeout(roomDraftTimer);
+      roomDraftTimer = null;
+    }
+  }
+
   /** Drop a room's stored draft now, and any write of it still waiting, so a
    *  line just sent cannot come back as a draft after a restart. */
   function discardRoomDraft(channel: string) {
-    if (roomDraftPending?.channel === channel) {
-      roomDraftPending = null;
-      if (roomDraftTimer) {
-        clearTimeout(roomDraftTimer);
-        roomDraftTimer = null;
-      }
-    }
+    cancelRoomDraftWrite(channel);
     if (roomDraftReady === channel) roomDraftSaved = '';
+    else roomDraftDropped = channel;
     void setChannelDraft(channel, '').catch(() => {});
   }
 
   function loadRoomDraft(channel: string) {
     const seq = ++roomDraftSeq;
     roomDraftReady = null;
+    roomDraftDropped = null;
     void getChannelDraft(channel)
       .catch(() => '')
-      .then((stored) => {
+      .then((read) => {
         if (seq !== roomDraftSeq || channelId !== channel) return;
+        const stored = roomDraftDropped === channel ? '' : read;
+        roomDraftDropped = null;
         // Text already in the box is newer: typed since opening, or kept in
         // memory from earlier this session.
         if (!inputText && stored) inputText = stored;
@@ -1230,14 +1243,30 @@
       });
   }
 
+  // Quitting does not tear the conversation down, so the last keystrokes
+  // still waiting on the save timer would otherwise never reach the disk.
   $effect(() => {
-    const channel = channelId;
-    const text = inputText;
-    if (!channel || roomDraftReady !== channel || text === roomDraftSaved) return;
+    const flush = () => flushRoomDraft();
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('beforeunload', flush);
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      window.removeEventListener('beforeunload', flush);
+    };
+  });
+
+  function queueRoomDraftWrite(channel: string, text: string) {
     roomDraftSaved = text;
     roomDraftPending = { channel, text };
     if (roomDraftTimer) clearTimeout(roomDraftTimer);
     roomDraftTimer = setTimeout(flushRoomDraft, ROOM_DRAFT_SAVE_MS);
+  }
+
+  $effect(() => {
+    const channel = channelId;
+    const text = inputText;
+    if (!channel || roomDraftReady !== channel || text === roomDraftSaved) return;
+    queueRoomDraftWrite(channel, text);
   });
 
   async function setupListener(gen: number, hash: string, channel: string): Promise<boolean> {
@@ -1291,7 +1320,7 @@
             reply_parent_deleted: event.payload.reply_parent_deleted === true,
           }];
           commitLiveMessages(next, event.payload.direction === 'sent' || wasPinned);
-          noteMissedMessage(wasPinned, event.payload.direction);
+          noteMissedMessage(wasPinned, event.payload.direction, event.payload.sender_pubkey);
           // Not while the open is still seeking back for the first unread line:
           // clearing `read` now would stop that seek short and misplace the
           // divider. The read after the load covers this line too.
@@ -1594,12 +1623,14 @@
         );
         unreadMarkerId = firstUnread?.id ?? null;
       }
-      const spot = conversationKey ? recalledScroll(conversationKey) : undefined;
-      if (spot && (await restoreScrollSpot(gen, spot))) {
-        // Back where the reader was, which is above anything new: the lines
-        // that arrived since are all further down.
-        if (unreadMarkerId !== null) missedWhileAway = true;
-      } else {
+      // Only with nothing unread. Opening marks the room read at once, so
+      // landing back above new lines would leave them unmarked by the next
+      // visit: no divider, no pill, just lines the reader never saw. The
+      // divider is where to start when there is one.
+      const spot =
+        conversationKey && unreadMarkerId === null ? recalledScroll(conversationKey) : undefined;
+      const restored = !!spot && (await restoreScrollSpot(gen, spot));
+      if (!restored) {
         if (gen !== loadGen) return;
         if (unreadMarkerId !== null) scrollToUnreadMarker();
         else scrollToBottom(true);
@@ -1962,6 +1993,10 @@
     const divider = box.querySelector<HTMLElement>('.conv-unread-divider');
     if (!divider) {
       unreadDividerAbove = false;
+      // Its line is not drawn: removed, from somebody since ignored, or
+      // trimmed off the top. With nothing to reach, the pill must stop
+      // promising unread lines below. Not while loading, when no row is drawn.
+      if (!loading) unreadDividerSeen = true;
       return;
     }
     const view = box.getBoundingClientRect();
@@ -1999,11 +2034,20 @@
    * drawn, so it is written before the row is added and need not be reactive.
    */
   const freshIds = new Set<number>();
+  /** Comfortably past the slide-in. Dropped then, so a row drawn again later
+   *  (the list remounting on a retry, a member un-ignored) does not replay
+   *  it, and the set holds only the last moment's arrivals. */
+  const FRESH_MS = 1000;
+
+  function addFresh(id: number): void {
+    freshIds.add(id);
+    setTimeout(() => freshIds.delete(id), FRESH_MS);
+  }
 
   function markFresh(next: readonly ConvMessage[]): void {
     const known = new Set(messages.map((message) => message.id));
     for (const message of next) {
-      if (!known.has(message.id)) freshIds.add(message.id);
+      if (!known.has(message.id)) addFresh(message.id);
     }
   }
 
@@ -2113,7 +2157,11 @@
       const box = messagesContainerEl;
       const row = box?.querySelector<HTMLElement>(`[data-msg-id="${spot.id}"]`);
       if (gen !== loadGen || !box || !row || box.clientHeight === 0) return;
-      box.scrollTop += row.getBoundingClientRect().top - box.getBoundingClientRect().top - spot.offset;
+      // No further above the top than the row now reaches. A long post the
+      // reader had unfolded comes back folded, so the depth they were at
+      // inside it would land well past it, among lines not yet read.
+      const offset = Math.max(spot.offset, -Math.max(0, row.offsetHeight - 40));
+      box.scrollTop += row.getBoundingClientRect().top - box.getBoundingClientRect().top - offset;
       scrolledAway = !isPinnedToBottom();
       checkUnreadDivider();
     });
@@ -2141,8 +2189,10 @@
     scrollToBottom();
   }
 
-  /** Note an incoming message the reader is not positioned to see. */
-  function noteMissedMessage(wasPinned: boolean, direction: string) {
+  /** Note an incoming message the reader is not positioned to see. Not one
+   *  from somebody they ignore, which is never drawn for them to find. */
+  function noteMissedMessage(wasPinned: boolean, direction: string, sender?: string) {
+    if (sender && ignoredSenders.includes(sender.toLowerCase())) return;
     if (!wasPinned && direction === 'received') missedWhileAway = true;
   }
 
@@ -2366,7 +2416,7 @@
       const alreadyDelivered = result.id !== null && earlyDeliveredIds.delete(result.id);
       const existing = messages.findIndex((message) => message.id === durableId);
       if (existing === -1) {
-        freshIds.add(durableId);
+        addFresh(durableId);
         messages = [...messages, {
           id: durableId,
           direction: 'sent' as const,
@@ -2489,13 +2539,23 @@
         console.warn('ChatConversation: could not drop the abandoned room line', e),
       );
       if (channel === channelId) {
-        commitLiveMessages([...messages, fromChannelRow(sent)], true);
+        // Leaving and coming back during the send reloads the transcript,
+        // which may already hold the new row, and the old one too if its
+        // delete was still on the way. A keyed list holding either twice
+        // breaks.
+        const kept = messages.filter((message) => message.id !== msg.id);
+        commitLiveMessages(
+          kept.some((message) => message.id === sent.id) ? kept : [...kept, fromChannelRow(sent)],
+          true,
+        );
       }
     } catch (e: unknown) {
       if (channel === channelId) {
-        const next = [...messages];
-        next.splice(Math.min(at, next.length), 0, restore);
-        messages = next;
+        if (!messages.some((message) => message.id === restore.id)) {
+          const next = [...messages];
+          next.splice(Math.min(at, next.length), 0, restore);
+          messages = next;
+        }
         sendError = translateError(e, m.chat_failed_to_send());
       }
     } finally {
@@ -2529,6 +2589,9 @@
       // here would only spend a datagram per member. The next keystroke starts
       // a fresh one.
       roomTypingSentOn = false;
+      // Or the save timer stores the line while it is sending, and a quit
+      // before the clear lands keeps it as the draft.
+      cancelRoomDraftWrite(channel);
     } else {
       stopOutgoingTyping();
     }
@@ -2540,7 +2603,7 @@
         if (reply && getPendingReply(channel)?.msgId === reply.msgId) setPendingReply(channel, null);
         if (channel === channelId) {
           if (!messages.some((message) => message.id === sent.id)) {
-            freshIds.add(sent.id);
+            addFresh(sent.id);
             messages = [...messages, fromChannelRow(sent)];
           }
           if (reply && replyTarget?.msgId === reply.msgId) replyTarget = null;
@@ -2587,6 +2650,9 @@
         }
         if (channel === channelId) sendError = failed;
         else toastError(failed);
+        // Still in the composer, so it is a draft again: the write the send
+        // cancelled has to happen after all.
+        if (channel === channelId && roomDraftReady === channel) queueRoomDraftWrite(channel, inputText);
       } else if (h === friendHash) {
         sendError = failed;
       } else {
@@ -2933,18 +2999,37 @@
   };
   let rowCache = new Map<number, CachedRow>();
 
-  /** Past either of these a message is folded until asked for. Judged from
-   *  the text rather than measured, so it costs nothing per bubble; set above
-   *  the folded height (`.bubble-text.folded`) so whatever folds really did
-   *  overflow it, even in a wide window. */
+  /** Past this many drawn lines a message is folded until asked for. Judged
+   *  from the formatted text rather than measured, so it costs nothing per
+   *  bubble; set above the folded height (`.bubble-text.folded`) so whatever
+   *  folds really did overflow it, even in a wide window. */
   const FOLD_MIN_LINES = 18;
-  const FOLD_MIN_CHARS = 1800;
+  /** Characters a wrapped line holds at the widest a bubble is drawn. */
+  const FOLD_LINE_CHARS = 80;
 
-  function isLongMessage(text: string): boolean {
-    if (text.length > FOLD_MIN_CHARS) return true;
-    let lines = 1;
-    for (let at = text.indexOf('\n'); at !== -1; at = text.indexOf('\n', at + 1)) {
-      if (++lines > FOLD_MIN_LINES) return true;
+  function plainInline(nodes: InlineNode[]): string {
+    let out = '';
+    for (const node of nodes) out += 'children' in node ? plainInline(node.children) : node.text;
+    return out;
+  }
+
+  function wrappedLines(text: string): number {
+    let lines = 0;
+    for (const line of text.split('\n')) lines += Math.max(1, Math.ceil(line.length / FOLD_LINE_CHARS));
+    return lines;
+  }
+
+  /** Code is counted a line per line, since it scrolls sideways instead of
+   *  wrapping: a one-line stack trace of two thousand characters is one line
+   *  tall, and folding it only hid it under the fade. */
+  function isLongMessage(blocks: FormatBlock[]): boolean {
+    let lines = 0;
+    for (const block of blocks) {
+      if (block.type === 'code') lines += block.text.split('\n').length;
+      else if (block.type === 'list') {
+        for (const item of block.items) lines += wrappedLines(plainInline(item));
+      } else lines += wrappedLines(plainInline(block.children));
+      if (lines > FOLD_MIN_LINES) return true;
     }
     return false;
   }
@@ -2987,8 +3072,9 @@
               // to a code span still counts; formatting is display-only.
               mentionsMe: msg.direction === 'received' && (pattern?.test(msg.message) ?? false),
               blocks: formatMessage(msg.message),
-              long: isLongMessage(msg.message),
+              long: false,
             };
+      if (row !== hit) row.long = isLongMessage(row.blocks);
       next.set(msg.id, row);
       return row;
     });
