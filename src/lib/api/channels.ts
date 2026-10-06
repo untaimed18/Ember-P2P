@@ -301,6 +301,17 @@ export async function markChannelMessagesRead(channelId: string): Promise<void> 
   return invoke('mark_channel_messages_read', { channelId });
 }
 
+/** The line left half-typed in a room, sealed with the chat key on disk.
+ *  Empty when there is none or chat is locked. */
+export async function getChannelDraft(channelId: string): Promise<string> {
+  return invoke('get_channel_draft', { channelId });
+}
+
+/** Keep a room's draft across restarts; an empty `text` drops it. */
+export async function setChannelDraft(channelId: string, text: string): Promise<void> {
+  return invoke('set_channel_draft', { channelId, text });
+}
+
 /** Substring search over this device's stored history for one room. Local
  *  only — nothing is asked of the network. */
 export async function searchChannelMessages(

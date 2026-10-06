@@ -632,6 +632,11 @@ const CHAT_AAD_DOMAIN: &[u8] = b"ember-chat-db-row-v1\0";
 const CHANNEL_MSG_AAD_DOMAIN: &[u8] = b"ember-channel-db-row-v1\0";
 const CHANNEL_SECRET_AAD_DOMAIN: &[u8] = b"ember-channel-secret-v1\0";
 const CHANNEL_SECRET_PREFIX: &str = "EMBRCSEC1:";
+const CHANNEL_DRAFT_AAD_DOMAIN: &[u8] = b"ember-channel-draft-v1\0";
+const CHANNEL_DRAFT_PREFIX: &str = "EMBRCDRF1:";
+/// The composer's 4096-character limit at four bytes a character. A draft is
+/// never sent from here, so this only bounds what one row can hold.
+const MAX_CHANNEL_DRAFT_BYTES: usize = 16 * 1024;
 const CHAT_ATTACH_AAD_DOMAIN: &[u8] = b"ember-chat-attachment-db-v1\0";
 /// Marks a sealed `chat_attachments` name or path. A value without it is one
 /// written before v60 that has not been sealed yet, and is read as it stands.
@@ -7666,6 +7671,11 @@ impl Database {
                 "DELETE FROM channel_key_epochs WHERE channel_id = ?1",
                 params![channel_id],
             )?;
+            Self::ensure_channel_drafts_locked(&tx)?;
+            tx.execute(
+                "DELETE FROM channel_drafts WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
             // The forget-list goes too. It exists to stop a deleted line being
             // re-inserted by the next gossip replay, and with the room itself
             // destroyed there is no ingest path left to refuse — so every row
@@ -7771,6 +7781,11 @@ impl Database {
                 params![channel_id],
             )?,
         };
+        Self::ensure_channel_drafts_locked(&tx)?;
+        tx.execute(
+            "DELETE FROM channel_drafts WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
         let n = tx.execute(
             "DELETE FROM channels WHERE channel_id = ?1",
             params![channel_id],
@@ -7778,6 +7793,102 @@ impl Database {
         tx.commit()?;
         bump_channel_roster_generation(channel_id);
         Ok(n > 0)
+    }
+
+    /// Half-typed room lines, kept across a restart. Sealed with the chat key
+    /// like the room's messages, because a draft is message text that has not
+    /// been sent yet and deserves no less. In a table of its own, created on
+    /// first use, for the same reason as
+    /// [`Self::ensure_transfer_part_folders_locked`]: a numbered migration
+    /// would stop 1.7.0 from opening the database after a downgrade.
+    fn ensure_channel_drafts_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_drafts (
+                channel_id TEXT PRIMARY KEY,
+                body TEXT NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        Ok(())
+    }
+
+    fn channel_draft_aad(channel_id: &str) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(CHANNEL_DRAFT_AAD_DOMAIN.len() + 4 + channel_id.len());
+        aad.extend_from_slice(CHANNEL_DRAFT_AAD_DOMAIN);
+        aad.extend_from_slice(&(channel_id.len() as u32).to_le_bytes());
+        aad.extend_from_slice(channel_id.as_bytes());
+        aad
+    }
+
+    /// Store a room's draft, or drop it when `text` is empty. Refuses while
+    /// chat is locked, since the draft could only be kept in the clear.
+    pub fn save_channel_draft(&self, channel_id: &str, text: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_drafts_locked(&conn)?;
+        if text.is_empty() {
+            conn.execute(
+                "DELETE FROM channel_drafts WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            return Ok(());
+        }
+        if text.len() > MAX_CHANNEL_DRAFT_BYTES {
+            anyhow::bail!("Draft is too long to keep");
+        }
+        let key = self.require_chat_key()?;
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+        let mut nonce = [0u8; CHAT_NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let aad = Self::channel_draft_aad(channel_id);
+        let encrypted = cipher
+            .encrypt(XNonce::from_slice(&nonce), Payload { msg: text.as_bytes(), aad: &aad })
+            .map_err(|_| anyhow::anyhow!("Failed to encrypt draft"))?;
+        let mut envelope = Vec::with_capacity(CHAT_NONCE_LEN + encrypted.len());
+        envelope.extend_from_slice(&nonce);
+        envelope.extend_from_slice(&encrypted);
+        let sealed = format!("{CHANNEL_DRAFT_PREFIX}{}", STANDARD_NO_PAD.encode(envelope));
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_drafts (channel_id, body, updated_at)
+             VALUES (?1, ?2, ?3)",
+            params![channel_id, sealed, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// A room's stored draft, or empty when there is none, chat is locked, or
+    /// the row no longer opens under the key this device holds.
+    pub fn load_channel_draft(&self, channel_id: &str) -> anyhow::Result<String> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_drafts_locked(&conn)?;
+        let Some(key) = self.chat_key.as_deref() else {
+            return Ok(String::new());
+        };
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT body FROM channel_drafts WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(String::new());
+        };
+        let opened = stored
+            .strip_prefix(CHANNEL_DRAFT_PREFIX)
+            .and_then(|encoded| STANDARD_NO_PAD.decode(encoded).ok())
+            .filter(|envelope| envelope.len() >= CHAT_NONCE_LEN + 16)
+            .and_then(|envelope| {
+                let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+                let aad = Self::channel_draft_aad(channel_id);
+                cipher
+                    .decrypt(
+                        XNonce::from_slice(&envelope[..CHAT_NONCE_LEN]),
+                        Payload { msg: &envelope[CHAT_NONCE_LEN..], aad: &aad },
+                    )
+                    .ok()
+            })
+            .and_then(|plain| String::from_utf8(plain).ok());
+        Ok(opened.unwrap_or_default())
     }
 
     pub fn load_channel_owner_seed(&self, channel_id: &str) -> anyhow::Result<Option<[u8; 32]>> {
@@ -14731,6 +14842,60 @@ mod tests {
         assert!(wrong_key.chat_attachment_grant(&sent, &friend, now).is_none());
 
         drop(wrong_key);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A room draft survives on disk sealed, reads back as typed, is bound to
+    /// its room, and goes when it is cleared or the room is forgotten.
+    #[test]
+    fn channel_drafts_are_sealed_and_bound_to_their_room() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-draft-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let (room, other) = ("a1".repeat(16), "b2".repeat(16));
+        assert_eq!(db.load_channel_draft(&room).unwrap(), "");
+
+        db.save_channel_draft(&room, "see you at the meetup").expect("save");
+        assert_eq!(db.load_channel_draft(&room).unwrap(), "see you at the meetup");
+        let stored: String = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT body FROM channel_drafts WHERE channel_id = ?1",
+                params![room],
+                |row| row.get(0),
+            )
+            .expect("raw row");
+        assert!(stored.starts_with(CHANNEL_DRAFT_PREFIX));
+        assert!(!stored.contains("meetup"));
+
+        // Moved under another room's id, the row no longer opens.
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO channel_drafts (channel_id, body) VALUES (?1, ?2)",
+                params![other, stored],
+            )
+            .expect("copy row");
+        assert_eq!(db.load_channel_draft(&other).unwrap(), "");
+
+        assert!(db.save_channel_draft(&room, &"x".repeat(MAX_CHANNEL_DRAFT_BYTES + 1)).is_err());
+        assert_eq!(db.load_channel_draft(&room).unwrap(), "see you at the meetup");
+
+        db.save_channel_draft(&room, "").expect("clear");
+        assert_eq!(db.load_channel_draft(&room).unwrap(), "");
+
+        db.save_channel_draft(&other, "still here").expect("save other");
+        db.delete_channel(&other, None).expect("forget");
+        assert_eq!(db.load_channel_draft(&other).unwrap(), "");
+
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));

@@ -11,9 +11,13 @@ import {
   ignoredMembers,
   channelNotifyLevels,
   channels,
+  channelSnoozes,
   channelUnreadMentions,
   cleanupChannelsStore,
   clearChannelUnread,
+  effectiveNotifyLevels,
+  endChannelSnooze,
+  expireChannelSnoozes,
   favouriteChannels,
   forgetChannelFavourite,
   initChannelsStore,
@@ -22,15 +26,27 @@ import {
   mergeChannelUnreadFromSnapshot,
   messageMentionsName,
   notifyLevelOf,
+  parseChannelSnoozes,
   refreshChannels,
   setChannelNotifyLevel,
+  snoozeChannel,
+  snoozedUntil,
+  snoozeEnd,
   toggleChannelFavourite,
   totalChannelUnread,
   unreadBadgeTone,
   xferNeedsConsent,
   xferStartsAsking,
 } from './channels';
-import { listChannels, type ChannelInfo, type ChannelTransferInfo } from '$lib/api/channels';
+import {
+  getChannelMessages,
+  listChannels,
+  type ChannelInfo,
+  type ChannelMessageInfo,
+  type ChannelTransferInfo,
+} from '$lib/api/channels';
+import { appSettings } from '$lib/stores/settings';
+import type { AppSettings } from '$lib/types';
 import { toast } from '$lib/stores/toast';
 import { notify } from '$lib/notifications';
 
@@ -40,6 +56,7 @@ vi.mock('$lib/api/channels', async () => {
     ...actual,
     listChannels: vi.fn(),
     listChannelTransfers: vi.fn(async () => []),
+    getChannelMessages: vi.fn(async () => []),
   };
 });
 
@@ -97,6 +114,7 @@ beforeEach(() => {
   vi.mocked(listChannels).mockReset();
   channels.set([]);
   channelNotifyLevels.set({});
+  channelSnoozes.set({});
   favouriteChannels.set([]);
   carriedChannels.set([]);
   ignoredMembers.set([]);
@@ -596,5 +614,122 @@ describe('unread counters', () => {
     await first;
     expect(get(channels).map((r) => r.name)).toEqual(['New room']);
     await second;
+  });
+});
+
+describe('snooze', () => {
+  it('silences a room like "Nothing" and keeps its own level underneath', () => {
+    setChannelNotifyLevel(A, 'mentions');
+    channels.set([room({ channel_id: A, unread: 2 }), room({ channel_id: B, unread: 3 })]);
+    channelUnreadMentions.set([A]);
+    expect(get(totalChannelUnread)).toBe(5);
+    snoozeChannel(A.toUpperCase(), '1h');
+    expect(snoozedUntil(get(channelSnoozes), A)).not.toBeNull();
+    expect(notifyLevelOf(get(effectiveNotifyLevels), A)).toBe('none');
+    expect(notifyLevelOf(get(channelNotifyLevels), A)).toBe('mentions');
+    expect(get(totalChannelUnread)).toBe(3);
+    endChannelSnooze(A);
+    expect(notifyLevelOf(get(effectiveNotifyLevels), A)).toBe('mentions');
+    expect(get(totalChannelUnread)).toBe(5);
+  });
+
+  it('holds back a file offer while it lasts', () => {
+    channelTransfers.set({
+      x: {
+        xfer_id: 'x',
+        channel_id: A,
+        peer_pubkey: 'ee'.repeat(32),
+        direction: 'receive',
+        name: 'f',
+        size: 1,
+        transferred: 0,
+        status: 'awaiting',
+      } as ChannelTransferInfo,
+    });
+    expect(get(awaitingChannelOffers)).toBe(1);
+    snoozeChannel(A, '8h');
+    expect(get(awaitingChannelOffers)).toBe(0);
+  });
+
+  it('ends by itself once the time is up', () => {
+    const now = Date.now();
+    channelSnoozes.set({ [A]: now - 1, [B]: now + 60_000 });
+    expireChannelSnoozes(now);
+    expect(get(channelSnoozes)).toEqual({ [B]: now + 60_000 });
+  });
+
+  it('runs "until tomorrow" to the coming morning', () => {
+    const evening = new Date(2026, 9, 5, 21, 30);
+    expect(new Date(snoozeEnd('tomorrow', evening))).toEqual(new Date(2026, 9, 6, 8, 0));
+    // Past midnight, "tomorrow" still means the morning about to come.
+    const smallHours = new Date(2026, 9, 6, 1, 15);
+    expect(new Date(snoozeEnd('tomorrow', smallHours))).toEqual(new Date(2026, 9, 6, 8, 0));
+    expect(snoozeEnd('1h', evening)).toBe(evening.getTime() + 3_600_000);
+  });
+
+  it('drops stored snoozes that are over, malformed or implausibly long', () => {
+    const now = 1_000_000;
+    const raw = JSON.stringify({
+      [A.toUpperCase()]: now + 5,
+      [B]: now - 5,
+      ['33'.repeat(16)]: now + 30 * 24 * 3_600_000,
+      junk: now + 5,
+      ['44'.repeat(16)]: 'soon',
+    });
+    expect(parseChannelSnoozes(raw, now)).toEqual({ [A]: now + 5 });
+    expect(parseChannelSnoozes('{', now)).toEqual({});
+  });
+
+  it('is forgotten with a room that is gone', async () => {
+    snoozeChannel(A, '1h');
+    snoozeChannel(B, '1h');
+    vi.mocked(listChannels).mockResolvedValueOnce([room({ channel_id: B, in_room: false })]);
+    await refreshChannels();
+    expect(Object.keys(get(channelSnoozes))).toEqual([B]);
+  });
+});
+
+describe('mention flags after a restart', () => {
+  const line = (partial: Partial<ChannelMessageInfo>): ChannelMessageInfo =>
+    ({
+      id: 1,
+      sender_pubkey: 'ee'.repeat(32),
+      direction: 'received',
+      message: '',
+      timestamp: 0,
+      read: false,
+      edited_at: 0,
+      msg_id: '',
+      delivery: 'delivered',
+      reply_to: null,
+      reply_to_me: false,
+      reply_parent: null,
+      reply_parent_deleted: false,
+      ...partial,
+    }) as ChannelMessageInfo;
+  const C = '33'.repeat(16);
+
+  it('flags the rooms whose unread lines name or answer the user', async () => {
+    appSettings.set({ channel_username: 'Ada', nickname: '' } as AppSettings);
+    vi.mocked(listChannels).mockResolvedValue([
+      room({ channel_id: A, unread: 2 }),
+      room({ channel_id: B, unread: 1 }),
+      room({ channel_id: C, unread: 3 }),
+      room({ channel_id: '44'.repeat(16), unread: 0 }),
+    ]);
+    vi.mocked(getChannelMessages).mockImplementation(async (id: string) => {
+      if (id === A) return [line({ message: 'morning @Ada' }), line({ message: 'hi' })];
+      if (id === B) return [line({ message: 'unrelated', reply_to_me: true })];
+      // Read already, and the user's own line: neither is a mention waiting.
+      return [
+        line({ message: 'Ada?', read: true }),
+        line({ message: 'Ada', direction: 'sent' }),
+      ];
+    });
+    await initChannelsStore();
+    await vi.waitFor(() => expect([...get(channelUnreadMentions)].sort()).toEqual([A, B]));
+    expect(vi.mocked(getChannelMessages)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(getChannelMessages)).toHaveBeenCalledWith(A, 2);
+    appSettings.set(null);
   });
 });

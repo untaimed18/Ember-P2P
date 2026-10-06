@@ -2524,6 +2524,8 @@ pub fn run() {
             commands::channels::get_channel_reactions,
             commands::channels::send_channel_message,
             commands::channels::mark_channel_messages_read,
+            commands::channels::get_channel_draft,
+            commands::channels::set_channel_draft,
             commands::channels::gather_channels,
             commands::channels::cached_channels,
             commands::channels::update_channel_moderation,

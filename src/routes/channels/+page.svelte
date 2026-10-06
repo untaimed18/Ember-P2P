@@ -25,6 +25,7 @@
     disambiguatedMemberName,
     formatBytes,
     formatDurationSecs,
+    formatDateTime,
     formatRelativeTime,
     formatSpeed,
     shortPubkey,
@@ -116,6 +117,12 @@
     setChannelInRoom,
     setChannelMemberCount,
     setChannelNotifyLevel,
+    channelSnoozes,
+    effectiveNotifyLevels,
+    endChannelSnooze,
+    snoozeChannel,
+    snoozedUntil,
+    type SnoozeChoice,
     upsertChannel,
     restoreActiveChannelOnEnter,
     stashActiveChannelOnLeave,
@@ -440,6 +447,27 @@
   );
   function notifyLevelLabel(level: ChannelNotifyLevel): string {
     return (NOTIFY_CHOICES.find((choice) => choice.level === level) ?? NOTIFY_CHOICES[0]).label();
+  }
+  let selectedSnoozedUntil = $derived(
+    selected ? snoozedUntil($channelSnoozes, selected.channel_id) : null,
+  );
+  const SNOOZE_CHOICES: { choice: SnoozeChoice; label: () => string }[] = [
+    { choice: '1h', label: () => m.channels_snooze_1h() },
+    { choice: '8h', label: () => m.channels_snooze_8h() },
+    { choice: 'tomorrow', label: () => m.channels_snooze_tomorrow() },
+  ];
+  let bellTitle = $derived(
+    selectedSnoozedUntil !== null
+      ? m.channels_snoozed_until({ time: snoozeEndLabel(selectedSnoozedUntil) })
+      : m.channels_notify_title({ level: notifyLevelLabel(selectedNotifyLevel) }),
+  );
+  /** The time alone when the snooze ends today, with the day when it does not. */
+  function snoozeEndLabel(until: number): string {
+    const sameDay = new Date(until).toDateString() === new Date().toDateString();
+    return formatDateTime(
+      Math.floor(until / 1000),
+      sameDay ? { hour: 'numeric', minute: '2-digit' } : { weekday: 'short', hour: 'numeric', minute: '2-digit' },
+    );
   }
   /** A public room's key is in its public listing, so "encrypted" alone
    *  would promise more than the padlock can keep. */
@@ -2691,6 +2719,14 @@
                         </svg>
                       </span>
                     {/if}
+                    {#if ch.in_room && ch.channel_id in $channelSnoozes}
+                      {@const snoozeLabel = m.channels_snoozed_until({ time: snoozeEndLabel($channelSnoozes[ch.channel_id]) })}
+                      <span class="chan-snooze" role="img" title={snoozeLabel} aria-label={snoozeLabel}>
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M13 9.6A5.5 5.5 0 016.4 3a5.5 5.5 0 106.6 6.6z"/>
+                        </svg>
+                      </span>
+                    {/if}
                     {#if memberCount !== null}
                       {@const count = memberCount}
                       <!-- Joined rooms show who is here now but rank on the
@@ -2721,7 +2757,7 @@
                            `unreadBadgeTone`. -->
                       <span
                         class="count-pill unread"
-                        class:silenced={unreadBadgeTone(notifyLevelOf($channelNotifyLevels, ch.channel_id), mentioned) === 'quiet'}
+                        class:silenced={unreadBadgeTone(notifyLevelOf($effectiveNotifyLevels, ch.channel_id), mentioned) === 'quiet'}
                         aria-label={mentioned
                           ? m.channels_unread_mention_aria({ count: ch.unread })
                           : plural(ch.unread, {
@@ -2808,7 +2844,12 @@
                 tabindex="-1"
                 class="menu-radio"
                 aria-checked={current === choice.level}
-                onclick={(e) => { closeCardMenu(e.currentTarget); setChannelNotifyLevel(channelId, choice.level); }}
+                onclick={(e) => {
+                  closeCardMenu(e.currentTarget);
+                  setChannelNotifyLevel(channelId, choice.level);
+                  // Picking a level is asking to hear the room that way now.
+                  endChannelSnooze(channelId);
+                }}
               >
                 <svg class="menu-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   {#if current === choice.level}<path d="M3.5 8.5l3 3 6-7"/>{/if}
@@ -2817,6 +2858,33 @@
               </button>
             {/each}
           </div>
+          {@const until = snoozedUntil($channelSnoozes, channelId)}
+          <!-- A room already set to Nothing has no alerts left to hold back. -->
+          {#if until !== null || current !== 'none'}
+            {@const snoozeHeading = until !== null
+              ? m.channels_snoozed_until({ time: snoozeEndLabel(until) })
+              : m.channels_snooze_heading()}
+            <div class="menu-sep" role="separator"></div>
+            <div role="group" aria-label={snoozeHeading}>
+              <span class="menu-heading" aria-hidden="true">{snoozeHeading}</span>
+              {#if until !== null}
+                <button
+                  type="button"
+                  role="menuitem"
+                  tabindex="-1"
+                  onclick={(e) => { closeCardMenu(e.currentTarget); endChannelSnooze(channelId); }}
+                >{m.channels_snooze_end()}</button>
+              {/if}
+              {#each SNOOZE_CHOICES as option (option.choice)}
+                <button
+                  type="button"
+                  role="menuitem"
+                  tabindex="-1"
+                  onclick={(e) => { closeCardMenu(e.currentTarget); snoozeChannel(channelId, option.choice); }}
+                >{option.label()}</button>
+              {/each}
+            </div>
+          {/if}
           <!-- These levels govern toasts; a desktop notification also needs
                the room-message switch in Settings, which is off by default,
                so "Mentions only" otherwise reads as a promise it cannot keep. -->
@@ -2988,15 +3056,17 @@
                 <details class="card-more notify-more">
                   <summary
                     class="icon-btn"
-                    class:on={selectedNotifyLevel !== 'all'}
-                    title={m.channels_notify_title({ level: notifyLevelLabel(selectedNotifyLevel) })}
+                    class:on={selectedNotifyLevel !== 'all' || selectedSnoozedUntil !== null}
+                    title={bellTitle}
                     aria-haspopup="menu"
-                    aria-label={m.channels_notify_title({ level: notifyLevelLabel(selectedNotifyLevel) })}
+                    aria-label={bellTitle}
                   >
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <path d="M6.2 12.2a1.9 1.9 0 003.6 0"/>
                       <path d="M3.6 12.2h8.8l-1.1-1.6V7.4a3.3 3.3 0 00-6.6 0v3.2z"/>
-                      {#if selectedNotifyLevel === 'none'}
+                      {#if selectedSnoozedUntil !== null}
+                        <path d="M11.2 1.6h3.2l-3.2 3.6h3.2"/>
+                      {:else if selectedNotifyLevel === 'none'}
                         <path d="M2.6 2.6l10.8 10.8"/>
                       {:else if selectedNotifyLevel === 'mentions'}
                         <circle cx="12.6" cy="3.4" r="1.9" fill="currentColor" stroke="none"/>
@@ -4444,6 +4514,15 @@
   }
 
   .chan-fav svg { width: 11px; height: 11px; }
+
+  .chan-snooze {
+    display: inline-flex;
+    flex-shrink: 0;
+    margin-inline-start: -4px;
+    color: var(--text-muted);
+  }
+
+  .chan-snooze svg { width: 12px; height: 12px; }
 
   /* Hidden until the row is reached, like Remove on a Discover row, and in
      the same slot, so joined and unjoined rows line up. */

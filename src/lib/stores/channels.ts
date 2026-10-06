@@ -1,9 +1,11 @@
 import { derived, get, writable } from 'svelte/store';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
+  getChannelMessages,
   listChannels,
   listChannelTransfers,
   type ChannelInfo,
+  type ChannelMessageInfo,
   type ChannelTransferInfo,
 } from '$lib/api/channels';
 import { isAppVisible } from '$lib/utils';
@@ -185,6 +187,141 @@ export function setChannelNotifyLevel(channelId: string, level: ChannelNotifyLev
   });
 }
 
+/**
+ * Rooms silenced for a while, by when the silence ends (milliseconds).
+ *
+ * Laid over the level rather than replacing it, so the room goes back to
+ * whatever the user had chosen once the time is up, with nothing to undo.
+ * While it lasts the room behaves exactly as "Nothing" does. Kept across a
+ * restart, but not in backups: an hour's quiet restored a week later would
+ * already be over.
+ */
+const SNOOZE_KEY = 'ember.channels.snooze.v1';
+/** Longest delay `setTimeout` takes before it fires at once instead. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+/** No choice snoozes for longer; a stored value past this is not one we wrote. */
+const MAX_SNOOZE_MS = 7 * 24 * 60 * 60_000;
+
+export type SnoozeChoice = '1h' | '8h' | 'tomorrow';
+
+export function parseChannelSnoozes(raw: string | null, now: number): Record<string, number> {
+  if (!raw) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const out: Record<string, number> = {};
+  for (const [key, until] of Object.entries(parsed)) {
+    if (!CHANNEL_ID_RE.test(key) || typeof until !== 'number' || !Number.isFinite(until)) continue;
+    if (until <= now || until > now + MAX_SNOOZE_MS) continue;
+    out[key.toLowerCase()] = until;
+  }
+  return out;
+}
+
+export function loadChannelSnoozes(
+  storage: StorageLike | null = browserStorage(),
+  now = Date.now(),
+): Record<string, number> {
+  if (!storage) return {};
+  try {
+    return parseChannelSnoozes(storage.getItem(SNOOZE_KEY), now);
+  } catch {
+    return {};
+  }
+}
+
+export const channelSnoozes = writable<Record<string, number>>(loadChannelSnoozes());
+
+let snoozeTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Drop every snooze that has run out. */
+export function expireChannelSnoozes(now = Date.now()): void {
+  channelSnoozes.update((cur) => {
+    if (!Object.values(cur).some((until) => until <= now)) return cur;
+    return Object.fromEntries(Object.entries(cur).filter(([, until]) => until > now));
+  });
+}
+
+channelSnoozes.subscribe((snoozes) => {
+  const storage = browserStorage();
+  if (storage) {
+    try {
+      if (Object.keys(snoozes).length === 0) storage.removeItem(SNOOZE_KEY);
+      else storage.setItem(SNOOZE_KEY, JSON.stringify(snoozes));
+    } catch {
+      // Quota exceeded / private mode. The snooze still holds for this session.
+    }
+  }
+  if (snoozeTimer) {
+    clearTimeout(snoozeTimer);
+    snoozeTimer = null;
+  }
+  const ends = Object.values(snoozes);
+  if (ends.length === 0) return;
+  // The earliest end only; expiring it writes the store, which lands back here
+  // and schedules the next. A delay past the timer's ceiling re-arms on firing.
+  const wait = Math.min(Math.max(0, Math.min(...ends) - Date.now()), MAX_TIMER_MS);
+  snoozeTimer = setTimeout(() => {
+    snoozeTimer = null;
+    expireChannelSnoozes();
+  }, wait);
+});
+
+/** When a snooze picked now would end. "Tomorrow" is 8 in the morning, and a
+ *  choice made in the small hours means the coming morning, not the next. */
+export function snoozeEnd(choice: SnoozeChoice, now = new Date()): number {
+  if (choice === '1h') return now.getTime() + 60 * 60_000;
+  if (choice === '8h') return now.getTime() + 8 * 60 * 60_000;
+  const morning = new Date(now);
+  morning.setHours(8, 0, 0, 0);
+  if (now.getHours() >= 4) morning.setDate(morning.getDate() + 1);
+  return morning.getTime();
+}
+
+export function snoozeChannel(channelId: string, choice: SnoozeChoice): void {
+  const id = channelId.toLowerCase();
+  if (!CHANNEL_ID_RE.test(id)) return;
+  const until = snoozeEnd(choice);
+  channelSnoozes.update((cur) => ({ ...cur, [id]: until }));
+}
+
+export function endChannelSnooze(channelId: string): void {
+  const id = channelId.toLowerCase();
+  channelSnoozes.update((cur) => {
+    if (!(id in cur)) return cur;
+    const { [id]: _ended, ...rest } = cur;
+    return rest;
+  });
+}
+
+/** When a room's snooze ends, or null if it is not snoozed. */
+export function snoozedUntil(snoozes: Record<string, number>, channelId: string): number | null {
+  return snoozes[channelId.toLowerCase()] ?? null;
+}
+
+/** The levels as they apply right now: a snoozed room is "Nothing". What the
+ *  alerts, badges and pills read; the room's own choice stays in
+ *  `channelNotifyLevels` for the menu to show. */
+export function applySnoozes(
+  levels: Record<string, QuietLevel>,
+  snoozes: Record<string, number>,
+): Record<string, QuietLevel> {
+  const ids = Object.keys(snoozes);
+  if (ids.length === 0) return levels;
+  const out = { ...levels };
+  for (const id of ids) out[id] = 'none';
+  return out;
+}
+
+export const effectiveNotifyLevels = derived(
+  [channelNotifyLevels, channelSnoozes],
+  ([levels, snoozes]) => applySnoozes(levels, snoozes),
+);
+
 /** Whether a received line may interrupt — toast or desktop notification. */
 export function channelMayAlert(level: ChannelNotifyLevel, mentionsMe: boolean): boolean {
   return level === 'all' || (level === 'mentions' && mentionsMe);
@@ -209,9 +346,9 @@ export function unreadBadgeTone(
 /**
  * Rooms holding an unread line that names this user.
  *
- * Session only: the database counts unread but keeps no record of which of
- * those lines were mentions, so after a restart a mentions-only room's
- * backlog is drawn quiet until somebody names the user again.
+ * Not stored: the database counts unread but keeps no record of which of
+ * those lines were mentions, so `rebuildUnreadMentions` works it out again
+ * from the unread lines themselves at startup.
  */
 export const channelUnreadMentions = writable<string[]>([]);
 
@@ -246,7 +383,7 @@ function myChannelName(): string {
  * has no business putting a number on the nav rail.
  */
 export const totalChannelUnread = derived(
-  [channels, channelNotifyLevels, channelUnreadMentions],
+  [channels, effectiveNotifyLevels, channelUnreadMentions],
   ([list, levels, mentioned]) =>
     list.reduce(
       (sum, channel) =>
@@ -599,6 +736,7 @@ export function forgetChannelIgnores(channelId: string): void {
  *  can walk back in. */
 export function forgetChannelNotifyLevel(channelId: string): void {
   setChannelNotifyLevel(channelId, 'all');
+  endChannelSnooze(channelId);
 }
 
 let initialized = false;
@@ -671,7 +809,7 @@ function offerMayAlert(
 /** How many incoming Ember Transfer offers are still waiting for a decision
  *  and are allowed to say so. */
 export const awaitingChannelOffers = derived(
-  [channelTransfers, channelNotifyLevels, ignoredMembers],
+  [channelTransfers, effectiveNotifyLevels, ignoredMembers],
   ([xfers, levels, ignored]) =>
     Object.values(xfers).filter(
       (xfer) =>
@@ -731,7 +869,7 @@ function toastXferOffer(channelId: string, peerPubkey?: string): void {
   if (isAppVisible() && (channelIsOnScreen(channelId) || get(activeChannelId) === channelId)) {
     return;
   }
-  if (!offerMayAlert(get(channelNotifyLevels), get(ignoredMembers), channelId, peerPubkey)) return;
+  if (!offerMayAlert(get(effectiveNotifyLevels), get(ignoredMembers), channelId, peerPubkey)) return;
   const room = get(channels).find((c) => c.channel_id === channelId);
   toast(
     room
@@ -800,8 +938,8 @@ carriedChannels.subscribe((ids) => {
 });
 
 /**
- * Bring a room's star, notification level and mention flag to the room it
- * handed off to.
+ * Bring a room's star, notification level, snooze and mention flag to the
+ * room it handed off to.
  *
  * All are keyed by room id, and an ownership handoff carries the conversation
  * to a new id — so the star was pruned once the user left the old room, and
@@ -828,6 +966,7 @@ function carryPrefsToSuccessors(list: ChannelInfo[]): void {
   if (moves.length === 0) return;
   let favourites = get(favouriteChannels);
   let levels = get(channelNotifyLevels);
+  let snoozes = get(channelSnoozes);
   let mentioned = get(channelUnreadMentions);
   let carried = get(carriedChannels);
   for (const [from, to] of moves) {
@@ -838,10 +977,12 @@ function carryPrefsToSuccessors(list: ChannelInfo[]): void {
     if (carried.includes(from)) continue;
     carried = [...carried, from];
     if (from in levels && !(to in levels)) levels = { ...levels, [to]: levels[from] };
+    if (from in snoozes && !(to in snoozes)) snoozes = { ...snoozes, [to]: snoozes[from] };
     if (mentioned.includes(from) && !mentioned.includes(to)) mentioned = [...mentioned, to];
   }
   if (favourites !== get(favouriteChannels)) favouriteChannels.set(favourites);
   if (levels !== get(channelNotifyLevels)) channelNotifyLevels.set(levels);
+  if (snoozes !== get(channelSnoozes)) channelSnoozes.set(snoozes);
   if (mentioned !== get(channelUnreadMentions)) channelUnreadMentions.set(mentioned);
   if (carried !== get(carriedChannels)) carriedChannels.set(carried);
 }
@@ -886,6 +1027,10 @@ async function refreshChannelsOnce(): Promise<void> {
     channelNotifyLevels.set(
       Object.fromEntries(Object.entries(levels).filter(([id]) => keep.has(id))),
     );
+  }
+  const snoozes = get(channelSnoozes);
+  if (Object.keys(snoozes).some((id) => !keep.has(id))) {
+    channelSnoozes.set(Object.fromEntries(Object.entries(snoozes).filter(([id]) => keep.has(id))));
   }
   const carried = get(carriedChannels);
   if (carried.some((id) => !keep.has(id))) {
@@ -1107,7 +1252,7 @@ function maybeToastChannelMessage(
   // applies its own visible-*and*-focused test.
   const roomOnScreen =
     isAppVisible() && (channelIsOnScreen(channelId) || get(activeChannelId) === channelId);
-  if (!channelMayAlert(notifyLevelOf(get(channelNotifyLevels), channelId), mentionsMe)) return;
+  if (!channelMayAlert(notifyLevelOf(get(effectiveNotifyLevels), channelId), mentionsMe)) return;
   // Ignoring somebody is presentational, and a toast quoting them is the least
   // ignorable presentation there is: it interrupts whatever page the user is on
   // with the text they asked not to see. The unread count still moves, which is
@@ -1128,6 +1273,61 @@ function maybeToastChannelMessage(
   // already looking rather than about the message. The notification's own
   // category switch is off by default; see `notify_channel_message`.
   void notify('channel_message', name, preview);
+}
+
+/** Most unread lines read back per room when the mention flags are rebuilt. */
+const MENTION_REBUILD_ROWS = 200;
+/** How long the rebuild waits for settings, which carry the name to match. */
+const MENTION_REBUILD_SETTINGS_WAIT_MS = 30_000;
+
+function settingsArrived(): Promise<boolean> {
+  if (get(appSettings)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let unsubscribe: (() => void) | null = null;
+    const timer = setTimeout(() => {
+      unsubscribe?.();
+      resolve(false);
+    }, MENTION_REBUILD_SETTINGS_WAIT_MS);
+    unsubscribe = appSettings.subscribe((settings) => {
+      if (!settings) return;
+      clearTimeout(timer);
+      // Not from inside the first call, which runs before `unsubscribe` is set.
+      queueMicrotask(() => unsubscribe?.());
+      resolve(true);
+    });
+  });
+}
+
+/**
+ * Work out again which rooms hold an unread mention, once at startup.
+ *
+ * The database counts unread lines but keeps no record of which named the
+ * user, so after a restart every "@" was gone and a mentions-only room's
+ * backlog drew quiet. The newest unread lines are read back and matched the
+ * way a live one is, which gives the flag back to the rooms that earned it.
+ */
+async function rebuildUnreadMentions(epoch: number): Promise<void> {
+  if (!(await settingsArrived()) || epoch !== storeEpoch) return;
+  const rooms = get(channels).filter((room) => room.in_room && !room.deleted && room.unread > 0);
+  for (const room of rooms) {
+    if (epoch !== storeEpoch) return;
+    if (get(channelUnreadMentions).includes(room.channel_id)) continue;
+    let rows: ChannelMessageInfo[];
+    try {
+      rows = await getChannelMessages(room.channel_id, Math.min(room.unread, MENTION_REBUILD_ROWS));
+    } catch {
+      continue;
+    }
+    if (epoch !== storeEpoch) return;
+    const named = rows.some(
+      (row) =>
+        row.direction === 'received'
+        && !row.read
+        && receivedMentionsMe(room.channel_id, row.message, row.sender_pubkey, row.reply_to_me),
+    );
+    // Rechecks the room still has unread, so one opened meanwhile is skipped.
+    if (named) noteUnreadMention(room.channel_id);
+  }
 }
 
 export async function initChannelsStore() {
@@ -1249,6 +1449,7 @@ export async function initChannelsStore() {
     unlisteners = registered;
     await refreshChannels().catch(() => {});
     void mergeChannelTransfers();
+    void rebuildUnreadMentions(myEpoch);
   } catch (err) {
     for (const fn of registered) {
       try {

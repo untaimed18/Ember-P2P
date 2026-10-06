@@ -19,11 +19,13 @@
   import { placeAttachments } from '$lib/chatAttachmentPlacement';
   import {
     deleteChannelMessage,
+    getChannelDraft,
     getChannelMessages,
     getChannelPins,
     markChannelMessagesRead,
     sendChannelMessage,
     sendChannelTyping,
+    setChannelDraft,
     setChannelMessagePinned,
     CHANNEL_PIN_MAX,
     REPLY_REFERENCE_BYTES,
@@ -86,6 +88,9 @@
   import { rovingToolbar } from '$lib/actions/rovingToolbar';
   import { appSettings } from '$lib/stores/settings';
   import { getDraft, setDraft, clearDraft, registerDraftFlusher } from '$lib/stores/chatTabs';
+  import { firstRowBelow, recalledScroll, rememberScroll, type ScrollSpot } from '$lib/chatScrollMemory';
+  import { insertAtSelection } from '$lib/emojiPicker';
+  import EmojiPicker from '$lib/components/EmojiPicker.svelte';
   import * as m from '$lib/paraglide/messages';
   import { codedErrorOf, translateError } from '$lib/i18n';
   import {
@@ -1047,6 +1052,12 @@
       sendSeq++;
       sending = false;
       inputText = getDraft(key);
+      if (channel) {
+        loadRoomDraft(channel);
+      } else {
+        roomDraftSeq++;
+        roomDraftReady = null;
+      }
       // Channel unread is cleared only after `markAsRead` succeeds. Clearing
       // the badge here raced a `refreshChannels` that still saw unread rows
       // and put the count back — or hid a room that was never actually marked.
@@ -1081,10 +1092,15 @@
       unreadDividerSeen = false;
       unreadDividerAbove = false;
       // Scroll position belongs to the conversation being left, not the one
-      // being opened: `loadMessages` lands this one on its own unread marker
-      // or at the bottom.
+      // being opened: `loadMessages` lands this one where the reader last
+      // left it, or else on its own unread marker or at the bottom.
       scrolledAway = false;
       missedWhileAway = false;
+      scrollSpotReady = false;
+      if (scrollSpotFrame) {
+        cancelAnimationFrame(scrollSpotFrame);
+        scrollSpotFrame = 0;
+      }
       // A jump asked for in the room being left means nothing in this one.
       queuedFocus = null;
       focusedId = null;
@@ -1097,6 +1113,7 @@
       reactions = {};
       picker = null;
       pickerPos = null;
+      emojiOpen = false;
       cancelEdit();
       // A pending reply is per room, like the draft restored above.
       replyTarget = channel ? getPendingReply(channel) : null;
@@ -1128,6 +1145,7 @@
       if (unlistenRead) { unlistenRead(); unlistenRead = null; }
       if (unlistenAttach) { unlistenAttach(); unlistenAttach = null; }
       if (key) setDraft(key, inputText);
+      flushRoomDraft();
       releaseChannelOnScreen?.();
       releaseChannelOnScreen = null;
       if (!channel) {
@@ -1153,7 +1171,71 @@
   $effect(() => {
     const key = conversationKey;
     if (!key) return;
-    return registerDraftFlusher(() => setDraft(key, inputText));
+    return registerDraftFlusher(() => {
+      setDraft(key, inputText);
+      flushRoomDraft();
+    });
+  });
+
+  // A room's draft also outlives a restart, sealed with the chat key on disk.
+  // Friend drafts stay in memory only (see `chatTabs`).
+  const ROOM_DRAFT_SAVE_MS = 600;
+  /** The room whose stored draft has been read. Until then the composer is not
+   *  written back, or the empty box of a room just opened would erase the copy
+   *  on disk before it had loaded. */
+  let roomDraftReady = $state<string | null>(null);
+  let roomDraftSeq = 0;
+  let roomDraftSaved = '';
+  let roomDraftPending: { channel: string; text: string } | null = null;
+  let roomDraftTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function flushRoomDraft() {
+    if (roomDraftTimer) {
+      clearTimeout(roomDraftTimer);
+      roomDraftTimer = null;
+    }
+    const pending = roomDraftPending;
+    roomDraftPending = null;
+    if (pending) void setChannelDraft(pending.channel, pending.text).catch(() => {});
+  }
+
+  /** Drop a room's stored draft now, and any write of it still waiting, so a
+   *  line just sent cannot come back as a draft after a restart. */
+  function discardRoomDraft(channel: string) {
+    if (roomDraftPending?.channel === channel) {
+      roomDraftPending = null;
+      if (roomDraftTimer) {
+        clearTimeout(roomDraftTimer);
+        roomDraftTimer = null;
+      }
+    }
+    if (roomDraftReady === channel) roomDraftSaved = '';
+    void setChannelDraft(channel, '').catch(() => {});
+  }
+
+  function loadRoomDraft(channel: string) {
+    const seq = ++roomDraftSeq;
+    roomDraftReady = null;
+    void getChannelDraft(channel)
+      .catch(() => '')
+      .then((stored) => {
+        if (seq !== roomDraftSeq || channelId !== channel) return;
+        // Text already in the box is newer: typed since opening, or kept in
+        // memory from earlier this session.
+        if (!inputText && stored) inputText = stored;
+        roomDraftSaved = stored;
+        roomDraftReady = channel;
+      });
+  }
+
+  $effect(() => {
+    const channel = channelId;
+    const text = inputText;
+    if (!channel || roomDraftReady !== channel || text === roomDraftSaved) return;
+    roomDraftSaved = text;
+    roomDraftPending = { channel, text };
+    if (roomDraftTimer) clearTimeout(roomDraftTimer);
+    roomDraftTimer = setTimeout(flushRoomDraft, ROOM_DRAFT_SAVE_MS);
   });
 
   async function setupListener(gen: number, hash: string, channel: string): Promise<boolean> {
@@ -1510,8 +1592,23 @@
         );
         unreadMarkerId = firstUnread?.id ?? null;
       }
-      if (unreadMarkerId !== null) scrollToUnreadMarker();
-      else scrollToBottom(true);
+      const spot = conversationKey ? recalledScroll(conversationKey) : undefined;
+      if (spot && (await restoreScrollSpot(gen, spot))) {
+        // Back where the reader was, which is above anything new: the lines
+        // that arrived since are all further down.
+        if (unreadMarkerId !== null) missedWhileAway = true;
+      } else {
+        if (gen !== loadGen) return;
+        if (unreadMarkerId !== null) scrollToUnreadMarker();
+        else scrollToBottom(true);
+      }
+      // A frame after the landing's own, so its scroll is not taken for the
+      // reader's.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (gen === loadGen) scrollSpotReady = true;
+        });
+      });
     } catch (e: unknown) {
       if (gen !== loadGen) return;
       if (messages.length === 0) {
@@ -1938,6 +2035,71 @@
     scrolledAway = !pinned;
     if (pinned) missedWhileAway = false;
     checkUnreadDivider();
+    if (scrollSpotReady && !scrollSpotFrame) {
+      scrollSpotFrame = requestAnimationFrame(() => {
+        scrollSpotFrame = 0;
+        if (scrollSpotReady) captureScrollSpot();
+      });
+    }
+  }
+
+  /** Off while a conversation is being opened and placed, when the scroll
+   *  events are the empty transcript and the landing, not the reader. */
+  let scrollSpotReady = false;
+  let scrollSpotFrame = 0;
+  /** Pages walked back to reach a remembered spot before giving up on it. */
+  const SCROLL_RESTORE_PAGES = 10;
+
+  function captureScrollSpot() {
+    const key = conversationKey;
+    const box = messagesContainerEl;
+    // Zero height is a hidden pane, where every rect reads as zero.
+    if (!key || !box || box.clientHeight === 0) return;
+    if (isPinnedToBottom()) {
+      rememberScroll(key, null);
+      return;
+    }
+    const top = box.getBoundingClientRect().top;
+    const rows = box.querySelectorAll<HTMLElement>('[data-msg-id]');
+    const first = firstRowBelow((i) => rows[i].getBoundingClientRect().bottom, rows.length, top);
+    // A line still being sent has no row id to come back to; the next one does.
+    for (let i = first; i < rows.length; i++) {
+      const id = Number(rows[i].dataset.msgId);
+      if (id > 0) {
+        rememberScroll(key, { id, offset: rows[i].getBoundingClientRect().top - top });
+        return;
+      }
+    }
+  }
+
+  /** Page back to a remembered message and put it where it was. False when it
+   *  cannot be reached or is not drawn, and the usual landing should run. */
+  async function restoreScrollSpot(gen: number, spot: ScrollSpot): Promise<boolean> {
+    for (
+      let page = 0;
+      page < SCROLL_RESTORE_PAGES && !messages.some((message) => message.id === spot.id);
+      page++
+    ) {
+      const before = oldestDbId;
+      if (before === null || before <= spot.id || !hasMoreHistory) break;
+      await loadOlderMessages();
+      if (gen !== loadGen) return false;
+      if (oldestDbId === before) break;
+    }
+    if (!visibleMessages.some((message) => message.id === spot.id)) return false;
+    await tick();
+    if (gen !== loadGen) return false;
+    // After the anchoring `loadOlderMessages` queues for itself, or it would
+    // land on top of this.
+    requestAnimationFrame(() => {
+      const box = messagesContainerEl;
+      const row = box?.querySelector<HTMLElement>(`[data-msg-id="${spot.id}"]`);
+      if (gen !== loadGen || !box || !row || box.clientHeight === 0) return;
+      box.scrollTop += row.getBoundingClientRect().top - box.getBoundingClientRect().top - spot.offset;
+      scrolledAway = !isPinnedToBottom();
+      checkUnreadDivider();
+    });
+    return true;
   }
 
   function jumpToLatest() {
@@ -2355,6 +2517,7 @@
           }
         }
         clearDraft(key);
+        discardRoomDraft(channel);
         return;
       }
       await deliverToFriend(h, text);
@@ -2442,6 +2605,31 @@
    *  mount a conversation, so its id has to be per instance. */
   let formatHelpOpen = $state(false);
   const formatSheetId = $props.id();
+  let emojiOpen = $state(false);
+  const emojiPickerId = `${formatSheetId}-emoji`;
+  const COMPOSER_MAX_CHARS = 4096;
+
+  /** Put a picked emoji where the caret was. The textarea keeps its selection
+   *  while the picker has focus, so that is still the place the user meant. */
+  function insertEmoji(emoji: string) {
+    emojiOpen = false;
+    const el = chatInputEl;
+    const at = insertAtSelection(
+      inputText,
+      el?.selectionStart ?? inputText.length,
+      el?.selectionEnd ?? inputText.length,
+      emoji,
+      COMPOSER_MAX_CHARS,
+    );
+    if (at) {
+      inputText = at.text;
+      notifyOutgoingTyping(at.text);
+    }
+    tick().then(() => {
+      chatInputEl?.focus();
+      if (at) chatInputEl?.setSelectionRange(at.caret, at.caret);
+    });
+  }
   /** Describes the composer while it is replying, so a screen reader hears who
    *  the line will answer on focus. */
   const replyBarId = `${formatSheetId}-reply`;
@@ -3644,7 +3832,7 @@
         placeholder={isChannel ? m.channels_send_placeholder() : m.chat_input_placeholder()}
         aria-label={m.chat_input_label()}
         aria-describedby={isChannel && replyTarget ? replyBarId : undefined}
-        maxlength="4096"
+        maxlength={COMPOSER_MAX_CHARS}
         rows="2"
         readonly={sending}
       ></textarea>
@@ -3655,6 +3843,41 @@
           {m.chat_slow_mode_wait({ seconds: slowModeLeft })}
         </span>
       {/if}
+      <div
+        class="conv-emoji"
+        onfocusout={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) emojiOpen = false;
+        }}
+      >
+        <button
+          type="button"
+          class="conv-format-toggle conv-emoji-toggle"
+          class:open={emojiOpen}
+          onclick={() => (emojiOpen = !emojiOpen)}
+          disabled={sending}
+          title={m.chat_emoji_button()}
+          aria-label={m.chat_emoji_button()}
+          aria-expanded={emojiOpen}
+          aria-controls={emojiPickerId}
+        >
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="10" cy="10" r="7"/>
+            <path d="M7 11.8a3.6 3.6 0 0 0 6 0"/>
+            <line x1="7.6" y1="8" x2="7.6" y2="8.1"/>
+            <line x1="12.4" y1="8" x2="12.4" y2="8.1"/>
+          </svg>
+        </button>
+        {#if emojiOpen}
+          <EmojiPicker
+            id={emojiPickerId}
+            onpick={insertEmoji}
+            onclose={() => {
+              emojiOpen = false;
+              chatInputEl?.focus();
+            }}
+          />
+        {/if}
+      </div>
       <!-- A cheat-sheet rather than toolbar buttons: the markers are typed, and
            a row of B/I/S controls would crowd a composer the dock already
            keeps narrow. Closes on focus leaving it, so it never lingers. -->
@@ -5309,9 +5532,28 @@
 
   /* Static, so the sheet anchors to the composer row (the same box the mention
      list uses) rather than to this small button. */
-  .conv-format-help {
+  .conv-format-help,
+  .conv-emoji {
     display: flex;
     align-self: center;
+  }
+
+  .conv-emoji-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .conv-emoji-toggle:disabled {
+    background: transparent;
+    color: var(--text-muted);
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  .conv-emoji-toggle svg {
+    width: 18px;
+    height: 18px;
   }
 
   .conv-format-toggle {

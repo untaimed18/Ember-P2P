@@ -2476,6 +2476,37 @@ pub async fn mark_channel_messages_read(
     Ok(())
 }
 
+/// The line left half-typed in a room, kept across restarts.
+#[tauri::command]
+pub async fn get_channel_draft(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+) -> Result<String, String> {
+    require_ember(&state).await?;
+    let channel_id = parse_channel_id(&channel_id)?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.load_channel_draft(&channel_id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_messages_failed", "Failed to load draft", e))
+}
+
+/// Keep a room's draft, or drop it when `text` is empty.
+#[tauri::command]
+pub async fn set_channel_draft(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    text: String,
+) -> Result<(), String> {
+    require_ember(&state).await?;
+    let channel_id = parse_channel_id(&channel_id)?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.save_channel_draft(&channel_id, &text))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_messages_failed", "Failed to save draft", e))
+}
+
 struct OwnedChannel {
     row: StoredChannel,
     ident: ChannelIdentity,
