@@ -1715,7 +1715,7 @@ pub(in crate::network) async fn on_upload_event(
         UploadEventKind::PeerAutoBanned { ip, reason, user_hash } => {
             // Manual live-session capture (hash-banned peer caught
             // mid-upload): persist against the peer row only — not
-            // the 7-day auto-ban table — so unban_peer remains the
+            // the 7-day auto-ban table — so the manual ban remains the
             // sole lifetime authority.
             let is_manual_capture = user_hash.is_some()
                 && reason.starts_with("manual peer ban");

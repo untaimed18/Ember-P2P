@@ -650,9 +650,9 @@ impl DhtStore {
         self.publisher_index.set_local(publisher_key);
     }
 
-    /// Resident record bytes. The observable side of the byte budget, kept
-    /// for the tests that pin eviction and for diagnostics.
-    #[allow(dead_code)]
+    /// Resident record bytes. The observable side of the byte budget, for the
+    /// tests that pin eviction.
+    #[cfg(test)]
     pub fn byte_len(&self) -> usize {
         self.bytes
     }
@@ -1376,7 +1376,7 @@ impl DhtStore {
     ///
     /// Only this module's tests call it, precisely because they need to
     /// observe pre-sweep state that `get_live` deliberately hides.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn get(&self, key: &[u8; 16]) -> Option<&Vec<DhtRecord>> {
         self.entries.get(key)
     }

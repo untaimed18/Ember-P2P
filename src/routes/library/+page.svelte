@@ -792,7 +792,7 @@
 
   /** Coalescing window for `shared-files-changed` while a scan is running.
    *
-   *  A refresh re-fetches the *entire* library over IPC — `get_shared_files`
+   *  A refresh re-fetches the *entire* library over IPC — a changed library
    *  returns every indexed row, and discovery allows up to 100,000 per folder —
    *  then recomputes every derived view over it. Hashing emits
    *  `shared-files-changed` continuously, so the 300 ms window meant a large

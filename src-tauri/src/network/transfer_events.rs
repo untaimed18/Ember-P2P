@@ -754,7 +754,7 @@ pub(super) async fn handle_download_event(
             let failure_kind_name = ed2k::transfer::failure_kind_name(&failure_kind);
             let failure_code = ed2k::transfer::classify_failure(&error, &failure_kind);
             let failure_summary = failure_code.message();
-            // User cancel is handled by cancel_transfer (history + row removal).
+            // User cancel is handled by cancel_transfers_batch (history + row removal).
             // Emitting transfer-failed here would briefly turn the progress bar
             // red before the frontend drops the row.
             if ed2k::transfer::is_user_cancel_error(&error)

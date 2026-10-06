@@ -539,12 +539,10 @@ pub async fn ack_pending_deep_link(
 /// Load a collection from a path already authorized by an OS file association
 /// or the native file picker.
 ///
-/// Unlike `collections::load_collection` (which constrains the path to the
-/// user's shared/download folders because it's driven by an in-app file
-/// dialog), a `.emulecollection` opened from the shell can live anywhere
-/// (Downloads, Desktop, an email attachment). The user double-clicking the
-/// file *is* the authorization, so we drop the folder-containment check and
-/// instead lean on extension, regular-file, and size validation.
+/// A `.emulecollection` opened from the shell can live anywhere (Downloads,
+/// Desktop, an email attachment). The user double-clicking the file *is* the
+/// authorization, so there is no folder-containment check; we lean on
+/// extension, regular-file, and size validation instead.
 ///
 /// This is deliberately not a Tauri command. Exposing a raw unrestricted path
 /// to the webview would let injected renderer code use the OS-authorized

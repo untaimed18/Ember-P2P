@@ -10,7 +10,6 @@ import {
   curatedReaction,
   formatReactors,
   gridMove,
-  isCuratedReaction,
   mergeReactionTallies,
   resolvePickerPlacement,
   visibleReactors,
@@ -50,9 +49,9 @@ describe('curated reactions', () => {
   });
 
   it('draws nothing for a withdrawal or a code from a newer build', () => {
-    expect(isCuratedReaction(REACTION_NONE)).toBe(false);
-    expect(isCuratedReaction(REACTION_CURATED_MAX + 1)).toBe(false);
-    expect(isCuratedReaction(255)).toBe(false);
+    expect(curatedReaction(REACTION_NONE)).toBeUndefined();
+    expect(curatedReaction(REACTION_CURATED_MAX + 1)).toBeUndefined();
+    expect(curatedReaction(255)).toBeUndefined();
     expect(curatedReaction(200)).toBeUndefined();
   });
 

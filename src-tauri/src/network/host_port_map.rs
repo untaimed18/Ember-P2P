@@ -77,11 +77,6 @@ impl<V> HostPortMap<V> {
         });
     }
 
-    pub(super) fn clear(&mut self) {
-        self.entries.clear();
-        self.ports_per_host.clear();
-    }
-
     pub(super) fn get_mut(&mut self, key: &(Ipv4Addr, u16)) -> Option<&mut V> {
         self.entries.get_mut(key)
     }
@@ -140,7 +135,7 @@ mod tests {
         assert!(!map.has_host(a));
         assert!(map.has_host(b));
 
-        map.clear();
+        map.retain(|_, _| false);
         assert_counts_match(&map);
         assert!(!map.has_host(b));
     }

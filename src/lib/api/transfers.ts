@@ -100,10 +100,6 @@ export async function resumeTransfer(transferId: string): Promise<void> {
   return withTimeout(invoke<void>('resume_transfer', { transferId }), 'resume_transfer');
 }
 
-export async function cancelTransfer(transferId: string): Promise<void> {
-  return invoke('cancel_transfer', { transferId });
-}
-
 export async function removeTransfer(transferId: string): Promise<void> {
   return invoke('remove_transfer', { transferId });
 }
@@ -230,10 +226,6 @@ export async function setPreviewPriority(transferId: string, enabled: boolean): 
   return invoke('set_preview_priority', { transferId, enabled });
 }
 
-export async function pauseAllTransfers(): Promise<void> {
-  return invoke('pause_all_transfers');
-}
-
 /** `MAX_BATCH_TRANSFER_IDS` in `commands/transfers.rs`: a larger request is
  *  refused outright with `transfers_batch_too_large`. */
 const MAX_BATCH_TRANSFER_IDS = 500;
@@ -262,10 +254,6 @@ export async function stopTransfersBatch(transferIds: string[]): Promise<void> {
 
 export async function cancelTransfersBatch(transferIds: string[]): Promise<void> {
   return invokeChunked('cancel_transfers_batch', transferIds);
-}
-
-export async function resumeAllTransfers(): Promise<void> {
-  return invoke('resume_all_transfers');
 }
 
 export async function getTransferSources(transferId: string): Promise<SourceInfo[]> {

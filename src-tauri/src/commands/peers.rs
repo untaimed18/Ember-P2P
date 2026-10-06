@@ -1046,26 +1046,6 @@ pub async fn offer_file_to_friend(
     await_reply(rx, "peers_no_response", "No response").await?
 }
 
-/// Per-friend count of outbound messages still waiting for a session, so the
-/// chat dock can show an "unsent" marker without loading each conversation.
-#[tauri::command]
-pub async fn get_pending_chat_counts(
-    state: tauri::State<'_, AppState>,
-) -> Result<std::collections::HashMap<String, i64>, String> {
-    let db = state.db.clone();
-    let rows = tokio::task::spawn_blocking(move || db.pending_chat_counts())
-        .await
-        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
-        .map_err(|e| {
-            coded_ctx(
-                "peers_failed_load_pending_counts",
-                "Failed to load queued message counts",
-                e,
-            )
-        })?;
-    Ok(rows.into_iter().collect())
-}
-
 #[tauri::command]
 pub async fn mark_messages_read(
     state: tauri::State<'_, AppState>,
@@ -1515,16 +1495,6 @@ async fn resolve_kad_host(input: &str, port: u16) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn get_peers(state: tauri::State<'_, AppState>) -> Result<Vec<PeerInfo>, String> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state
-        .network_tx
-        .try_send(NetworkCommand::GetPeersSnapshot { tx })
-        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    await_reply(rx, "peers_failed_get_peers", "Failed to get peers").await
-}
-
-#[tauri::command]
 pub async fn get_network_stats(state: tauri::State<'_, AppState>) -> Result<NetworkStats, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -1571,50 +1541,10 @@ pub async fn ban_peer(state: tauri::State<'_, AppState>, peer_id: String) -> Res
 }
 
 #[tauri::command]
-pub async fn unban_peer(state: tauri::State<'_, AppState>, peer_id: String) -> Result<(), String> {
-    if peer_id.len() != 32 || !peer_id.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(coded(
-            "peers_invalid_peer_id",
-            "Invalid peer ID (expected 32 hex characters)",
-        ));
-    }
-
-    let db = state.db.clone();
-    let pid = peer_id.clone();
-    tokio::task::spawn_blocking(move || db.unban_peer(&pid))
-        .await
-        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
-        .map_err(|e| coded_ctx("peers_failed_unban_peer", "Failed to unban peer", e))?;
-
-    // Unban is already persisted to the DB above; the network task
-    // notification only refreshes the in-memory banned-IPs cache. If
-    // the channel is full the cache catches up on next refresh cycle
-    // — the user shouldn't see "unban failed" when the row is gone.
-    if let Err(e) = state.network_tx.try_send(NetworkCommand::UnbanPeer {
-        peer_id_hex: peer_id,
-    }) {
-        tracing::warn!(
-            "Peer unbanned in DB, but cache refresh was not enqueued (channel full): {e}"
-        );
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
 pub fn kad_connect(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state
         .network_tx
         .try_send(NetworkCommand::KadConnect)
-        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn kad_disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state
-        .network_tx
-        .try_send(NetworkCommand::KadDisconnect)
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     Ok(())
 }
@@ -1886,34 +1816,16 @@ pub fn kad_cancel_search(state: tauri::State<'_, AppState>, id: String) -> Resul
     Ok(())
 }
 
-/// Look up the reputation record for a single peer by user-hash. The
-/// backend's `ReputationTracker` runs in-memory and is consulted for
-/// ban decisions; this is the only IPC surface that exposes its state
-/// to the UI (trust badge / per-peer diagnostics).
-#[tauri::command]
-pub async fn get_peer_reputation(
-    state: tauri::State<'_, AppState>,
-    user_hash_hex: String,
-) -> Result<Option<PeerReputationInfo>, String> {
-    let hash = parse_user_hash(&user_hash_hex.to_lowercase())?;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state
-        .network_tx
-        .try_send(NetworkCommand::GetPeerReputation {
-            user_hash: hash,
-            tx,
-        })
-        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    await_reply(rx, "peers_no_response", "No response").await
-}
-
-/// Look up reputation for many peers in one round trip.
+/// Look up reputation for many peers in one round trip. The backend's
+/// `ReputationTracker` runs in-memory and is consulted for ban decisions;
+/// this and [`get_reputation_stats`] are the IPC surface that exposes its
+/// state to the UI.
 ///
 /// The Known Clients table needs a Trust badge per visible row and refreshes
-/// them on a timer, so the per-hash command it used to call put a hundred
-/// entries into the bounded network command channel every eight seconds and
-/// starved unrelated commands into `network_busy`. Every answer comes from the
-/// same in-memory tracker, so the fan-out bought nothing.
+/// them on a timer, so a per-hash command put a hundred entries into the
+/// bounded network command channel every eight seconds and starved unrelated
+/// commands into `network_busy`. Every answer comes from the same in-memory
+/// tracker, so the fan-out bought nothing.
 ///
 /// Malformed hashes are skipped rather than failing the whole request: the
 /// caller is rendering a table, and one bad row must not blank the other
@@ -1945,8 +1857,7 @@ pub async fn get_peer_reputation_batch(
     await_reply(rx, "peers_no_response", "No response").await
 }
 
-/// Aggregate reputation-tracker stats for the security / statistics
-/// UI. Same-only-path rationale as `get_peer_reputation`.
+/// Aggregate reputation-tracker stats for the security / statistics UI.
 #[tauri::command]
 pub async fn get_reputation_stats(
     state: tauri::State<'_, AppState>,

@@ -304,12 +304,6 @@ export function formatRemaining(totalSize: number, transferred: number, speed: n
   return `${compactDuration(Math.round(remaining / speed))} (${remainStr})`;
 }
 
-/** Truncate a hex hash with ellipsis. */
-export function truncateHash(hash: string, len = 16): string {
-  if (hash.length <= len) return hash;
-  return `${hash.slice(0, len)}\u2026`;
-}
-
 const utf8 = new TextEncoder();
 
 /** The backend's nickname cap (`commands/settings.rs`), in UTF-8 bytes. */

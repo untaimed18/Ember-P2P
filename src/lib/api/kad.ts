@@ -1,15 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import { withTimeout } from '$lib/utils';
-import type { NetworkStats, PeerInfo, KadContact, KadSearchEntry } from '$lib/types';
+import type { NetworkStats, KadContact, KadSearchEntry } from '$lib/types';
 
 // The KAD commands below take `withTimeout`'s 20 s default unless noted: long
 // enough for the legitimately slow ones (pinned HTTP download of a fresh
 // nodes.dat, firewall recheck) but short enough that a hung IPC doesn't feel
 // permanent.
-
-export async function getPeers(): Promise<PeerInfo[]> {
-  return invoke('get_peers');
-}
 
 export async function getNetworkStats(): Promise<NetworkStats> {
   return invoke('get_network_stats');
@@ -17,10 +13,6 @@ export async function getNetworkStats(): Promise<NetworkStats> {
 
 export async function banPeer(peerId: string): Promise<void> {
   return invoke('ban_peer', { peerId });
-}
-
-export async function unbanPeer(peerId: string): Promise<void> {
-  return invoke('unban_peer', { peerId });
 }
 
 export async function kadConnect(): Promise<void> {

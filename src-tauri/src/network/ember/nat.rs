@@ -57,27 +57,6 @@ pub enum NatType {
 
 
 impl NatType {
-    /// Whether a hole-punch between two NAT types is likely to succeed.
-    ///
-    /// Retained as the reference definition of punch compatibility and
-    /// covered by this module's tests. The live friend-connect gate is a
-    /// narrower `!= Symmetric` check on our own type alone, since we learn
-    /// the peer's type only after the punch request is already in flight.
-    #[allow(dead_code)]
-    pub fn can_punch_with(&self, other: &NatType) -> bool {
-        matches!(
-            (self, other),
-            (NatType::Open, _)
-                | (_, NatType::Open)
-                | (NatType::FullCone, _)
-                | (_, NatType::FullCone)
-                | (NatType::RestrictedCone, NatType::RestrictedCone)
-                | (NatType::RestrictedCone, NatType::PortRestricted)
-                | (NatType::PortRestricted, NatType::RestrictedCone)
-                | (NatType::PortRestricted, NatType::PortRestricted)
-        )
-    }
-
     pub fn as_u8(&self) -> u8 {
         match self {
             NatType::Open => 0,
@@ -587,17 +566,6 @@ fn parse_mapped_address(data: &[u8]) -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn nat_type_punch_compatibility() {
-        assert!(NatType::Open.can_punch_with(&NatType::Symmetric));
-        assert!(NatType::FullCone.can_punch_with(&NatType::Symmetric));
-        assert!(NatType::RestrictedCone.can_punch_with(&NatType::PortRestricted));
-        assert!(NatType::PortRestricted.can_punch_with(&NatType::PortRestricted));
-        assert!(!NatType::Symmetric.can_punch_with(&NatType::Symmetric));
-        assert!(!NatType::Symmetric.can_punch_with(&NatType::PortRestricted));
-        assert!(!NatType::PortRestricted.can_punch_with(&NatType::Symmetric));
-    }
 
     /// On the shared socket a punch registration names the port the loop
     /// advertises everywhere else, and follows it as it changes, not the port

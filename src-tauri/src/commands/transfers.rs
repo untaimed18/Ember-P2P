@@ -1820,8 +1820,8 @@ pub async fn cancel_transfers_batch(
                 .get_transfer(&transfer_id)
                 .map(|t| (t.file_hash.clone(), t.file_name.clone(), t.total_size));
             if let Some(control) = manager.get_control(&transfer_id) {
-                // Deletes the `.part` — see `cancel_transfer` for why this is
-                // `discard` rather than `cancel`.
+                // Discard, not cancel: this path deletes the `.part`, so the
+                // writer should drop its handle without fsyncing it first.
                 control.discard();
             }
             (manager.cancel(&transfer_id), info)
@@ -1850,9 +1850,9 @@ pub async fn cancel_transfers_batch(
         }
     }
 
-    // Wait for teardown acks concurrently (same wall-clock deadline as single cancel),
-    // then always remove DB rows — matching `cancel_transfer`. Retaining rows on
-    // ack timeout caused cancelled downloads to resurrect on the next launch.
+    // Wait for teardown acks concurrently under one wall-clock deadline, then
+    // always remove DB rows. Retaining rows on ack timeout caused cancelled
+    // downloads to resurrect on the next launch.
     let results = futures::future::join_all(pending_acks.into_iter().map(
         |(transfer_id, ack_rx)| async move {
             (
@@ -2254,89 +2254,6 @@ pub async fn resume_transfer(
 }
 
 #[tauri::command]
-pub async fn cancel_transfer(
-    state: tauri::State<'_, AppState>,
-    transfer_id: String,
-) -> Result<(), String> {
-    let (promoted, cancelled_info) = {
-        let mut manager = state.transfer_manager.write().await;
-        let info = manager
-            .get_transfer(&transfer_id)
-            .map(|t| (t.file_hash.clone(), t.file_name.clone(), t.total_size));
-        if let Some(control) = manager.get_control(&transfer_id) {
-            // Discard, not cancel: this path deletes the `.part`, so the writer
-            // should drop its handle without fsyncing it first.
-            control.discard();
-        }
-        (manager.cancel(&transfer_id), info)
-    };
-
-    if let Some((file_hash, file_name, file_size)) = cancelled_info {
-        let db = state.db.clone();
-        db_blocking(move || {
-            if let Err(e) =
-                db.record_download_history(&file_hash, &file_name, file_size, "cancelled")
-            {
-                tracing::warn!("Failed to record cancelled download history for {file_hash}: {e}");
-            }
-        })
-        .await;
-    }
-
-    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    let (send_result, dl_roots) = tokio::join!(
-        bounded_send(
-            &state.network_tx,
-            NetworkCommand::CancelDownload {
-                transfer_id: transfer_id.clone(),
-                cleanup_ack: Some(ack_tx),
-            },
-        ),
-        async { state.config.read().await.settings.download_roots() },
-    );
-    // Wait for the network task to confirm it released the file before we
-    // delete the partials. On timeout / closed channel we still proceed
-    // (best-effort cleanup), but log it: deleting while the task may still
-    // hold a handle is the race this ack exists to avoid.
-    //
-    // A send that never landed is reported as itself rather than as a closed
-    // ack channel: the ack sender went out with the undelivered command, so
-    // awaiting it would only mint a misleading "channel closed" line.
-    // `cancel_transfers_batch` already distinguishes the two.
-    if let Err(e) = send_result {
-        tracing::warn!(
-            "cancel_transfer: network task unavailable for {transfer_id}; proceeding with best-effort cleanup ({e})"
-        );
-    } else {
-        match tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(_)) => tracing::warn!(
-                "Cancel cleanup ack channel closed without ack for {transfer_id}; proceeding with best-effort cleanup"
-            ),
-            Err(_) => tracing::warn!(
-                "Timed out waiting for cancel cleanup ack for {transfer_id}; proceeding with best-effort cleanup"
-            ),
-        }
-    }
-    cleanup_partial_files(&state.db, &dl_roots, &transfer_id).await;
-    spawn_deferred_partial_cleanup(state.db.clone(), dl_roots, transfer_id.clone());
-
-    {
-        let db = state.db.clone();
-        let tid = transfer_id.clone();
-        db_blocking(move || {
-            if let Err(e) = db.remove_transfer(&tid) {
-                tracing::warn!("Failed to remove transfer {tid} from database: {e}");
-            }
-        })
-        .await;
-    }
-
-    start_promoted_downloads(&state, &promoted).await;
-    Ok(())
-}
-
-#[tauri::command]
 pub async fn remove_transfer(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
@@ -2410,7 +2327,9 @@ pub async fn remove_transfer(
     // delete the partials (best-effort on timeout/closed channel, but log the
     // race window — deleting while the task may still hold a handle is exactly
     // what this ack exists to avoid). An undelivered command is reported as
-    // itself; see `cancel_transfer`.
+    // itself rather than as a closed ack channel: the ack sender went out with
+    // the undelivered command, so awaiting it would only mint a misleading
+    // "channel closed" line.
     if let Err(e) = send_result {
         tracing::warn!(
             "remove_transfer: network task unavailable for {transfer_id}; proceeding with best-effort cleanup ({e})"
@@ -2813,7 +2732,6 @@ pub async fn set_preview_priority(
 /// the user resumes a transfer concurrently, the resume and the broadcast
 /// pause may interleave; last command wins per transfer. Callers should
 /// debounce in the UI rather than expect a transactional guarantee.
-#[tauri::command]
 pub async fn pause_all_transfers(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -2873,7 +2791,6 @@ pub async fn pause_all_transfers(
     Ok(())
 }
 
-#[tauri::command]
 /// Resume every paused / stopped download. See pause_all_transfers for the
 /// same eventual-consistency caveat.
 pub async fn resume_all_transfers(

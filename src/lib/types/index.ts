@@ -623,16 +623,6 @@ export interface EmberDiagnostics {
   ember_dht_verified_highwater?: number;
 }
 
-/** Result of an `ember_ping_peer` harness round-trip. `rtt_ms` is set
- *  iff `success` is true. The `peerPubkeyHex` argument is optional —
- *  when omitted, the backend resolves the peer's Noise pubkey from
- *  the KAD-fed cache. */
-export interface EmberPingResult {
-  success: boolean;
-  rtt_ms?: number;
-  error?: string;
-}
-
 /** One Ember DHT routing-table contact, as returned by
  *  `get_ember_dht_contacts`. All key/id fields are hex-encoded.
  *  The UI snapshot omits `addr` so peer IPs never reach the webview. */
@@ -671,57 +661,6 @@ export interface EmberDhtStoreEntry {
   record_count: number;
   keyword_records: number;
   source_records: number;
-}
-
-/** Result of a single-hop `ember_dht_find_node`: the contacts a peer
- *  answered with for a target ID, or the reason the lookup failed. */
-export interface EmberDhtFindResult {
-  success: boolean;
-  contacts: EmberDhtContact[];
-  rtt_ms?: number;
-  error?: string;
-}
-
-/** Result of `ember_dht_publish_keyword`: the DHT key the signed record
- *  landed under and how many nodes acknowledged storing it. */
-export interface EmberDhtPublishResult {
-  success: boolean;
-  key: string;
-  stored_on: number;
-  targets: number;
-  error?: string;
-}
-
-/** One signed record returned by `ember_dht_find_value`. Only records
- *  whose publisher signature verified are surfaced. */
-export interface EmberDhtRecordInfo {
-  record_type: number;
-  file_name: string;
-  file_size: number;
-  file_hash: string;
-  publisher: string;
-  timestamp: number;
-}
-
-/** Result of an iterative `ember_dht_find_value`: the verified records
- *  discovered for a keyword, or the reason the lookup failed. */
-export interface EmberDhtFindValueResult {
-  success: boolean;
-  records: EmberDhtRecordInfo[];
-  rtt_ms?: number;
-  error?: string;
-}
-
-/** Result of `ember_dht_run_maintenance` (slice 6): how much work the
- *  forced maintenance cycle kicked off. */
-export interface EmberDhtMaintenanceResult {
-  success: boolean;
-  buckets_refreshed: number;
-  liveness_pings_sent: number;
-  records_republished: number;
-  announces_sent: number;
-  kad_bridge_pings_sent: number;
-  error?: string;
 }
 
 export interface ServerInfo {
@@ -939,8 +878,6 @@ export interface AppSettings {
   download_queue_wait_secs: number;
   /** Extra multi-source retry rounds after initial tasks (1–20) */
   multisource_retry_rounds: number;
-  /** Per-source part hash failure retries during transfer (1–20) */
-  download_part_retry_rounds: number;
   /** Max download size in GiB (1–593; default 593, the ed2k part-count ceiling) */
   max_download_file_size_gib: number;
   /** Global search / find-sources / find-notes timeout in seconds (30–600) */

@@ -355,41 +355,6 @@ pub(super) fn channel_gossip_inbound_ok(
     ember::channel::rate_window_allow(times, now, CHANNEL_GOSSIP_RATE_WINDOW, limit)
 }
 
-/// Handshake-capable send. Channel gossip, transfer, and CHANNEL_RELAY
-/// must not use this: `HandshakeStarted` used to count as delivered and
-/// skip overlay + the WebSocket outbox. DHT lookups still start sessions
-/// through their own `prepare_outgoing` paths.
-#[allow(dead_code)]
-pub(super) async fn send_ember_dht_frame(
-    socket: &UdpSocket,
-    state: &mut NetworkState,
-    contact: &ember::dht::EmberContact,
-    frame: &[u8],
-) -> bool {
-    match state
-        .ember_transport
-        .prepare_outgoing(contact.addr, Some(&contact.noise_pub), frame)
-    {
-        ember::transport::OutgoingResult::Ready { packet }
-        | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-            if let Err(e) = socket.send_to(&packet, contact.addr).await {
-                debug!("Ember channel gossip: send to {} failed: {e}", contact.addr);
-                false
-            } else {
-                true
-            }
-        }
-        ember::transport::OutgoingResult::Queued => true,
-        ember::transport::OutgoingResult::Error(e) => {
-            debug!(
-                "Ember channel gossip: transport error for {}: {e}",
-                contact.addr
-            );
-            false
-        }
-    }
-}
-
 /// Seal and send only if a Noise session for this identity already exists.
 /// Does not start a handshake — `prepare_outgoing` is not called unless
 /// [`ember_has_live_session`] is true, so CHANNEL_RELAY cannot re-seal an

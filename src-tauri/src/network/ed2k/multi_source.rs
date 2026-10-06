@@ -2867,7 +2867,6 @@ impl MultiSourceDownload {
         // 180 KiB block. See `network::ed2k::write_coordinator`.
         let shared_part_file = super::write_coordinator::PartFileWriter::open(
             part_path.clone(),
-            super::write_coordinator::OpenMode::OpenExisting,
             allowed_roots.clone(),
             Some(self.control.discarding_flag()),
         )
@@ -8571,7 +8570,6 @@ async fn download_parts_from_source(
             .unwrap_or_default();
         super::write_coordinator::PartFileWriter::open(
             part_path.to_path_buf(),
-            super::write_coordinator::OpenMode::OpenExisting,
             allowed,
             Some(control.discarding_flag()),
         )
@@ -9711,7 +9709,6 @@ async fn download_parts_from_source(
                                             start: gs,
                                             end: ge,
                                             sender_ip: v4,
-                                            sender_user_hash: Some(peer_user_hash),
                                         })
                                         .await;
                                 }
@@ -9995,7 +9992,6 @@ async fn download_parts_from_source(
                                             start: gs,
                                             end: ge,
                                             sender_ip: v4,
-                                            sender_user_hash: Some(peer_user_hash),
                                         })
                                         .await;
                                 }
@@ -10616,17 +10612,15 @@ async fn download_parts_from_source(
                                     &control,
                                     &part_queue,
                                     peer_supports_large_files,
-                                    file_size,
-                                    blocks_per_packet,
                                     _src_idx,
                                 )
                                 .await
                                 {
-                                    Some(c) => {
-                                        if !part_queue.contains(&c.part_idx) {
-                                            part_queue.push(c.part_idx);
+                                    Some(part_idx) => {
+                                        if !part_queue.contains(&part_idx) {
+                                            part_queue.push(part_idx);
                                         }
-                                        Some(c.part_idx)
+                                        Some(part_idx)
                                     }
                                     None => None,
                                 }
@@ -11863,16 +11857,6 @@ fn remember_injected_source(injected: &mut Vec<DownloadSource>, source: Download
     true
 }
 
-/// One part chosen for pre-pipelining, with its block layout already computed
-/// so a future caller can reuse the work without a second pass.
-#[allow(dead_code)]
-struct PipelineCandidate {
-    part_idx: usize,
-    all_blocks: Vec<(u64, u64)>,
-    batches: Vec<Vec<(u64, u64)>>,
-    needs_i64: bool,
-}
-
 /// Pick the next part to pre-pipeline for this source, applying the
 /// same two-stage selection (strict, then relaxed) as the post-part
 /// dynamic-extend path. Returns `None` when there's nothing useful to
@@ -11886,14 +11870,10 @@ async fn pre_pipeline_next_part_ms(
     control: &Arc<TransferControl>,
     part_queue: &[usize],
     peer_supports_large_files: bool,
-    file_size: u64,
-    // Blocks per request packet for this source's current speed tier, so a
-    // pipelined part is cut to the same width the budget allows.
-    blocks_per_packet: usize,
     // This source's worker index, so the block list is ordered around what the
     // *other* workers have in flight rather than around itself.
     worker: usize,
-) -> Option<PipelineCandidate> {
+) -> Option<usize> {
     let cs = chunk_sel.as_ref()?.read().await;
 
     let (completed, in_prog, remaining, part_count, gap_bytes) = {
@@ -11962,13 +11942,6 @@ async fn pre_pipeline_next_part_ms(
         // now. Caller can re-try on the next iteration.
         return None;
     }
-    let batches: Vec<Vec<(u64, u64)>> = all_blocks
-        .chunks(blocks_per_packet)
-        .map(|c| c.to_vec())
-        .collect();
-    if batches.is_empty() {
-        return None;
-    }
     let needs_large_offsets = all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
     if needs_large_offsets && !peer_supports_large_files {
         // Don't pre-pipeline a part this peer cannot address. The 32-bit
@@ -11976,15 +11949,7 @@ async fn pre_pipeline_next_part_ms(
         // request path refuses such a source outright for the same reason.
         return None;
     }
-    let needs_i64 = needs_large_offsets;
-    let _ = file_size;
-
-    Some(PipelineCandidate {
-        part_idx: next_part,
-        all_blocks,
-        batches,
-        needs_i64,
-    })
+    Some(next_part)
 }
 
 /// Pick the part to assign a freshly arrived source, or `None` when it holds
@@ -13669,7 +13634,7 @@ mod new_connection_window_tests {
 mod unverified_part_sweep_tests {
     use super::*;
     use crate::network::ed2k::hash::PARTSIZE;
-    use crate::network::ed2k::write_coordinator::{OpenMode, PartFileWriter};
+    use crate::network::ed2k::write_coordinator::PartFileWriter;
 
     fn temp_base(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -13705,7 +13670,7 @@ mod unverified_part_sweep_tests {
         .unwrap();
         let path = root.join("file.part");
         std::fs::write(&path, data).unwrap();
-        let output = PartFileWriter::open(path.clone(), OpenMode::OpenExisting, vec![root_s], None)
+        let output = PartFileWriter::open(path.clone(), vec![root_s], None)
             .await
             .unwrap();
 

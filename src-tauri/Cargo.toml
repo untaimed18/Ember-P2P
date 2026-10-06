@@ -178,7 +178,7 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["sync-secret-service"] }
 # D-Bus for the sleep inhibitor (`src/power.rs`) and the tray-host probe
-# (`src/tray_host.rs`). The same crate and major version `notify-rust` already
+# (`src/tray.rs`). The same crate and major version `notify-rust` already
 # links for desktop notifications, so this adds no second D-Bus stack.
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 

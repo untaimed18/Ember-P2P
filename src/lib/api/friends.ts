@@ -154,11 +154,6 @@ export async function getUnreadMessageCounts(): Promise<[string, number][]> {
   return invoke('get_unread_message_counts');
 }
 
-/** Per-friend count of outbound messages still waiting for a session. */
-export async function getPendingChatCounts(): Promise<Record<string, number>> {
-  return invoke('get_pending_chat_counts');
-}
-
 /**
  * Offer one of our shared files to a friend. Sends an invitation only — the
  * friend chooses whether to download it.

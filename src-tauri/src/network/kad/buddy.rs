@@ -235,38 +235,6 @@ impl BuddyManager {
         }
     }
 
-    pub async fn reset(&mut self) {
-        self.state = BuddyState::NoBuddy;
-        self.buddy_id = None;
-        self.buddy_addr = None;
-        self.buddy_udp_port = None;
-        self.last_find_attempt = None;
-        self.find_attempt_count = 0;
-        if let Some(h) = self.buddy_reader_handle.take() {
-            h.abort();
-        }
-        if let Some(w) = self.buddy_writer.take() {
-            w.abort();
-        }
-        self.last_buddy_ping = None;
-        self.buddy_ponged_since_ping = false;
-        self.last_buddy_pong = None;
-        self.buddy_pongs_promptly = false;
-        if let Some(h) = self.serving_reader_handle.take() {
-            h.abort();
-        }
-        if let Some(w) = self.serving_writer.take() {
-            w.abort();
-        }
-        self.serving_buddy_for = None;
-        self.serving_callback_check = None;
-        self.serving_callback_budget = 0;
-        // See `disconnect_buddy` — `.await` the real lock instead of a
-        // best-effort `try_lock()` so this can never skip clearing stale
-        // pending-buddy entries under lock contention.
-        self.pending_buddy_hashes.lock().await.clear();
-    }
-
     pub fn state(&self) -> BuddyState {
         self.state
     }

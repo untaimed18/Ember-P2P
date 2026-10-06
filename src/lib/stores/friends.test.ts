@@ -5,7 +5,6 @@ import {
   cleanupFriendsStore,
   commitFriendsList,
   friendsList,
-  setFriendsList,
 } from './friends';
 import type { FriendInfo } from '$lib/api/friends';
 
@@ -48,14 +47,6 @@ describe('shared friends list ordering', () => {
     const second = beginFriendsListFetch();
     expect(commitFriendsList(second, [friend(B)])).toBe(true);
     expect(get(friendsList).map((f) => f.user_hash)).toEqual([B]);
-  });
-
-  it('lets an authoritative write supersede a fetch still in flight', () => {
-    const inFlight = beginFriendsListFetch();
-    setFriendsList([friend(A)]);
-
-    expect(commitFriendsList(inFlight, [friend(B)])).toBe(false);
-    expect(get(friendsList).map((f) => f.user_hash)).toEqual([A]);
   });
 
   it('starts clean after a teardown so a stale ticket cannot win', () => {

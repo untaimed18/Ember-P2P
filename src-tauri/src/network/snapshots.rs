@@ -120,46 +120,6 @@ pub(super) fn kad_searches_snapshot(state: &NetworkState) -> Vec<KadSearchInfo> 
         .collect()
 }
 
-pub(super) fn routing_peers_snapshot(state: &NetworkState) -> Vec<PeerInfo> {
-    state
-        .routing_table
-        .all_contacts()
-        .take(200)
-        .map(|contact| PeerInfo {
-            id: contact.id.to_hex(),
-            addresses: vec![format!("{}:{}", contact.ip, contact.udp_port)],
-            nickname: state
-                .peer_nicknames
-                .get(&contact.id)
-                .cloned()
-                .unwrap_or_default(),
-            last_seen: contact.last_seen,
-            files_shared: 0,
-            banned: false,
-        })
-        .collect()
-}
-
-pub(super) fn merge_saved_peers(mut peers: Vec<PeerInfo>, saved_peers: Vec<PeerInfo>) -> Vec<PeerInfo> {
-    for saved in saved_peers {
-        if let Some(existing) = peers.iter_mut().find(|peer| peer.id == saved.id) {
-            if !saved.nickname.is_empty() {
-                existing.nickname = saved.nickname;
-            }
-            if !saved.addresses.is_empty() {
-                existing.addresses = saved.addresses;
-            }
-            existing.last_seen = existing.last_seen.max(saved.last_seen);
-            existing.files_shared = existing.files_shared.max(saved.files_shared);
-            existing.banned = saved.banned;
-        } else if saved.banned {
-            peers.push(saved);
-        }
-    }
-
-    peers
-}
-
 /// Map a `IdentState` enum value into the short label the UI displays
 /// in the upload-pane "Queued" / "Known Clients" tabs. Mirrors the
 /// strings eMule itself uses in its "Identification" client-detail

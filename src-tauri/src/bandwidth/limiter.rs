@@ -55,8 +55,6 @@ pub struct BandwidthLimiter {
     upload_debt: AtomicU64,
     total_uploaded: AtomicU64,
     total_downloaded: AtomicU64,
-    upload_speed: AtomicU64,
-    download_speed: AtomicU64,
     smoothed_upload: AtomicU64,
     smoothed_download: AtomicU64,
     /// True while the USS controller is actively managing the effective
@@ -87,8 +85,6 @@ impl BandwidthLimiter {
             upload_debt: AtomicU64::new(0),
             total_uploaded: AtomicU64::new(0),
             total_downloaded: AtomicU64::new(0),
-            upload_speed: AtomicU64::new(0),
-            download_speed: AtomicU64::new(0),
             smoothed_upload: AtomicU64::new(0),
             smoothed_download: AtomicU64::new(0),
             uss_active: AtomicBool::new(false),
@@ -655,25 +651,7 @@ impl BandwidthLimiter {
         self.total_downloaded.load(Ordering::Relaxed)
     }
 
-    /// Per-second upload delta (raw, unsmoothed). Kept as part of the
-    /// limiter's public API for future consumers; `smoothed_upload_speed` is
-    /// what the UI currently reads.
-    #[allow(dead_code)]
-    pub fn upload_speed(&self) -> u64 {
-        self.upload_speed.load(Ordering::Relaxed)
-    }
-
-    /// Per-second download delta (raw, unsmoothed). See `upload_speed`.
-    #[allow(dead_code)]
-    pub fn download_speed(&self) -> u64 {
-        self.download_speed.load(Ordering::Relaxed)
-    }
-
     pub fn update_speeds(&self, uploaded_delta: u64, downloaded_delta: u64) {
-        self.upload_speed.store(uploaded_delta, Ordering::Relaxed);
-        self.download_speed
-            .store(downloaded_delta, Ordering::Relaxed);
-
         let prev_weight = SPEED_SMOOTHING_DENOMINATOR - SPEED_SMOOTHING_NEW;
         let prev_up = self.smoothed_upload.load(Ordering::Relaxed);
         let smoothed_up = uploaded_delta

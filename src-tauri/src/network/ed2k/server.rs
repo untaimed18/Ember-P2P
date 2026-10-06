@@ -1940,12 +1940,6 @@ mod tests {
     }
 
     #[test]
-    fn existing_simple_search_unchanged() {
-        let buf = build_search_request("test");
-        assert_eq!(buf, vec![0x01, 0x04, 0x00, b't', b'e', b's', b't']);
-    }
-
-    #[test]
     fn search_result_extracts_media_rating_and_comment() {
         fn put_str(buf: &mut Vec<u8>, s: &str) {
             buf.extend_from_slice(&(s.len() as u16).to_le_bytes());
@@ -2011,12 +2005,6 @@ const SRVCAP_UNICODE: u32 = 0x0010;
 const SRVCAP_LARGEFILES: u32 = 0x0100;
 const SRVCAP_SUPPORTCRYPT: u32 = 0x0200;
 const SRVCAP_REQUESTCRYPT: u32 = 0x0400;
-// Documented for completeness but intentionally never advertised: stock eMule
-// only sets this when the user enables "require obfuscated server connection"
-// (off by default), and advertising it unconditionally made strict lugdunum
-// servers drop our obfuscated login. See `login()`.
-#[allow(dead_code)]
-const SRVCAP_REQUIRECRYPT: u32 = 0x0800;
 
 const CT_NAME: u8 = 0x01;
 const CT_VERSION: u8 = 0x11;
@@ -2084,67 +2072,44 @@ fn write_uint32_tag(buf: &mut Vec<u8>, name_id: u8, value: u32) {
     buf.extend_from_slice(&value.to_le_bytes());
 }
 
-// The plain single-keyword OP_SEARCHREQUEST payload. Kept because
-// `existing_simple_search_unchanged` pins these bytes: live searches always
-// send the AND-tree form, so nothing outside the tests builds one.
-#[allow(dead_code)]
-fn build_search_request(query: &str) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.push(0x01); // Search type: string
-    let clamped = &query.as_bytes()[..query.len().min(u16::MAX as usize)];
-    buf.extend_from_slice(&(clamped.len() as u16).to_le_bytes());
-    buf.extend_from_slice(clamped);
-    buf
-}
-
 // ---------------------------------------------------------------------------
-// Boolean search tree support (L12)
+// Boolean search tree reference encoder (L12), test builds only
 // ---------------------------------------------------------------------------
 
-// ED2K search comparison operators (SearchFile.h). `write_search_node` emits
-// only the two `_EQUAL` bounds; the rest complete the operator space so a new
-// `SearchExpression` variant does not have to re-derive the numbering from
-// eMule. Dead outside `cargo test` for the reason given on `SearchExpression`.
-#[allow(dead_code)]
-const ED2K_SEARCH_OP_EQUAL: u8 = 0x00;
-#[allow(dead_code)]
-const ED2K_SEARCH_OP_GREATER: u8 = 0x01;
-#[allow(dead_code)]
-const ED2K_SEARCH_OP_LESS: u8 = 0x02;
-#[allow(dead_code)]
+// The two ED2K search comparison operators `write_search_node` emits
+// (SearchFile.h).
+#[cfg(test)]
 const ED2K_SEARCH_OP_GREATER_EQUAL: u8 = 0x03;
-#[allow(dead_code)]
+#[cfg(test)]
 const ED2K_SEARCH_OP_LESS_EQUAL: u8 = 0x04;
-#[allow(dead_code)]
-const ED2K_SEARCH_OP_NOTEQUAL: u8 = 0x05;
 
-// Wire-format node type bytes for the search tree. All read by
-// `write_search_node`, so they are dead only because it is. An operator node
-// is `SEARCH_NODE_OPERATOR` followed by one of the `SEARCH_BOOL_*` bytes.
-#[allow(dead_code)]
+// Wire-format node type bytes for the search tree, read by
+// `write_search_node`. An operator node is `SEARCH_NODE_OPERATOR` followed by
+// one of the `SEARCH_BOOL_*` bytes.
+#[cfg(test)]
 const SEARCH_NODE_OPERATOR: u8 = 0x00;
-#[allow(dead_code)]
+#[cfg(test)]
 const SEARCH_BOOL_AND: u8 = 0x00;
-#[allow(dead_code)]
+#[cfg(test)]
 const SEARCH_BOOL_OR: u8 = 0x01;
-#[allow(dead_code)]
+#[cfg(test)]
 const SEARCH_BOOL_NOT: u8 = 0x02;
-#[allow(dead_code)]
+#[cfg(test)]
 const SEARCH_LEAF_STRING: u8 = 0x01;
-#[allow(dead_code)]
+#[cfg(test)]
 const SEARCH_LEAF_META_STRING: u8 = 0x02;
-#[allow(dead_code)]
+#[cfg(test)]
 const SEARCH_LEAF_META_UINT32: u8 = 0x03;
 
 // Single-byte tag-name IDs used inside search meta constraints. Read only by
 // `write_search_node`, same as the node bytes above.
-#[allow(dead_code)]
+#[cfg(test)]
 const FT_FILESIZE_TAG: u8 = 0x02;
-#[allow(dead_code)]
+#[cfg(test)]
 const FT_FILETYPE_TAG: u8 = 0x03;
-#[allow(dead_code)]
+#[cfg(test)]
 const FT_FILEFORMAT_TAG: u8 = 0x04;
-#[allow(dead_code)]
+#[cfg(test)]
 const FT_SOURCES_TAG: u8 = 0x15;
 
 /// A boolean search expression tree matching eMule's OP_SEARCHREQUEST wire format.
@@ -2153,14 +2118,14 @@ const FT_SOURCES_TAG: u8 = 0x15;
 /// then left subtree, then right subtree).  Leaf nodes encode either a plain
 /// search string or a typed meta-constraint (size, type, extension, sources).
 ///
-/// Nothing in a release build constructs one: live searches serialize through
+/// Test builds only: live searches serialize through
 /// [`crate::network::kad::messages::build_search_expression_with_node`], which
 /// also covers Kad and 64-bit size leaves, and go out via
-/// [`ServerLink::send_search_expr_bytes`]. This tree and its helpers
-/// are kept because the `search_tree_*` tests pin the eD2K search wire format
-/// byte for byte, independently of that shared builder — which is what would
-/// catch the shared builder drifting away from what eD2K servers accept.
-#[allow(dead_code)]
+/// [`ServerLink::send_search_expr_bytes`]. This tree and its helpers let the
+/// `search_tree_*` tests pin the eD2K search wire format byte for byte,
+/// independently of that shared builder — which is what would catch the shared
+/// builder drifting away from what eD2K servers accept.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub enum SearchExpression {
     String(String),
@@ -2178,7 +2143,7 @@ pub enum SearchExpression {
 /// format suitable for use as the payload of an `OP_SEARCHREQUEST` packet.
 ///
 /// Called by the `search_tree_*` tests only — see [`SearchExpression`].
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn build_search_tree(expr: &SearchExpression) -> Vec<u8> {
     let mut buf = Vec::new();
     write_search_node(&mut buf, expr);
@@ -2186,7 +2151,7 @@ pub fn build_search_tree(expr: &SearchExpression) -> Vec<u8> {
 }
 
 // Reached only through `build_search_tree`, and recursively from itself.
-#[allow(dead_code)]
+#[cfg(test)]
 fn write_search_node(buf: &mut Vec<u8>, expr: &SearchExpression) {
     match expr {
         SearchExpression::String(s) => {
@@ -2235,7 +2200,7 @@ fn write_search_node(buf: &mut Vec<u8>, expr: &SearchExpression) {
 /// Find the largest byte index <= max_len that doesn't split a multi-byte UTF-8 codepoint.
 ///
 /// Only `write_search_node` calls it.
-#[allow(dead_code)]
+#[cfg(test)]
 fn truncate_utf8_safe(bytes: &[u8], max_len: usize) -> usize {
     let mut len = max_len.min(bytes.len());
     while len > 0 && (bytes[len - 1] & 0xC0) == 0x80 {
@@ -2260,7 +2225,7 @@ fn truncate_utf8_safe(bytes: &[u8], max_len: usize) -> usize {
 /// Wire format: `0x03 | value(u32 LE) | comparison_op(u8) | tag_name_len(u16 LE) | tag_name`
 ///
 /// Only `write_search_node` calls it.
-#[allow(dead_code)]
+#[cfg(test)]
 fn write_search_meta_uint32(buf: &mut Vec<u8>, value: u32, op: u8, tag_name_id: u8) {
     buf.push(SEARCH_LEAF_META_UINT32);
     buf.extend_from_slice(&value.to_le_bytes());
@@ -2272,7 +2237,7 @@ fn write_search_meta_uint32(buf: &mut Vec<u8>, value: u32, op: u8, tag_name_id: 
 /// Wire format: `0x02 | value_len(u16 LE) | value | tag_name_len(u16 LE) | tag_name`
 ///
 /// Only `write_search_node` calls it.
-#[allow(dead_code)]
+#[cfg(test)]
 fn write_search_meta_string(buf: &mut Vec<u8>, value: &str, tag_name_id: u8) {
     buf.push(SEARCH_LEAF_META_STRING);
     let bytes = value.as_bytes();

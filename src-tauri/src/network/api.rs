@@ -113,9 +113,6 @@ pub enum NetworkCommand {
     BanPeer {
         peer_id_hex: String,
     },
-    UnbanPeer {
-        peer_id_hex: String,
-    },
     FindNotes {
         file_hash: KadId,
         file_size: u64,
@@ -180,7 +177,6 @@ pub enum NetworkCommand {
         block_private: bool,
     },
     KadConnect,
-    KadDisconnect,
     KadBootstrapIp {
         ip: String,
         port: u16,
@@ -210,9 +206,6 @@ pub enum NetworkCommand {
     },
     RecheckFirewall {
         tx: oneshot::Sender<Result<usize, String>>,
-    },
-    GetPeersSnapshot {
-        tx: oneshot::Sender<Vec<PeerInfo>>,
     },
     GetNetworkStatsSnapshot {
         tx: oneshot::Sender<NetworkStats>,
@@ -511,10 +504,6 @@ pub enum NetworkCommand {
     /// showing offline (chat/browse disabled) until a fresh session forms.
     GetOnlineFriends {
         tx: oneshot::Sender<Vec<String>>,
-    },
-    GetPeerReputation {
-        user_hash: [u8; 16],
-        tx: oneshot::Sender<Option<PeerReputationInfo>>,
     },
     /// Reputation for many peers at once, keyed by lowercase hex user hash.
     ///
@@ -869,7 +858,7 @@ pub(super) fn ember_dht_contact_info(
     }
 }
 
-/// Per-peer reputation snapshot. Returned by the `get_peer_reputation`
+/// Per-peer reputation snapshot. Returned by the `get_peer_reputation_batch`
 /// Tauri command so the UI can render a verification / trust badge
 /// next to a peer (upload queue, transfer detail panel, etc.).
 #[derive(Debug, Clone, serde::Serialize)]

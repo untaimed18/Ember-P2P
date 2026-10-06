@@ -1558,9 +1558,6 @@ pub struct AppSettings {
     /// Extra multi-source retry rounds after initial source tasks (default 3)
     #[serde(default = "default_multisource_retry_rounds")]
     pub multisource_retry_rounds: u32,
-    /// Per-source part hash failure retry rounds during data transfer (default 3)
-    #[serde(default = "default_download_part_retry_rounds")]
-    pub download_part_retry_rounds: u32,
     /// Maximum download file size in GiB (1–593; default 593 — the ed2k
     /// part-count ceiling, see `ed2k_download_limits`)
     #[serde(default = "default_max_download_file_size_gib")]
@@ -1908,7 +1905,6 @@ pub struct RuntimeStatus {
 pub struct Ed2kDownloadLimits {
     pub queue_wait_secs: u64,
     pub multisource_retry_rounds: u32,
-    pub part_retry_rounds: u32,
     pub max_download_bytes: u64,
 }
 
@@ -1924,7 +1920,6 @@ impl AppSettings {
         Ed2kDownloadLimits {
             queue_wait_secs: self.download_queue_wait_secs.clamp(60, 14400),
             multisource_retry_rounds: self.multisource_retry_rounds.clamp(1, 20),
-            part_retry_rounds: self.download_part_retry_rounds.clamp(1, 20),
             max_download_bytes,
         }
     }
@@ -2201,10 +2196,6 @@ fn default_multisource_retry_rounds() -> u32 {
     3
 }
 
-fn default_download_part_retry_rounds() -> u32 {
-    3
-}
-
 fn default_max_download_file_size_gib() -> u32 {
     593
 }
@@ -2424,7 +2415,6 @@ impl Default for AppSettings {
             spam_filter_profile: default_spam_filter_profile(),
             download_queue_wait_secs: default_download_queue_wait_secs(),
             multisource_retry_rounds: default_multisource_retry_rounds(),
-            download_part_retry_rounds: default_download_part_retry_rounds(),
             max_download_file_size_gib: default_max_download_file_size_gib(),
             search_timeout_secs: default_search_timeout_secs(),
             save_search_history: true,

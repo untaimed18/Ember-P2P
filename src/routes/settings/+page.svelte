@@ -1323,8 +1323,7 @@
       'max_concurrent_downloads', 'max_concurrent_uploads', 'max_sources_per_file',
       'max_connections', 'max_connections_per_five_secs',
       'download_queue_wait_secs', 'multisource_retry_rounds',
-      'download_part_retry_rounds', 'max_download_file_size_gib',
-      'search_timeout_secs', 'max_friends', 'chat_attachment_auto_accept_mb',
+      'max_download_file_size_gib', 'search_timeout_secs', 'max_friends', 'chat_attachment_auto_accept_mb',
     ] as const;
     const numericValues = s as unknown as Record<string, unknown>;
     for (const key of numericFields) {
@@ -1369,7 +1368,6 @@
     s.max_connections_per_five_secs = ci(s.max_connections_per_five_secs, 0, 500, 20);
     s.download_queue_wait_secs = ci(s.download_queue_wait_secs, 60, 14400, 1800);
     s.multisource_retry_rounds = ci(s.multisource_retry_rounds, 1, 20, 3);
-    s.download_part_retry_rounds = ci(s.download_part_retry_rounds, 1, 20, 3);
     s.max_download_file_size_gib = ci(s.max_download_file_size_gib, 1, 593, 593);
     s.search_timeout_secs = ci(s.search_timeout_secs, 30, 600, 120);
     s.max_friends = ci(s.max_friends, 1, 500, 200);

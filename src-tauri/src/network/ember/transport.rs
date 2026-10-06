@@ -857,7 +857,7 @@ pub struct EmberTransport {
     /// datagram bought ~8192 comparisons on the network event loop.
     ///
     /// Rows may name a digest the map no longer holds ([`Self::forget_handshake`],
-    /// the TTL sweep in [`Self::cleanup`], [`Self::cleanup_all`]), and the same
+    /// the TTL sweep in [`Self::cleanup`]), and the same
     /// digest can appear twice if it is re-inserted after its TTL lapsed. Both
     /// are resolved at pop time by matching `seen_at`, so a stale row can never
     /// evict a fresher entry.
@@ -1272,7 +1272,7 @@ impl EmberTransport {
     }
 
     /// Check if we have an established session with a peer.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn has_session(&self, addr: &SocketAddr) -> bool {
         slots_at(&self.sessions, *addr).next().is_some()
     }
@@ -1758,28 +1758,6 @@ impl EmberTransport {
             self.pending.remove(addr);
         }
         stalled
-    }
-
-    /// Drop every session and pending handshake. Used when the
-    /// `ember_native_enabled` feature flag flips off so a session
-    /// established during an "on" period cannot decrypt later traffic
-    /// when the user re-enables it (different harness session,
-    /// different intent, possibly different peer trust).
-    pub fn cleanup_all(&mut self) {
-        self.sessions.clear();
-        self.staged_sessions.clear();
-        self.pending.clear();
-        self.recent_handshakes.clear();
-        self.recent_handshake_order.clear();
-        self.deferred_ik.clear();
-        // `dialled` deliberately survives. Clearing it alongside the session state
-        // looked tidy and was wrong: the caller does reset its reachability
-        // conclusion here, but the NAT mappings these dials opened outlive the
-        // toggle, which is the whole reason `DIAL_MEMORY` is ten minutes. A user who
-        // turns Ember off and straight back on would otherwise have a peer we
-        // dialled — one the routing table does not hold, which is exactly the
-        // population this map exists for — ping back and be read as a stranger. It
-        // holds no session or cryptographic state, and is TTL-pruned anyway.
     }
 
     /// Drive the Noise state machine for an inbound UDP packet and
@@ -2373,18 +2351,6 @@ impl EmberTransport {
                 break;
             };
             self.deferred_ik.remove(&newest);
-        }
-    }
-
-    #[allow(dead_code)]
-    fn evict_oldest_deferred_ik(&mut self) {
-        if let Some(oldest) = self
-            .deferred_ik
-            .iter()
-            .min_by_key(|(_, d)| d.stored)
-            .map(|(k, _)| *k)
-        {
-            self.deferred_ik.remove(&oldest);
         }
     }
 
@@ -5781,48 +5747,6 @@ mod tests {
         let mut transport = EmberTransport::new(priv_key, pub_key);
         assert_eq!(transport.session_count(), 0);
         transport.cleanup(); // should not panic on empty
-    }
-
-    #[test]
-    fn cleanup_all_drops_active_sessions() {
-        let (alice_priv, alice_pub) = make_keypair();
-        let (bob_priv, bob_pub) = make_keypair();
-
-        let mut alice = EmberTransport::new(alice_priv, alice_pub);
-        let mut bob = EmberTransport::new(bob_priv, bob_pub);
-
-        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
-        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
-
-        // Establish a session via Noise IK so cleanup_all has something
-        // to drop.
-        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"hello") {
-            OutgoingResult::HandshakeStarted { packet } => packet,
-            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
-        };
-        let resp = match bob.process_incoming(&init, alice_addr) {
-            IncomingResult::HandshakeComplete {
-                packets_to_send, ..
-            } => packets_to_send,
-            _ => panic!("expected HandshakeComplete on responder side"),
-        };
-        assert_eq!(resp.len(), 2, "IK message 2 plus the routability probe");
-        match alice.process_incoming(&resp[0], bob_addr) {
-            IncomingResult::HandshakeComplete { .. } => {}
-            _ => panic!("expected HandshakeComplete on initiator side"),
-        }
-
-        assert!(alice.has_session(&bob_addr));
-        assert!(bob.has_session(&alice_addr));
-        assert_eq!(alice.session_count(), 1);
-
-        alice.cleanup_all();
-        bob.cleanup_all();
-
-        assert_eq!(alice.session_count(), 0);
-        assert_eq!(bob.session_count(), 0);
-        assert!(!alice.has_session(&bob_addr));
-        assert!(!bob.has_session(&alice_addr));
     }
 
     /// End-to-end integration test that drives the same code path

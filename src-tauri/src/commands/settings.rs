@@ -877,7 +877,6 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
     changed |= clamp_assign(&mut settings.multisource_retry_rounds, 1, 20);
-    changed |= clamp_assign(&mut settings.download_part_retry_rounds, 1, 20);
     changed |= clamp_assign(&mut settings.max_download_file_size_gib, 1, 593);
     changed |= clamp_assign(&mut settings.search_timeout_secs, 30, 600);
     changed |= clamp_assign(&mut settings.max_friends, 1, 500);
@@ -1230,12 +1229,6 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         return Err(coded(
             "settings_multisource_retry_rounds_invalid",
             "Multi-source retry rounds must be between 1 and 20",
-        ));
-    }
-    if !(1..=20).contains(&settings.download_part_retry_rounds) {
-        return Err(coded(
-            "settings_download_part_retry_rounds_invalid",
-            "Part hash retry rounds must be between 1 and 20",
         ));
     }
     if !(1..=593).contains(&settings.max_download_file_size_gib) {
@@ -2316,27 +2309,6 @@ pub fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
                 e,
             )
         })?;
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
-    crate::commands::chat_window::set_chat_window_visible(&app, true);
-    if let Some(window) = app.get_webview_window("main") {
-        // Unminimize first — `show()` doesn't restore from minimized on
-        // Windows, only from the hidden state. Without this the tray-icon
-        // double-click would be a no-op for users who minimized through
-        // the title-bar instead of closing.
-        let _ = window.unminimize();
-        window.show().map_err(|e| {
-            coded_ctx(
-                "settings_show_window_failed",
-                "Failed to show main window",
-                e,
-            )
-        })?;
-        let _ = window.set_focus();
     }
     Ok(())
 }

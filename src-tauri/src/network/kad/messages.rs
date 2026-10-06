@@ -1156,12 +1156,11 @@ const FT_FILEFORMAT: u8 = 0x04;
 ///   0x01           = String leaf  (u16-len UTF-8 string)
 ///   0x02           = Meta-string  (u16-len value, u16-len tag-name, tag id)
 ///   0x03 / 0x08    = Numeric u32/u64 (value, 1-byte op, u16-len tag-name, tag id)
-// Retained as the canonical flat-keyword builder and wire-format reference
-// (locked down by `search_expr_tests`). The live search path now routes through
+// Test builds only: the flat-keyword form `search_expr_tests` uses to lock down
+// the wire format. The live search path routes through
 // `build_search_expression_with_node` so it can emit boolean keyword trees from
-// the query parser; `network` being a private module makes this otherwise-public
-// helper read as dead code without the allow.
-#[allow(dead_code)]
+// the query parser.
+#[cfg(test)]
 pub fn build_search_expression(keywords: &[String], constraints: &SearchConstraints) -> Vec<u8> {
     fn write_string_leaf(buf: &mut Vec<u8>, s: &str) {
         buf.push(0x01);

@@ -146,7 +146,7 @@ pub struct AppState {
     /// Cached transfer statistics — updated by the network loop.
     pub cached_transfer_stats: Arc<RwLock<TransferStats>>,
     /// Cached shared files list — updated by sharing commands and the network
-    /// loop's background task so `get_shared_files` never contends with
+    /// loop's background task so `get_shared_files_if_changed` never contends with
     /// `local_index` writers (hashing, scanning, stats merge).
     pub cached_shared_files: Arc<RwLock<Vec<FileInfo>>>,
     /// Search spam filter for scoring and marking spam results.
@@ -272,12 +272,6 @@ impl AppState {
         id
     }
 
-    /// Remove a background scan entry once it finishes; does not await.
-    #[allow(dead_code)]
-    pub async fn deregister_background_scan(&self, id: u64) {
-        self.background_scans.write().await.remove(&id);
-    }
-
     /// Await all currently-tracked background scans. Aborts any still running
     /// after a grace period so shutdown can't hang on a frozen hasher.
     ///
@@ -323,28 +317,6 @@ impl AppState {
             for ah in abort_handles {
                 ah.abort();
             }
-        }
-    }
-
-    /// Wait until `scanning_count` reaches zero or `grace` elapses. Used on
-    /// shutdown paths that don't own JoinHandles directly (e.g. the startup
-    /// scan spawned from `tauri::setup`).
-    #[allow(dead_code)]
-    pub async fn wait_scans_idle(&self, grace: std::time::Duration) {
-        let deadline = std::time::Instant::now() + grace;
-        while self
-            .scanning_count
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
-        {
-            if std::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    "scan workers still active after {:?}; continuing shutdown",
-                    grace
-                );
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 }

@@ -5533,12 +5533,6 @@ pub async fn remove_shared_folder(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn get_shared_files(state: tauri::State<'_, AppState>) -> Result<Vec<FileInfo>, String> {
-    let cached = state.cached_shared_files.read().await;
-    Ok(cached.clone())
-}
-
 /// Most hashes one [`library_hashes_among`] call may ask about: a search tab's
 /// results or a clipboard's links, never the whole library.
 const MAX_LIBRARY_HASH_QUERY: usize = 20_000;
@@ -5590,7 +5584,7 @@ pub async fn library_hashes_among(
     })
 }
 
-/// [`get_shared_files`] for a caller that already holds a copy.
+/// The cached library rows, omitted when the caller already holds a copy.
 #[derive(serde::Serialize)]
 pub struct SharedFilesSnapshot {
     /// Changes whenever any row's serialized form does.
@@ -6205,10 +6199,8 @@ pub async fn batch_set_priority(
     Ok(count)
 }
 
-/// Bulk-share many files in a single Tauri call. Returns the count of
-/// files actually flipped to shared (already-shared paths and unknown
-/// paths contribute 0).
-#[tauri::command]
+/// Bulk-share many files. Returns the count of files actually flipped to
+/// shared (already-shared paths and unknown paths contribute 0).
 pub async fn batch_share(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -8045,39 +8037,6 @@ fn withhold_keys(
     changed
 }
 
-/// Put `paths` back on the allowlist of each partly shared folder they sit in.
-/// Discovery walks only what an allowlist names, so a file shared again from
-/// the Library but left off its folder's list would fall out of the index on
-/// the next scan. Returns whether any list changed.
-async fn readmit_to_allowlists(state: &AppState, paths: &[String]) -> Result<bool, String> {
-    let keys = paths
-        .iter()
-        .map(|path| crate::search::index::normalize_path_key(path))
-        .collect::<Vec<_>>();
-    let mut readmitted = false;
-    edit_folder_allowlists(state, |lists| {
-        readmitted = readmit_keys(lists, &keys);
-        readmitted
-    })
-    .await?;
-    Ok(readmitted)
-}
-
-fn readmit_keys(lists: &mut std::collections::HashMap<String, Vec<String>>, keys: &[String]) -> bool {
-    let mut changed = false;
-    for (folder, entries) in lists.iter_mut() {
-        let mut allowed = entries.iter().cloned().collect::<HashSet<_>>();
-        for key in keys {
-            if crate::security::path_within_dir(key, folder) && !allowlist_permits(&allowed, key) {
-                allowed.insert(key.clone());
-                entries.push(key.clone());
-                changed = true;
-            }
-        }
-    }
-    changed
-}
-
 /// Forget the allowlists of `folder` and anything nested under it, and any
 /// entry in an enclosing share's allowlist that offers something inside it.
 /// Used when the whole folder stops being offered, so nothing is left to
@@ -8155,73 +8114,6 @@ fn withhold_under(
         changed = true;
     }
     withhold_keys(allowlists, withheld, keys) || changed
-}
-
-#[tauri::command]
-pub async fn share_file(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    file_path: String,
-) -> Result<(), String> {
-    let offers = crate::sharing::indexer::AllowlistOffers::new(
-        &state.config.read().await.settings.pending_folder_allowlists,
-    );
-    let mutation = {
-        let mut index = state.local_index.write().await;
-        if index.get_by_path(&file_path).is_none() {
-            // Surface a desync instead of silently reporting success: the UI
-            // asked to share a path the backend index doesn't know about.
-            return Err(coded(
-                "sharing_file_not_in_index",
-                "File not found in shared index",
-            ));
-        }
-        if index
-            .get_by_path(&file_path)
-            .is_some_and(|file| file.hash.is_empty())
-        {
-            return Err(coded(
-                "sharing_file_hash_pending",
-                "File is still hashing and cannot be shared individually",
-            ));
-        }
-        // Hash-wide, as every share change is; but a copy withheld by its
-        // own partly shared folder keeps that, as `batch_share` keeps it.
-        // Readmitting every copy put each one on its folder's list, which
-        // the browser and the drop paths only do after a native confirmation.
-        let mut mutation = index.set_file_shared_by_path(&file_path, true);
-        keep_unlisted_copies_unshared(&mut index, &mut mutation, &offers, Some(&file_path));
-        mutation
-    };
-    if mutation.changed_paths > 0 {
-        let readmitted = match readmit_to_allowlists(&state, std::slice::from_ref(&file_path)).await {
-            Ok(readmitted) => readmitted,
-            Err(e) => {
-                revert_share_mutation(&state, &mutation, true).await;
-                return Err(e);
-            }
-        };
-        refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        if let Err(e) = persist_share_mutation(&state, &mutation, true).await {
-            if readmitted {
-                if let Err(undo_error) =
-                    drop_from_allowlists(&state, std::slice::from_ref(&file_path)).await
-                {
-                    warn!("Could not take {file_path} back off its folder's allowlist: {undo_error}");
-                }
-            }
-            return Err(e);
-        }
-        let _ = app.emit(
-            "shared-files-changed",
-            serde_json::json!({ "shared": mutation.changed_paths }),
-        );
-        info!(
-            "Shared {} file path(s) from {}",
-            mutation.changed_paths, file_path
-        );
-    }
-    Ok(())
 }
 
 #[tauri::command]
@@ -9288,22 +9180,7 @@ mod tests {
     }
 
     #[test]
-    fn sharing_a_file_again_puts_it_back_on_its_folders_allowlist() {
-        let sep = std::path::MAIN_SEPARATOR;
-        let folder = crate::search::index::normalize_path_key(&format!("C:{sep}music"));
-        let kept = format!("{folder}{sep}a.mp3");
-        let back = format!("{folder}{sep}b.mp3");
-        let elsewhere = crate::search::index::normalize_path_key(&format!("D:{sep}films{sep}c.mkv"));
-        let mut lists = std::collections::HashMap::new();
-        lists.insert(folder.clone(), vec![kept.clone()]);
-
-        assert!(readmit_keys(&mut lists, &[back.clone(), back.clone(), elsewhere]));
-        assert_eq!(lists[&folder], vec![kept.clone(), back.clone()]);
-        assert!(!readmit_keys(&mut lists, &[kept]), "an entry already on the list is left alone");
-    }
-
-    #[test]
-    fn a_file_unshared_from_a_partial_share_stays_walked_until_shared_again() {
+    fn a_file_unshared_from_a_partial_share_stays_walked() {
         let sep = std::path::MAIN_SEPARATOR;
         let folder = crate::search::index::normalize_path_key(&format!("C:{sep}music"));
         let a = format!("{folder}{sep}a.mp3");
@@ -9323,11 +9200,6 @@ mod tests {
         assert_eq!(withheld, std::collections::HashMap::from([(folder.clone(), vec![a.clone()])]));
         let walked = crate::sharing::indexer::discovery_lists(&lists, &withheld);
         assert!(walked[&folder].contains(&a), "discovery still walks it");
-
-        // Shared again: back on the list, and no longer withheld.
-        assert!(readmit_keys(&mut lists, std::slice::from_ref(&a)));
-        assert!(tidy_withheld(&lists, &mut withheld));
-        assert!(withheld.is_empty());
 
         // A folder that lost its allowlist is shared whole; nothing is withheld.
         withhold_keys(&mut lists, &mut withheld, &HashSet::from([b.clone()]));

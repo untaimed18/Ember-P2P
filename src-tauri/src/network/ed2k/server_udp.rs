@@ -383,42 +383,15 @@ impl ServerUdpSocket {
     /// per category) and under-counting (the previous SourceExchange
     /// estimate was `sources.len() * 10`, missing the packet header
     /// and per-source overhead).
-    /// Backwards-compatible plain-only receive. Used by tests; live
-    /// recv goes through `try_recv_with` so we can attempt UDP
-    /// obfuscation decryption when the first byte ≠ `0xE3`.
-    #[allow(dead_code)]
+    /// Plain-only receive for tests; live recv goes through `try_recv_with`
+    /// so we can attempt UDP obfuscation decryption when the first byte ≠
+    /// `0xE3`.
+    #[cfg(test)]
     pub async fn try_recv(&self) -> Option<(usize, ServerUdpResponse)> {
         match self.try_recv_with(|_ip, _port| None).await {
             ServerUdpRecv::Packet(len, resp) => Some((len, resp)),
             ServerUdpRecv::Skipped | ServerUdpRecv::Drained => None,
         }
-    }
-
-    // `recv_packet` / `process_received` were drafted as building
-    // blocks for an event-driven recv arm but the actual integration
-    // shortened the existing ping timer's interval instead (cleaner
-    // diff against the giant inline dispatch block). Kept as
-    // `#[cfg(test)]`-only helpers below so the API surface is still
-    // tested even though prod uses `try_recv_with` from the timer.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub async fn recv_packet(&self) -> std::io::Result<(Vec<u8>, SocketAddr)> {
-        let mut buf = [0u8; 65536];
-        let (len, addr) = self.socket.recv_from(&mut buf).await?;
-        Ok((buf[..len].to_vec(), addr))
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub fn process_received<F>(
-        data: &[u8],
-        addr: SocketAddr,
-        key_lookup: F,
-    ) -> Option<(usize, ServerUdpResponse)>
-    where
-        F: Fn(Ipv4Addr, u16) -> Option<(u32, u16)>,
-    {
-        decode_server_datagram(data, addr, key_lookup).map(|resp| (data.len(), resp))
     }
 
     /// Same as `try_recv`, plus an opportunity to attempt UDP-server

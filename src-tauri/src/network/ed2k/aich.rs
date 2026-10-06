@@ -32,6 +32,7 @@ pub const MAX_AICH_RECOVERY_BYTES: usize = 256 * 1024;
 /// against 26 — and with it the SHA-1. Routing through [`merkle_root`], which
 /// hardcodes `is_left_branch = true`, therefore disagreed with
 /// [`compute_all_part_hashes`] for roughly half of all parts.
+#[cfg(test)]
 pub fn compute_aich_part(data: &[u8], part_index: usize, num_parts: usize) -> [u8; 20] {
     if data.is_empty() {
         return Sha1::digest([]).into();
@@ -842,17 +843,6 @@ pub async fn part_aich_summary_blocking(
     })
     .await
     .ok()
-}
-
-/// [`compute_aich_part`] on the blocking pool.
-pub async fn compute_aich_part_blocking(
-    part_data: std::sync::Arc<Vec<u8>>,
-    part_index: usize,
-    num_parts: usize,
-) -> Option<[u8; 20]> {
-    tokio::task::spawn_blocking(move || compute_aich_part(&part_data, part_index, num_parts))
-        .await
-        .ok()
 }
 
 /// eMule known2_64.met file format version

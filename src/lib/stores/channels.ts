@@ -582,18 +582,6 @@ function loadIgnored(): IgnoredMember[] {
 
 export const ignoredMembers = writable<IgnoredMember[]>(loadIgnored());
 
-/**
- * Pubkeys ignored everywhere — chat filters and member-row checks still
- * compare hex strings.
- *
- * Global entries only. Callers that know which room they are drawing should
- * use {@link ignoredKeysForChannel} instead, or a member muted in one room
- * would vanish from every other.
- */
-export const ignoredMemberKeys = derived(ignoredMembers, (list) =>
-  list.filter((entry) => entry.rooms === undefined).map((entry) => entry.pubkey),
-);
-
 /** Pubkeys hidden in one room: the global entries plus that room's own. */
 export function ignoredKeysForChannel(
   list: IgnoredMember[],

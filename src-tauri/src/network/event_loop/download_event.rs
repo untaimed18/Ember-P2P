@@ -1204,7 +1204,7 @@ pub(in crate::network) async fn on_download_event(
             }
         }
         if is_user_cancel {
-            // cancel_transfer / CancelDownload already removed the
+            // cancel_transfers_batch / CancelDownload already removed the
             // row and recorded history as "cancelled". Falling
             // through would emit transfer-failed and paint the
             // download bar red for a moment before the UI drops it.

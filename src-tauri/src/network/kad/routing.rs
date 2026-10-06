@@ -816,20 +816,6 @@ impl RoutingZone {
         }
     }
 
-    // K3: retained for future explicit-trust callers (tests, migration
-    // tools) now that the ambient load paths no longer mass-verify.
-    #[allow(dead_code)]
-    fn set_all_contacts_verified(&mut self) {
-        if let Some(bin) = &mut self.bin {
-            for c in &mut bin.contacts {
-                c.verified = true;
-            }
-        } else if let Some(children) = &mut self.children {
-            children.0.set_all_contacts_verified();
-            children.1.set_all_contacts_verified();
-        }
-    }
-
     /// Find the deepest leaf zone containing our own ID (always child[0] since
     /// our XOR distance to ourselves is zero). Returns its level.
     fn deepest_leaf_level(&self) -> u32 {
@@ -1494,16 +1480,6 @@ impl RoutingTable {
         self.len() == 0
     }
 
-    pub fn clear(&mut self) {
-        let now = chrono::Utc::now().timestamp();
-        self.root = RoutingZone::new_leaf(0, KadId::from_u32(0), 0);
-        self.big_timer_global_deadline = now;
-        self.next_zone_event_order = 1;
-        self.global_ip_count.clear();
-        self.global_subnet_count.clear();
-        self.in_use_contacts.clear();
-    }
-
     pub fn get_contact(&self, id: &KadId) -> Option<&KadContact> {
         let distance = self.local_id.xor_distance(id);
         if let Some(bin) = self.root.find_bin(&distance) {
@@ -1543,12 +1519,6 @@ impl RoutingTable {
             }
         }
         None
-    }
-
-    // K3: kept for future explicit-trust callers; see RoutingZone counterpart.
-    #[allow(dead_code)]
-    pub fn set_all_contacts_verified(&mut self) {
-        self.root.set_all_contacts_verified();
     }
 
     /// eMule GetBootstrapContacts -- TopDepth(LOG_BASE_EXPONENT).

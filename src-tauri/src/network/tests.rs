@@ -2280,15 +2280,12 @@ fn the_publish_queue_count_tracks_its_contents() {
     assert_eq!(pub_.queued_count, actual);
     assert_eq!(actual, 12, "four records across three targets");
 
-    pub_.clear();
-    assert_eq!(pub_.queued_count, 0);
-    assert!(pub_.queued.is_empty());
-
     // And the cap actually stops admitting once reached.
-    pub_.queued_count = EMBER_BATCH_QUEUE_MAX;
-    assert!(!pub_.enqueue(&targets, record_ref(2, 0), record));
+    let mut capped = EmberBatchPublisher::default();
+    capped.queued_count = EMBER_BATCH_QUEUE_MAX;
+    assert!(!capped.enqueue(&targets, record_ref(2, 0), record));
     assert!(
-        pub_.queued.is_empty(),
+        capped.queued.is_empty(),
         "the cap must refuse work rather than growing without bound"
     );
 }

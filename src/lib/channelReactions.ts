@@ -65,10 +65,6 @@ export function curatedReaction(code: number): CuratedReaction | undefined {
   return BY_CODE.get(code);
 }
 
-export function isCuratedReaction(code: number): boolean {
-  return BY_CODE.has(code);
-}
-
 /** Names listed before the rest are summed into "and N others". */
 export const REACTORS_NAMED_MAX = 3;
 

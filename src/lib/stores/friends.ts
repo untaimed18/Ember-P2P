@@ -202,13 +202,6 @@ function writeFriendsList(friends: FriendInfo[]): void {
   rememberFriendNames(friends);
 }
 
-/** Authoritative write for the shared list and the name cache together.
- *  Supersedes any fetch still in flight. */
-export function setFriendsList(friends: FriendInfo[]): void {
-  friendsFetchLanded = ++friendsFetchTicket;
-  writeFriendsList(friends);
-}
-
 /** Publish a fetch's result unless a newer one already landed. Returns
  *  whether it was taken, so a caller can skip side effects (closing chat
  *  tabs, say) it would otherwise base on a superseded list. */

@@ -139,10 +139,6 @@ export async function removeSharedFolder(path: string): Promise<void> {
   return invoke('remove_shared_folder', { path });
 }
 
-export async function getSharedFiles(): Promise<FileInfo[]> {
-  return invoke('get_shared_files');
-}
-
 /** The backend's cap on one `library_hashes_among` request. */
 const MAX_LIBRARY_HASH_QUERY = 20_000;
 
@@ -172,7 +168,7 @@ export async function getSharedFilesIfChanged(etag: string | null): Promise<Shar
 /**
  * Count and total size of files the user is actively sharing (the `shared`
  * flag is set), not the total number of files in the library. Lightweight
- * alternative to summing `getSharedFiles()` for the status bar.
+ * enough for the status bar.
  */
 export async function getSharedFileCount(): Promise<{ count: number; total_bytes: number }> {
   return invoke('get_shared_file_count');
@@ -305,16 +301,8 @@ export async function unshareFile(filePath: string, fileHash?: string): Promise<
   return invoke('unshare_file', { filePath, fileHash });
 }
 
-export async function shareFile(filePath: string): Promise<void> {
-  return invoke('share_file', { filePath });
-}
-
 export async function batchSetPriority(filePaths: string[], priority: string): Promise<number> {
   return invoke('batch_set_priority', { filePaths, priority });
-}
-
-export async function batchShare(filePaths: string[]): Promise<number> {
-  return invoke('batch_share', { filePaths });
 }
 
 export async function batchUnshare(filePaths: string[]): Promise<number> {

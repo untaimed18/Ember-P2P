@@ -18,105 +18,8 @@ pub struct CollectionDownloadResult {
     pub failed_count: usize,
 }
 
-#[allow(dead_code)]
-pub async fn load_collection(
-    state: tauri::State<'_, AppState>,
-    path: String,
-) -> Result<Collection, String> {
-    let p = std::path::PathBuf::from(&path);
-    if p.components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(coded(
-            "collections_path_no_parent_dir",
-            "Path must not contain '..' components",
-        ));
-    }
-    let ext = p
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase());
-    if !matches!(ext.as_deref(), Some("emulecollection") | Some("txt")) {
-        return Err(coded(
-            "collections_invalid_file_extension",
-            "File must be a .emulecollection or .txt file",
-        ));
-    }
-    let p2 = p.clone();
-    let canonical = tokio::task::spawn_blocking(move || {
-        if !p2.exists() {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "file does not exist",
-            ))
-        } else {
-            std::fs::canonicalize(&p2)
-        }
-    })
-    .await
-    .map_err(|e| {
-        coded_ctx(
-            "collections_canonicalize_task_failed",
-            "Canonicalize task failed",
-            e,
-        )
-    })?
-    .map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            coded("collections_file_not_found", "File does not exist")
-        } else {
-            coded_ctx("collections_cannot_resolve_path", "Cannot resolve path", e)
-        }
-    })?;
-    let config = state.config.read().await;
-    let download_root = std::path::PathBuf::from(&config.settings.download_folder);
-    let mut allowed_dirs: Vec<String> = config.settings.shared_folders.clone();
-    if !config.settings.download_folder.is_empty() {
-        allowed_dirs.push(download_root.to_string_lossy().into_owned());
-    }
-    drop(config);
-
-    if allowed_dirs.is_empty() {
-        return Err(coded(
-            "collections_no_folders_configured",
-            "No shared or download folders configured",
-        ));
-    }
-    let canonical = crate::security::filesystem::verify_existing_path(&canonical, &allowed_dirs)
-        .map_err(|e| {
-            coded_ctx(
-                "collections_file_outside_allowed_dirs",
-                "Collection file must be inside an unchanged approved root",
-                e,
-            )
-        })?;
-
-    // Cap the on-disk size before `Collection::load` reads the whole file into
-    // memory (`std::fs::read`). `open_collection_file` already enforces this;
-    // the webview-callable `load_collection` path did not, so a multi-GiB file
-    // inside an allowed folder could OOM the client.
-    const MAX_COLLECTION_BYTES: u64 = 32 * 1024 * 1024;
-    let meta = tokio::fs::metadata(&canonical)
-        .await
-        .map_err(|e| coded_ctx("collections_stat_failed", "Cannot stat collection file", e))?;
-    if meta.len() > MAX_COLLECTION_BYTES {
-        return Err(coded(
-            "collections_file_too_large",
-            "Collection file too large (max 32 MiB)",
-        ));
-    }
-
-    tokio::task::spawn_blocking(move || {
-        Collection::load(&canonical)
-            .map_err(|e| coded_ctx("collections_load_failed", "Failed to load collection", e))
-    })
-    .await
-    .map_err(|e| coded_ctx("collections_load_task_failed", "Load task failed", e))?
-}
-
 /// Native picker path for Library. Selecting a file is an explicit user
-/// authorization, so use the same bounded parser as OS file-association opens
-/// instead of the raw IPC command's shared/download-root policy.
+/// authorization, so use the same bounded parser as OS file-association opens.
 #[tauri::command]
 pub async fn pick_and_load_collection(app: tauri::AppHandle) -> Result<Option<Collection>, String> {
     let selected = tokio::task::spawn_blocking(move || {
@@ -142,13 +45,11 @@ pub async fn pick_and_load_collection(app: tauri::AppHandle) -> Result<Option<Co
 }
 
 async fn create_collection_internal(
-    state: &AppState,
     name: String,
     author: String,
     files: Vec<CollectionFile>,
     output_path: String,
     binary: bool,
-    enforce_output_scope: bool,
 ) -> Result<String, String> {
     if name.len() > MAX_COLLECTION_FIELD_LEN {
         return Err(coded_ctx(
@@ -260,37 +161,6 @@ async fn create_collection_internal(
         .map_err(|e| coded_ctx("collections_invalid_output_path", "Invalid output path", e))?
     };
 
-    let mut scoped_dirs: Option<Vec<String>> = None;
-    if enforce_output_scope {
-        let config = state.config.read().await;
-        let mut allowed_dirs: Vec<String> = config.settings.shared_folders.clone();
-        if !config.settings.download_folder.is_empty() {
-            allowed_dirs.push(
-                std::path::PathBuf::from(&config.settings.download_folder)
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
-        drop(config);
-
-        if allowed_dirs.is_empty() {
-            return Err(coded(
-                "collections_no_folders_configured",
-                "No shared or download folders configured",
-            ));
-        }
-        crate::security::filesystem::verify_output_path(&canonical, &allowed_dirs).map_err(
-            |e| {
-                coded_ctx(
-                    "collections_output_outside_allowed_dirs",
-                    "Output path must be inside an unchanged approved root",
-                    e,
-                )
-            },
-        )?;
-        scoped_dirs = Some(allowed_dirs);
-    }
-
     let ext = canonical
         .extension()
         .and_then(|e| e.to_str())
@@ -310,58 +180,10 @@ async fn create_collection_internal(
         } else {
             collection.to_text_bytes().into_bytes()
         };
-        match scoped_dirs {
-            // Scoped export: create the file through a pinned parent-directory
-            // handle rather than by pathname. `verify_output_path` above only
-            // proves the location was inside an approved root *at check time*,
-            // and both the write and `atomic_write`'s own temp file resolve
-            // the parent by name afterwards — so a directory swapped in
-            // between could redirect the export out of the approved tree.
-            // `archive_recovery` and the download-completion path already
-            // write through this helper for the same reason.
-            Some(allowed_dirs) => {
-                use std::io::Write;
-                // Write a sibling temp through the pinned parent handle and
-                // rename it over the target, so the export keeps the
-                // crash-safety the unscoped branch has.
-                //
-                // Deleting the old file first and then creating the new one —
-                // which is what `create_new` seemed to require — meant any
-                // failure after the delete (disk full, permissions changed, a
-                // crash) left the user with no collection file at all. The
-                // rename is the only step that resolves by pathname, and it is
-                // the same step `atomic_write` relies on.
-                let tmp_path = crate::security::unique_tmp_path(&write_path);
-                let (_, mut file) = crate::security::filesystem::create_new_verified_output(
-                    &tmp_path,
-                    &allowed_dirs,
-                )
-                .map_err(|e| {
-                    coded_ctx(
-                        "collections_output_outside_allowed_dirs",
-                        "Output path must be inside an unchanged approved root",
-                        e,
-                    )
-                })?;
-                let mut written = file.write_all(&bytes).and_then(|()| file.sync_all());
-                // Close before renaming: Windows will not replace a file that
-                // still has an open handle on the source.
-                drop(file);
-                if written.is_ok() {
-                    written = std::fs::rename(&tmp_path, &write_path);
-                }
-                if let Err(e) = written {
-                    // Never leave the scratch file behind next to the user's
-                    // collections; the original is still intact either way.
-                    let _ = std::fs::remove_file(&tmp_path);
-                    return Err(coded_ctx("collections_save_failed", "Failed to save", e));
-                }
-            }
-            // Unscoped export (the user picked the destination themselves):
-            // no approved root applies, so keep the crash-safe atomic write.
-            None => crate::security::atomic_write(&write_path, &bytes, false)
-                .map_err(|e| coded_ctx("collections_save_failed", "Failed to save", e))?,
-        }
+        // The user picked the destination themselves, so no approved root
+        // applies; keep the crash-safe atomic write.
+        crate::security::atomic_write(&write_path, &bytes, false)
+            .map_err(|e| coded_ctx("collections_save_failed", "Failed to save", e))?;
         Ok::<_, String>(())
     })
     .await
@@ -372,28 +194,13 @@ async fn create_collection_internal(
     ))
 }
 
-/// Legacy raw-path helper kept for unit tests. Not registered as IPC.
-#[allow(dead_code)]
-pub async fn create_collection(
-    state: tauri::State<'_, AppState>,
-    name: String,
-    author: String,
-    files: Vec<CollectionFile>,
-    output_path: String,
-    binary: bool,
-) -> Result<String, String> {
-    create_collection_internal(&state, name, author, files, output_path, binary, true).await
-}
-
 /// Native save-dialog path for Library exports. Picking the destination in the
-/// OS dialog *is* the user's authorization, so the shared/download-root policy
-/// the raw IPC command above enforces does not apply — mirrors
-/// `pick_and_load_collection`. Restricting it here only broke exports to the
-/// desktop or documents folder.
+/// OS dialog *is* the user's authorization, so no shared/download-root policy
+/// applies — mirrors `pick_and_load_collection`. Restricting it here only broke
+/// exports to the desktop or documents folder.
 #[tauri::command]
 pub async fn create_collection_with_dialog(
     app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
     name: String,
     author: String,
     files: Vec<CollectionFile>,
@@ -425,17 +232,9 @@ pub async fn create_collection_with_dialog(
     let Some(selected) = selected else {
         return Ok(None);
     };
-    create_collection_internal(
-        &state,
-        name,
-        author,
-        files,
-        selected.to_string_lossy().into_owned(),
-        binary,
-        false,
-    )
-    .await
-    .map(Some)
+    create_collection_internal(name, author, files, selected.to_string_lossy().into_owned(), binary)
+        .await
+        .map(Some)
 }
 
 #[tauri::command]

@@ -6,5 +6,3 @@ export const BP_MD = 980;
 export const BP_SM = 760;
 
 export const MQ_MAX_LG = `(max-width: ${BP_LG}px)`;
-export const MQ_MAX_MD = `(max-width: ${BP_MD}px)`;
-export const MQ_MAX_SM = `(max-width: ${BP_SM}px)`;

@@ -1470,18 +1470,6 @@ impl SearchManager {
             .any(|s| s.target == *target && !s.completed)
     }
 
-    /// Expected response contact count for a specific active search
-    /// (eMule GetExpectedResponseContactCount / GetRequestContactCount).
-    /// Returns 0 if the id is missing or already completed.
-    #[allow(dead_code)] // exercised by unit tests; KadRes uses max_accepted_response_count_for
-    pub fn get_expected_response_count(&self, id: &SearchId) -> u8 {
-        self.active
-            .get(id)
-            .filter(|s| !s.completed)
-            .map(|s| s.get_expected_response_count())
-            .unwrap_or(0)
-    }
-
     /// Maximum contacts accepted in a KadRes for the matched search `id`
     /// from `from_id`.
     ///
@@ -2213,21 +2201,16 @@ mod tests {
     }
 
     #[test]
-    fn get_expected_response_count_works_for_keyword_searches() {
+    fn keyword_searches_accept_a_find_value_sized_response() {
         let target = kad_id(5);
         let mut manager = SearchManager::new();
 
         let (sid, ..) = manager.start_search(target, SearchType::FindKeyword, Vec::new());
         assert_ne!(sid, SearchId(0));
 
-        let expected = manager.get_expected_response_count(&sid);
-        assert!(
-            expected > 0,
-            "keyword search must have nonzero expected response count"
-        );
         assert_eq!(
             manager.max_accepted_response_count_for(&sid, None),
-            expected,
+            KADEMLIA_FIND_VALUE,
             "default max accepted must equal GetRequestContactCount"
         );
     }

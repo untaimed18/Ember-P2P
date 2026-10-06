@@ -2862,7 +2862,7 @@ impl Database {
             //
             // Columns on `credits` rather than a side table: they are keyed by
             // the same `user_hash`, they are written and pruned on exactly the
-            // same schedule, and `save_all_credits` replaces the table
+            // same schedule, and `save_all_credits_with_ember` replaces the table
             // wholesale, so a separate table would only add a second thing to
             // keep in step with that replacement.
             let tx = conn.unchecked_transaction()?;
@@ -3813,28 +3813,18 @@ impl Database {
         Ok(())
     }
 
-    pub fn unban_peer(&self, peer_id: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE peers SET banned = 0 WHERE id = ?1",
-            params![peer_id],
-        )?;
-        Ok(())
-    }
-
     /// Record `ip` as one of the addresses belonging to a (banned) peer.
     ///
     /// Used when a live upload session is torn down because its peer was
     /// banned by user-hash: the connecting IP may not have been in the
-    /// routing table or peer DB at ban time, so without this it would not
-    /// be cleared by `unban_peer` (which reverses a ban by walking the
-    /// peer's known addresses). Storing it here makes ban/unban symmetric.
-    /// The port is recorded as 0 (placeholder) — only the IP is ever used
-    /// by the ban/unban paths, and boot-contact loading skips banned peers
-    /// so the placeholder never produces a junk KAD contact. The row is
+    /// routing table or peer DB at ban time, so without this the ban would
+    /// not cover it after a restart (boot rebuilds IP bans from banned
+    /// peers' addresses). The port is recorded as 0 (placeholder) — only the
+    /// IP is ever used by the ban path, and boot-contact loading skips banned
+    /// peers so the placeholder never produces a junk KAD contact. The row is
     /// upserted with `banned = 1` so a peer we only ever saw as an inbound
-    /// uploader still exists for `unban_peer` to flip. Idempotent: an IP
-    /// already present (under any port) is not duplicated.
+    /// uploader still exists. Idempotent: an IP already present (under any
+    /// port) is not duplicated.
     pub fn add_banned_peer_address(
         &self,
         peer_id: &str,
@@ -3900,16 +3890,6 @@ impl Database {
                 now as i64,
                 expires_at.min(i64::MAX as u64) as i64
             ],
-        )?;
-        Ok(())
-    }
-
-    /// Remove an automatic IP ban.
-    pub fn unban_ip(&self, ip: std::net::Ipv4Addr) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM banned_ips WHERE ip = ?1",
-            params![ip.to_string()],
         )?;
         Ok(())
     }
@@ -4416,10 +4396,9 @@ impl Database {
 
     /// Record many cancelled/finished downloads in one transaction.
     ///
-    /// Same reasoning as [`Database::remove_transfers`]: the per-row
-    /// [`Database::record_download_history`] opens its own transaction, so a
-    /// batch cancel paid one fsync per row before it even reached the deletes.
-    /// Rows are `(file_hash, file_name, file_size, status)`.
+    /// Same reasoning as [`Database::remove_transfers`]: a transaction per row
+    /// made a batch cancel pay one fsync per row before it even reached the
+    /// deletes. Rows are `(file_hash, file_name, file_size, status)`.
     pub fn record_download_history_batch(
         &self,
         rows: &[(String, String, u64, &str)],
@@ -5056,74 +5035,13 @@ impl Database {
         Ok(())
     }
 
-    /// Persist the full credit ledger as a single atomic replacement.
-    /// The previous implementation only ran `INSERT OR REPLACE` per row,
-    /// which meant rows pruned in memory by `CreditManager::cleanup_stale`
-    /// were left behind in the database. On the next launch the loader
-    /// would resurrect those stale rows and the in-memory eviction
-    /// would have to run again — visible as a Known Clients tab that
-    /// kept showing months-old "Unknown" peers across restarts even
-    /// after the periodic pruner had supposedly cleaned them up.
-    ///
-    /// `DELETE FROM credits` followed by the INSERTs inside one
-    /// transaction guarantees the table mirrors the in-memory snapshot
-    /// exactly. SQLite's transaction guarantees that either the whole
-    /// replacement lands or nothing changes, so a crash mid-flush won't
-    /// leave the table empty.
-    // Retained as a focused, unit-tested building block (full-replacement
-    // semantics); production flushes go through `save_credit_changes` and
-    // `sync_all_credits_with_ember`.
-    #[allow(dead_code)]
-    pub fn save_all_credits(&self, credits: &[CreditRowRef<'_>]) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM credits", [])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash, crypto_verified_once, peer_name, client_software, seen_ip) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
-            )?;
-            for (
-                hash,
-                uploaded,
-                downloaded,
-                last_seen,
-                public_key,
-                ident_ip,
-                ident_state,
-                ember_hash,
-                crypto_verified_once,
-                peer_name,
-                client_software,
-                seen_ip,
-            ) in credits
-            {
-                stmt.execute(params![
-                    &hash[..],
-                    i64::try_from(*uploaded).unwrap_or(i64::MAX),
-                    i64::try_from(*downloaded).unwrap_or(i64::MAX),
-                    *last_seen,
-                    *public_key,
-                    i64::from(*ident_ip),
-                    i64::from(*ident_state),
-                    ember_hash.map(|eh| eh.as_slice()),
-                    i64::from(*crypto_verified_once),
-                    *peer_name,
-                    *client_software,
-                    i64::from(*seen_ip),
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Load persisted Ember credit records. Returns raw field tuples so
     /// the caller can rehydrate `EmberCreditRecord` without this layer
     /// depending on the credit types — same pattern as
     /// `load_credits`.
     ///
     /// Field order matches the v15 schema and the
-    /// `save_all_ember_credits` INSERT statement: pubkey, uploaded,
+    /// `save_all_credits_with_ember` INSERT statement: pubkey, uploaded,
     /// downloaded, last_upload_time, last_download_time,
     /// completed_sessions, total_sessions, avg_upload_speed, last_seen,
     /// ident_verified.
@@ -5181,66 +5099,14 @@ impl Database {
         Ok(records)
     }
 
-    /// Full-replacement save for the Ember credit table — same
-    /// contract as `save_all_credits`: DELETE followed by INSERT
-    /// inside one transaction so on-disk state matches the
-    /// in-memory `CreditManager.ember_credits` snapshot exactly. A
-    /// crash mid-flush leaves the pre-save rows intact thanks to
-    /// SQLite's all-or-nothing transaction guarantee.
-    #[allow(clippy::type_complexity, dead_code)]
-    pub fn save_all_ember_credits(
-        &self,
-        credits: &[(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)],
-    ) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM ember_credits", [])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO ember_credits (\
-                    pub_key, uploaded, downloaded, last_upload_time, last_download_time, \
-                    completed_sessions, total_sessions, avg_upload_speed, last_seen, ident_verified\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )?;
-            for (
-                pk,
-                up,
-                down,
-                last_up,
-                last_down,
-                completed,
-                total,
-                avg_speed,
-                last_seen,
-                verified,
-            ) in credits
-            {
-                stmt.execute(params![
-                    &pk[..],
-                    i64::try_from(*up).unwrap_or(i64::MAX),
-                    i64::try_from(*down).unwrap_or(i64::MAX),
-                    *last_up,
-                    *last_down,
-                    i64::from(*completed),
-                    i64::from(*total),
-                    i64::try_from(*avg_speed).unwrap_or(i64::MAX),
-                    *last_seen,
-                    i64::from(*verified),
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Full-replacement save of BOTH credit tables inside a SINGLE
     /// transaction, so the `credits` and `ember_credits` tables can never
-    /// diverge across a crash or a partial failure. The previous code ran
-    /// `save_all_credits` and `save_all_ember_credits` as two independent
-    /// committed transactions back-to-back; if the second failed (or the
-    /// process died between them) the two tables ended up inconsistent
-    /// despite a comment claiming "either both land or neither". Both
-    /// DELETE+INSERT pairs now share one `tx`, restoring that guarantee.
+    /// diverge across a crash or a partial failure: both DELETE+INSERT pairs
+    /// share one `tx`.
+    ///
+    /// A replacement rather than per-row `INSERT OR REPLACE`, so rows pruned
+    /// in memory by `CreditManager::cleanup_stale` do not survive on disk and
+    /// get resurrected by the loader on the next launch.
     #[allow(clippy::type_complexity)]
     pub fn save_all_credits_with_ember(
         &self,
@@ -7052,8 +6918,8 @@ impl Database {
         Ok(matched)
     }
 
-    /// Count of outbound messages still queued, per friend. Drives the
-    /// "unsent" affordance in the chat dock.
+    /// Count of outbound messages still queued, per friend.
+    #[cfg(test)]
     pub fn pending_chat_counts(&self) -> anyhow::Result<Vec<(String, i64)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
@@ -12249,24 +12115,8 @@ impl Database {
         }
     }
 
-    /// Record a completed or cancelled download in history.
-    pub fn record_download_history(
-        &self,
-        file_hash: &str,
-        file_name: &str,
-        file_size: u64,
-        status: &str,
-    ) -> anyhow::Result<()> {
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
-        Self::record_download_history_in(&tx, file_hash, file_name, file_size, status)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// The history insert itself, so a caller that is already inside a
-    /// transaction (see [`Database::complete_transfer`]) can include it rather
-    /// than opening a second one.
+    /// Record a completed or cancelled download in history, inside a
+    /// transaction the caller already holds (see [`Database::complete_transfer`]).
     fn record_download_history_in(
         conn: &rusqlite::Connection,
         file_hash: &str,
@@ -13542,27 +13392,30 @@ mod tests {
         assert_eq!(blocked[0].1, "Mallory");
     }
 
-    /// Regression: `save_all_credits` MUST act as a full replacement so
-    /// records pruned in memory by `CreditManager::cleanup_stale` are
-    /// also dropped from the persisted table. Before this was a bare
-    /// `INSERT OR REPLACE`, the database accumulated stale rows
-    /// indefinitely — visible as a Known Clients tab that kept showing
-    /// months-old peers across restarts even though the in-memory
-    /// pruner was running on the periodic timer.
+    /// Regression: `save_all_credits_with_ember` MUST act as a full
+    /// replacement so records pruned in memory by
+    /// `CreditManager::cleanup_stale` are also dropped from the persisted
+    /// table. Before this was a bare `INSERT OR REPLACE`, the database
+    /// accumulated stale rows indefinitely — visible as a Known Clients tab
+    /// that kept showing months-old peers across restarts even though the
+    /// in-memory pruner was running on the periodic timer.
     #[test]
     fn save_all_credits_is_a_full_replacement() {
-        let db = credits_only_db();
+        let (db, path) = migrated_credits_db("replace");
         let h1 = [0x01u8; 16];
         let h2 = [0x02u8; 16];
         let h3 = [0x03u8; 16];
         let pk: &[u8] = &[0xAA; 4];
 
         // Seed three records.
-        db.save_all_credits(&[
-            (&h1, 100, 200, 1_700_000_000, pk, 0, 0, None, false, "", "", 0),
-            (&h2, 300, 400, 1_700_000_001, pk, 0x0102_0304, 1, None, true, "", "", 0),
-            (&h3, 500, 600, 1_700_000_002, pk, 0, 0, None, false, "", "", 0),
-        ])
+        db.save_all_credits_with_ember(
+            &[
+                (&h1, 100, 200, 1_700_000_000, pk, 0, 0, None, false, "", "", 0),
+                (&h2, 300, 400, 1_700_000_001, pk, 0x0102_0304, 1, None, true, "", "", 0),
+                (&h3, 500, 600, 1_700_000_002, pk, 0, 0, None, false, "", "", 0),
+            ],
+            &[],
+        )
         .expect("seed");
         let loaded = db.load_credits().expect("reload after seed");
         assert_eq!(loaded.len(), 3, "seed must persist three records");
@@ -13570,8 +13423,11 @@ mod tests {
         // Re-save with only one of the three. The other two represent
         // stale records the in-memory pruner has just dropped — they
         // must NOT survive in the database.
-        db.save_all_credits(&[(&h2, 999, 888, 1_700_000_999, pk, 0x0102_0304, 1, None, true, "Nia", "eMule 0.60a", 0x0506_0708)])
-            .expect("replace");
+        db.save_all_credits_with_ember(
+            &[(&h2, 999, 888, 1_700_000_999, pk, 0x0102_0304, 1, None, true, "Nia", "eMule 0.60a", 0x0506_0708)],
+            &[],
+        )
+        .expect("replace");
         let after = db.load_credits().expect("reload after replace");
         assert_eq!(after.len(), 1, "stale records must not persist");
         assert_eq!(after[0].0, h2);
@@ -13593,6 +13449,7 @@ mod tests {
             "client_software must persist"
         );
         assert_eq!(after[0].11, 0x0506_0708, "seen_ip must persist");
+        remove_db_files(db, &path);
     }
 
     /// Saving an empty slice must clear every existing row — the only
@@ -13600,14 +13457,15 @@ mod tests {
     /// that has to actually empty the table.
     #[test]
     fn save_all_credits_with_empty_input_clears_table() {
-        let db = credits_only_db();
+        let (db, path) = migrated_credits_db("empty");
         let h1 = [0x01u8; 16];
-        db.save_all_credits(&[(&h1, 1, 1, 0, &[], 0, 0, None, false, "", "", 0)])
+        db.save_all_credits_with_ember(&[(&h1, 1, 1, 0, &[], 0, 0, None, false, "", "", 0)], &[])
             .expect("seed");
         assert_eq!(db.load_credits().expect("reload").len(), 1);
 
-        db.save_all_credits(&[]).expect("empty save");
+        db.save_all_credits_with_ember(&[], &[]).expect("empty save");
         assert!(db.load_credits().expect("reload empty").is_empty());
+        remove_db_files(db, &path);
     }
 
     /// Opened through the real migrations, so the `ON CONFLICT` targets are
@@ -13799,17 +13657,20 @@ mod tests {
     /// after any restart.
     #[test]
     fn crypto_verified_anchor_round_trips() {
-        let db = credits_only_db();
+        let (db, path) = migrated_credits_db("anchor");
         let anchored = [0x11u8; 16];
         let fresh = [0x22u8; 16];
         let pk: &[u8] = &[0xAA; 4];
 
-        db.save_all_credits(&[
-            (&anchored, 10, 20, 1_700_000_000, pk, 0, 1, None, true, "", "", 0),
-            // Persisted `Failed` (2) with no anchor: exactly the state a
-            // stranger can force by failing one challenge under this hash.
-            (&fresh, 30, 40, 1_700_000_001, pk, 0, 2, None, false, "", "", 0),
-        ])
+        db.save_all_credits_with_ember(
+            &[
+                (&anchored, 10, 20, 1_700_000_000, pk, 0, 1, None, true, "", "", 0),
+                // Persisted `Failed` (2) with no anchor: exactly the state a
+                // stranger can force by failing one challenge under this hash.
+                (&fresh, 30, 40, 1_700_000_001, pk, 0, 2, None, false, "", "", 0),
+            ],
+            &[],
+        )
         .expect("seed");
 
         let loaded = db.load_credits().expect("reload");
@@ -13825,6 +13686,7 @@ mod tests {
             !anchor_of(fresh),
             "an unanchored record must not gain an anchor from its ident_state"
         );
+        remove_db_files(db, &path);
     }
 
     /// In-memory `Database` with just the `banned_ips` table for
@@ -13849,13 +13711,11 @@ mod tests {
     }
 
     #[test]
-    fn banned_ip_roundtrip_and_unban() {
+    fn banned_ip_roundtrip() {
         let db = banned_ips_db();
         let ip: std::net::Ipv4Addr = "203.0.113.7".parse().unwrap();
         db.ban_ip(ip, "test", 0).expect("ban");
         assert_eq!(db.get_banned_ips().expect("load"), vec![ip]);
-        db.unban_ip(ip).expect("unban");
-        assert!(db.get_banned_ips().expect("load after unban").is_empty());
     }
 
     #[test]
