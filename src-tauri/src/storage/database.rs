@@ -7637,9 +7637,14 @@ impl Database {
         // standing, the handoff loop kept publishing and then completed it,
         // which created the successor room — in the room list, walked into —
         // on a device whose user had just destroyed the room it came from.
+        // The room's keys go too. `deleted` and `is_owner` are all the refusal
+        // reads; the owner seed and join secret left behind could still sign
+        // for the room and mint invites to it, with nothing able to remove
+        // them later, since `forget_channel` refuses a row we own.
         let n = tx.execute(
             "UPDATE channels SET in_room = 0, deleted = 1,
-                 pending_successor = '', pending_handoff_version = 0
+                 pending_successor = '', pending_handoff_version = 0,
+                 owner_seed = NULL, join_secret = NULL, topic = '', welcome = ''
              WHERE channel_id = ?1",
             params![channel_id],
         )?;
@@ -12012,6 +12017,26 @@ impl Database {
         } else {
             ChannelEditOutcome::Applied(id)
         })
+    }
+
+    /// When one member's current reaction to a line was made, if they have one
+    /// stored (a withdrawn one counts: it carries the time that keeps a stale
+    /// frame from reasserting it).
+    pub fn channel_reaction_stamp(
+        &self,
+        channel_id: &str,
+        msg_id: &str,
+        member_pubkey: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock();
+        Ok(conn
+            .query_row(
+                "SELECT reacted_at FROM channel_message_reactions
+                 WHERE channel_id = ?1 AND msg_id = ?2 AND member_pubkey = ?3",
+                params![channel_id, msg_id, member_pubkey.to_ascii_lowercase()],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// Record one member's reaction to one line, newest claim winning.
@@ -17845,6 +17870,12 @@ mod tests {
         let gone = db.get_channel(&channel_id).unwrap().unwrap();
         assert!(!gone.in_room);
         assert!(gone.deleted);
+        assert!(gone.is_owner, "the refusal still knows it was ours");
+        assert!(
+            db.load_channel_owner_seed(&channel_id).unwrap().is_none(),
+            "a destroyed room keeps no key that could still sign for it"
+        );
+        assert!(db.load_channel_join_secret(&channel_id).unwrap().is_none());
         assert!(
             !db.set_channel_in_room(&channel_id, true).unwrap(),
             "a tombstoned room cannot be re-entered on this device"

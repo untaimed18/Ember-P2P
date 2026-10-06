@@ -1056,6 +1056,16 @@ pub(super) async fn handle_inbound_channel_gossip(
             debug!("Ember channel gossip: rate-limited history sync in {channel_id_hex}");
             return;
         }
+        // And a ceiling per room whoever asks. The budget above is keyed on a
+        // key the asker picks, so a stream of fresh keys each got a full one,
+        // and every answer is up to forty frames charged to the relay
+        // allowance all of our rooms share. Any other member can answer the
+        // same request, so one refused here is not left without history.
+        if !channel_history_replies_ok(gossip.channel_id) {
+            forget_channel_gossip(state, &gossip.msg_id);
+            debug!("Ember channel gossip: history sync replies for {channel_id_hex} at the room ceiling");
+            return;
+        }
         reply_channel_history_sync(
             socket,
             state,
@@ -1466,6 +1476,16 @@ pub(super) async fn apply_channel_handoff_offer(
     handoff_offers_seen()
         .lock()
         .note(gossip.channel_id, target_pk, version, now);
+    // The offer's signature does not cover the envelope it travels in, so one
+    // captured offer can be re-sealed without limit for the hour it stays
+    // live. Each copy used to be relayed room-wide and, on the nominee, to
+    // re-mint and flood both readies as the nominee's own traffic. Once a
+    // minute per offer is plenty for an owner repeating one whose ready was
+    // lost, and no use to a replay.
+    if !handoff_offer_echo_due(gossip.channel_id, version, now) {
+        debug!("Ember channel handoff: offer v{version} for {} already answered", ch.channel_id);
+        return;
+    }
     // Behind the room's newest key, we are behind the snapshot that announced
     // it too — the one carrying the ban that rotated it. The successor starts
     // from our copy of the ban list, so answering now could carry into it the
@@ -1647,6 +1667,60 @@ async fn apply_room_friend_request(
 /// Live ownership offers seen flooding each room, for deciding which readies
 /// to relay. Held beside the event loop's state rather than in it because only
 /// the handoff handlers read it.
+/// Catch-up requests one room may have answered by this node per minute, from
+/// all askers together. Honest catch-up is one request per member every few
+/// minutes, so this is only reached by a burst of rejoins or by a flood.
+const CHANNEL_HISTORY_REPLIES_PER_ROOM_PER_MIN: usize = 12;
+
+fn channel_history_replies_ok(channel_id: [u8; 16]) -> bool {
+    static REPLIES: std::sync::OnceLock<
+        parking_lot::Mutex<HashMap<[u8; 16], std::collections::VecDeque<std::time::Instant>>>,
+    > = std::sync::OnceLock::new();
+    let mut replies = REPLIES.get_or_init(Default::default).lock();
+    let now = std::time::Instant::now();
+    // Only rooms this device is in get this far, so the map is as small as the
+    // room list; the sweep just stops it keeping rooms long since quiet.
+    replies.retain(|_, times| {
+        times
+            .back()
+            .is_some_and(|last| now.saturating_duration_since(*last) < std::time::Duration::from_secs(120))
+    });
+    ember::channel::rate_window_allow(
+        replies.entry(channel_id).or_default(),
+        now,
+        std::time::Duration::from_secs(60),
+        CHANNEL_HISTORY_REPLIES_PER_ROOM_PER_MIN,
+    )
+}
+
+/// Least time between two copies of one offer that this node acts on.
+const HANDOFF_OFFER_ECHO_SECS: i64 = 60;
+/// Offers tracked at once; past it the one acted on longest ago goes.
+const HANDOFF_OFFER_ECHO_CAP: usize = 256;
+
+/// Whether a copy of the offer for `version` in `channel_id` should be acted
+/// on now: the first, or the first a minute after the last. Records it if so.
+fn handoff_offer_echo_due(channel_id: [u8; 16], version: u64, now: i64) -> bool {
+    static ECHOES: std::sync::OnceLock<parking_lot::Mutex<HashMap<([u8; 16], u64), i64>>> =
+        std::sync::OnceLock::new();
+    let mut echoes = ECHOES.get_or_init(Default::default).lock();
+    let key = (channel_id, version);
+    if let Some(last) = echoes.get(&key) {
+        if now.saturating_sub(*last) < HANDOFF_OFFER_ECHO_SECS {
+            return false;
+        }
+    } else if echoes.len() >= HANDOFF_OFFER_ECHO_CAP {
+        echoes.retain(|_, last| now.saturating_sub(*last) < ember::channel::HANDOFF_PENDING_TTL_SECS);
+        if echoes.len() >= HANDOFF_OFFER_ECHO_CAP {
+            if let Some(oldest) = echoes.iter().min_by_key(|(_, last)| **last).map(|(k, _)| *k) {
+                echoes.remove(&oldest);
+            }
+        }
+    }
+    echoes.insert(key, now);
+    true
+}
+
 fn handoff_offers_seen() -> &'static parking_lot::Mutex<ember::channel::HandoffOffersSeen> {
     static SEEN: std::sync::OnceLock<parking_lot::Mutex<ember::channel::HandoffOffersSeen>> =
         std::sync::OnceLock::new();
@@ -2488,7 +2562,8 @@ pub(super) async fn send_channel_typing(
 /// about it. Relayed on the same terms as chat: refused for rate or for a banned
 /// author, forwarded otherwise, and forwarded even when *we* refuse to apply it —
 /// our window closing is a fact about this device's clock, not about the frame,
-/// and a neighbour who was away may still legitimately accept it.
+/// and a neighbour who was away may still legitimately accept it. Not forwarded
+/// when it is forged or a revision we already hold.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_inbound_channel_edit(
     socket: &UdpSocket,
@@ -2531,6 +2606,13 @@ pub(super) async fn handle_inbound_channel_edit(
     }
     let target_hex = hex::encode(edit.target_msg_id);
     let now = chrono::Utc::now().timestamp();
+    // Passed on unless the frame is no news to anyone: a revision we already
+    // hold is a replay (the signature does not cover the envelope id, so one
+    // captured edit can be re-sealed without limit, each copy spending its
+    // author's budget on every hop), and one its author did not sign is
+    // forged. Our own clock or our own delete refusing it is still no reason
+    // to keep it from a neighbour.
+    let mut relay = true;
     match db.apply_channel_message_edit(
         channel_id_hex,
         &target_hex,
@@ -2589,11 +2671,19 @@ pub(super) async fn handle_inbound_channel_edit(
             );
         }
         Ok(outcome) => {
+            relay = !matches!(
+                outcome,
+                crate::storage::database::ChannelEditOutcome::NotNewer
+                    | crate::storage::database::ChannelEditOutcome::NotAuthor
+            );
             debug!("Ember channel edit in {channel_id_hex} not applied: {outcome:?}");
         }
         Err(error) => {
             debug!("Ember channel edit in {channel_id_hex} failed: {error}");
         }
+    }
+    if !relay {
+        return;
     }
     if let Some(next) = gossip.decremented_ttl() {
         fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
@@ -2678,9 +2768,16 @@ pub(super) async fn handle_inbound_channel_reactions(
             "ember:channel-reactions",
             serde_json::json!({ "channel_id": channel_id_hex }),
         );
-    }
-    if let Some(next) = gossip.decremented_ttl() {
-        fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+        // Passed on only when it told us something. The decoder drops entries
+        // whose signature fails and still returns the batch, so relaying
+        // regardless let a frame of garbage, needing no key at all in a public
+        // room, spread room-wide and use up every node's relay allowance; and a
+        // reaction captured and re-sealed under a fresh envelope id travelled as
+        // far as the original did. Whoever sent us a real one has already
+        // reached the rest of the room with it.
+        if let Some(next) = gossip.decremented_ttl() {
+            fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+        }
     }
 }
 

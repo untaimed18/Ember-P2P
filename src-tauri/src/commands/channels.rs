@@ -78,6 +78,9 @@ const LOCAL_SEND_PER_MINUTE: usize = 20;
 /// with the character cap: an invite carrying a longer name is one older
 /// builds refuse to parse.
 const MAX_CHANNEL_NAME: usize = 64;
+/// How far ahead of the clock a reaction may be stamped to stay newer than the
+/// one it replaces. Well inside what `gossip_timestamp_ok` lets through.
+const REACTION_MAX_LEAD_SECS: i64 = 30;
 const MAX_CHANNEL_MESSAGE: usize = 4096;
 const DEFAULT_FIND_TIMEOUT_MS: u64 = 30_000;
 /// Tombstone directory is a hint, not membership. The HTTP client can sit
@@ -370,7 +373,13 @@ async fn require_ember(state: &AppState) -> Result<(), String> {
 
 fn sanitize_channel_name(name: &str) -> Result<String, String> {
     let cleaned = crate::security::sanitize_display_name(name);
-    if cleaned.is_empty() || cleaned == "Anonymous" && name.trim().is_empty() {
+    // Against the raw name, not `cleaned`: sanitising stands "Anonymous" in for
+    // a name with nothing visible in it, so one typed entirely in zero-width or
+    // direction marks would otherwise claim a room called "Anonymous".
+    let visible = name.chars().any(|c| {
+        !c.is_whitespace() && !c.is_control() && !crate::security::is_invisible_or_bidi_control_pub(c)
+    });
+    if cleaned.is_empty() || !visible {
         return Err(coded(
             "channels_name_invalid",
             "Channel name must not be empty",
@@ -684,7 +693,11 @@ async fn record_self_member(
 async fn discard_partial_channel(state: &AppState, channel_id: &str) {
     let db = state.db.clone();
     let id = channel_id.to_string();
-    let outcome = tokio::task::spawn_blocking(move || db.delete_channel(&id, None)).await;
+    // As `forget_channel` does: a ban on us that a forget kept must survive a
+    // rejoin that failed half way, or the next attempt walks straight back in.
+    let our_pubkey = hex::encode(state.identity.ed25519_public_key);
+    let outcome =
+        tokio::task::spawn_blocking(move || db.delete_channel(&id, Some(&our_pubkey))).await;
     let failure = match outcome {
         Ok(Ok(_)) => return,
         Ok(Err(e)) => e.to_string(),
@@ -1022,16 +1035,16 @@ pub async fn join_channel(
             "That is not a valid ember-channel invite",
         )
     })?;
-    let name = if invite.name.is_empty() {
-        let id_hex = hex::encode(invite.channel_id);
-        id_hex[..8].to_string()
+    // A room named before this cap existed, or by a peer that never had it,
+    // is trimmed to the same length rather than refused — the name is theirs
+    // to choose, ours only to draw. One with nothing visible in it is drawn
+    // like no name at all.
+    let name = sanitize_channel_name(&invite.name)
+        .unwrap_or_else(|_| crate::security::sanitize_remote_text(&invite.name, MAX_CHANNEL_NAME_CHARS));
+    let name = if name.is_empty() {
+        hex::encode(invite.channel_id)[..8].to_string()
     } else {
-        // A room named before this cap existed, or by a peer that never had it,
-        // is trimmed to the same length rather than refused — the name is
-        // theirs to choose, ours only to draw.
-        sanitize_channel_name(&invite.name).unwrap_or_else(|_| {
-            crate::security::sanitize_remote_text(&invite.name, MAX_CHANNEL_NAME_CHARS)
-        })
+        name
     };
     let channel_id_hex = hex::encode(invite.channel_id);
 
@@ -1495,6 +1508,11 @@ pub async fn get_channel_invite(
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("channels_invite_failed", "Failed to load invite", e))?
         .ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
+    // A destroyed room's row only remains to refuse a way back in, and handing
+    // out an invite to it is exactly that.
+    if row.deleted {
+        return Err(coded("channels_not_found", "Channel not found"));
+    }
     // Same gate as sending and attaching. A banned member still holds retired
     // epoch secrets, so without this they could keep handing out invites that
     // read nothing and look to the recipient like a broken room.
@@ -2019,7 +2037,25 @@ pub async fn set_channel_message_reaction(
         ));
     }
     let msg_id_bytes = parse_msg_id(&target.msg_id)?;
-    let reacted_at = chrono::Utc::now().timestamp();
+    // Strictly after the reaction it replaces. Newest wins and a tie keeps the
+    // stored one, so two picks inside one second used to keep the first here
+    // while the second was flooded with the same stamp: members who saw that
+    // one first kept it, and the room's tallies disagreed for good.
+    let db = state.db.clone();
+    let (id_for_stamp, msg_for_stamp) = (channel_id.clone(), target.msg_id.clone());
+    let member_for_stamp = hex::encode(state.identity.ed25519_public_key);
+    let previous = tokio::task::spawn_blocking(move || {
+        db.channel_reaction_stamp(&id_for_stamp, &msg_for_stamp, &member_for_stamp)
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_reaction_failed", "Failed to load reaction", e))?;
+    let now = chrono::Utc::now().timestamp();
+    let reacted_at = previous.map_or(now, |prev| now.max(prev.saturating_add(1)));
+    // Far enough ahead that the room's future-date check could refuse it.
+    if reacted_at > now + REACTION_MAX_LEAD_SECS {
+        return Err(coded("channels_reaction_failed", "Reacting too quickly"));
+    }
     let sig = channel::reaction_signature(
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
         &member_pk,
@@ -2041,7 +2077,7 @@ pub async fn set_channel_message_reaction(
     let msg_id_for_write = target.msg_id.clone();
     let member_hex = hex::encode(member_pk);
     let sig_hex = hex::encode(sig);
-    tokio::task::spawn_blocking(move || {
+    let stored = tokio::task::spawn_blocking(move || {
         db.set_channel_message_reaction(
             &id_for_write,
             &msg_id_for_write,
@@ -2054,6 +2090,11 @@ pub async fn set_channel_message_reaction(
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_reaction_failed", "Failed to save reaction", e))?;
+    // Another of our devices got a later one in between. Flooding this one
+    // would tell the room something this device does not hold.
+    if !stored {
+        return Err(coded("channels_reaction_failed", "A newer reaction is already stored"));
+    }
 
     let plain = channel::encode_channel_reactions(&[channel::ChannelReaction {
         target_msg_id: msg_id_bytes,
@@ -2501,10 +2542,16 @@ pub async fn set_channel_draft(
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.save_channel_draft(&channel_id, &text))
-        .await
-        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-        .map_err(|e| coded_ctx("channels_messages_failed", "Failed to save draft", e))
+    tokio::task::spawn_blocking(move || {
+        // A save still on its way when the room was forgotten would otherwise
+        // leave a draft behind that nothing ever deletes.
+        let present = db.get_channel(&channel_id)?.is_some_and(|row| !row.deleted);
+        let text = if present { text } else { String::new() };
+        db.save_channel_draft(&channel_id, &text)
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_messages_failed", "Failed to save draft", e))
 }
 
 struct OwnedChannel {
@@ -2528,6 +2575,13 @@ async fn load_owned_channel(
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load channel", e))?;
     let row = row.ok_or_else(|| coded("channels_not_found", "Channel not found"))?;
+    // A room the owner destroyed keeps its row only so it cannot be walked
+    // back into. Every owner tool would otherwise still sign for it: a fresh
+    // moderation record, a new room key, a directory entry putting it back in
+    // Discover.
+    if row.deleted {
+        return Err(coded("channels_not_found", "Channel not found"));
+    }
     // Deliberately no ban check: everything below requires ownership, and
     // `self_banned_from` exempts an owner, so a ban here could only ever be a
     // moderator's gossip or a stale row locking the owner out of the very
@@ -4405,6 +4459,7 @@ pub async fn add_channel_moderator(
     let owned = load_owned_channel(&state, &channel_id).await?;
     let mut bans = load_banned_pubkeys(&state, &channel_id).await?;
     let mut mods = load_moderator_pubkeys(&state, &channel_id).await?;
+    let was_banned = bans.contains(&pk);
     bans.retain(|existing| existing != &pk);
     if !mods.contains(&pk) {
         if mods.len() >= CHANNEL_MOD_LIST_MAX {
@@ -4425,6 +4480,12 @@ pub async fn add_channel_moderator(
         &mods,
     )
     .await?;
+    // Appointing lifts a ban, so it owes what lifting one does: the ban may
+    // have rotated the key past them, and without it the new moderator sits
+    // "key behind", unable to post, until the next routine reseal.
+    if was_banned {
+        reseal_current_epoch_to_member(&state, &owned, pk).await?;
+    }
     Ok(())
 }
 
@@ -6159,6 +6220,17 @@ mod tests {
         // Three bytes a character: the record's byte ceiling binds first.
         assert!(sanitize_channel_name(&"房".repeat(21)).is_ok());
         assert!(sanitize_channel_name(&"房".repeat(22)).is_err());
+    }
+
+    /// Nothing visible is no name, rather than the "Anonymous" sanitising
+    /// stands in for it.
+    #[test]
+    fn a_room_name_of_invisible_characters_is_refused() {
+        for name in ["", "   ", "\u{200B}", "\u{202E}\u{200D}", " \u{2066} "] {
+            assert!(sanitize_channel_name(name).is_err(), "{name:?}");
+        }
+        assert_eq!(sanitize_channel_name(" \u{200B}Lobby ").unwrap(), "Lobby");
+        assert_eq!(sanitize_channel_name("Anonymous").unwrap(), "Anonymous");
     }
 
     /// Discover names come from whoever published the record, which is the one

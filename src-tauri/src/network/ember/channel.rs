@@ -2842,8 +2842,8 @@ pub fn typing_send_allow(
 /// Admit one inbound typing frame from `author` in `channel_id`, or refuse it.
 ///
 /// Its own map rather than the chat budget's: sharing it would let a member's
-/// typing spend the allowance their next line needs. Same refuse-when-full rule
-/// as [`author_gossip_allow`], for the same reason.
+/// typing spend the allowance their next line needs. Bounded the same way as
+/// [`author_gossip_allow`].
 pub fn typing_recv_allow(
     seen: &mut HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>>,
     channel_id: [u8; 16],
@@ -2851,9 +2851,7 @@ pub fn typing_recv_allow(
     now: Instant,
 ) -> bool {
     let key = (channel_id, *author);
-    if seen.len() >= CHANNEL_GOSSIP_AUTHOR_CAP && !seen.contains_key(&key) {
-        return false;
-    }
+    make_room_in_rate_map(seen, &key, CHANNEL_GOSSIP_AUTHOR_CAP);
     rate_window_allow(
         seen.entry(key).or_default(),
         now,
@@ -4116,14 +4114,38 @@ pub fn rate_window_allow(
     true
 }
 
+/// Make a slot for `key` in a full per-author rate map by dropping the pair
+/// heard from longest ago.
+///
+/// The map is shared by every room, and it used to refuse anyone new once it
+/// was full. Throwaway keys cost nothing to make, so a handful of frames
+/// naming a few hundred of them shut every member this device was not already
+/// tracking out of every room, private ones included, for as long as the
+/// stream kept up. Dropping the stalest entry keeps the same bound on size and
+/// costs its owner only the rest of a short window; the newcomer is tracked
+/// from here on, so nothing is admitted untracked.
+fn make_room_in_rate_map<K: Eq + std::hash::Hash + Copy>(
+    seen: &mut HashMap<K, VecDeque<Instant>>,
+    key: &K,
+    cap: usize,
+) {
+    if seen.len() < cap || seen.contains_key(key) {
+        return;
+    }
+    // An empty window sorts first, being the one with nothing left to lose.
+    let stalest = seen
+        .iter()
+        .min_by_key(|(_, times)| times.back().copied())
+        .map(|(k, _)| *k);
+    if let Some(stalest) = stalest {
+        seen.remove(&stalest);
+    }
+}
+
 /// Admit one chat message from `author` in `channel_id`, or refuse it as a
 /// flood. Keyed on the room as well as the author so a member who is noisy in
-/// one room is not throttled in another.
-///
-/// Refuses outright once `CHANNEL_GOSSIP_AUTHOR_CAP` other pairs are tracked:
-/// the map is the only thing standing between a stream of invented authors and
-/// unbounded growth, and an admitted-but-untracked message would let exactly
-/// that stream past.
+/// one room is not throttled in another. Bounded at
+/// `CHANNEL_GOSSIP_AUTHOR_CAP` pairs; see [`make_room_in_rate_map`].
 pub fn author_gossip_allow(
     seen: &mut HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>>,
     channel_id: [u8; 16],
@@ -4131,9 +4153,7 @@ pub fn author_gossip_allow(
     now: Instant,
 ) -> bool {
     let key = (channel_id, *author);
-    if seen.len() >= CHANNEL_GOSSIP_AUTHOR_CAP && !seen.contains_key(&key) {
-        return false;
-    }
+    make_room_in_rate_map(seen, &key, CHANNEL_GOSSIP_AUTHOR_CAP);
     let times = seen.entry(key).or_default();
     rate_window_allow(
         times,
@@ -4148,9 +4168,8 @@ pub fn author_gossip_allow(
 /// Deliberately its own budget rather than sharing the chat one. Answering a
 /// catch-up is the most expensive thing an unproven peer can ask us to do, and
 /// the honest rate is one request per room every few minutes, so the two are
-/// nowhere near each other. Shares the cap and the refuse-when-full rule with
-/// [`author_gossip_allow`] for the same reason: an untracked requester waved
-/// through is exactly the stream of invented identities the cap exists to stop.
+/// nowhere near each other. Shares the cap and the way a full map makes room
+/// with [`author_gossip_allow`].
 pub fn history_sync_allow(
     seen: &mut HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>>,
     channel_id: [u8; 16],
@@ -4158,9 +4177,7 @@ pub fn history_sync_allow(
     now: Instant,
 ) -> bool {
     let key = (channel_id, *author);
-    if seen.len() >= CHANNEL_GOSSIP_AUTHOR_CAP && !seen.contains_key(&key) {
-        return false;
-    }
+    make_room_in_rate_map(seen, &key, CHANNEL_GOSSIP_AUTHOR_CAP);
     let times = seen.entry(key).or_default();
     rate_window_allow(
         times,
@@ -5995,27 +6012,34 @@ mod tests {
         assert_eq!(order.len(), before);
     }
 
-    /// Once the map is full an unknown author must be refused, not admitted
-    /// untracked — otherwise a stream of invented authors walks straight past
-    /// the limit that is meant to stop it.
+    /// A map full of invented authors must not shut a real one out, and must
+    /// not grow past its cap or let the newcomer through untracked.
     #[test]
-    fn a_full_author_map_refuses_newcomers_rather_than_forgetting_them() {
+    fn a_full_author_map_makes_room_by_dropping_the_stalest() {
         let mut seen = HashMap::new();
         let room = [0x07u8; 16];
+        let t0 = Instant::now();
         for i in 0..CHANNEL_GOSSIP_AUTHOR_CAP {
             let mut author = [0u8; 32];
             author[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            assert!(author_gossip_allow(&mut seen, room, &author, Instant::now()));
+            assert!(author_gossip_allow(&mut seen, room, &author, t0 + Duration::from_millis(i as u64)));
         }
         assert_eq!(seen.len(), CHANNEL_GOSSIP_AUTHOR_CAP);
+        let later = t0 + Duration::from_secs(5);
+        let real = [0xFFu8; 32];
         assert!(
-            !author_gossip_allow(&mut seen, room, &[0xFFu8; 32], Instant::now()),
-            "the map is full, so an untracked author is refused"
+            author_gossip_allow(&mut seen, room, &real, later),
+            "a newcomer is admitted even with the map full"
         );
-        assert_eq!(
-            seen.len(),
-            CHANNEL_GOSSIP_AUTHOR_CAP,
-            "and refusing does not grow the map"
+        assert_eq!(seen.len(), CHANNEL_GOSSIP_AUTHOR_CAP, "without the map growing");
+        assert!(seen.contains_key(&(room, real)), "and is tracked from then on");
+        assert!(!seen.contains_key(&(room, [0u8; 32])), "the oldest entry gave up its slot");
+        for _ in 1..CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC {
+            assert!(author_gossip_allow(&mut seen, room, &real, later));
+        }
+        assert!(
+            !author_gossip_allow(&mut seen, room, &real, later),
+            "and is held to the same rate as anyone"
         );
     }
 
@@ -7816,14 +7840,15 @@ mod tests {
             assert!(author_gossip_allow(&mut chat, room, &ada, t0));
         }
 
-        // A full map refuses a newcomer rather than growing.
+        // A full map makes room for a newcomer rather than growing.
         let mut full: HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>> = HashMap::new();
         for i in 0..CHANNEL_GOSSIP_AUTHOR_CAP {
             let mut author = [0u8; 32];
             author[..8].copy_from_slice(&(i as u64).to_le_bytes());
             assert!(typing_recv_allow(&mut full, room, &author, t0));
         }
-        assert!(!typing_recv_allow(&mut full, room, &[0xFFu8; 32], t0));
+        assert!(typing_recv_allow(&mut full, room, &[0xFFu8; 32], t0));
+        assert_eq!(full.len(), CHANNEL_GOSSIP_AUTHOR_CAP);
         prune_rate_windows(&mut full, later + Duration::from_secs(60), Duration::from_secs(60));
         assert!(full.is_empty());
         assert!(typing_recv_allow(&mut full, room, &[0xFFu8; 32], later));

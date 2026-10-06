@@ -1368,6 +1368,11 @@ export async function initChannelsStore() {
           refreshChannels()
             .catch(() => {})
             .then(() => {
+              // Turned off meanwhile, or the fetch failed and the room is still
+              // not here: no row means no name, and naming it "Channels" is the
+              // very thing waiting was for.
+              if (myEpoch !== storeEpoch) return;
+              if (!get(channels).some((channel) => channel.channel_id === channelId)) return;
               const mentionsMe = receivedMentionsMe(channelId, message, sender, replyToMe);
               if (mentionsMe) noteUnreadMention(channelId);
               maybeToastChannelMessage(channelId, message, sender, mentionsMe, sentAt);

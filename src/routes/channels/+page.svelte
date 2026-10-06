@@ -1537,9 +1537,11 @@
       // them. `refreshChannels` rather than `loadChannels`: we select the new
       // room explicitly below, so the latter's roster fetch for whatever was
       // previously open would be thrown away.
+      // The room exists from here on. A refresh that fails must not read as a
+      // failed create, which sent people to make it a second time.
       const [copied] = await Promise.all([
         copyToClipboard(invite.uri),
-        refreshChannels(),
+        refreshChannels().catch((e) => console.warn('refreshChannels after create failed:', e)),
       ]);
       await selectChannel(invite.channel_id);
       if (copied) {
@@ -1582,7 +1584,7 @@
         item.channel_id === joined.channel_id ? { ...item, joined: joined.in_room } : item,
       );
       upsertChannel(joined);
-      void refreshChannels();
+      void refreshChannels().catch(() => {});
       await selectChannel(joined.channel_id);
     } catch (e) {
       error = translateError(e, m.error_operation_failed());
@@ -1618,7 +1620,7 @@
       clearDraft(`ch:${id}`);
       setPendingReply(id, null);
       forgetChannelFavourite(id);
-      void refreshChannels();
+      void refreshChannels().catch(() => {});
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
       // The optimistic walk-out has to come back too, not just the row.
@@ -1727,7 +1729,7 @@
         item.channel_id === joined.channel_id ? { ...item, joined: joined.in_room } : item,
       );
       upsertChannel(joined);
-      void refreshChannels();
+      void refreshChannels().catch(() => {});
       await selectChannel(joined.channel_id);
     } catch (e) {
       error = translateError(e, m.error_operation_failed());
@@ -1756,16 +1758,20 @@
     // successful delete even if the following refresh throws — otherwise
     // Discover would resurrect the room.
     hideChannel(id);
-    forgetChannelNotifyLevel(id);
-    forgetChannelFavourite(id);
-    forgetChannelIgnores(id);
     let deleted = false;
     try {
       if (storedChannelIds.has(id)) await forgetChannel(id);
       deleted = true;
+      // Only once it is really gone: a forget that failed brings the room
+      // back, and it has to come back muted and ignoring whom it did.
+      forgetChannelNotifyLevel(id);
+      forgetChannelFavourite(id);
+      forgetChannelIgnores(id);
       clearDraft(`ch:${id}`);
       setPendingReply(id, null);
-      await refreshChannels();
+      // The room is gone either way; a list that failed to reload is not a
+      // failed forget, and saying so invited a second attempt.
+      await refreshChannels().catch((e) => console.warn('refreshChannels after forget failed:', e));
     } catch (e) {
       if (!deleted) unhideChannel(id);
       toastError(translateError(e, m.error_operation_failed()));
@@ -1796,7 +1802,7 @@
       await tick();
       clearDraft(`ch:${id}`);
       setPendingReply(id, null);
-      await refreshChannels();
+      await refreshChannels().catch((e) => console.warn('refreshChannels after delete failed:', e));
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -1827,7 +1833,9 @@
     try {
       const updated = await updateChannelModeration(id, editTopic, editWelcome);
       replaceChannel(updated);
-      editingModeration = false;
+      // The form is the selected room's; if that has changed, the room now on
+      // screen still has its own edit open.
+      if (selectedId === id) editingModeration = false;
       toastSuccess(m.channels_moderation_saved());
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -1844,7 +1852,7 @@
     try {
       const updated = await renameChannel(id, name);
       replaceChannel(updated);
-      renameDraft = updated.name;
+      if (selectedId === id) renameDraft = updated.name;
       toastSuccess(m.channels_rename_saved());
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -1975,19 +1983,28 @@
     return m.channels_slow_mode_seconds({ count: secs });
   }
 
-  async function handleSlowMode(secs: number) {
+  /** Whether it was saved. A refused choice has to be put back on the select
+   *  by its caller: the value it is drawn from never changed, so Svelte has
+   *  nothing to write and the refused option stayed showing. */
+  async function handleSlowMode(secs: number): Promise<boolean> {
     const id = selectedId;
-    if (!id || savingSlowMode) return;
+    if (!id || savingSlowMode) return false;
     savingSlowMode = true;
     try {
       replaceChannel(await setChannelSlowMode(id, secs));
+      return true;
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
-      // The select reads off the row, so a refresh is what puts it back.
       await refreshChannels().catch(() => {});
+      return false;
     } finally {
       savingSlowMode = false;
     }
+  }
+
+  /** Put a select back on the value it is drawn from after a refused change. */
+  function restoreSelect(el: HTMLSelectElement, value: string) {
+    el.value = value;
   }
 
   async function handleInvitePolicy(ownerOnly: boolean) {
@@ -2033,7 +2050,7 @@
       await transferChannelOwnership(id, target.member_pubkey);
       transferSent = { ...transferSent, [id]: target.member_pubkey };
       toastSuccess(m.channels_transfer_started());
-      await refreshChannels();
+      await refreshChannels().catch((e) => console.warn('refreshChannels after transfer failed:', e));
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -2042,23 +2059,26 @@
     }
   }
 
-  async function handleNominee(memberPubkey: string, days = DEFAULT_CLAIM_DAYS) {
+  /** Whether it was saved; see `handleSlowMode`. */
+  async function handleNominee(memberPubkey: string, days = DEFAULT_CLAIM_DAYS): Promise<boolean> {
     const id = selectedId;
     // Takes the gate it was already setting. Writing `savingModeration` without
     // checking it meant two of these could overlap, and whichever finished first
     // cleared the flag the other was still relying on — re-enabling every
     // moderation control while a write was in flight.
-    if (!id || moderationBusy) return;
+    if (!id || moderationBusy) return false;
     savingModeration = true;
     try {
       await setChannelSuccessorNominee(id, memberPubkey || null, memberPubkey ? days : null);
-      toastSuccess(m.channels_succession_saved());
-      await refreshChannels();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
+      return false;
     } finally {
       savingModeration = false;
     }
+    toastSuccess(m.channels_succession_saved());
+    await refreshChannels().catch((e) => console.warn('refreshChannels after nominee failed:', e));
+    return true;
   }
 
   async function handleClaim() {
@@ -2068,7 +2088,7 @@
     try {
       const successor = await claimChannelOwnership(id);
       toastSuccess(m.channels_claimed());
-      await refreshChannels();
+      await refreshChannels().catch((e) => console.warn('refreshChannels after claim failed:', e));
       await selectChannel(successor.channel_id);
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -3837,7 +3857,12 @@
             aria-label={m.channels_slow_mode_title()}
             disabled={savingSlowMode}
             value={String(selected.slow_mode_secs)}
-            onchange={(e) => void handleSlowMode(Number(e.currentTarget.value))}
+            onchange={(e) => {
+              const el = e.currentTarget;
+              void handleSlowMode(Number(el.value)).then((saved) => {
+                if (!saved && selected) restoreSelect(el, String(selected.slow_mode_secs));
+              });
+            }}
           >
             {#each SLOW_MODE_CHOICES as choice (choice)}
               <option value={String(choice)}>{slowModeLabel(choice)}</option>
@@ -3874,7 +3899,12 @@
             <select
               disabled={moderationBusy}
               value={selected.successor_nominee}
-              onchange={(e) => handleNominee(e.currentTarget.value)}
+              onchange={(e) => {
+                const el = e.currentTarget;
+                void handleNominee(el.value).then((saved) => {
+                  if (!saved && selected) restoreSelect(el, selected.successor_nominee);
+                });
+              }}
             >
               <option value="">{m.channels_succession_none()}</option>
               {#each sortedMembers as mem (mem.member_pubkey)}
@@ -3893,8 +3923,12 @@
                 aria-label={m.channels_succession_wait()}
                 disabled={moderationBusy}
                 value={String(selected.claim_after_days)}
-                onchange={(e) =>
-                  handleNominee(selected.successor_nominee, Number(e.currentTarget.value))}
+                onchange={(e) => {
+                  const el = e.currentTarget;
+                  void handleNominee(selected.successor_nominee, Number(el.value)).then((saved) => {
+                    if (!saved && selected) restoreSelect(el, String(selected.claim_after_days));
+                  });
+                }}
               >
                 {#each CLAIM_WINDOWS as days (days)}
                   <option value={String(days)}>{m.channels_succession_days({ days })}</option>

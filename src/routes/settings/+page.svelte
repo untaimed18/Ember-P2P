@@ -32,6 +32,7 @@
     hiddenChannels,
     ignoredMembers,
     channelNotifyLevels,
+    channelSnoozes,
     setChannelNotifyLevel,
     toggleMemberIgnore,
     unhideChannel,
@@ -4945,7 +4946,13 @@
   message={m.settings_channels_clear_muted_message()}
   confirmLabel={m.settings_channels_clear()}
   danger={true}
-  onconfirm={() => { channelNotifyLevels.set({}); showSaveMsg(m.settings_channels_cleared(), false, 2000); }}
+  onconfirm={() => {
+    // A snooze is the same silence for a while; leaving it would keep rooms
+    // quiet that this list, and the user, now believe are back to normal.
+    channelNotifyLevels.set({});
+    channelSnoozes.set({});
+    showSaveMsg(m.settings_channels_cleared(), false, 2000);
+  }}
 />
 
 <ConfirmDialog
