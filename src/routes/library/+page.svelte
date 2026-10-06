@@ -2123,6 +2123,43 @@
   let ctxCopySub = $state(false);
   let ctxSendSub = $state(false);
   let ctxWebSub = $state(false);
+
+  // Hover intent for the submenus that open on hover. The path from a parent
+  // item to its submenu crosses the gap beside the item and often clips a
+  // neighbouring item, or the file list when the menu sits near an edge.
+  // Closing on the first `mouseleave` snapped the submenu shut on the way to
+  // it, so leaving waits a moment, reaching the submenu (a child of the item,
+  // so it re-enters the item) cancels that, and brushing past another parent
+  // item only switches to it if the pointer stays there.
+  type HoverSub = 'priority' | 'copy' | 'send';
+  const CTX_SUB_INTENT_MS = 300;
+  let ctxSubTimer: ReturnType<typeof setTimeout> | undefined;
+  function openHoverSub(which: HoverSub | null) {
+    clearTimeout(ctxSubTimer);
+    ctxPrioritySub = which === 'priority';
+    ctxCopySub = which === 'copy';
+    if (which === 'send' && !ctxSendSub) void loadSendableFriends();
+    ctxSendSub = which === 'send';
+    if (which) ctxWebSub = false;
+  }
+  function enterHoverSub(which: HoverSub) {
+    clearTimeout(ctxSubTimer);
+    const open: HoverSub | null = ctxPrioritySub ? 'priority' : ctxCopySub ? 'copy' : ctxSendSub ? 'send' : null;
+    if (open === null || open === which) openHoverSub(which);
+    else ctxSubTimer = setTimeout(() => openHoverSub(which), CTX_SUB_INTENT_MS);
+  }
+  function leaveHoverSub() {
+    clearTimeout(ctxSubTimer);
+    ctxSubTimer = setTimeout(() => openHoverSub(null), CTX_SUB_INTENT_MS);
+  }
+  /** A click on a parent item opens its submenu. Without stopping it here the
+   *  click reached the document handler and dismissed the whole menu. Clicks
+   *  on the submenu's own items are left alone: they run their action. */
+  function clickHoverSub(e: MouseEvent, which: HoverSub) {
+    if (e.target instanceof Element && e.target.closest('.ctx-submenu')) return;
+    e.stopPropagation();
+    openHoverSub(which);
+  }
   // Empty until settings load, so the submenu shows its "configure in Settings"
   // hint rather than a stale list.
   let webServices = $derived($appSettings?.web_services ?? []);
@@ -2161,6 +2198,7 @@
 
   function onCtx(e: MouseEvent, f: FileInfo) {
     e.preventDefault();
+    clearTimeout(ctxSubTimer);
     ctxPrioritySub = false;
     ctxCopySub = false;
     ctxSendSub = false;
@@ -2179,6 +2217,7 @@
     void tick().then(() => ctxMenuItems(ctxMenuEl)[0]?.focus());
   }
   function closeCtx() {
+    clearTimeout(ctxSubTimer);
     ctxMenu = null;
     ctxPrioritySub = false;
     ctxCopySub = false;
@@ -2224,6 +2263,7 @@
       if (!parentItem) return false;
       e.preventDefault();
       parentItem.focus();
+      clearTimeout(ctxSubTimer);
       ctxPrioritySub = false;
       ctxCopySub = false;
       ctxSendSub = false;
@@ -4493,9 +4533,10 @@
         tabindex="0"
         aria-haspopup="menu"
         aria-expanded={ctxPrioritySub}
-        onmouseenter={() => ctxPrioritySub = true}
-        onmouseleave={() => ctxPrioritySub = false}
-        onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') ctxPrioritySub = true; }}
+        onmouseenter={() => enterHoverSub('priority')}
+        onmouseleave={leaveHoverSub}
+        onclick={(e) => clickHoverSub(e, 'priority')}
+        onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') openHoverSub('priority'); }}
       >
         {m.library_col_priority()}
         <span class="ctx-hint">{priorityLabel(ctxMenu.file.priority)}</span>
@@ -4526,9 +4567,10 @@
         tabindex="0"
         aria-haspopup="menu"
         aria-expanded={ctxCopySub}
-        onmouseenter={() => ctxCopySub = true}
-        onmouseleave={() => ctxCopySub = false}
-        onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') ctxCopySub = true; }}
+        onmouseenter={() => enterHoverSub('copy')}
+        onmouseleave={leaveHoverSub}
+        onclick={(e) => clickHoverSub(e, 'copy')}
+        onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') openHoverSub('copy'); }}
       >
         {m.servers_copy_ed2k_link()}
         {#if ctxCopySub}
@@ -4559,7 +4601,7 @@
         tabindex="0"
         aria-haspopup="menu"
         aria-expanded={ctxWebSub}
-        onclick={(e) => { e.stopPropagation(); ctxWebSub = !ctxWebSub; }}
+        onclick={(e) => { e.stopPropagation(); const next = !ctxWebSub; openHoverSub(null); ctxWebSub = next; }}
         onkeydown={(e) => {
           if (e.target !== e.currentTarget) return;
           if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowRight') {
@@ -4610,9 +4652,10 @@
           tabindex="0"
           aria-haspopup="menu"
           aria-expanded={ctxSendSub}
-          onmouseenter={() => { ctxSendSub = true; void loadSendableFriends(); }}
-          onmouseleave={() => ctxSendSub = false}
-          onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') { ctxSendSub = true; void loadSendableFriends(); } }}
+          onmouseenter={() => enterHoverSub('send')}
+          onmouseleave={leaveHoverSub}
+          onclick={(e) => clickHoverSub(e, 'send')}
+          onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') openHoverSub('send'); }}
         >
           {m.library_send_to_friend()}
           {#if ctxSendSub}
