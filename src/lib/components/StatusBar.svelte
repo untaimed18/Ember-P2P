@@ -6,7 +6,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { networkStats, serverStatus } from '$lib/stores/network';
   import { getSharedFileCount } from '$lib/api/sharing';
-  import { formatBytes, formatNumber, formatSpeed } from '$lib/utils';
+  import { formatBytes, formatNumber, formatLiveSpeed } from '$lib/utils';
   import { addToast } from '$lib/stores/toast';
   import { emberJoinTimedOut } from '$lib/stores/emberJoin';
   import { isUploadCounterPhase } from '$lib/sharedFileStats';
@@ -303,7 +303,7 @@
     >
       <span aria-hidden="true">↑</span>
       <span class="sr-only">{m.statusbar_upload_sr()}</span>
-      {formatSpeed($networkStats.upload_speed)}
+      {formatLiveSpeed($networkStats.upload_speed)}
     </button>
     <button
       bind:this={downloadButton}
@@ -316,7 +316,7 @@
     >
       <span aria-hidden="true">↓</span>
       <span class="sr-only">{m.statusbar_download_sr()}</span>
-      {formatSpeed($networkStats.download_speed)}
+      {formatLiveSpeed($networkStats.download_speed)}
     </button>
     <SpeedLimitsPopover bind:open={limitsOpen} anchor={limitsAnchor} />
     <span class="status-item muted status-totals" role="img" title={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })} aria-label={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })}>

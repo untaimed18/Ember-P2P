@@ -7,7 +7,7 @@
     respondChatAttachment,
     type ChatAttachment,
   } from '$lib/api/friends';
-  import { formatBytes, formatDurationSecs, formatSpeed } from '$lib/utils';
+  import { formatBytes, formatDurationSecs, formatLiveSpeed } from '$lib/utils';
   import { extensionFromPath, fileTypeKey } from '$lib/fileTypes';
   import FileTypeIcon from '$lib/components/FileTypeIcon.svelte';
   import { noteXferBytes, xferRate, xferSecondsLeft, type RateSamples } from '$lib/xferRate';
@@ -205,7 +205,7 @@
     {/if}
     <span class="attach-status-text">{statusLine}</span>
     {#if rate > 0}
-      <span class="attach-speed">{formatSpeed(rate)}</span>
+      <span class="attach-speed">{formatLiveSpeed(rate)}</span>
     {/if}
     {#if secondsLeft !== null}
       <span class="attach-left">{m.chat_attach_time_left({ time: formatDurationSecs(secondsLeft) })}</span>

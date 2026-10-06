@@ -25,7 +25,7 @@
   import { banPeer, getBannedPeers, unbanPeer } from '$lib/api/kad';
   import { getPeerReputationBatch, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
   import {
-    formatSize, formatSpeed, formatDate, formatDateWithYear, formatDurationSecs,
+    formatSize, formatLiveSpeed, formatDate, formatDateWithYear, formatDurationSecs,
     formatRemaining, formatRelativeTime, formatNumber, copyToClipboard, readFromClipboard,
   } from '$lib/utils';
   import { onMount, onDestroy, untrack } from 'svelte';
@@ -2029,6 +2029,40 @@
     const entry = speedHistory.get(t.id);
     if (entry && entry.ewma > 0) return entry.ewma;
     return 0;
+  }
+
+  // The Speed columns' text. The live rate is recomputed on every progress
+  // event, several times a second, and a block leaving the backend's window
+  // moves it in a visible step, so printing it directly flickered too fast to
+  // read. The text instead follows it once a second, easing towards it the way
+  // eMule's list refreshes. Sorting and time left keep reading `liveSpeed`.
+  const SHOWN_SPEED_REFRESH_MS = 1000;
+  const SHOWN_SPEED_EASING = 0.5;
+  let shownSpeeds = $state<Record<string, number>>({});
+  function refreshShownSpeeds() {
+    const next: Record<string, number> = {};
+    for (const t of $transfers) {
+      const live = liveSpeed(t);
+      if (live <= 0) continue;
+      const prev = shownSpeeds[t.id];
+      next[t.id] = prev && prev > 0 ? prev + SHOWN_SPEED_EASING * (live - prev) : live;
+    }
+    shownSpeeds = next;
+  }
+  $effect(() => {
+    // Untracked: the refresh reads the rows and writes `shownSpeeds`, so a
+    // tracked call would re-run this effect on every update instead of once.
+    untrack(refreshShownSpeeds);
+    const timer = setInterval(refreshShownSpeeds, SHOWN_SPEED_REFRESH_MS);
+    return () => clearInterval(timer);
+  });
+  /** What a Speed cell prints. A row that stopped drops to 0 at once rather
+   *  than waiting out the refresh; one that just started shows its live rate
+   *  until the next refresh picks it up. */
+  function shownSpeed(t: Transfer): number {
+    const live = liveSpeed(t);
+    if (live <= 0) return 0;
+    return shownSpeeds[t.id] ?? live;
   }
 
   /** True when every byte is on disk, including the 1-byte hold
@@ -5361,8 +5395,8 @@
                 {:else if column.key === 'completed_size'}
                   <td class="num-cell">{formatSize(t.completed_size ?? t.transferred)}</td>
                 {:else if column.key === 'speed'}
-                  {@const spd = liveSpeed(t)}
-                  <td class="num-cell">{spd > 0 ? formatSpeed(spd) : '\u2014'}</td>
+                  {@const spd = shownSpeed(t)}
+                  <td class="num-cell">{spd > 0 ? formatLiveSpeed(spd) : '\u2014'}</td>
                 {:else if column.key === 'progress'}
                   <td class="progress-cell">
                     {#if t.status === 'searching' && t.sources === 0 && t.progress === 0}
@@ -5504,7 +5538,7 @@
                           <span class="source-tag" title={m.transfers_parts_title()}>{m.transfers_parts({ have: src.available_parts, total: src.total_parts })}</span>
                         {/if}
                         {#if src.speed > 0}
-                          <span class="source-tag source-tag-accent">{formatSpeed(src.speed)}</span>
+                          <span class="source-tag source-tag-accent">{formatLiveSpeed(src.speed)}</span>
                         {/if}
                         {#if src.transferred > 0}
                           <span class="source-tag">{formatSize(src.transferred)}</span>
@@ -5910,8 +5944,8 @@
                   {:else if column.key === 'client_software'}
                     <td class="sw-cell" title={t.client_software || ''}><bdi dir="auto">{t.client_software || '\u2014'}</bdi></td>
                   {:else if column.key === 'speed'}
-                    {@const spd = liveSpeed(t)}
-                    <td class="num-cell">{spd > 0 ? formatSpeed(spd) : '\u2014'}</td>
+                    {@const spd = shownSpeed(t)}
+                    <td class="num-cell">{spd > 0 ? formatLiveSpeed(spd) : '\u2014'}</td>
                   {:else if column.key === 'transferred'}
                     <td class="num-cell">{formatSize(t.transferred)}</td>
                   {:else if column.key === 'total_size'}
@@ -6474,7 +6508,7 @@
                     {:else if column.key === 'file_name'}
                       <td class="name-cell" title={clientParent?.file_name || ''}><bdi dir="auto">{clientParent?.file_name || '\u2014'}</bdi></td>
                     {:else if column.key === 'speed'}
-                      <td class="num-cell">{src.status === 'transferring' ? formatSpeed(src.speed) : '\u2014'}</td>
+                      <td class="num-cell">{src.status === 'transferring' ? formatLiveSpeed(src.speed) : '\u2014'}</td>
                     {:else if column.key === 'downloaded'}
                       <td class="num-cell">{src.transferred > 0 ? formatSize(src.transferred) : '\u2014'}</td>
                     {:else if column.key === 'parts'}

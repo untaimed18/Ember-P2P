@@ -46,7 +46,7 @@
   import { get } from 'svelte/store';
   import { listen } from '@tauri-apps/api/event';
   import type { SearchResult, SpamExplanation } from '$lib/types';
-  import { formatNumber, formatSize, formatSpeed, copyToClipboard, sizeUnitLabel } from '$lib/utils';
+  import { formatNumber, formatSize, formatLiveSpeed, copyToClipboard, sizeUnitLabel } from '$lib/utils';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { addToast } from '$lib/stores/toast';
   import { inertBackground, trapTabKey } from '$lib/a11y';
@@ -4848,7 +4848,7 @@
                 {/if}
                 {#if selectedDlTransfer.status === 'active' || selectedDlTransfer.speed > 0}
                   <dt>{m.search_speed_label()}</dt>
-                  <dd>{selectedDlTransfer.speed > 0 ? formatSpeed(selectedDlTransfer.speed) : '—'}</dd>
+                  <dd>{selectedDlTransfer.speed > 0 ? formatLiveSpeed(selectedDlTransfer.speed) : '—'}</dd>
                 {/if}
                 {#if selectedDlTransfer.sources > 0}
                   <dt>{m.search_sources_label()}</dt>

@@ -27,7 +27,7 @@
     formatDurationSecs,
     formatDateTime,
     formatRelativeTime,
-    formatSpeed,
+    formatLiveSpeed,
     shortPubkey,
   } from '$lib/utils';
   import {
@@ -3587,7 +3587,7 @@
                   <span class="members-label">{m.channels_xfer_panel_title()}</span>
                   <span class="xfer-drawer-count">{roomTransfers.length}</span>
                   {#if roomXferRate > 0}
-                    <span class="xfer-drawer-rate">{formatSpeed(roomXferRate)}</span>
+                    <span class="xfer-drawer-rate">{formatLiveSpeed(roomXferRate)}</span>
                   {/if}
                   <svg class="xfer-drawer-chevron" class:flipped={xferCollapsed} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="m4 6 4 4 4-4"/>
@@ -3659,7 +3659,7 @@
                             {:else}
                               <span class="xfer-pct">{pct}%</span>
                               {#if rate > 0}
-                                <span class="xfer-speed">{formatSpeed(rate)}</span>
+                                <span class="xfer-speed">{formatLiveSpeed(rate)}</span>
                               {/if}
                               {#if left !== null}
                                 <span class="xfer-left">

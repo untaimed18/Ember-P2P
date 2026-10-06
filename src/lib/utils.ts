@@ -40,6 +40,32 @@ export function formatSpeed(bytesPerSec: number): string {
   return `${formatBytes(bytesPerSec)}${SIZE_UNITS.perSecond}`;
 }
 
+/**
+ * [`formatSpeed`] for a rate that changes while it is on screen: always one
+ * decimal above bytes ("2.0 MB/s", not "2 MB/s"), so a right-aligned figure
+ * keeps its width as it moves instead of jumping sideways each time the
+ * decimal comes and goes.
+ */
+export function formatLiveSpeed(bytesPerSec: number): string {
+  const units = SIZE_UNITS.units;
+  if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) {
+    return `${SIZE_FORMATTER.format(0)} ${units[0]}${SIZE_UNITS.perSecond}`;
+  }
+  let i = 0;
+  let val = bytesPerSec;
+  while (val >= 1024 && i < units.length - 1) {
+    val /= 1024;
+    i++;
+  }
+  // What would print as "1024" in this unit is shown as 1.0 of the next.
+  if (val >= (i === 0 ? 1023.5 : 1023.95) && i < units.length - 1) {
+    val /= 1024;
+    i++;
+  }
+  const number = i === 0 ? SIZE_FORMATTER.format(Math.round(val)) : FIXED_ONE_DECIMAL.format(val);
+  return `${number} ${units[i]}${SIZE_UNITS.perSecond}`;
+}
+
 /** The app language's label for 1024^`power` bytes: "KB", "Ko", "КБ". */
 export function sizeUnitLabel(power: number): string {
   return SIZE_UNITS.units[power] ?? '';
@@ -89,6 +115,11 @@ const SIZE_UNITS: { units: readonly string[]; perSecond: string } = ({
 } as Record<string, { units: readonly string[]; perSecond: string }>)[APP_LOCALE]
   ?? { units: ['B', 'KB', 'MB', 'GB', 'TB'], perSecond: '/s' };
 const SIZE_FORMATTER = new Intl.NumberFormat(APP_LOCALE, {
+  maximumFractionDigits: 1,
+  useGrouping: false,
+});
+const FIXED_ONE_DECIMAL = new Intl.NumberFormat(APP_LOCALE, {
+  minimumFractionDigits: 1,
   maximumFractionDigits: 1,
   useGrouping: false,
 });
