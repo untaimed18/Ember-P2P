@@ -4027,6 +4027,11 @@ pub(crate) async fn maybe_send_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
         let cm = cm.read().await;
         cm.secident_request_state(&peer_user_hash, peer_ip_u32, peer_secident_level)
     }) else {
+        debug!(
+            "SecIdent: not challenging {peer_addr} ({}): peer level {peer_secident_level}, \
+             no local key, or already verified at this address",
+            crate::security::short_hash(&peer_user_hash)
+        );
         return Ok(None);
     };
     let challenge = rand::RngCore::next_u32(&mut rand::rngs::OsRng).wrapping_add(1);
@@ -4034,6 +4039,10 @@ pub(crate) async fn maybe_send_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     secident_payload.push(state);
     secident_payload.extend_from_slice(&challenge.to_le_bytes());
     write_packet_async(writer, OP_EMULEPROT, OP_SECIDENTSTATE, &secident_payload).await?;
+    debug!(
+        "SecIdent: challenged {peer_addr} ({}) with state {state} (peer level {peer_secident_level})",
+        crate::security::short_hash(&peer_user_hash)
+    );
     Ok(Some(challenge))
 }
 
@@ -4116,6 +4125,18 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
             sig_pkt.push(challenge_ip_kind.unwrap_or(super::credits::CRYPT_CIP_NONECLIENT));
         }
         write_packet_async(writer, OP_EMULEPROT, OP_SIGNATURE, &sig_pkt).await?;
+        debug!(
+            "SecIdent: answered {peer_addr} ({}) challenge state {state}: key sent={}, v{}",
+            crate::security::short_hash(&peer_user_hash),
+            state >= 2 && !pub_key.is_empty(),
+            if add_trailer { 2 } else { 1 }
+        );
+    } else {
+        debug!(
+            "SecIdent: could not sign {peer_addr} ({}) challenge state {state}: \
+             no key for the peer or no local key",
+            crate::security::short_hash(&peer_user_hash)
+        );
     }
     Ok(())
 }
@@ -4132,11 +4153,18 @@ pub(crate) async fn handle_secident_signature(
     let Some(cm) = credit_manager else {
         return;
     };
+    let peer = crate::security::short_hash(&peer_user_hash);
     let sig_len = payload[0] as usize;
     if sig_len == 0 || payload.len() < 1 + sig_len {
+        debug!(
+            "SecIdent: ignored malformed OP_SIGNATURE from {peer_addr} ({peer}): \
+             {} bytes, declared signature length {sig_len}",
+            payload.len()
+        );
         return;
     }
     let Some(challenge) = pending_secident_challenge.take() else {
+        debug!("SecIdent: ignored OP_SIGNATURE from {peer_addr} ({peer}) with no challenge of ours outstanding");
         return;
     };
     let peer_ip_u32 = match peer_addr.ip() {
@@ -4152,6 +4180,11 @@ pub(crate) async fn handle_secident_signature(
     } else if payload.len() == 2 + sig_len && (peer_secident_level & 2) != 0 {
         Some(payload[1 + sig_len])
     } else {
+        debug!(
+            "SecIdent: ignored OP_SIGNATURE from {peer_addr} ({peer}): {} bytes for a \
+             {sig_len}-byte signature does not fit peer level {peer_secident_level}",
+            payload.len()
+        );
         return;
     };
     let verified = {
@@ -4172,12 +4205,14 @@ pub(crate) async fn handle_secident_signature(
     };
     let mut cm = cm.write().await;
     if verified {
+        debug!("SecIdent: verified {peer_addr} ({peer}), v{}", if challenge_kind.is_some() { 2 } else { 1 });
         cm.set_ident_state(peer_user_hash, IdentState::Verified);
         cm.check_identity_ip(peer_user_hash, peer_ip_u32);
     } else if cm
         .get_record(&peer_user_hash)
         .is_none_or(|record| record.ident_state == IdentState::Needed)
     {
+        debug!("SecIdent: signature from {peer_addr} ({peer}) did not verify; marked Failed");
         // Only demote a record that was actually awaiting its first proof,
         // matching eMule (`ClientCredits.cpp:507`, which sets IS_IDFAILED only
         // from IS_IDNEEDED). Demoting unconditionally let anyone who knows a
@@ -4186,6 +4221,11 @@ pub(crate) async fn handle_secident_signature(
         // both strips their score multiplier and, before the anchor was made
         // durable, set them up to have their credits reset later.
         cm.set_ident_state(peer_user_hash, IdentState::Failed);
+    } else {
+        debug!(
+            "SecIdent: signature from {peer_addr} ({peer}) did not verify; state left as {:?}",
+            cm.get_record(&peer_user_hash).map(|record| record.ident_state)
+        );
     }
 }
 
