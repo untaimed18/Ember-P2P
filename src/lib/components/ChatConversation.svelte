@@ -3446,7 +3446,11 @@
           {/if}
         </div>
       {/if}
-      {#each rows as row (row.msg.id)}
+      {#each rows as row, i (row.msg.id)}
+        <!-- A file card between two lines breaks their run, whoever sent them. -->
+        {@const startsRun = row.startsRun || attachmentPlacement.before.has(row.msg.id)}
+        {@const endsRun =
+          row.endsRun || (i + 1 < rows.length && attachmentPlacement.before.has(rows[i + 1].msg.id))}
         {#each attachmentPlacement.before.get(row.msg.id) ?? [] as a (a.xfer_id)}
           {@render attachmentRow(a)}
         {/each}
@@ -3467,7 +3471,7 @@
           class="conv-msg"
           class:sent={row.msg.direction === 'sent'}
           class:received={row.msg.direction === 'received'}
-          class:starts-run={row.startsRun}
+          class:starts-run={startsRun}
           class:fresh={freshIds.has(row.msg.id)}
         >
         {#if isChannel && row.msg.direction === 'sent'}
@@ -3484,8 +3488,8 @@
           data-msg-id={row.msg.id}
           class:sent={row.msg.direction === 'sent'}
           class:received={row.msg.direction === 'received'}
-          class:starts-run={row.startsRun}
-          class:ends-run={row.endsRun}
+          class:starts-run={startsRun}
+          class:ends-run={endsRun}
           class:focused={row.msg.id === focusedId}
           class:mentions-me={row.mentionsMe}
         >
@@ -3589,7 +3593,7 @@
             >{folded ? m.chat_show_more() : m.chat_show_less()}</button>
           {/if}
           {/if}
-          {#if !isChannel && (row.endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0)}
+          {#if !isChannel && (endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0)}
             {@render messageTimestamp(row.msg)}
           {/if}
           <!-- Copy is offered on every line. Edit and remove are channels
