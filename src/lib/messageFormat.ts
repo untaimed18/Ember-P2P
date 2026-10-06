@@ -1,8 +1,9 @@
 /**
  * Lightweight, display-only formatting for chat messages.
  *
- * `**bold**`, `*italic*` / `_italic_`, `~~strike~~`, `` `code` `` and fenced
- * code blocks. Nothing here changes what is sent: the wire carries the raw
+ * `**bold**`, `*italic*` / `_italic_`, `~~strike~~`, `` `code` ``, fenced
+ * code blocks, and runs of `- item` or `1. item` lines drawn as lists. Nothing
+ * here changes what is sent: the wire carries the raw
  * text, so an older Ember shows the asterisks, and "Copy text" copies them.
  *
  * The output is a tree of plain objects the conversation renders with Svelte
@@ -41,7 +42,10 @@ export type LinkNode = { type: 'link'; text: string; href: string };
 
 export type FormatBlock =
   | { type: 'text'; children: InlineNode[] }
-  | { type: 'code'; text: string };
+  | { type: 'code'; text: string }
+  /** `start` is the first item's number; later numbers are not kept, as in
+   *  Markdown, so "1. 1. 1." still counts up. */
+  | { type: 'list'; ordered: boolean; start: number; items: InlineNode[][] };
 
 /**
  * Past this the message is rendered with links only. The backend caps a
@@ -59,6 +63,17 @@ export const FORMAT_MAX_CHARS = 8192;
 export const FORMAT_MAX_DEPTH = 3;
 
 const MARKER_RE = /[*_~`]/;
+/**
+ * A list item: `-`, `*` or `•` and a space, or `-` or `•` straight onto a
+ * letter, which is how a lot of release notes are typed. Not `*` onto a
+ * letter, which opens italics.
+ */
+const BULLET_RE = /^ {0,3}(?:[-*•][ \t]+|[-•](?=\p{L}))(?=\S)/u;
+/** `1.` or `1)` and a space. Three digits at most, so "2024. What a year"
+ *  stays a sentence. */
+const NUMBERED_RE = /^ {0,3}(\d{1,3})[.)][ \t]+(?=\S)/;
+/** Cheap test for whether any line could start a list. */
+const LIST_HINT_RE = /(?:^|\n) {0,3}(?:[-*•][ \t]+\S|[-•]\p{L}|\d{1,3}[.)][ \t]+\S)/u;
 /** Up to three spaces of indent, an optional language tag (ignored), and
  *  nothing else on the line. */
 const FENCE_OPEN_RE = /^ {0,3}```[A-Za-z0-9_+#.-]{0,32}[ \t]*\r?$/;
@@ -84,7 +99,7 @@ export function formatMessage(text: string): FormatBlock[] {
   if (!text) return [];
   // The common case — no marker character at all — costs one regex test on
   // top of the link scan the transcript already did.
-  if (text.length > FORMAT_MAX_CHARS || !MARKER_RE.test(text)) {
+  if (text.length > FORMAT_MAX_CHARS || (!MARKER_RE.test(text) && !LIST_HINT_RE.test(text))) {
     return [{ type: 'text', children: linkNodes(linkifyMessage(text)) }];
   }
   const lines = text.split('\n');
@@ -126,7 +141,61 @@ function linkNodes(segments: MessageSegment[]): InlineNode[] {
   );
 }
 
+type ListKind = 'bullet' | 'number';
+
+function listKind(line: string): ListKind | null {
+  if (BULLET_RE.test(line)) return 'bullet';
+  if (NUMBERED_RE.test(line)) return 'number';
+  return null;
+}
+
+/**
+ * Text lines, with any run of list items made a list. A run needs two items:
+ * one line starting "- " in the middle of a conversation is far more often a
+ * dash than a list, and drawing it as one bullet would look like a glitch.
+ */
 function pushTextBlock(blocks: FormatBlock[], lines: string[], from: number, to: number) {
+  let paragraphStart = from;
+  let i = from;
+  while (i < to) {
+    const kind = listKind(lines[i]);
+    if (!kind) {
+      i++;
+      continue;
+    }
+    let end = i + 1;
+    while (end < to && listKind(lines[end]) === kind) end++;
+    if (end - i >= 2) {
+      pushParagraph(blocks, lines, paragraphStart, trimBlankEnd(lines, paragraphStart, i));
+      blocks.push(listBlock(lines, i, end, kind));
+      paragraphStart = trimBlankStart(lines, end, to);
+    }
+    i = end;
+  }
+  pushParagraph(blocks, lines, paragraphStart, to);
+}
+
+/** The blank lines either side of a list are its own spacing, not text. */
+function trimBlankEnd(lines: string[], from: number, to: number): number {
+  while (to > from && !stripCr(lines[to - 1]).trim()) to--;
+  return to;
+}
+
+function trimBlankStart(lines: string[], from: number, to: number): number {
+  while (from < to && !stripCr(lines[from]).trim()) from++;
+  return from;
+}
+
+function listBlock(lines: string[], from: number, to: number, kind: ListKind): FormatBlock {
+  const marker = kind === 'bullet' ? BULLET_RE : NUMBERED_RE;
+  const start = kind === 'number' ? Number(NUMBERED_RE.exec(lines[from])?.[1] ?? 1) : 1;
+  const items = lines
+    .slice(from, to)
+    .map((line) => formatLine(stripCr(line).replace(marker, '')));
+  return { type: 'list', ordered: kind === 'number', start, items };
+}
+
+function pushParagraph(blocks: FormatBlock[], lines: string[], from: number, to: number) {
   if (from >= to) return;
   const children: InlineNode[] = [];
   for (let i = from; i < to; i++) {

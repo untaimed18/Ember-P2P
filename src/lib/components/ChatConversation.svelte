@@ -1102,6 +1102,7 @@
         scrollSpotFrame = 0;
       }
       freshIds.clear();
+      unfoldedIds = new Set();
       // A jump asked for in the room being left means nothing in this one.
       queuedFocus = null;
       focusedId = null;
@@ -2928,8 +2929,35 @@
     day: number | null;
     mentionsMe: boolean;
     blocks: FormatBlock[];
+    long: boolean;
   };
   let rowCache = new Map<number, CachedRow>();
+
+  /** Past either of these a message is folded until asked for. Judged from
+   *  the text rather than measured, so it costs nothing per bubble; set above
+   *  the folded height (`.bubble-text.folded`) so whatever folds really did
+   *  overflow it, even in a wide window. */
+  const FOLD_MIN_LINES = 18;
+  const FOLD_MIN_CHARS = 1800;
+
+  function isLongMessage(text: string): boolean {
+    if (text.length > FOLD_MIN_CHARS) return true;
+    let lines = 1;
+    for (let at = text.indexOf('\n'); at !== -1; at = text.indexOf('\n', at + 1)) {
+      if (++lines > FOLD_MIN_LINES) return true;
+    }
+    return false;
+  }
+
+  /** Long messages the reader opened up. Per conversation, like the scroll
+   *  position: coming back to a room folds them again. */
+  let unfoldedIds = $state(new Set<number>());
+
+  function toggleFold(id: number) {
+    const next = new Set(unfoldedIds);
+    if (!next.delete(id)) next.add(id);
+    unfoldedIds = next;
+  }
   /** The pattern the cache was built against. A rename changes who is
    *  mentioned, so every cached verdict is stale. */
   let rowCachePattern: RegExp | null = null;
@@ -2959,6 +2987,7 @@
               // to a code span still counts; formatting is display-only.
               mentionsMe: msg.direction === 'received' && (pattern?.test(msg.message) ?? false),
               blocks: formatMessage(msg.message),
+              long: isLongMessage(msg.message),
             };
       next.set(msg.id, row);
       return row;
@@ -2979,7 +3008,7 @@
       return true;
     });
     return messages.map((msg, i) => {
-      const { day, mentionsMe, blocks } = derivedRows[i];
+      const { day, mentionsMe, blocks, long } = derivedRows[i];
       const hasNext = i + 1 < messages.length;
       const newDay = opensDay[i];
       const sameAuthorAsPrev = i > 0 && sameChannelAuthor(messages[i - 1], msg);
@@ -3000,6 +3029,7 @@
         endsRun: !sameAuthorAsNext || !sameDayAsNext,
         mentionsMe: mentionsMe || repliesToMe,
         blocks,
+        long,
       };
     });
   });
@@ -3450,13 +3480,28 @@
               </div>
             </div>
           {:else}
-          <div class="bubble-text">{#each row.blocks as block, bi (bi)}{#if block.type === 'text'}<bdi dir="auto">{@render inlineNodes(block.children)}</bdi>{:else}{@const codeKey = `${row.msg.id}:${bi}`}<div class="fmt-codeblock"><!-- Focusable so a long line can be scrolled sideways from the keyboard: a scroll container is the one non-widget that needs a tab stop. --><!-- svelte-ignore a11y_no_noninteractive_tabindex --><pre dir="auto" tabindex="0" role="group" aria-label={m.chat_code_block_label()}><code>{block.text}</code></pre><button
+          {@const folded = row.long && !unfoldedIds.has(row.msg.id)}
+          <!-- Tabbing to a link below the fold opens it up, rather than
+               scrolling the clipped box under its own edge. -->
+          <div
+            class="bubble-text"
+            class:folded
+            onfocusin={folded ? () => toggleFold(row.msg.id) : undefined}
+          >{#each row.blocks as block, bi (bi)}{#if block.type === 'text'}<bdi dir="auto">{@render inlineNodes(block.children)}</bdi>{:else if block.type === 'list'}{#if block.ordered}<ol class="fmt-list" start={block.start}>{#each block.items as item, ii (ii)}<li><bdi dir="auto">{@render inlineNodes(item)}</bdi></li>{/each}</ol>{:else}<ul class="fmt-list">{#each block.items as item, ii (ii)}<li><bdi dir="auto">{@render inlineNodes(item)}</bdi></li>{/each}</ul>{/if}{:else}{@const codeKey = `${row.msg.id}:${bi}`}<div class="fmt-codeblock"><!-- Focusable so a long line can be scrolled sideways from the keyboard: a scroll container is the one non-widget that needs a tab stop. --><!-- svelte-ignore a11y_no_noninteractive_tabindex --><pre dir="auto" tabindex="0" role="group" aria-label={m.chat_code_block_label()}><code>{block.text}</code></pre><button
                   type="button"
                   class="fmt-codeblock-copy"
                   onclick={() => void copyCodeBlock(codeKey, block.text)}
                   title={m.chat_copy_code()}
                   aria-label={copiedCodeKey === codeKey ? m.common_copied() : m.chat_copy_code()}
                 >{copiedCodeKey === codeKey ? m.common_copied() : m.common_copy()}</button></div>{/if}{/each}</div>
+          {#if row.long}
+            <button
+              type="button"
+              class="bubble-fold"
+              aria-expanded={!folded}
+              onclick={() => toggleFold(row.msg.id)}
+            >{folded ? m.chat_show_more() : m.chat_show_less()}</button>
+          {/if}
           {/if}
           {#if !isChannel && (row.endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0)}
             {@render messageTimestamp(row.msg)}
@@ -3868,7 +3913,11 @@
         onclick={refreshMentionToken}
         onkeyup={refreshMentionToken}
         onblur={() => (mentionStart = -1)}
-        placeholder={isChannel ? m.channels_send_placeholder() : m.chat_input_placeholder()}
+        placeholder={isChannel
+          ? friendName.trim()
+            ? m.channels_send_placeholder_named({ room: friendName.trim() })
+            : m.channels_send_placeholder()
+          : m.chat_input_placeholder()}
         aria-label={m.chat_input_label()}
         aria-describedby={isChannel && replyTarget ? replyBarId : undefined}
         maxlength={COMPOSER_MAX_CHARS}
@@ -4355,6 +4404,56 @@
 
   .bubble-text {
     white-space: pre-wrap;
+  }
+
+  /* Fourteen lines and a fade, so a long post shows what it is about without
+     taking the whole transcript. Below `FOLD_MIN_LINES`, so anything folded
+     really does run past it. */
+  .bubble-text.folded {
+    max-height: calc(1.4em * 14);
+    overflow: hidden;
+    mask-image: linear-gradient(to bottom, #000 calc(100% - 3em), transparent);
+  }
+
+  .bubble-fold {
+    display: block;
+    margin-top: 4px;
+    padding: 2px 0;
+    border: none;
+    background: none;
+    color: inherit;
+    font: inherit;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+  }
+
+  .conv-bubble.received .bubble-fold {
+    color: var(--text-accent);
+  }
+
+  .bubble-fold:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  /* Lists keep the bubble's own line spacing; `pre-wrap` is reset inside so
+     the markup between items is not drawn as blank lines. */
+  .fmt-list {
+    margin: 2px 0;
+    padding-inline-start: 1.4em;
+    white-space: normal;
+  }
+
+  .fmt-list li {
+    white-space: pre-wrap;
+  }
+
+  .fmt-list li + li {
+    margin-top: 1px;
   }
 
   /* Tinted from `currentColor` so the same rule reads on an accent-filled sent

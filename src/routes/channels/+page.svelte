@@ -461,6 +461,50 @@
       ? m.channels_snoozed_until({ time: snoozeEndLabel(selectedSnoozedUntil) })
       : m.channels_notify_title({ level: notifyLevelLabel(selectedNotifyLevel) }),
   );
+  /**
+   * Welcome messages the reader folded to one line, by room, against the text
+   * they folded. A fingerprint rather than the text, so the page does not keep
+   * a second copy of every room's welcome; when the owner rewrites it the
+   * fingerprint stops matching and the new one is shown in full.
+   */
+  const FOLDED_WELCOMES_KEY = 'ember.channels.welcome-folded.v1';
+  const FOLDED_WELCOMES_MAX = 200;
+
+  function welcomeFingerprint(text: string): string {
+    let hash = 5381;
+    for (let i = 0; i < text.length; i++) hash = ((hash * 33) ^ text.charCodeAt(i)) >>> 0;
+    return `${text.length}:${hash.toString(36)}`;
+  }
+
+  function loadFoldedWelcomes(): Record<string, string> {
+    try {
+      const parsed: unknown = JSON.parse(localStorage.getItem(FOLDED_WELCOMES_KEY) ?? '{}');
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+      return Object.fromEntries(
+        Object.entries(parsed).filter(
+          (entry): entry is [string, string] => /^[0-9a-f]{32}$/.test(entry[0]) && typeof entry[1] === 'string',
+        ),
+      );
+    } catch {
+      return {};
+    }
+  }
+
+  let foldedWelcomes = $state<Record<string, string>>(loadFoldedWelcomes());
+
+  function toggleWelcomeFold(channelId: string, welcome: string) {
+    const print = welcomeFingerprint(welcome);
+    const { [channelId]: current, ...rest } = foldedWelcomes;
+    // Oldest first, and a fold re-inserts, so the cap drops the stalest.
+    const kept = Object.entries(rest).slice(-(FOLDED_WELCOMES_MAX - 1));
+    foldedWelcomes = Object.fromEntries(current === print ? kept : [...kept, [channelId, print]]);
+    try {
+      localStorage.setItem(FOLDED_WELCOMES_KEY, JSON.stringify(foldedWelcomes));
+    } catch {
+      // Quota exceeded / private mode. The fold still holds for this session.
+    }
+  }
+
   /** The time alone when the snooze ends today, with the day when it does not. */
   function snoozeEndLabel(until: number): string {
     const sameDay = new Date(until).toDateString() === new Date().toDateString();
@@ -678,10 +722,18 @@
           (hit) => !hit.sender_pubkey || !roomIgnoredKeys.includes(hit.sender_pubkey.toLowerCase()),
         ),
   );
+  /** Who is here first: the list is for finding someone to talk to, and
+   *  ordering by name alone buried the members who could answer among the
+   *  ones last seen days ago. */
+  const PRESENCE_RANK = { online: 0, away: 1, offline: 2 } as const;
+
   let sortedMembers = $derived(
     members.slice().sort((a, b) => {
       if (a.is_self !== b.is_self) return a.is_self ? -1 : 1;
       if (a.banned !== b.banned) return a.banned ? 1 : -1;
+      const presence =
+        PRESENCE_RANK[presenceOf(a, presenceNow)] - PRESENCE_RANK[presenceOf(b, presenceNow)];
+      if (presence !== 0) return presence;
       if (a.moderator !== b.moderator) return a.moderator ? -1 : 1;
       const an = (a.nickname || a.member_pubkey).toLowerCase();
       const bn = (b.nickname || b.member_pubkey).toLowerCase();
@@ -2684,6 +2736,12 @@
                   class:highlighted={highlightedRow?.channel_id === ch.channel_id}
                   class:joining={joiningIds.includes(ch.channel_id)}
                   class:moved={!!ch.successor_id}
+                  class:has-unread={ch.in_room
+                    && ch.unread > 0
+                    && unreadBadgeTone(
+                      notifyLevelOf($effectiveNotifyLevels, ch.channel_id),
+                      $channelUnreadMentions.includes(ch.channel_id),
+                    ) === 'loud'}
                   data-room-id={ch.channel_id}
                   title={ch.successor_id ? m.channels_transferred_badge() : undefined}
                   oncontextmenu={ch.in_room ? openCardMenu : undefined}
@@ -3116,8 +3174,21 @@
               </div>
             </header>
             {#if selected.welcome.trim()}
-              <div class="welcome-banner" role="note">
+              {@const welcomeFolded = foldedWelcomes[selected.channel_id] === welcomeFingerprint(selected.welcome)}
+              <div class="welcome-banner" class:folded={welcomeFolded} role="note">
                 <p><bdi dir="auto">{selected.welcome}</bdi></p>
+                <button
+                  type="button"
+                  class="welcome-toggle"
+                  aria-expanded={!welcomeFolded}
+                  title={welcomeFolded ? m.channels_welcome_expand() : m.channels_welcome_collapse()}
+                  aria-label={welcomeFolded ? m.channels_welcome_expand() : m.channels_welcome_collapse()}
+                  onclick={() => toggleWelcomeFold(selected.channel_id, selected.welcome)}
+                >
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d={welcomeFolded ? 'M4 6l4 4 4-4' : 'M4 10l4-4 4 4'}/>
+                  </svg>
+                </button>
               </div>
             {/if}
             {#if selected.successor_id}
@@ -4644,9 +4715,16 @@
     line-height: 1.3;
   }
 
+  /* Regular until something is waiting, so the rooms worth opening stand out
+     by shape as well as by their pill. A quiet room's backlog stays regular,
+     matching its grey pill. */
   .chan-name {
-    font-weight: 600;
+    font-weight: 500;
     overflow-wrap: anywhere;
+  }
+
+  .chan-row.has-unread .chan-name {
+    font-weight: 700;
   }
 
   /* Inline after the last word, so it follows the name onto a second line. */
@@ -5348,7 +5426,56 @@
     overflow: auto;
   }
 
-  .welcome-banner p { margin: 0; }
+  .welcome-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .welcome-banner p {
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+  }
+
+  .welcome-banner.folded {
+    align-items: center;
+    padding-block: 4px;
+    overflow: hidden;
+  }
+
+  .welcome-banner.folded p {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .welcome-toggle {
+    flex-shrink: 0;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-secondary);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+  }
+
+  .welcome-toggle:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .welcome-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  .welcome-toggle svg { width: 14px; height: 14px; }
 
   :global([data-theme="dark"]) .welcome-banner {
     background: color-mix(in srgb, var(--accent) 8%, var(--bg-secondary));

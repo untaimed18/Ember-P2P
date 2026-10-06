@@ -25,7 +25,14 @@ function show(nodes: InlineNode[]): string {
 
 function render(text: string): string {
   return formatMessage(text)
-    .map((b) => (b.type === 'code' ? `[pre:${b.text}]` : show(b.children)))
+    .map((b) => {
+      if (b.type === 'code') return `[pre:${b.text}]`;
+      if (b.type === 'list') {
+        const tag = b.ordered ? `ol${b.start === 1 ? '' : ` start=${b.start}`}` : 'ul';
+        return `[${tag}:${b.items.map(show).join(';')}]`;
+      }
+      return show(b.children);
+    })
     .join('|');
 }
 
@@ -35,7 +42,13 @@ function visibleText(blocks: FormatBlock[]): string {
     nodes
       .map((n) => ('children' in n ? walk(n.children) : n.text))
       .join('');
-  return blocks.map((b) => (b.type === 'code' ? b.text : walk(b.children))).join('\n');
+  return blocks
+    .map((b) => {
+      if (b.type === 'code') return b.text;
+      if (b.type === 'list') return b.items.map(walk).join('\n');
+      return walk(b.children);
+    })
+    .join('\n');
 }
 
 function depth(nodes: InlineNode[]): number {
@@ -140,13 +153,50 @@ describe('formatMessage: unmatched and non-markers', () => {
     expect(render('****x****')).toBe('****x****');
   });
 
-  it('leaves bullet-style lists alone', () => {
-    expect(render('* one\n* two')).toBe('* one\n* two');
+  it('does not read a bullet as an italic marker', () => {
+    expect(render('* one\n* two')).toBe('[ul:one;two]');
   });
 
   it('preserves every character when nothing matches', () => {
     const text = 'a*b _c d_e ~f ** g `h ~~ i';
     expect(visibleText(formatMessage(text))).toBe(text);
+  });
+});
+
+describe('formatMessage: lists', () => {
+  it('draws runs of bullet lines as a list, with formatting inside', () => {
+    expect(render('- one\n- **two**\n• three')).toBe('[ul:one;<b>two</b>;three]');
+    expect(render('* a\n* b')).toBe('[ul:a;b]');
+  });
+
+  it('takes release-note dashes with no space before a word', () => {
+    expect(render('What is new:\n-Faster search\n-Fewer bugs')).toBe(
+      'What is new:|[ul:Faster search;Fewer bugs]',
+    );
+  });
+
+  it('numbers from the first item', () => {
+    expect(render('1. first\n2. second')).toBe('[ol:first;second]');
+    expect(render('3) third\n4) fourth')).toBe('[ol start=3:third;fourth]');
+  });
+
+  it('keeps the text around a list, without the blank lines that set it apart', () => {
+    expect(render('Before\n\n- a\n- b\n\nAfter')).toBe('Before|[ul:a;b]|After');
+  });
+
+  it('leaves a single dash line, negatives and years as they are', () => {
+    expect(render('- just a dash')).toBe('- just a dash');
+    expect(render('-5 today\n-3 tomorrow')).toBe('-5 today\n-3 tomorrow');
+    expect(render('2024. What a year\n2025. Another')).toBe('2024. What a year\n2025. Another');
+    expect(render('*italic* line\n*more* here')).toBe('<i>italic</i> line\n<i>more</i> here');
+  });
+
+  it('splits bullets and numbers into separate lists', () => {
+    expect(render('- a\n- b\n1. c\n2. d')).toBe('[ul:a;b]|[ol:c;d]');
+  });
+
+  it('leaves list markers inside a code block alone', () => {
+    expect(render('```\n- a\n- b\n```')).toBe('[pre:- a\n- b]');
   });
 });
 
