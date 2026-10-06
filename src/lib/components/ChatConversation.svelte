@@ -2102,7 +2102,22 @@
     return true;
   }
 
+  /** Unread lines below the reader that they have not reached yet: coming back
+   *  to a remembered spot, or a jump that landed above the divider. */
+  let unreadAhead = $derived(unreadMarkerId !== null && !unreadDividerSeen && !unreadDividerAbove);
+
   function jumpToLatest() {
+    // To the first of them rather than past them. Once the divider has been on
+    // screen the next press goes the rest of the way.
+    const box = messagesContainerEl;
+    const divider = unreadAhead ? box?.querySelector<HTMLElement>('.conv-unread-divider') : null;
+    if (box && divider && divider.getBoundingClientRect().top >= box.getBoundingClientRect().bottom) {
+      divider.scrollIntoView({
+        block: 'start',
+        behavior: prefersReducedMotion.current ? 'auto' : 'smooth',
+      });
+      return;
+    }
     missedWhileAway = false;
     scrolledAway = false;
     scrollToBottom();
@@ -3666,17 +3681,17 @@
   {#if scrolledAway && messages.length > 0 && !loading}
     <button
       class="conv-jump"
-      class:has-unseen={missedWhileAway}
+      class:has-unseen={missedWhileAway || unreadAhead}
       class:above-typing={typingPillShown}
       type="button"
       onclick={jumpToLatest}
-      title={missedWhileAway ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
-      aria-label={missedWhileAway ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
+      title={missedWhileAway || unreadAhead ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
+      aria-label={missedWhileAway || unreadAhead ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
     >
       <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
         <path d="M8 3v9M4.5 8.5 8 12l3.5-3.5" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
-      <span>{missedWhileAway ? m.chat_new_messages_below() : m.chat_jump_to_latest()}</span>
+      <span>{missedWhileAway || unreadAhead ? m.chat_new_messages_below() : m.chat_jump_to_latest()}</span>
     </button>
   {/if}
   </div>
