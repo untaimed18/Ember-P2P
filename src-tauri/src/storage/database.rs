@@ -3813,18 +3813,56 @@ impl Database {
         Ok(())
     }
 
+    pub fn unban_peer(&self, peer_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE peers SET banned = 0 WHERE id = ?1",
+            params![peer_id],
+        )?;
+        Ok(())
+    }
+
+    /// Every manually banned peer, with the name and client software its
+    /// credit record last saw. A ban is placed by user hash from a transfer
+    /// row, so the `peers` row itself usually carries no name. Rows are
+    /// `(peer_id, addresses, peer_name, client_software)`.
+    pub fn get_banned_peers(&self) -> anyhow::Result<Vec<(String, Vec<String>, String, String)>> {
+        let conn = self.conn.lock();
+        let banned: Vec<(String, String)> = conn
+            .prepare("SELECT id, addresses FROM peers WHERE banned = 1 ORDER BY id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut credit = conn.prepare(
+            "SELECT peer_name, client_software FROM credits WHERE user_hash = ?1",
+        )?;
+        let mut out = Vec::with_capacity(banned.len());
+        for (id, addresses) in banned {
+            let addresses: Vec<String> = serde_json::from_str(&addresses).unwrap_or_default();
+            let (name, client) = match hex::decode(&id) {
+                Ok(hash) if hash.len() == 16 => credit
+                    .query_row(params![hash], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .optional()?
+                    .unwrap_or_default(),
+                _ => (String::new(), String::new()),
+            };
+            out.push((id, addresses, name, client));
+        }
+        Ok(out)
+    }
+
     /// Record `ip` as one of the addresses belonging to a (banned) peer.
     ///
     /// Used when a live upload session is torn down because its peer was
     /// banned by user-hash: the connecting IP may not have been in the
-    /// routing table or peer DB at ban time, so without this the ban would
-    /// not cover it after a restart (boot rebuilds IP bans from banned
-    /// peers' addresses). The port is recorded as 0 (placeholder) — only the
-    /// IP is ever used by the ban path, and boot-contact loading skips banned
-    /// peers so the placeholder never produces a junk KAD contact. The row is
+    /// routing table or peer DB at ban time, so without this it would not
+    /// be cleared by `unban_peer` (which reverses a ban by walking the
+    /// peer's known addresses). Storing it here makes ban/unban symmetric.
+    /// The port is recorded as 0 (placeholder) — only the IP is ever used
+    /// by the ban/unban paths, and boot-contact loading skips banned peers
+    /// so the placeholder never produces a junk KAD contact. The row is
     /// upserted with `banned = 1` so a peer we only ever saw as an inbound
-    /// uploader still exists. Idempotent: an IP already present (under any
-    /// port) is not duplicated.
+    /// uploader still exists for `unban_peer` to flip. Idempotent: an IP
+    /// already present (under any port) is not duplicated.
     pub fn add_banned_peer_address(
         &self,
         peer_id: &str,
@@ -3890,6 +3928,16 @@ impl Database {
                 now as i64,
                 expires_at.min(i64::MAX as u64) as i64
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove an automatic IP ban.
+    pub fn unban_ip(&self, ip: std::net::Ipv4Addr) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM banned_ips WHERE ip = ?1",
+            params![ip.to_string()],
         )?;
         Ok(())
     }
@@ -13711,11 +13759,44 @@ mod tests {
     }
 
     #[test]
-    fn banned_ip_roundtrip() {
+    fn banned_ip_roundtrip_and_unban() {
         let db = banned_ips_db();
         let ip: std::net::Ipv4Addr = "203.0.113.7".parse().unwrap();
         db.ban_ip(ip, "test", 0).expect("ban");
         assert_eq!(db.get_banned_ips().expect("load"), vec![ip]);
+        db.unban_ip(ip).expect("unban");
+        assert!(db.get_banned_ips().expect("load after unban").is_empty());
+    }
+
+    /// The banned list names a peer from its credit record, since the ban
+    /// itself is placed by hash alone, and an unban takes it off the list.
+    #[test]
+    fn banned_peers_list_names_from_credits_and_drops_unbanned_rows() {
+        let (db, path) = migrated_credits_db("banned-list");
+        let named = [0x0Au8; 16];
+        let unnamed = [0x0Bu8; 16];
+        db.save_all_credits_with_ember(
+            &[(&named, 1, 1, 0, &[], 0, 0, None, false, "Nia", "eMule 0.60a", 0)],
+            &[],
+        )
+        .expect("seed credits");
+        db.ban_peer(&hex::encode(named)).expect("ban named");
+        db.ban_peer(&hex::encode(unnamed)).expect("ban unnamed");
+
+        let listed = db.get_banned_peers().expect("list");
+        assert_eq!(
+            listed,
+            vec![
+                (hex::encode(named), Vec::new(), "Nia".to_string(), "eMule 0.60a".to_string()),
+                (hex::encode(unnamed), Vec::new(), String::new(), String::new()),
+            ]
+        );
+
+        db.unban_peer(&hex::encode(named)).expect("unban");
+        let listed = db.get_banned_peers().expect("list after unban");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, hex::encode(unnamed));
+        remove_db_files(db, &path);
     }
 
     #[test]

@@ -386,6 +386,44 @@ impl ReputationManager {
         self.peers.values().filter(|p| p.is_banned(now)).count()
     }
 
+    /// Clear an active ban for a specific peer (manual unban from the UI).
+    /// Resets `banned_until` and pulls the score back above the ban
+    /// threshold so the peer isn't immediately re-banned by stale
+    /// negative score. Returns `true` if the peer had a record. No-op if
+    /// the peer is unknown.
+    pub fn clear_ban(&mut self, node_id: &[u8; 16]) -> bool {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            peer.banned_until = None;
+            if peer.score <= BAN_THRESHOLD {
+                peer.score = BAN_THRESHOLD + 1;
+            }
+            peer.penalty = peer.penalty.max(BAN_THRESHOLD + 1);
+            self.touch();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear an active IP-correlation ban (and soften the IP score) so a
+    /// manual unban that removes the IP from `banned_ips` is not
+    /// immediately re-armed by the next scored event against a still-
+    /// banned `IpReputation` row.
+    pub fn clear_ip_ban(&mut self, ip: std::net::Ipv4Addr) -> bool {
+        let key = ip.octets();
+        if let Some(entry) = self.ips.get_mut(&key) {
+            entry.banned_until = None;
+            if entry.score <= IP_BAN_THRESHOLD {
+                entry.score = IP_BAN_THRESHOLD + 1;
+            }
+            entry.penalty = entry.penalty.max(IP_BAN_THRESHOLD + 1);
+            self.touch();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Mirror a node-identity ban onto an observed IPv4 so periodic
     /// `banned_ips` rebuilds (which re-seed from
     /// `currently_banned_ips`) keep enforcing that address for the
@@ -1166,6 +1204,23 @@ mod tests {
             "rotating free identities must not reset address-level abuse history"
         );
         assert!(manager.currently_banned_ips().contains(&ip));
+        assert!(manager.clear_ip_ban(ip));
+        assert!(!manager.currently_banned_ips().contains(&ip));
+    }
+
+    /// A manual unban has to stick: the score is lifted clear of the ban
+    /// threshold, or the peer's next bad event re-bans them on the spot.
+    #[test]
+    fn clearing_a_manual_ban_lifts_it_and_the_score() {
+        let mut manager = ReputationManager::new();
+        let id = [7u8; 16];
+        manager.apply_manual_ban(&id);
+        assert!(manager.is_banned(&id));
+
+        assert!(manager.clear_ban(&id));
+        assert!(!manager.is_banned(&id));
+        assert!(manager.score(&id) > BAN_THRESHOLD);
+        assert!(!manager.clear_ban(&[8u8; 16]), "an unknown peer has nothing to clear");
     }
 
     #[test]

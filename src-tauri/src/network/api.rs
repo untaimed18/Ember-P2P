@@ -113,6 +113,9 @@ pub enum NetworkCommand {
     BanPeer {
         peer_id_hex: String,
     },
+    UnbanPeer {
+        peer_id_hex: String,
+    },
     FindNotes {
         file_hash: KadId,
         file_size: u64,

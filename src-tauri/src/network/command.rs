@@ -2180,11 +2180,12 @@ async fn handle_command_inner(
                 }
                 // Keep ReputationManager in sync so Trust badges and
                 // reputation-gated connect paths see the manual ban
-                // immediately.
+                // immediately (UnbanPeer already cleared this side).
                 state.reputation.apply_manual_ban(&kad_id.0);
                 // Persist each IP against this peer so the ban survives a
                 // restart (boot rebuilds banned_ips from banned peers'
-                // addresses).
+                // addresses) and so unban_peer — which walks the peer's
+                // addresses — clears it again. Keeps ban/unban symmetric.
                 //
                 // One blocking hop for the whole address set, rather than a
                 // synchronous `rusqlite` write per IP on this thread: a peer
@@ -2199,6 +2200,13 @@ async fn handle_command_inner(
                 // detached it could land behind a later command's write and
                 // re-ban a peer on disk that every in-memory set reports as
                 // clear, until the next restart rebuilt the bans from it.
+                //
+                // Awaiting orders this against the *commands* that follow, which
+                // is what `UnbanPeer` needs — but not against the IPC task,
+                // which writes `banned = 0` itself before it enqueues that
+                // command. That half is closed at the other end: `UnbanPeer`
+                // re-asserts the row rather than trusting a write it did not
+                // sequence.
                 {
                     let ban_db = db.clone();
                     let ban_peer = peer_id_hex.clone();
@@ -2216,6 +2224,105 @@ async fn handle_command_inner(
                     }
                 }
             }
+        }
+
+        NetworkCommand::UnbanPeer { peer_id_hex } => {
+            // `commands::peers::unban_peer` already cleared the row before it
+            // enqueued this, so the write below is normally a no-op — but the
+            // two are not ordered by anything. `BanPeer` upserts `banned = 1`
+            // from a blocking task this loop awaits, and the IPC unban writes
+            // `banned = 0` concurrently with it, so an unban issued while a ban
+            // was still queued behind a busy database could be overwritten by
+            // the ban it was answering. On disk the peer then stayed banned
+            // while every in-memory set said otherwise, and the next launch
+            // rebuilt the bans from the row.
+            //
+            // Re-asserting here fixes that because the loop *does* order this
+            // against `BanPeer`: that handler cannot still be persisting when
+            // this one runs. Awaited for the same reason it is there — the
+            // point of the blocking hop is to free the worker, not to give up
+            // the ordering.
+            {
+                let unban_db = db.clone();
+                let unban_peer = peer_id_hex.clone();
+                let cleared =
+                    tokio::task::spawn_blocking(move || unban_db.unban_peer(&unban_peer)).await;
+                match cleared {
+                    Ok(Err(e)) => {
+                        warn!("Failed to clear the persisted ban for {peer_id_hex}: {e}")
+                    }
+                    Err(e) => warn!("Unban persistence task for {peer_id_hex} failed: {e}"),
+                    Ok(Ok(())) => {}
+                }
+            }
+            if let Some(kad_id) = KadId::from_hex(&peer_id_hex) {
+                if let Some(contact) = state.routing_table.get_contact(&kad_id) {
+                    state.banned_ips.remove(&contact.ip);
+                    if let Err(e) = db.unban_ip(contact.ip) {
+                        warn!(
+                            "Failed to clear persisted IP ban for {} (peer {peer_id_hex}): {e}",
+                            contact.ip
+                        );
+                    }
+                }
+            }
+            match db.get_peer_addresses(&peer_id_hex) {
+                Ok(addresses) => {
+                    for addr_str in &addresses {
+                        if let Some((ip_str, _)) = addr_str.rsplit_once(':') {
+                            if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                                state.banned_ips.remove(&ip);
+                                // Also clear any persistent auto-ban for this IP.
+                                if let Err(e) = db.unban_ip(ip) {
+                                    warn!(
+                                        "Failed to clear persisted IP ban for {ip} (peer {peer_id_hex}): {e}"
+                                    );
+                                }
+                                // Soften IP-reputation so the next scored
+                                // event cannot immediately re-arm an IP ban.
+                                let _ = state.reputation.clear_ip_ban(ip);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Could not read stored addresses for peer {peer_id_hex}: {e}")
+                }
+            }
+            if let Ok(mut shared) = shared_banned_ips.write() {
+                *shared = state.banned_ips.clone();
+            }
+            // Also remove from upload-only banned set, and clear any
+            // reputation ban for this user hash — otherwise the source /
+            // callback paths (which gate on `reputation.is_banned`) would
+            // keep the peer blocked despite the UI showing them unbanned.
+            if let Some(kad_id) = KadId::from_hex(&peer_id_hex) {
+                if let Ok(mut set) = shared_banned_hashes.write() {
+                    set.remove(&kad_id.0);
+                }
+                if state.reputation.clear_ban(&kad_id.0) {
+                    debug!("Cleared reputation ban for {peer_id_hex}");
+                }
+                // Routing-table contact IP may not be on the peer row.
+                if let Some(contact) = state.routing_table.get_contact(&kad_id) {
+                    let _ = state.reputation.clear_ip_ban(contact.ip);
+                    state.banned_ips.remove(&contact.ip);
+                }
+                // Reputation bans mirror onto every SourceManager IP for the
+                // user hash; clear those too or the next sync_enforced_banned_ips
+                // tick would re-inject them from currently_banned_ips().
+                {
+                    let sm = source_manager.read().await;
+                    for ip in sm.find_ips_by_user_hash(&kad_id.0) {
+                        let _ = state.reputation.clear_ip_ban(ip);
+                        state.banned_ips.remove(&ip);
+                    }
+                }
+                if let Ok(mut shared) = shared_banned_ips.write() {
+                    *shared = state.banned_ips.clone();
+                }
+            }
+            info!("Unbanned peer {peer_id_hex}");
         }
 
         NetworkCommand::GetNetworkStatsSnapshot { tx } => {

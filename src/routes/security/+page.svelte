@@ -23,6 +23,7 @@
   import { getSettings } from '$lib/api/settings';
   import { setAppSettings } from '$lib/stores/settings';
   import { networkStats } from '$lib/stores/network';
+  import { getBannedPeers, unbanPeer, type BannedPeer } from '$lib/api/kad';
   import IconX from '$lib/components/IconX.svelte';
 
   let stats = $state<IpFilterStats | null>(null);
@@ -48,6 +49,56 @@
         return m.security_ipfilter_live_reload_failed({ entries: result.entryCount });
       default:
         return m.security_ipfilter_live_reload_deferred({ entries: result.entryCount });
+    }
+  }
+
+  // Peers banned by user hash from Transfers. Loaded on mount so the header
+  // button can show how many there are before the panel is opened.
+  let bannedPeers = $state<BannedPeer[]>([]);
+  let showBanned = $state(false);
+  let unbanning = $state<string[]>([]);
+  let bannedSeq = 0;
+
+  async function loadBanned(opts?: { quiet?: boolean }) {
+    const seq = ++bannedSeq;
+    try {
+      const peers = await getBannedPeers();
+      if (unmounted || seq !== bannedSeq) return;
+      bannedPeers = peers;
+    } catch (e: unknown) {
+      if (unmounted || seq !== bannedSeq || opts?.quiet) return;
+      error = toErrorMsg(e);
+    }
+  }
+
+  function bannedName(peer: BannedPeer): string {
+    return peer.name || m.common_unknown();
+  }
+
+  /** The address a ban was last recorded at, without the placeholder port 0
+   *  an IP-only capture is stored with. */
+  function lastAddress(peer: BannedPeer): string {
+    const addr = peer.addresses[peer.addresses.length - 1];
+    if (!addr) return '\u2014';
+    return addr.endsWith(':0') ? addr.slice(0, -2) : addr;
+  }
+
+  async function handleUnban(peer: BannedPeer) {
+    if (unbanning.includes(peer.user_hash)) return;
+    unbanning = [...unbanning, peer.user_hash];
+    error = null;
+    try {
+      await unbanPeer(peer.user_hash);
+      if (unmounted) return;
+      flash(m.security_unbanned_user({ name: bannedName(peer) }));
+    } catch (e: unknown) {
+      if (unmounted) return;
+      error = toErrorMsg(e);
+    } finally {
+      if (!unmounted) {
+        unbanning = unbanning.filter((h) => h !== peer.user_hash);
+        await loadBanned();
+      }
     }
   }
 
@@ -159,6 +210,7 @@
   }
 
   onMount(() => {
+    void loadBanned({ quiet: true });
     void (async () => {
       await loadStats();
       // Startup deferred ipfilter load may still be in flight — re-poll
@@ -537,9 +589,69 @@
     >
       {showUrlForm ? m.common_cancel() : m.security_from_url()}
     </button>
-    <button class="ghost" onclick={() => void loadStats({ offset: listOffset })} disabled={loading}>{m.common_refresh()}</button>
+    <button
+      class="ghost"
+      onclick={() => { showBanned = !showBanned; if (showBanned) void loadBanned(); }}
+      aria-expanded={showBanned}
+      aria-controls="banned-users-panel"
+    >
+      {m.security_banned_users()}
+      {#if bannedPeers.length > 0}
+        <span class="count-pill">{formatNumber(bannedPeers.length)}</span>
+      {/if}
+    </button>
+    <button
+      class="ghost"
+      onclick={() => { void loadStats({ offset: listOffset }); void loadBanned(); }}
+      disabled={loading}
+    >{m.common_refresh()}</button>
   </div>
 </div>
+
+{#if showBanned}
+  <section id="banned-users-panel" class="banned-panel" aria-label={m.security_banned_users()}>
+    <p class="banned-hint">{m.security_banned_users_hint()}</p>
+    {#if bannedPeers.length === 0}
+      <p class="banned-empty">{m.security_banned_users_empty()}</p>
+    {:else}
+      <div class="banned-scroll">
+        <table class="banned-table">
+          <thead>
+            <tr>
+              <th>{m.security_banned_col_user()}</th>
+              <th>{m.security_banned_col_client()}</th>
+              <th>{m.security_banned_col_address()}</th>
+              <th class="col-unban"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each bannedPeers as peer (peer.user_hash)}
+              <tr>
+                <td>
+                  <div class="banned-user">
+                    <bdi dir="auto" class="banned-name">{bannedName(peer)}</bdi>
+                    <span class="banned-hash" title={peer.user_hash}>{peer.user_hash}</span>
+                  </div>
+                </td>
+                <td class="banned-client"><bdi dir="auto">{peer.client_software || '\u2014'}</bdi></td>
+                <td class="banned-addr" title={peer.addresses.join('\n')}>{lastAddress(peer)}</td>
+                <td class="col-unban">
+                  <button
+                    type="button"
+                    class="ghost unban-btn"
+                    onclick={() => void handleUnban(peer)}
+                    disabled={unbanning.includes(peer.user_hash)}
+                    aria-label={m.security_unban_aria({ name: bannedName(peer) })}
+                  >{m.security_unban()}</button>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+  </section>
+{/if}
 
 {#if showUrlForm}
   <div id="ipfilter-url-form" class="ipfilter-url-form" role="group" aria-label={m.security_fetch_url_aria()}>
@@ -837,6 +949,106 @@
   }
   .ipfilter-url-form button {
     flex-shrink: 0;
+  }
+
+  .count-pill {
+    display: inline-block;
+    min-width: 18px;
+    margin-left: 6px;
+    padding: 0 6px;
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--danger) 18%, transparent);
+    color: var(--danger);
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    line-height: 18px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Banned users: same placement as the URL form, bounded so a long ban list
+     never pushes the IP filter table off the page. */
+  .banned-panel {
+    padding: 10px 16px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+  }
+  .banned-hint,
+  .banned-empty {
+    margin: 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+  }
+  .banned-empty {
+    padding-top: 6px;
+    color: var(--text-secondary);
+  }
+  .banned-scroll {
+    margin-top: 8px;
+    max-height: 220px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .banned-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--font-size-sm);
+    table-layout: fixed;
+  }
+  .banned-table th {
+    position: sticky;
+    top: 0;
+    padding: 4px 8px;
+    text-align: left;
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    color: var(--text-secondary);
+    background: var(--bg-surface);
+    border-bottom: 1px solid var(--border);
+  }
+  .banned-table td {
+    padding: 4px 8px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
+  }
+  .banned-table tbody tr:last-child td {
+    border-bottom: none;
+  }
+  .banned-user {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .banned-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--text-primary);
+  }
+  .banned-hash {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+  }
+  .banned-client {
+    color: var(--text-secondary);
+  }
+  .banned-addr {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+  .banned-table th.col-unban,
+  .col-unban {
+    width: 96px;
+    text-align: right;
+  }
+  .unban-btn {
+    font-size: var(--font-size-sm);
+    padding: 2px 10px;
   }
 
   /* --- Banners --- */

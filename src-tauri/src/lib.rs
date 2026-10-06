@@ -2444,6 +2444,8 @@ pub fn run() {
             commands::sharing::remove_missing_files,
             commands::peers::get_network_stats,
             commands::peers::ban_peer,
+            commands::peers::unban_peer,
+            commands::peers::get_banned_peers,
             commands::peers::add_friend,
             commands::peers::remove_friend,
             commands::peers::block_friend,

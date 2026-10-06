@@ -22,7 +22,7 @@
   import { previewFile } from '$lib/api/preview';
   import { addFriend, getFriends } from '$lib/api/friends';
   import { beginFriendsListFetch, commitFriendsList } from '$lib/stores/friends';
-  import { banPeer } from '$lib/api/kad';
+  import { banPeer, getBannedPeers, unbanPeer } from '$lib/api/kad';
   import { getPeerReputationBatch, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
   import {
     formatSize, formatSpeed, formatDate, formatDateWithYear, formatDurationSecs,
@@ -386,6 +386,7 @@
     // is showing, so it primes its own count.
     void refreshKnownCounts();
     void refreshFriendHashes();
+    void refreshBanned();
     listen<{
       transfer_id: string; ip: string; port: number; status: string;
       queue_rank?: number; speed: number; transferred: number; client_software: string; peer_name: string;
@@ -1371,6 +1372,38 @@
         knownCopyTimer = undefined;
       }, 1400);
     }
+  }
+
+  // Manual bans, keyed by lowercase user hash to the id the ban was stored
+  // under, which is what an unban has to name. The Trust badge cannot stand in
+  // for this: its reputation mirror of a manual ban expires, the ban does not.
+  let bannedIds = $state<Map<string, string>>(new Map());
+  async function refreshBanned() {
+    try {
+      const peers = await getBannedPeers();
+      if (!mounted) return;
+      bannedIds = new Map(peers.map((p) => [p.user_hash.toLowerCase(), p.user_hash]));
+    } catch (e) {
+      // Non-fatal: without the list every peer just offers Ban.
+      console.warn('Failed to load banned peers:', e);
+    }
+  }
+  function bannedIdOf(userHash: string | null | undefined): string | undefined {
+    return userHash ? bannedIds.get(userHash.toLowerCase()) : undefined;
+  }
+  async function unbanUser(userHash: string, name: string) {
+    const id = bannedIdOf(userHash);
+    if (!id) return;
+    await unbanPeer(id);
+    const next = new Map(bannedIds);
+    next.delete(userHash.toLowerCase());
+    bannedIds = next;
+    // Same invalidation as a ban, so the Trust badge drops "banned" now.
+    const reps = { ...reputationMap };
+    delete reps[userHash];
+    reputationMap = reps;
+    void refreshReputations([userHash], true);
+    showInfo(m.transfers_unbanned_user({ name }));
   }
 
   async function refreshFriendHashes() {
@@ -3229,6 +3262,14 @@
           };
           return;
         }
+        case 'unban_user':
+          await unbanUser(
+            kc.user_hash,
+            (kc.ember_hash && friendNickById[kc.ember_hash.toLowerCase()])
+              || kc.peer_name
+              || kc.user_hash.slice(0, 8) + '\u2026',
+          );
+          break;
       }
     } catch (e: unknown) {
       transferError = toErrorMsg(e);
@@ -3357,6 +3398,10 @@
           };
           return;
         }
+        case 'unban_user':
+          if (!t.user_hash) { transferError = m.transfers_no_user_hash(); break; }
+          await unbanUser(t.user_hash, t.peer_name || t.user_hash.slice(0, 8) + '\u2026');
+          break;
       }
     } catch (e: unknown) { transferError = toErrorMsg(e); }
   }
@@ -6891,7 +6936,11 @@
       >{m.search_ctx_find_related()}</button>
       {#if ctxTransfer.user_hash}
         <div class="ctx-sep" role="separator"></div>
-        <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('ban_user')}>{m.transfers_ctx_ban_user()}</button>
+        {#if bannedIdOf(ctxTransfer.user_hash)}
+          <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unban_user')}>{m.transfers_ctx_unban_user()}</button>
+        {:else}
+          <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('ban_user')}>{m.transfers_ctx_ban_user()}</button>
+        {/if}
       {/if}
     {/if}
   </div>
@@ -6928,9 +6977,15 @@
       {/if}
     {/if}
     <div class="ctx-sep" role="separator"></div>
-    <button class="ctx-item ctx-danger" role="menuitem" onclick={() => knownCtxAction('ban_user')}>
-      {m.transfers_ctx_ban_user()}
-    </button>
+    {#if bannedIdOf(knownCtxMenu.client.user_hash)}
+      <button class="ctx-item" role="menuitem" onclick={() => knownCtxAction('unban_user')}>
+        {m.transfers_ctx_unban_user()}
+      </button>
+    {:else}
+      <button class="ctx-item ctx-danger" role="menuitem" onclick={() => knownCtxAction('ban_user')}>
+        {m.transfers_ctx_ban_user()}
+      </button>
+    {/if}
   </div>
 {/if}
 
@@ -6964,6 +7019,7 @@
       delete next[confirmBan.userHash];
       reputationMap = next;
       void refreshReputations([confirmBan.userHash], true);
+      void refreshBanned();
       showInfo(m.transfers_banned_user({ name: confirmBan.name }));
     } catch (e: unknown) {
       transferError = toErrorMsg(e);

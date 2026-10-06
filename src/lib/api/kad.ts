@@ -15,6 +15,27 @@ export async function banPeer(peerId: string): Promise<void> {
   return invoke('ban_peer', { peerId });
 }
 
+export async function unbanPeer(peerId: string): Promise<void> {
+  return invoke('unban_peer', { peerId });
+}
+
+/** A peer the user banned. `name` and `client_software` are what its credit
+ *  record last saw, and empty when it never learned them. */
+export interface BannedPeer {
+  /** The id the ban was placed under (the peer's eD2K user hash, hex) —
+   *  pass it back to `unbanPeer` unchanged. */
+  user_hash: string;
+  name: string;
+  client_software: string;
+  /** `ip:port` in the order they were recorded; the port is 0 when only the
+   *  IP was captured. */
+  addresses: string[];
+}
+
+export async function getBannedPeers(): Promise<BannedPeer[]> {
+  return invoke('get_banned_peers');
+}
+
 export async function kadConnect(): Promise<void> {
   return withTimeout(invoke('kad_connect'), 'KAD connect');
 }

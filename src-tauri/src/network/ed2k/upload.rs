@@ -2857,10 +2857,11 @@ pub enum UploadEventKind {
     PeerAutoBanned {
         ip: std::net::Ipv4Addr,
         reason: String,
-        /// When set, the IP is also recorded against this peer's DB record,
-        /// so it lasts as long as the manual ban does. `None` for anonymous
-        /// abuse auto-bans (AddRequestCount etc.), which instead self-heal on
-        /// eMule's `CLIENTBANTIME` — see `AUTO_BAN_TTL_BEHAVIOUR_SECS`.
+        /// When set, the IP is also recorded against this peer's DB record
+        /// so a later manual `unban_peer` clears it (ban/unban symmetry).
+        /// `None` for anonymous abuse auto-bans (AddRequestCount etc.), which
+        /// have no manual unban path and instead self-heal on eMule's
+        /// `CLIENTBANTIME` — see `AUTO_BAN_TTL_BEHAVIOUR_SECS`.
         user_hash: Option<[u8; 16]>,
     },
 }
@@ -8760,8 +8761,9 @@ impl UploadHandler {
                                     ip: peer_v4,
                                     reason: "manual peer ban (captured from live upload session)"
                                         .to_string(),
-                                    // Associate with the banned peer so this
-                                    // captured IP lives with its manual ban.
+                                    // Associate with the banned peer so a later
+                                    // unban_peer (which walks the peer's known
+                                    // addresses) also clears this captured IP.
                                     user_hash: (peer_user_hash != [0u8; 16])
                                         .then_some(peer_user_hash),
                                 },

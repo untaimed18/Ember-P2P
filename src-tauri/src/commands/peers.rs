@@ -1541,6 +1541,76 @@ pub async fn ban_peer(state: tauri::State<'_, AppState>, peer_id: String) -> Res
 }
 
 #[tauri::command]
+pub async fn unban_peer(state: tauri::State<'_, AppState>, peer_id: String) -> Result<(), String> {
+    if peer_id.len() != 32 || !peer_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(coded(
+            "peers_invalid_peer_id",
+            "Invalid peer ID (expected 32 hex characters)",
+        ));
+    }
+
+    let db = state.db.clone();
+    let pid = peer_id.clone();
+    tokio::task::spawn_blocking(move || db.unban_peer(&pid))
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_unban_peer", "Failed to unban peer", e))?;
+
+    // Unban is already persisted to the DB above; the network task
+    // notification only refreshes the in-memory banned-IPs cache. If
+    // the channel is full the cache catches up on next refresh cycle
+    // — the user shouldn't see "unban failed" when the row is gone.
+    if let Err(e) = state.network_tx.try_send(NetworkCommand::UnbanPeer {
+        peer_id_hex: peer_id,
+    }) {
+        tracing::warn!(
+            "Peer unbanned in DB, but cache refresh was not enqueued (channel full): {e}"
+        );
+    }
+
+    Ok(())
+}
+
+/// A peer the user banned, as the Security page lists it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BannedPeerInfo {
+    /// The id the ban was placed under: the peer's eD2K user hash, hex.
+    pub user_hash: String,
+    /// Last name and client software the peer's credit record saw; empty
+    /// when we never learned them.
+    pub name: String,
+    pub client_software: String,
+    /// Addresses recorded against the ban, `ip:port`.
+    pub addresses: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn get_banned_peers(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<BannedPeerInfo>, String> {
+    let db = state.db.clone();
+    let rows = tokio::task::spawn_blocking(move || db.get_banned_peers())
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| {
+            coded_ctx(
+                "peers_failed_load_banned_peers",
+                "Failed to load banned peers",
+                e,
+            )
+        })?;
+    Ok(rows
+        .into_iter()
+        .map(|(user_hash, addresses, name, client_software)| BannedPeerInfo {
+            user_hash,
+            name,
+            client_software,
+            addresses,
+        })
+        .collect())
+}
+
+#[tauri::command]
 pub fn kad_connect(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state
         .network_tx
