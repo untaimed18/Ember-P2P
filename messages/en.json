@@ -3704,6 +3704,8 @@
   "error_channels_forget_joined": "Leave the room before removing it from your list",
   "error_channels_forget_owned": "You own this room — delete it instead of removing it from your list",
   "error_channels_forget_failed": "Could not remove the room: {detail}",
+  "error_channels_remove_message_failed": "Could not remove the message: {detail}",
+  "error_channels_delete_failed": "Could not delete the room: {detail}",
   "error_channels_invite_failed": "Could not load the invite: {detail}",
   "error_channels_members_failed": "Could not load members: {detail}",
   "error_channels_messages_failed": "Could not load messages: {detail}",

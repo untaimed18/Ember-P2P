@@ -3680,6 +3680,8 @@
   "error_channels_forget_joined": "Sal de la sala antes de quitarla de tu lista",
   "error_channels_forget_owned": "Esta sala es tuya: elimínala en lugar de quitarla de tu lista",
   "error_channels_forget_failed": "No se pudo quitar la sala: {detail}",
+  "error_channels_remove_message_failed": "No se pudo quitar el mensaje: {detail}",
+  "error_channels_delete_failed": "No se pudo eliminar la sala: {detail}",
   "error_channels_invite_failed": "No se pudo cargar la invitación: {detail}",
   "error_channels_members_failed": "No se pudieron cargar los miembros: {detail}",
   "error_channels_messages_failed": "No se pudieron cargar los mensajes: {detail}",

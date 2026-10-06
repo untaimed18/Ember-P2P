@@ -3680,6 +3680,8 @@
   "error_channels_forget_joined": "Выйдите из комнаты, прежде чем убирать её из списка",
   "error_channels_forget_owned": "Эта комната принадлежит вам — удалите её, а не убирайте из списка",
   "error_channels_forget_failed": "Не удалось убрать комнату: {detail}",
+  "error_channels_remove_message_failed": "Не удалось убрать сообщение: {detail}",
+  "error_channels_delete_failed": "Не удалось удалить комнату: {detail}",
   "error_channels_invite_failed": "Не удалось загрузить приглашение: {detail}",
   "error_channels_members_failed": "Не удалось загрузить участников: {detail}",
   "error_channels_messages_failed": "Не удалось загрузить сообщения: {detail}",

@@ -1820,7 +1820,8 @@ pub async fn update_settings(
         crate::commands::channels::apply_channel_username_locally(
             &state,
             &settings.channel_username,
-        );
+        )
+        .await;
     }
 
     // Keep the synchronous mirror used by the close-event handler in sync

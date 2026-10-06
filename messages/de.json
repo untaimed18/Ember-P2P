@@ -3704,6 +3704,8 @@
   "error_channels_forget_joined": "Verlassen Sie den Raum, bevor Sie ihn aus Ihrer Liste entfernen",
   "error_channels_forget_owned": "Dieser Raum gehört Ihnen – löschen Sie ihn, statt ihn aus Ihrer Liste zu entfernen",
   "error_channels_forget_failed": "Raum konnte nicht entfernt werden: {detail}",
+  "error_channels_remove_message_failed": "Nachricht konnte nicht entfernt werden: {detail}",
+  "error_channels_delete_failed": "Raum konnte nicht gelöscht werden: {detail}",
   "error_channels_invite_failed": "Einladung konnte nicht geladen werden: {detail}",
   "error_channels_members_failed": "Mitglieder konnten nicht geladen werden: {detail}",
   "error_channels_messages_failed": "Nachrichten konnten nicht geladen werden: {detail}",

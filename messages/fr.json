@@ -3680,6 +3680,8 @@
   "error_channels_forget_joined": "Quittez le salon avant de le retirer de votre liste",
   "error_channels_forget_owned": "Ce salon vous appartient : supprimez-le au lieu de le retirer de votre liste",
   "error_channels_forget_failed": "Impossible de retirer le salon : {detail}",
+  "error_channels_remove_message_failed": "Impossible de retirer le message : {detail}",
+  "error_channels_delete_failed": "Impossible de supprimer le salon : {detail}",
   "error_channels_invite_failed": "Impossible de charger l’invitation : {detail}",
   "error_channels_members_failed": "Impossible de charger les membres : {detail}",
   "error_channels_messages_failed": "Impossible de charger les messages : {detail}",

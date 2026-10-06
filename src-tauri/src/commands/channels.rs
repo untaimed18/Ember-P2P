@@ -530,7 +530,7 @@ async fn persist_channel_username(state: &AppState, username: &str) -> Result<()
         .try_send(NetworkCommand::UpdateSettings {
             settings: Box::new(new_settings),
         });
-    apply_channel_username_locally(state, username);
+    apply_channel_username_locally(state, username).await;
     Ok(())
 }
 
@@ -540,9 +540,17 @@ async fn persist_channel_username(state: &AppState, username: &str) -> Result<()
 /// the network loop has swapped its settings copy lets it publish the old
 /// handle into the newly-due slots. The loop does that work when it applies
 /// `UpdateSettings`.
-pub(crate) fn apply_channel_username_locally(state: &AppState, username: &str) {
+pub(crate) async fn apply_channel_username_locally(state: &AppState, username: &str) {
     let pk = hex::encode(state.identity.ed25519_public_key);
-    let _ = state.db.rename_self_channel_member(&pk, username);
+    let db = state.db.clone();
+    let username = username.to_string();
+    // Off the async worker: the write waits on the connection lock the
+    // network loop holds for its own database work.
+    let outcome =
+        tokio::task::spawn_blocking(move || db.rename_self_channel_member(&pk, &username)).await;
+    if let Ok(Err(e)) = outcome {
+        tracing::warn!(error = %e, "could not rename our own room roster rows");
+    }
 }
 
 /// Claim `username` on Rendezvous and return the stored display form.
@@ -1383,9 +1391,17 @@ pub async fn leave_channel(
     // every other roster until we aged out twenty minutes later — with nothing
     // that could notice or try again. The network loop owns the retry, exactly
     // as it does for a live announcement, and clears the marker once one lands.
-    let _ = state
-        .db
-        .mark_channel_departure_due(&channel_id, chrono::Utc::now().timestamp());
+    let db = state.db.clone();
+    let id = channel_id.clone();
+    let now = chrono::Utc::now().timestamp();
+    // The leave itself is done by here, so a failure to note it as owed is
+    // reported in the log rather than to the user, who could do nothing with
+    // it; the room still ages off other rosters when presence lapses.
+    match tokio::task::spawn_blocking(move || db.mark_channel_departure_due(&id, now)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(channel_id = %channel_id, error = %e, "could not record the departure notice as owed"),
+        Err(e) => tracing::warn!(channel_id = %channel_id, error = %e, "departure notice task failed"),
+    }
     Ok(())
 }
 
@@ -1475,12 +1491,17 @@ pub async fn delete_owned_channel(
     ))
     .await
     .map_err(|e| registry_fail(e, "channels_name_taken"))?;
+    // Every moderation command holds this from its load to its commit, so
+    // taking it here lets one already past its check finish before the purge,
+    // instead of signing a fresh record for the room straight after it. Taken
+    // after the registry call, which can wait seconds on the network.
+    let _snapshot = moderation_lock().lock().await;
     let db = state.db.clone();
     let id = channel_id.clone();
     tokio::task::spawn_blocking(move || db.tombstone_channel(&id))
         .await
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-        .map_err(|e| coded_ctx("channels_leave_failed", "Failed to leave channel", e))?;
+        .map_err(|e| coded_ctx("channels_delete_failed", "Failed to delete the room", e))?;
     if let Ok(bytes) = hex::decode(&channel_id) {
         if let Ok(id) = <[u8; 16]>::try_from(bytes.as_slice()) {
             let _ = state
@@ -2224,7 +2245,7 @@ pub async fn delete_channel_message(
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-    .map_err(|e| coded_ctx("channels_messages_failed", "Could not remove the message", e))?;
+    .map_err(|e| coded_ctx("channels_remove_message_failed", "Could not remove the message", e))?;
     if !removed {
         return Err(coded("channels_not_found", "Message not found"));
     }

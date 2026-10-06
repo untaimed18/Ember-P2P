@@ -699,6 +699,12 @@ pub(super) async fn handle_inbound_channel_relay(
         .await;
         return;
     }
+    // Only a frame of the room the envelope names, which is the room the
+    // gates below are about. Unchecked, any hop could have us carry its frames
+    // for some other room to members of ours.
+    if ember::channel::ChannelGossip::decode(inner).is_none_or(|frame| frame.channel_id != channel_id) {
+        return;
+    }
     let in_room = cached_channel_view(state, db, channel_id)
         .is_some_and(|view| view.row.in_room_now());
     let roster = if in_room {
@@ -725,6 +731,11 @@ pub(super) async fn handle_inbound_channel_relay(
     };
     let live = ember_has_live_session(state, &contact);
     if !ember::channel::inbound_channel_relay_may_forward(in_room, target_on_roster, live) {
+        return;
+    }
+    // A forward is a relay like any other, so it spends the same allowance.
+    if !channel_gossip_rate_ok(state, false) {
+        debug!("Ember channel relay: forward for {from_id} over the relay budget");
         return;
     }
     let (_rid, frame) = state.ember_dht.build_channel_msg(inner.to_vec());
@@ -809,16 +820,23 @@ pub(super) async fn handle_inbound_channel_gossip(
         forget_channel_gossip(state, &dedup_key);
         return;
     };
-    if variant
-        && ember::channel::decode_channel_chat_plain(
-            &plain,
-            &gossip.channel_id,
-            &gossip.msg_id,
-            gossip.timestamp,
-        )
-        .is_none()
-    {
-        return;
+    if variant {
+        if ember::channel::is_chat_plain(&plain) {
+            if ember::channel::decode_channel_chat_plain(
+                &plain,
+                &gossip.channel_id,
+                &gossip.msg_id,
+                gossip.timestamp,
+            )
+            .is_none()
+            {
+                return;
+            }
+        } else if !take_chat_claimed_id(&gossip.msg_id) {
+            // Another body under an id a non-chat frame already holds: a
+            // re-sealed retry or a replay, and nothing the first did not say.
+            return;
+        }
     }
     // Ember Transfer frames are addressed to one member and never relayed on,
     // so they are matched before the gossip types and always return.
@@ -1216,6 +1234,9 @@ pub(super) async fn handle_inbound_channel_gossip(
     };
     let sender_hex = hex::encode(sender_pk);
     let msg_id_hex = hex::encode(gossip.msg_id);
+    if !variant {
+        note_chat_claimed_id(gossip.msg_id);
+    }
     // Ahead of the rate charge: our own lines echo back as variants, and a line
     // we already hold says nothing new to us or to the mesh.
     if variant
@@ -1667,6 +1688,44 @@ async fn apply_room_friend_request(
 /// Live ownership offers seen flooding each room, for deciding which readies
 /// to relay. Held beside the event loop's state rather than in it because only
 /// the handoff handlers read it.
+/// Envelope ids whose first frame here was a chat line, kept for the non-chat
+/// frame it may have squatted on.
+///
+/// A chat line's signature covers its envelope id, but a ban, handoff, edit or
+/// beacon travels under a random id its own signature does not, and the id is
+/// in the clear. A member who saw a moderator's ban go past could flood their
+/// own valid line under its id; every node that line reached first then took
+/// the real ban for a variant and dropped it, since only chat variants were
+/// let through. One non-chat frame is let through under such an id.
+const CHAT_CLAIMED_IDS_CAP: usize = 4096;
+
+fn chat_claimed_ids() -> &'static parking_lot::Mutex<(HashSet<[u8; 16]>, std::collections::VecDeque<[u8; 16]>)> {
+    static IDS: std::sync::OnceLock<
+        parking_lot::Mutex<(HashSet<[u8; 16]>, std::collections::VecDeque<[u8; 16]>)>,
+    > = std::sync::OnceLock::new();
+    IDS.get_or_init(Default::default)
+}
+
+fn note_chat_claimed_id(msg_id: [u8; 16]) {
+    let mut guard = chat_claimed_ids().lock();
+    let (ids, order) = &mut *guard;
+    if !ids.insert(msg_id) {
+        return;
+    }
+    order.push_back(msg_id);
+    while order.len() > CHAT_CLAIMED_IDS_CAP {
+        if let Some(old) = order.pop_front() {
+            ids.remove(&old);
+        }
+    }
+}
+
+/// Whether `msg_id` was claimed by a chat line, using that up: one rescue per
+/// id, so a squatted id cannot carry a stream of re-sealed copies.
+fn take_chat_claimed_id(msg_id: &[u8; 16]) -> bool {
+    chat_claimed_ids().lock().0.remove(msg_id)
+}
+
 /// Catch-up requests one room may have answered by this node per minute, from
 /// all askers together. Honest catch-up is one request per member every few
 /// minutes, so this is only reached by a burst of rejoins or by a flood.

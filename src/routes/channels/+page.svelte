@@ -1446,7 +1446,17 @@
 
   async function selectChannel(id: string) {
     const ch = $channelsStore.find((c) => c.channel_id === id);
-    if (!ch?.in_room) return;
+    if (!ch?.in_room) {
+      // A joined row the directory cache drew while the room list itself has
+      // never loaded: there is nothing here to open it from, and the click
+      // used to do nothing at all. Try the list again, and open the room if
+      // it arrives.
+      if (!ch && !channelsLoaded && !loading) {
+        await loadChannels();
+        if ($channelsStore.some((c) => c.channel_id === id && c.in_room)) await selectChannel(id);
+      }
+      return;
+    }
     activeChannelId.set(id);
     members = [];
     membersLoading = true;
@@ -2512,7 +2522,16 @@
   {#if error}
     <div class="banner error-banner" role="alert">
       <span>{error}</span>
-      <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
+      <!-- The full-page Retry only shows while the list is empty, and the
+           directory cache can fill it before the room list ever loads. -->
+      <div class="banner-actions">
+        {#if !channelsLoaded}
+          <button class="ghost" onclick={() => void loadChannels()} disabled={loading}>
+            {loading ? m.common_loading() : m.common_retry()}
+          </button>
+        {/if}
+        <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
+      </div>
     </div>
   {/if}
 
@@ -4156,6 +4175,12 @@
     font-size: var(--font-size-sm);
     font-weight: 600;
     color: var(--text-primary);
+  }
+
+  .banner-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
   }
 
   .banner {

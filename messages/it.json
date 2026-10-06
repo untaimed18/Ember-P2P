@@ -3680,6 +3680,8 @@
   "error_channels_forget_joined": "Esci dalla stanza prima di rimuoverla dal tuo elenco",
   "error_channels_forget_owned": "Questa stanza è tua: eliminala invece di rimuoverla dal tuo elenco",
   "error_channels_forget_failed": "Impossibile rimuovere la stanza: {detail}",
+  "error_channels_remove_message_failed": "Impossibile rimuovere il messaggio: {detail}",
+  "error_channels_delete_failed": "Impossibile eliminare la stanza: {detail}",
   "error_channels_invite_failed": "Impossibile caricare l'invito: {detail}",
   "error_channels_members_failed": "Impossibile caricare i membri: {detail}",
   "error_channels_messages_failed": "Impossibile caricare i messaggi: {detail}",

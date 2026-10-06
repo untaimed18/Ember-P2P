@@ -7791,6 +7791,10 @@ impl Database {
             "DELETE FROM channel_drafts WHERE channel_id = ?1",
             params![channel_id],
         )?;
+        // A claim followed in this room is about this room alone. The handoff
+        // loop would drop it on its next pass for want of a row; going with the
+        // row keeps who claimed it off the disk in between.
+        Self::delete_channel_handoff_commit_locked(&tx, channel_id)?;
         let n = tx.execute(
             "DELETE FROM channels WHERE channel_id = ?1",
             params![channel_id],

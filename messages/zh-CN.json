@@ -3680,6 +3680,8 @@
   "error_channels_forget_joined": "请先离开房间，再将其从列表中移除",
   "error_channels_forget_owned": "这个房间归你所有——请删除它，而不是从列表中移除",
   "error_channels_forget_failed": "无法移除房间：{detail}",
+  "error_channels_remove_message_failed": "无法移除消息：{detail}",
+  "error_channels_delete_failed": "无法删除房间：{detail}",
   "error_channels_invite_failed": "无法加载邀请：{detail}",
   "error_channels_members_failed": "无法加载成员：{detail}",
   "error_channels_messages_failed": "无法加载消息：{detail}",

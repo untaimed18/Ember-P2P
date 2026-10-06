@@ -1434,6 +1434,12 @@ pub struct ChannelGossip {
 // it still read, an impersonator would just send the old frame and the
 // signature would buy nothing.
 const CHAT_PLAIN_VERSION: u8 = 15;
+
+/// Whether an opened frame is a chat line by its leading byte, without the
+/// signature check `decode_channel_chat_plain` does.
+pub fn is_chat_plain(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&CHAT_PLAIN_VERSION)
+}
 // 2 was unsigned moderator gossip. Same hole chat closed: the content key
 // proves membership, not who sent the frame. Retired rather than accepted
 // alongside, or an impersonator would just send the old frame.
