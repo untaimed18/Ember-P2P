@@ -316,6 +316,40 @@ pub const EMBER_EXT_BROWSE_SCOPE: u8 = 0x0B;
 /// it and simply cannot tell the listing was cut short.
 pub const EMBER_EXT_BROWSE_SUMMARY: u8 = 0x0C;
 
+/// [`OP_EMBER_EXT`] sub-type: "I am sending you a DHT `PING` from my Ember UDP
+/// socket — send me one too." A friend-coordinated simultaneous open, for a
+/// friend we hold a session with but cannot reach as a DHT contact: each
+/// outbound `PING` opens the return path through its sender's own NAT, and
+/// whichever lands first is answered with a signed `PONG` that admits its
+/// sender through the ordinary path.
+///
+/// Body is [`encode_dht_meet`]: the sender's Ember UDP port and whether this
+/// is the answer to one. The port is claimed because it cannot be observed;
+/// the IP never travels and is always taken from the session itself, so a
+/// friend cannot aim our `PING` at a third party. The frame grants nothing —
+/// only a real `PONG` creates a contact. A peer that predates it ignores it.
+pub const EMBER_EXT_DHT_MEET: u8 = 0x0D;
+
+const DHT_MEET_FLAG_ANSWER: u8 = 0x01;
+
+/// [`EMBER_EXT_DHT_MEET`] body: `udp_port(2, LE) || flags(1)`.
+pub fn encode_dht_meet(udp_port: u16, answer: bool) -> [u8; 3] {
+    let [lo, hi] = udp_port.to_le_bytes();
+    [lo, hi, if answer { DHT_MEET_FLAG_ANSWER } else { 0 }]
+}
+
+/// The claimed UDP port and the answer flag, or `None` for a body too short
+/// or naming port zero. Longer bodies are read for what they start with, so a
+/// later build can append fields.
+pub fn decode_dht_meet(body: &[u8]) -> Option<(u16, bool)> {
+    let port = u16::from_le_bytes([*body.first()?, *body.get(1)?]);
+    if port == 0 {
+        return None;
+    }
+    let answer = body.get(2).is_some_and(|flags| flags & DHT_MEET_FLAG_ANSWER != 0);
+    Some((port, answer))
+}
+
 /// Wrap `body` in an [`OP_EMBER_EXT`] payload under `ext_type`.
 pub fn build_ember_ext(ext_type: u8, body: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(1 + body.len());
@@ -3318,6 +3352,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_dht_meet_body_round_trips_and_refuses_port_zero() {
+        assert_eq!(decode_dht_meet(&encode_dht_meet(4672, false)), Some((4672, false)));
+        assert_eq!(decode_dht_meet(&encode_dht_meet(51_000, true)), Some((51_000, true)));
+        assert_eq!(decode_dht_meet(&[0x40, 0x12]), Some((0x1240, false)), "flags are optional");
+        assert_eq!(decode_dht_meet(&[0x40, 0x12, 0x01, 0xAA]), Some((0x1240, true)));
+        assert_eq!(decode_dht_meet(&encode_dht_meet(0, false)), None);
+        assert_eq!(decode_dht_meet(&[0x40]), None);
+    }
+
     /// Sub-types dispatch off one byte with no length or type tag around it, so
     /// a duplicate would silently route one message into the other's handler.
     #[test]
@@ -3335,6 +3379,7 @@ mod tests {
             EMBER_EXT_ATTACH_CANCEL,
             EMBER_EXT_BROWSE_SCOPE,
             EMBER_EXT_BROWSE_SUMMARY,
+            EMBER_EXT_DHT_MEET,
         ];
         let mut seen = std::collections::HashSet::new();
         for sub_type in sub_types {

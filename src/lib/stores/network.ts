@@ -1,4 +1,4 @@
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { DegradedReason, NetworkStats, ServerLogLine } from '$lib/types';
@@ -6,8 +6,6 @@ import { getNetworkStats } from '$lib/api/kad';
 import { getServerLog } from '$lib/api/server';
 import { relatedSearchSupported as apiRelatedSearchSupported } from '$lib/api/search';
 import { isAppVisible, withTimeout } from '$lib/utils';
-import { getSettings, updateSettings } from '$lib/api/settings';
-import { setAppSettings } from '$lib/stores/settings';
 import { addToast, removeToast, toast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
 import { appendServerLog, hydrateServerLog } from '$lib/stores/serverLog';
 import { friendDisplayName } from '$lib/stores/friends';
@@ -119,11 +117,19 @@ function narrowServerStatus(raw: unknown): ServerStatus | undefined {
     : undefined;
 }
 
-// True once UPnP has been auto-disabled this session after a failed start-up
-// mapping. Lets UI (e.g. the KAD-page UPnP tile) show "Disabled" immediately,
-// without waiting for the persisted setting to round-trip back through
-// `getSettings`. Reset on store teardown.
-export const upnpAutoDisabled = writable<boolean>(false);
+/** Inbound TCP proven by something other than a UPnP forward: the firewall
+ *  check's connect-back, or a HighID from the eD2K server. */
+export function reachableWithoutUpnp(
+  stats: Pick<NetworkStats, 'tcp_status' | 'ed2k_low_id'>,
+): boolean {
+  return stats.tcp_status === 'Open' || stats.ed2k_low_id === false;
+}
+
+// How long a failed first UPnP result waits for that proof before it warns.
+// The firewall check and an eD2K login normally settle within a minute or two
+// of start-up, so a user who forwards ports by hand (often through a VPN)
+// never sees a warning that does not apply to them.
+export const UPNP_WARNING_GRACE_MS = 3 * 60_000;
 
 let initialized = false;
 let unlisteners: UnlistenFn[] = [];
@@ -138,47 +144,72 @@ let lastPollOkAt = 0;
 let storeEpoch = 0;
 // Last UPnP mapped state we surfaced, so we only toast on transitions.
 // `null` until the backend's startup `upnp-status` event arrives: that first
-// event sets the baseline (warning if it failed, silence if it succeeded —
-// working UPnP is the expected case and shouldn't pop a toast). Subsequent
-// events are real changes (recovery / loss) and are always toasted.
+// event sets the baseline (a warning if it failed and nothing else shows we
+// are reachable, silence if it succeeded — working UPnP is the expected case
+// and shouldn't pop a toast). Later events are real changes (recovery / loss).
 let lastUpnpMapped: boolean | null = null;
+let lastUpnpStoodDown = false;
 // Id of the current sticky UPnP failure toast (if any). UPnP-failure toasts
 // don't auto-dismiss — port forwarding is broken until the user acts, so the
 // warning must persist until they close it. We track the id so we can retract
 // the stale warning ourselves once the mapping recovers, instead of leaving a
 // permanent "UPnP failed" toast next to a "restored" one.
 let upnpToastId: number | null = null;
+// Whether the live warning is the start-up failure, which proof of
+// reachability retracts. A "lost" warning is not: the proof it would be
+// checked against was most likely earned through the forward that just went.
+let upnpToastRetractable = false;
+// Whether a UPnP warning reached the user this session, so "restored" is only
+// said to someone who was told something was wrong.
+let upnpWarningShown = false;
+// The start-up failure warning waiting out `UPNP_WARNING_GRACE_MS`, and the
+// watch that cancels or retracts it once peers are shown to reach us.
+let upnpWarningTimer: ReturnType<typeof setTimeout> | null = null;
+let upnpReachUnsubscribe: (() => void) | null = null;
 
 function clearUpnpToast() {
   if (upnpToastId !== null) {
     removeToast(upnpToastId);
     upnpToastId = null;
   }
+  upnpToastRetractable = false;
 }
 
-// Guard so we persist the auto-disable at most once per session even if the
-// backend somehow re-reports the failure. Reset on store teardown.
-let upnpAutoDisablePersisted = false;
+function showUpnpWarning(message: string, retractable: boolean) {
+  clearUpnpToast();
+  upnpToastId = addToast('warning', message, 0);
+  upnpToastRetractable = retractable;
+  upnpWarningShown = true;
+}
 
-// Persist `upnp_enabled = false` after the backend auto-disabled UPnP for a
-// failed mapping. The network task has already stopped using UPnP for this
-// session; this just makes the choice stick (and reflects it in the Settings
-// UI) so the next launch doesn't retry a setup the router can't satisfy. The
-// user can re-enable it in Settings once they've fixed forwarding.
-async function persistUpnpDisabled() {
-  if (upnpAutoDisablePersisted) return;
-  upnpAutoDisablePersisted = true;
-  try {
-    const current = await getSettings();
-    if (current.upnp_enabled) {
-      const updated = { ...current, upnp_enabled: false };
-      const result = await updateSettings(updated);
-      setAppSettings(result.settings);
-    }
-  } catch {
-    // Let a later event retry — the on-disk setting wasn't changed.
-    upnpAutoDisablePersisted = false;
+function stopUpnpReachWatch() {
+  if (upnpWarningTimer !== null) {
+    clearTimeout(upnpWarningTimer);
+    upnpWarningTimer = null;
   }
+  upnpReachUnsubscribe?.();
+  upnpReachUnsubscribe = null;
+}
+
+/** Warn that UPnP could not forward the ports, unless something else shows
+ *  peers can reach us: now, within the grace period, or after the warning is
+ *  up, in which case it is taken down again. */
+function warnUpnpFailedUnlessReachable(message: string) {
+  stopUpnpReachWatch();
+  clearUpnpToast();
+  if (reachableWithoutUpnp(get(networkStats))) return;
+  const epoch = storeEpoch;
+  upnpWarningTimer = setTimeout(() => {
+    upnpWarningTimer = null;
+    if (epoch !== storeEpoch) return;
+    showUpnpWarning(message, true);
+  }, UPNP_WARNING_GRACE_MS);
+  // The synchronous first call sees the value checked just above.
+  upnpReachUnsubscribe = networkStats.subscribe((stats) => {
+    if (!reachableWithoutUpnp(stats)) return;
+    stopUpnpReachWatch();
+    if (upnpToastRetractable) clearUpnpToast();
+  });
 }
 
 function syncServerStatus(stats: NetworkStats) {
@@ -321,12 +352,12 @@ export async function initNetworkStore() {
     // `upnp_mapped` in the store fresh from here so the KAD-page tile updates
     // immediately, and toast the user when automatic forwarding isn't working
     // so they can set up manual port forwarding if peers can't reach them.
-    // `auto_disabled` is set when the backend turned UPnP off after a failed
-    // start-up mapping; we then persist the setting so it stays off.
+    // `stood_down` is set while the backend has removed forwards that could
+    // not reach this computer; that needs nothing from the user.
     registered.push(await listen<{
       mapped: boolean;
       gateway_found: boolean;
-      auto_disabled: boolean;
+      stood_down: boolean;
       tcp_port: number;
       udp_port: number;
     }>('upnp-status', (event) => {
@@ -342,33 +373,29 @@ export async function initNetworkStore() {
       lastNetworkUpdate = lastEventUpdate;
       const mapped = p.mapped;
       const gateway_found = p.gateway_found === true;
-      const auto_disabled = p.auto_disabled === true;
+      const stoodDown = p.stood_down === true;
       const tcp_port = typeof p.tcp_port === 'number' ? p.tcp_port : 0;
       const udp_port = typeof p.udp_port === 'number' ? p.udp_port : 0;
-      networkStats.update((s) => withDerivedNetworkState({ ...s, upnp_mapped: mapped }));
-
-      if (auto_disabled) {
-        upnpAutoDisabled.set(true);
-        void persistUpnpDisabled();
-      }
+      networkStats.update((s) =>
+        withDerivedNetworkState({ ...s, upnp_mapped: mapped, upnp_stood_down: stoodDown }),
+      );
 
       // Failure toasts are sticky (duration 0): they stay until the user
       // dismisses them with the X. Only one is ever live at a time — replace
       // any previous one so the message always reflects the latest state.
-      const showStickyWarning = (message: string) => {
+      if (stoodDown) {
+        stopUpnpReachWatch();
         clearUpnpToast();
-        upnpToastId = addToast('warning', message, 0);
-      };
-
-      if (lastUpnpMapped === null) {
-        // First report this session establishes the baseline. On a failure
-        // UPnP stays enabled and the backend keeps retrying the mapping in the
-        // background (the `maintain` tick), so the message points the user at
-        // manual port forwarding as a fallback rather than claiming UPnP was
-        // turned off. If a later retry succeeds, the recovery branch below
-        // retracts this warning.
+      } else if (lastUpnpMapped === null || lastUpnpStoodDown) {
+        // First report this session establishes the baseline, and so does the
+        // first after a stand-down ends: the forwards are being set up afresh.
+        // On a failure UPnP stays enabled and the backend keeps retrying the
+        // mapping in the background (the `maintain` tick), so the message
+        // points the user at manual port forwarding as a fallback rather than
+        // claiming UPnP was turned off. If a later retry succeeds, the
+        // recovery branch below retracts this warning.
         if (!mapped) {
-          showStickyWarning(
+          warnUpnpFailedUnlessReachable(
             gateway_found
               ? m.upnp_alert_failed_rejected({ tcp: tcp_port, udp: udp_port })
               : m.upnp_alert_failed_no_gateway({ tcp: tcp_port, udp: udp_port })
@@ -376,14 +403,18 @@ export async function initNetworkStore() {
         }
       } else if (mapped !== lastUpnpMapped) {
         if (mapped) {
-          // Recovered: retract the lingering failure warning and confirm.
+          // Recovered: retract the lingering failure warning, and confirm it
+          // to anyone who was told something was wrong.
+          stopUpnpReachWatch();
           clearUpnpToast();
-          toastSuccess(m.upnp_alert_restored());
+          if (upnpWarningShown) toastSuccess(m.upnp_alert_restored());
+          upnpWarningShown = false;
         } else {
-          showStickyWarning(m.upnp_alert_lost({ tcp: tcp_port, udp: udp_port }));
+          showUpnpWarning(m.upnp_alert_lost({ tcp: tcp_port, udp: udp_port }), false);
         }
       }
       lastUpnpMapped = mapped;
+      lastUpnpStoodDown = stoodDown;
     }));
     registered.push(await listen<{ message: string; transient?: boolean }>('network-error', (event) => {
       const message = typeof event.payload?.message === 'string' ? event.payload.message : '';
@@ -536,10 +567,11 @@ export function cleanupNetworkStore() {
   lastEventUpdate = 0;
   lastPollOkAt = 0;
   lastNetworkUpdate = 0;
+  stopUpnpReachWatch();
   clearUpnpToast();
   lastUpnpMapped = null;
-  upnpAutoDisablePersisted = false;
-  upnpAutoDisabled.set(false);
+  lastUpnpStoodDown = false;
+  upnpWarningShown = false;
   if (statsPollInterval !== null) {
     clearInterval(statsPollInterval);
     statsPollInterval = null;

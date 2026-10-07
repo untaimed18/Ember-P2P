@@ -1698,8 +1698,7 @@ pub async fn update_settings(
             // this one has to stay writable because the form saves it with
             // everything else, so it is provenance that is checked instead.
             // Only a *change* is gated: an unchanged path re-saved by a
-            // background caller (the UPnP auto-disable handler persists through
-            // here with no user present) never reaches this branch.
+            // background caller with no user present never reaches this branch.
             if !download_root_was_picked(std::path::Path::new(&settings.download_folder)) {
                 return Err(coded(
                     "settings_download_folder_not_picked",
@@ -1741,8 +1740,7 @@ pub async fn update_settings(
         //
         // Deliberately narrow. Re-approval grants the sandbox to whatever
         // object now sits at the path, and `update_settings` is also reached
-        // from background paths with no user present — the UPnP auto-disable
-        // handler persists through it from a network event. The flag says the
+        // from background paths with no user present. The flag says the
         // download folder was picked in Settings, but it travels over IPC, so
         // it is treated as a request rather than as consent and
         // `download_root_reapproval_authorized` decides.

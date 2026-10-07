@@ -592,9 +592,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
     let _ = app_handle.emit("network-status", NetworkStatus::Connecting);
 
-    // Mutable: a failed startup mapping auto-disables UPnP for the rest of
-    // this session (see the emission below), which gates off the maintenance
-    // retries, the QUIC port mapping, and the shutdown teardown.
+    // Read once: gates the maintenance retries, the QUIC port mapping and the
+    // shutdown teardown for the whole session, so a change applies at restart.
     let upnp_enabled = settings.upnp_enabled;
 
     // Defer UPnP gateway discovery/mapping and heavy disk loads until after
@@ -1026,6 +1025,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_gossip_reputation: ember::dht::gossip::GossipReputation::new(),
         ember_friend_contacts_asked: HashMap::new(),
         ember_friend_contacts_served: HashMap::new(),
+        ember_friend_meets_asked: HashMap::new(),
+        ember_friend_meets_pinged: HashMap::new(),
             ember_bridge_fast_at: None,
             ember_gossip_probe_window: (std::time::Instant::now(), 0),
             ember_publish_beat_acked: 0,
@@ -4156,11 +4157,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 if upnp_enabled && !upnp_maintain_in_flight {
                     let revision = upnp_mappings.revision();
                     let mut mappings = upnp_mappings.clone();
+                    let seen_ip = state.external_ip;
                     let tx = upnp_maintain_result_tx.clone();
                     upnp_maintain_in_flight = true;
                     upnp_maintain_started_at = Some(tokio::time::Instant::now());
                     upnp_maintain_handle = Some(tokio::spawn(async move {
-                        let mapped = mappings.maintain().await;
+                        let mapped = mappings.maintain(seen_ip).await;
                         let _ = tx.send(UpnpMaintainResult {
                             revision,
                             mappings,

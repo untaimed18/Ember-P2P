@@ -1364,9 +1364,28 @@ footer.doc-end {
   record would then never be first, never face an empty budget, and never be
   served, while the responder went on reporting it as held. A page therefore
   resumes at the earliest record it passed over, which re-sends the ones after
-  it; content-based dedup at the searcher absorbs that. Positions are advisory,
-  since the responder’s list shifts as records expire, so paging may repeat or
-  skip an entry.
+  it; content-based dedup at the searcher absorbs that. Positions alone are
+  advisory, since the responder’s list shifts as records expire; the resume
+  anchors below are what keeps a shift from skipping an entry.
+</p>
+<p>
+  <strong>Resume anchors.</strong> <span class="badge">additive</span>
+  A page follow-up may name, in the same optional block (tag <code>0x06</code>),
+  up to three 8-byte anchors: the record the last page ended on and the two
+  ahead of it, nearest first. An anchor is the first four bytes of a record’s
+  <code>file_hash</code> followed by the first four of its publisher key — the
+  pair records dedupe on, so it survives a republish, which replaces a record in
+  place under a new signature. The searcher finds that record without being
+  told: every record from the requested start up to <code>next_position</code>
+  was served, so blob <code>next_position − start_position − 1</code> is the
+  one the page ended on. The responder resumes after the first anchor it still
+  holds and falls back to <code>start_position</code> when it holds none, which
+  is also what a responder predating the tag does. Where an anchor moved the
+  start, the responder reports <code>next_position</code> and
+  <code>total_available</code> shifted by the same amount, so both stay in the
+  searcher’s numbering: progress past what it asked, exhaustion at
+  <code>next_position ≥ total_available</code>, and the blob arithmetic above
+  all still hold.
 </p>
 <p>
   <strong>Query constraints.</strong> <span class="badge">additive</span>

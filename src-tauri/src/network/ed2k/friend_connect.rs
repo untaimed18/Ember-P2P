@@ -982,6 +982,26 @@ pub async fn run_friend_session_over_transport(
                                                 }).await;
                                             }
                                         }
+                                        Some((super::messages::EMBER_EXT_DHT_MEET, body)) => {
+                                            // A relayed session has no address
+                                            // of the friend's own to ping.
+                                            if let (false, std::net::IpAddr::V4(peer_ip), Some((udp_port, answer))) = (
+                                                relayed,
+                                                addr.ip(),
+                                                super::messages::decode_dht_meet(body),
+                                            ) {
+                                                let _ = session_ul_event_tx.send(UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind: UploadEventKind::EmberDhtMeet {
+                                                        ember_hash: peer_ember_hash,
+                                                        peer_ip,
+                                                        udp_port,
+                                                        answer,
+                                                        reply_tx: session_ember_session_handle.tx.clone(),
+                                                    },
+                                                }).await;
+                                            }
+                                        }
                                         Some((super::messages::EMBER_EXT_ATTACH_OFFER
                                             | super::messages::EMBER_EXT_ATTACH_REPLY
                                             | super::messages::EMBER_EXT_ATTACH_CANCEL, _)) => {

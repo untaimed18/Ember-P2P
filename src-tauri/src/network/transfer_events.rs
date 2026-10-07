@@ -1176,6 +1176,7 @@ pub(super) async fn handle_upload_event(
         | UploadEventKind::EmberRelayOffer { .. }
         | UploadEventKind::EmberDhtContactRequest { .. }
         | UploadEventKind::EmberDhtContacts { .. }
+        | UploadEventKind::EmberDhtMeet { .. }
         | UploadEventKind::EmberFileOfferAck { .. }
         | UploadEventKind::EmberFriendRequest { .. }
         | UploadEventKind::EmberFriendRetract { .. }

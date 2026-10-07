@@ -1381,6 +1381,15 @@ impl DhtStore {
         self.entries.get(key)
     }
 
+    /// Make the `index`th record held under `key` lapse now, the way a record
+    /// does between two `FIND_VALUE` pages.
+    #[cfg(test)]
+    pub fn lapse_for_test(&mut self, key: &[u8; 16], index: usize) {
+        if let Some(record) = self.entries.get_mut(key).and_then(|records| records.get_mut(index)) {
+            record.expires_at_unix = 0;
+        }
+    }
+
     /// Retrieve the **non-expired** records for a key. The FIND_VALUE responder
     /// uses this so a lookup never receives a record past its TTL even if the
     /// periodic `expire()` sweep hasn't run since it lapsed. Returns an empty

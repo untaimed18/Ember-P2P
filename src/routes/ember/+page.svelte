@@ -29,6 +29,9 @@
   import { emberJoinTimedOut } from '$lib/stores/emberJoin';
   import { checkForUpdates, installUpdate, restartToUpdate, updater } from '$lib/stores/updater';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
+  import PortTest from '$lib/components/PortTest.svelte';
+  import { appSettings } from '$lib/stores/settings';
+  import { networkStats } from '$lib/stores/network';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import IconX from '$lib/components/IconX.svelte';
   import { relaunch } from '@tauri-apps/plugin-process';
@@ -301,6 +304,19 @@
           : m.ember_dht_udp_unreachable_hint(),
   );
 
+  // What a relayed user can do about it. Forwarding on the router does nothing
+  // while traffic leaves through a VPN (the backend has stood UPnP down for
+  // exactly that), and is no advice at all once UPnP has already forwarded
+  // the ports, so those cases point elsewhere.
+  let relayedFix = $derived.by(() => {
+    if (reachability !== 'relayed' || !$appSettings) return '';
+    const ports = { tcp: $appSettings.tcp_port, udp: $appSettings.udp_port };
+    if (!$appSettings.upnp_enabled) return m.ember_health_relayed_fix_upnp_off(ports);
+    if ($networkStats.upnp_stood_down) return m.ember_health_relayed_fix_vpn(ports);
+    if ($networkStats.upnp_mapped) return m.ember_health_relayed_fix_forwarded();
+    return m.ember_health_relayed_fix(ports);
+  });
+
   // Deliberately the live count of files with a placed source record, not the
   // session `*_published` counters: those only ever climb, so they would keep
   // claiming "Published" after the user unshared everything, and a keyword ack
@@ -410,6 +426,8 @@
     { id: 'gossip-introducers-rationed', k: m.ember_stat_gossip_introducers_rationed(), v: formatNumber(diag?.ember_dht_gossip_introducers_rationed ?? 0) },
     { id: 'friend-contact-asks', k: m.ember_stat_friend_contact_asks(), v: formatNumber(diag?.ember_dht_friend_contact_asks ?? 0) },
     { id: 'friend-contacts-learned', k: m.ember_stat_friend_contacts_learned(), v: formatNumber(diag?.ember_dht_friend_contacts_learned ?? 0) },
+    { id: 'friend-meets', k: m.ember_stat_friend_meets(), v: formatNumber(diag?.ember_dht_friend_meets ?? 0) },
+    { id: 'friend-meets-converted', k: m.ember_stat_friend_meets_converted(), v: formatNumber(diag?.ember_dht_friend_meets_converted ?? 0) },
     { id: 'liveness-pings', k: m.ember_stat_liveness_pings(), v: formatNumber(diag?.ember_dht_liveness_pings_sent ?? 0) },
     { id: 'pongs-received', k: m.ember_stat_pongs_received(), v: formatNumber(diag?.ember_dht_pongs_received ?? 0) },
     { id: 'peers', k: m.ember_stat_peers(), v: formatNumber(diag?.ember_peers_known ?? 0) },
@@ -661,6 +679,10 @@
             <span class="badge" class:tone-success={reachabilityTone === 'ok'} class:tone-warning={reachabilityTone === 'warn'} class:tone-muted={reachabilityTone === 'muted'}>{reachabilityLabel}</span>
           </div>
           <p class="hint">{reachabilityHint}</p>
+          {#if relayedFix}
+            <p class="hint">{relayedFix}</p>
+          {/if}
+          <PortTest />
         </div>
       </div>
 

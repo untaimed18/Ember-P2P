@@ -53,6 +53,7 @@
   let tcpPort = $state(_init.tcp_port);
   let udpPort = $state(_init.udp_port);
   let upnpEnabled = $state(_init.upnp_enabled);
+  let launchAtLogin = $state(_init.launch_at_login);
   let maxUploadSpeed = $state(_init.max_upload_speed);
   let maxDownloadSpeed = $state(_init.max_download_speed);
   let selectedTheme: Theme = $state(getInitialTheme());
@@ -362,6 +363,7 @@
       tcp_port: tcpPort,
       udp_port: udpPort,
       upnp_enabled: upnpEnabled,
+      launch_at_login: launchAtLogin,
       max_upload_speed: maxUploadSpeed,
       max_download_speed: maxDownloadSpeed,
       auto_connect_server: false,
@@ -638,6 +640,7 @@
           <div class="toggle-row">
             <ToggleSwitch bind:checked={upnpEnabled} label={m.wizard_ports_upnp_label()} />
           </div>
+          <p class="step-hint toggle-hint">{m.wizard_ports_upnp_hint()}</p>
           {#if portsFromEmule}
             <p class="step-hint from-emule">{m.wizard_ports_from_emule()}</p>
           {/if}
@@ -669,9 +672,9 @@
 
       {:else if step === 7}
         <!--
-          No switches left on this step, and it stays anyway: it is the one
-          screen that tells a new user which networks the app is about to join
-          on their behalf. Dropping it would make that disclosure happen
+          The one screen that tells a new user which networks the app is about
+          to join on their behalf, so it stays even though neither network can
+          be switched off here. Dropping it would make that disclosure happen
           silently, which is the wrong trade even for a shorter wizard.
         -->
         <div class="step-content">
@@ -698,6 +701,10 @@
             </div>
           </div>
           <p class="step-hint">{m.wizard_connect_hint()}</p>
+          <div class="toggle-row">
+            <ToggleSwitch bind:checked={launchAtLogin} label={m.wizard_launch_at_login_label()} />
+          </div>
+          <p class="step-hint toggle-hint">{m.wizard_launch_at_login_hint()}</p>
         </div>
 
       {:else if step === 8}
@@ -1239,6 +1246,10 @@
 
   .toggle-row {
     margin: 14px 0 4px;
+  }
+
+  .step-hint.toggle-hint {
+    margin-top: 4px;
   }
 
   /* Speed test */

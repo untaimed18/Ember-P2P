@@ -55,6 +55,7 @@ pub(super) async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkSt
             contact,
             request_id: per_search_req_id,
             start_position,
+            resume_after,
         } = query;
         // The shortlist is not the routing table, and its contents arrive
         // straight out of a peer's `FOUND_NODE`. The table refuses an address
@@ -95,9 +96,12 @@ pub(super) async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkSt
                 keys.extend_from_slice(&extra_keys);
                 // Non-zero on a page follow-up: this node already answered and
                 // said it holds records past what its datagram could carry.
-                state
-                    .ember_dht
-                    .build_find_value(keys, start_position, constraints.clone())
+                state.ember_dht.build_find_value_resuming(
+                    keys,
+                    start_position,
+                    constraints.clone(),
+                    resume_after,
+                )
             }
         };
 

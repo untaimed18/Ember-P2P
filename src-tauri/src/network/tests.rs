@@ -5842,6 +5842,31 @@ fn a_friend_just_asked_is_not_due_again_immediately() {
     );
 }
 
+/// The meet keeps its own, slower clock: a friend asked to meet is not due
+/// again when the contact ask would be.
+#[test]
+fn a_friend_asked_to_meet_waits_out_the_meet_interval() {
+    let friend = [9u8; 16];
+    let start = std::time::Instant::now();
+    let mut asked = HashMap::new();
+    asked.insert(friend, start);
+    assert!(EMBER_FRIEND_MEET_INTERVAL > EMBER_FRIEND_CONTACT_ASK_INTERVAL);
+
+    let at_contact_interval = start + EMBER_FRIEND_CONTACT_ASK_INTERVAL;
+    assert!(least_recently_asked_due(
+        vec![(friend, ())],
+        &asked,
+        at_contact_interval,
+        EMBER_FRIEND_MEET_INTERVAL
+    )
+    .is_empty());
+    let later = start + EMBER_FRIEND_MEET_INTERVAL;
+    assert_eq!(
+        least_recently_asked_due(vec![(friend, ())], &asked, later, EMBER_FRIEND_MEET_INTERVAL).len(),
+        1
+    );
+}
+
 /// A contact with a real key, since the friend answer is decoded on the
 /// far side and `decode_contact_list` drops anything whose Ed25519 key is
 /// not a valid point.

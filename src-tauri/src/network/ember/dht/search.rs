@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use tracing::{debug, trace, warn};
 
+use super::messages::{record_anchor, ResumeAnchors, MAX_RESUME_ANCHORS};
 use super::publish::SignedRecord;
 use super::routing::RoutingTable;
 use super::{EmberContact, EmberNodeId, ALPHA, K_BUCKET_SIZE};
@@ -405,6 +406,43 @@ pub struct QueryTarget {
     /// Record offset for a `FIND_VALUE`. Zero for a `FIND_NODE` and for the
     /// first query sent to any node.
     pub start_position: u16,
+    /// For a page follow-up, the records the last page ended on. Empty for a
+    /// first query.
+    pub resume_after: ResumeAnchors,
+}
+
+/// The anchors for the page after one that was asked to begin at `asked_start`
+/// and said to continue at `next_position`.
+///
+/// A responder serves every record from where the page began up to the one it
+/// says to continue at (the first it passed over, or one past the last it
+/// took), and reports both positions in our numbering. So blob
+/// `next_position - asked_start - 1` is the record the page ended on, and the
+/// blobs before it are the records ahead of it in the responder's list.
+/// Nearest first. Empty when the page does not reach that far, which only a
+/// responder breaking that rule can cause; the position alone is then what
+/// the follow-up carries, as it did before anchors existed.
+pub(super) fn page_resume_anchors(blobs: &[Vec<u8>], asked_start: u16, next_position: u16) -> ResumeAnchors {
+    let mut anchors = ResumeAnchors::default();
+    let Some(ended_on) = next_position
+        .checked_sub(asked_start)
+        .and_then(|span| span.checked_sub(1))
+        .map(usize::from)
+        .filter(|&at| at < blobs.len())
+    else {
+        return anchors;
+    };
+    for blob in blobs[..=ended_on].iter().rev().take(MAX_RESUME_ANCHORS) {
+        let Some(anchor) = blob
+            .len()
+            .checked_sub(64)
+            .and_then(|body| record_anchor(&blob[..body]))
+        else {
+            break;
+        };
+        anchors.push(anchor);
+    }
+    anchors
 }
 
 /// A query awaiting an answer.
@@ -414,6 +452,9 @@ struct PendingQuery {
     /// to advance past it, and so a page follow-up is distinguishable from a
     /// first query (only the latter is ever zero).
     start_position: u16,
+    /// The anchors it carried, so a retry or a re-ask of the same window
+    /// carries them again.
+    resume_after: ResumeAnchors,
     /// For a page, whether the answer that earned it delivered anything. See
     /// [`OwedPage::backed`].
     backed: bool,
@@ -424,6 +465,7 @@ struct PendingQuery {
 struct OwedPage {
     node: EmberNodeId,
     start: u16,
+    resume_after: ResumeAnchors,
     /// The answer that asked for this page carried at least one new record
     /// with a valid publisher signature.
     ///
@@ -1091,6 +1133,7 @@ impl IterativeSearch {
                 PendingQuery {
                     node: node_id,
                     start_position: start,
+                    resume_after: owed.resume_after,
                     backed: owed.backed,
                 },
             );
@@ -1098,6 +1141,7 @@ impl IterativeSearch {
                 contact,
                 request_id: req_id,
                 start_position: start,
+                resume_after: owed.resume_after,
             });
         }
         for item in skipped_pages {
@@ -1165,6 +1209,7 @@ impl IterativeSearch {
                         PendingQuery {
                             node: entry.contact.node_id,
                             start_position: 0,
+                            resume_after: ResumeAnchors::default(),
                             backed: false,
                         },
                     );
@@ -1172,6 +1217,7 @@ impl IterativeSearch {
                         contact: entry.contact.clone(),
                         request_id: req_id,
                         start_position: 0,
+                        resume_after: ResumeAnchors::default(),
                     });
                 }
             }
@@ -1286,7 +1332,9 @@ impl IterativeSearch {
             }
             return ResponseOutcome::REFUSED;
         }
-        let asked_start = expected.map(|p| p.start_position).unwrap_or(0);
+        let (asked_start, asked_resume) = expected
+            .map(|p| (p.start_position, p.resume_after))
+            .unwrap_or_default();
 
         for entry in &mut self.shortlist {
             if entry.contact.node_id == *from_id {
@@ -1337,6 +1385,9 @@ impl IterativeSearch {
         }
         let mut cut_short = false;
         let mut delivered_now = 0usize;
+        let next_resume = page
+            .map(|page| page_resume_anchors(&value_records, asked_start, page.next_position))
+            .unwrap_or_default();
         // Records this reply carried for our key, taken or not. A page with
         // none earns no follow-up: otherwise an empty answer bought another
         // query, up to the per-node page allowance, and a cheap identity could
@@ -1494,7 +1545,13 @@ impl IterativeSearch {
         }
 
         if let Some(page) = page.filter(|_| carried > 0) {
-            self.queue_next_page(from_id, asked_start, page, cut_short, delivered_now > 0);
+            self.queue_next_page(
+                from_id,
+                (asked_start, asked_resume),
+                (page, next_resume),
+                cut_short,
+                delivered_now > 0,
+            );
         }
 
         // Merge closer nodes into shortlist
@@ -1625,8 +1682,8 @@ impl IterativeSearch {
     fn queue_next_page(
         &mut self,
         node: &EmberNodeId,
-        asked_start: u16,
-        page: ValuePage,
+        (asked_start, asked_resume): (u16, ResumeAnchors),
+        (page, next_resume): (ValuePage, ResumeAnchors),
         cut_short: bool,
         backed: bool,
     ) {
@@ -1657,9 +1714,9 @@ impl IterativeSearch {
         // costs nothing for the records we kept, which dedup before they are
         // charged, and returns the ones we turned away.
         let resume_at = if cut_short && asked_start > 0 {
-            asked_start
+            (asked_start, asked_resume)
         } else {
-            page.next_position
+            (page.next_position, next_resume)
         };
         let offered = self.offered_results.get(node).copied().unwrap_or(0);
         if offered >= self.per_node_result_allowance(node) {
@@ -1680,19 +1737,21 @@ impl IterativeSearch {
         self.page_queue.push_back(OwedPage {
             node: *node,
             start: page.next_position,
+            resume_after: next_resume,
             backed,
         });
     }
 
     /// Hold a page the quarter share refused until nothing else is owed. See
     /// [`Self::parked_pages`].
-    fn park_page(&mut self, node: &EmberNodeId, start: u16) {
+    fn park_page(&mut self, node: &EmberNodeId, (start, resume_after): (u16, ResumeAnchors)) {
         if self.parked_pages.iter().any(|p| p.node == *node) {
             return;
         }
         self.parked_pages.push_back(OwedPage {
             node: *node,
             start,
+            resume_after,
             backed: false,
         });
     }
@@ -1863,6 +1922,7 @@ impl IterativeSearch {
                 self.page_queue.push_back(OwedPage {
                     node: node_id,
                     start,
+                    resume_after: pending.resume_after,
                     backed: pending.backed,
                 });
             }
@@ -2492,6 +2552,29 @@ mod tests {
             last_seen: chrono::Utc::now().timestamp(),
             failed_queries: 0,
         }
+    }
+
+    /// The anchors come from the blob the page ended on and the ones ahead of
+    /// it, nearest first, and from nothing when the page does not reach it.
+    #[test]
+    fn resume_anchors_name_where_the_page_ended() {
+        let blob = |n: u8| {
+            let mut b = vec![0u8; super::super::publish::RECORD_HEADER_LEN + 64];
+            b[17] = n;
+            b[73] = n;
+            b
+        };
+        let anchor = |n: u8| record_anchor(&blob(n)[..super::super::publish::RECORD_HEADER_LEN]).unwrap();
+        let blobs: Vec<Vec<u8>> = (0..5).map(blob).collect();
+
+        let picked: Vec<[u8; 8]> = page_resume_anchors(&blobs, 4, 8).iter().copied().collect();
+        assert_eq!(picked, vec![anchor(3), anchor(2), anchor(1)]);
+        let picked: Vec<[u8; 8]> = page_resume_anchors(&blobs, 4, 5).iter().copied().collect();
+        assert_eq!(picked, vec![anchor(0)]);
+
+        assert!(page_resume_anchors(&blobs, 4, 4).is_empty(), "no progress, no anchor");
+        assert!(page_resume_anchors(&blobs, 0, 9).is_empty(), "past what the page carried");
+        assert!(page_resume_anchors(&[vec![0u8; 70]], 0, 1).is_empty(), "too short to name");
     }
 
     /// A FOUND_NODE lead we have never reached: `last_seen == 0`, so

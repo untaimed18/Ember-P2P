@@ -117,6 +117,7 @@
   import * as m from '$lib/paraglide/messages';
   import { plural } from '$lib/plural';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
+  import PortTest from '$lib/components/PortTest.svelte';
   import { highlightMatches } from '$lib/stores/highlight';
   import SpeedInput from '$lib/components/SpeedInput.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
@@ -130,7 +131,7 @@
   } from '$lib/stores/updater';
   import { silentUpdate, silentUpdateResume } from '$lib/stores/silentUpdate';
   import { toastError } from '$lib/stores/toast';
-  import { networkStats, upnpAutoDisabled } from '$lib/stores/network';
+  import { networkStats } from '$lib/stores/network';
   import { isShortcutLetter } from '$lib/shortcutKey';
 
   const appVersion = import.meta.env.VITE_APP_VERSION;
@@ -1608,10 +1609,7 @@
         }),
       });
     }
-    // A failed start-up mapping turns UPnP off for the session and then saves
-    // it off, which matches what is running and needs no restart.
-    const runningUpnp = launch.upnp_enabled && !$upnpAutoDisabled;
-    if (saved.upnp_enabled !== runningUpnp) {
+    if (saved.upnp_enabled !== launch.upnp_enabled) {
       pending.push({
         field: 'upnp_enabled',
         reason: saved.upnp_enabled
@@ -3904,6 +3902,9 @@
               <span class="hint">{m.settings_upnp_hint()}</span>
             </div>
             <ToggleSwitch bind:checked={settings.upnp_enabled} ariaLabel={m.settings_upnp_label()} />
+          </div>
+          <div class="field">
+            <PortTest />
           </div>
 
           <div class="field toggle-row">

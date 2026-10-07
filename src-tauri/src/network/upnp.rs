@@ -26,6 +26,32 @@ const MAPPING_INSPECTION_TIMEOUT: Duration = Duration::from_secs(3);
 /// one behind it. Generous, because this is a LAN round-trip and the cost of
 /// giving up too early is a mapping that silently stops being renewed.
 const SOAP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Consecutive maintenance passes (10 min apart) that must find the router's
+/// WAN address disagreeing with the address peers see before the forwards are
+/// removed. One pass could be catching an address change half-way through.
+const STAND_DOWN_AFTER_PASSES: u32 = 2;
+
+/// Whether a forward on a router whose WAN address is `wan_ip` can carry
+/// traffic to us, given the address peers see us at.
+///
+/// Only a *public* WAN address that disagrees with what peers see is a "no":
+/// our traffic leaves through something else, a VPN tunnel most often, so
+/// nobody dials the router's address. A private or carrier-grade WAN address
+/// is not enough on its own, because an outer router forwarding to this one
+/// (a DMZ or port forward on the ISP's modem) does deliver through the inner
+/// mapping. Not knowing the address peers see is not evidence either way, and
+/// neither is a private one: a server on the LAN reports that as our HighID.
+fn forward_reaches_us(wan_ip: Ipv4Addr, seen_ip: Option<Ipv4Addr>) -> bool {
+    match seen_ip {
+        Some(seen)
+            if !crate::security::is_special_use_v4(wan_ip)
+                && !crate::security::is_special_use_v4(seen) =>
+        {
+            seen == wan_ip
+        }
+        _ => true,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MappingOwnership {
@@ -110,8 +136,16 @@ pub struct UpnpMappings {
     /// Don't retry discovery before this instant.
     next_discovery_at: Option<Instant>,
     revision: u64,
-    /// The gateway's own WAN address, read when TCP and UDP both mapped.
+    /// The gateway's own WAN address, read whenever TCP or UDP mapped.
     external_ip: Option<Ipv4Addr>,
+    /// Mappings removed because they could not carry traffic (see
+    /// [`forward_reaches_us`]). Nothing is mapped or renewed while set; each
+    /// maintenance pass re-reads the WAN address and maps again once it is the
+    /// one peers see.
+    stood_down: bool,
+    /// Consecutive passes that found the WAN address disagreeing with the
+    /// address peers see; [`STAND_DOWN_AFTER_PASSES`] of them stand down.
+    wan_disagreements: u32,
 }
 
 /// The gateway's WAN address while it forwards every Ember port, else zero.
@@ -142,6 +176,8 @@ impl UpnpMappings {
             next_discovery_at: None,
             revision: 0,
             external_ip: None,
+            stood_down: false,
+            wan_disagreements: 0,
         }
     }
 
@@ -152,6 +188,14 @@ impl UpnpMappings {
             _ => 0,
         };
         FORWARDED_EXTERNAL_IP.store(bits, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The gateway's WAN address under [`SOAP_TIMEOUT`]; `None` on any failure.
+    async fn read_wan_ip(gateway: &Gw) -> Option<Ipv4Addr> {
+        match tokio::time::timeout(SOAP_TIMEOUT, gateway.get_external_ip()).await {
+            Ok(Ok(std::net::IpAddr::V4(ip))) => Some(ip),
+            _ => None,
+        }
     }
 
     /// `Gateway::add_port` under [`SOAP_TIMEOUT`]. `None` means it timed out.
@@ -336,11 +380,8 @@ impl UpnpMappings {
                 }
                 None => false,
             };
-            let external_ip = if tcp_ok && udp_ok {
-                match tokio::time::timeout(SOAP_TIMEOUT, gateway.get_external_ip()).await {
-                    Ok(Ok(std::net::IpAddr::V4(ip))) => Some(ip),
-                    _ => None,
-                }
+            let external_ip = if tcp_ok || udp_ok {
+                Self::read_wan_ip(gateway).await
             } else {
                 None
             };
@@ -378,6 +419,9 @@ impl UpnpMappings {
             }
             self.publish_forwarding();
             return self.udp_mapped;
+        }
+        if self.stood_down {
+            return false;
         }
         let ok = {
             let Some(gateway) = &self.gateway else {
@@ -438,6 +482,14 @@ impl UpnpMappings {
     /// least the TCP or KAD UDP mapping succeeded. On discovery failure the
     /// retry backoff is advanced; `maintain` retries when it elapses.
     pub async fn setup(&mut self) -> bool {
+        if !self.discover().await || self.stood_down {
+            return false;
+        }
+        self.map_all().await
+    }
+
+    /// Find the gateway and cache it. On failure the retry backoff advances.
+    async fn discover(&mut self) -> bool {
         let options = igd_next::SearchOptions {
             timeout: Some(DISCOVERY_TIMEOUT),
             ..Default::default()
@@ -457,7 +509,7 @@ impl UpnpMappings {
         self.next_discovery_at = None;
         self.gateway = Some(gateway);
         self.revision = self.revision.saturating_add(1);
-        self.map_all().await
+        true
     }
 
     fn note_discovery_failure(&mut self) {
@@ -472,16 +524,45 @@ impl UpnpMappings {
     ///   the whole session;
     /// - gateway known and the lease is due: re-add the mappings;
     /// - renew fails for every mapping: assume the cached gateway went stale
-    ///   (router reboot / control-URL change), drop it and re-discover.
+    ///   (router reboot / control-URL change), drop it and re-discover;
+    /// - the router's WAN address is not the one peers see (`seen_ip`): remove
+    ///   the mappings, which cannot carry traffic, and map again once it is.
     ///
     /// Returns whether the TCP or KAD UDP mapping is currently in place.
-    pub async fn maintain(&mut self) -> bool {
+    pub async fn maintain(&mut self, seen_ip: Option<Ipv4Addr>) -> bool {
         if self.gateway.is_none() {
             if self.next_discovery_at.is_some_and(|t| Instant::now() < t) {
                 return false;
             }
-            self.setup().await;
-            return self.is_mapped();
+            if !self.stood_down {
+                self.setup().await;
+                return self.is_mapped();
+            }
+            if !self.discover().await {
+                return false;
+            }
+        }
+        if self.stood_down {
+            if self.wan_now_reaches_us(seen_ip).await != Some(true) {
+                return false;
+            }
+            info!("UPnP: the router's WAN address is the one peers see again; restoring port forwarding");
+            self.stood_down = false;
+            self.last_map_attempt = None;
+            self.revision = self.revision.saturating_add(1);
+        } else if self.note_wan_disagreement(seen_ip) {
+            let cached_wan = self.external_ip;
+            match self.wan_now_reaches_us(seen_ip).await {
+                // Confirmed by a fresh read of an address that has not just
+                // moved. One that moved is the router reconnecting, and the
+                // address peers see may simply not have caught up yet.
+                Some(false) if self.external_ip == cached_wan => {
+                    self.stand_down(seen_ip).await;
+                    return false;
+                }
+                Some(false) => self.wan_disagreements = 0,
+                Some(true) | None => {}
+            }
         }
         if self
             .last_map_attempt
@@ -497,7 +578,83 @@ impl UpnpMappings {
         self.is_mapped()
     }
 
+    /// Count this pass towards standing down: true once the cached WAN address
+    /// has disagreed with `seen_ip` for [`STAND_DOWN_AFTER_PASSES`] in a row.
+    fn note_wan_disagreement(&mut self, seen_ip: Option<Ipv4Addr>) -> bool {
+        let disagrees = self.is_mapped()
+            && self
+                .external_ip
+                .is_some_and(|wan| !forward_reaches_us(wan, seen_ip));
+        self.wan_disagreements = if disagrees {
+            self.wan_disagreements.saturating_add(1)
+        } else {
+            0
+        };
+        self.wan_disagreements >= STAND_DOWN_AFTER_PASSES
+    }
+
+    /// Re-read the WAN address and judge it against `seen_ip`; `None` when the
+    /// gateway did not say, which is no verdict either way. The cached address
+    /// can be up to a lease old, and a router that reconnected since may have
+    /// the one peers now see. A stood-down gateway that does not answer is
+    /// dropped, so the next pass re-discovers it rather than asking a stale one
+    /// forever.
+    async fn wan_now_reaches_us(&mut self, seen_ip: Option<Ipv4Addr>) -> Option<bool> {
+        let gateway = self.gateway.as_ref()?;
+        match Self::read_wan_ip(gateway).await {
+            Some(wan) => {
+                self.external_ip = Some(wan);
+                let reaches = forward_reaches_us(wan, seen_ip);
+                if reaches {
+                    self.wan_disagreements = 0;
+                }
+                self.publish_forwarding();
+                Some(reaches)
+            }
+            None => {
+                debug!("UPnP: gateway did not report its WAN address");
+                if self.stood_down {
+                    self.gateway = None;
+                }
+                None
+            }
+        }
+    }
+
+    /// Remove the mappings and stop renewing them, keeping the gateway so a
+    /// later pass can check whether they would work again.
+    async fn stand_down(&mut self, seen_ip: Option<Ipv4Addr>) {
+        info!(
+            "UPnP: the router's WAN address {:?} is not the address peers see ({:?}); removing port forwarding, which cannot reach this computer",
+            self.external_ip, seen_ip
+        );
+        self.remove_owned_mappings().await;
+        self.tcp_mapped = false;
+        self.udp_mapped = false;
+        self.quic_mapped = false;
+        self.stood_down = true;
+        self.wan_disagreements = 0;
+        self.revision = self.revision.saturating_add(1);
+        self.publish_forwarding();
+    }
+
     pub async fn teardown(&mut self) {
+        self.remove_owned_mappings().await;
+        self.gateway = None;
+        self.tcp_mapped = false;
+        self.udp_mapped = false;
+        self.quic_mapped = false;
+        self.external_ip = None;
+        self.last_map_attempt = None;
+        self.next_discovery_at = None;
+        self.stood_down = false;
+        self.wan_disagreements = 0;
+        self.revision = self.revision.saturating_add(1);
+        self.publish_forwarding();
+    }
+
+    /// Remove each mapping we hold and can prove is still ours.
+    async fn remove_owned_mappings(&self) {
         if let Some(ref gateway) = self.gateway {
             let local_ip = local_ipv4(gateway.addr);
             if self.tcp_mapped {
@@ -512,9 +669,11 @@ impl UpnpMappings {
                     .await
                         == MappingOwnership::EmberOwned
                     {
-                        let _ = gateway
-                            .remove_port(igd_next::PortMappingProtocol::TCP, self.tcp_port)
-                            .await;
+                        let _ = tokio::time::timeout(
+                            SOAP_TIMEOUT,
+                            gateway.remove_port(igd_next::PortMappingProtocol::TCP, self.tcp_port),
+                        )
+                        .await;
                     }
                 }
             }
@@ -530,9 +689,11 @@ impl UpnpMappings {
                     .await
                         == MappingOwnership::EmberOwned
                     {
-                        let _ = gateway
-                            .remove_port(igd_next::PortMappingProtocol::UDP, self.udp_port)
-                            .await;
+                        let _ = tokio::time::timeout(
+                            SOAP_TIMEOUT,
+                            gateway.remove_port(igd_next::PortMappingProtocol::UDP, self.udp_port),
+                        )
+                        .await;
                     }
                 }
             }
@@ -550,9 +711,11 @@ impl UpnpMappings {
                             .await
                                 == MappingOwnership::EmberOwned
                             {
-                                let _ = gateway
-                                    .remove_port(igd_next::PortMappingProtocol::UDP, qp)
-                                    .await;
+                                let _ = tokio::time::timeout(
+                                    SOAP_TIMEOUT,
+                                    gateway.remove_port(igd_next::PortMappingProtocol::UDP, qp),
+                                )
+                                .await;
                             }
                         }
                     }
@@ -562,15 +725,6 @@ impl UpnpMappings {
                 info!("UPnP: removed port mappings");
             }
         }
-        self.gateway = None;
-        self.tcp_mapped = false;
-        self.udp_mapped = false;
-        self.quic_mapped = false;
-        self.external_ip = None;
-        self.last_map_attempt = None;
-        self.next_discovery_at = None;
-        self.revision = self.revision.saturating_add(1);
-        self.publish_forwarding();
     }
 
     pub fn is_mapped(&self) -> bool {
@@ -591,6 +745,12 @@ impl UpnpMappings {
     /// the two cases need different remediation advice.
     pub fn has_gateway(&self) -> bool {
         self.gateway.is_some()
+    }
+
+    /// Whether the mappings were removed because they could not reach us.
+    /// Unlike a failure, this needs nothing from the user.
+    pub fn stood_down(&self) -> bool {
+        self.stood_down
     }
 
     pub fn revision(&self) -> u64 {
@@ -800,6 +960,48 @@ mod tests {
         assert_eq!(m.last_map_attempt, Some(attempted), "nothing new to map");
     }
 
+    #[test]
+    fn only_a_public_wan_address_peers_do_not_see_rules_a_forward_out() {
+        let home = Ipv4Addr::new(81, 2, 69, 160);
+        let vpn = Ipv4Addr::new(93, 184, 216, 34);
+        assert!(forward_reaches_us(home, Some(home)));
+        assert!(!forward_reaches_us(home, Some(vpn)), "traffic leaves through a VPN");
+        assert!(forward_reaches_us(home, None), "an unknown address is no evidence");
+        // An outer router can forward to this one, so these stay mapped.
+        assert!(forward_reaches_us(Ipv4Addr::new(192, 168, 0, 2), Some(vpn)));
+        assert!(forward_reaches_us(Ipv4Addr::new(100, 64, 3, 9), Some(vpn)));
+        assert!(forward_reaches_us(Ipv4Addr::UNSPECIFIED, Some(vpn)));
+        // A LAN server's HighID is a private address, not where peers see us.
+        assert!(forward_reaches_us(home, Some(Ipv4Addr::new(192, 168, 1, 5))));
+    }
+
+    #[test]
+    fn standing_down_takes_consecutive_disagreements_while_mapped() {
+        let home = Ipv4Addr::new(81, 2, 69, 160);
+        let vpn = Some(Ipv4Addr::new(93, 184, 216, 34));
+        let mut m = UpnpMappings::new(4662, 4672);
+        m.external_ip = Some(home);
+        assert!(!m.note_wan_disagreement(vpn), "nothing mapped, nothing to remove");
+        assert_eq!(m.wan_disagreements, 0);
+
+        m.tcp_mapped = true;
+        assert!(!m.note_wan_disagreement(vpn), "one pass is not enough");
+        assert!(!m.note_wan_disagreement(Some(home)), "agreement resets the count");
+        assert!(!m.note_wan_disagreement(vpn));
+        assert!(m.note_wan_disagreement(vpn));
+    }
+
+    #[tokio::test]
+    async fn a_stood_down_instance_maps_nothing_until_it_can_check_again() {
+        let mut m = UpnpMappings::new(4662, 4672);
+        m.stood_down = true;
+        m.next_discovery_at = Some(Instant::now() + Duration::from_secs(600));
+        assert!(!m.maintain(Some(Ipv4Addr::new(93, 184, 216, 34))).await);
+        assert!(m.stood_down(), "still stood down without a WAN address to check");
+        assert!(!m.map_quic_port(5000).await);
+        assert!(!m.quic_mapped);
+    }
+
     #[tokio::test]
     async fn teardown_clears_all_state() {
         let mut m = UpnpMappings::new(4662, 4672);
@@ -808,6 +1010,7 @@ mod tests {
         m.quic_mapped = true;
         m.quic_port = Some(5000);
         m.last_map_attempt = Some(Instant::now());
+        m.stood_down = true;
         // No gateway is set, so teardown does no network I/O but must still
         // reset every flag so a later re-setup starts from a clean slate.
         m.teardown().await;
@@ -816,5 +1019,6 @@ mod tests {
         assert!(!m.has_gateway());
         assert!(m.last_map_attempt.is_none());
         assert!(m.next_discovery_at.is_none());
+        assert!(!m.stood_down());
     }
 }

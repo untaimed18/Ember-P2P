@@ -1666,39 +1666,15 @@ pub(super) async fn send_ember_bridge_ping(
         EmberIpVerdict::Pending => return false,
     }
     let addr = SocketAddr::new(IpAddr::V4(ip), udp_port);
-    let (_wire_req_id, frame) = state.ember_dht.build_ping();
-    // Whether the peer was actually dialled, as opposed to our own transport
-    // declining to build the frame. Only a real dial should start the retry
-    // cooldown.
-    let mut dialled = true;
-    let sent = match state
-        .ember_transport
-        .prepare_outgoing(addr, noise_pub, &frame)
-    {
-        ember::transport::OutgoingResult::Ready { packet }
-        | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-            match send_ember_udp(socket, &packet, addr, &state.ember_dht_overhead).await {
-                Ok(_) => true,
-                Err(e) => {
-                    debug!("Ember bridge: ping to {addr} failed: {e}");
-                    false
-                }
-            }
-        }
-        ember::transport::OutgoingResult::Queued => true,
-        ember::transport::OutgoingResult::Error(e) => {
-            debug!("Ember bridge: transport error pinging {addr}: {e}");
-            dialled = false;
-            false
-        }
-    };
+    let sent = send_ember_dht_ping(socket, state, addr, noise_pub).await;
     // A peer we never transmitted to has told us nothing, so holding it out of
     // the candidate list for the full retry window spends the bridge's only
     // means of converting a lead on our own transport hiccup. A lost or
     // unanswered ping still counts — that is what the window is for.
-    if dialled {
+    if sent.is_some() {
         note_ember_bridge_attempt(state, ip, udp_port);
     }
+    let sent = sent == Some(true);
     if sent {
         state.ember_diagnostics.ember_dht_kad_bridge_pings = state
             .ember_diagnostics
@@ -1706,6 +1682,38 @@ pub(super) async fn send_ember_bridge_ping(
             .saturating_add(1);
     }
     sent
+}
+
+/// Build a DHT `PING` and send it to `addr`. `None` when our own transport
+/// declined to build it, so the peer was never dialled; otherwise whether the
+/// datagram went out (or was queued behind a handshake).
+async fn send_ember_dht_ping(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    addr: SocketAddr,
+    noise_pub: Option<&[u8; 32]>,
+) -> Option<bool> {
+    let (_wire_req_id, frame) = state.ember_dht.build_ping();
+    match state
+        .ember_transport
+        .prepare_outgoing(addr, noise_pub, &frame)
+    {
+        ember::transport::OutgoingResult::Ready { packet }
+        | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+            match send_ember_udp(socket, &packet, addr, &state.ember_dht_overhead).await {
+                Ok(_) => Some(true),
+                Err(e) => {
+                    debug!("Ember DHT: ping to {addr} failed: {e}");
+                    Some(false)
+                }
+            }
+        }
+        ember::transport::OutgoingResult::Queued => Some(true),
+        ember::transport::OutgoingResult::Error(e) => {
+            debug!("Ember DHT: transport error pinging {addr}: {e}");
+            None
+        }
+    }
 }
 
 fn note_ember_bridge_attempt(state: &mut NetworkState, ip: Ipv4Addr, udp_port: u16) {
@@ -1794,10 +1802,20 @@ pub(super) fn ember_friend_ask_order<T>(
     asked: &HashMap<[u8; 16], std::time::Instant>,
     now: std::time::Instant,
 ) -> Vec<([u8; 16], T)> {
+    least_recently_asked_due(live, asked, now, EMBER_FRIEND_CONTACT_ASK_INTERVAL)
+}
+
+/// [`ember_friend_ask_order`] for any per-friend `interval`.
+pub(super) fn least_recently_asked_due<T>(
+    live: Vec<([u8; 16], T)>,
+    asked: &HashMap<[u8; 16], std::time::Instant>,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> Vec<([u8; 16], T)> {
     let mut due: Vec<([u8; 16], T)> = live
         .into_iter()
         .filter(|(eh, _)| match asked.get(eh) {
-            Some(last) => now.saturating_duration_since(*last) >= EMBER_FRIEND_CONTACT_ASK_INTERVAL,
+            Some(last) => now.saturating_duration_since(*last) >= interval,
             None => true,
         })
         .collect();
@@ -1935,6 +1953,156 @@ pub(super) async fn ingest_friend_ember_contacts(
     // No introducer: see the note above. The probe budget and its one-second
     // window still apply, so this cannot outspend ordinary gossip.
     probe_ember_gossip_leads(socket, state, &contacts, None).await;
+}
+
+/// Whether `friend` already answers us as a DHT contact. An Ember hash is the
+/// friend's DHT node ID (see [`ingest_friend_ember_contacts`]), so this needs
+/// no address at all.
+fn friend_is_verified_contact(state: &NetworkState, friend: &[u8; 16]) -> bool {
+    state
+        .ember_dht
+        .routing()
+        .get_contact(&ember::dht::EmberNodeId(*friend))
+        .is_some_and(|contact| contact.is_verified())
+}
+
+/// Ask friends we hold a direct session with, but no verified DHT contact
+/// for, to meet over UDP (`EMBER_EXT_DHT_MEET`).
+///
+/// This is the half of the friend route the contact ask cannot cover: a
+/// friend can hand over the contacts it holds, but cannot *become* one while
+/// neither side can reach the other's UDP socket unsolicited. The meet makes
+/// both `PING`s solicited. The friend `PING`s us as it answers, we `PING` it
+/// on reading the answer, and each `PING` opens the path back through its
+/// sender's own NAT.
+///
+/// Asked at any table size, since the condition — this friend is not a
+/// contact — is exact rather than a starvation guess. Skipped while our own
+/// NAT is symmetric: the port the friend would aim at is then not the one our
+/// next datagram leaves from. Relayed sessions are skipped too, because the
+/// friend's half has to `PING` the address the session is connected from.
+/// Returns how many friends were asked.
+pub(super) async fn ask_friends_to_meet(state: &mut NetworkState) -> usize {
+    let now = std::time::Instant::now();
+    let pending: Vec<[u8; 16]> = state.ember_friend_meets_asked.keys().copied().collect();
+    for friend in pending {
+        if friend_is_verified_contact(state, &friend) {
+            state.ember_friend_meets_asked.remove(&friend);
+            state.ember_diagnostics.ember_dht_friend_meets_converted = state
+                .ember_diagnostics
+                .ember_dht_friend_meets_converted
+                .saturating_add(1);
+            info!(
+                "Ember DHT: friend {} is a contact after meeting over UDP",
+                crate::security::short_hash(&friend)
+            );
+        }
+    }
+    if state.nat_info.nat_type == ember::nat::NatType::Symmetric {
+        return 0;
+    }
+    let udp_port = advertised_udp_port(state);
+    if udp_port == 0 {
+        return 0;
+    }
+    let live: Vec<([u8; 16], tokio::sync::mpsc::Sender<Vec<u8>>)> = {
+        let sessions = state.ember_sessions.read().await;
+        sessions
+            .iter()
+            .filter(|(_, h)| {
+                h.is_fresh()
+                    && h.is_secure_v2()
+                    && !h.is_relayed()
+                    && h.peer_addr().is_some_and(|addr| addr.is_ipv4())
+            })
+            .map(|(eh, h)| (*eh, h.tx.clone()))
+            .collect()
+    };
+    // A secure session is not always a friend's, and only a friend answers.
+    let live: Vec<_> = {
+        let friends = state.xfer_friend_hashes.read().await;
+        live.into_iter()
+            .filter(|(eh, _)| friends.contains(eh) && !friend_is_verified_contact(state, eh))
+            .collect()
+    };
+    let due = least_recently_asked_due(live, &state.ember_friend_meets_asked, now, EMBER_FRIEND_MEET_INTERVAL);
+    let frame = ed2k::messages::build_ember_ext_frame(
+        ed2k::messages::EMBER_EXT_DHT_MEET,
+        &ed2k::messages::encode_dht_meet(udp_port, false),
+    );
+    let mut asked = 0usize;
+    for (eh, tx) in due {
+        if asked >= EMBER_FRIEND_MEETS_PER_TICK {
+            break;
+        }
+        if tx.try_send(frame.clone()).is_err() {
+            continue;
+        }
+        state.ember_friend_meets_asked.insert(eh, now);
+        asked += 1;
+        state.ember_diagnostics.ember_dht_friend_meets = state
+            .ember_diagnostics
+            .ember_dht_friend_meets
+            .saturating_add(1);
+    }
+    if asked > 0 {
+        debug!("Ember DHT: asked {asked} friend(s) to meet over UDP");
+    }
+    asked
+}
+
+/// Act on a friend's `EMBER_EXT_DHT_MEET`: `PING` it at the address its
+/// session is connected from and the port it claimed, and, unless this is the
+/// answer to our own ask, answer with ours so it `PING`s us back.
+///
+/// An answer is only acted on inside [`EMBER_FRIEND_MEET_ANSWER_WINDOW`] of our
+/// ask, and a friend is `PING`ed for a meet at most once per window whichever
+/// frame asked for it, so no run of frames has us `PING` it on demand. When
+/// both sides ask at once, each answer then lands inside the window its own
+/// ask already used, which is right: both `PING`s have gone out. Nothing here
+/// touches the routing table; only the `PONG` can, through the ordinary path.
+pub(super) async fn answer_friend_meet(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    friend: [u8; 16],
+    peer_ip: Ipv4Addr,
+    udp_port: u16,
+    answer: bool,
+    reply_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    if crate::security::is_bogus_v4(peer_ip) {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let within_window =
+        |at: Option<&std::time::Instant>| at.is_some_and(|at| now.saturating_duration_since(*at) < EMBER_FRIEND_MEET_ANSWER_WINDOW);
+    if answer && !within_window(state.ember_friend_meets_asked.get(&friend)) {
+        return;
+    }
+    if within_window(state.ember_friend_meets_pinged.get(&friend)) {
+        return;
+    }
+    // The user's filter and bans hold for a friend's address too; this is
+    // not a bridge attempt, so none of the bridge's bookkeeping applies.
+    if !matches!(ember_peer_ip_verdict(state, peer_ip, udp_port), EmberIpVerdict::Allowed) {
+        return;
+    }
+    state.ember_friend_meets_pinged.insert(friend, now);
+    let noise = lookup_ember_noise_key(&state.ember_noise_keys, peer_ip, udp_port);
+    let addr = SocketAddr::new(IpAddr::V4(peer_ip), udp_port);
+    send_ember_dht_ping(socket, state, addr, noise.as_ref()).await;
+    if answer {
+        return;
+    }
+    let our_port = advertised_udp_port(state);
+    if our_port == 0 || state.nat_info.nat_type == ember::nat::NatType::Symmetric {
+        return;
+    }
+    let frame = ed2k::messages::build_ember_ext_frame(
+        ed2k::messages::EMBER_EXT_DHT_MEET,
+        &ed2k::messages::encode_dht_meet(our_port, true),
+    );
+    let _ = reply_tx.try_send(frame);
 }
 
 /// Offer a friend's contacts to the routing table. Returns how many took a

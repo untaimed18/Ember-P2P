@@ -86,6 +86,8 @@ pub struct EmberMaintenanceResult {
     /// Friend sessions asked for their Ember DHT contacts. Like the bridge,
     /// non-zero only while the table is short of a working set.
     pub friend_contact_asks: usize,
+    /// Friends asked to meet over UDP this cycle.
+    pub friend_meets: usize,
 }
 
 /// Persisted peak of verified Ember DHT contacts, so a restart does not
@@ -1015,6 +1017,13 @@ pub(super) struct NetworkState {
     /// nothing about when we should next ask them.
     pub(super) ember_friend_contacts_asked: HashMap<[u8; 16], std::time::Instant>,
     pub(super) ember_friend_contacts_served: HashMap<[u8; 16], std::time::Instant>,
+
+    /// The same pair for `EMBER_EXT_DHT_MEET`: when we last asked each friend
+    /// to meet over UDP, and when we last `PING`ed one for a meet (its ask or
+    /// its answer). An ask stays here until the friend turns up as a verified
+    /// contact (counted as a meet that worked) or its interval lapses.
+    pub(super) ember_friend_meets_asked: HashMap<[u8; 16], std::time::Instant>,
+    pub(super) ember_friend_meets_pinged: HashMap<[u8; 16], std::time::Instant>,
 
     /// Session store-ack/fail totals as of the previous Ember publish
     /// heartbeat, so that line can report a per-cycle delta next to the total

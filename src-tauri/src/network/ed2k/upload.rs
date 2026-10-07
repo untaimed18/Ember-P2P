@@ -2741,6 +2741,19 @@ pub enum UploadEventKind {
         ember_hash: [u8; 16],
         contacts: Vec<u8>,
     },
+    /// A friend is `PING`ing our Ember UDP socket and asks us to `PING` its
+    /// own (`EMBER_EXT_DHT_MEET`). Only raised for a direct session: the
+    /// `PING` goes to `peer_ip`, the address that session is connected from,
+    /// with the port the friend claimed, never to an address it named.
+    EmberDhtMeet {
+        ember_hash: [u8; 16],
+        peer_ip: std::net::Ipv4Addr,
+        udp_port: u16,
+        /// This is the answer to a meet we asked for, so it is not answered.
+        answer: bool,
+        /// The friend session this arrived on, for our own answer.
+        reply_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    },
     /// A friend is offering to send us a file. Surfaced to the UI for an
     /// explicit accept — we never start a download because a peer asked us to.
     EmberFileOffer {
@@ -13780,6 +13793,33 @@ impl UploadHandler {
                                             kind: UploadEventKind::EmberDhtContacts {
                                                 ember_hash: eh,
                                                 contacts: body.to_vec(),
+                                            },
+                                        })
+                                        .await;
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_DHT_MEET, body)) => {
+                                // A relayed session has no address of the
+                                // friend's own to ping.
+                                if let (
+                                    Some(std::net::IpAddr::V4(peer_ip)),
+                                    Some((udp_port, answer)),
+                                    Some(reply_tx),
+                                ) = (
+                                    attach_addr.map(|a| a.ip()),
+                                    super::messages::decode_dht_meet(body),
+                                    ember_session_handle.as_ref().map(|h| h.tx.clone()),
+                                ) {
+                                    let _ = self
+                                        .upload_event_tx
+                                        .send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind: UploadEventKind::EmberDhtMeet {
+                                                ember_hash: eh,
+                                                peer_ip,
+                                                udp_port,
+                                                answer,
+                                                reply_tx,
                                             },
                                         })
                                         .await;

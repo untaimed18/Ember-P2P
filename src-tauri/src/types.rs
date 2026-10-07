@@ -657,6 +657,10 @@ pub struct NetworkStats {
     pub firewalled: bool,
     pub buddy_status: String,
     pub upnp_mapped: bool,
+    /// UPnP removed its forwards because the router's address is not the one
+    /// peers see (a VPN, typically). Not a failure; nothing for the user to do.
+    #[serde(default)]
+    pub upnp_stood_down: bool,
     pub stores_acknowledged: u32,
     pub kad_users_estimate: u32,
     #[serde(default)]
@@ -896,6 +900,17 @@ pub struct EmberDiagnostics {
     /// builds that predate the sub-type, or have nothing verified to share.
     #[serde(default)]
     pub ember_dht_friend_contacts_learned: u32,
+    /// Times we asked a friend to meet over UDP (`EMBER_EXT_DHT_MEET`) because
+    /// we held no verified contact for it.
+    #[serde(default)]
+    pub ember_dht_friend_meets: u32,
+    /// Friends that became verified contacts within a meet's interval.
+    ///
+    /// Read against the meets: attempts that never convert are the
+    /// both-ends-symmetric case the simultaneous open cannot cross, measured
+    /// rather than assumed.
+    #[serde(default)]
+    pub ember_dht_friend_meets_converted: u32,
     /// Iterative Ember DHT lookups currently running (gauge, not a
     /// counter).
     #[serde(default)]
@@ -1343,6 +1358,7 @@ impl Default for NetworkStats {
             firewalled: false,
             buddy_status: String::from("none"),
             upnp_mapped: false,
+            upnp_stood_down: false,
             stores_acknowledged: 0,
             kad_users_estimate: 0,
             tcp_status: String::from("Unknown"),
@@ -2379,7 +2395,7 @@ impl Default for AppSettings {
             withheld_folder_files: std::collections::HashMap::new(),
             shared_folder_scan_cursors: std::collections::HashMap::new(),
             nodes_dat_path: String::new(),
-            upnp_enabled: false,
+            upnp_enabled: true,
             stun_keepalive_enabled: true,
             obfuscation_enabled: true,
             ip_filter_enabled: true,
@@ -2825,5 +2841,19 @@ mod tests {
         let defaults = AppSettings::default();
         assert!(!defaults.bandwidth_schedule_enabled);
         assert!(defaults.bandwidth_schedule.is_empty());
+    }
+
+    /// UPnP starts on for a new profile only. `upnp_enabled` has no serde
+    /// default, so every saved config carries the user's own answer and an
+    /// upgrade must not turn it on for someone who forwards ports by hand.
+    #[test]
+    fn upnp_starts_on_for_new_profiles_and_a_saved_off_stays_off() {
+        let defaults = AppSettings::default();
+        assert!(defaults.upnp_enabled);
+        let mut value = serde_json::to_value(&defaults).expect("serialize default settings");
+        value["upnp_enabled"] = serde_json::json!(false);
+        let parsed: AppSettings =
+            serde_json::from_value(value).expect("a saved config still loads");
+        assert!(!parsed.upnp_enabled);
     }
 }

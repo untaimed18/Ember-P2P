@@ -300,6 +300,9 @@ export interface NetworkStats {
   firewalled: boolean;
   buddy_status: 'none' | 'searching' | 'connecting' | 'connecting_lowid' | 'connected' | 'connected_lowid' | 'serving' | 'serving_lowid';
   upnp_mapped: boolean;
+  /** UPnP removed its forwards because the router's address is not the one
+   *  peers see (a VPN, typically). Not a failure. */
+  upnp_stood_down?: boolean;
   stores_acknowledged: number;
   kad_users_estimate: number;
   tcp_status?: string;
@@ -454,6 +457,11 @@ export interface EmberDiagnostics {
   /** Contacts a friend answered with that the routing table accepted. Asks
    *  climbing with this flat means friends have nothing verified to share. */
   ember_dht_friend_contacts_learned?: number;
+  /** Times we asked a friend that is not a DHT contact to meet over UDP. */
+  ember_dht_friend_meets?: number;
+  /** Friends that became verified contacts within a meet's interval. Meets
+   *  climbing with this flat is the both-ends-symmetric case. */
+  ember_dht_friend_meets_converted?: number;
   ember_dht_records_republished: number;
   /** KAD-bridge bootstrap pings sent this session (slice 13): while the DHT
    *  is still sparse, KAD-learned Ember peers are DHT-pinged so their signed
