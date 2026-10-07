@@ -1203,6 +1203,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         attach_inbound: HashMap::new(),
         attach_fetches: HashMap::new(),
         attach_auto_log: HashMap::new(),
+        attach_retry_asked: HashMap::new(),
+        attach_reoffered: HashMap::new(),
         ember_channel_epoch_searches: HashMap::new(),
         ember_pending_channel_epoch: Vec::new(),
         channel_epoch_fetch_at: HashMap::new(),

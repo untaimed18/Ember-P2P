@@ -87,6 +87,7 @@
   import { portal } from '$lib/actions/portal';
   import { rovingToolbar } from '$lib/actions/rovingToolbar';
   import { appSettings } from '$lib/stores/settings';
+  import { chatAllowedWith, readReceiptsWith } from '$lib/friendSettings';
   import { getDraft, setDraft, clearDraft, registerDraftFlusher } from '$lib/stores/chatTabs';
   import { firstRowBelow, recalledScroll, rememberScroll, type ScrollSpot } from '$lib/chatScrollMemory';
   import { insertAtSelection } from '$lib/emojiPicker';
@@ -223,12 +224,15 @@
     !isChannel && friendHash ? $onlineFriends.has(friendHash.toLowerCase()) : false,
   );
 
-  // The user can disable chat entirely in Settings; when off, the backend
-  // drops inbound and refuses outbound chat, so reflect that in the UI rather
-  // than letting the user type into a textarea whose sends will be rejected.
-  let chatDisabled = $derived(!isChannel && $appSettings?.friend_chat_disabled === true);
+  // The user can disable chat in Settings, or for this friend in theirs; when
+  // off, the backend drops inbound and refuses outbound chat, so reflect that
+  // in the UI rather than letting the user type into a textarea whose sends
+  // will be rejected.
+  let chatDisabled = $derived(
+    !isChannel && !!friendHash && !chatAllowedWith($appSettings, friendHash),
+  );
   let showReadReceipts = $derived(
-    !isChannel && $appSettings?.friend_chat_read_receipts !== false,
+    !isChannel && !!friendHash && readReceiptsWith($appSettings, friendHash),
   );
   let chatLocked = $state(false);
 

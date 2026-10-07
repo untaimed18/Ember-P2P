@@ -114,6 +114,11 @@ pub(crate) struct ChatAttachmentInfo {
     /// The name is a program, shortcut or script, or one dressed up as a
     /// document (`report.pdf.exe`); see `security::is_dangerous_extension`.
     pub risky: bool,
+    /// Bumped each time the transfer is tried again, so the UI can tell this
+    /// attempt's updates from late ones belonging to the attempt that ended.
+    pub attempt: u32,
+    /// Whether "Try again" can do anything for this row on this side.
+    pub retryable: bool,
 }
 
 impl ChatAttachmentInfo {
@@ -135,7 +140,32 @@ impl ChatAttachmentInfo {
                 && row.status == "complete"
                 && row.dest_path.is_some(),
             risky: crate::security::is_dangerous_extension(&row.file_name),
+            attempt: row.attempt,
+            retryable: retryable(&row.direction, &row.status),
         }
+    }
+}
+
+/// Ended sends our user may offer again under the same transfer id.
+const RETRYABLE_SENT: &[&str] = &["failed", "unreachable", "busy", "expired"];
+/// Ended receives our user may ask the sender to offer again. Only ones that
+/// broke after being accepted: the sender honours nothing else (see
+/// [`FRIEND_RETRYABLE_SENT`]), and anything else was refused or lapsed.
+const RETRYABLE_RECEIVED: &[&str] = &["failed", "unreachable"];
+/// Sends a friend may ask us to offer again: ones that broke, never ones that
+/// lapsed or were refused, so a friend cannot revive a grant the user let go.
+const FRIEND_RETRYABLE_SENT: &[&str] = &["failed", "unreachable"];
+/// Received rows a re-offer of the same file reopens.
+const REOFFER_REOPENS: &[&str] = &["failed", "unreachable", "expired"];
+/// How long a "Try again" press on a received card stands as acceptance of
+/// the re-offer it asked for. After that the re-offer is asked about afresh.
+const RETRY_ASK_WINDOW_SECS: i64 = 120;
+
+fn retryable(direction: &str, status: &str) -> bool {
+    match direction {
+        "sent" => RETRYABLE_SENT.contains(&status),
+        "received" => RETRYABLE_RECEIVED.contains(&status),
+        _ => false,
     }
 }
 
@@ -262,6 +292,8 @@ pub(crate) struct InboundAttach {
     /// Sanitized: what the file will be called on disk.
     name: String,
     received_at: i64,
+    /// A re-offer our own "Try again" asked for.
+    requested: bool,
 }
 
 async fn send_ext(
@@ -312,11 +344,8 @@ pub(super) async fn offer_preflight(
     settings: &AppSettings,
     friend: &[u8; 16],
 ) -> Result<u16, String> {
-    if settings.friend_chat_disabled {
-        return Err(coded(
-            "peers_attach_disabled",
-            "Chatting with friends is turned off in Settings",
-        ));
+    if !settings.chat_allowed_with(friend) {
+        return Err(chat_off_error(settings));
     }
     if quic_endpoint(state).is_none() {
         return Err(unavailable());
@@ -335,6 +364,22 @@ pub(super) async fn offer_preflight(
         return Err(relayed());
     }
     quic_port_for(state, session.peer_addr()).ok_or_else(unavailable)
+}
+
+/// Why a file cannot go to a friend chat with whom is off: the global switch,
+/// or this friend's own setting overriding it.
+pub(crate) fn chat_off_error(settings: &AppSettings) -> String {
+    if settings.friend_chat_disabled {
+        coded(
+            "peers_attach_disabled",
+            "Chatting with friends is turned off in Settings",
+        )
+    } else {
+        coded(
+            "peers_attach_disabled_friend",
+            "Chatting with this friend is turned off in your settings for them",
+        )
+    }
 }
 
 async fn session_pubkey(state: &NetworkState, friend: &[u8; 16]) -> Option<[u8; 32]> {
@@ -473,11 +518,175 @@ pub(super) async fn send_offer(
     let row = db.chat_attachment(&xfer_hex).ok_or_else(not_found)?;
     emit_row(app, &row);
     info!(
-        "Chat attachment: offered {} ({size} bytes) to {}",
+        "Chat attachment: offered {xfer_hex} ({size} bytes) to {}",
         crate::security::short_hash(&friend),
-        xfer_hex
     );
     Ok(ChatAttachmentInfo::from_row(&row))
+}
+
+enum OfferAgainError {
+    /// The file is no longer where it was sent from.
+    SourceGone(String),
+    Other(String),
+}
+
+/// The offer we made for `row`, as it was, with our QUIC port as it is now.
+async fn offer_again_body(
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+    friend: &[u8; 16],
+    xfer_hex: &str,
+    row: &ChatAttachmentRow,
+) -> Result<Vec<u8>, OfferAgainError> {
+    let mut xfer_id = [0u8; 16];
+    hex::decode_to_slice(xfer_hex, &mut xfer_id).map_err(|_| OfferAgainError::Other(not_found()))?;
+    let (path, size, root_hex) = db
+        .chat_attachment_source(xfer_hex)
+        .ok_or_else(|| OfferAgainError::Other(not_found()))?;
+    let mut root = [0u8; 32];
+    hex::decode_to_slice(&root_hex, &mut root).map_err(|_| OfferAgainError::Other(not_found()))?;
+    let quic_port = offer_preflight(state, settings, friend)
+        .await
+        .map_err(OfferAgainError::Other)?;
+    // Only that it is still there: whether it is still the same file is what
+    // the root decides when the friend reads it.
+    let present = tokio::task::spawn_blocking(move || {
+        std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() == size)
+    })
+    .await
+    .unwrap_or(false);
+    if !present {
+        return Err(OfferAgainError::SourceGone(coded_ctx(
+            "peers_attach_failed",
+            "Could not send that file",
+            "it is no longer where it was sent from",
+        )));
+    }
+    let offer = AttachOffer {
+        xfer_id,
+        size,
+        root,
+        quic_port,
+        name: row.file_name.clone(),
+    };
+    attach::encode_attach_offer(&offer).ok_or_else(|| {
+        OfferAgainError::Other(coded_ctx(
+            "peers_attach_failed",
+            "Could not send that file",
+            "the file name or size cannot be offered",
+        ))
+    })
+}
+
+/// Offer a file we sent before again, under the same transfer id, so the
+/// conversation keeps one card for it. The row goes back to `status` (with
+/// `expires_at` when given) only from one of `from`, and the friend gets the
+/// offer it had, with our QUIC port as it is now.
+#[allow(clippy::too_many_arguments)]
+async fn reoffer(
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app: &tauri::AppHandle,
+    settings: &AppSettings,
+    friend: [u8; 16],
+    xfer_id: [u8; 16],
+    status: &str,
+    expires_at: Option<i64>,
+    from: &[&str],
+) -> Result<(), String> {
+    let xfer_hex = hex::encode(xfer_id);
+    let row = db.chat_attachment(&xfer_hex).ok_or_else(not_found)?;
+    let body = match offer_again_body(state, db, settings, &friend, &xfer_hex, &row).await {
+        Ok(body) => body,
+        Err(OfferAgainError::SourceGone(e)) => {
+            // Settled, so the card stops offering a retry that cannot work.
+            if db
+                .reopen_chat_attachment(&xfer_hex, from, "source_gone", None)
+                .unwrap_or(false)
+            {
+                emit_by_id(app, db, &xfer_hex);
+            }
+            return Err(e);
+        }
+        Err(OfferAgainError::Other(e)) => return Err(e),
+    };
+    let reopened = db
+        .reopen_chat_attachment(&xfer_hex, from, status, expires_at)
+        .map_err(|e| coded_ctx("peers_attach_failed", "Could not send that file", e))?;
+    if !reopened {
+        return Err(not_found());
+    }
+    if let Err(e) = send_ext(state, &friend, EMBER_EXT_ATTACH_OFFER, &body).await {
+        let _ = db.set_chat_attachment_status(&xfer_hex, &row.status, None, None);
+        emit_by_id(app, db, &xfer_hex);
+        return Err(e);
+    }
+    emit_by_id(app, db, &xfer_hex);
+    info!(
+        "Chat attachment: offered {xfer_hex} again ({} bytes) to {}",
+        row.file_size,
+        crate::security::short_hash(&friend),
+    );
+    Ok(())
+}
+
+/// The user pressed "Try again" on a transfer that ended without the file.
+///
+/// Sent: offer it again, as a fresh offer the friend has the usual time to
+/// answer, which the friend's side takes or asks about exactly as a first
+/// offer. Received: ask the sender to offer it again — an accept for a
+/// transfer that broke is that request, and needs no new message — and this
+/// press is the acceptance of the re-offer it brings; see [`on_reoffer`].
+pub(super) async fn retry(
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app: &tauri::AppHandle,
+    settings: &AppSettings,
+    xfer_id: [u8; 16],
+) -> Result<(), String> {
+    let xfer_hex = hex::encode(xfer_id);
+    let row = db.chat_attachment(&xfer_hex).ok_or_else(not_found)?;
+    let mut friend = [0u8; 16];
+    hex::decode_to_slice(&row.friend_hash, &mut friend).map_err(|_| not_found())?;
+    if !retryable(&row.direction, &row.status) {
+        return Err(not_found());
+    }
+    let now = chrono::Utc::now().timestamp();
+    if row.direction == "sent" {
+        return reoffer(
+            state,
+            db,
+            app,
+            settings,
+            friend,
+            xfer_id,
+            "offered",
+            Some(now + ATTACH_OFFER_TTL_SECS),
+            RETRYABLE_SENT,
+        )
+        .await;
+    }
+    if receive_running(state, &xfer_id) {
+        return Ok(());
+    }
+    // The re-offer this asks for would be refused on arrival.
+    if settings.chat_allowed_with(&friend) && !settings.files_allowed_from(&friend) {
+        return Err(coded(
+            "peers_attach_files_disabled_friend",
+            "Files from this friend are turned off in your settings for them",
+        ));
+    }
+    let session_port = offer_preflight(state, settings, &friend).await?;
+    let ask = attach::encode_attach_reply(&xfer_id, AttachReply::Accept, Some(session_port));
+    send_ext(state, &friend, EMBER_EXT_ATTACH_REPLY, &ask).await?;
+    state.attach_retry_asked.retain(|_, at| now - *at < RETRY_ASK_WINDOW_SECS);
+    state.attach_retry_asked.insert(xfer_id, now);
+    info!(
+        "Chat attachment: asked {} to offer {xfer_hex} again",
+        crate::security::short_hash(&friend),
+    );
+    Ok(())
 }
 
 /// The friend answered an offer we made.
@@ -486,6 +695,7 @@ pub(super) async fn on_reply(
     state: &mut NetworkState,
     db: &Arc<Database>,
     app: &tauri::AppHandle,
+    settings: &AppSettings,
     friend: [u8; 16],
     xfer_id: [u8; 16],
     reply: AttachReply,
@@ -500,24 +710,55 @@ pub(super) async fn on_reply(
     if row.direction != "sent" || row.friend_hash != hex::encode(friend) {
         return;
     }
+    let now = chrono::Utc::now().timestamp();
+    state
+        .attach_reoffered
+        .retain(|_, at| now - *at < ATTACH_OFFER_TTL_SECS);
+    if reply.is_accept() && FRIEND_RETRYABLE_SENT.contains(&row.status.as_str()) {
+        on_friend_retry(state, db, app, settings, friend, xfer_id, &row, now).await;
+        return;
+    }
     if reply.is_accept() {
         // The accept can arrive after the stream has already started — the
         // recipient dials the moment it sends the accept — so `active` is as
-        // valid a starting point as `offered`. The expiry still has to move:
-        // the offer's short lifetime is for "nobody answered", and a retry after
-        // it would otherwise be refused mid-transfer.
+        // valid a starting point as `offered`. The stream that got there first
+        // moved the expiry already; see `ServeProgress::note`.
         if !matches!(row.status.as_str(), "offered" | "accepted" | "active") {
             return;
         }
-        let now = chrono::Utc::now().timestamp();
         let Some(expires_at) = db.chat_attachment_expiry(&xfer_hex) else {
             return;
         };
-        let Some(extend) = accept_extends_grant(row.created_at, expires_at, now) else {
+        let Some(extend) = accept_extends_grant(&row.status, expires_at, now) else {
             return;
         };
+        if row.status != "offered" && state.attach_reoffered.remove(&xfer_id).is_none() {
+            // An accept for a transfer already under way here, that is not
+            // the answer to an offer we made again: their "Try again" on a
+            // receive that broke without our hearing of it — they restarted,
+            // or their cancel went down a session that had gone. They no
+            // longer hold the offer, so it goes to them again; the grant
+            // stays as it is.
+            match offer_again_body(state, db, settings, &friend, &xfer_hex, &row).await {
+                Ok(body) => {
+                    if send_ext(state, &friend, EMBER_EXT_ATTACH_OFFER, &body).await.is_ok() {
+                        state.attach_reoffered.insert(xfer_id, now);
+                        info!(
+                            "Chat attachment: offered {xfer_hex} again to {}, who lost it",
+                            crate::security::short_hash(&friend),
+                        );
+                    }
+                }
+                Err(OfferAgainError::SourceGone(e) | OfferAgainError::Other(e)) => info!(
+                    "Chat attachment: could not offer {xfer_hex} again for {}: {e}",
+                    crate::security::short_hash(&friend),
+                ),
+            }
+            return;
+        }
         if extend {
             let _ = db.set_chat_attachment_expiry(&xfer_hex, now + ATTACH_GRANT_TTL_SECS);
+            let _ = db.mark_chat_attachment_granted(&xfer_hex);
         }
         if row.status == "offered" {
             let _ = db.set_chat_attachment_status(&xfer_hex, "accepted", None, None);
@@ -537,9 +778,14 @@ pub(super) async fn on_reply(
         }
         return;
     }
-    if row.status != "offered" {
+    // A re-offer the friend asked for goes out already `accepted`, and their
+    // side can still turn it down: refused on arrival, declined when their
+    // acceptance fell back to asking, or lapsed unanswered (sent as busy).
+    let refused_reoffer = row.status == "accepted" && row.transferred == 0;
+    if row.status != "offered" && !refused_reoffer {
         return;
     }
+    state.attach_reoffered.remove(&xfer_id);
     let status = match reply {
         AttachReply::Accept => unreachable!("handled above"),
         AttachReply::Decline => "declined",
@@ -551,16 +797,114 @@ pub(super) async fn on_reply(
     emit_by_id(app, db, &xfer_hex);
 }
 
+/// The friend's "Try again" on a transfer of ours that broke.
+///
+/// One that had its grant is offered again as already accepted, and only while
+/// that grant is in date: nothing here extends it, so a friend cannot keep a
+/// file readable past what the user gave it. One that broke before the grant
+/// began — they could never reach us — is offered again as the first offer
+/// was, so their accept grants it once, as it would have; but no later than
+/// the grant could have run from when the user sent it.
+///
+/// When it will not be offered again for good — the grant ran out, the file
+/// is gone, chat with them is off — they are told, so their card stops
+/// offering a retry. A passing failure leaves it for them to try later.
+#[allow(clippy::too_many_arguments)]
+async fn on_friend_retry(
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app: &tauri::AppHandle,
+    settings: &AppSettings,
+    friend: [u8; 16],
+    xfer_id: [u8; 16],
+    row: &ChatAttachmentRow,
+    now: i64,
+) {
+    let xfer_hex = hex::encode(xfer_id);
+    let expires_at = db.chat_attachment_expiry(&xfer_hex).unwrap_or(0);
+    let granted = db.chat_attachment_was_granted(&xfer_hex);
+    let Some((status, offer_expiry)) =
+        friend_retry_reopens(granted, row.attempt, row.created_at, expires_at, now)
+    else {
+        info!(
+            "Chat attachment: {} asked for {xfer_hex} again after its grant ran out",
+            crate::security::short_hash(&friend),
+        );
+        refuse_friend_retry(state, &friend, xfer_id, AttachCancel::User).await;
+        return;
+    };
+    match reoffer(
+        state,
+        db,
+        app,
+        settings,
+        friend,
+        xfer_id,
+        status,
+        offer_expiry,
+        FRIEND_RETRYABLE_SENT,
+    )
+    .await
+    {
+        Ok(()) => {
+            // An `offered` row's accept is told apart by its status already.
+            if status == "accepted" {
+                state.attach_reoffered.insert(xfer_id, now);
+            }
+        }
+        Err(e) => {
+            info!(
+                "Chat attachment: could not offer {xfer_hex} again for {}: {e}",
+                crate::security::short_hash(&friend),
+            );
+            let gone = db
+                .chat_attachment(&xfer_hex)
+                .is_some_and(|r| r.status == "source_gone");
+            if gone {
+                refuse_friend_retry(state, &friend, xfer_id, AttachCancel::SourceGone).await;
+            } else if !settings.chat_allowed_with(&friend) {
+                refuse_friend_retry(state, &friend, xfer_id, AttachCancel::User).await;
+            }
+        }
+    }
+}
+
+/// What a friend's "Try again" reopens one of our sends as, and with what
+/// expiry; `None` when it is too late. See [`on_friend_retry`].
+fn friend_retry_reopens(
+    granted: bool,
+    attempt: u32,
+    created_at: i64,
+    expires_at: i64,
+    now: i64,
+) -> Option<(&'static str, Option<i64>)> {
+    // Rows from before grants were recorded: one still on its first offer's
+    // lifetime never had one.
+    let never_granted = !granted && (attempt > 0 || expires_at <= created_at + ATTACH_OFFER_TTL_SECS);
+    if never_granted {
+        (now < created_at + ATTACH_GRANT_TTL_SECS).then_some(("offered", Some(now + ATTACH_OFFER_TTL_SECS)))
+    } else {
+        (expires_at > now).then_some(("accepted", None))
+    }
+}
+
+async fn refuse_friend_retry(state: &NetworkState, friend: &[u8; 16], xfer_id: [u8; 16], reason: AttachCancel) {
+    let body = attach::encode_attach_cancel(&xfer_id, reason);
+    let _ = send_ext(state, friend, EMBER_EXT_ATTACH_CANCEL, &body).await;
+}
+
 /// What an accept may do to a grant: `None` once it has lapsed — a late accept
 /// is not a way back into an offer nobody answered — and otherwise whether it
 /// still carries the offer's short lifetime and should move to the grant's.
-/// Once moved it stays put, so a friend repeating the accept cannot keep a
-/// path readable indefinitely.
-fn accept_extends_grant(created_at: i64, expires_at: i64, now: i64) -> Option<bool> {
+///
+/// That is exactly a row still `offered`: the first accept, or the first
+/// stream, moves it on, and only our own user puts it back (by offering again).
+/// So a friend repeating the accept cannot keep a path readable indefinitely.
+fn accept_extends_grant(status: &str, expires_at: i64, now: i64) -> Option<bool> {
     if expires_at <= now {
         return None;
     }
-    Some(expires_at <= created_at + ATTACH_OFFER_TTL_SECS)
+    Some(status == "offered")
 }
 
 /// Dial the recipient while it dials us, so our NAT has an outbound mapping for
@@ -605,9 +949,17 @@ pub(crate) struct ServeProgress {
     /// Every chunk has been handed to the stream. Not the same as delivered:
     /// the caller still has to see the friend acknowledge them.
     queued_all: bool,
+    /// Where the stream had got to, for saying so when it stops.
+    position: u64,
+    size: u64,
 }
 
 impl ServeProgress {
+    /// The last position the stream reported, and the file's size.
+    pub(crate) fn reached(&self) -> (u64, u64) {
+        (self.position, self.size)
+    }
+
     /// A row the user cancelled must not be walked back to `active` or
     /// `complete` by a stream that was already running when they did.
     fn writable(status: &str) -> bool {
@@ -628,10 +980,22 @@ impl ServeProgress {
         size: u64,
     ) -> bool {
         let xfer_hex = hex::encode(xfer_id);
+        self.position = position;
+        self.size = size;
         if self.row.is_none() {
             let Some(row) = db.chat_attachment(&xfer_hex) else {
                 return false;
             };
+            // A friend reading the file has accepted it, whether or not its
+            // accept has landed yet, so the grant moves to its full lifetime
+            // here as well — once, like the accept: only `offered` moves it.
+            if row.status == "offered" {
+                let _ = db.set_chat_attachment_expiry(
+                    &xfer_hex,
+                    chrono::Utc::now().timestamp() + ATTACH_GRANT_TTL_SECS,
+                );
+                let _ = db.mark_chat_attachment_granted(&xfer_hex);
+            }
             if Self::writable(&row.status) {
                 let _ = db.set_chat_attachment_status(&xfer_hex, "active", Some(position), None);
             }
@@ -673,6 +1037,12 @@ impl ServeProgress {
         let Some(row) = &self.row else {
             return;
         };
+        if self.queued_all && !delivered {
+            info!(
+                "Chat attachment: sent all of {} but the friend did not confirm it arrived",
+                row.xfer_id
+            );
+        }
         if !(delivered && self.queued_all) {
             return;
         }
@@ -698,19 +1068,28 @@ pub(super) async fn on_offer(
     let xfer_hex = hex::encode(xfer_id);
     let refuse = |reply: AttachReply| attach::encode_attach_reply(&xfer_id, reply, None);
 
-    if settings.friend_chat_disabled {
+    if !settings.files_allowed_from(&friend) {
         // The chat switch doubles as "no unsolicited contact from friends",
-        // exactly as it does for file offers, rather than a second control
-        // that could disagree with it.
+        // exactly as it does for file offers, and a friend's own files setting
+        // narrows it further. Read as they are now, so a re-offer after the
+        // user switched this off is refused like a first one.
         let _ = send_ext(state, &friend, EMBER_EXT_ATTACH_REPLY, &refuse(AttachReply::NotAllowed)).await;
         return;
     }
-    // A transfer id we already know is a replay or a duplicate delivery, not a
-    // second offer, and must not overwrite what the first one became.
-    if state.attach_inbound.contains_key(&xfer_id) || db.chat_attachment(&xfer_hex).is_some() {
+    let now = chrono::Utc::now().timestamp();
+    // First, so an offer of ours that lapsed unanswered is not mistaken below
+    // for one still waiting when the sender offers it again.
+    prune_inbound(state, db, app, now).await;
+    // A transfer id we already know is a duplicate delivery or a replay, and
+    // must not overwrite what the first one became — unless it is the same
+    // file offered again after that transfer ended without it.
+    if state.attach_inbound.contains_key(&xfer_id) || receive_running(state, &xfer_id) {
         return;
     }
-    let now = chrono::Utc::now().timestamp();
+    if let Some(row) = db.chat_attachment(&xfer_hex) {
+        on_reoffer(state, db, app, settings, friend, offer, peer_addr, row).await;
+        return;
+    }
     // Only a race gets here — the sender refuses to offer over a relayed
     // session — but an offer with no address behind it can never be fetched,
     // so it is settled now rather than left for an Accept that cannot work.
@@ -742,7 +1121,6 @@ pub(super) async fn on_offer(
         .await;
         return;
     }
-    prune_inbound(state, db, app, now);
     let pending = state
         .attach_inbound
         .values()
@@ -787,6 +1165,7 @@ pub(super) async fn on_offer(
             offer,
             name,
             received_at: now,
+            requested: false,
         },
     );
 
@@ -796,6 +1175,105 @@ pub(super) async fn on_offer(
     if risky || !try_auto_accept(state, db, app, settings, friend, xfer_id, size, now).await {
         emit_by_id(app, db, &xfer_hex);
     }
+}
+
+/// Whether a receive of `xfer_id` is still running.
+fn receive_running(state: &NetworkState, xfer_id: &[u8; 16]) -> bool {
+    state
+        .attach_fetches
+        .get(xfer_id)
+        .is_some_and(|(_, handle)| !handle.is_finished())
+}
+
+/// A friend offered again a file it offered us before, under the same transfer
+/// id: the sender's "Try again", or its answer to ours. Reopens the same row,
+/// so the conversation keeps one card for the file.
+///
+/// Only the same file from the same friend, and only after the transfer ended
+/// without it. From there it is decided exactly as a first offer is, against
+/// the settings as they are now: fetched without asking only under the user's
+/// auto-accept ceiling and the friend's budget, and never for a risky file.
+/// Having accepted the first attempt is not consent to this one — the user
+/// may have changed their mind, or their settings, since.
+///
+/// The one exception is a re-offer the user asked for by pressing "Try again"
+/// on this card within [`RETRY_ASK_WINDOW_SECS`]: that press accepted it. It
+/// still goes through everything `accept_offer` checks, and falls back to
+/// asking if any of that fails.
+#[allow(clippy::too_many_arguments)]
+async fn on_reoffer(
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app: &tauri::AppHandle,
+    settings: &AppSettings,
+    friend: [u8; 16],
+    offer: AttachOffer,
+    peer_addr: Option<SocketAddr>,
+    row: ChatAttachmentRow,
+) {
+    let xfer_id = offer.xfer_id;
+    let xfer_hex = hex::encode(xfer_id);
+    let same_file = row.direction == "received"
+        && row.friend_hash == hex::encode(friend)
+        && row.file_size == offer.size
+        && db
+            .chat_attachment_root(&xfer_hex)
+            .is_some_and(|root| root == hex::encode(offer.root));
+    if !same_file || !REOFFER_REOPENS.contains(&row.status.as_str()) || peer_addr.is_none() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let pending = state
+        .attach_inbound
+        .values()
+        .filter(|a| a.friend == friend)
+        .count();
+    if pending >= MAX_PENDING_PER_FRIEND {
+        let busy = attach::encode_attach_reply(&xfer_id, AttachReply::Busy, None);
+        let _ = send_ext(state, &friend, EMBER_EXT_ATTACH_REPLY, &busy).await;
+        return;
+    }
+    let Some(peer_pubkey) = session_pubkey(state, &friend).await else {
+        return;
+    };
+    let reopened = db
+        .reopen_chat_attachment(&xfer_hex, REOFFER_REOPENS, "awaiting", Some(now + ATTACH_OFFER_TTL_SECS))
+        .unwrap_or(false);
+    if !reopened {
+        return;
+    }
+    let asked_at = state.attach_retry_asked.remove(&xfer_id);
+    let asked = asked_at.is_some_and(|at| now - at < RETRY_ASK_WINDOW_SECS);
+    info!(
+        "Chat attachment: {} offered {xfer_hex} again",
+        crate::security::short_hash(&friend),
+    );
+    let size = offer.size;
+    // The name as stored reads as a placeholder when it cannot be opened, so
+    // the one offered now is checked as well.
+    let risky = crate::security::is_dangerous_extension(&row.file_name)
+        || crate::security::is_dangerous_extension(&crate::security::sanitize_filename(&offer.name));
+    state.attach_inbound.insert(
+        xfer_id,
+        InboundAttach {
+            friend,
+            peer_pubkey,
+            peer_addr,
+            offer,
+            name: row.file_name,
+            received_at: now,
+            requested: asked_at.is_some(),
+        },
+    );
+    if asked {
+        match accept_offer(state, db, app, settings, xfer_id).await {
+            Ok(()) => return,
+            Err(e) => info!("Chat attachment: {xfer_hex} waits for the user: {e}"),
+        }
+    } else if !risky && try_auto_accept(state, db, app, settings, friend, xfer_id, size, now).await {
+        return;
+    }
+    emit_by_id(app, db, &xfer_hex);
 }
 
 /// Fetch a fresh offer without asking, if it is under the user's ceiling and
@@ -813,10 +1291,7 @@ async fn try_auto_accept(
     now: i64,
 ) -> bool {
     let xfer_hex = hex::encode(xfer_id);
-    let ceiling = settings
-        .chat_attachment_auto_accept_mb
-        .min(crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB)
-        .saturating_mul(1024 * 1024);
+    let ceiling = settings.auto_accept_mb_for(&friend).saturating_mul(1024 * 1024);
     if ceiling == 0 || size > ceiling || !fetch_slot_free(state, &friend) {
         return false;
     }
@@ -871,7 +1346,11 @@ pub(super) fn auto_accept_allowed(
 }
 
 /// Retire offers nobody answered in time.
-fn prune_inbound(state: &mut NetworkState, db: &Database, app: &tauri::AppHandle, now: i64) {
+///
+/// The sender's side of a first offer lapses on its own clock. A re-offer we
+/// asked for with "Try again" may have gone out already accepted, which it
+/// would hold until the grant ran out, so the sender hears it lapsed.
+async fn prune_inbound(state: &mut NetworkState, db: &Database, app: &tauri::AppHandle, now: i64) {
     let lapsed: Vec<[u8; 16]> = state
         .attach_inbound
         .iter()
@@ -879,10 +1358,16 @@ fn prune_inbound(state: &mut NetworkState, db: &Database, app: &tauri::AppHandle
         .map(|(id, _)| *id)
         .collect();
     for id in lapsed {
-        state.attach_inbound.remove(&id);
+        let Some(inbound) = state.attach_inbound.remove(&id) else {
+            continue;
+        };
         let xfer_hex = hex::encode(id);
         let _ = db.set_chat_attachment_status(&xfer_hex, "expired", None, None);
         emit_by_id(app, db, &xfer_hex);
+        if inbound.requested {
+            let body = attach::encode_attach_reply(&id, AttachReply::Busy, None);
+            let _ = send_ext(state, &inbound.friend, EMBER_EXT_ATTACH_REPLY, &body).await;
+        }
     }
 }
 
@@ -895,7 +1380,7 @@ pub(super) async fn respond(
     xfer_id: [u8; 16],
     accept: bool,
 ) -> Result<(), String> {
-    prune_inbound(state, db, app, chrono::Utc::now().timestamp());
+    prune_inbound(state, db, app, chrono::Utc::now().timestamp()).await;
     if !state.attach_inbound.contains_key(&xfer_id) {
         return Err(not_found());
     }
@@ -1230,10 +1715,11 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
         let quic = dial_quic(ctx, &cert, &key, attempt);
         // QUIC listens on a UDP port of its own, which a setup forwarding only
         // the eD2K ports never opens. The friend's TCP listener is dialled
-        // beside the first QUIC dial once that has had a head start, rather
-        // than after it has timed out, and only once: after that the remaining
-        // retries are QUIC's.
-        let dialled = if !connected && !tcp_tried && !ctx.tcp_dials.is_empty() {
+        // beside a QUIC dial once that has had a head start, rather than after
+        // it has timed out, and only once. Also after a QUIC connection broke
+        // mid-file: the path that carried it may be what failed, and a redial
+        // over it can stall through every remaining attempt.
+        let dialled = if !tcp_tried && !ctx.tcp_dials.is_empty() {
             tcp_tried = true;
             attach_tcp::dial_quic_or_tcp(quic, || dial_friend_tcp(ctx, &ctx.tcp_dials)).await
         } else {
@@ -1270,6 +1756,7 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
             .try_clone()
             .map_err(|e| ReceiveFailure::Disk(e.to_string()))?;
         let mut last_emit: Option<Instant> = None;
+        let mut verified = 0u64;
         let status_wait = next_status_wait(status_waited);
         let fetched = attach_stream::fetch_attachment_waiting(
             &mut recv,
@@ -1280,6 +1767,7 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
             &ctx.root,
             handle,
             |progress| {
+                verified = progress.verified;
                 if last_emit.is_none_or(|at| at.elapsed() >= PROGRESS_INTERVAL) {
                     last_emit = Some(Instant::now());
                     emit_progress(&ctx.app, &ctx.db, &ctx.row, progress.received);
@@ -1302,11 +1790,23 @@ async fn receive_with_retries(ctx: &FetchCtx, part: &std::fs::File) -> Result<()
             Err(FetchError::Refused(status)) => return Err(ReceiveFailure::Refused(status)),
             Err(FetchError::Transient(e)) => last = ReceiveFailure::Unreachable(e.to_string()),
         }
+        note_stream_stopped(ctx, "QUIC", verified, attempt, &last);
     }
     Err(match last {
         ReceiveFailure::Unreachable(detail) if !connected => ReceiveFailure::NoRoute(detail),
         other => other,
     })
+}
+
+/// A stream that stopped before the file did, said in the default log: it is
+/// the only record of why a transfer stalled, and it is on this side.
+fn note_stream_stopped(ctx: &FetchCtx, carrier: &str, verified: u64, attempt: u32, why: &ReceiveFailure) {
+    info!(
+        "Chat attachment: {carrier} stream for {} stopped at {verified} of {} bytes (attempt {}/{FETCH_ATTEMPTS}): {why}",
+        hex::encode(ctx.xfer_id),
+        ctx.size,
+        attempt + 1,
+    );
 }
 
 /// Where the friend's upload listener may answer over TCP. The IP is the
@@ -1385,6 +1885,7 @@ async fn receive_over_tcp(
             Err(e) => return Some(Err(ReceiveFailure::Disk(e.to_string()))),
         };
         let mut last_emit: Option<Instant> = None;
+        let mut verified = 0u64;
         let fetched = attach_tcp::fetch_over_tcp(
             &mut parts,
             attach::ATTACH_STREAM_MSG_TYPE,
@@ -1394,6 +1895,7 @@ async fn receive_over_tcp(
             &ctx.root,
             handle,
             |progress| {
+                verified = progress.verified;
                 if last_emit.is_none_or(|at| at.elapsed() >= PROGRESS_INTERVAL) {
                     last_emit = Some(Instant::now());
                     emit_progress(&ctx.app, &ctx.db, &ctx.row, progress.received);
@@ -1410,6 +1912,7 @@ async fn receive_over_tcp(
             Err(FetchError::Refused(status)) => return Some(Err(ReceiveFailure::Refused(status))),
             Err(FetchError::Transient(e)) => last = ReceiveFailure::Unreachable(e.to_string()),
         }
+        note_stream_stopped(ctx, "TCP", verified, attempt, &last);
     }
     // A TCP path that only ever failed the way a network does is no verdict
     // on the transfer: the remaining QUIC retries may still get through.
@@ -1501,15 +2004,33 @@ pub(super) fn on_cancel(
     if row.friend_hash != hex::encode(friend) {
         return;
     }
+    // An offer still waiting on us was withdrawn, whatever the sender calls
+    // it. Settling it as `failed` would make it look like a receive that broke.
     let status = match reason {
+        _ if row.direction == "received" && row.status == "awaiting" => "cancelled",
         AttachCancel::User => "cancelled",
         AttachCancel::Unreachable => "unreachable",
         AttachCancel::SourceGone => "source_gone",
         AttachCancel::Stalled | AttachCancel::Corrupt => "failed",
     };
-    let moved = db
+    info!(
+        "Chat attachment: {} stopped {xfer_hex} ({reason:?})",
+        crate::security::short_hash(&friend),
+    );
+    let mut moved = db
         .advance_chat_attachment(&xfer_hex, status, None, None)
         .unwrap_or(false);
+    // The answer to our "Try again" on a receive that had already ended: the
+    // sender will not offer it again, so the card stops offering a retry.
+    if !moved
+        && row.direction == "received"
+        && matches!(reason, AttachCancel::User | AttachCancel::SourceGone)
+    {
+        state.attach_retry_asked.remove(&xfer_id);
+        moved = db
+            .reopen_chat_attachment(&xfer_hex, RETRYABLE_RECEIVED, status, None)
+            .unwrap_or(false);
+    }
     stop_local(state, settings, &xfer_id);
     if moved {
         emit_by_id(app, db, &xfer_hex);
@@ -1717,19 +2238,87 @@ mod tests {
     }
 
     /// An accept moves a fresh offer onto the grant's lifetime once, and a
-    /// late or repeated one cannot move it again.
+    /// late or repeated one cannot move it again. Only our own re-offer puts
+    /// a row back to `offered`, which is what lets a retry be extended.
     #[test]
     fn an_accept_extends_a_grant_once_and_never_revives_one() {
         let created = 1_000;
         let offer_expiry = created + ATTACH_OFFER_TTL_SECS;
-        let extends = |expires_at, now| accept_extends_grant(created, expires_at, now);
-        assert_eq!(extends(offer_expiry, created + 10), Some(true));
-        assert_eq!(extends(offer_expiry, offer_expiry), None);
-        assert_eq!(extends(offer_expiry, offer_expiry + 60), None);
+        assert_eq!(accept_extends_grant("offered", offer_expiry, created + 10), Some(true));
+        assert_eq!(accept_extends_grant("offered", offer_expiry, offer_expiry), None);
+        assert_eq!(accept_extends_grant("offered", offer_expiry, offer_expiry + 60), None);
 
         let granted = created + 10 + ATTACH_GRANT_TTL_SECS;
-        assert_eq!(extends(granted, created + 20), Some(false));
-        assert_eq!(extends(granted, granted), None);
+        for moved_on in ["accepted", "active"] {
+            assert_eq!(accept_extends_grant(moved_on, granted, created + 20), Some(false));
+            assert_eq!(accept_extends_grant(moved_on, granted, granted - 1), Some(false));
+        }
+        assert_eq!(accept_extends_grant("accepted", granted, granted), None);
+    }
+
+    /// A friend's retry may give a file the one grant it never got, but never
+    /// a second one, and never a grant past what the user's offer allowed.
+    #[test]
+    fn a_friend_retry_grants_at_most_once_and_never_past_the_users_grant() {
+        let sent = 1_000_000;
+        let first_offer_lapses = sent + ATTACH_OFFER_TTL_SECS;
+
+        // Could never reach us: offered again as the first offer was.
+        let now = sent + 60;
+        assert_eq!(
+            friend_retry_reopens(false, 0, sent, first_offer_lapses, now),
+            Some(("offered", Some(now + ATTACH_OFFER_TTL_SECS)))
+        );
+        // Still so after the offer's own lifetime, within the day.
+        let later = sent + 3_600;
+        assert_eq!(
+            friend_retry_reopens(false, 0, sent, first_offer_lapses, later),
+            Some(("offered", Some(later + ATTACH_OFFER_TTL_SECS)))
+        );
+        // But not past it.
+        assert_eq!(
+            friend_retry_reopens(false, 2, sent, first_offer_lapses, sent + ATTACH_GRANT_TTL_SECS),
+            None
+        );
+
+        // Had its grant: reopened inside it, unextended.
+        let grant_ends = sent + 120 + ATTACH_GRANT_TTL_SECS;
+        assert_eq!(
+            friend_retry_reopens(true, 1, sent, grant_ends, sent + 7_200),
+            Some(("accepted", None))
+        );
+        assert_eq!(friend_retry_reopens(true, 1, sent, grant_ends, grant_ends), None);
+        // A row from before grants were recorded whose expiry moved past the
+        // offer's had one.
+        assert_eq!(
+            friend_retry_reopens(false, 0, sent, grant_ends, sent + 7_200),
+            Some(("accepted", None))
+        );
+    }
+
+    /// What "Try again" is offered on: an ended send our user can re-offer, and
+    /// an ended receive the sender will honour a request for.
+    #[test]
+    fn try_again_is_offered_only_where_it_can_work() {
+        for status in ["failed", "unreachable", "busy", "expired"] {
+            assert!(retryable("sent", status), "sent {status}");
+        }
+        for status in ["failed", "unreachable"] {
+            assert!(retryable("received", status), "received {status}");
+        }
+        for status in ["expired", "busy", "declined", "cancelled", "complete", "source_gone"] {
+            assert!(!retryable("received", status), "received {status}");
+        }
+        for status in ["offered", "accepted", "active", "declined", "cancelled", "complete", "too_large", "not_allowed", "source_gone"] {
+            assert!(!retryable("sent", status), "sent {status}");
+        }
+        // A friend may only ask for what broke, which our own retry covers.
+        for status in FRIEND_RETRYABLE_SENT {
+            assert!(RETRYABLE_SENT.contains(status));
+        }
+        for status in RETRYABLE_RECEIVED {
+            assert!(REOFFER_REOPENS.contains(status));
+        }
     }
 
     const MB: u64 = 1024 * 1024;
@@ -1795,6 +2384,7 @@ mod tests {
             status: status.into(),
             transferred: 40,
             created_at: 1,
+            attempt: 0,
         }
     }
 
@@ -1838,6 +2428,7 @@ mod tests {
             },
             name: "f".into(),
             received_at: 0,
+            requested: false,
         };
         let inbound = std::collections::HashMap::from([
             ([10u8; 16], offer(gone, 10)),

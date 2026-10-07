@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import * as m from '$lib/paraglide/messages';
-import type { AppSettings, WebService } from '$lib/types';
+import type { AppSettings, FriendOverrides, WebService } from '$lib/types';
 import { flushToastActionsBeforeExit } from '$lib/stores/toast';
 
 export type SettingsUpdateOutcome = 'applied' | 'restart_required' | 'deferred';
@@ -141,6 +141,16 @@ export interface QuickLimitsPatch {
 /** Emitted with the full persisted settings after a save made outside the
  *  Settings page (the tray's alternative-speed toggle, the status bar). */
 export const SETTINGS_CHANGED_EVENT = 'ember:settings-changed';
+
+/** Replace one friend's exceptions to the friend settings. A field left out
+ *  follows the global setting; none at all clears the friend's entry. Resolves
+ *  with the settings as saved; {@link SETTINGS_CHANGED_EVENT} follows. */
+export async function setFriendOverrides(
+  userHashHex: string,
+  overrides: FriendOverrides,
+): Promise<AppSettings> {
+  return invoke('set_friend_overrides', { userHashHex, overrides });
+}
 
 /** Persist and apply speed limits without a full settings save. Resolves with
  *  the settings as saved; {@link SETTINGS_CHANGED_EVENT} follows. */

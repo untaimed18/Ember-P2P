@@ -1648,6 +1648,13 @@ pub(super) struct NetworkState {
     /// stops a friend filling the disk one small file at a time. See
     /// [`chat_attach::auto_accept_allowed`].
     pub(super) attach_auto_log: HashMap<[u8; 16], VecDeque<(i64, u64)>>,
+    /// Received attachments whose card the user pressed "Try again" on, and
+    /// when. That press is their acceptance of the re-offer it asks for.
+    pub(super) attach_retry_asked: HashMap<[u8; 16], i64>,
+    /// Files we sent and offered again because the friend pressed "Try again",
+    /// and when. The friend's next accept answers that offer rather than
+    /// asking for another, which is what keeps the two from looping.
+    pub(super) attach_reoffered: HashMap<[u8; 16], i64>,
     /// In-flight FIND_VALUE of a content-key epoch record (`search_id` →
     /// channel + epoch).
     pub(super) ember_channel_epoch_searches: HashMap<u32, ([u8; 16], i64)>,

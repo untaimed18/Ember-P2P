@@ -1641,6 +1641,18 @@ pub struct AppSettings {
     /// outright, so this never makes a stranger's file land on disk.
     #[serde(default = "default_chat_attachment_auto_accept_mb")]
     pub chat_attachment_auto_accept_mb: u64,
+    /// Per-friend exceptions to the friend settings above, keyed by the
+    /// friend's lowercase hex hash. A field left unset follows the global
+    /// setting, so a friend with no entry is treated exactly as before.
+    ///
+    /// Backend-owned: only `set_friend_overrides` writes it, one friend at a
+    /// time, so a whole-settings save from a page opened earlier cannot put
+    /// back an override the user has since changed.
+    ///
+    /// Read leniently: an entry this build cannot read is dropped on its own,
+    /// rather than failing the whole config and resetting every setting.
+    #[serde(default, deserialize_with = "deserialize_friend_overrides")]
+    pub friend_overrides: std::collections::BTreeMap<String, FriendOverrides>,
     /// Rendezvous server URL for friend discovery
     #[serde(default = "default_rendezvous_url")]
     pub rendezvous_url: String,
@@ -2242,6 +2254,126 @@ fn default_chat_attachment_auto_accept_mb() -> u64 {
 pub const CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB: u64 =
     crate::network::ember::attach::ATTACH_MAX_BYTES / (1024 * 1024);
 
+/// Friends with overrides kept at most: past the friends list's own ceiling
+/// of 500, so a real list always fits and a hand-edited file cannot grow the
+/// config without bound.
+pub const MAX_FRIEND_OVERRIDES: usize = 1_000;
+
+/// One friend's exceptions to the global friend settings. Every field left
+/// `None` follows the global one. The friend's name is not here: it is the
+/// nickname in the friends table, which the user already sets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FriendOverrides {
+    /// Chat with this friend, both ways. Off also refuses their files, as the
+    /// global chat switch does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<bool>,
+    /// Files this friend sends: in chat, and file offers. Has no default of
+    /// its own — unset follows chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<bool>,
+    /// Their files at or under this many megabytes are fetched without asking;
+    /// `Some(0)` always asks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_accept_mb: Option<u64>,
+    /// Let this friend browse our shared files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browse: Option<bool>,
+    /// Read receipts with this friend, both ways.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_receipts: Option<bool>,
+    /// Tell us when this friend comes online.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_online: Option<bool>,
+    /// Tell us about this friend's messages and files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_messages: Option<bool>,
+}
+
+impl FriendOverrides {
+    /// Nothing differs from the global settings, so no entry is needed.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The same overrides with the ceiling held to
+    /// [`CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB`], past which it means nothing.
+    pub fn normalized(mut self) -> Self {
+        self.auto_accept_mb = self
+            .auto_accept_mb
+            .map(|mb| mb.min(CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB));
+        self
+    }
+}
+
+fn deserialize_friend_overrides<'de, D>(
+    deserializer: D,
+) -> Result<std::collections::BTreeMap<String, FriendOverrides>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let serde_json::Value::Object(raw) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    Ok(raw
+        .into_iter()
+        .filter_map(|(key, value)| Some((key, serde_json::from_value(value).ok()?)))
+        .collect())
+}
+
+/// Whether `key` is the form [`AppSettings::friend_overrides`] is keyed by.
+pub fn is_friend_override_key(key: &str) -> bool {
+    key.len() == 32 && key.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+impl AppSettings {
+    fn overrides_for(&self, friend: &[u8; 16]) -> Option<&FriendOverrides> {
+        if self.friend_overrides.is_empty() {
+            return None;
+        }
+        self.friend_overrides.get(&hex::encode(friend))
+    }
+
+    /// Chat with `friend`, both ways.
+    pub fn chat_allowed_with(&self, friend: &[u8; 16]) -> bool {
+        self.overrides_for(friend)
+            .and_then(|o| o.chat)
+            .unwrap_or(!self.friend_chat_disabled)
+    }
+
+    /// Files from `friend`: chat attachments and file offers. Never while chat
+    /// with them is off, whatever the files setting says.
+    pub fn files_allowed_from(&self, friend: &[u8; 16]) -> bool {
+        self.chat_allowed_with(friend)
+            && self.overrides_for(friend).and_then(|o| o.files).unwrap_or(true)
+    }
+
+    /// The auto-accept ceiling for `friend`'s files, in megabytes.
+    pub fn auto_accept_mb_for(&self, friend: &[u8; 16]) -> u64 {
+        self.overrides_for(friend)
+            .and_then(|o| o.auto_accept_mb)
+            .unwrap_or(self.chat_attachment_auto_accept_mb)
+            .min(CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB)
+    }
+
+    /// Whether `friend` may browse our shared files.
+    pub fn browse_allowed_for(&self, friend: &[u8; 16]) -> bool {
+        self.overrides_for(friend)
+            .and_then(|o| o.browse)
+            .unwrap_or(!self.friend_browse_disabled)
+    }
+
+    /// Read receipts with `friend`, both ways. Never while chat with them is
+    /// off.
+    pub fn read_receipts_with(&self, friend: &[u8; 16]) -> bool {
+        self.chat_allowed_with(friend)
+            && self
+                .overrides_for(friend)
+                .and_then(|o| o.read_receipts)
+                .unwrap_or(self.friend_chat_read_receipts)
+    }
+}
+
 /// Default rendezvous server URL.
 ///
 /// L13: trust model for the V1 default rendezvous host.
@@ -2444,6 +2576,7 @@ impl Default for AppSettings {
             friend_session_encryption: true,
             channel_file_offers: default_channel_file_offers(),
             chat_attachment_auto_accept_mb: default_chat_attachment_auto_accept_mb(),
+            friend_overrides: std::collections::BTreeMap::new(),
             max_friends: default_max_friends(),
             rendezvous_url: default_rendezvous_url(),
             ember_native_enabled: true,
@@ -2555,6 +2688,129 @@ pub struct TransferSourcesPayload<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_friend_override_wins_over_the_global_setting_and_only_for_that_friend() {
+        let ana = [0xA1; 16];
+        let ben = [0xB2; 16];
+        let mut settings = AppSettings {
+            friend_chat_disabled: true,
+            friend_browse_disabled: false,
+            friend_chat_read_receipts: true,
+            chat_attachment_auto_accept_mb: 25,
+            ..AppSettings::default()
+        };
+        assert!(!settings.chat_allowed_with(&ana));
+        assert!(!settings.files_allowed_from(&ana));
+        assert!(!settings.read_receipts_with(&ana));
+        assert!(settings.browse_allowed_for(&ana));
+        assert_eq!(settings.auto_accept_mb_for(&ana), 25);
+
+        settings.friend_overrides.insert(
+            hex::encode(ana),
+            FriendOverrides {
+                chat: Some(true),
+                browse: Some(false),
+                auto_accept_mb: Some(0),
+                ..FriendOverrides::default()
+            },
+        );
+        assert!(settings.chat_allowed_with(&ana));
+        assert!(settings.files_allowed_from(&ana));
+        assert!(settings.read_receipts_with(&ana));
+        assert!(!settings.browse_allowed_for(&ana));
+        assert_eq!(settings.auto_accept_mb_for(&ana), 0, "0 is always ask");
+        assert!(!settings.chat_allowed_with(&ben));
+        assert!(settings.browse_allowed_for(&ben));
+        assert_eq!(settings.auto_accept_mb_for(&ben), 25);
+    }
+
+    #[test]
+    fn files_and_read_receipts_never_outlive_chat_with_a_friend() {
+        let ana = [0xA1; 16];
+        let mut settings = AppSettings::default();
+        settings.friend_overrides.insert(
+            hex::encode(ana),
+            FriendOverrides {
+                chat: Some(false),
+                files: Some(true),
+                read_receipts: Some(true),
+                ..FriendOverrides::default()
+            },
+        );
+        assert!(!settings.files_allowed_from(&ana));
+        assert!(!settings.read_receipts_with(&ana));
+
+        settings.friend_overrides.insert(
+            hex::encode(ana),
+            FriendOverrides {
+                files: Some(false),
+                ..FriendOverrides::default()
+            },
+        );
+        assert!(settings.chat_allowed_with(&ana));
+        assert!(!settings.files_allowed_from(&ana));
+    }
+
+    #[test]
+    fn a_friend_auto_accept_ceiling_is_held_to_the_global_maximum() {
+        let ana = [0xA1; 16];
+        let over = FriendOverrides {
+            auto_accept_mb: Some(u64::MAX),
+            ..FriendOverrides::default()
+        };
+        assert_eq!(
+            over.clone().normalized().auto_accept_mb,
+            Some(CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB)
+        );
+        let mut settings = AppSettings::default();
+        settings.friend_overrides.insert(hex::encode(ana), over);
+        assert_eq!(settings.auto_accept_mb_for(&ana), CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB);
+    }
+
+    #[test]
+    fn friend_overrides_leave_unset_fields_out_of_the_saved_config() {
+        let only_chat = FriendOverrides {
+            chat: Some(false),
+            ..FriendOverrides::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&only_chat).unwrap(),
+            serde_json::json!({ "chat": false })
+        );
+        let parsed: FriendOverrides = serde_json::from_str(r#"{"chat":false}"#).unwrap();
+        assert_eq!(parsed, only_chat);
+        assert!(FriendOverrides::default().is_empty());
+        assert!(!only_chat.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_friend_override_is_dropped_without_failing_the_config() {
+        let ana = hex::encode([0xA1; 16]);
+        let ben = hex::encode([0xB2; 16]);
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value["friend_overrides"] = serde_json::json!({
+            ana.clone(): { "chat": false },
+            ben.clone(): { "chat": "no" },
+        });
+        value["max_friends"] = serde_json::json!(123);
+        let parsed: AppSettings = serde_json::from_str(&value.to_string()).expect("config still loads");
+        assert_eq!(parsed.max_friends, 123, "fields after it still read");
+        assert_eq!(parsed.friend_overrides.len(), 1);
+        assert_eq!(parsed.friend_overrides[&ana].chat, Some(false));
+
+        value["friend_overrides"] = serde_json::json!(5);
+        let parsed: AppSettings = serde_json::from_str(&value.to_string()).expect("config still loads");
+        assert!(parsed.friend_overrides.is_empty());
+    }
+
+    #[test]
+    fn friend_override_keys_are_lowercase_friend_hashes() {
+        assert!(is_friend_override_key(&hex::encode([0xAB; 16])));
+        assert!(!is_friend_override_key(&hex::encode([0xAB; 16]).to_ascii_uppercase()));
+        assert!(!is_friend_override_key("abc"));
+        assert!(!is_friend_override_key(&"g".repeat(32)));
+    }
 
     /// `as_wire` is what `transfer-source-detail` events carry and what the
     /// frontend's `SourceInfo['status']` union enumerates, while the

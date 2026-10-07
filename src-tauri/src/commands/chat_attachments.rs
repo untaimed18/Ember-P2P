@@ -82,11 +82,11 @@ pub async fn pick_and_send_chat_attachment(
     if !state.friend_hashes.read().await.contains(&friend) {
         return Err(coded("peers_not_friend", "Can only send files to friends"));
     }
-    if state.config.read().await.settings.friend_chat_disabled {
-        return Err(coded(
-            "peers_attach_disabled",
-            "Chatting with friends is turned off in Settings",
-        ));
+    {
+        let config = state.config.read().await;
+        if !config.settings.chat_allowed_with(&friend) {
+            return Err(crate::network::chat_attach::chat_off_error(&config.settings));
+        }
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     bounded_send(
@@ -217,6 +217,22 @@ pub async fn cancel_chat_attachment(
     bounded_send(
         &state.network_tx,
         NetworkCommand::CancelChatAttachment { xfer_id, tx },
+    )
+    .await?;
+    await_reply(rx, "peers_no_response", "No response").await?
+}
+
+/// Try a transfer that ended without the file again, keeping its card.
+#[tauri::command]
+pub async fn retry_chat_attachment(
+    state: tauri::State<'_, AppState>,
+    xfer_id: String,
+) -> Result<(), String> {
+    let xfer_id = parse_xfer_id(&xfer_id)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    bounded_send(
+        &state.network_tx,
+        NetworkCommand::RetryChatAttachment { xfer_id, tx },
     )
     .await?;
     await_reply(rx, "peers_no_response", "No response").await?

@@ -372,8 +372,8 @@ export async function initFriendsStore() {
         onlineFriends.update((s) => (s.has(hash) ? s : new Set([...s, hash])));
         searchingFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
         clearSearchTimer(hash);
-        if (!wasOnline && shouldNotify('friend_online')) {
-          void notify('friend_online', m.notify_friend_online({ name: friendDisplayName(hash) }));
+        if (!wasOnline && shouldNotify('friend_online', hash)) {
+          void notify('friend_online', m.notify_friend_online({ name: friendDisplayName(hash) }), '', hash);
         }
       }),
     );
@@ -429,11 +429,12 @@ export async function initFriendsStore() {
         // The preview is capped hard: the shell renders it outside anything the
         // webview controls, and the backend strips direction overrides from
         // whatever gets there and escapes markup on the shells that parse it.
-        if (shouldNotify('friend_message')) {
+        if (shouldNotify('friend_message', hash)) {
           void notify(
             'friend_message',
             friendDisplayName(hash),
             safeEventText(p.message, 200),
+            hash,
           );
         }
       }),
@@ -470,11 +471,12 @@ export async function initFriendsStore() {
           // Bound the list so a misbehaving friend cannot grow it without end.
           return [...rest, { user_hash, file_hash, file_name, file_size, ember_file_hash }].slice(-20);
         });
-        if (shouldNotify('friend_message')) {
+        if (shouldNotify('friend_message', user_hash)) {
           void notify(
             'friend_message',
             m.notify_file_offer_title({ name: friendDisplayName(user_hash) }),
             file_name,
+            user_hash,
           );
         }
       }),
@@ -487,10 +489,11 @@ export async function initFriendsStore() {
         // already looking at that conversation: a file waiting for an answer,
         // and one that arrived by itself under the auto-accept ceiling.
         // Progress ticks repeat the same status many times a second, so each
-        // (transfer, moment) pair is announced once.
+        // (transfer, attempt, moment) is announced once. The attempt is part of
+        // it because "Try again" brings the same transfer back to an offer.
         const moment = a.status === 'awaiting' ? 'offer' : a.status === 'complete' ? 'done' : null;
         if (!moment) return;
-        const key = `${a.xfer_id}:${moment}`;
+        const key = `${a.xfer_id}:${a.attempt}:${moment}`;
         if (announcedAttachments.has(key)) return;
         announcedAttachments.add(key);
         if (announcedAttachments.size > 500) {
@@ -499,7 +502,7 @@ export async function initFriendsStore() {
         }
         if (get(activeChatHash) === a.user_hash && isAppVisible()) return;
         if (chatWindowShows(a.user_hash)) return;
-        if (!shouldNotify('friend_message')) return;
+        if (!shouldNotify('friend_message', a.user_hash)) return;
         const name = friendDisplayName(a.user_hash);
         void notify(
           'friend_message',
@@ -507,6 +510,7 @@ export async function initFriendsStore() {
             ? m.chat_attach_notify_offer({ name })
             : m.chat_attach_notify_received({ name }),
           safeEventText(a.name, 256),
+          a.user_hash,
         );
       }),
     );

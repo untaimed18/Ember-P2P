@@ -2401,6 +2401,8 @@ pub fn run() {
             commands::chat_attachments::pick_and_send_chat_attachment,
             commands::chat_attachments::respond_chat_attachment,
             commands::chat_attachments::cancel_chat_attachment,
+            commands::chat_attachments::retry_chat_attachment,
+            commands::settings::set_friend_overrides,
             commands::chat_attachments::list_chat_attachments,
             commands::chat_attachments::open_chat_attachment,
             commands::chat_attachments::open_chat_files_folder,

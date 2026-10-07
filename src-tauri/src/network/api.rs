@@ -424,6 +424,12 @@ pub enum NetworkCommand {
         xfer_id: [u8; 16],
         tx: oneshot::Sender<Result<(), String>>,
     },
+    /// Try a failed attachment again under the same transfer id, so it stays
+    /// one card in the conversation.
+    RetryChatAttachment {
+        xfer_id: [u8; 16],
+        tx: oneshot::Sender<Result<(), String>>,
+    },
     GetFileComments {
         file_hash: String,
         tx: oneshot::Sender<Option<ed2k::comments::FileCommentInfo>>,

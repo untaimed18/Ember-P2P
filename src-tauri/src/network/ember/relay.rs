@@ -2263,10 +2263,15 @@ where
         Some(limiter),
     )
     .await;
+    // In the default log either way: the friend's side says why its receive
+    // stopped, and this is the only record of where ours did.
+    let (reached, size) = progress.reached();
     match &served {
         Ok(0) => debug!("No live attachment grant for {peer_hex}"),
         Ok(bytes) => info!("Chat attachment: served {bytes} byte(s) to {peer_hex}"),
-        Err(e) => debug!("Attachment stream to {peer_hex} failed: {e}"),
+        Err(e) => info!(
+            "Chat attachment: stream to {peer_hex} stopped at {reached} of {size} bytes: {e}"
+        ),
     }
     Some((served, progress))
 }

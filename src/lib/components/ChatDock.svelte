@@ -27,6 +27,7 @@
     clearFileOffer,
   } from '$lib/stores/friends';
   import { appSettings } from '$lib/stores/settings';
+  import { chatAllowedWith } from '$lib/friendSettings';
   import { toastError, toastSuccess } from '$lib/stores/toast';
   import { formatBytes } from '$lib/utils';
   import { translateError } from '$lib/i18n';
@@ -158,7 +159,14 @@
   let panelEl: HTMLDivElement | undefined = $state();
   let returnFocusEl: HTMLElement | null = null;
   let acceptingOffer: string | null = $state(null);
-  let chatDisabled = $derived($appSettings?.friend_chat_disabled === true);
+  /** Chat is off with everyone: globally with no friend switched back on, or
+   *  for every friend there is. One friend's own setting only takes them out
+   *  of the list. */
+  let chatDisabled = $derived(
+    $friendsList.length > 0
+      ? !$friendsList.some((f) => chatAllowedWith($appSettings, f.user_hash))
+      : $appSettings?.friend_chat_disabled === true,
+  );
   let pendingOffers = $derived($fileOffers);
 
   /**
@@ -227,7 +235,9 @@
       ? []
       : [...$friendsList]
           .filter(
-            (f) => !$chatTabs.some((t) => t.hash === f.user_hash.toLowerCase()),
+            (f) =>
+              !$chatTabs.some((t) => t.hash === f.user_hash.toLowerCase()) &&
+              chatAllowedWith($appSettings, f.user_hash),
           )
           .map((f) => {
             const hash = f.user_hash.toLowerCase();
@@ -311,7 +321,7 @@
     if (row.kind === 'open') {
       setActiveTab(row.hash);
     } else {
-      if (chatDisabled) return;
+      if (!chatAllowedWith($appSettings, row.hash)) return;
       openChat(row.hash, row.name);
     }
     closeSwitcher();

@@ -98,6 +98,10 @@ pub(crate) fn persist_with_root_transaction(
 /// setup/settings forms can round-trip one object, but `update_settings`
 /// always restores these values from the authoritative in-memory config.
 const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
+    // Written one friend at a time by `set_friend_overrides`. The Settings page
+    // holds a copy from whenever it opened, and saving that back would undo a
+    // change made since from the friend's card.
+    "friend_overrides",
     "shared_folders",
     "previous_download_folders",
     "default_shared_folder_seeded",
@@ -804,6 +808,14 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    // A hand-edited or damaged entry is repaired or dropped, not a reason to
+    // reset every other setting.
+    let overrides = normalize_friend_overrides(settings.friend_overrides.clone());
+    if overrides != settings.friend_overrides {
+        settings.friend_overrides = overrides;
+        changed = true;
+    }
+
     // A username stored under the older, looser rule (spaces, punctuation, up
     // to 32 bytes) is not a corrupt config — but `validate_settings` now
     // refuses it, and on load that answer means backup-and-reset of every
@@ -1049,6 +1061,12 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "settings_chat_attachment_auto_accept_invalid",
             "The automatic download limit is larger than any file a friend can send",
             crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB,
+        ));
+    }
+    if normalize_friend_overrides(settings.friend_overrides.clone()) != settings.friend_overrides {
+        return Err(coded(
+            "settings_friend_overrides_invalid",
+            "A friend's settings could not be saved",
         ));
     }
     if !crate::auto_update::record::CHECK_FREQUENCIES
@@ -2519,6 +2537,138 @@ pub async fn set_close_behavior(
     Ok(())
 }
 
+/// Per-friend overrides as this build keeps them: keys lowercased, entries
+/// under a key that is not a friend hash dropped, each value normalized,
+/// entries left with nothing to override dropped, and no more than
+/// [`crate::types::MAX_FRIEND_OVERRIDES`].
+pub(crate) fn normalize_friend_overrides(
+    overrides: std::collections::BTreeMap<String, crate::types::FriendOverrides>,
+) -> std::collections::BTreeMap<String, crate::types::FriendOverrides> {
+    overrides
+        .into_iter()
+        .map(|(key, value)| (key.to_ascii_lowercase(), value))
+        .filter(|(key, _)| crate::types::is_friend_override_key(key))
+        .map(|(key, value)| (key, value.normalized()))
+        .filter(|(_, value)| !value.is_empty())
+        .take(crate::types::MAX_FRIEND_OVERRIDES)
+        .collect()
+}
+
+/// Persist one change to the settings made outside the Settings page: under
+/// the save lock, before the in-memory copy moves, then handed to the network
+/// loop and announced to every open view. `change` returns false when there is
+/// nothing to save.
+pub(crate) async fn save_settings_change(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    change: impl FnOnce(&mut AppSettings) -> Result<bool, String>,
+) -> Result<AppSettings, String> {
+    let _settings_save_guard = state.settings_save_lock.lock().await;
+    let (new_settings, save_data) = {
+        let config = state.config.read().await;
+        let mut new_settings = config.settings.clone();
+        if !change(&mut new_settings)? {
+            return Ok(new_settings);
+        }
+        new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
+        let data = config.prepare_save_settings(&new_settings).map_err(|e| {
+            coded_ctx(
+                "settings_serialize_failed",
+                "Failed to serialize settings",
+                e,
+            )
+        })?;
+        (new_settings, data)
+    };
+    let (data, tmp, final_path) = save_data;
+    tokio::task::spawn_blocking(move || {
+        crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+    })
+    .await
+    .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?
+    .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
+    {
+        let mut config = state.config.write().await;
+        config.settings = new_settings.clone();
+    }
+    // Under the save lock, as `update_settings` does, so a concurrent save
+    // cannot land in the loop ahead of this one.
+    if let Err(e) = state
+        .network_tx
+        .send_timeout(
+            NetworkCommand::UpdateSettings {
+                settings: Box::new(new_settings.clone()),
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    {
+        tracing::warn!("Settings were saved, but the live network update was dropped: {e}");
+    }
+    if let Err(error) = app.emit(SETTINGS_CHANGED_EVENT, &new_settings) {
+        tracing::debug!("Could not emit the settings change: {error}");
+    }
+    Ok(new_settings)
+}
+
+/// Set one friend's exceptions to the friend settings, replacing what they
+/// had. Every field left unset follows the global setting; all of them unset
+/// removes the friend's entry.
+#[tauri::command]
+pub async fn set_friend_overrides(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    user_hash_hex: String,
+    overrides: crate::types::FriendOverrides,
+) -> Result<AppSettings, String> {
+    let key = user_hash_hex.trim().to_ascii_lowercase();
+    let mut hash = [0u8; 16];
+    if !crate::types::is_friend_override_key(&key) || hex::decode_to_slice(&key, &mut hash).is_err() {
+        return Err(coded("peers_not_friend", "That is not one of your friends"));
+    }
+    if !state.friend_hashes.read().await.contains(&hash) {
+        return Err(coded("peers_not_friend", "That is not one of your friends"));
+    }
+    let overrides = overrides.normalized();
+    let saved = save_settings_change(&app, &state, move |settings| {
+        let before = settings.friend_overrides.get(&key).cloned();
+        if overrides.is_empty() {
+            settings.friend_overrides.remove(&key);
+        } else {
+            if before.is_none()
+                && settings.friend_overrides.len() >= crate::types::MAX_FRIEND_OVERRIDES
+            {
+                return Err(coded(
+                    "settings_friend_overrides_invalid",
+                    "A friend's settings could not be saved",
+                ));
+            }
+            settings.friend_overrides.insert(key.clone(), overrides.clone());
+        }
+        Ok(settings.friend_overrides.get(&key) != before.as_ref())
+    })
+    .await?;
+    // Removed while this was saving: its own clear may have run first.
+    if !state.friend_hashes.read().await.contains(&hash) {
+        clear_friend_overrides(&app, &state, &hash).await?;
+        return Err(coded("peers_not_friend", "That is not one of your friends"));
+    }
+    Ok(saved)
+}
+
+/// Forget a removed friend's overrides, so adding them again starts from the
+/// global settings rather than from choices made about the old friendship.
+pub(crate) async fn clear_friend_overrides(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    friend: &[u8; 16],
+) -> Result<(), String> {
+    let key = hex::encode(friend);
+    save_settings_change(app, state, move |settings| Ok(settings.friend_overrides.remove(&key).is_some()))
+        .await
+        .map(|_| ())
+}
+
 /// The limits the tray and the status bar change without a trip to Settings.
 /// A field left out keeps its saved value.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -3316,6 +3466,41 @@ pub async fn open_ember_share(target: String, text: String) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn friend_overrides_normalize_to_what_this_build_keeps() {
+        use crate::types::{FriendOverrides, CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB, MAX_FRIEND_OVERRIDES};
+        let chat_off = FriendOverrides {
+            chat: Some(false),
+            ..FriendOverrides::default()
+        };
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(hex::encode([1u8; 16]), chat_off.clone());
+        map.insert(hex::encode([2u8; 16]), FriendOverrides::default());
+        map.insert(hex::encode([0xABu8; 16]).to_ascii_uppercase(), chat_off.clone());
+        map.insert("not a hash".to_string(), chat_off.clone());
+        map.insert(
+            hex::encode([4u8; 16]),
+            FriendOverrides {
+                auto_accept_mb: Some(u64::MAX),
+                ..FriendOverrides::default()
+            },
+        );
+        let normalized = normalize_friend_overrides(map);
+        assert_eq!(normalized.len(), 3, "{normalized:?}");
+        assert_eq!(normalized.get(&hex::encode([1u8; 16])), Some(&chat_off));
+        assert_eq!(normalized.get(&hex::encode([0xABu8; 16])), Some(&chat_off), "lowercased, kept");
+        assert_eq!(
+            normalized[&hex::encode([4u8; 16])].auto_accept_mb,
+            Some(CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB)
+        );
+        assert_eq!(normalize_friend_overrides(normalized.clone()), normalized);
+
+        let many: std::collections::BTreeMap<_, _> = (0..MAX_FRIEND_OVERRIDES + 5)
+            .map(|i| (format!("{i:032x}"), chat_off.clone()))
+            .collect();
+        assert_eq!(normalize_friend_overrides(many).len(), MAX_FRIEND_OVERRIDES);
+    }
 
     #[test]
     fn known_met_notice_waits_for_the_frontend_and_is_taken_once() {

@@ -35,6 +35,7 @@ import { showNotification } from '$lib/api/system';
 import { appSettings } from '$lib/stores/settings';
 import type { AppSettings } from '$lib/types';
 import { chatWindowFocused, isChatWindow } from '$lib/windowRole';
+import { friendNotifies } from '$lib/friendSettings';
 
 /** The categories a user can switch off independently, keyed to their setting. */
 export type NotifyCategory =
@@ -148,8 +149,12 @@ function recordSignature(signature: string, now: number): void {
  *
  * Exported so callers with expensive bodies to build — resolving a friend's
  * nickname, formatting a size — can bail before doing the work.
+ *
+ * `friendHash` names the friend a friend notification is about, so that
+ * friend's own setting can stand in for the category's. The master switch is
+ * never overridden: it is the one place a user turns everything off.
  */
-export function shouldNotify(category: NotifyCategory): boolean {
+export function shouldNotify(category: NotifyCategory, friendHash?: string): boolean {
   if (deliveryUnavailable) return false;
   // The chat window hears every event the main window does. The main window
   // alone speaks, or each message would be announced twice.
@@ -160,7 +165,13 @@ export function shouldNotify(category: NotifyCategory): boolean {
   // nothing, an unwanted one is a broken promise.
   if (!settings) return false;
   if (!settings.notifications_enabled) return false;
-  if (!settings[CATEGORY_SETTING[category]]) return false;
+  if (friendHash && (category === 'friend_online' || category === 'friend_message')) {
+    if (!friendNotifies(settings, friendHash, category === 'friend_online' ? 'online' : 'messages')) {
+      return false;
+    }
+  } else if (!settings[CATEGORY_SETTING[category]]) {
+    return false;
+  }
   if (settings.notifications_only_when_unfocused && emberIsFocused(category)) return false;
   return true;
 }
@@ -176,8 +187,9 @@ export async function notify(
   category: NotifyCategory,
   title: string,
   body = '',
+  friendHash?: string,
 ): Promise<void> {
-  if (!shouldNotify(category)) return;
+  if (!shouldNotify(category, friendHash)) return;
   const trimmedTitle = title.trim();
   if (!trimmedTitle) return;
 

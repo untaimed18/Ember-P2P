@@ -516,6 +516,7 @@ pub async fn add_friend(
 
 #[tauri::command]
 pub async fn remove_friend(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<(), String> {
@@ -545,7 +546,13 @@ pub async fn remove_friend(
         }
     }
 
-    tear_down_friend(&state, hash).await
+    tear_down_friend(&state, hash).await?;
+    // Best effort: the friendship is already gone, and an override left behind
+    // only applies if this hash is ever added again.
+    if let Err(e) = super::settings::clear_friend_overrides(&app, &state, &hash).await {
+        tracing::warn!("Could not clear a removed friend's settings: {e}");
+    }
+    Ok(())
 }
 
 /// Revoke every live grant held by a friend whose database rows have just
@@ -598,6 +605,7 @@ async fn tear_down_friend(state: &AppState, hash: [u8; 16]) -> Result<(), String
 /// them straight back to mutual without a prompt.
 #[tauri::command]
 pub async fn block_friend(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<(), String> {
@@ -611,7 +619,11 @@ pub async fn block_friend(
         .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("peers_failed_block_friend", "Failed to block", e))?;
 
-    tear_down_friend(&state, hash).await
+    tear_down_friend(&state, hash).await?;
+    if let Err(e) = super::settings::clear_friend_overrides(&app, &state, &hash).await {
+        tracing::warn!("Could not clear a blocked friend's settings: {e}");
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -959,6 +971,11 @@ fn code_permanent_chat_failure(reason: String) -> String {
     let lowered = reason.to_ascii_lowercase();
     if lowered.contains("can only chat with friends") {
         coded("peers_not_friend", "Can only chat with friends")
+    } else if lowered.contains("chat is disabled for this friend") {
+        coded(
+            "peers_attach_disabled_friend",
+            "Chatting with this friend is turned off in your settings for them",
+        )
     } else if lowered.contains("chat is disabled") {
         coded(
             "peers_attach_disabled",
@@ -1070,7 +1087,7 @@ pub async fn mark_messages_read(
         })?;
     let send_receipt = {
         let cfg = state.config.read().await;
-        !cfg.settings.friend_chat_disabled && cfg.settings.friend_chat_read_receipts
+        cfg.settings.read_receipts_with(&eh)
     };
     if send_receipt {
         let db_hash = state.db.clone();
@@ -2970,6 +2987,7 @@ mod tests {
     fn chat_failure_classification_matches_network_wording() {
         for permanent in [
             "Chat is disabled in Friends settings",
+            "Chat is disabled for this friend",
             "Can only chat with friends",
             "ChatEncryptFailed",
         ] {
@@ -2998,6 +3016,7 @@ mod tests {
     fn permanent_chat_failures_reach_the_composer_coded() {
         for (reason, code) in [
             ("Chat is disabled in Friends settings", "peers_attach_disabled"),
+            ("Chat is disabled for this friend", "peers_attach_disabled_friend"),
             ("Can only chat with friends", "peers_not_friend"),
         ] {
             let coded: serde_json::Value =

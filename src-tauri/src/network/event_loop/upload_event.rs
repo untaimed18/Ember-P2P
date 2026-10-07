@@ -395,10 +395,11 @@ pub(in crate::network) async fn on_upload_event(
             framed.extend_from_slice(&ack);
             let _ = reply_tx.try_send(framed);
         } else if friend_hashes.read().await.contains(&offer_eh) {
-            let status = if settings.friend_chat_disabled {
+            let status = if !settings.files_allowed_from(&offer_eh) {
                 // Reuse the chat switch as the "no unsolicited
                 // contact from friends" control rather than adding
-                // a second one that could disagree with it.
+                // a second one that could disagree with it; a
+                // friend's own files setting narrows it.
                 ed2k::messages::OFFER_STATUS_DECLINED
             } else {
                 ed2k::messages::OFFER_STATUS_ACCEPTED
@@ -477,6 +478,7 @@ pub(in crate::network) async fn on_upload_event(
             state,
             db,
             app_handle,
+            settings,
             attach_eh,
             xfer_id,
             reply,
@@ -615,8 +617,10 @@ pub(in crate::network) async fn on_upload_event(
                 }
             }
             // The session is live, so anything the user typed
-            // while this friend was unreachable can go out now.
-            if still_friend {
+            // while this friend was unreachable can go out now —
+            // unless chat with them was turned off since, which
+            // holds it until it is back on or ages out.
+            if still_friend && settings.chat_allowed_with(ember_hash) {
                 flush_pending_chat(
                     db,
                     app_handle,
@@ -625,8 +629,7 @@ pub(in crate::network) async fn on_upload_event(
                     *ember_hash,
                 )
                 .await;
-                if !settings.friend_chat_disabled && settings.friend_chat_read_receipts
-                {
+                if settings.read_receipts_with(ember_hash) {
                     flush_pending_read_receipt(
                         db,
                         &state.ember_sessions,
@@ -759,16 +762,17 @@ pub(in crate::network) async fn on_upload_event(
                 // the outbound dial path), so without flushing
                 // here queued chat would sit unsent while the UI
                 // showed the friend online and new sends worked.
-                flush_pending_chat(
-                    db,
-                    app_handle,
-                    &state.ember_sessions,
-                    &ed25519_secret_key,
-                    *ember_hash,
-                )
-                .await;
-                if !settings.friend_chat_disabled && settings.friend_chat_read_receipts
-                {
+                if settings.chat_allowed_with(ember_hash) {
+                    flush_pending_chat(
+                        db,
+                        app_handle,
+                        &state.ember_sessions,
+                        &ed25519_secret_key,
+                        *ember_hash,
+                    )
+                    .await;
+                }
+                if settings.read_receipts_with(ember_hash) {
                     flush_pending_read_receipt(
                         db,
                         &state.ember_sessions,
@@ -849,6 +853,20 @@ pub(in crate::network) async fn on_upload_event(
                 friend_hashes.write().await.remove(&decline_hash);
                 crate::network::friend_intro::forget_friend_intro_secret(&decline_hash);
                 ed2k::upload::revoke_all_secure_sessions(decline_hash);
+                // As removal does. Off this loop: the save hands the
+                // settings back to it and would wait on itself.
+                let clear_app = app_handle.clone();
+                tokio::spawn(async move {
+                    use tauri::Manager;
+                    let Some(state) = clear_app.try_state::<crate::app_state::AppState>() else {
+                        return;
+                    };
+                    if let Err(e) =
+                        crate::commands::settings::clear_friend_overrides(&clear_app, &state, &decline_hash).await
+                    {
+                        warn!("Could not clear a declined friend's settings: {e}");
+                    }
+                });
                 let _ = app_handle.emit(
                     "ember:friend-request-declined",
                     serde_json::json!({
@@ -883,7 +901,7 @@ pub(in crate::network) async fn on_upload_event(
             );
             return;
         }
-        if !settings.friend_chat_disabled {
+        if settings.chat_allowed_with(&chat_eh) {
             let hash_hex = hex::encode(chat_eh);
             // L20: same ingress sanitisation as the
             // download-event path above. Inbound chat
@@ -942,7 +960,7 @@ pub(in crate::network) async fn on_upload_event(
     }
 
     if let UploadEventKind::EmberChatTyping { ember_hash: typing_eh, typing } = event.kind {
-        if !settings.friend_chat_disabled
+        if settings.chat_allowed_with(&typing_eh)
             && friend_hashes.read().await.contains(&typing_eh)
         {
             let _ = app_handle.emit(
@@ -961,8 +979,7 @@ pub(in crate::network) async fn on_upload_event(
         // tell friends we have read nor record that they have read
         // us. Persisting while the setting is off would still paint
         // "Seen" the moment it is turned back on.
-        if settings.friend_chat_disabled
-            || !settings.friend_chat_read_receipts
+        if !settings.read_receipts_with(&read_eh)
             || !friend_hashes.read().await.contains(&read_eh)
         {
             return;
@@ -1003,7 +1020,7 @@ pub(in crate::network) async fn on_upload_event(
         // wire has to enforce it, or anyone who learns our Ember
         // hash could add us one-sidedly and read our library.
         let is_mutual_friend = mutual_friend_hashes.read().await.contains(&browse_eh);
-        if !settings.friend_browse_disabled && is_mutual_friend {
+        if settings.browse_allowed_for(&browse_eh) && is_mutual_friend {
             let files = {
                 let idx = local_index.read().await;
                 idx.all_files().to_vec()

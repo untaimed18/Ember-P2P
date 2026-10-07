@@ -88,6 +88,8 @@ pub struct ChatAttachmentRow {
     pub status: String,
     pub transferred: u64,
     pub created_at: i64,
+    /// How many times the transfer was tried again; 0 on its first attempt.
+    pub attempt: u32,
 }
 
 /// One row of a room's history as the UI needs it.
@@ -911,6 +913,22 @@ impl Database {
             corrupt_backup: None,
         };
         db.run_migrations()?;
+        // Every attachment read joins it, so it is made now rather than left
+        // to the first read to fail on.
+        {
+            let conn = db.conn.lock();
+            Self::ensure_chat_attachment_attempts_locked(&conn)?;
+            let has_granted: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('chat_attachment_attempts') WHERE name = 'granted'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_granted == 0 {
+                conn.execute_batch(
+                    "ALTER TABLE chat_attachment_attempts ADD COLUMN granted INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+        }
 
         info!("Database initialized");
         Ok(db)
@@ -3354,6 +3372,90 @@ impl Database {
         Ok(())
     }
 
+    /// What a file we sent was offered as — `(source_path, file_size,
+    /// root_hash)` — whatever has become of the transfer since. For offering it
+    /// again; [`Self::chat_attachment_grant`] is what decides whether it can be
+    /// read.
+    pub fn chat_attachment_source(&self, xfer_id: &str) -> Option<(String, u64, String)> {
+        let conn = self.conn.lock();
+        let (stored, size, root) = conn
+            .query_row(
+                "SELECT source_path, file_size, root_hash FROM chat_attachments
+                 WHERE xfer_id = ?1 AND direction = 'sent' AND source_path IS NOT NULL",
+                rusqlite::params![xfer_id],
+                |row| {
+                    let path: String = row.get(0)?;
+                    let size: i64 = row.get(1)?;
+                    let root: String = row.get(2)?;
+                    Ok((path, size.max(0) as u64, root))
+                },
+            )
+            .ok()?;
+        drop(conn);
+        let path =
+            Self::open_attachment_field(self.chat_key.as_deref(), xfer_id, "source_path", &stored)?;
+        Some((path, size, root))
+    }
+
+    /// The root an attachment row was offered under, either direction.
+    pub fn chat_attachment_root(&self, xfer_id: &str) -> Option<String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT root_hash FROM chat_attachments WHERE xfer_id = ?1",
+            rusqlite::params![xfer_id],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    /// Put an ended attachment back to `status` for another try, with nothing
+    /// transferred, and `expires_at` when given. Only from one of `from`, in the
+    /// same statement as the check, so a retry cannot revive a row that moved
+    /// on meanwhile. Returns whether it did.
+    pub fn reopen_chat_attachment(
+        &self,
+        xfer_id: &str,
+        from: &[&str],
+        status: &str,
+        expires_at: Option<i64>,
+    ) -> anyhow::Result<bool> {
+        if from.is_empty() {
+            return Ok(false);
+        }
+        let placeholders = (0..from.len())
+            .map(|i| format!("?{}", i + 4))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE chat_attachments SET
+                status = ?2,
+                transferred = 0,
+                expires_at = COALESCE(?3, expires_at)
+             WHERE xfer_id = ?1 AND status IN ({placeholders})"
+        );
+        let mut params: Vec<rusqlite::types::Value> = vec![
+            xfer_id.to_string().into(),
+            status.to_string().into(),
+            expires_at.map_or(rusqlite::types::Value::Null, rusqlite::types::Value::Integer),
+        ];
+        params.extend(from.iter().map(|s| rusqlite::types::Value::Text(s.to_string())));
+        let conn = self.conn.lock();
+        Self::ensure_chat_attachment_attempts_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let moved = tx.execute(&sql, rusqlite::params_from_iter(params))? > 0;
+        if moved {
+            // What tells the UI an update belongs to this attempt and not to
+            // the one that ended, which it otherwise keeps over anything later.
+            tx.execute(
+                "INSERT INTO chat_attachment_attempts (xfer_id, attempt) VALUES (?1, 1)
+                 ON CONFLICT(xfer_id) DO UPDATE SET attempt = attempt + 1",
+                rusqlite::params![xfer_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(moved)
+    }
+
     /// The live grant for `xfer_id`, if `friend_hash` is who it was granted to.
     ///
     /// The friend is part of the lookup rather than something the caller checks
@@ -3507,11 +3609,14 @@ impl Database {
         limit: i64,
     ) -> anyhow::Result<Vec<ChatAttachmentRow>> {
         let conn = self.conn.lock();
+        Self::ensure_chat_attachment_attempts_locked(&conn)?;
         let mut stmt = conn.prepare(
-            "SELECT xfer_id, friend_hash, direction, file_name, file_size,
-                    dest_path, status, transferred, created_at
-             FROM chat_attachments WHERE friend_hash = ?1
-             ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+            "SELECT a.xfer_id, a.friend_hash, a.direction, a.file_name, a.file_size,
+                    a.dest_path, a.status, a.transferred, a.created_at, n.attempt
+             FROM chat_attachments a
+             LEFT JOIN chat_attachment_attempts n ON n.xfer_id = a.xfer_id
+             WHERE a.friend_hash = ?1
+             ORDER BY a.created_at DESC, a.rowid DESC LIMIT ?2",
         )?;
         let rows = stmt
             .query_map(
@@ -3526,7 +3631,7 @@ impl Database {
 
     /// Column order shared by every attachment read: xfer_id, friend_hash,
     /// direction, file_name, file_size, dest_path, status, transferred,
-    /// created_at. Name and path come back as stored; see
+    /// created_at, attempt. Name and path come back as stored; see
     /// [`Self::open_chat_attachment_row`].
     fn chat_attachment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatAttachmentRow> {
         Ok(ChatAttachmentRow {
@@ -3539,7 +3644,53 @@ impl Database {
             status: row.get(6)?,
             transferred: row.get::<_, i64>(7)?.max(0) as u64,
             created_at: row.get(8)?,
+            attempt: row.get::<_, Option<i64>>(9)?.unwrap_or(0).clamp(0, i64::from(u32::MAX)) as u32,
         })
+    }
+
+    /// How many times each attachment was tried again, created on first use so
+    /// the schema stays at the version 1.7.0 can still open after a downgrade.
+    /// A row without an entry is on its first attempt.
+    ///
+    /// `granted` is set once the friend has had the full grant for a file we
+    /// sent, which decides what their "Try again" may reopen; see
+    /// [`Self::chat_attachment_was_granted`].
+    fn ensure_chat_attachment_attempts_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS chat_attachment_attempts (
+                xfer_id TEXT PRIMARY KEY,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                granted INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Record that a file we sent moved from its offer's short lifetime to
+    /// the grant's.
+    pub fn mark_chat_attachment_granted(&self, xfer_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_attachment_attempts_locked(&conn)?;
+        conn.execute(
+            "INSERT INTO chat_attachment_attempts (xfer_id, attempt, granted) VALUES (?1, 0, 1)
+             ON CONFLICT(xfer_id) DO UPDATE SET granted = 1",
+            rusqlite::params![xfer_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the friend ever had the full grant for a file we sent.
+    pub fn chat_attachment_was_granted(&self, xfer_id: &str) -> bool {
+        let conn = self.conn.lock();
+        if Self::ensure_chat_attachment_attempts_locked(&conn).is_err() {
+            return true;
+        }
+        conn.query_row(
+            "SELECT granted FROM chat_attachment_attempts WHERE xfer_id = ?1",
+            rusqlite::params![xfer_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .is_ok_and(|granted| granted != 0)
     }
 
     /// Open the sealed name and path of a row read by
@@ -3559,11 +3710,14 @@ impl Database {
     /// One attachment by id, whichever side of it this node is on.
     pub fn chat_attachment(&self, xfer_id: &str) -> Option<ChatAttachmentRow> {
         let conn = self.conn.lock();
+        Self::ensure_chat_attachment_attempts_locked(&conn).ok()?;
         let row = conn
             .query_row(
-                "SELECT xfer_id, friend_hash, direction, file_name, file_size,
-                        dest_path, status, transferred, created_at
-                 FROM chat_attachments WHERE xfer_id = ?1",
+                "SELECT a.xfer_id, a.friend_hash, a.direction, a.file_name, a.file_size,
+                        a.dest_path, a.status, a.transferred, a.created_at, n.attempt
+                 FROM chat_attachments a
+                 LEFT JOIN chat_attachment_attempts n ON n.xfer_id = a.xfer_id
+                 WHERE a.xfer_id = ?1",
                 rusqlite::params![xfer_id],
                 Self::chat_attachment_from_row,
             )
@@ -3607,12 +3761,21 @@ impl Database {
     /// is never a candidate, whatever its age.
     fn prune_settled_chat_attachments_locked(conn: &Connection, now: i64) -> anyhow::Result<usize> {
         let cutoff = now.saturating_sub(CHAT_ATTACHMENT_RETENTION_SECS);
-        Ok(conn.execute(
+        let deleted = conn.execute(
             "DELETE FROM chat_attachments
              WHERE status NOT IN ('offered', 'awaiting', 'accepted', 'active')
                AND expires_at < ?1 AND created_at < ?1",
             rusqlite::params![cutoff],
-        )?)
+        )?;
+        // Rows also go with a removed friend, so counts are cleared by what is
+        // left rather than by what this pass deleted.
+        Self::ensure_chat_attachment_attempts_locked(conn)?;
+        conn.execute(
+            "DELETE FROM chat_attachment_attempts
+             WHERE xfer_id NOT IN (SELECT xfer_id FROM chat_attachments)",
+            [],
+        )?;
+        Ok(deleted)
     }
 
     /// Write a consistent, self-contained copy of the live database to `dest`.
@@ -14730,6 +14893,70 @@ mod tests {
                 "a {status} attachment must not still be readable"
             );
         }
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// "Try again" reuses the row: it moves back only from a status it was
+    /// asked to, counts the attempt, keeps its place in the conversation, and
+    /// leaves the schema where a downgrade can still open it.
+    #[test]
+    fn a_retried_attachment_reopens_its_own_row_and_counts_the_attempt() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-attach-retry-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let xfer = "ab".repeat(8);
+        let friend = "cd".repeat(8);
+        let now = 1_000_000i64;
+        db.upsert_chat_attachment(
+            &xfer, &friend, "sent", "holiday.zip", 4096, &"11".repeat(32),
+            Some("C:\\private\\holiday.zip"), "offered", now, now + 600,
+        )
+        .expect("insert");
+        assert_eq!(db.chat_attachment(&xfer).expect("row").attempt, 0);
+        db.set_chat_attachment_status(&xfer, "active", Some(2048), None).expect("active");
+
+        assert!(
+            !db.reopen_chat_attachment(&xfer, &["failed"], "offered", Some(now + 900)).expect("reopen"),
+            "a live transfer is not reopened"
+        );
+        db.set_chat_attachment_status(&xfer, "failed", None, None).expect("failed");
+        assert!(db.reopen_chat_attachment(&xfer, &["failed"], "offered", Some(now + 900)).expect("reopen"));
+        let row = db.chat_attachment(&xfer).expect("row");
+        assert_eq!((row.status.as_str(), row.transferred, row.attempt, row.created_at), ("offered", 0, 1, now));
+        assert_eq!(db.chat_attachment_expiry(&xfer), Some(now + 900));
+        assert!(db.chat_attachment_grant(&xfer, &friend, now).is_some(), "readable again");
+        assert_eq!(
+            db.chat_attachment_source(&xfer).map(|(p, s, r)| (p, s, r.len())),
+            Some(("C:\\private\\holiday.zip".to_string(), 4096, 64))
+        );
+
+        db.set_chat_attachment_status(&xfer, "failed", None, None).expect("failed");
+        assert!(db.reopen_chat_attachment(&xfer, &["failed"], "accepted", None).expect("reopen"));
+        assert_eq!(db.chat_attachment(&xfer).expect("row").attempt, 2);
+        assert_eq!(db.chat_attachment_expiry(&xfer), Some(now + 900), "no expiry given, none moved");
+        assert_eq!(
+            db.chat_attachments_for_friend(&friend, 10).expect("list")[0].attempt,
+            2,
+            "the list carries the attempt too"
+        );
+
+        assert!(!db.chat_attachment_was_granted(&xfer));
+        db.mark_chat_attachment_granted(&xfer).expect("granted");
+        assert!(db.chat_attachment_was_granted(&xfer));
+        assert_eq!(db.chat_attachment(&xfer).expect("row").attempt, 2, "the attempt is kept");
+        let fresh = "ef".repeat(8);
+        db.mark_chat_attachment_granted(&fresh).expect("granted before any retry");
+        assert!(db.chat_attachment_was_granted(&fresh));
+        assert_eq!(db.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 62, "1.7.0 has to open this database");
 
         drop(db);
         let _ = std::fs::remove_file(&path);

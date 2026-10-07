@@ -5225,6 +5225,11 @@ async fn handle_command_inner(
             let _ = tx.send(result);
         }
 
+        NetworkCommand::RetryChatAttachment { xfer_id, tx } => {
+            let result = super::chat_attach::retry(state, db, app_handle, settings, xfer_id).await;
+            let _ = tx.send(result);
+        }
+
         NetworkCommand::ForgetKnownPaths { paths } => {
             let forgotten = known_files.forget_paths(&paths);
             debug!("known.met forgot {forgotten} of {} gone paths", paths.len());
@@ -6037,8 +6042,12 @@ async fn handle_command_inner(
             message,
             tx,
         } => {
-            if settings.friend_chat_disabled {
-                let _ = tx.send(Err("Chat is disabled in Friends settings".into()));
+            if !settings.chat_allowed_with(&friend_eh) {
+                let _ = tx.send(Err(if settings.friend_chat_disabled {
+                    "Chat is disabled in Friends settings".into()
+                } else {
+                    "Chat is disabled for this friend".into()
+                }));
             } else if !friend_hashes.read().await.contains(&friend_eh) {
                 let _ = tx.send(Err("Can only chat with friends".into()));
             } else {
@@ -6429,7 +6438,7 @@ async fn handle_command_inner(
             ember_hash: friend_eh,
             typing,
         } => {
-            if settings.friend_chat_disabled || !friend_hashes.read().await.contains(&friend_eh) {
+            if !settings.chat_allowed_with(&friend_eh) || !friend_hashes.read().await.contains(&friend_eh) {
                 return;
             }
             let _ = send_encrypted_chat_ext(
@@ -6446,8 +6455,7 @@ async fn handle_command_inner(
             ember_hash: friend_eh,
             body_hash,
         } => {
-            if settings.friend_chat_disabled
-                || !settings.friend_chat_read_receipts
+            if !settings.read_receipts_with(&friend_eh)
                 || !friend_hashes.read().await.contains(&friend_eh)
             {
                 return;

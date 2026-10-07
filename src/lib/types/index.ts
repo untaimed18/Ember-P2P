@@ -814,6 +814,27 @@ export interface AntiLeechReplaceResult {
   compile_errors: Array<[string, string]>;
 }
 
+/** One friend's exceptions to the friend settings. A field left out follows
+ *  the global setting. Mirrors `FriendOverrides` in `src-tauri/src/types.rs`.
+ *  The friend's name is not here: it is their nickname in the friends list. */
+export interface FriendOverrides {
+  /** Chat both ways. Off also refuses their files. */
+  chat?: boolean;
+  /** Files from this friend (chat attachments and file offers). Unset follows
+   *  chat. */
+  files?: boolean;
+  /** Their files at or under this many MB download without asking; 0 always
+   *  asks. */
+  auto_accept_mb?: number;
+  /** Let this friend browse our shared files. */
+  browse?: boolean;
+  /** Read receipts both ways. */
+  read_receipts?: boolean;
+  notify_online?: boolean;
+  /** Messages and files from this friend. */
+  notify_messages?: boolean;
+}
+
 export interface AppSettings {
   nickname: string;
   /** Unique Channels handle claimed on Rendezvous. Empty until chosen. */
@@ -915,6 +936,9 @@ export interface AppSettings {
   /** Files a friend sends in chat at or under this many MB download without
    *  asking; larger ones wait for an accept. 0 always asks. At most 2048. */
   chat_attachment_auto_accept_mb: number;
+  /** Per-friend exceptions to the friend settings above, keyed by the friend's
+   *  lowercase hex hash. Written only through `setFriendOverrides`. */
+  friend_overrides?: Record<string, FriendOverrides>;
   /** Maximum number of friends allowed (1–500) */
   max_friends: number;
   /**

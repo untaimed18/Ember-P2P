@@ -205,6 +205,10 @@ export interface ChatAttachment {
   has_file: boolean;
   /** A program, shortcut or script, or one named like a document. */
   risky: boolean;
+  /** Bumped each time the transfer is tried again; 0 on its first attempt. */
+  attempt: number;
+  /** "Try again" can do something for this row on this side. */
+  retryable: boolean;
 }
 
 /** Statuses a transfer never leaves. */
@@ -227,8 +231,14 @@ export const CHAT_ATTACHMENT_TERMINAL: ReadonlySet<ChatAttachmentStatus> = new S
  * arrive after it, and nothing moves a transfer out of a terminal status.
  * Progress ticks carry no new status, so one that crosses a snapshot in flight
  * must not drag the bar backwards either.
+ *
+ * "Try again" is the one way out of an ending, and it starts a new attempt:
+ * anything from a later attempt wins, and anything from an earlier one is late.
  */
 export function mergeChatAttachment(prev: ChatAttachment, next: ChatAttachment): ChatAttachment {
+  if (next.attempt !== prev.attempt) {
+    return next.attempt > prev.attempt ? next : prev;
+  }
   if (CHAT_ATTACHMENT_TERMINAL.has(prev.status) && !CHAT_ATTACHMENT_TERMINAL.has(next.status)) {
     return prev;
   }
@@ -251,6 +261,11 @@ export async function respondChatAttachment(xferId: string, accept: boolean): Pr
 
 export async function cancelChatAttachment(xferId: string): Promise<void> {
   return invoke('cancel_chat_attachment', { xferId });
+}
+
+/** Try a transfer that ended without the file again, on the same card. */
+export async function retryChatAttachment(xferId: string): Promise<void> {
+  return invoke('retry_chat_attachment', { xferId });
 }
 
 export async function listChatAttachments(userHashHex: string): Promise<ChatAttachment[]> {
@@ -295,6 +310,8 @@ export function parseChatAttachment(raw: unknown): ChatAttachment | null {
     created_at: num(r.created_at),
     has_file: r.has_file === true,
     risky: r.risky === true,
+    attempt: Math.floor(num(r.attempt)),
+    retryable: r.retryable === true,
   };
 }
 

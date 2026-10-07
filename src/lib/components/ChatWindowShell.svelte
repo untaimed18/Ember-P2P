@@ -3,7 +3,10 @@
   import ChatDock from '$lib/components/ChatDock.svelte';
   import Toast from '$lib/components/Toast.svelte';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
-  import { loadAppSettings, clearAppSettings } from '$lib/stores/settings';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+  import { loadAppSettings, clearAppSettings, setAppSettings } from '$lib/stores/settings';
+  import { SETTINGS_CHANGED_EVENT } from '$lib/api/settings';
+  import type { AppSettings } from '$lib/types';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { clearAllToasts, toastError } from '$lib/stores/toast';
   import { initChatWindowSide } from '$lib/chatPopout';
@@ -35,6 +38,21 @@
     };
     window.addEventListener('unhandledrejection', onUnhandledRejection);
 
+    // Per-friend chat, read receipts and notifications are read from these
+    // settings. A friend's settings dialog announces its saves; the Settings
+    // page does not, and is caught up with when this window is next focused.
+    let unlistenSettingsChanged: UnlistenFn | null = null;
+    listen<AppSettings>(SETTINGS_CHANGED_EVENT, (event) => {
+      if (mounted) setAppSettings(event.payload);
+    })
+      .then((fn) => {
+        if (mounted) unlistenSettingsChanged = fn;
+        else fn();
+      })
+      .catch((e) => console.error('Failed to register settings-changed listener:', e));
+    const onFocus = () => void loadAppSettings();
+    window.addEventListener('focus', onFocus);
+
     void (async () => {
       const outcomes = await Promise.allSettled([initFriendsStore(), loadAppSettings()]);
       for (const outcome of outcomes) {
@@ -52,6 +70,8 @@
     return () => {
       mounted = false;
       window.removeEventListener('unhandledrejection', onUnhandledRejection);
+      window.removeEventListener('focus', onFocus);
+      unlistenSettingsChanged?.();
       stopActivityReporting();
       teardown?.();
       cleanupTheme();
