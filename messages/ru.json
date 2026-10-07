@@ -914,6 +914,7 @@
   "friends_remove_aria": "Удалить друга {name}",
   "friends_block": "Заблокировать",
   "friend_settings_open": "Настройки для {name}",
+  "friend_settings_open_custom": "Настройки для {name} (некоторые отличаются от ваших настроек по умолчанию)",
   "friend_settings_title": "Настройки для {name}",
   "friend_settings_hint": "Действуют только для этого друга. «По умолчанию» следует вашим настройкам друзей и меняется вместе с ними.",
   "friend_settings_name": "Имя",

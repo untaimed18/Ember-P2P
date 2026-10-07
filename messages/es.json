@@ -914,6 +914,7 @@
   "friends_remove_aria": "Eliminar al amigo {name}",
   "friends_block": "Bloquear",
   "friend_settings_open": "Ajustes de {name}",
+  "friend_settings_open_custom": "Ajustes de {name} (algunos difieren de tus valores predeterminados)",
   "friend_settings_title": "Ajustes de {name}",
   "friend_settings_hint": "Solo se aplican a este amigo. «Usar predeterminado» sigue tus ajustes de Amigos y cambia cuando ellos cambian.",
   "friend_settings_name": "Nombre",

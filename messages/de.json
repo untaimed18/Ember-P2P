@@ -914,6 +914,7 @@
   "friends_remove_aria": "Freund {name} entfernen",
   "friends_block": "Blockieren",
   "friend_settings_open": "Einstellungen für {name}",
+  "friend_settings_open_custom": "Einstellungen für {name} (einige weichen von Ihren Standards ab)",
   "friend_settings_title": "Einstellungen für {name}",
   "friend_settings_hint": "Diese gelten nur für diesen Freund. „Standard verwenden“ folgt Ihren Freundes-Einstellungen und ändert sich mit ihnen.",
   "friend_settings_name": "Name",

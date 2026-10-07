@@ -2134,7 +2134,7 @@
   // it, so leaving waits a moment, reaching the submenu (a child of the item,
   // so it re-enters the item) cancels that, and brushing past another parent
   // item only switches to it if the pointer stays there.
-  type HoverSub = 'priority' | 'copy' | 'send';
+  type HoverSub = 'priority' | 'copy' | 'send' | 'web';
   const CTX_SUB_INTENT_MS = 300;
   let ctxSubTimer: ReturnType<typeof setTimeout> | undefined;
   function openHoverSub(which: HoverSub | null) {
@@ -2143,11 +2143,19 @@
     ctxCopySub = which === 'copy';
     if (which === 'send' && !ctxSendSub) void loadSendableFriends();
     ctxSendSub = which === 'send';
-    if (which) ctxWebSub = false;
+    ctxWebSub = which === 'web';
   }
   function enterHoverSub(which: HoverSub) {
     clearTimeout(ctxSubTimer);
-    const open: HoverSub | null = ctxPrioritySub ? 'priority' : ctxCopySub ? 'copy' : ctxSendSub ? 'send' : null;
+    const open: HoverSub | null = ctxPrioritySub
+      ? 'priority'
+      : ctxCopySub
+        ? 'copy'
+        : ctxSendSub
+          ? 'send'
+          : ctxWebSub
+            ? 'web'
+            : null;
     if (open === null || open === which) openHoverSub(which);
     else ctxSubTimer = setTimeout(() => openHoverSub(which), CTX_SUB_INTENT_MS);
   }
@@ -4604,12 +4612,14 @@
         tabindex="0"
         aria-haspopup="menu"
         aria-expanded={ctxWebSub}
-        onclick={(e) => { e.stopPropagation(); const next = !ctxWebSub; openHoverSub(null); ctxWebSub = next; }}
+        onmouseenter={() => enterHoverSub('web')}
+        onmouseleave={leaveHoverSub}
+        onclick={(e) => clickHoverSub(e, 'web')}
         onkeydown={(e) => {
           if (e.target !== e.currentTarget) return;
           if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowRight') {
             e.preventDefault();
-            ctxWebSub = true;
+            openHoverSub('web');
           }
         }}
       >

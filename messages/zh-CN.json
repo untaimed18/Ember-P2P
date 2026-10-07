@@ -914,6 +914,7 @@
   "friends_remove_aria": "移除好友 {name}",
   "friends_block": "屏蔽",
   "friend_settings_open": "{name} 的设置",
+  "friend_settings_open_custom": "{name} 的设置（部分与你的默认值不同）",
   "friend_settings_title": "{name} 的设置",
   "friend_settings_hint": "这些设置只对这位好友生效。“使用默认值”跟随你的好友设置，并随之变化。",
   "friend_settings_name": "名称",

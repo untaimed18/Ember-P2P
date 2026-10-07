@@ -1490,8 +1490,12 @@
             class:has-overrides={hasOverrides(f.user_hash)}
             disabled={!$appSettings}
             onclick={() => (settingsFor = f)}
-            title={m.friend_settings_open({ name: shortName })}
-            aria-label={m.friend_settings_open({ name: shortName })}
+            title={hasOverrides(f.user_hash)
+              ? m.friend_settings_open_custom({ name: shortName })
+              : m.friend_settings_open({ name: shortName })}
+            aria-label={hasOverrides(f.user_hash)
+              ? m.friend_settings_open_custom({ name: shortName })
+              : m.friend_settings_open({ name: shortName })}
           >
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <circle cx="8" cy="8" r="2.1"/>
@@ -2244,7 +2248,6 @@
   }
 
   .card-settings-btn {
-    position: relative;
     width: 26px;
     height: 26px;
     padding: 0;
@@ -2268,16 +2271,15 @@
     height: 15px;
   }
 
-  /* This friend has settings of their own, so the gear is worth a look. */
-  .card-settings-btn.has-overrides::after {
-    content: '';
-    position: absolute;
-    top: 4px;
-    right: 4px;
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--accent);
+  /* This friend has settings of their own: the gear reads as switched on. */
+  .card-settings-btn.has-overrides {
+    background: var(--accent-fill);
+    color: var(--accent);
+  }
+
+  .card-settings-btn.has-overrides:hover {
+    background: color-mix(in srgb, var(--accent) 24%, transparent);
+    color: var(--accent-hover);
   }
 
   .card-more-menu {
