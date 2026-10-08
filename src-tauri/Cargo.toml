@@ -197,6 +197,9 @@ windows-sys = { version = "0.61", features = [
     # `SetThreadExecutionState`, the sleep inhibitor held during transfers
     # (see `src/power.rs`).
     "Win32_System_Power",
+    # `RegGetValueW`, to tell a missing launch-at-sign-in `Run` value from one
+    # the user disabled in Task Manager (see `src/login_launch.rs`).
+    "Win32_System_Registry",
     "Win32_System_Threading",
 ] }
 

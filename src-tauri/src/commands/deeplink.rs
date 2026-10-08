@@ -862,6 +862,9 @@ mod tests {
             r"\\?\GLOBALROOT\Device\Mup\attacker.example\s\list.emulecollection",
             r"\\.\C:\..\UNC\attacker.example\s\list.emulecollection",
             r"\\.\C:\Users\..\..\UNC\attacker.example\s\list.emulecollection",
+            r"\??\UNC\attacker.example\s\list.emulecollection",
+            r"\??\GLOBALROOT\Device\Mup\attacker.example\s\list.emulecollection",
+            r"\??\C:\..\UNC\attacker.example\s\list.emulecollection",
         ];
         for path in remote {
             assert!(is_network_path(path), "{path}");
@@ -884,6 +887,7 @@ mod tests {
             assert!(!is_network_path(local), "{local}");
             assert_eq!(preview_deep_link_payload(local).unwrap().kind, "collection");
         }
+        assert!(!is_network_path(r"\??\C:\Users\Ember\set.emulecollection"));
     }
 
     #[test]

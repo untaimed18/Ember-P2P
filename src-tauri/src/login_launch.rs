@@ -106,31 +106,79 @@ pub fn apply(app: &AppHandle, enabled: bool) -> Result<(), String> {
     result.map_err(|error| error.to_string())
 }
 
-/// Remove an entry left behind while the setting is off, off the main thread.
+/// Bring the OS entry in line with the setting at launch, off the main thread.
 ///
-/// Only that direction. Re-registering at every launch would override the user
-/// turning Ember off in Task Manager or their desktop's startup settings, and
-/// those are as much their choice as this setting is.
+/// With the setting off, an entry left behind is removed. With it on, only an
+/// entry that is gone altogether is written again — on Windows, where a
+/// reinstall's uninstall step deletes the `Run` value while the setting stays
+/// on. One the user turned off in Task Manager keeps its value and is left
+/// alone, as is anything their desktop's startup settings did elsewhere: those
+/// are as much their choice as this setting is.
 ///
 /// Not for debug builds or harness nodes, which must not touch the user's real
 /// sign-in entry.
 pub fn reconcile_at_launch(app: &AppHandle, enabled: bool) {
-    if enabled || touches_nothing() {
+    if touches_nothing() || (enabled && !cfg!(windows)) {
         return;
     }
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let stale = launcher(&app).and_then(|launcher| {
-            if launcher.is_enabled().unwrap_or(false) {
+        let result = launcher(&app).and_then(|launcher| {
+            if enabled {
+                restore_missing_entry(&app, &launcher)
+            } else if launcher.is_enabled().unwrap_or(false) {
                 launcher.disable().map_err(|error| error.to_string())
             } else {
                 Ok(())
             }
         });
-        if let Err(error) = stale {
-            tracing::warn!("Could not remove the launch-at-sign-in entry: {error}");
+        if let Err(error) = result {
+            tracing::warn!("Could not reconcile the launch-at-sign-in entry: {error}");
         }
     });
+}
+
+#[cfg(windows)]
+fn restore_missing_entry(app: &AppHandle, launcher: &AutoLaunch) -> Result<(), String> {
+    if run_value_present(&app.package_info().name)? {
+        return Ok(());
+    }
+    tracing::info!("Launch at sign-in is on but its Run entry is gone; registering it again");
+    launcher.enable().map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+fn restore_missing_entry(_app: &AppHandle, _launcher: &AutoLaunch) -> Result<(), String> {
+    Ok(())
+}
+
+/// Whether the per-user `Run` key holds a value named `name`, whatever it says.
+#[cfg(windows)]
+fn run_value_present(name: &str) -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_ANY};
+
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let subkey = wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    let value = wide(name);
+    // SAFETY: both strings are NUL-terminated and outlive the call, and with
+    // every out-pointer null the call only reports whether the value exists.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_ANY,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    match status {
+        ERROR_SUCCESS => Ok(true),
+        ERROR_FILE_NOT_FOUND => Ok(false),
+        other => Err(format!("reading the Run key failed with error {other}")),
+    }
 }
 
 #[cfg(test)]

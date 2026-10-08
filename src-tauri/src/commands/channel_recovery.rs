@@ -95,6 +95,13 @@ impl Probe {
             _ => &[],
         }
     }
+
+    /// Whether enough of the network answered for what this did not return
+    /// to count as not there. Anyone can file records under any key, so a few
+    /// nodes returning something is no better than a few returning nothing.
+    fn settles_absence(&self) -> bool {
+        matches!(self, Probe::Absent | Probe::Found(_, true))
+    }
 }
 
 /// One DHT lookup, told apart into "here", "not here" and "cannot say".
@@ -276,7 +283,12 @@ async fn examine(
     }
     // Without both answers a room handed on, or taken over, could be run
     // again as if it never was.
-    if matches!(handoff, Probe::Unknown) || matches!(claim, Probe::Unknown) {
+    if !handoff.settles_absence() || !claim.settles_absence() {
+        return Slot::Unsettled;
+    }
+    // One walk that reached few nodes can return a snapshot the owner has
+    // since replaced, and the owner loop would re-sign that older state.
+    if !first.settles_absence() && !second.settles_absence() {
         return Slot::Unsettled;
     }
     let mut records = first.records().to_vec();
@@ -535,9 +547,8 @@ async fn read_owned_rooms_list(state: &AppState) -> Option<Vec<OwnedRoomSalt>> {
         return Some(salts);
     }
     // Nothing that is a list: no list yet, but only on enough of the
-    // network's word. Anyone can file other records under the key.
-    let settled = |p: &Probe| matches!(p, Probe::Absent | Probe::Found(_, true));
-    (settled(&first) || settled(&second)).then(Vec::new)
+    // network's word.
+    (first.settles_absence() || second.settles_absence()).then(Vec::new)
 }
 
 /// Read the identity's owned-rooms list, put back every room in it that the
@@ -584,7 +595,7 @@ pub(crate) async fn scan_owned_rooms(
     let url = crate::commands::channels::rendezvous_url(state).await;
     let deleted: Option<HashSet<String>> = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        crate::network::rendezvous::fetch_deleted_channel_ids(&url),
+        crate::network::rendezvous::fetch_complete_deleted_channel_ids(&url),
     )
     .await
     .ok()
@@ -795,6 +806,16 @@ mod tests {
         assert_eq!(merged, vec![[1; 16], [2; 16], [3; 16]]);
         assert_eq!(merged_lists(&[stranger], &pubkey), None, "someone else's list is no list");
         assert_eq!(merged_lists(&[blob(&[], &identity)], &pubkey), Some(Vec::new()));
+    }
+
+    /// Records from a walk few nodes answered prove nothing is missing no more
+    /// than an empty one does: anyone can file junk under a room's claim key.
+    #[test]
+    fn only_a_walk_enough_nodes_answered_settles_what_it_lacks() {
+        assert!(Probe::Absent.settles_absence());
+        assert!(Probe::Found(vec![vec![0u8; 8]], true).settles_absence());
+        assert!(!Probe::Found(vec![vec![0u8; 8]], false).settles_absence());
+        assert!(!Probe::Unknown.settles_absence());
     }
 
     #[test]

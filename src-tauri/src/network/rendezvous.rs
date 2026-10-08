@@ -3541,9 +3541,32 @@ pub(crate) async fn fetch_channel_directory(
 /// otherwise keep answering with a full page and a fresh cursor forever.
 const MAX_DELETED_ID_PAGES: usize = 50;
 
+/// The registry's deleted rooms, as far as [`MAX_DELETED_ID_PAGES`] reaches.
+/// Enough to hide rooms from Discover or refuse a join.
 pub(crate) async fn fetch_deleted_channel_ids(
     base_url: &str,
 ) -> Result<Vec<String>, ChannelRegistryError> {
+    fetch_deleted_channel_id_pages(base_url).await.map(|(ids, _)| ids)
+}
+
+/// [`fetch_deleted_channel_ids`], refused when the page bound cut it short.
+///
+/// For owned-room recovery, which puts back any room the list lacks: deleting
+/// a room that holds a name is tombstoned past the registry's cap, so a full
+/// registry can run past what the bound reaches.
+pub(crate) async fn fetch_complete_deleted_channel_ids(
+    base_url: &str,
+) -> Result<Vec<String>, ChannelRegistryError> {
+    match fetch_deleted_channel_id_pages(base_url).await? {
+        (ids, true) => Ok(ids),
+        (_, false) => Err(ChannelRegistryError::Unavailable),
+    }
+}
+
+/// The ids, and whether the server said they were all of them.
+async fn fetch_deleted_channel_id_pages(
+    base_url: &str,
+) -> Result<(Vec<String>, bool), ChannelRegistryError> {
     require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
     let base = base_url.trim_end_matches('/');
     let http = client(base_url)
@@ -3575,7 +3598,7 @@ pub(crate) async fn fetch_deleted_channel_ids(
         )
         .map_err(|_| ChannelRegistryError::Unavailable)?;
         let Some(list) = body.get("ids") else {
-            return Ok(out);
+            return Ok((out, true));
         };
         let page: Vec<String> = serde_json::from_value(list.clone())
             .map_err(|_| ChannelRegistryError::Unavailable)?;
@@ -3595,10 +3618,10 @@ pub(crate) async fn fetch_deleted_channel_ids(
             Some(next) if !page_was_empty && cursor.as_deref().is_none_or(|c| next.as_str() > c) => {
                 cursor = Some(next);
             }
-            _ => return Ok(out),
+            _ => return Ok((out, true)),
         }
     }
-    Ok(out)
+    Ok((out, false))
 }
 
 /// Percent-encode a cursor for use in a query string.

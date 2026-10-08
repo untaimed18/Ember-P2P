@@ -5598,20 +5598,32 @@ pub async fn library_hashes_among(
             })
             .collect()
     };
-    // Off the runtime: a library on a network drive can be slow to answer.
-    tokio::task::spawn_blocking(move || {
+    // Off the runtime: a library on a network drive can be slow to answer, and
+    // one gone offline answers each path only at the SMB timeout. Past the
+    // bound nothing counts as owned, as when the check fails: the worst case is
+    // a result or link offered for a file the user cannot reach anyway.
+    let check = tokio::task::spawn_blocking(move || {
         candidates
             .into_iter()
             .filter(|(_, paths)| paths.iter().any(|p| std::path::Path::new(p).is_file()))
             .map(|(hash, _)| hash)
             .collect::<Vec<String>>()
-    })
-    .await
-    .or_else(|e| {
-        warn!("library_hashes_among: the disk check failed: {e}");
-        Ok(Vec::new())
-    })
+    });
+    match tokio::time::timeout(LIBRARY_HASH_CHECK_TIMEOUT, check).await {
+        Ok(Ok(owned)) => Ok(owned),
+        Ok(Err(e)) => {
+            warn!("library_hashes_among: the disk check failed: {e}");
+            Ok(Vec::new())
+        }
+        Err(_) => {
+            warn!("library_hashes_among: the disk check took too long; treating none as owned");
+            Ok(Vec::new())
+        }
+    }
 }
+
+/// How long [`library_hashes_among`] waits on the disk.
+const LIBRARY_HASH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The cached library rows, omitted when the caller already holds a copy.
 #[derive(serde::Serialize)]

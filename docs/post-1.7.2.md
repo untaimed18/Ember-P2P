@@ -166,6 +166,38 @@ mostly symbols, several copies of one name, an empty room.
 - Tune the thresholds (`LIKELY_SPAM_SCORE`, `DUPLICATE_NAME_FLOOD`) from what
   shows up in real use.
 
+## Friends: tester requests
+
+Friends is marked BETA from 1.7.2. Two requests from testing:
+
+- **Offers that wait for the friend.** A chat attachment needs the friend
+  connected to be offered, and lapses after five minutes unanswered
+  (`ATTACH_OFFER_TTL_SECS`), so a file sent to someone at their desk but
+  away from it disappears. Files up to the auto-accept ceiling (25 MB by
+  default) already arrive unasked. To do: keep a sent file queued across
+  restarts and re-offer it when the friend's session comes up; keep an
+  inbound offer waiting until the user answers rather than five minutes;
+  decide how long either side holds one, and what happens when the file
+  moves first. "Try again" and the 24-hour grant are the pieces to build on.
+- **An Away status.** Friends see online or offline only. An "Away" or "Not
+  at PC" state, set by hand and by idle time, sent as a new friend-session
+  extension frame (older builds ignore unknown ones), shown in the friends
+  list and the chat header.
+
+## Known limits from the 1.7.2 audit
+
+- **A claim the owner meets on its way back.** An owner back from a
+  claimable silence follows its nominee's claim only in a copy signed before
+  it returned. The nominee re-signs every six hours, so a re-sign landing in
+  the minutes before the owner's first successful fetch leaves it running a
+  room its members have left. Dropping the signed-at rule would close it, at
+  the cost of following a claim first published after the return; the
+  members follow the owner's commitment either way.
+- **Downgrading to 1.7.1 leaves one upload slot.** 1.7.2 stores
+  Auto as `max_concurrent_uploads = 0`; 1.7.1 repairs that to 1 and saves
+  it. A separate `upload_slots_auto` flag, with the number kept in 1.7.1's
+  range, would make the downgrade harmless.
+
 ## Ember DHT
 
 - Key-epoch records are still stored on our own table's closest nodes. A

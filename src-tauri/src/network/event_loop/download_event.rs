@@ -147,17 +147,22 @@ fn cancel_failure_is_superseded(error: &str, registered: Option<&TransferControl
     ed2k::transfer::is_user_cancel_error(error) && registered.is_some_and(|c| !c.is_cancelled())
 }
 
-/// Whether a `Completed` or `Failed` was sent by a worker whose control has
-/// since been replaced, so the senders, handle and row it would act on are a
-/// newer worker's. Such an event still ends the restore verification it
-/// reports. One sent by no worker, or arriving with no control registered, is
-/// handled as it always was.
+/// Whether a `Failed` was sent by a worker whose control has since been
+/// replaced, so the senders, handle and row it would act on are a newer
+/// worker's. Such an event still ends the restore verification it reports. One
+/// sent by no worker, or arriving with no control registered, is handled as it
+/// always was.
+///
+/// Never a `Completed`. It is sent only once the file is in Downloads, by a
+/// finish task Pause and Stop cannot abort, so a Resume during a slow move
+/// starts a worker that finds no `.part` and begins the file again. Dropping
+/// the result left that worker re-downloading a file already finished;
+/// handling it completes the row, and `complete` cancels the newer worker.
 fn drop_superseded_terminal_event(event: &DownloadEvent, mgr: &mut TransferManager) -> bool {
-    let (transfer_id, generation) = match event {
-        DownloadEvent::Completed { transfer_id, generation, .. }
-        | DownloadEvent::Failed { transfer_id, generation, .. } => (transfer_id, *generation),
-        _ => return false,
+    let DownloadEvent::Failed { transfer_id, generation, .. } = event else {
+        return false;
     };
+    let generation = *generation;
     let superseded = generation
         .zip(mgr.get_control(transfer_id))
         .is_some_and(|(sender, registered)| sender != registered.generation());
@@ -251,7 +256,7 @@ pub(in crate::network) async fn on_download_event(
         });
         }
     }
-    if matches!(event, DownloadEvent::Completed { .. } | DownloadEvent::Failed { .. })
+    if matches!(event, DownloadEvent::Failed { .. })
         && drop_superseded_terminal_event(&event, &mut *transfer_manager.write().await)
     {
         return;
@@ -1943,7 +1948,10 @@ mod superseded_failure_tests {
 
         let old = Some(paused.generation());
         assert!(drop_superseded_terminal_event(&failed("dl", old), &mut mgr));
-        assert!(drop_superseded_terminal_event(&completed("dl", old), &mut mgr));
+        assert!(
+            !drop_superseded_terminal_event(&completed("dl", old), &mut mgr),
+            "a Completed means the file is already in Downloads, whoever sent it"
+        );
     }
 
     #[test]
@@ -1980,7 +1988,7 @@ mod superseded_failure_tests {
         let other = Some(TransferControl::new().generation());
         assert!(drop_superseded_terminal_event(&failed("dl", other), &mut mgr));
         assert!(mgr.is_restore_verification_running("dl"));
-        assert!(drop_superseded_terminal_event(&completed("dl", Some(check.generation())), &mut mgr));
+        assert!(drop_superseded_terminal_event(&failed("dl", Some(check.generation())), &mut mgr));
         assert!(!mgr.is_restore_verification_running("dl"));
     }
 }

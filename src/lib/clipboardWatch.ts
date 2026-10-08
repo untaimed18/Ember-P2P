@@ -50,6 +50,10 @@ async function newFileCount(text: string): Promise<number> {
 
 async function check(): Promise<void> {
   if (checking || !get(appSettings)?.watch_clipboard_links) return;
+  // Asked again when the read is due: focus can pass through Ember on the way
+  // to another app inside the settle delay, and a window can turn visible
+  // without being focused.
+  if (!document.hasFocus() || document.visibilityState !== 'visible') return;
   checking = true;
   try {
     const text = (await readClipboardText())?.trim();
