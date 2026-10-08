@@ -271,6 +271,7 @@ fn prune_ember_peer_caches(
     prune_stale_ember_peers(&mut state.known_ember_peers);
     prune_stale_ember_noise_keys(&mut state.ember_noise_keys);
     prune_stale_ember_peers(&mut state.ember_keyless_peers);
+    state.ember_observed_votes.expire();
     // Keep a session contact while it is still talking to us, not
     // merely while one of the two sibling caches remembers it.
     // Those are refreshed by `note_connected_ember_peer` on an eD2K

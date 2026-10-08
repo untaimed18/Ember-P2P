@@ -17,6 +17,9 @@ freeze as.
 - Members see that history stops where this device's does.
 - Discover folds away listings that look like spam, and hiding a listing says
   what it does.
+- Room governance, Discover listings, handoffs, claims and owned-rooms lists
+  are stored on the nodes a lookup finds closest to their key, as library
+  records are, rather than on the closest our own table holds.
 
 ## Channels: before the BETA badge comes off
 
@@ -163,9 +166,9 @@ mostly symbols, several copies of one name, an empty room.
 - Tune the thresholds (`LIKELY_SPAM_SCORE`, `DUPLICATE_NAME_FLOOD`) from what
   shows up in real use.
 
-## Other
+## Ember DHT
 
-- `network::ember::dht::search::tests::a_re_sent_record_costs_bandwidth_but_not_offer_allowance`
-  failed once in a full parallel run and passed on its own. It looks
-  timing-sensitive under load; it needs a look so it cannot fail a release
-  build.
+- Key-epoch records are still stored on our own table's closest nodes. A
+  lookup per member would flood the target-lookup queue in a large room;
+  batching them, or resolving the room's neighbourhood once, would let them
+  join the lookup-backed set.

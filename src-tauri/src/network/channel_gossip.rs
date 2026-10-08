@@ -2011,10 +2011,7 @@ pub(super) async fn publish_committed_channel_handoff(
         ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE,
         &ident.signing_key,
     );
-    let Some(publish_id) = state
-        .ember_publish
-        .start_publish(record, state.ember_dht.routing())
-    else {
+    let Some(publish_id) = start_own_channel_publish(state, record) else {
         debug!(
             "Ember channel handoff: could not start publishing {}; still its owner",
             ch.channel_id
@@ -2374,10 +2371,7 @@ pub(super) async fn maybe_republish_retired_channel_handoffs(
                 &ember::crypto::signing_key_from_bytes(&state.local_ed25519_seed),
             ),
         };
-        let Some(publish_id) = state
-            .ember_publish
-            .start_publish(record, state.ember_dht.routing())
-        else {
+        let Some(publish_id) = start_own_channel_publish(state, record) else {
             continue;
         };
         drive_ember_publish(socket, state, publish_id).await;

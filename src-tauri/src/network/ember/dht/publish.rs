@@ -2916,29 +2916,10 @@ impl PublishManager {
         }
     }
 
-    /// Store on the closest contacts currently in `routing`: verified ones
-    /// first, with unverified leads filling any slots they leave empty (see
-    /// `RoutingTable::find_closest_prefer_verified`). Channel presence,
-    /// moderation, and handoff still use this snapshot.
-    ///
-    /// Leads stay in deliberately. On a young network they are most of the
-    /// table, and one that never answers costs a handshake and a target that
-    /// times out rather than a lost publish: nothing here parks a record for
-    /// failing, and the callers that care retry when it stored on nobody.
-    pub fn start_publish(
-        &mut self,
-        record: SignedRecord,
-        routing: &super::routing::RoutingTable,
-    ) -> Option<u32> {
-        let dht_key = EmberNodeId(record.keyword_hash);
-        let targets = routing.find_closest_prefer_verified(&dht_key, super::K_BUCKET_SIZE);
-        self.start_publish_to(record, targets)
-    }
-
     /// Start a publish onto an already-resolved target set.
     ///
-    /// Used by buddy `PROXY_STORE` and the harness so they share the same
-    /// lookup-backed replica set as library keyword/source publish, instead of
+    /// Every caller resolves the set the way library keyword/source publish
+    /// does, lookup-backed with the table's closest as fallback, instead of
     /// storing only on whoever happens to sit in this node's table.
     pub fn start_publish_to(
         &mut self,

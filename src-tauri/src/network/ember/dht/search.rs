@@ -3566,6 +3566,9 @@ mod tests {
         // and re-sends 2 and 3 behind it.
         const TOTAL: u16 = 4;
         let script: [(u16, &[u16], u16); 2] = [(0, &[0, 2, 3], 1), (1, &[1, 2, 3], TOTAL)];
+        // Signed once: the record carries a whole-second timestamp, so signing
+        // per page lets a second boundary make the re-sent copies new records.
+        let held: Vec<Vec<u8>> = (0..TOTAL).map(|i| signed_value_blob("ubuntu", i)).collect();
 
         let mut blobs_on_the_wire = 0usize;
         for (expected_start, served, next_position) in script {
@@ -3574,10 +3577,7 @@ mod tests {
             let query = &batch[0];
             assert_eq!(query.start_position, expected_start);
             blobs_on_the_wire += served.len();
-            let blobs = served
-                .iter()
-                .map(|i| signed_value_blob("ubuntu", *i))
-                .collect();
+            let blobs = served.iter().map(|i| held[*i as usize].clone()).collect();
             search.process_response(
                 query.request_id,
                 &peer.node_id,

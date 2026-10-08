@@ -1319,6 +1319,36 @@ pub(super) fn ember_overlay_publish_targets_within(
     targets
 }
 
+/// Start storing one of our own channel records, on the same lookup-backed
+/// replica set library records use.
+///
+/// Our table's closest contacts to an arbitrary key are often not the network's,
+/// and a searcher's walk ends at the network's, so a room's governance, listing
+/// or owned-rooms list stored only on the former could go unfound. Presence and
+/// key-epoch records reuse a lookup already cached but never queue one. A
+/// presence key changes every [`ember::channel::PRESENCE_EPOCH_SECS`], so its
+/// lookup would land after the only publish that could use it. Key epochs are
+/// one key per member, so a large room's republish would fill the queue, which
+/// drains a few keys a minute, and hold back every other key behind it.
+pub(super) fn start_own_channel_publish(
+    state: &mut NetworkState,
+    record: ember::dht::publish::SignedRecord,
+) -> Option<u32> {
+    let queue_limit = own_record_target_queue_limit(&record.data);
+    let targets = ember_overlay_publish_targets_within(state, record.keyword_hash, queue_limit);
+    state.ember_publish.start_publish_to(record, targets)
+}
+
+/// The target-lookup queue limit for one of our own records; see
+/// [`start_own_channel_publish`].
+pub(super) fn own_record_target_queue_limit(data: &[u8]) -> usize {
+    use ember::dht::publish::{channel_kind_from_data, CHANNEL_KIND_EPOCH, CHANNEL_KIND_PRESENCE};
+    match channel_kind_from_data(data) {
+        Some(CHANNEL_KIND_PRESENCE | CHANNEL_KIND_EPOCH) => 0,
+        _ => EMBER_PUBLISH_TARGET_QUEUE_MAX,
+    }
+}
+
 /// Drop expired entries from the noise-key cache. Called next to
 /// `prune_stale_ember_peers` so the two Ember-mesh caches stay in
 /// step on the same TTL.

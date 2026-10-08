@@ -556,10 +556,7 @@ pub(super) async fn maybe_publish_channel_presence(
             &identity.noise_public_key,
             &signing,
         );
-        if let Some(publish_id) = state
-            .ember_publish
-            .start_publish(record, state.ember_dht.routing())
-        {
+        if let Some(publish_id) = start_own_channel_publish(state, record) {
             // Stamped up front so the next scan does not start a second publish
             // for this room while the first is still in flight. Our own
             // last_seen has to move with the announce too: gossip neighbors
@@ -715,10 +712,7 @@ pub(super) async fn publish_channel_departures(
         {
             continue;
         }
-        let Some(publish_id) = state
-            .ember_publish
-            .start_publish(record, state.ember_dht.routing())
-        else {
+        let Some(publish_id) = start_own_channel_publish(state, record) else {
             continue;
         };
         // Cleared only once a node says it stored the record. Clearing on the
@@ -2418,10 +2412,7 @@ pub(super) async fn maybe_publish_owned_channel_records(
             undo_owned_rotation(db, &ch.channel_id, rotated);
             continue;
         };
-        let Some(publish_id) = state
-            .ember_publish
-            .start_publish(record, state.ember_dht.routing())
-        else {
+        let Some(publish_id) = start_own_channel_publish(state, record) else {
             undo_owned_rotation(db, &ch.channel_id, rotated);
             continue;
         };
@@ -2543,10 +2534,7 @@ pub(super) async fn maybe_publish_owned_channel_records(
                     Some(ch.language.as_str()).filter(|l| !l.is_empty()),
                     &ident.signing_key,
                 );
-                if let Some(index_id) = state
-                    .ember_publish
-                    .start_publish(index, state.ember_dht.routing())
-                {
+                if let Some(index_id) = start_own_channel_publish(state, index) {
                     drive_ember_publish(socket, state, index_id).await;
                 }
             }
@@ -2682,7 +2670,7 @@ pub(super) async fn maybe_publish_owned_rooms_list(
         warn!("Ember: could not sign this identity's list of owned rooms");
         return;
     };
-    if let Some(publish_id) = state.ember_publish.start_publish(record, state.ember_dht.routing()) {
+    if let Some(publish_id) = start_own_channel_publish(state, record) {
         // A changed list goes out once more within the hour: starting a store
         // is not its landing, and a list that missed would leave a new room
         // unfindable until the next six-hourly pass.
@@ -2811,10 +2799,7 @@ pub(super) async fn republish_channel_key_epoch(
             &sealed,
             &ident.signing_key,
         );
-        if let Some(publish_id) = state
-            .ember_publish
-            .start_publish(record, state.ember_dht.routing())
-        {
+        if let Some(publish_id) = start_own_channel_publish(state, record) {
             drive_ember_publish(socket, state, publish_id).await;
         }
     }

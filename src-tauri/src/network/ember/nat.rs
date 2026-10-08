@@ -279,9 +279,14 @@ fn local_probe_ip(local_socket: &UdpSocket, reflector: Option<SocketAddr>) -> Op
     (!addr.ip().is_unspecified()).then_some(addr.ip())
 }
 
+/// Bounded by [`STUN_TIMEOUT`], as the mapping keep-alive's lookups are. One
+/// name the resolver hangs on would otherwise use up the network loop's whole
+/// NAT probe watchdog, and the probe would be abandoned without trying the
+/// reflectors after it.
 async fn resolve_stun_server(server: &str) -> Result<SocketAddr, String> {
-    tokio::net::lookup_host(server)
+    tokio::time::timeout(STUN_TIMEOUT, tokio::net::lookup_host(server))
         .await
+        .map_err(|_| format!("DNS resolve {server}: timed out"))?
         .map_err(|e| format!("DNS resolve {server}: {e}"))?
         .find(|a| a.is_ipv4())
         .ok_or_else(|| format!("No IPv4 address for {server}"))

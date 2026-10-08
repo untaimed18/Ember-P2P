@@ -3050,10 +3050,7 @@ async fn handle_command_inner(
             }
             #[cfg(debug_assertions)]
             let key_hex = hex::encode(record.keyword_hash);
-            let publish_id = match state
-                .ember_publish
-                .start_publish(*record, state.ember_dht.routing())
-            {
+            let publish_id = match start_own_channel_publish(state, *record) {
                 Some(id) => id,
                 None => {
                     let _ = tx.send(Err(format!(

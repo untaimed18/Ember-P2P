@@ -2870,6 +2870,29 @@ fn only_our_own_publishes_may_fill_the_target_lookup_queue() {
     assert_eq!(queue.len(), 3, "our own key still queues past that share");
 }
 
+/// A room's governance, listing and owned-rooms keys earn a target lookup;
+/// presence keys, which change before one lands, and key-epoch keys, one per
+/// member, do not.
+#[test]
+fn only_channel_keys_that_republish_queue_a_target_lookup() {
+    use ember::dht::publish::SignedRecord;
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let channel_id = [0x11u8; 16];
+    let channel_pk = sk.verifying_key().to_bytes();
+
+    let index = SignedRecord::channel_index("room", channel_id, channel_pk, false, None, &sk);
+    let owned = SignedRecord::owned_rooms(&[[0x22u8; 16]], &sk).expect("one salt fits");
+    let presence = SignedRecord::channel_presence(
+        "nick", channel_id, channel_pk, &[0x33; 32], false, 1, &[0x44; 32], &sk,
+    );
+    let epoch = SignedRecord::channel_key_epoch(channel_id, channel_pk, &[0x55; 32], 2, &[0u8; 48], &sk);
+
+    assert_eq!(own_record_target_queue_limit(&index.data), EMBER_PUBLISH_TARGET_QUEUE_MAX);
+    assert_eq!(own_record_target_queue_limit(&owned.data), EMBER_PUBLISH_TARGET_QUEUE_MAX);
+    assert_eq!(own_record_target_queue_limit(&presence.data), 0);
+    assert_eq!(own_record_target_queue_limit(&epoch.data), 0);
+}
+
 #[test]
 fn ember_publish_instant_treats_never_and_expired_as_due() {
     let now = std::time::Instant::now();
