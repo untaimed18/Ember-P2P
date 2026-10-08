@@ -376,7 +376,7 @@ pub struct GatheredChannelInfo {
     pub language: String,
 }
 
-async fn require_ember(state: &AppState) -> Result<(), String> {
+pub(crate) async fn require_ember(state: &AppState) -> Result<(), String> {
     if !state.config.read().await.settings.ember_native_enabled {
         return Err(coded(
             "channels_ember_disabled",
@@ -479,7 +479,7 @@ fn registry_fail(err: crate::network::rendezvous::ChannelRegistryError, taken: &
     }
 }
 
-async fn rendezvous_url(state: &AppState) -> String {
+pub(crate) async fn rendezvous_url(state: &AppState) -> String {
     state.config.read().await.settings.rendezvous_url.clone()
 }
 
@@ -502,7 +502,7 @@ async fn registry_call<T>(
         ))
 }
 
-async fn require_channel_username(state: &AppState) -> Result<String, String> {
+pub(crate) async fn require_channel_username(state: &AppState) -> Result<String, String> {
     let name = state.config.read().await.settings.channel_username.clone();
     if name.trim().is_empty() {
         return Err(coded(
@@ -814,11 +814,22 @@ pub async fn create_channel(
     }
     let username = require_channel_username(&state).await?;
     let username = reassert_channel_username(&state, &username).await?;
-    let ident = ChannelIdentity::generate();
-    let join_secret = if private {
-        channel::generate_private_join_secret()
-    } else {
-        channel::public_join_secret(&ident.pubkey)
+    // Derived from our identity, so the room can be found again from it.
+    let (ident, derived) = {
+        let db = state.db.clone();
+        let identity_seed = state.identity.ed25519_secret_key;
+        tokio::task::spawn_blocking(move || {
+            crate::network::channel_membership::mint_owned_room_identity(&db, &identity_seed)
+        })
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    };
+    // A derived room's first key comes from its seed as well, so the owner can
+    // rebuild it; a random room's stays random.
+    let join_secret = match (private, derived) {
+        (true, true) => channel::derive_owned_join_secret(&ident.seed()),
+        (true, false) => channel::generate_private_join_secret(),
+        (false, _) => channel::public_join_secret(&ident.pubkey),
     };
     let visibility = if private {
         CHANNEL_KIND_PRIVATE
@@ -946,6 +957,8 @@ pub async fn create_channel(
             owner_pubkey: Some(state.identity.ed25519_public_key),
             key_epoch: Some(0),
             language,
+            // What a device restored from the identity names the room by.
+            room_name: Some(name.clone()),
             ..Default::default()
         },
         ident.channel_id,
@@ -1217,7 +1230,7 @@ async fn refuse_deleted_channel(
     }
 }
 
-async fn enter_stored_channel(
+pub(crate) async fn enter_stored_channel(
     state: &AppState,
     channel_id: &str,
     username: &str,
@@ -1484,11 +1497,15 @@ pub async fn forget_channel(
 
 #[tauri::command]
 pub async fn claim_channel_username(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     name: String,
 ) -> Result<String, String> {
     let display = claim_username_on_registry(&state, &name).await?;
     persist_channel_username(&state, &display).await?;
+    // Taking up Channels this session: the identity's list of rooms is read
+    // now, not at the next launch, so a room made today is listed today.
+    crate::commands::channel_recovery::ensure_list_read(app);
     Ok(display)
 }
 
@@ -1501,7 +1518,7 @@ pub async fn delete_owned_channel(
 ) -> Result<(), String> {
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
-    let owned = load_owned_channel(&state, &channel_id).await?;
+    let owned = load_owned_channel_as(&state, &channel_id, true).await?;
     let url = rendezvous_url(&state).await;
     let channel_seed = owned.ident.seed();
     registry_call(crate::network::rendezvous::delete_channel_registry(
@@ -2606,12 +2623,27 @@ async fn load_owned_channel(
     state: &AppState,
     channel_id: &str,
 ) -> Result<OwnedChannel, String> {
+    load_owned_channel_as(state, channel_id, false).await
+}
+
+/// [`load_owned_channel`], and with `even_recovering` also for a recovered room
+/// still waiting on its current key. Every owner tool but deleting the room
+/// signs something that names the room's key, and until the key is back it
+/// would name an older one; deleting is left open so a room whose key never
+/// comes back can still be got rid of.
+async fn load_owned_channel_as(
+    state: &AppState,
+    channel_id: &str,
+    even_recovering: bool,
+) -> Result<OwnedChannel, String> {
     let db = state.db.clone();
     let id = channel_id.to_string();
-    let (row, seed) = tokio::task::spawn_blocking(move || {
+    let (row, seed, recovering) = tokio::task::spawn_blocking(move || {
         let row = db.get_channel(&id)?;
         let seed = db.load_channel_owner_seed(&id)?;
-        Ok::<_, anyhow::Error>((row, seed))
+        let recovering = db.channel_owner_key_pending(&id)?.is_some()
+            || crate::network::channel_membership::room_being_restored(&id);
+        Ok::<_, anyhow::Error>((row, seed, recovering))
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
@@ -2640,6 +2672,12 @@ async fn load_owned_channel(
             "Only the channel owner can do that",
         )
     })?;
+    if recovering && !even_recovering {
+        return Err(coded(
+            "channels_owner_key_pending",
+            "This room's key is still being restored to this device. Try again in a moment.",
+        ));
+    }
     let ident = ChannelIdentity::from_seed(&seed);
     let Ok(id_bytes) = hex::decode(&row.channel_id) else {
         return Err(coded("channels_not_found", "Channel not found"));
@@ -2763,17 +2801,20 @@ async fn owner_moderation_tail(state: &AppState, owned: &OwnedChannel) -> Modera
     // Re-read rather than trusting `owned.row`: a ban rotates the key before
     // committing, so the snapshot in hand is one epoch stale and members would
     // never learn to go looking for the new one.
-    let (live_epoch, removed_pins) = {
+    let (live_epoch, removed_pins, name_unconfirmed) = {
         let db = state.db.clone();
         let id = owned.row.channel_id.clone();
         let pins = owned.row.pinned_msg_ids.clone();
-        let fallback = (owned.row.key_epoch, Vec::new());
+        // Held back if it cannot be read: a stand-in name signed into the
+        // snapshot would rename the room for every member.
+        let fallback = (owned.row.key_epoch, Vec::new(), true);
         tokio::task::spawn_blocking(move || {
             let row = db.get_channel_lite(&id).ok().flatten()?;
             // A pin this device has removed is pruned here, which is the
             // owner's next commit of any kind.
             let removed = db.channel_messages_removed(&id, &pins).unwrap_or_default();
-            Some((row.key_epoch, removed))
+            let unconfirmed = db.channel_name_unconfirmed(&id).unwrap_or(true);
+            Some((row.key_epoch, removed, unconfirmed))
         })
         .await
         .ok()
@@ -2810,10 +2851,14 @@ async fn owner_moderation_tail(state: &AppState, owned: &OwnedChannel) -> Modera
             0 => None,
             secs => Some(secs),
         },
-        // Only once the room has been renamed; see `ModerationTail::room_name`.
-        // Taken from the row in hand, which the rename path fills with the new
-        // name before committing, rather than re-read from the database.
-        room_name: (owned.row.renamed_at > 0).then(|| owned.row.name.clone()),
+        // On every snapshot, as the owner loop's republish carries it: it is
+        // where a device restored from a backup learns the room's name, and
+        // two snapshots that differ in it would fit different pins. Taken from
+        // the row in hand, which the rename path fills with the new name before
+        // committing. Held back only while the name is a recovery's stand-in;
+        // a rename commits the real one before that marker is cleared, so the
+        // rename itself carries it.
+        room_name: (!name_unconfirmed || owned.row.renamed_at > 0).then(|| owned.row.name.clone()),
         // Absent when off, like slow mode, so a room that never uses either
         // keeps publishing the tail it always has.
         announce_only: owned.row.announce_only.then_some(true),
@@ -3342,6 +3387,32 @@ async fn rotate_channel_key(
 
     let our_seed = state.identity.ed25519_secret_key;
     let our_hex = hex::encode(state.identity.ed25519_public_key);
+    // Sealed to ourselves as well, in a member's slot: the key is random, so
+    // this copy is the only way a device restored from an older backup gets
+    // the room's current key back.
+    if let Some(wrap) = channel::derive_channel_epoch_secret(
+        &our_seed,
+        &state.identity.ed25519_public_key,
+        &owned.channel_id,
+        next_epoch,
+    ) {
+        let sealed = channel::seal_channel_key_epoch(&wrap, &owned.channel_id, next_epoch, &secret);
+        let record = SignedRecord::channel_key_epoch(
+            owned.channel_id,
+            owned.ident.pubkey,
+            &state.identity.ed25519_public_key,
+            next_epoch,
+            &sealed,
+            &owned.ident.signing_key,
+        );
+        if let Err(e) = queue_signed_record(state, record).await {
+            tracing::warn!(
+                channel_id = %owned.row.channel_id,
+                error = %e,
+                "could not queue the owner's own copy of a rotated channel key"
+            );
+        }
+    }
     for member in members {
         // Banned members are the point of rotating, and we already hold the key
         // we just minted.
@@ -3545,6 +3616,39 @@ pub async fn rotate_channel_room_key(
     let mods = load_moderator_pubkeys(&state, &channel_id).await?;
     rotate_and_commit(&state, &owned, &bans, &mods).await?;
     channel_info_from_id(&state, &channel_id).await
+}
+
+/// Give a recovered private room a fresh key when its current one cannot be
+/// fetched back — sealed by a build that kept no copy for the owner, or a copy
+/// that lapsed. Minted above `pending` and any epoch the room was told of
+/// since, so it cannot reuse a number the room has used; sealed to every
+/// member and to us; announced at once. Members lose nothing: they still hold
+/// every key they had. Returns the new epoch.
+pub(crate) async fn rekey_recovered_room(
+    state: &AppState,
+    channel_id: &str,
+    pending: i64,
+) -> Result<i64, String> {
+    let _snapshot = moderation_lock().lock().await;
+    let mut owned = load_owned_channel_as(state, channel_id, true).await?;
+    if owned.row.visibility != CHANNEL_KIND_PRIVATE {
+        return Err(coded(
+            "channels_rotate_public",
+            "A public room's key comes from its address, so there is nothing to rotate",
+        ));
+    }
+    owned.row.key_epoch = owned.row.key_epoch.max(owned.row.key_epoch_wanted).max(pending);
+    let next = owned.row.key_epoch.saturating_add(1);
+    let bans = load_banned_pubkeys(state, channel_id).await?;
+    let mods = load_moderator_pubkeys(state, channel_id).await?;
+    if let Err(e) = rotate_and_commit(state, &owned, &bans, &mods).await {
+        // Storing the new key lifted the wait; rolled back, it has to stand.
+        let db = state.db.clone();
+        let id = channel_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || db.mark_channel_owner_key_pending(&id, pending)).await;
+        return Err(e);
+    }
+    Ok(next)
 }
 
 /// Choose whether members other than the owner may hand out invites.
@@ -3758,7 +3862,15 @@ pub async fn set_channel_language(
     .await?;
     // The listing is what Discover shows before anyone joins, so it has to
     // change with the snapshot rather than wait for the owner loop's renewal.
-    if owned.row.visibility != CHANNEL_KIND_PRIVATE {
+    // Not under a recovery's stand-in name, which Discover would then list.
+    let name_unconfirmed = {
+        let db = state.db.clone();
+        let id = channel_id.clone();
+        tokio::task::spawn_blocking(move || db.channel_name_unconfirmed(&id).unwrap_or(true))
+            .await
+            .unwrap_or(true)
+    };
+    if owned.row.visibility != CHANNEL_KIND_PRIVATE && !name_unconfirmed {
         let record = SignedRecord::channel_index(
             &owned.row.name,
             owned.ident.channel_id,
@@ -4783,7 +4895,16 @@ pub async fn claim_channel_ownership(
         ));
     }
 
-    let successor = ChannelIdentity::generate();
+    // The successor is ours, so made the way a room we create is.
+    let successor = {
+        let db = state.db.clone();
+        let identity_seed = state.identity.ed25519_secret_key;
+        tokio::task::spawn_blocking(move || {
+            crate::network::channel_membership::mint_owned_room_identity(&db, &identity_seed).0
+        })
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    };
     let private = row.visibility == CHANNEL_KIND_PRIVATE;
     let seed = successor.seed();
     let old_pubkey = hex::decode(&row.pubkey)
@@ -4815,7 +4936,6 @@ pub async fn claim_channel_ownership(
             "This room does not need claiming",
         ));
     }
-
     // Everything that needed serialising is now in the database, and the room
     // reads as claimed, so a second attempt is refused by the guard above
     // rather than by this lock. Released before the network work because

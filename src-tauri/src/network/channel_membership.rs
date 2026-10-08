@@ -2131,7 +2131,7 @@ pub(super) async fn maybe_refresh_channel_moderation(
     }
 }
 
-pub(super) fn ingest_channel_moderation_records(
+pub(crate) fn ingest_channel_moderation_records(
     db: &Database,
     channel_id: [u8; 16],
     records: &[Vec<u8>],
@@ -2212,11 +2212,13 @@ pub(super) fn ingest_channel_moderation_records(
     applied
 }
 
-/// Owners re-STORE the records only they can sign, so the 24h DHT TTL cannot
-/// age them out: the moderation record, plus the public-index listing for
-/// public rooms. Both share that TTL, and remaining life is derived from the
+/// Owners re-STORE the records only they can sign, so their DHT TTL cannot age
+/// them out while the owner is about: the moderation record, plus the
+/// public-index listing for public rooms. Remaining life is derived from the
 /// publisher's signed creation time, so replication between storers cannot
-/// stand in for the owner re-signing (see `DhtStore::store`).
+/// stand in for the owner re-signing (see `DhtStore::store`). The lifetimes
+/// themselves are long (see `record_ttl`) for the owner's sake as much as the
+/// members': a restored device rebuilds the rooms it owns from these.
 pub(super) async fn maybe_publish_owned_channel_records(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -2262,6 +2264,16 @@ pub(super) async fn maybe_publish_owned_channel_records(
             .copied()
             .unwrap_or(0);
         if !ember::channel::schedule_due(last, now, ember::channel::MODERATION_REPUBLISH_SECS) {
+            continue;
+        }
+        // Recovered, and still without the key the room seals with: a snapshot
+        // from here would announce an older one, and a rotation would mint a
+        // key under a number the room already uses. The key-epoch loop fetches
+        // our own sealed copy and lifts this. Behind the schedule, so only a
+        // room that is due costs the read.
+        if room_being_restored(&ch.channel_id)
+            || db.channel_owner_key_pending(&ch.channel_id).ok().flatten().is_some()
+        {
             continue;
         }
         // A commitment this device did not offer: a record it found stored, or
@@ -2360,9 +2372,14 @@ pub(super) async fn maybe_publish_owned_channel_records(
                     0 => None,
                     secs => Some(secs),
                 },
-                // Carried on every republish once the room has been renamed, so
-                // a member who was offline for the edit still catches up.
-                room_name: (ch.renamed_at > 0).then(|| ch.name.clone()),
+                // On every republish, so a member who was offline for a rename
+                // still catches up — and so this snapshot is where a device
+                // restored from a backup learns the name of a room it owns,
+                // which nothing else it can ask holds for a private room.
+                // Held back only while the name here is a stand-in a recovery
+                // put in, which must not rename the room for everyone.
+                room_name: (!db.channel_name_unconfirmed(&ch.channel_id).unwrap_or(true))
+                    .then(|| ch.name.clone()),
                 // Both on every republish for the same reason as slow mode, and
                 // absent when unused so other rooms' tails are unchanged. Pins
                 // this device has since removed are left out; `channel_moderation`
@@ -2423,8 +2440,11 @@ pub(super) async fn maybe_publish_owned_channel_records(
             // entry, the name claim, and the succession clock all age from the
             // last pass. Walking out of a room you own is not abandonment and
             // must not start that clock — closing Ember for good is, and that
-            // stops this loop on its own.
-            if !settings.rendezvous_url.is_empty() {
+            // stops this loop on its own. Not with a recovery's stand-in name,
+            // which a registry whose real claim has lapsed would then take.
+            if !settings.rendezvous_url.is_empty()
+                && !db.channel_name_unconfirmed(&ch.channel_id).unwrap_or(true)
+            {
                 let url = settings.rendezvous_url.clone();
                 let cid = ident.channel_id;
                 let cpk = ident.pubkey;
@@ -2512,8 +2532,9 @@ pub(super) async fn maybe_publish_owned_channel_records(
             // established room aged out of the index after a day while its
             // members carried on none the wiser. Renewed on the same cadence
             // because this is the only loop that already holds the room key,
-            // and 6h against a 24h TTL survives a missed pass.
-            if !private {
+            // and 6h against a 24h TTL survives a missed pass. Not while the
+            // name is a recovery's stand-in, which Discover would then list.
+            if !private && !db.channel_name_unconfirmed(&ch.channel_id).unwrap_or(true) {
                 let index = ember::dht::publish::SignedRecord::channel_index(
                     &ch.name,
                     channel_id,
@@ -2541,6 +2562,142 @@ pub(super) async fn maybe_publish_owned_channel_records(
         }
     }
 }
+
+/// The key for a room this identity is about to own: created, handed over to
+/// us, or claimed. Returns whether it was derived from the identity, so the
+/// caller can derive the rest of the room's keys the same way.
+///
+/// Derived from the identity and a fresh random salt (see
+/// [`ember::channel::derive_owned_room_seed`]), with the salt written down
+/// before the room is published: that is what the identity's owned-rooms list
+/// carries, and what lets the room be found again from the identity alone. A
+/// salt that cannot be written gives a random key instead, which works the
+/// same but only comes back with a backup taken after it.
+pub(crate) fn mint_owned_room_identity(
+    db: &Database,
+    identity_seed: &[u8; 32],
+) -> (ember::channel::ChannelIdentity, bool) {
+    let salt = ember::channel::generate_owned_room_salt();
+    let ident = ember::channel::ChannelIdentity::from_seed(
+        &ember::channel::derive_owned_room_seed(identity_seed, &salt),
+    );
+    match db.record_channel_owned_salt(&hex::encode(ident.channel_id), &salt) {
+        Ok(()) => (ident, true),
+        Err(e) => {
+            debug!("Ember channel: could not record a room salt, using a random key: {e}");
+            (ember::channel::ChannelIdentity::generate(), false)
+        }
+    }
+}
+
+/// Whether the identity's owned-rooms list on the network has been read into
+/// the database since this launch. Held in memory, not in the database: a
+/// database copied back by hand, or by the system's own restore, carries
+/// whatever the database said, and an old one would publish its list over a
+/// newer one naming rooms made since.
+static OWNED_ROOMS_LIST_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn owned_rooms_list_read() -> bool {
+    OWNED_ROOMS_LIST_READ.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn note_owned_rooms_list_read() {
+    OWNED_ROOMS_LIST_READ.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Rooms a recovery is putting back right now. Between the row going in and
+/// the room's snapshot landing on it, the owner loop would otherwise sign a
+/// snapshot of a room with no bans, no topic and an old key, and that
+/// snapshot, being newer, would then outrank the real one.
+fn rooms_being_restored() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static ROOMS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    ROOMS.get_or_init(Default::default)
+}
+
+pub(crate) fn room_being_restored(channel_id: &str) -> bool {
+    rooms_being_restored()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(channel_id)
+}
+
+/// Held while a recovery puts a room back; the room is let go when dropped.
+pub(crate) struct RestoringRoom(String);
+
+impl RestoringRoom {
+    pub(crate) fn begin(channel_id: &str) -> Self {
+        rooms_being_restored()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(channel_id.to_string());
+        Self(channel_id.to_string())
+    }
+}
+
+impl Drop for RestoringRoom {
+    fn drop(&mut self) {
+        rooms_being_restored()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Keep the identity's owned-rooms list on the network: on the owner records'
+/// cadence, and as soon as the set of rooms changes, so a room made or taken
+/// over is in it within a tick rather than within six hours.
+///
+/// Only once the network's list has been read this launch (see
+/// [`owned_rooms_list_read`]): a database from an older time would otherwise
+/// replace a list naming the rooms made since with one that does not. An
+/// empty list is published too, so a deleted last room stops being listed.
+pub(super) async fn maybe_publish_owned_rooms_list(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    identity: &crate::storage::identity::NodeIdentity,
+) {
+    if !owned_rooms_list_read() || db.chat_locked() {
+        return;
+    }
+    let Ok(salts) = db.owned_room_salts() else {
+        return;
+    };
+    let now = chrono::Utc::now().timestamp();
+    let unchanged = state.owned_rooms_published.as_ref() == Some(&salts);
+    if unchanged
+        && !ember::channel::schedule_due(
+            state.owned_rooms_published_at,
+            now,
+            ember::channel::MODERATION_REPUBLISH_SECS,
+        )
+    {
+        return;
+    }
+    let signing = crate::network::ember::crypto::signing_key_from_bytes(&identity.ed25519_secret_key);
+    // `owned_room_salts` stops at what one list carries, so this only fails
+    // if the identity key itself is unusable.
+    let Some(record) = ember::dht::publish::SignedRecord::owned_rooms(&salts, &signing) else {
+        warn!("Ember: could not sign this identity's list of owned rooms");
+        return;
+    };
+    if let Some(publish_id) = state.ember_publish.start_publish(record, state.ember_dht.routing()) {
+        // A changed list goes out once more within the hour: starting a store
+        // is not its landing, and a list that missed would leave a new room
+        // unfindable until the next six-hourly pass.
+        state.owned_rooms_published_at = if unchanged {
+            now
+        } else {
+            now - ember::channel::MODERATION_REPUBLISH_SECS + OWNED_ROOMS_CONFIRM_SECS
+        };
+        state.owned_rooms_published = Some(salts);
+        drive_ember_publish(socket, state, publish_id).await;
+    }
+}
+
+/// How soon a changed owned-rooms list is published again.
+const OWNED_ROOMS_CONFIRM_SECS: i64 = 30 * 60;
 
 /// Drop an epoch whose moderation snapshot never went out, so the room keeps
 /// talking under the key its members still hold.
@@ -2622,19 +2779,20 @@ pub(super) async fn republish_channel_key_epoch(
         return;
     };
     let our_seed = identity.ed25519_secret_key;
-    for member in db.list_channel_members(&ch.channel_id).unwrap_or_default() {
+    // Our own copy first, sealed to our own identity: it is what a device
+    // restored from a backup taken before this epoch reads the key back from.
+    // A member's slot, so the record is the one every member's is.
+    let members = db.list_channel_members(&ch.channel_id).unwrap_or_default();
+    let recipients = std::iter::once(our_pk).chain(members.iter().filter_map(|member| {
         if member.banned {
-            continue;
+            return None;
         }
-        let Some(member_pk) = hex::decode(&member.member_pubkey)
+        let member_pk = hex::decode(&member.member_pubkey)
             .ok()
-            .and_then(|b| <[u8; 32]>::try_from(b).ok())
-        else {
-            continue;
-        };
-        if member_pk == our_pk {
-            continue;
-        }
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())?;
+        (member_pk != our_pk).then_some(member_pk)
+    }));
+    for member_pk in recipients.collect::<Vec<_>>() {
         let Some(wrap) = ember::channel::derive_channel_epoch_secret(
             &our_seed,
             &member_pk,
@@ -2696,7 +2854,14 @@ pub(super) async fn maybe_refresh_channel_key_epoch(
         if started >= CHANNEL_EPOCH_FETCH_PER_TICK {
             break;
         }
-        if ch.is_owner
+        // An owner mints its keys and needs none fetched — unless it is a
+        // recovered owner, which fetches the current one back from the copy it
+        // sealed to itself.
+        let recovering = ch.is_owner
+            && ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE
+            && ch.key_epoch_wanted > ch.key_epoch
+            && db.channel_owner_key_pending(&ch.channel_id).ok().flatten().is_some();
+        if (ch.is_owner && !recovering)
             || ch.visibility != ember::channel::CHANNEL_KIND_PRIVATE
             || ch.key_epoch_wanted <= 0
             || !ch.successor_id.is_empty()
@@ -2758,7 +2923,7 @@ pub(super) async fn maybe_refresh_channel_key_epoch(
 
 /// What an epoch fetch came back with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ChannelEpochIngest {
+pub(crate) enum ChannelEpochIngest {
     /// Nothing sealed to us that this build could use.
     Nothing,
     /// The key is stored; the room is readable under it.
@@ -2780,7 +2945,7 @@ pub(super) enum ChannelEpochIngest {
 /// members on this one to keep reading has to seal the later version under a
 /// key of its own. Only the room key signs these records, so this is the
 /// owner's word.
-pub(super) fn ingest_channel_epoch_records(
+pub(crate) fn ingest_channel_epoch_records(
     db: &Database,
     identity: &crate::storage::identity::NodeIdentity,
     channel_id: [u8; 16],
@@ -2812,6 +2977,16 @@ pub(super) fn ingest_channel_epoch_records(
     };
     let mut newer_version = None;
     let mut opened_one = false;
+    // Newest first. A rotation rolled back and tried again under the same
+    // epoch leaves two sealed keys in one slot, and a storer that missed the
+    // second still serves the first; the one the owner signed last is the one
+    // the room uses.
+    let mut records: Vec<&Vec<u8>> = records.iter().collect();
+    records.sort_by_key(|blob| {
+        std::cmp::Reverse(
+            ember::dht::publish::SignedRecord::from_value_blob(blob).map_or(i64::MIN, |r| r.timestamp),
+        )
+    });
     for blob in records {
         let Some((member, record_epoch, envelope)) =
             ember::dht::publish::SignedRecord::parse_channel_key_epoch(blob, &channel_id)

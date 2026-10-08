@@ -600,6 +600,27 @@ export async function listChannelTransfers(): Promise<ChannelTransferInfo[]> {
   return invoke('list_channel_transfers');
 }
 
+/** What a look for this identity's rooms found. */
+export interface OwnedRoomScan {
+  /** Rooms put back on this device, or made ours again. */
+  recovered: number;
+  /** The identity's list of rooms was read. False when the network could not
+   *  be reached well enough to be sure; the look is worth repeating then. */
+  confirmed: boolean;
+  /** Rooms in the list that could not be settled this time. Ember keeps
+   *  looking at them on its own. */
+  unsettled: number;
+}
+
+/** Emitted when rooms this identity owns were put back: `{ count }`. */
+export const CHANNELS_RECOVERED_EVENT = 'ember:channels-recovered';
+
+/** Look the network over for rooms this identity owns that this device does
+ *  not hold, and put them back. */
+export async function recoverOwnedChannels(): Promise<OwnedRoomScan> {
+  return invoke('recover_owned_channels');
+}
+
 /** Open the folder received room transfers are saved to. It is not shared,
  *  unlike `Downloads`. */
 export async function openChannelFilesFolder(): Promise<void> {

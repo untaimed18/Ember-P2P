@@ -80,6 +80,7 @@ pub(in crate::network) async fn on_ember_maintenance_tick(
             identity,
         )
         .await;
+        maybe_publish_owned_rooms_list(udp_socket, state, db, identity).await;
     }
     if settings.ember_native_enabled {
         // Release per-author flood slots for members who have gone

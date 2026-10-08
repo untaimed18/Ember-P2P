@@ -2,7 +2,7 @@ mod api;
 mod bans;
 mod browse;
 mod channel_gossip;
-mod channel_membership;
+pub(crate) mod channel_membership;
 mod channel_relay;
 mod channel_xfer;
 mod chat;
@@ -1112,6 +1112,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_dht_search_requests: HashMap::new(),
         ember_dht_pending_lookups: HashMap::new(),
         ember_dht_pending_value_lookups: HashMap::new(),
+        ember_dht_value_lookup_responded: HashMap::new(),
         ember_publish: ember::dht::publish::PublishManager::new(),
         ember_dht_publish_requests: HashMap::new(),
         ember_dht_pending_publishes: HashMap::new(),
@@ -1205,6 +1206,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         attach_auto_log: HashMap::new(),
         attach_retry_asked: HashMap::new(),
         attach_reoffered: HashMap::new(),
+        owned_rooms_published: None,
+        owned_rooms_published_at: 0,
         ember_channel_epoch_searches: HashMap::new(),
         ember_pending_channel_epoch: Vec::new(),
         channel_epoch_fetch_at: HashMap::new(),

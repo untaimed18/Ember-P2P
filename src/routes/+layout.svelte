@@ -24,7 +24,8 @@
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
   import { chatDockOpen, closeDock, retainChatTabs } from '$lib/stores/chatTabs';
-  import { initChannelsStore, cleanupChannelsStore } from '$lib/stores/channels';
+  import { initChannelsStore, cleanupChannelsStore, refreshChannels } from '$lib/stores/channels';
+  import { CHANNELS_RECOVERED_EVENT } from '$lib/api/channels';
   import { loadAppSettings, clearAppSettings, setAppSettings } from '$lib/stores/settings';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { applyDocumentLang, translateError } from '$lib/i18n';
@@ -315,6 +316,7 @@
     let unlistenClose: UnlistenFn | null = null;
     let unlistenConfigCorrupt: UnlistenFn | null = null;
     let unlistenDbCorrupt: UnlistenFn | null = null;
+    let unlistenRecovered: UnlistenFn | null = null;
     let unlistenKnownMet: UnlistenFn | null = null;
     let unlistenPolicyReset: UnlistenFn | null = null;
     let unlistenFoldersAdded: UnlistenFn | null = null;
@@ -385,6 +387,22 @@
     })
       .then((fn) => { if (mounted) unlistenDbCorrupt = fn; else fn(); })
       .catch((e) => console.error('Failed to register db-corrupt listener:', e));
+
+    // Rooms this identity owns, found on the network again after a restore
+    // or from Settings, and put back on this device.
+    listen<{ count: number }>(CHANNELS_RECOVERED_EVENT, (event) => {
+      const count = event.payload?.count ?? 0;
+      if (count <= 0) return;
+      toastSuccess(
+        plural(count, {
+          one: m.layout_channels_recovered_one,
+          other: () => m.layout_channels_recovered_other({ count }),
+        }),
+      );
+      refreshChannels().catch(() => {});
+    })
+      .then((fn) => { if (mounted) unlistenRecovered = fn; else fn(); })
+      .catch((e) => console.error('Failed to register channels-recovered listener:', e));
 
     // known.met could not be read: nothing is published and only friends are
     // uploaded to this session, which used to show nowhere but the log.
@@ -802,6 +820,7 @@
       if (unlistenClose) unlistenClose();
       if (unlistenConfigCorrupt) unlistenConfigCorrupt();
       if (unlistenDbCorrupt) unlistenDbCorrupt();
+      if (unlistenRecovered) unlistenRecovered();
       if (unlistenKnownMet) unlistenKnownMet();
       if (unlistenPolicyReset) unlistenPolicyReset();
       if (unlistenFoldersAdded) unlistenFoldersAdded();

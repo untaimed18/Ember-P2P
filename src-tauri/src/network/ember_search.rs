@@ -322,6 +322,11 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             if let Some(search) = &search {
                 record_ember_find_value_quality(&mut state.ember_diagnostics, search);
             }
+            // Before the records, so a waiter that has them reads this too.
+            if let Some(responded) = state.ember_dht_value_lookup_responded.remove(&search_id) {
+                let count = search.as_ref().map_or(0, |s| s.responded_count());
+                responded.store(count, std::sync::atomic::Ordering::Release);
+            }
             let held = search
                 .as_mut()
                 .map(|s| std::mem::take(&mut s.results))

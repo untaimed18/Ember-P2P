@@ -128,6 +128,30 @@ pub struct ChannelMessageRow {
 /// [`Database::note_channel_newer_line`].
 pub const CHANNEL_NEWER_LINES_PER_ROOM: i64 = 200;
 
+/// Salts kept for rooms not (yet) on this device; see
+/// [`Database::record_channel_owned_salt`].
+const CHANNEL_ORPHAN_SALTS_KEPT: i64 = 64;
+
+/// How long a salt read from the network's list is carried for a room this
+/// device has not put back: twice the life of the records it would be put
+/// back from, after which there is nothing left to find.
+const CHANNEL_CARRIED_SALT_SECS: i64 = 60 * 86_400;
+
+/// What [`Database::adopt_recovered_owned_channel`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveredChannel {
+    /// The room was not here; it is now, as ours.
+    Inserted,
+    /// We held it as a member; we own it again.
+    Adopted,
+    /// We already held it with its seed.
+    AlreadyOwned,
+    /// We deleted it here, and it stays that way.
+    Deleted,
+    /// We handed it on from here.
+    Moved,
+}
+
 /// The rows of `channel_newer_frames` that still say something: of a room this
 /// device holds, and for a key, an epoch past the one the room reads under. A
 /// row for a room deleted by a build that never knew the table, or for an
@@ -7808,6 +7832,16 @@ impl Database {
                 "DELETE FROM channel_newer_frames WHERE channel_id = ?1",
                 params![channel_id],
             )?;
+            Self::ensure_channel_owner_key_pending_locked(&tx)?;
+            tx.execute(
+                "DELETE FROM channel_owner_key_pending WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            Self::ensure_channel_name_unconfirmed_locked(&tx)?;
+            tx.execute(
+                "DELETE FROM channel_name_unconfirmed WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
             // The forget-list goes too. It exists to stop a deleted line being
             // re-inserted by the next gossip replay, and with the room itself
             // destroyed there is no ingest path left to refuse — so every row
@@ -7884,6 +7918,16 @@ impl Database {
         Self::ensure_channel_newer_frames_locked(&tx)?;
         tx.execute(
             "DELETE FROM channel_newer_frames WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Self::ensure_channel_owner_key_pending_locked(&tx)?;
+        tx.execute(
+            "DELETE FROM channel_owner_key_pending WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Self::ensure_channel_name_unconfirmed_locked(&tx)?;
+        tx.execute(
+            "DELETE FROM channel_name_unconfirmed WHERE channel_id = ?1",
             params![channel_id],
         )?;
         // A nominee's seeds stay. The owner may already have published a
@@ -8090,6 +8134,358 @@ impl Database {
             out.entry(channel_id).or_default().note(&source, kind);
         }
         Ok(out)
+    }
+
+    /// The salt each room this identity owns was derived from; see
+    /// [`crate::network::ember::channel::derive_owned_room_seed`]. A room with
+    /// no row here has a random seed, as every room did before. Created on
+    /// first use.
+    ///
+    /// `carried` marks a salt read from the network's list for a room this
+    /// device could not put back yet: it stays listed, so the room is not
+    /// dropped from the list for good by the first device to publish one.
+    fn ensure_channel_owned_salts_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_owned_salts (
+                channel_id TEXT PRIMARY KEY,
+                salt TEXT NOT NULL,
+                carried INTEGER NOT NULL DEFAULT 0,
+                carried_at INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Keep listing a salt from the network's list whose room is not back yet.
+    pub fn carry_owned_salt(
+        &self,
+        channel_id: &str,
+        salt: &crate::network::ember::channel::OwnedRoomSalt,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owned_salts_locked(&conn)?;
+        // Dated from the first time it was carried, not the latest: a room that
+        // never comes back is dropped once the list stops being worth keeping
+        // it in, rather than carried for ever.
+        conn.execute(
+            "INSERT INTO channel_owned_salts (channel_id, salt, carried, carried_at)
+             VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT(channel_id) DO UPDATE SET
+                carried = 1,
+                carried_at = CASE WHEN carried = 1 THEN carried_at ELSE excluded.carried_at END",
+            params![channel_id, hex::encode(salt), chrono::Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Stop listing a salt whose room is gone: deleted, or handed on.
+    pub fn drop_owned_salt(&self, channel_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owned_salts_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM channel_owned_salts WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remember the salt a room's seed came from. Written before the room is
+    /// published, so a room the network knows always has one here.
+    pub fn record_channel_owned_salt(
+        &self,
+        channel_id: &str,
+        salt: &crate::network::ember::channel::OwnedRoomSalt,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owned_salts_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO channel_owned_salts (channel_id, salt) VALUES (?1, ?2)
+             ON CONFLICT(channel_id) DO NOTHING",
+            params![channel_id, hex::encode(salt)],
+        )?;
+        // Salts minted for rooms that never came to exist — a creation that
+        // failed, a handoff nobody completed — are kept only the newest few:
+        // each handoff offer version mints one, and an owner could send many.
+        tx.execute(
+            "DELETE FROM channel_owned_salts
+             WHERE carried = 0
+               AND channel_id NOT IN (SELECT channel_id FROM channels)
+               AND rowid NOT IN (
+                   SELECT rowid FROM channel_owned_salts
+                   WHERE carried = 0
+                     AND channel_id NOT IN (SELECT channel_id FROM channels)
+                   ORDER BY rowid DESC LIMIT ?1
+               )",
+            params![CHANNEL_ORPHAN_SALTS_KEPT],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The salts of the rooms this device runs as owner — held with their
+    /// seed, not deleted, not handed on — and of those carried for a room not
+    /// back yet, in a stable order: what the identity's owned-rooms list says.
+    /// A carried room may be held here as a member, rejoined from an invite
+    /// since the device was lost; it is still ours to recover.
+    pub fn owned_room_salts(&self) -> anyhow::Result<Vec<crate::network::ember::channel::OwnedRoomSalt>> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owned_salts_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT s.salt FROM channel_owned_salts s
+             LEFT JOIN channels c ON c.channel_id = s.channel_id
+             WHERE (c.is_owner = 1 AND c.deleted = 0 AND c.successor_id = ''
+                    AND c.owner_seed IS NOT NULL)
+                OR (s.carried = 1 AND s.carried_at > ?2
+                    AND (c.channel_id IS NULL OR (c.deleted = 0 AND c.successor_id = '')))
+             ORDER BY s.carried, s.salt
+             LIMIT ?1",
+        )?;
+        let carried_since = chrono::Utc::now().timestamp() - CHANNEL_CARRIED_SALT_SECS;
+        let salts = stmt
+            .query_map(
+                params![
+                    crate::network::ember::dht::publish::OWNED_ROOMS_MAX as i64,
+                    carried_since
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .filter_map(|row| row.ok())
+            .filter_map(|hex_salt| hex::decode(hex_salt).ok())
+            .filter_map(|bytes| <[u8; 16]>::try_from(bytes).ok())
+            .collect();
+        Ok(salts)
+    }
+
+    /// Whether the identity's owned-rooms list on the network has been read
+    /// into this database since it was restored from a backup or rebuilt.
+    ///
+    /// Every launch reads the list once before publishing its own (see
+    /// [`crate::network::channel_membership::owned_rooms_list_read`]); this
+    /// records only that a restore owes that read even on a profile that has
+    /// not taken up Channels on this device yet. Created on first use, which
+    /// owes nothing.
+    fn ensure_owned_rooms_list_synced_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_owned_rooms_synced (
+                id INTEGER PRIMARY KEY CHECK (id = 0),
+                synced INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        Ok(())
+    }
+
+    pub fn set_owned_rooms_list_synced(&self, synced: bool) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_owned_rooms_list_synced_locked(&conn)?;
+        conn.execute(
+            "INSERT INTO channel_owned_rooms_synced (id, synced) VALUES (0, ?1)
+             ON CONFLICT(id) DO UPDATE SET synced = excluded.synced",
+            params![i64::from(synced)],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a read of the network's list is owed because this database was
+    /// explicitly marked as restored or rebuilt — not merely never read by a
+    /// profile that has never owned a room.
+    pub fn owned_rooms_list_read_owed(&self) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_owned_rooms_list_synced_locked(&conn)?;
+        Ok(conn
+            .query_row(
+                "SELECT synced FROM channel_owned_rooms_synced WHERE id = 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|synced| synced == 0))
+    }
+
+    /// Rooms this device owns again after a recovery but cannot run yet: the
+    /// key they currently seal with is `epoch`, which it has still to fetch
+    /// back from its own sealed copy. Until it has, it must not republish the
+    /// room or rotate it, or it would announce an older key and mint one under
+    /// a number the room already uses. Created on first use.
+    fn ensure_channel_owner_key_pending_locked(conn: &Connection) -> anyhow::Result<()> {
+        static SHAPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_owner_key_pending (
+                channel_id TEXT PRIMARY KEY,
+                epoch INTEGER NOT NULL,
+                since INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        // A development build made the table without `since`.
+        if !SHAPED.load(std::sync::atomic::Ordering::Acquire) {
+            let has_since = conn
+                .prepare("SELECT 1 FROM pragma_table_info('channel_owner_key_pending') WHERE name = 'since'")?
+                .exists([])?;
+            if !has_since {
+                conn.execute_batch(
+                    "ALTER TABLE channel_owner_key_pending ADD COLUMN since INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            SHAPED.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+
+    pub fn mark_channel_owner_key_pending(&self, channel_id: &str, epoch: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owner_key_pending_locked(&conn)?;
+        // Dated from when the wait began, not from the latest epoch it moved to.
+        conn.execute(
+            "INSERT INTO channel_owner_key_pending (channel_id, epoch, since) VALUES (?1, ?2, ?3)
+             ON CONFLICT(channel_id) DO UPDATE SET epoch = MAX(epoch, excluded.epoch)",
+            params![channel_id, epoch, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// When a recovered room began waiting on its current key.
+    pub fn channel_owner_key_pending_since(&self, channel_id: &str) -> anyhow::Result<Option<(i64, i64)>> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owner_key_pending_locked(&conn)?;
+        Ok(conn
+            .query_row(
+                "SELECT epoch, since FROM channel_owner_key_pending WHERE channel_id = ?1",
+                params![channel_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// The epoch a recovered room is waiting on, if it is waiting.
+    pub fn channel_owner_key_pending(&self, channel_id: &str) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owner_key_pending_locked(&conn)?;
+        Ok(conn
+            .query_row(
+                "SELECT epoch FROM channel_owner_key_pending WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Rooms whose name here is a stand-in a recovery put in, because nothing
+    /// it could ask said what the room is called. Kept out of every snapshot
+    /// and listing the owner signs, so it never renames the room for its
+    /// members; the owner renaming the room ends it. Created on first use.
+    fn ensure_channel_name_unconfirmed_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_name_unconfirmed (
+                channel_id TEXT PRIMARY KEY
+            );",
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_channel_name_unconfirmed(&self, channel_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_name_unconfirmed_locked(&conn)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_name_unconfirmed (channel_id) VALUES (?1)",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn channel_name_unconfirmed(&self, channel_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_name_unconfirmed_locked(&conn)?;
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM channel_name_unconfirmed WHERE channel_id = ?1",
+                params![channel_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Put a room this identity owns back on this device, from what the
+    /// network still holds of it. Nothing is overwritten: a room already held
+    /// with its seed is left alone, one deleted here stays deleted, and one
+    /// held as a member — rejoined from an invite since the device was lost —
+    /// is made ours again with its keys and history as they are.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adopt_recovered_owned_channel(
+        &self,
+        channel_id: &str,
+        pubkey: &str,
+        name: &str,
+        visibility: &str,
+        owner_seed: &[u8; 32],
+        join_secret: Option<&[u8; 32]>,
+        salt: &crate::network::ember::channel::OwnedRoomSalt,
+    ) -> anyhow::Result<RecoveredChannel> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owned_salts_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let outcome = match Self::get_channel_locked(&tx, channel_id)? {
+            Some(row) if row.deleted => RecoveredChannel::Deleted,
+            // Handed on from here: the room it moved to is the one to run, and
+            // this one gave up its seed when it went.
+            Some(row) if !row.successor_id.is_empty() => RecoveredChannel::Moved,
+            Some(_)
+                if self
+                    .load_channel_secret_locked(&tx, channel_id, "owner_seed", "owner")?
+                    .is_some() =>
+            {
+                RecoveredChannel::AlreadyOwned
+            }
+            Some(_) => {
+                let owner_enc = Self::encrypt_channel_secret(
+                    self.require_chat_key()?,
+                    channel_id,
+                    "owner",
+                    owner_seed,
+                )?;
+                tx.execute(
+                    "UPDATE channels SET is_owner = 1, owner_seed = ?2, in_room = 1
+                     WHERE channel_id = ?1",
+                    params![channel_id, owner_enc],
+                )?;
+                RecoveredChannel::Adopted
+            }
+            None => {
+                self.insert_channel_locked(
+                    &tx,
+                    channel_id,
+                    pubkey,
+                    name,
+                    visibility,
+                    true,
+                    Some(owner_seed),
+                    join_secret,
+                )?;
+                RecoveredChannel::Inserted
+            }
+        };
+        match outcome {
+            RecoveredChannel::Adopted | RecoveredChannel::Inserted | RecoveredChannel::AlreadyOwned => {
+                tx.execute(
+                    "INSERT INTO channel_owned_salts (channel_id, salt, carried) VALUES (?1, ?2, 0)
+                     ON CONFLICT(channel_id) DO UPDATE SET carried = 0",
+                    params![channel_id, hex::encode(salt)],
+                )?;
+            }
+            // Gone from here for good: no longer listed.
+            RecoveredChannel::Deleted | RecoveredChannel::Moved => {
+                tx.execute(
+                    "DELETE FROM channel_owned_salts WHERE channel_id = ?1",
+                    params![channel_id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        drop(conn);
+        if matches!(outcome, RecoveredChannel::Adopted | RecoveredChannel::Inserted) {
+            bump_channel_roster_generation(channel_id);
+        }
+        Ok(outcome)
     }
 
     fn channel_draft_aad(channel_id: &str) -> Vec<u8> {
@@ -8304,6 +8700,13 @@ impl Database {
         tx.execute(
             "DELETE FROM channel_newer_frames
              WHERE channel_id = ?1 AND source = 'key' AND epoch <= ?2",
+            params![channel_id, epoch],
+        )?;
+        // A recovered room this device owns can run again once it holds the
+        // key it was waiting on.
+        Self::ensure_channel_owner_key_pending_locked(&tx)?;
+        tx.execute(
+            "DELETE FROM channel_owner_key_pending WHERE channel_id = ?1 AND epoch <= ?2",
             params![channel_id, epoch],
         )?;
         tx.execute(
@@ -11069,6 +11472,12 @@ impl Database {
         conn.execute(
             "UPDATE channels SET name = ?2, renamed_at = ?3 WHERE channel_id = ?1",
             params![channel_id, name, renamed_at],
+        )?;
+        // The owner has named the room: whatever stood in for its name is gone.
+        Self::ensure_channel_name_unconfirmed_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM channel_name_unconfirmed WHERE channel_id = ?1",
+            params![channel_id],
         )?;
         drop(conn);
         bump_channel_roster_generation(channel_id);
@@ -18563,6 +18972,194 @@ mod tests {
         db.insert_channel(&other, &"5b".repeat(32), "Room", "private", false, None, None)
             .expect("insert channel again");
         assert_eq!(db.channel_newer_status(&other).unwrap(), ChannelNewerStatus::default());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The owned-rooms list names the rooms run here as owner and the ones
+    /// carried for later, never a room that never came to exist or is gone,
+    /// and a restored database publishes none until it has read the network's.
+    #[test]
+    fn the_owned_rooms_list_names_live_and_carried_rooms_only() {
+        use crate::network::ember::channel::{derive_owned_room_seed, ChannelIdentity};
+        let path = std::env::temp_dir().join(format!(
+            "ember-owned-salts-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        assert!(!db.owned_rooms_list_read_owed().unwrap(), "a new profile owes no read");
+        db.set_owned_rooms_list_synced(false).unwrap();
+        assert!(db.owned_rooms_list_read_owed().unwrap(), "restored: a read is owed");
+        db.set_owned_rooms_list_synced(true).unwrap();
+        assert!(!db.owned_rooms_list_read_owed().unwrap(), "and paid once read");
+
+        // Minted from the identity and a salt the list can be rebuilt from,
+        // and not listed until the room it was minted for exists.
+        let identity = [0x5Au8; 32];
+        let (ident, derived) = crate::network::channel_membership::mint_owned_room_identity(&db, &identity);
+        assert!(derived);
+        assert!(db.owned_room_salts().unwrap().is_empty(), "no room yet");
+        let id = hex::encode(ident.channel_id);
+        db.insert_channel(&id, &hex::encode(ident.pubkey), "Mine", "public", true, Some(&ident.seed()), None)
+            .unwrap();
+        let salts = db.owned_room_salts().unwrap();
+        assert_eq!(salts.len(), 1);
+        assert_eq!(
+            ChannelIdentity::from_seed(&derive_owned_room_seed(&identity, &salts[0])).channel_id,
+            ident.channel_id,
+            "the listed salt rebuilds the room"
+        );
+
+        // Carried for a room not back yet, whether or not it is held here as
+        // a member; dropped once it is known to be gone.
+        let absent = "ab".repeat(16);
+        db.carry_owned_salt(&absent, &[7u8; 16]).unwrap();
+        let member = "cd".repeat(16);
+        db.insert_channel(&member, &"ef".repeat(32), "As member", "public", false, None, None)
+            .unwrap();
+        db.carry_owned_salt(&member, &[8u8; 16]).unwrap();
+        let salts = db.owned_room_salts().unwrap();
+        assert_eq!(salts.len(), 3);
+        assert_eq!(salts, db.owned_room_salts().unwrap(), "in a stable order");
+        assert_ne!(salts[0], [7u8; 16], "the room run here before those carried");
+        db.drop_owned_salt(&absent).unwrap();
+        db.tombstone_channel(&member).unwrap();
+        assert_eq!(db.owned_room_salts().unwrap().len(), 1, "gone rooms are not listed");
+
+        // A room deleted here leaves the list.
+        db.tombstone_channel(&id).unwrap();
+        assert!(db.owned_room_salts().unwrap().is_empty());
+
+        // Salts minted for rooms that never came to exist are kept only the
+        // newest few.
+        for _ in 0..(CHANNEL_ORPHAN_SALTS_KEPT + 10) {
+            crate::network::channel_membership::mint_owned_room_identity(&db, &identity);
+        }
+        let orphans: i64 = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM channel_owned_salts
+                 WHERE channel_id NOT IN (SELECT channel_id FROM channels)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, CHANNEL_ORPHAN_SALTS_KEPT);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A recovered room goes back in without overwriting anything, and one
+    /// still waiting on its current key stops waiting when the key arrives.
+    #[test]
+    fn a_recovered_room_is_adopted_without_overwriting_and_waits_for_its_key() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-recover-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let seed = [0x0Du8; 32];
+        let join = [0x0Eu8; 32];
+
+        let salt = [0x0Fu8; 16];
+        let fresh = "1a".repeat(16);
+        db.carry_owned_salt(&fresh, &salt).unwrap();
+        assert_eq!(
+            db.adopt_recovered_owned_channel(&fresh, &"2b".repeat(32), "Lost room", "private", &seed, Some(&join), &salt)
+                .unwrap(),
+            RecoveredChannel::Inserted
+        );
+        assert_eq!(db.owned_room_salts().unwrap(), vec![salt], "listed as ours, not carried");
+        let carried: i64 = db
+            .conn
+            .lock()
+            .query_row("SELECT carried FROM channel_owned_salts WHERE channel_id = ?1", params![fresh], |r| r.get(0))
+            .unwrap();
+        assert_eq!(carried, 0);
+        let row = db.get_channel(&fresh).unwrap().expect("row");
+        assert!(row.is_owner && row.in_room_now());
+        assert_eq!(db.load_channel_owner_seed(&fresh).unwrap(), Some(seed));
+        assert_eq!(db.load_channel_join_secret(&fresh).unwrap(), Some(join));
+        assert_eq!(
+            db.adopt_recovered_owned_channel(&fresh, &"2b".repeat(32), "Again", "private", &[0x99; 32], None, &salt)
+                .unwrap(),
+            RecoveredChannel::AlreadyOwned
+        );
+        assert_eq!(db.load_channel_owner_seed(&fresh).unwrap(), Some(seed), "not overwritten");
+
+        // Rejoined from an invite as a member since the device was lost.
+        let member = "3c".repeat(16);
+        db.insert_channel(&member, &"4d".repeat(32), "As member", "private", false, None, Some(&join))
+            .unwrap();
+        db.set_channel_in_room(&member, false).unwrap();
+        assert_eq!(
+            db.adopt_recovered_owned_channel(&member, &"4d".repeat(32), "Ignored", "private", &seed, None, &[0x10; 16])
+                .unwrap(),
+            RecoveredChannel::Adopted
+        );
+        let row = db.get_channel(&member).unwrap().expect("row");
+        assert!(row.is_owner && row.in_room_now());
+        assert_eq!(row.name, "As member", "its name is kept");
+        assert_eq!(db.load_channel_join_secret(&member).unwrap(), Some(join), "and its key");
+
+        // Deleted here stays deleted.
+        let gone = "5e".repeat(16);
+        db.insert_channel(&gone, &"6f".repeat(32), "Gone", "public", true, Some(&seed), None)
+            .unwrap();
+        db.tombstone_channel(&gone).unwrap();
+        db.carry_owned_salt(&gone, &[0x11; 16]).unwrap();
+        assert_eq!(
+            db.adopt_recovered_owned_channel(&gone, &"6f".repeat(32), "Gone", "public", &seed, None, &[0x11; 16])
+                .unwrap(),
+            RecoveredChannel::Deleted
+        );
+        assert_eq!(db.owned_room_salts().unwrap().len(), 2, "the deleted room is no longer listed");
+
+        // Handed on from here: the room to run is the successor.
+        let moved = "7a".repeat(16);
+        db.insert_channel(&moved, &"8b".repeat(32), "Moved", "public", true, Some(&seed), None)
+            .unwrap();
+        db.conn
+            .lock()
+            .execute("UPDATE channels SET successor_id = ?2 WHERE channel_id = ?1", params![moved, "9c".repeat(16)])
+            .unwrap();
+        assert_eq!(
+            db.adopt_recovered_owned_channel(&moved, &"8b".repeat(32), "Moved", "public", &seed, None, &[0x12; 16])
+                .unwrap(),
+            RecoveredChannel::Moved
+        );
+
+        // Waiting on epoch 3 until it, or a later one, is stored.
+        db.mark_channel_owner_key_pending(&fresh, 3).unwrap();
+        assert_eq!(db.channel_owner_key_pending(&fresh).unwrap(), Some(3));
+        db.insert_channel_key_epoch(&fresh, 2, &[2u8; 32]).unwrap();
+        assert_eq!(db.channel_owner_key_pending(&fresh).unwrap(), Some(3), "an older key is not it");
+        db.insert_channel_key_epoch(&fresh, 3, &[3u8; 32]).unwrap();
+        assert_eq!(db.channel_owner_key_pending(&fresh).unwrap(), None);
+        // A stand-in name stays out of what the owner signs until a rename.
+        assert!(!db.channel_name_unconfirmed(&fresh).unwrap());
+        db.mark_channel_name_unconfirmed(&fresh).unwrap();
+        assert!(db.channel_name_unconfirmed(&fresh).unwrap());
+        db.rename_owned_channel(&fresh, "Named again", 1_000).unwrap();
+        assert!(!db.channel_name_unconfirmed(&fresh).unwrap());
+
+        db.mark_channel_owner_key_pending(&fresh, 5).unwrap();
+        db.mark_channel_name_unconfirmed(&fresh).unwrap();
+        assert!(db.delete_channel(&fresh, None).unwrap());
+        assert_eq!(db.channel_owner_key_pending(&fresh).unwrap(), None, "goes with the room");
+        assert!(!db.channel_name_unconfirmed(&fresh).unwrap(), "and so does the stand-in");
 
         drop(db);
         let _ = std::fs::remove_file(&path);

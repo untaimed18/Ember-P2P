@@ -829,6 +829,12 @@ pub fn run() {
                 })?,
             );
 
+            // A database that came back from a backup, or was rebuilt, counts
+            // only the rooms made before it: the rooms this identity owns are
+            // looked for again before a number is handed out.
+            if restore_applied || db.corrupt_backup.is_some() {
+                commands::channel_recovery::owe_scan(&db);
+            }
             let mut config = AppConfig::load(&app_handle).map_err(|e| {
                 tracing::error!("Failed to load config: {e}");
                 e
@@ -1171,6 +1177,7 @@ pub fn run() {
             }
             background::spawn(app_handle.clone());
             auto_update::scheduler::spawn(app_handle.clone());
+            commands::channel_recovery::spawn_startup_scan(app_handle.clone());
 
             // Non-silent recovery notice: if config.json was corrupt at load,
             // tell the user (their settings were reset to defaults; the original
@@ -2490,6 +2497,7 @@ pub fn run() {
             $($harness,)*
             commands::channels::list_channels,
             commands::channels::dismiss_channel_newer_lines,
+            commands::channel_recovery::recover_owned_channels,
             commands::channels::create_channel,
             commands::channels::join_channel,
             commands::channels::enter_channel,

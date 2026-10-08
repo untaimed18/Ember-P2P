@@ -62,6 +62,7 @@ mod tests {
 }
 
 pub mod backup;
+pub mod channel_recovery;
 pub mod channels;
 pub mod chat_attachments;
 pub mod chat_window;

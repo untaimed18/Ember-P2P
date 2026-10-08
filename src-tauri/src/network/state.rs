@@ -124,6 +124,11 @@ pub(super) struct EmberSourceAddress {
 pub struct EmberValueLookupPending {
     pub search_id: u32,
     pub records_rx: oneshot::Receiver<Vec<Vec<u8>>>,
+    /// Nodes that answered the walk, set before `records_rx` resolves. A walk
+    /// nobody answered — offline, or a routing table of contacts that have
+    /// gone — finishes empty-handed whether or not the record exists, so a
+    /// caller reading "nothing found" as "nothing there" checks this first.
+    pub responded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub(super) struct PendingDownload {
@@ -1316,6 +1321,9 @@ pub(super) struct NetworkState {
     /// `ember_dht_pending_lookups` because a value lookup yields records,
     /// not contacts.
     pub(super) ember_dht_pending_value_lookups: HashMap<u32, oneshot::Sender<Vec<Vec<u8>>>>,
+    /// Where each of those waiters reads how many nodes answered its walk.
+    pub(super) ember_dht_value_lookup_responded:
+        HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     /// Active keyword/source publishes (slice 5). `PublishManager` tracks
     /// the targeted nodes and their acks; the network task drives it by
     /// sending `STORE_RECORD` frames and feeding `STORE_ACK`s back in.
@@ -1655,6 +1663,10 @@ pub(super) struct NetworkState {
     /// and when. The friend's next accept answers that offer rather than
     /// asking for another, which is what keeps the two from looping.
     pub(super) attach_reoffered: HashMap<[u8; 16], i64>,
+    /// The owned-rooms list last published, and when. See
+    /// `channel_membership::maybe_publish_owned_rooms_list`.
+    pub(super) owned_rooms_published: Option<Vec<[u8; 16]>>,
+    pub(super) owned_rooms_published_at: i64,
     /// In-flight FIND_VALUE of a content-key epoch record (`search_id` →
     /// channel + epoch).
     pub(super) ember_channel_epoch_searches: HashMap<u32, ([u8; 16], i64)>,

@@ -4312,6 +4312,22 @@ mod tests {
         // plain file, and a DPAPI-wrapped secret.
         let db = crate::storage::database::Database::open_at(&source_dir.join("ember.db"))
             .expect("open source database");
+        // A private room this profile owns. Its seed is the only thing that can
+        // sign for it, sealed with the chat key, so losing either half of the
+        // pair in a move loses the room.
+        let room = "a1".repeat(16);
+        let (owner_seed, join_secret, rotated) = ([0x0Au8; 32], [0x0Bu8; 32], [0x0Cu8; 32]);
+        db.insert_channel(
+            &room,
+            &"b2".repeat(32),
+            "Owned room",
+            "private",
+            true,
+            Some(&owner_seed),
+            Some(&join_secret),
+        )
+        .expect("insert owned room");
+        db.insert_channel_key_epoch(&room, 1, &rotated).expect("rotate");
         let identity_plaintext = br#"{"kad_id":[1,2,3],"user_hash":"abc"}"#;
         std::fs::write(
             source_dir.join("identity.json"),
@@ -4418,6 +4434,23 @@ mod tests {
         assert_eq!(
             restored_db.schema_version(),
             crate::storage::database::MAX_SUPPORTED_SCHEMA_VERSION
+        );
+        // And the room still belongs to this profile: the restored chat key
+        // opens the seed that signs for it, and every key it has sealed with.
+        assert!(!restored_db.chat_locked(), "the chat key came with the backup");
+        assert_eq!(
+            restored_db.load_channel_owner_seed(&room).expect("read seed"),
+            Some(owner_seed),
+            "an owned room survives a move"
+        );
+        assert_eq!(
+            restored_db.load_channel_join_secret(&room).expect("read join secret"),
+            Some(join_secret)
+        );
+        assert_eq!(
+            restored_db.load_channel_key_epochs(&room).expect("read epochs"),
+            vec![(1, rotated)],
+            "and so do the room's rotated keys"
         );
         drop(restored_db);
 

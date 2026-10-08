@@ -3028,9 +3028,14 @@ async fn handle_command_inner(
             state
                 .ember_dht_pending_value_lookups
                 .insert(search_id, records_tx);
+            let responded = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            state
+                .ember_dht_value_lookup_responded
+                .insert(search_id, responded.clone());
             let _ = tx.send(Ok(EmberValueLookupPending {
                 search_id,
                 records_rx,
+                responded,
             }));
 
             // Kick off the first round (and resolve immediately if the
@@ -3109,9 +3114,14 @@ async fn handle_command_inner(
             state
                 .ember_dht_pending_value_lookups
                 .insert(search_id, records_tx);
+            let responded = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            state
+                .ember_dht_value_lookup_responded
+                .insert(search_id, responded.clone());
             let _ = tx.send(Ok(EmberValueLookupPending {
                 search_id,
                 records_rx,
+                responded,
             }));
             drive_ember_search(socket, state, search_id).await;
         }

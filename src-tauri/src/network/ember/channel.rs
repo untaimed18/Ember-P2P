@@ -695,6 +695,70 @@ pub fn public_join_secret(channel_pubkey: &[u8; 32]) -> [u8; 32] {
     *channel_pubkey
 }
 
+/// BLAKE3 `derive_key` context for a room seed this identity owns.
+const OWNED_ROOM_SEED_CONTEXT: &str = "ember-channel-owned-room-seed-v1";
+/// BLAKE3 `derive_key` context for a private room's first content key, from
+/// its owner seed.
+const OWNED_JOIN_SECRET_CONTEXT: &str = "ember-channel-owned-join-secret-v1";
+
+/// Prefix of the DHT key an identity files its owned-rooms list under.
+const OWNED_ROOMS_KEY_PREFIX: &[u8] = b"ember:identity:owned-rooms:v1";
+
+/// Random part of a room seed this identity owns; see
+/// [`derive_owned_room_seed`].
+pub type OwnedRoomSalt = [u8; 16];
+
+/// The seed of the room this identity owns under `salt`.
+///
+/// A random seed per room made every room a secret of its own: a backup taken
+/// before it was created could not bring it back, so losing the device lost the
+/// room. Derived from the identity instead, the room comes back from the
+/// identity and the salt, and the salts travel in a list the identity signs and
+/// keeps on the network ([`owned_rooms_key`]), so one backup of the identity is
+/// enough for every room it will ever own.
+///
+/// The salt is random rather than a count, on purpose. A count would have to
+/// be proved unused before it was handed out again, and nothing on the network
+/// can prove that — a record can lapse or be withheld — so a wrong guess would
+/// give a second room the keys of a first. A random salt makes the worst a
+/// lost list can do losing the room, never sharing its keys.
+///
+/// One-way and domain-separated: a salt says nothing without the identity's
+/// secret, so the list does not reveal which rooms are this identity's.
+pub fn derive_owned_room_seed(identity_seed: &[u8; 32], salt: &OwnedRoomSalt) -> [u8; 32] {
+    let mut material = [0u8; 48];
+    material[..32].copy_from_slice(identity_seed);
+    material[32..].copy_from_slice(salt);
+    let seed = blake3::derive_key(OWNED_ROOM_SEED_CONTEXT, &material);
+    zeroize::Zeroize::zeroize(&mut material);
+    seed
+}
+
+/// A fresh salt for a room this identity is about to own.
+pub fn generate_owned_room_salt() -> OwnedRoomSalt {
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    salt
+}
+
+/// DHT key of the list of rooms `identity_pubkey` owns.
+pub fn owned_rooms_key(identity_pubkey: &[u8; 32]) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(OWNED_ROOMS_KEY_PREFIX);
+    hasher.update(identity_pubkey);
+    let hash = hasher.finalize();
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hash.as_bytes()[..16]);
+    key
+}
+
+/// The first content key of a private room whose seed is `owner_seed`, so the
+/// owner can rebuild it from the seed. Later keys are random (see the rotation)
+/// and come back from the owner's own sealed copy instead.
+pub fn derive_owned_join_secret(owner_seed: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key(OWNED_JOIN_SECRET_CONTEXT, owner_seed)
+}
+
 pub fn generate_private_join_secret() -> [u8; 32] {
     let mut secret = [0u8; 32];
     OsRng.fill_bytes(&mut secret);
@@ -8139,6 +8203,66 @@ mod tests {
             15 => V167Branch::Chat,
             _ => V167Branch::DroppedWithDebugLog,
         }
+    }
+
+    /// A room this identity owns is found again from the identity and its
+    /// salt alone, so the derivation has to be stable, and distinct per salt
+    /// and per identity.
+    #[test]
+    fn an_owned_room_seed_comes_from_the_identity_and_its_salt() {
+        let identity = [0x11u8; 32];
+        let other = [0x12u8; 32];
+        let (a, b) = ([0xA0u8; 16], [0xB0u8; 16]);
+        let first = derive_owned_room_seed(&identity, &a);
+        assert_eq!(first, derive_owned_room_seed(&identity, &a), "the same every time");
+        assert_ne!(first, derive_owned_room_seed(&identity, &b));
+        assert_ne!(first, derive_owned_room_seed(&other, &a));
+        assert_ne!(first, identity, "never the identity itself");
+        let room = ChannelIdentity::from_seed(&first);
+        assert_ne!(
+            room.channel_id,
+            ChannelIdentity::from_seed(&derive_owned_room_seed(&identity, &b)).channel_id
+        );
+        let join = derive_owned_join_secret(&first);
+        assert_eq!(join, derive_owned_join_secret(&first));
+        assert_ne!(join, first, "the room key is not the signing seed");
+        assert_ne!(join, derive_owned_join_secret(&derive_owned_room_seed(&identity, &b)));
+        assert_ne!(generate_owned_room_salt(), generate_owned_room_salt());
+        assert_ne!(owned_rooms_key(&[1u8; 32]), owned_rooms_key(&[2u8; 32]));
+        // Pinned, so a change to the derivation cannot slip by: every room a
+        // user made would stop being found.
+        assert_eq!(
+            hex::encode(derive_owned_room_seed(&[0u8; 32], &[0u8; 16])),
+            "f982f4676919993879dc656983b99bf64c3d13b8971b668c5feb11e54f726ada"
+        );
+        assert_eq!(
+            hex::encode(derive_owned_join_secret(&[0u8; 32])),
+            "27ec5a96727b86e57ea4af798bb24b4516251798a9f2e88d20f57817b50388d8"
+        );
+        assert_eq!(hex::encode(owned_rooms_key(&[0u8; 32])), "3de512871cd4704d180ce03fb2c45054");
+    }
+
+    /// The owner's own sealed copy of a rotated key is what a restored device
+    /// reads the key back from: sealed to itself, opened by itself.
+    #[test]
+    fn an_owner_can_seal_a_room_key_to_itself_and_open_it_again() {
+        let owner = SigningKey::from_bytes(&[0x33; 32]);
+        let owner_pub = owner.verifying_key().to_bytes();
+        let channel_id = [0x44u8; 16];
+        let wrap = derive_channel_epoch_secret(&owner.to_bytes(), &owner_pub, &channel_id, 3)
+            .expect("an identity can derive with itself");
+        let sealed = seal_channel_key_epoch(&wrap, &channel_id, 3, &[0x55; 32]);
+        let reopened = derive_channel_epoch_secret(&owner.to_bytes(), &owner_pub, &channel_id, 3)
+            .expect("derives again");
+        assert_eq!(open_channel_key_epoch(&reopened, &channel_id, 3, &sealed), Some([0x55; 32]));
+        let member = SigningKey::from_bytes(&[0x66; 32]);
+        let member_side =
+            derive_channel_epoch_secret(&member.to_bytes(), &owner_pub, &channel_id, 3).unwrap();
+        assert_eq!(
+            open_channel_key_epoch(&member_side, &channel_id, 3, &sealed),
+            None,
+            "nobody else opens the owner's own copy"
+        );
     }
 
     fn ext_frame(signer: &SigningKey, kind: u8, flags: u8, body: &[u8]) -> Vec<u8> {

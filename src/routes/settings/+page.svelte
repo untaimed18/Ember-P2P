@@ -24,6 +24,7 @@
     CHANNEL_USERNAME_MAX,
     isValidChannelUsername,
     openChannelFilesFolder,
+    recoverOwnedChannels,
     sanitizeChannelUsernameInput,
   } from '$lib/api/channels';
   import { setAppSettings, appSettings } from '$lib/stores/settings';
@@ -1231,6 +1232,28 @@
   function trackedTimeout(fn: () => void, ms: number) {
     const id = setTimeout(() => { activeTimers.delete(id); fn(); }, ms);
     activeTimers.add(id);
+  }
+
+  let recoveringRooms = $state(false);
+  /** Look for rooms this identity owns. Rooms put back are announced by the
+   *  app-wide notice the backend's event raises, so only the other two
+   *  outcomes are said here. */
+  async function findOwnedRooms() {
+    if (recoveringRooms) return;
+    recoveringRooms = true;
+    try {
+      const scan = await recoverOwnedChannels();
+      const sure = scan.confirmed && scan.unsettled === 0;
+      if (!sure) {
+        showSaveMsg(m.settings_channels_recover_unsure(), true, 6000);
+      } else if (scan.recovered === 0) {
+        showSaveMsg(m.settings_channels_recover_none(), false, 6000);
+      }
+    } catch (e) {
+      showSaveMsg(translateError(e), true, 6000);
+    } finally {
+      recoveringRooms = false;
+    }
   }
 
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -4322,6 +4345,23 @@
               </button>
             </div>
             <span class="hint">{m.settings_channel_file_offers_hint()}</span>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="field">
+            <div class="toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_channels_recover()}</span>
+                <span class="hint">{m.settings_channels_recover_hint()}</span>
+              </div>
+              <button
+                type="button"
+                class="action-btn"
+                disabled={recoveringRooms}
+                onclick={() => void findOwnedRooms()}
+              >{recoveringRooms ? m.settings_channels_recovering() : m.settings_channels_recover_btn()}</button>
+            </div>
           </div>
 
           <div class="divider"></div>

@@ -1551,7 +1551,9 @@ pub(super) async fn apply_channel_handoff_offer(
                 None
             }
             _ => {
-                let ident = ember::channel::ChannelIdentity::generate();
+                // Ours from the moment the owner commits, so made the way a room
+                // we create is, and found again from our identity if we lose it.
+                let (ident, _) = mint_owned_room_identity(db, &state.local_ed25519_seed);
                 match db.store_handoff_pending_seed(
                     &ch.channel_id,
                     version,
