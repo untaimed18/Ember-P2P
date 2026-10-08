@@ -102,6 +102,8 @@ function room(partial: Partial<ChannelInfo> & { channel_id: string }): ChannelIn
     announce_only: false,
     pinned_msg_ids: [],
     language: '',
+    newer_lines: 0,
+    newer_key: false,
     ...partial,
   } as ChannelInfo;
 }

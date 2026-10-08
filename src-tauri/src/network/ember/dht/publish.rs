@@ -4376,6 +4376,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_epoch_record_in_a_later_envelope_version_is_stored_and_read_back() {
+        let room = SigningKey::from_bytes(&[0x52; 32]);
+        let room_pub = room.verifying_key().to_bytes();
+        let channel_id = channel::channel_id_from_pubkey(&room_pub);
+        let member = [0x61u8; 32];
+        let mut later = vec![0xEEu8; 200];
+        later[0] = 2;
+        let record = SignedRecord::channel_key_epoch(channel_id, room_pub, &member, 7, &later, &room);
+        assert!(record.channel_store_ok(), "a storer cannot read it, so it takes it");
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        assert_eq!(
+            SignedRecord::parse_channel_key_epoch(&blob, &channel_id),
+            Some((member, 7, later.clone())),
+            "and a member is handed it to decide whether it can open it"
+        );
+        let mut store = super::super::store::DhtStore::new();
+        assert!(store.store(record.keyword_hash, record.data.clone(), record.signature));
+
+        let bare = SignedRecord::channel_key_epoch(channel_id, room_pub, &member, 7, &[2], &room);
+        assert!(!bare.channel_store_ok(), "a version byte alone is no envelope");
+    }
+
     /// The channel sub-decoders sit behind `channel_store_ok`, which is only
     /// reached after an Ed25519 signature verifies — so random and bit-flipped
     /// buffers cannot get to them, and the record-level fuzz's two deterministic

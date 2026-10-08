@@ -2489,6 +2489,7 @@ pub fn run() {
             commands::peers::get_ember_dht_store,
             $($harness,)*
             commands::channels::list_channels,
+            commands::channels::dismiss_channel_newer_lines,
             commands::channels::create_channel,
             commands::channels::join_channel,
             commands::channels::enter_channel,

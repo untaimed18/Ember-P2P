@@ -124,6 +124,44 @@ pub struct ChannelMessageRow {
     pub reply_parent_deleted: bool,
 }
 
+/// Newest lines per room kept as needing a newer Ember; see
+/// [`Database::note_channel_newer_line`].
+pub const CHANNEL_NEWER_LINES_PER_ROOM: i64 = 200;
+
+/// The rows of `channel_newer_frames` that still say something: of a room this
+/// device holds, and for a key, an epoch past the one the room reads under. A
+/// row for a room deleted by a build that never knew the table, or for an
+/// epoch a later key overtook, says nothing.
+const CHANNEL_NEWER_LIVE_ROWS: &str = "FROM channel_newer_frames f
+     JOIN channels c ON c.channel_id = f.channel_id
+     WHERE (f.source <> 'key' OR f.epoch > c.key_epoch)";
+
+/// What in one room this build was sent and cannot read, counted against what
+/// it reads now — a row written before an update taught it the kind no longer
+/// counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChannelNewerStatus {
+    /// Displayable lines of a kind this build does not know.
+    pub lines: i64,
+    /// The room's key came sealed in a version this build cannot open.
+    pub key: bool,
+}
+
+impl ChannelNewerStatus {
+    fn note(&mut self, source: &str, kind: i64) {
+        let Ok(kind) = u8::try_from(kind) else {
+            return;
+        };
+        match source {
+            "line" if !crate::network::ember::channel::ext_kind_understood(kind) => self.lines += 1,
+            "key" if !crate::network::ember::channel::epoch_envelope_version_supported(kind) => {
+                self.key = true;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// What a reply's quote needs of the line it answers.
 ///
 /// Read at the time the reply is read, so a parent revised since shows its
@@ -7678,6 +7716,13 @@ impl Database {
                 now
             ],
         )?;
+        // Anything left under this id belonged to a copy of the room deleted by
+        // a build that did not know to clear it.
+        Self::ensure_channel_newer_frames_locked(conn)?;
+        conn.execute(
+            "DELETE FROM channel_newer_frames WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
         Ok(())
     }
 
@@ -7758,6 +7803,11 @@ impl Database {
                 "DELETE FROM channel_drafts WHERE channel_id = ?1",
                 params![channel_id],
             )?;
+            Self::ensure_channel_newer_frames_locked(&tx)?;
+            tx.execute(
+                "DELETE FROM channel_newer_frames WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
             // The forget-list goes too. It exists to stop a deleted line being
             // re-inserted by the next gossip replay, and with the room itself
             // destroyed there is no ingest path left to refuse — so every row
@@ -7831,6 +7881,11 @@ impl Database {
             "DELETE FROM channel_message_reactions WHERE channel_id = ?1",
             params![channel_id],
         )?;
+        Self::ensure_channel_newer_frames_locked(&tx)?;
+        tx.execute(
+            "DELETE FROM channel_newer_frames WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
         // A nominee's seeds stay. The owner may already have published a
         // handoff naming one, and it is then the only key to a successor every
         // other member is following; rejoining this room finds the record and
@@ -7896,6 +7951,145 @@ impl Database {
             );",
         )?;
         Ok(())
+    }
+
+    /// What this device was sent in a room and could not read because it
+    /// needs a newer Ember: extension frames of a kind this build does not
+    /// know, and a sealed room key in an envelope version it cannot open.
+    /// Kept so the room can say so instead of leaving gaps nobody can see;
+    /// never the frames themselves.
+    ///
+    /// `source` is `line` or `key`. For a line, `ref` is its wire id and
+    /// `kind` the extension kind; for a key, `ref` is the epoch and `kind` the
+    /// envelope version. Created on first use, like
+    /// [`Self::ensure_channel_drafts_locked`].
+    fn ensure_channel_newer_frames_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_newer_frames (
+                channel_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                ref TEXT NOT NULL,
+                kind INTEGER NOT NULL,
+                epoch INTEGER NOT NULL DEFAULT 0,
+                sender_pubkey TEXT NOT NULL DEFAULT '',
+                seen_at INTEGER NOT NULL,
+                PRIMARY KEY (channel_id, source, ref)
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Note a displayable frame this build cannot read, `seen_at` being when
+    /// it arrived here. Returns whether the room's count went up: at the cap
+    /// a new row displaces the oldest, which the count does not show. Only the
+    /// newest [`CHANNEL_NEWER_LINES_PER_ROOM`] are kept per room.
+    pub fn note_channel_newer_line(
+        &self,
+        channel_id: &str,
+        msg_id: &str,
+        sender_pubkey: &str,
+        kind: u8,
+        seen_at: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_newer_frames_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let added = tx.execute(
+            "INSERT OR IGNORE INTO channel_newer_frames
+                (channel_id, source, ref, kind, sender_pubkey, seen_at)
+             VALUES (?1, 'line', ?2, ?3, ?4, ?5)",
+            params![channel_id, msg_id, i64::from(kind), sender_pubkey, seen_at],
+        )? > 0;
+        let pruned = if added {
+            tx.execute(
+                "DELETE FROM channel_newer_frames
+                 WHERE channel_id = ?1 AND source = 'line' AND ref NOT IN (
+                     SELECT ref FROM channel_newer_frames
+                     WHERE channel_id = ?1 AND source = 'line'
+                     ORDER BY seen_at DESC, ref DESC LIMIT ?2
+                 )",
+                params![channel_id, CHANNEL_NEWER_LINES_PER_ROOM],
+            )?
+        } else {
+            0
+        };
+        tx.commit()?;
+        Ok(added && pruned == 0)
+    }
+
+    /// Note that this room's key for `epoch` came sealed in an envelope
+    /// version this build cannot open. Returns whether that was news. An epoch
+    /// at or below the one the room already reads under is moot and not noted.
+    pub fn note_channel_newer_key(
+        &self,
+        channel_id: &str,
+        epoch: i64,
+        version: u8,
+        seen_at: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_newer_frames_locked(&conn)?;
+        let added = conn.execute(
+            "INSERT OR IGNORE INTO channel_newer_frames
+                (channel_id, source, ref, kind, epoch, seen_at)
+             SELECT ?1, 'key', ?2, ?3, ?2, ?4
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM channels WHERE channel_id = ?1 AND key_epoch >= ?2
+             )",
+            params![channel_id, epoch, i64::from(version), seen_at],
+        )? > 0;
+        Ok(added)
+    }
+
+    /// The user has seen that some of a room's lines need a newer Ember.
+    pub fn dismiss_channel_newer_lines(&self, channel_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_newer_frames_locked(&conn)?;
+        Ok(conn.execute(
+            "DELETE FROM channel_newer_frames WHERE channel_id = ?1 AND source = 'line'",
+            params![channel_id],
+        )? > 0)
+    }
+
+    /// What needs a newer Ember in one room.
+    pub fn channel_newer_status(&self, channel_id: &str) -> anyhow::Result<ChannelNewerStatus> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_newer_frames_locked(&conn)?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT f.source, f.kind {CHANNEL_NEWER_LIVE_ROWS} AND f.channel_id = ?1"
+        ))?;
+        let mut status = ChannelNewerStatus::default();
+        for row in stmt.query_map(params![channel_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (source, kind) = row?;
+            status.note(&source, kind);
+        }
+        Ok(status)
+    }
+
+    /// [`Self::channel_newer_status`] for every room that has any.
+    pub fn channel_newer_status_all(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<String, ChannelNewerStatus>> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_newer_frames_locked(&conn)?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT f.channel_id, f.source, f.kind {CHANNEL_NEWER_LIVE_ROWS}"
+        ))?;
+        let mut out: std::collections::HashMap<String, ChannelNewerStatus> =
+            std::collections::HashMap::new();
+        for row in stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })? {
+            let (channel_id, source, kind) = row?;
+            out.entry(channel_id).or_default().note(&source, kind);
+        }
+        Ok(out)
     }
 
     fn channel_draft_aad(channel_id: &str) -> Vec<u8> {
@@ -8102,6 +8296,14 @@ impl Database {
         // demote the room to an older key for everything it sends next.
         tx.execute(
             "UPDATE channels SET key_epoch = ?2 WHERE channel_id = ?1 AND key_epoch < ?2",
+            params![channel_id, epoch],
+        )?;
+        // A key this build could open has arrived, so no earlier one is still
+        // waiting on a newer Ember.
+        Self::ensure_channel_newer_frames_locked(&tx)?;
+        tx.execute(
+            "DELETE FROM channel_newer_frames
+             WHERE channel_id = ?1 AND source = 'key' AND epoch <= ?2",
             params![channel_id, epoch],
         )?;
         tx.execute(
@@ -18277,6 +18479,90 @@ mod tests {
         db.insert_channel_message(&channel_id, &me, "sent", "newer", "s2", 7_000, "", true)
             .unwrap();
         assert_eq!(db.last_sent_channel_message_at(&channel_id).unwrap(), 7_000);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// What a room was sent that needs a newer Ember is counted, bounded,
+    /// dismissed, superseded by a key this build can open, and forgotten with
+    /// the room.
+    #[test]
+    fn a_room_keeps_count_of_what_needs_a_newer_ember() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-newer-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "7d".repeat(16);
+        let other = "8e".repeat(16);
+        for id in [&channel_id, &other] {
+            db.insert_channel(id, &"5b".repeat(32), "Room", "private", false, None, None)
+                .expect("insert channel");
+        }
+        assert_eq!(db.channel_newer_status(&channel_id).unwrap(), ChannelNewerStatus::default());
+
+        let sender = "ab".repeat(32);
+        assert!(db.note_channel_newer_line(&channel_id, &"01".repeat(16), &sender, 90, 100).unwrap());
+        assert!(
+            !db.note_channel_newer_line(&channel_id, &"01".repeat(16), &sender, 90, 100).unwrap(),
+            "the same line twice is one line"
+        );
+        assert!(db.note_channel_newer_line(&other, &"02".repeat(16), &sender, 91, 100).unwrap());
+        assert_eq!(db.channel_newer_status(&channel_id).unwrap().lines, 1);
+        let all = db.channel_newer_status_all().unwrap();
+        assert_eq!((all[&channel_id].lines, all[&other].lines), (1, 1));
+
+        // Bounded per room, newest kept, and a line past the cap is not news:
+        // the count it would announce did not move.
+        for i in 0..CHANNEL_NEWER_LINES_PER_ROOM + 10 {
+            let counted = db
+                .note_channel_newer_line(&channel_id, &format!("{i:032x}"), &sender, 90, 1_000 + i)
+                .unwrap();
+            assert_eq!(counted, i + 1 < CHANNEL_NEWER_LINES_PER_ROOM, "line {i}");
+        }
+        assert_eq!(
+            db.channel_newer_status(&channel_id).unwrap().lines,
+            CHANNEL_NEWER_LINES_PER_ROOM
+        );
+
+        assert!(db.dismiss_channel_newer_lines(&channel_id).unwrap());
+        assert_eq!(db.channel_newer_status(&channel_id).unwrap().lines, 0);
+        assert_eq!(db.channel_newer_status(&other).unwrap().lines, 1, "only that room's");
+
+        // A key in a version this build cannot open, until one it can arrives.
+        assert!(db.note_channel_newer_key(&channel_id, 5, 2, 200).unwrap());
+        assert!(!db.note_channel_newer_key(&channel_id, 5, 2, 201).unwrap());
+        assert!(db.channel_newer_status(&channel_id).unwrap().key);
+        db.insert_channel_key_epoch(&channel_id, 4, &[4u8; 32]).unwrap();
+        assert!(db.channel_newer_status(&channel_id).unwrap().key, "an older key settles nothing");
+        db.insert_channel_key_epoch(&channel_id, 5, &[5u8; 32]).unwrap();
+        assert!(!db.channel_newer_status(&channel_id).unwrap().key);
+
+        // An epoch the room already reads past is moot, and not noted.
+        assert!(!db.note_channel_newer_key(&channel_id, 5, 2, 202).unwrap());
+        assert!(!db.note_channel_newer_key(&channel_id, 3, 2, 202).unwrap());
+
+        // Rows naming what this build reads do not count.
+        db.note_channel_newer_key(&channel_id, 9, crate::network::ember::channel::EPOCH_ENVELOPE_VERSION, 300)
+            .unwrap();
+        assert!(!db.channel_newer_status(&channel_id).unwrap().key);
+
+        assert!(db.delete_channel(&other, None).unwrap());
+        assert!(!db.channel_newer_status_all().unwrap().contains_key(&other));
+
+        // A row left under an id whose room went without clearing it — a
+        // delete by a build that never knew the table — counts for nothing,
+        // and a room created again under that id starts clean.
+        db.note_channel_newer_line(&other, &"03".repeat(16), &sender, 92, 400).unwrap();
+        assert!(!db.channel_newer_status_all().unwrap().contains_key(&other));
+        db.insert_channel(&other, &"5b".repeat(32), "Room", "private", false, None, None)
+            .expect("insert channel again");
+        assert_eq!(db.channel_newer_status(&other).unwrap(), ChannelNewerStatus::default());
 
         drop(db);
         let _ = std::fs::remove_file(&path);

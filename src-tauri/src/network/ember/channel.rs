@@ -31,7 +31,7 @@ const HANDOFF_KEY_PREFIX: &[u8] = b"ember:channel:handoff:v1";
 const EPOCH_KEY_PREFIX: &[u8] = b"ember:channel:epoch:v1";
 const CLAIM_KEY_PREFIX: &[u8] = b"ember:channel:claim:v1";
 const EPOCH_AAD_DOMAIN: &[u8] = b"ember-channel-key-epoch-v1\0";
-const EPOCH_ENVELOPE_VERSION: u8 = 1;
+pub const EPOCH_ENVELOPE_VERSION: u8 = 1;
 /// `version(1) + nonce + key(32) + tag`.
 pub const EPOCH_ENVELOPE_LEN: usize = 1 + GOSSIP_NONCE_LEN + 32 + GOSSIP_TAG_LEN;
 const HANDOFF_OFFER_DOMAIN: &[u8] = b"ember-channel-handoff-offer-v1\0";
@@ -942,8 +942,30 @@ fn epoch_aad(channel_id: &[u8; 16], epoch: i64) -> Vec<u8> {
 
 /// Storers cannot open an epoch blob, so they check only that it is the right
 /// shape — a truncated or padded one is dropped rather than stored to mislead.
+///
+/// The shape is only known for the version this build seals. A later version
+/// is stored on its leading byte alone, within the record size every store
+/// already enforces: refusing it would mean a later key scheme could not be
+/// published until every node on the network had updated, when only the room's
+/// own members need to read it. Version 0 was never written and is refused.
+///
+/// A storer keeps one record per publisher under a key, so a later version
+/// sealed under [`epoch_key`] replaces this one rather than sitting beside it.
+/// A build that wants members still on this version to keep reading has to
+/// file the later one under a key of its own.
 pub fn epoch_envelope_store_ok(extra: &[u8]) -> bool {
-    extra.len() == EPOCH_ENVELOPE_LEN && extra[0] == EPOCH_ENVELOPE_VERSION
+    match extra.first() {
+        Some(&EPOCH_ENVELOPE_VERSION) => extra.len() == EPOCH_ENVELOPE_LEN,
+        Some(&version) => version > EPOCH_ENVELOPE_VERSION && extra.len() > 1,
+        None => false,
+    }
+}
+
+/// Whether this build can open an epoch envelope's version. A sealed key in a
+/// version it cannot is a room that has moved to a newer Ember, not a key that
+/// has yet to arrive.
+pub fn epoch_envelope_version_supported(version: u8) -> bool {
+    version == EPOCH_ENVELOPE_VERSION
 }
 
 /// Rendezvous capability two channel members compute for each other.
@@ -1536,6 +1558,141 @@ const XFER_SEEN_PLAIN_VERSION: u8 = 28;
 /// How long a sender waits to hear that its sealed offer was read before it
 /// asks whether to send the plain one as well.
 pub const XFER_PLAIN_OFFER_FALLBACK_SECS: u64 = 10;
+
+/// Lowest leading byte of an extension frame. Every kind from here up is laid
+/// out as [`ChannelExtFrame`]: `kind || flags || sender || signature || body`.
+///
+/// Every kind below this was given a layout of its own, which only a build
+/// that knows it can parse. One this build has never heard of fell through to
+/// the chat decoder and was dropped without being passed on, so in a room of
+/// mostly older members a new kind of frame reached only the newer members a
+/// newer member happened to be connected to. Builds that know this layout check
+/// an extension frame's author and pass it on whatever its kind, under the same
+/// rules a chat line meets, so a kind added later travels through them as far
+/// as chat does. Kinds 30 to 63 stay unassigned.
+pub const EXT_KIND_MIN: u8 = 64;
+/// Set on an extension frame a person would have seen: a reader that does not
+/// know the kind tells its user something here needs a newer Ember, rather
+/// than leaving a gap they cannot see. Unset for anything with nothing to show.
+pub const EXT_FLAG_DISPLAY: u8 = 0x01;
+const EXT_SIG_DOMAIN: &[u8] = b"ember-channel-ext-author-v1\0";
+/// `kind(1) + flags(1) + sender(32) + signature(64)`.
+const EXT_HEADER_LEN: usize = 1 + 1 + 32 + 64;
+
+/// An extension frame, its author checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelExtFrame {
+    pub kind: u8,
+    pub flags: u8,
+    pub sender: [u8; 32],
+    pub signature: [u8; 64],
+    pub body: Vec<u8>,
+}
+
+impl ChannelExtFrame {
+    pub fn displayable(&self) -> bool {
+        self.flags & EXT_FLAG_DISPLAY != 0
+    }
+}
+
+/// Extension kinds this build reads. None yet: a kind is added here by the
+/// build that first gives it a meaning, and every build before that passes it
+/// on and, if it is displayable, says so.
+const UNDERSTOOD_EXT_KINDS: &[u8] = &[];
+
+pub fn ext_kind_understood(kind: u8) -> bool {
+    UNDERSTOOD_EXT_KINDS.contains(&kind)
+}
+
+/// What an extension frame's author signs: the same room, id and time binding
+/// a chat line's signature has, and the kind and flags too, so neither can be
+/// changed by a member passing the frame on.
+fn ext_sig_preimage(
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+    kind: u8,
+    flags: u8,
+    sender: &[u8; 32],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(EXT_SIG_DOMAIN.len() + 16 + 16 + 8 + 2 + 32 + body.len());
+    out.extend_from_slice(EXT_SIG_DOMAIN);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(msg_id);
+    out.extend_from_slice(&timestamp.to_le_bytes());
+    out.push(kind);
+    out.push(flags);
+    out.extend_from_slice(sender);
+    out.extend_from_slice(body);
+    out
+}
+
+/// Build an extension frame. `None` for a kind below [`EXT_KIND_MIN`], which
+/// belongs to a layout of its own. No kind is sent yet; this is the one way a
+/// later one will be.
+#[allow(dead_code)]
+pub fn encode_channel_ext_frame(
+    signing_key: &SigningKey,
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+    kind: u8,
+    flags: u8,
+    body: &[u8],
+) -> Option<Vec<u8>> {
+    if kind < EXT_KIND_MIN {
+        return None;
+    }
+    let sender = signing_key.verifying_key().to_bytes();
+    let signature = crypto::sign(
+        signing_key,
+        &ext_sig_preimage(channel_id, msg_id, timestamp, kind, flags, &sender, body),
+    );
+    let mut out = Vec::with_capacity(EXT_HEADER_LEN + body.len());
+    out.push(kind);
+    out.push(flags);
+    out.extend_from_slice(&sender);
+    out.extend_from_slice(&signature);
+    out.extend_from_slice(body);
+    Some(out)
+}
+
+/// Read an extension frame, or nothing if it is not one or its author cannot
+/// be proved. Unknown flag bits are kept, not refused: they are signed, and a
+/// later build may give them a meaning.
+pub fn decode_channel_ext_frame(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+) -> Option<ChannelExtFrame> {
+    if bytes.len() < EXT_HEADER_LEN || bytes[0] < EXT_KIND_MIN {
+        return None;
+    }
+    let kind = bytes[0];
+    let flags = bytes[1];
+    let mut sender = [0u8; 32];
+    sender.copy_from_slice(&bytes[2..34]);
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(&bytes[34..98]);
+    let body = &bytes[EXT_HEADER_LEN..];
+    let author = crypto::verifying_key_from_bytes(&sender)?;
+    if !crypto::verify(
+        &author,
+        &ext_sig_preimage(channel_id, msg_id, timestamp, kind, flags, &sender, body),
+        &signature,
+    ) {
+        return None;
+    }
+    Some(ChannelExtFrame {
+        kind,
+        flags,
+        sender,
+        signature,
+        body: body.to_vec(),
+    })
+}
 const TYPING_SIG_DOMAIN: &[u8] = b"ember-channel-typing-author-v1\0";
 const PRESENCE_BEACON_SIG_DOMAIN: &[u8] = b"ember-channel-presence-beacon-v1\0";
 const MOD_ACTION_BAN: u8 = 1;
@@ -7982,6 +8139,153 @@ mod tests {
             15 => V167Branch::Chat,
             _ => V167Branch::DroppedWithDebugLog,
         }
+    }
+
+    fn ext_frame(signer: &SigningKey, kind: u8, flags: u8, body: &[u8]) -> Vec<u8> {
+        encode_channel_ext_frame(signer, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS, kind, flags, body)
+            .expect("an extension kind")
+    }
+
+    /// The author, kind and flags of an extension frame are what lets a build
+    /// that has never heard of its kind check it and pass it on, so all of them
+    /// have to be bound to the room, the id and the time.
+    #[test]
+    fn an_extension_frame_proves_its_author_kind_and_flags() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let frame = ext_frame(&alice, 200, EXT_FLAG_DISPLAY | 0x80, b"later");
+        let read = decode_channel_ext_frame(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS)
+            .expect("a well-formed frame reads");
+        assert_eq!(read.kind, 200);
+        assert_eq!(read.sender, alice.verifying_key().to_bytes());
+        assert_eq!(read.body, b"later");
+        assert!(read.displayable());
+        assert_eq!(read.flags, EXT_FLAG_DISPLAY | 0x80, "unknown flag bits are kept");
+
+        // An empty body is a frame too.
+        assert!(decode_channel_ext_frame(
+            &ext_frame(&alice, EXT_KIND_MIN, 0, b""),
+            &CHAT_CHANNEL,
+            &CHAT_MSG_ID,
+            CHAT_TS
+        )
+        .is_some_and(|f| !f.displayable() && f.body.is_empty()));
+
+        // Any byte changed in transit, header or body, breaks it.
+        for at in [0usize, 1, 2, 40, frame.len() - 1] {
+            let mut bent = frame.clone();
+            bent[at] ^= if at == 0 { 0x01 } else { 0xFF };
+            assert!(
+                decode_channel_ext_frame(&bent, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none(),
+                "byte {at} is covered"
+            );
+        }
+        // So does lifting it into another room, under another id, or re-dating it.
+        assert!(decode_channel_ext_frame(&frame, &[0x77; 16], &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_channel_ext_frame(&frame, &CHAT_CHANNEL, &[0x77; 16], CHAT_TS).is_none());
+        assert!(decode_channel_ext_frame(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS + 1).is_none());
+        // And a truncated header is not a frame.
+        assert!(decode_channel_ext_frame(&frame[..97], &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+    }
+
+    #[test]
+    fn extension_kinds_start_above_every_layout_of_their_own() {
+        let alice = SigningKey::generate(&mut OsRng);
+        assert!(encode_channel_ext_frame(&alice, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS, EXT_KIND_MIN - 1, 0, b"")
+            .is_none());
+        // A frame of a fixed layout is not read as an extension frame.
+        assert!(decode_channel_ext_frame(&chat_frame(&alice, "hi"), &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS)
+            .is_none());
+        for version in [
+            CHAT_PLAIN_VERSION,
+            MOD_ACTION_PLAIN_VERSION,
+            SYNC_REQUEST_PLAIN_VERSION,
+            HANDOFF_OFFER_PLAIN_VERSION,
+            HANDOFF_READY_PLAIN_VERSION,
+            HANDOFF_READY_PROVEN_PLAIN_VERSION,
+            CHAT_EDIT_PLAIN_VERSION,
+            REACTION_PLAIN_VERSION,
+            XFER_OFFER_PLAIN_VERSION,
+            XFER_REPLY_PLAIN_VERSION,
+            XFER_BLOCK_REQUEST_PLAIN_VERSION,
+            XFER_CANCEL_PLAIN_VERSION,
+            XFER_DONE_PLAIN_VERSION,
+            XFER_BLOCK_DATA_SEALED_VERSION,
+            PRESENCE_BEACON_PLAIN_VERSION,
+            TYPING_PLAIN_VERSION,
+            XFER_STREAM_SEALED_VERSION,
+            XFER_OFFER_SEALED_VERSION,
+            ROOM_FRIEND_REQUEST_PLAIN_VERSION,
+            XFER_SEEN_PLAIN_VERSION,
+        ] {
+            assert!(version < EXT_KIND_MIN, "{version} would be read as an extension frame");
+        }
+        assert!(!ext_kind_understood(EXT_KIND_MIN));
+        assert!(!ext_kind_understood(u8::MAX));
+    }
+
+    /// None of the decoders the dispatch tries ahead of extension frames may
+    /// claim one, or a later kind would be misread as an older one.
+    #[test]
+    fn no_fixed_layout_decoder_claims_an_extension_frame() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let frame = ext_frame(&alice, 90, EXT_FLAG_DISPLAY, &[0u8; 300]);
+        assert!(xfer_frame_peek(&frame).is_none());
+        assert!(decode_channel_presence_beacons(&frame, &CHAT_CHANNEL, 0, CHAT_TS).is_none());
+        assert!(
+            decode_channel_handoff_offer(&frame, &CHAT_CHANNEL, &alice.verifying_key().to_bytes())
+                .is_none()
+        );
+        assert!(decode_channel_typing(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_room_friend_request(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_channel_handoff_ready(&frame, &CHAT_CHANNEL).is_none());
+        assert!(decode_channel_handoff_ready_proven(&frame, &CHAT_CHANNEL).is_none());
+        assert!(decode_channel_sync_request(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_channel_mod_action(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_channel_chat_edit(&frame, &CHAT_CHANNEL).is_none());
+        assert!(decode_channel_reactions(&frame, &CHAT_CHANNEL).is_none());
+        assert!(decode_channel_chat_plain(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        // And builds before this one route it to their drop-with-a-log branch,
+        // which is all they can do with it.
+        assert_eq!(v1_6_7_branch(&frame), V167Branch::DroppedWithDebugLog);
+    }
+
+    #[test]
+    fn a_later_key_envelope_is_stored_but_only_this_version_is_opened() {
+        let owner = SigningKey::generate(&mut OsRng);
+        let member = SigningKey::generate(&mut OsRng);
+        let channel_id = [0x31u8; 16];
+        let epoch = 4;
+        let wrap = derive_channel_epoch_secret(
+            &owner.to_bytes(),
+            &member.verifying_key().to_bytes(),
+            &channel_id,
+            epoch,
+        )
+        .expect("derives");
+        let sealed = seal_channel_key_epoch(&wrap, &channel_id, epoch, &[0x42; 32]);
+        assert!(epoch_envelope_store_ok(&sealed));
+        assert!(epoch_envelope_version_supported(sealed[0]));
+
+        // A later version is stored at whatever length it needs, short or long,
+        // since storers cannot read it and only the members can.
+        for len in [2usize, 40, EPOCH_ENVELOPE_LEN, 600] {
+            let mut later = vec![0xEEu8; len];
+            later[0] = EPOCH_ENVELOPE_VERSION + 1;
+            assert!(epoch_envelope_store_ok(&later), "length {len}");
+            assert!(open_channel_key_epoch(&wrap, &channel_id, epoch, &later).is_none());
+        }
+        assert!(!epoch_envelope_version_supported(EPOCH_ENVELOPE_VERSION + 1));
+
+        // Never-written shapes stay refused: nothing, a bare version byte, version 0.
+        assert!(!epoch_envelope_store_ok(&[]));
+        assert!(!epoch_envelope_store_ok(&[EPOCH_ENVELOPE_VERSION + 1]));
+        let mut zero = sealed.clone();
+        zero[0] = 0;
+        assert!(!epoch_envelope_store_ok(&zero));
+        // This version keeps its exact shape.
+        let mut padded = sealed.clone();
+        padded.push(0);
+        assert!(!epoch_envelope_store_ok(&padded));
     }
 
     #[test]

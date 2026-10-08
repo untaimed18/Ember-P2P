@@ -1014,6 +1014,12 @@ async fn apply_channel_ingest_results(
             serde_json::json!({ "channel_id": hex::encode(channel_id) }),
         );
     }
+    for channel_id in results.needs_newer {
+        let _ = app_handle.emit(
+            "ember:channel-newer",
+            serde_json::json!({ "channel_id": hex::encode(channel_id) }),
+        );
+    }
     for (channel_id, successor_id) in results.followed {
         let _ = app_handle.emit(
             "ember:channel-handoff",

@@ -147,9 +147,22 @@ pub struct ChannelInfo {
     pub pinned_msg_ids: Vec<String>,
     /// The room's default language code, empty for none.
     pub language: String,
+    /// Lines sent here that this build cannot show, because they need a newer
+    /// Ember. Cleared when the user dismisses the notice.
+    pub newer_lines: i64,
+    /// The room's current key was sealed to us in a way only a newer Ember can
+    /// open, so new messages stay locked until this device updates.
+    pub newer_key: bool,
 }
 
 impl ChannelInfo {
+    /// Fill in what in this room needs a newer Ember.
+    fn with_newer(mut self, status: crate::storage::database::ChannelNewerStatus) -> Self {
+        self.newer_lines = status.lines;
+        self.newer_key = self.key_behind && status.key;
+        self
+    }
+
     fn from_stored(row: StoredChannel, you_are_banned: bool, you_are_moderator: bool) -> Self {
         let key_behind =
             row.visibility == CHANNEL_KIND_PRIVATE && row.key_epoch_wanted > row.key_epoch;
@@ -183,6 +196,8 @@ impl ChannelInfo {
             announce_only: row.announce_only,
             pinned_msg_ids: row.pinned_msg_ids,
             language: row.language,
+            newer_lines: 0,
+            newer_key: false,
         }
     }
 
@@ -735,6 +750,9 @@ pub async fn list_channels(state: tauri::State<'_, AppState>) -> Result<Vec<Chan
         // a banned member an unbanned composer hands them a box whose sends
         // every peer will drop, so a failed read must not read as "not banned".
         let flags = db.channel_member_flags(&our_pk)?;
+        // A notice, not a gate, so a failed read shows none rather than
+        // failing the list.
+        let newer = db.channel_newer_status_all().unwrap_or_default();
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             // No roster row in a room means neither flag is set there. That is
@@ -750,12 +768,11 @@ pub async fn list_channels(state: tauri::State<'_, AppState>) -> Result<Vec<Chan
             let you_are_moderator = moderator;
             let moderation_updated_at = row.moderation_updated_at;
             let moderation_checked_at = row.moderation_checked_at;
+            let newer_status = newer.get(&row.channel_id).copied().unwrap_or_default();
             out.push(
-                ChannelInfo::from_stored(row, you_are_banned, you_are_moderator).with_viewer(
-                    &our_pk,
-                    moderation_updated_at,
-                    moderation_checked_at,
-                ),
+                ChannelInfo::from_stored(row, you_are_banned, you_are_moderator)
+                    .with_viewer(&our_pk, moderation_updated_at, moderation_checked_at)
+                    .with_newer(newer_status),
             );
         }
         Ok::<_, anyhow::Error>(out)
@@ -1142,11 +1159,12 @@ pub async fn join_channel(
     // and does arrive already banned. Hardcoding `false` handed the user an
     // enabled composer that refused the first thing they typed, and stayed
     // wrong until the next `list_channels`.
-    let (row, you_are_banned, you_are_moderator) = tokio::task::spawn_blocking(move || {
+    let (row, you_are_banned, you_are_moderator, newer) = tokio::task::spawn_blocking(move || {
         let row = db.get_channel(&db_id)?;
         let banned = db.channel_member_is_banned(&db_id, &ours)?;
         let moderator = db.channel_member_is_moderator(&db_id, &ours)?;
-        Ok::<_, anyhow::Error>((row, banned, moderator))
+        let newer = db.channel_newer_status(&db_id).unwrap_or_default();
+        Ok::<_, anyhow::Error>((row, banned, moderator, newer))
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
@@ -1156,7 +1174,8 @@ pub async fn join_channel(
     let checked_at = row.moderation_checked_at;
     Ok(
         ChannelInfo::from_stored(row, you_are_banned, you_are_moderator)
-            .with_viewer(&our_pk, updated_at, checked_at),
+            .with_viewer(&our_pk, updated_at, checked_at)
+            .with_newer(newer),
     )
 }
 
@@ -1294,11 +1313,13 @@ async fn enter_stored_channel(
         let row = db.get_channel(&id)?.ok_or_else(|| anyhow::anyhow!("missing"))?;
         let banned = !row.is_owner && db.channel_member_is_banned(&row.channel_id, &our_pk)?;
         let moderator = db.channel_member_is_moderator(&row.channel_id, &our_pk)?;
+        let newer = db.channel_newer_status(&row.channel_id).unwrap_or_default();
         let updated_at = row.moderation_updated_at;
         let checked_at = row.moderation_checked_at;
         Ok::<_, anyhow::Error>(
             ChannelInfo::from_stored(row, banned, moderator)
-                .with_viewer(&our_pk, updated_at, checked_at),
+                .with_viewer(&our_pk, updated_at, checked_at)
+                .with_newer(newer),
         )
     })
     .await
@@ -2991,12 +3012,13 @@ async fn channel_info_from_id(state: &AppState, channel_id: &str) -> Result<Chan
     let db = state.db.clone();
     let id = channel_id.to_string();
     let our = our_pk.clone();
-    let (row, you_are_banned, you_are_moderator) = tokio::task::spawn_blocking(move || {
+    let (row, you_are_banned, you_are_moderator, newer) = tokio::task::spawn_blocking(move || {
         let row = db.get_channel(&id)?;
         let owned = row.as_ref().is_some_and(|r| r.is_owner);
         let banned = !owned && db.channel_member_is_banned(&id, &our)?;
         let moderator = db.channel_member_is_moderator(&id, &our)?;
-        Ok::<_, anyhow::Error>((row, banned, moderator))
+        let newer = db.channel_newer_status(&id).unwrap_or_default();
+        Ok::<_, anyhow::Error>((row, banned, moderator, newer))
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
@@ -3005,12 +3027,30 @@ async fn channel_info_from_id(state: &AppState, channel_id: &str) -> Result<Chan
     let moderation_updated_at = row.moderation_updated_at;
     let moderation_checked_at = row.moderation_checked_at;
     Ok(
-        ChannelInfo::from_stored(row, you_are_banned, you_are_moderator).with_viewer(
-            &our_pk,
-            moderation_updated_at,
-            moderation_checked_at,
-        ),
+        ChannelInfo::from_stored(row, you_are_banned, you_are_moderator)
+            .with_viewer(&our_pk, moderation_updated_at, moderation_checked_at)
+            .with_newer(newer),
     )
+}
+
+/// The user has seen that some of a room's lines need a newer Ember. Returns
+/// the room as it reads now.
+#[tauri::command]
+pub async fn dismiss_channel_newer_lines(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+) -> Result<ChannelInfo, String> {
+    let channel_id = channel_id.trim().to_ascii_lowercase();
+    if channel_id.len() != 32 || hex::decode(&channel_id).is_err() {
+        return Err(coded("channels_not_found", "Channel not found"));
+    }
+    let db = state.db.clone();
+    let id = channel_id.clone();
+    tokio::task::spawn_blocking(move || db.dismiss_channel_newer_lines(&id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load channel", e))?;
+    channel_info_from_id(&state, &channel_id).await
 }
 
 async fn load_joined_channel(

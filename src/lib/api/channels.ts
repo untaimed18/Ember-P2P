@@ -49,6 +49,12 @@ export interface ChannelInfo {
   /** The owner's default language code for the room, empty for none. Shown as
    *  a flag; nothing is filtered on it. */
   language: string;
+  /** Lines sent here that this version cannot show because they need a newer
+   *  Ember. Cleared by {@link dismissChannelNewerLines}. */
+  newer_lines: number;
+  /** The room's current key needs a newer Ember to open, so new messages stay
+   *  locked until this device updates. Only ever set alongside `key_behind`. */
+  newer_key: boolean;
 }
 
 /** Most messages a room can pin, mirroring `CHANNEL_PIN_MAX` in
@@ -505,6 +511,12 @@ export async function setChannelMessagePinned(
   pinned: boolean,
 ): Promise<ChannelInfo> {
   return invoke('set_channel_message_pinned', { channelId, msgId, pinned });
+}
+
+/** The user has seen that some of a room's lines need a newer Ember. Resolves
+ *  with the room as it reads now. */
+export async function dismissChannelNewerLines(channelId: string): Promise<ChannelInfo> {
+  return invoke('dismiss_channel_newer_lines', { channelId });
 }
 
 /** The room's pins, oldest first, resolved against local history. */

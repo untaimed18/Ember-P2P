@@ -2756,23 +2756,43 @@ pub(super) async fn maybe_refresh_channel_key_epoch(
     }
 }
 
+/// What an epoch fetch came back with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChannelEpochIngest {
+    /// Nothing sealed to us that this build could use.
+    Nothing,
+    /// The key is stored; the room is readable under it.
+    Rekeyed,
+    /// The owner sealed this epoch to us in an envelope version this build
+    /// cannot open, and in none that it can: the room needs a newer Ember.
+    NeedsNewer,
+}
+
 /// Open an epoch record sealed to us and store the key it carries.
 ///
 /// The wrapping key is pairwise with the owner, so a blob sealed to anyone else
 /// simply fails to open — which is exactly what makes a ban an eviction.
+///
+/// A version this build cannot open counts only when no record it can open
+/// came back too: storers that predate later versions refuse them and may
+/// still hold this one. They cannot both be held by one storer, which keeps a
+/// single record per publisher under a key, so a later build that wants
+/// members on this one to keep reading has to seal the later version under a
+/// key of its own. Only the room key signs these records, so this is the
+/// owner's word.
 pub(super) fn ingest_channel_epoch_records(
     db: &Database,
     identity: &crate::storage::identity::NodeIdentity,
     channel_id: [u8; 16],
     epoch: i64,
     records: &[Vec<u8>],
-) -> bool {
+) -> ChannelEpochIngest {
     if db.chat_locked() {
-        return false;
+        return ChannelEpochIngest::Nothing;
     }
     let channel_id_hex = hex::encode(channel_id);
     let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
-        return false;
+        return ChannelEpochIngest::Nothing;
     };
     let Some(owner_pk) = hex::decode(&ch.owner_pubkey)
         .ok()
@@ -2780,7 +2800,7 @@ pub(super) fn ingest_channel_epoch_records(
     else {
         // We have not learned who owns the room, so there is nobody to derive
         // the wrapping key against yet. The moderation poll fixes that.
-        return false;
+        return ChannelEpochIngest::Nothing;
     };
     let Some(wrap) = ember::channel::derive_channel_epoch_secret(
         &identity.ed25519_secret_key,
@@ -2788,8 +2808,10 @@ pub(super) fn ingest_channel_epoch_records(
         &channel_id,
         epoch,
     ) else {
-        return false;
+        return ChannelEpochIngest::Nothing;
     };
+    let mut newer_version = None;
+    let mut opened_one = false;
     for blob in records {
         let Some((member, record_epoch, envelope)) =
             ember::dht::publish::SignedRecord::parse_channel_key_epoch(blob, &channel_id)
@@ -2801,19 +2823,44 @@ pub(super) fn ingest_channel_epoch_records(
         if member != identity.ed25519_public_key || record_epoch != epoch {
             continue;
         }
+        if let Some(&version) = envelope.first() {
+            if !ember::channel::epoch_envelope_version_supported(version) {
+                newer_version = Some(version);
+                continue;
+            }
+        }
         let Some(secret) =
             ember::channel::open_channel_key_epoch(&wrap, &channel_id, epoch, &envelope)
         else {
             continue;
         };
+        opened_one = true;
         match db.insert_channel_key_epoch(&channel_id_hex, epoch, &secret) {
-            Ok(()) => return true,
+            Ok(()) => return ChannelEpochIngest::Rekeyed,
             Err(e) => {
                 debug!("Ember channel epoch {epoch} for {channel_id_hex} not stored: {e}");
             }
         }
     }
-    false
+    // A key this build opened and could not store is a local failure, not a
+    // room that has moved on.
+    let Some(version) = newer_version.filter(|_| !opened_one) else {
+        return ChannelEpochIngest::Nothing;
+    };
+    match db.note_channel_newer_key(&channel_id_hex, epoch, version, chrono::Utc::now().timestamp()) {
+        Ok(true) => {
+            info!(
+                "Ember channel {channel_id_hex}: epoch {epoch} came sealed in envelope version \
+                 {version}, which needs a newer Ember"
+            );
+            ChannelEpochIngest::NeedsNewer
+        }
+        Ok(false) => ChannelEpochIngest::Nothing,
+        Err(e) => {
+            debug!("Ember channel {channel_id_hex}: could not note a newer key: {e}");
+            ChannelEpochIngest::Nothing
+        }
+    }
 }
 
 pub(super) const CHANNEL_HANDOFF_FETCH_PER_TICK: usize = 2;
@@ -3458,6 +3505,9 @@ pub(super) struct ChannelIngestResults {
     pub(super) claimed: Vec<([u8; 16], [u8; 16])>,
     /// Rooms that became readable under a new epoch.
     pub(super) rekeyed: Vec<[u8; 16]>,
+    /// Rooms whose new epoch was sealed to us in a version that needs a
+    /// newer Ember.
+    pub(super) needs_newer: Vec<[u8; 16]>,
     /// `(room, successor)` for each handoff followed.
     pub(super) followed: Vec<([u8; 16], [u8; 16])>,
     /// `(room, successor)` for each room we own committed to a stored record
@@ -3498,8 +3548,10 @@ pub(super) fn run_channel_ingest(
         }
     }
     for (channel_id, epoch, records) in batch.epoch {
-        if ingest_channel_epoch_records(db, identity, channel_id, epoch, &records) {
-            results.rekeyed.push(channel_id);
+        match ingest_channel_epoch_records(db, identity, channel_id, epoch, &records) {
+            ChannelEpochIngest::Nothing => {}
+            ChannelEpochIngest::Rekeyed => results.rekeyed.push(channel_id),
+            ChannelEpochIngest::NeedsNewer => results.needs_newer.push(channel_id),
         }
     }
     for (channel_id, records) in batch.handoff {

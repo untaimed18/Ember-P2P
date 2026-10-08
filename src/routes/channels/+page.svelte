@@ -40,6 +40,13 @@
   import { toast, toastError, toastSuccess } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
+  import {
+    checkForUpdates,
+    installUpdate,
+    restartToUpdate,
+    runStagedInstaller,
+    updater,
+  } from '$lib/stores/updater';
   import * as m from '$lib/paraglide/messages';
   import {
     addChannelModerator,
@@ -51,6 +58,7 @@
     createChannel,
     isValidChannelUsername,
     deleteOwnedChannel,
+    dismissChannelNewerLines,
     enterChannel,
     forgetChannel,
     gatherChannels,
@@ -648,6 +656,8 @@
       pinned_msg_ids: [],
       // From the room's signed listing, so it shows before joining.
       language: item.language ?? '',
+      newer_lines: 0,
+      newer_key: false,
     };
   }
   let leaveTargetName = $derived(
@@ -1212,6 +1222,23 @@
         else unlistenModeration = fn;
       })
       .catch((e) => console.error('Failed to register channel-moderation listener:', e));
+    // Something in a room needs a newer Ember: its banner comes with the room.
+    // Coalesced, because anyone who can post in a public room can send these
+    // as fast as they can chat, and each one is a full re-read of the list.
+    let unlistenNewer: UnlistenFn | undefined;
+    let newerRefresh: ReturnType<typeof setTimeout> | undefined;
+    listen<{ channel_id: string }>('ember:channel-newer', () => {
+      if (newerRefresh !== undefined) return;
+      newerRefresh = setTimeout(() => {
+        newerRefresh = undefined;
+        if (!cancelled) refreshChannels().catch(() => {});
+      }, NEWER_REFRESH_MS);
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenNewer = fn;
+      })
+      .catch((e) => console.error('Failed to register channel-newer listener:', e));
     let unlistenHandoff: UnlistenFn | undefined;
     listen<{ channel_id: string; successor_id?: string; phase?: string }>('ember:channel-handoff', (event) => {
       if (event.payload?.phase === 'failed') toastError(m.error_channels_handoff_stuck());
@@ -1278,6 +1305,8 @@
       unlistenPresence?.();
       unlistenChat?.();
       unlistenModeration?.();
+      unlistenNewer?.();
+      clearTimeout(newerRefresh);
       unlistenHandoff?.();
       unlistenFound?.();
       document.removeEventListener('pointerdown', onCardMenuPointerDown);
@@ -2400,6 +2429,31 @@
   let roomOffersWaiting = $derived(
     roomTransfers.filter((t) => t.status === 'awaiting' || xferNeedsConsent(t)).length,
   );
+  /** How long `ember:channel-newer` events are gathered into one list re-read. */
+  const NEWER_REFRESH_MS = 2_000;
+  let newerLinesLabel = $derived.by(() => {
+    const count = selected?.newer_lines ?? 0;
+    return plural(count, {
+      one: m.channels_newer_lines_one,
+      other: () => m.channels_newer_lines_other({ count }),
+    });
+  });
+  let dismissingNewer = $state(false);
+  async function dismissNewer(channelId: string) {
+    if (dismissingNewer) return;
+    dismissingNewer = true;
+    try {
+      replaceChannel(await dismissChannelNewerLines(channelId));
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      dismissingNewer = false;
+    }
+  }
+  let updateBusy = $derived(
+    $updater.phase === 'checking' || $updater.phase === 'downloading' || $updater.phase === 'installing',
+  );
+
   let membersToggleLabel = $derived.by(() => {
     if (membersOpen) return m.channels_hide_members();
     if (roomOffersWaiting === 0) return m.channels_show_members();
@@ -2446,6 +2500,28 @@
     untrack(bringOutXferDrawer);
   });
 </script>
+
+<!-- What the newer-Ember banners offer: the next step the updater can take. -->
+{#snippet updateAction()}
+  {#if $updater.phase === 'available'}
+    <button type="button" class="ghost" onclick={() => void installUpdate()}>{m.updater_install()}</button>
+  {:else if $updater.phase === 'ready'}
+    <button type="button" class="ghost" onclick={() => void restartToUpdate()}>{m.updater_restart_now()}</button>
+  {:else if $updater.phase === 'stalled' && $updater.installerReady}
+    <button type="button" class="ghost" onclick={() => void runStagedInstaller()}>{m.updater_stalled_run()}</button>
+  {:else}
+    <!-- Said here, so a check that finds nothing is not a button that just
+         flips back. The sender may be on a build that is not out yet. -->
+    {#if $updater.phase === 'uptodate'}
+      <span class="newer-result">{m.updater_uptodate()}</span>
+    {:else if $updater.phase === 'error'}
+      <span class="newer-result">{m.updater_error_title()}</span>
+    {/if}
+    <button type="button" class="ghost" disabled={updateBusy} onclick={() => void checkForUpdates()}>
+      {$updater.phase === 'checking' ? m.updater_checking() : m.settings_about_check_btn()}
+    </button>
+  {/if}
+{/snippet}
 
 {#snippet howBody()}
   <p class="how-lede">{m.channels_page_subtitle()}</p>
@@ -3258,10 +3334,35 @@
                 <span>{m.channels_transfer_started()}</span>
               </div>
             {/if}
-            {#if selected.key_behind}
+            {#if selected.newer_key}
+              <div class="key-behind-banner newer-banner" role="status">
+                <div class="newer-text">
+                  <strong>{m.channels_newer_key()}</strong>
+                  <span>{m.channels_newer_key_body()}</span>
+                </div>
+                <span class="newer-actions">{@render updateAction()}</span>
+              </div>
+            {:else if selected.key_behind}
               <div class="key-behind-banner" role="status">
                 <strong>{m.channels_key_behind()}</strong>
                 <span>{m.channels_key_behind_body()}</span>
+              </div>
+            {/if}
+            {#if selected.newer_lines > 0}
+              <div class="successor-banner" role="status">
+                <span>{newerLinesLabel}</span>
+                <span class="newer-actions">
+                  <!-- One update button per room: the key banner above has it. -->
+                  {#if !selected.newer_key}
+                    {@render updateAction()}
+                  {/if}
+                  <button
+                    type="button"
+                    class="ghost"
+                    disabled={dismissingNewer}
+                    onclick={() => void dismissNewer(selected.channel_id)}
+                  >{m.common_dismiss()}</button>
+                </span>
               </div>
             {/if}
             {#if !selected.is_owner && !selected.successor_id && nomineeNotice}
@@ -5153,6 +5254,32 @@
   .key-behind-banner strong {
     font-size: var(--font-size-md);
     color: var(--text-primary);
+  }
+
+  .key-behind-banner.newer-banner {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .newer-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .newer-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .newer-result {
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
   }
 
   /* Transfers live at the foot of the members pane, beside the people they
